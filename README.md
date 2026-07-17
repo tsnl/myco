@@ -22,9 +22,12 @@ local machine **and** on remotes you configure — one session, many hosts.
 
 ## Requirements
 
+- API credentials for the model backend you pick (see below)
 - **Rust / cargo** (stable)
 - **`curl`** — `build.rs` fetches MiniLM safetensors at compile time
-- API credentials for the model backend you pick (see below)
+- Extra binaries on `PATH`
+  - Required: `ssh`, `lynx` (web-browser), `uv`, `bash`
+  - Recommended: `git`, `gh`, `curl`
 
 Optional: `trunk` + `wasm32-unknown-unknown` only if you build **`crates/myco-gui`**.
 
