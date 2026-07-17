@@ -56,7 +56,10 @@ struct FileRecord {
 pub struct SearchIndex {
     tantivy: Index,
     writer: IndexWriter,
+    /// Full path key; STRING so deletes/lookups are exact (not tokenized).
     path_field: Field,
+    /// Tokenized path + basename for filename / path-component queries.
+    path_text_field: Field,
     body_field: Field,
     /// path_key -> file body (snippets / line hits / embed source)
     files: HashMap<String, FileRecord>,
@@ -74,6 +77,13 @@ impl SearchIndex {
                 .set_tokenizer("default")
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         );
+        // Not stored: path_field already holds the full path for retrieval.
+        let path_text_opts = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let path_text_field = schema_builder.add_text_field("path_text", path_text_opts);
         let body_field = schema_builder.add_text_field("body", text_opts);
         let schema = schema_builder.build();
         let tantivy = Index::create_in_ram(schema);
@@ -84,6 +94,7 @@ impl SearchIndex {
             tantivy,
             writer,
             path_field,
+            path_text_field,
             body_field,
             files: HashMap::new(),
             vectors: HashMap::new(),
@@ -157,6 +168,7 @@ impl SearchIndex {
         }
 
         let key = path_key(path);
+        let path_text = path_search_text(path);
         let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
         let term = Term::from_field_text(self.path_field, &key);
@@ -165,6 +177,7 @@ impl SearchIndex {
             .writer
             .add_document(doc!(
                 self.path_field => key.as_str(),
+                self.path_text_field => path_text.as_str(),
                 self.body_field => text.as_str(),
             ))
             .is_err()
@@ -220,7 +233,11 @@ impl SearchIndex {
             .map_err(|e| format!("tantivy reload: {e}"))?;
         let searcher = reader.searcher();
 
-        let parser = QueryParser::for_index(&self.tantivy, vec![self.body_field]);
+        // Default fields: body content + tokenized path/filename.
+        let parser = QueryParser::for_index(
+            &self.tantivy,
+            vec![self.body_field, self.path_text_field],
+        );
         let tq: Box<dyn Query> = match parser.parse_query(q) {
             Ok(qq) => qq,
             Err(_) => {
@@ -260,7 +277,24 @@ impl SearchIndex {
             let path = PathBuf::from(path_str);
             let rec = self.files.get(path_str);
             let (line_number, line_text, snippet) = match rec {
-                Some(rec) => line_hit(&rec.lines, q),
+                Some(rec) => {
+                    let body_hit = line_hit(&rec.lines, q);
+                    // Path-only matches have no body line; show path as snippet.
+                    if body_hit.0.is_none() && path_matches_query(path_str, q) {
+                        (
+                            None,
+                            None,
+                            truncate(
+                                path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(path_str),
+                                240,
+                            ),
+                        )
+                    } else {
+                        body_hit
+                    }
+                }
                 None => {
                     let body = doc
                         .get_first(self.body_field)
@@ -384,6 +418,47 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Text indexed for path/filename search.
+///
+/// Emits the full path with separators turned into spaces (so the default
+/// tokenizer can split components) plus the basename again so names like
+/// `SKILL.md` remain findable as a single token-friendly phrase.
+fn path_search_text(path: &Path) -> String {
+    let key = path_key(path);
+    let spaced = key
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { ' ' } else { c })
+        .collect::<String>();
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if !name.is_empty() => format!("{spaced} {name}"),
+        _ => spaced,
+    }
+}
+
+fn path_matches_query(path_str: &str, query: &str) -> bool {
+    let lower_path = path_str.to_lowercase();
+    let name = Path::new(path_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '$' && c != '.')
+                .to_lowercase()
+        })
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if terms.is_empty() {
+        let q = query.trim().to_lowercase();
+        return !q.is_empty() && (lower_path.contains(&q) || name.contains(&q));
+    }
+    terms
+        .iter()
+        .all(|t| lower_path.contains(t) || name.contains(t))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -525,6 +600,38 @@ mod tests {
         let hits = idx.search_exact("PDF forms", None, 10).unwrap();
         assert!(!hits.is_empty(), "{hits:?}");
         assert!(hits[0].path.ends_with("SKILL.md"), "{hits:?}");
+    }
+
+    #[test]
+    fn exact_search_by_filename() {
+        let mut idx = SearchIndex::new().unwrap();
+        idx.upsert_file(
+            Path::new("/tmp/skills/publish/SKILL.md"),
+            "---\nname: publish\ndescription: ship releases\n---\n".into(),
+        );
+        idx.upsert_file(
+            Path::new("/tmp/skills/publish/notes.txt"),
+            "no skill marker here, just notes\n".into(),
+        );
+        idx.commit().unwrap();
+
+        let hits = idx.search_exact("SKILL.md", None, 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].path.ends_with("SKILL.md"), "{hits:?}");
+
+        let hits = idx.search_exact("publish", None, 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.path.ends_with("SKILL.md")),
+            "path component 'publish' should match: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn path_search_text_includes_basename() {
+        let t = path_search_text(Path::new("/tmp/skills/publish/SKILL.md"));
+        assert!(t.contains("SKILL.md"), "{t}");
+        assert!(t.contains("publish"), "{t}");
+        assert!(!t.contains('/'), "{t}");
     }
 
     #[test]
