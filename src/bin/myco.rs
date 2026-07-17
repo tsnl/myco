@@ -1179,6 +1179,7 @@ impl EventSink for CliEventSink {
 mod tests {
     use super::*;
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
+    use myco::uuid_simple_hex;
     use serde_json::json;
     use std::time::Duration;
 

@@ -234,10 +234,8 @@ impl SearchIndex {
         let searcher = reader.searcher();
 
         // Default fields: body content + tokenized path/filename.
-        let parser = QueryParser::for_index(
-            &self.tantivy,
-            vec![self.body_field, self.path_text_field],
-        );
+        let parser =
+            QueryParser::for_index(&self.tantivy, vec![self.body_field, self.path_text_field]);
         let tq: Box<dyn Query> = match parser.parse_query(q) {
             Ok(qq) => qq,
             Err(_) => {
