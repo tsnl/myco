@@ -1,0 +1,5 @@
+# sentence-transformers/all-MiniLM-L6-v2 (Candle; no ORT)
+# base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/
+53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  model.safetensors  # size=90868376
+be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  tokenizer.json  # size=466247
+953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  config.json  # size=612

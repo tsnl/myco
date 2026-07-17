@@ -1,0 +1,14 @@
+# Point to `myco-gui` frontend Yew app:
+[build]
+target = "crates/myco-gui/index.html"
+# manifest_path = "crates/myco-web-ui/Cargo.toml"
+
+# Trunk static file server + reverse proxy:
+[serve]
+addresses = ["0.0.0.0"]
+port = 8080
+
+# Reverse-proxy `/api/` requests to API server:
+[[proxy]]
+rewrite = "/api"
+backend = "http://localhost:8000/api"
