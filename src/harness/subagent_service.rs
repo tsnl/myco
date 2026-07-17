@@ -137,9 +137,7 @@ impl SubagentService {
         );
         worker_session.title = Some(format!("subagent of {parent_session_id}"));
         if let Err(e) = worker_session.save() {
-            eprintln!(
-                "warning: failed to create hidden subagent session {agent_id_hex}: {e}"
-            );
+            eprintln!("warning: failed to create hidden subagent session {agent_id_hex}: {e}");
         }
 
         let child_context = root
@@ -184,9 +182,7 @@ impl SubagentService {
         worker_session.messages = subagent.history().to_vec();
         worker_session.touch();
         if let Err(e) = worker_session.save() {
-            eprintln!(
-                "warning: failed to save hidden subagent session {agent_id_hex}: {e}"
-            );
+            eprintln!("warning: failed to save hidden subagent session {agent_id_hex}: {e}");
         }
 
         if let Err(e) = write_subagent_log(

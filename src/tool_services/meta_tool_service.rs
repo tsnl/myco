@@ -88,7 +88,9 @@ impl SessionMetaTool {
         let action = input.action.clone().unwrap_or(ActionKind::Get);
         match action {
             ActionKind::Get => self.action_get(input.session_id.as_deref()),
-            ActionKind::List => self.action_list(input.limit, input.include_hidden.unwrap_or(false)),
+            ActionKind::List => {
+                self.action_list(input.limit, input.include_hidden.unwrap_or(false))
+            }
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => {
                 let text = input.scratchpad.unwrap_or_default();
