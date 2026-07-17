@@ -201,7 +201,10 @@ impl BashService {
     ///
     /// Unlike sessions, exec **waits for the process to exit**. Bounded by
     /// `timeout_ms` so a runaway command cannot hang the agent forever; on
-    /// timeout or cancel the child is killed and partial stdout/stderr are returned.
+    /// timeout or cancel the child is killed and partial stdout/stderr are
+    /// returned. The final pipe drain is bounded too (`EXEC_DRAIN_GRACE`):
+    /// a backgrounded grandchild that inherits the pipes must not hold the
+    /// result hostage past the child's own exit.
     async fn run_oneshot(
         &self,
         command: &str,
@@ -211,6 +214,10 @@ impl BashService {
     ) -> generative_model::ToolResult {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-c", command])
+            // Never inherit stdin: in `--mode host` it is the NDJSON protocol
+            // pipe, and a child that reads it (python, xargs, `read`…) would
+            // consume protocol bytes and desync the whole host connection.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -230,31 +237,14 @@ impl BashService {
         };
         let child_pid = child.id();
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
-        // Shared buffers so cancel/timeout paths can still report partial output.
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        // Shared buffers, appended to as data arrives, so the bounded drain
+        // below can report partial output even when a reader never hits EOF.
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-        let stdout_task = {
-            let stdout_buf = Arc::clone(&stdout_buf);
-            tokio::spawn(async move {
-                let mut local = Vec::new();
-                let _ = stdout.read_to_end(&mut local).await;
-                if let Ok(mut g) = stdout_buf.lock() {
-                    *g = local;
-                }
-            })
-        };
-        let stderr_task = {
-            let stderr_buf = Arc::clone(&stderr_buf);
-            tokio::spawn(async move {
-                let mut local = Vec::new();
-                let _ = stderr.read_to_end(&mut local).await;
-                if let Ok(mut g) = stderr_buf.lock() {
-                    *g = local;
-                }
-            })
-        };
+        let stdout_task = spawn_capture(stdout, Arc::clone(&stdout_buf));
+        let stderr_task = spawn_capture(stderr, Arc::clone(&stderr_buf));
 
         let deadline = Duration::from_millis(timeout_ms.max(1));
         // When cancel/timeout wins, select drops the wait future so we can
@@ -276,8 +266,7 @@ impl BashService {
                 kill_process_group(child_pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                drain_capture(stdout_task, stderr_task).await;
                 let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 generative_model::ToolResult::err(format!(
@@ -292,8 +281,7 @@ impl BashService {
                 kill_process_group(child_pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                drain_capture(stdout_task, stderr_task).await;
                 let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 generative_model::ToolResult::text(format!(
@@ -309,8 +297,7 @@ impl BashService {
                 ))
             }
             Outcome::Status(status) => {
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                drain_capture(stdout_task, stderr_task).await;
                 let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 match status {
@@ -450,12 +437,17 @@ impl BashService {
                 }
             };
             // Re-check under lock in case of concurrent start with same id.
+            // The child is already running (readers + waiter own it), so a
+            // losing start must kill it here or it leaks unkillable: its pid
+            // is never stored anywhere the agent can reach.
             if sessions.contains_key(session_id) {
+                kill_process_group(pid);
                 return generative_model::ToolResult::err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
+                kill_process_group(pid);
                 return generative_model::ToolResult::err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
@@ -813,6 +805,9 @@ struct OutputBuffer {
     exited: bool,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
+    /// Readers (stdout, stderr) that hit EOF. 2 + `exited` ⇒ the whole
+    /// process group is almost certainly gone (see `kill_session_process`).
+    eof_streams: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -895,6 +890,44 @@ impl SessionSnapshot {
     }
 }
 
+/// How long exec waits for its pipe readers after the child is gone. The
+/// readers only EOF when *every* write end closes, so a backgrounded
+/// grandchild (`sleep 300 & echo hi`) would otherwise stall the result for
+/// its whole lifetime — or forever, for a daemon.
+const EXEC_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Read `reader` to EOF, appending to `buf` as data arrives (not just at EOF),
+/// so a bounded drain still observes everything read so far.
+fn spawn_capture<R>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut g) = buf.lock() {
+                        g.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
+/// with the child already dead, so anything still holding the pipes open is a
+/// stray grandchild whose future output we deliberately give up on.
+async fn drain_capture(stdout_task: tokio::task::JoinHandle<()>, stderr_task: tokio::task::JoinHandle<()>) {
+    for mut task in [stdout_task, stderr_task] {
+        if tokio::time::timeout(EXEC_DRAIN_GRACE, &mut task).await.is_err() {
+            task.abort();
+        }
+    }
+}
+
 fn spawn_reader<R>(mut reader: R, kind: StreamKind, shared: Arc<SessionShared>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -917,6 +950,10 @@ where
                 Err(_) => break,
             }
         }
+        if let Ok(mut b) = shared.buffer.lock() {
+            b.eof_streams += 1;
+        }
+        shared.notify.notify_waiters();
     });
 }
 
@@ -936,10 +973,24 @@ fn kill_process_group(pid: Option<u32>) {
         .status();
 }
 
-/// Best-effort SIGKILL of a session's process group; process may already have exited.
+/// Best-effort SIGKILL of a session's process group.
 /// Sync so it is safe to call from `Drop` / `on_agent_finished`.
+///
+/// Skipped when the leader exited *and* both pipes hit EOF: the group is then
+/// almost certainly empty, and `kill(-pgid)` on a fully-dead group could hit
+/// an unrelated process that recycled the pid. If anything still holds a pipe
+/// open (a live grandchild), we do kill — that is exactly the process close
+/// is meant to stop.
 fn kill_session_process(session: &Session) {
+    let group_done = session
+        .shared
+        .buffer
+        .lock()
+        .map(|b| b.exited && b.eof_streams >= 2)
+        .unwrap_or(false);
+    if !group_done {
     kill_process_group(session.pid);
+}
 }
 
 fn spawn_waiter(mut child: Child, shared: Arc<SessionShared>) {
@@ -1730,6 +1781,59 @@ mod tests {
             text.contains("timed_out") || text.contains("timed out"),
             "expected timeout status: {text}"
         );
+    }
+
+    /// A backgrounded grandchild inherits the stdout/stderr pipes, so the
+    /// readers see no EOF at child exit. Exec must still return promptly
+    /// (bounded drain), with the output the child did produce.
+    #[tokio::test]
+    async fn exec_returns_at_exit_despite_backgrounded_pipe_holder() {
+        let harness = harness();
+        let t0 = Instant::now();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "sleep 15 & echo hi",
+                "timeout_ms": 30_000,
+            }),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "exec should return at child exit + drain grace, took {elapsed:?}: {text}"
+        );
+        assert!(text.contains("hi"), "partial output must survive: {text}");
+        assert!(text.contains("Exit code: Some(0)"), "{text}");
+    }
+
+    /// Exec children get a null stdin. Inheriting ours is never right: in
+    /// `--mode host` it is the NDJSON protocol pipe, and a child that reads
+    /// it desyncs the whole host connection.
+    #[tokio::test]
+    async fn exec_stdin_is_null_not_inherited() {
+        let harness = harness();
+        let t0 = Instant::now();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "wc -c",
+                "timeout_ms": 10_000,
+            }),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stdin must be closed (instant EOF), took {elapsed:?}: {text}"
+        );
+        assert!(text.contains("0"), "wc -c on null stdin reads 0 bytes: {text}");
     }
 
     /// Timeout must kill the whole process group, not just the outer `bash -c`.
