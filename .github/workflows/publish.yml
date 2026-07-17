@@ -39,6 +39,15 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
+      - name: Cache MiniLM embed weights
+        uses: actions/cache@v4
+        with:
+          path: src/text_search/embed_weights
+          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+
+      - name: Seed MiniLM embed weights
+        run: bash scripts/seed-minilm-weights.sh
+
       - name: Semver bump and cargo publish
         id: publish
         uses: tsnl/semver-bump-and-cargo-publish@v1
