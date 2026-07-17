@@ -10,6 +10,7 @@ mod test_tools;
 mod test_utils;
 
 #[tokio::test]
+#[ignore = "live provider API; run with: cargo test -- --ignored"]
 async fn test_agent_tool_use() {
     test_utils::load_dotenv();
 
