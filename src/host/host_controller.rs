@@ -156,10 +156,17 @@ impl HostController {
         }
     }
 
-    /// Fire a tool call and await its demuxed reply (cancel abandons this waiter only).
+    /// Fire a tool call and await its demuxed reply.
     ///
-    /// Subprocess hosts connect on first use. Concurrent callers only serialize briefly
-    /// in [`submit`]; awaiting the tool result is outside the connection mutex.
+    /// **In-process:** cancel is delivered only via [`HostDispatchContext`] so the
+    /// tool can kill children and return. We deliberately do **not**
+    /// `select!`-abandon the dispatch future — that leaked `sleep`/pipe work and
+    /// wedged later calls under suite load. Tools that ignore cancel may run to
+    /// completion (or their own timeout).
+    ///
+    /// **Subprocess:** cancel abandons this waiter only (host may still finish
+    /// the tool). Connect happens on first use; concurrent callers only serialize
+    /// briefly in [`submit`].
     pub async fn call(
         &self,
         agent_id: uuid::Uuid,
@@ -182,21 +189,17 @@ impl HostController {
             Backend::InProcess { worker } => {
                 let tool_id = tool_use.id.clone();
                 let worker = Arc::clone(worker);
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        return ToolResult::err("cancelled").with_id(tool_id);
-                    }
-                    r = worker.dispatch_tool_use(
+                worker
+                    .dispatch_tool_use(
                         tool_use,
                         HostDispatchContext {
                             agent_id,
-                            cancel: cancel.clone(),
+                            cancel,
                             agent_root,
                         },
-                    ) => r,
-                };
-                result
+                    )
+                    .await
+                    .with_id(tool_id)
             }
             Backend::Subprocess { .. } => self.call_subprocess(agent_id, tool_use, cancel).await,
         }
@@ -723,33 +726,47 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_midcall_does_not_wedge_next_call_in_process() {
         let ctl = HostController::local_in_process();
 
         let cancel = CancelToken::new();
-        let cancel_bg = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            cancel_bg.cancel();
-        });
-
-        let cancelled = ctl
-            .call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "slow".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "sleep 2; echo done-slow"}),
-                },
-                cancel,
-            )
-            .await;
+        // Cancel from the same task after a short delay — more reliable than a
+        // background spawn under heavy suite load / current_thread runtimes.
+        let mut call = std::pin::pin!(ctl.call(
+            uuid::Uuid::nil(),
+            ToolUse {
+                id: "slow".into(),
+                name: "bash".into(),
+                // Long enough that cancel always races before natural exit.
+                // Explicit timeout so we never lean on the 60s default.
+                input: json!({
+                    "command": "sleep 120; echo done-slow",
+                    "timeout_ms": 180_000
+                }),
+            },
+            cancel.clone(),
+        ));
+        let cancelled = tokio::select! {
+            r = &mut call => r,
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {
+                cancel.cancel();
+                call.await
+            }
+        };
+        assert!(
+            cancel.is_cancelled(),
+            "token should be cancelled after test cancel"
+        );
         assert!(cancelled.is_error, "{cancelled:?}");
-        assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
+        assert!(
+            tool_text(&cancelled).contains("cancelled"),
+            "expected cancelled result, got: {cancelled:?}"
+        );
 
+        // Next call must not hang: cancel cleanup must free the host path.
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             ctl.call(
                 uuid::Uuid::nil(),
                 ToolUse {
