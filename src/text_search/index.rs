@@ -149,11 +149,19 @@ impl SearchIndex {
             return false;
         }
 
+        // Cap math accounts for replacing the existing version, and is checked
+        // *before* the removal: an over-cap rewrite keeps the old version
+        // searchable instead of deleting it and then indexing nothing.
+        let old_bytes = self
+            .files
+            .get(&path_key(path))
+            .map(|rec| rec.text.len() as u64)
+            .unwrap_or(0);
+        if self.total_bytes - old_bytes + bytes > MAX_TOTAL_BYTES {
+            return false;
+        }
         if self.contains_file(path) {
             self.remove_file(path);
-        }
-        if self.total_bytes + bytes > MAX_TOTAL_BYTES {
-            return false;
         }
 
         let key = path_key(path);
