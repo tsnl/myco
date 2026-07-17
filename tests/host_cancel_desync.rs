@@ -25,30 +25,31 @@ fn tool_text(result: &myco::generative_model::ToolResult) -> String {
         .join("\n")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_midcall_then_next_call_succeeds() {
     let client = HostController::local_in_process();
 
     let cancel = CancelToken::new();
-    let cancel_bg = cancel.clone();
-    tokio::spawn(async move {
-        // Cancel after the bash child is almost certainly running.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        cancel_bg.cancel();
-    });
-
-    let cancelled = client
-        .call(
-            uuid::Uuid::nil(),
-            ToolUse {
-                id: "slow".into(),
-                name: "bash".into(),
-                // Long enough that cancel always races before natural exit.
-                input: json!({"command": "sleep 30; echo done-slow"}),
-            },
-            cancel,
-        )
-        .await;
+    // Same-task delayed cancel (avoids spawn scheduling races under suite load).
+    let mut call = std::pin::pin!(client.call(
+        uuid::Uuid::nil(),
+        ToolUse {
+            id: "slow".into(),
+            name: "bash".into(),
+            input: json!({
+                "command": "sleep 120; echo done-slow",
+                "timeout_ms": 180_000
+            }),
+        },
+        cancel.clone(),
+    ));
+    let cancelled = tokio::select! {
+        r = &mut call => r,
+        _ = tokio::time::sleep(Duration::from_millis(400)) => {
+            cancel.cancel();
+            call.await
+        }
+    };
     assert!(cancelled.is_error, "{cancelled:?}");
     assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
 

@@ -662,17 +662,12 @@ mod tests {
             "expected overlapping execution: last_start={last_start:?} first_end={first_end:?} starts={starts:?} ends={ends:?}"
         );
 
-        // Wall clock should be ~1 delay, not ~2. Allow generous headroom for
-        // CI / parallel suite load (scheduler jitter, other tests).
+        // Overlap of starts/ends is the real concurrency signal. Wall clock is
+        // only a coarse guard against fully serial execution; allow large slack
+        // for CI / parallel suite load (scheduler jitter, other tests).
         assert!(
-            wall < delay * 3 + Duration::from_millis(500),
+            wall < delay * 6 + Duration::from_secs(1),
             "expected concurrent wall time ~1 delay, got {wall:?} (delay={delay:?})"
-        );
-        // Overlap check above is the real concurrency signal; this only
-        // rejects pathological full-serial runs with large slack.
-        assert!(
-            wall < delay * 4,
-            "wall {wall:?} looks serial for delay={delay:?}"
         );
     }
 

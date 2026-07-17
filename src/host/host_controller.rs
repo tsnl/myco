@@ -726,32 +726,43 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_midcall_does_not_wedge_next_call_in_process() {
         let ctl = HostController::local_in_process();
 
         let cancel = CancelToken::new();
-        let cancel_bg = cancel.clone();
-        tokio::spawn(async move {
-            // Cancel after the bash child is almost certainly running.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            cancel_bg.cancel();
-        });
-
-        let cancelled = ctl
-            .call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "slow".into(),
-                    name: "bash".into(),
-                    // Long enough that cancel always races before natural exit.
-                    input: json!({"command": "sleep 30; echo done-slow"}),
-                },
-                cancel,
-            )
-            .await;
+        // Cancel from the same task after a short delay — more reliable than a
+        // background spawn under heavy suite load / current_thread runtimes.
+        let mut call = std::pin::pin!(ctl.call(
+            uuid::Uuid::nil(),
+            ToolUse {
+                id: "slow".into(),
+                name: "bash".into(),
+                // Long enough that cancel always races before natural exit.
+                // Explicit timeout so we never lean on the 60s default.
+                input: json!({
+                    "command": "sleep 120; echo done-slow",
+                    "timeout_ms": 180_000
+                }),
+            },
+            cancel.clone(),
+        ));
+        let cancelled = tokio::select! {
+            r = &mut call => r,
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {
+                cancel.cancel();
+                call.await
+            }
+        };
+        assert!(
+            cancel.is_cancelled(),
+            "token should be cancelled after test cancel"
+        );
         assert!(cancelled.is_error, "{cancelled:?}");
-        assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
+        assert!(
+            tool_text(&cancelled).contains("cancelled"),
+            "expected cancelled result, got: {cancelled:?}"
+        );
 
         // Next call must not hang: cancel cleanup must free the host path.
         let result = tokio::time::timeout(
