@@ -108,6 +108,10 @@ pub enum WireEvent {
         is_error: bool,
     },
     TurnFinished {},
+    Usage {
+        #[serde(default)]
+        usage: serde_json::Value,
+    },
     AgentFinished {
         #[serde(default)]
         is_error: bool,

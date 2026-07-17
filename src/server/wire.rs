@@ -10,7 +10,7 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::generative_model::{Content, TurnEndReason};
+use crate::generative_model::{Content, TokenUsage, TurnEndReason};
 use crate::session::{AgentEvent, TraceContext};
 
 /// Correlation context on every streamed event (subagent nesting via `depth`).
@@ -71,6 +71,11 @@ pub enum WireEvent {
         reason: TurnEndReason,
         context: WireContext,
     },
+    /// Provider usage for the most recent generate call (drives `USER used/max`).
+    Usage {
+        usage: TokenUsage,
+        context: WireContext,
+    },
     AgentFinished {
         #[serde(skip_serializing_if = "Option::is_none")]
         log_path: Option<String>,
@@ -126,6 +131,10 @@ impl From<&AgentEvent> for WireEvent {
             },
             AgentEvent::TurnFinished { reason, context } => WireEvent::TurnFinished {
                 reason: reason.clone(),
+                context: context.into(),
+            },
+            AgentEvent::Usage { usage, context } => WireEvent::Usage {
+                usage: *usage,
                 context: context.into(),
             },
             AgentEvent::AgentFinished {

@@ -321,7 +321,10 @@ fn apply_event(
                 reload_sessions(sessions);
             });
         }
-        WireEvent::Lagged { .. } | WireEvent::AgentStarted { .. } | WireEvent::Unknown => {}
+        WireEvent::Lagged { .. }
+        | WireEvent::AgentStarted { .. }
+        | WireEvent::Usage { .. }
+        | WireEvent::Unknown => {}
     }
 }
 
