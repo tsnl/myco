@@ -3,6 +3,28 @@
 How to inspect, install, and repair **this** runtime (agent + host pool). Use when tools fail,
 hosts look wrong, or the user asks you to update `myco` / explain the harness.
 
+## Host PATH prerequisites
+
+Same executables as README **Requirements** (extra binaries on `PATH`). Install on each machine
+that runs the agent and/or host tools; remotes need what their host tools spawn, not only the
+agent laptop.
+
+**Required**
+
+- **`ssh`** — attaches remotes (`ssh … myco --mode host` over NDJSON) and is used for install/diagnose over SSH.
+- **`lynx`** — powers the `lynx_tui_browser` host tool (`lynx -dump` plaintext pages / search results).
+- **`uv`** — hermetic Python runs (agent computer-use norm: scripts and deps without polluting the system).
+- **`bash`** — host `bash` tool (one-shot `exec` and multi-turn shell sessions).
+
+**Recommended**
+
+- **`git`** — worktrees/branches, repo inspection, and `git archive` when shipping local source to remotes.
+- **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
+- **`curl`** — `build.rs` MiniLM asset fetch at compile time, and downloading release source tarballs.
+
+Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above). Optional
+`trunk` + `wasm32-unknown-unknown` only for **`crates/myco-gui`**.
+
 ## Finding configured hosts
 
 - **Local** is always present (in-process); it does not appear under `[[remote_hosts]]`.
