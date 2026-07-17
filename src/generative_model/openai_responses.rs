@@ -870,9 +870,7 @@ impl ResponsesUsage {
         crate::generative_model::TokenUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            cache_read_tokens: self
-                .input_tokens_details
-                .and_then(|d| d.cached_tokens),
+            cache_read_tokens: self.input_tokens_details.and_then(|d| d.cached_tokens),
             cache_creation_tokens: None,
         }
     }

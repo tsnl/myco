@@ -375,10 +375,7 @@ async fn run_repl(
 ) {
     loop {
         println!("{USER_RULE}");
-        let used = agent
-            .last_usage()
-            .map(|u| u.context_tokens())
-            .unwrap_or(0);
+        let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
         println!("USER {used}/{max}");
         println!();

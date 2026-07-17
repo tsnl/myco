@@ -42,8 +42,7 @@ fn turn_tool_use(tool_uses: Vec<ToolUse>) -> GenerateOutput {
         tool_uses,
         turn_end_reason: TurnEndReason::ToolUse,
         usage: None,
-    },
-    usage: None,
+    }
 }
 
 fn turn_end(text: &str) -> GenerateOutput {
@@ -52,8 +51,7 @@ fn turn_end(text: &str) -> GenerateOutput {
         tool_uses: vec![],
         turn_end_reason: TurnEndReason::EndTurn,
         usage: None,
-    },
-    usage: None,
+    }
 }
 
 /// Scripted multi-turn interactive shell:

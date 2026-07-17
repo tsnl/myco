@@ -949,6 +949,7 @@ mod tests {
             content: vec![Content::Text { text: "hmm".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
         }]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
