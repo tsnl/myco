@@ -29,7 +29,6 @@ impl ToolService for TextEditorService {
             // at runtime after conversion — schemars would emit root `oneOf` for that enum,
             // which Anthropic rejects (missing `input_schema.type`).
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 
@@ -422,6 +421,12 @@ fn insert_after_line(content: &str, insert_line: i64, insert_text: &str) -> Resu
     };
 
     if insert_line == total_lines {
+        // A last line without trailing newline: add one so the inserted text
+        // starts on its own line instead of gluing onto the last line. The
+        // model cannot compensate — ranged view strips trailing-newline info.
+        if !content.is_empty() && !content.ends_with('\n') {
+            return Ok(format!("{content}\n{insert_text}"));
+        }
         return Ok(format!("{content}{insert_text}"));
     }
 
@@ -431,8 +436,16 @@ fn insert_after_line(content: &str, insert_line: i64, insert_text: &str) -> Resu
 }
 
 fn atomically_write_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    // Resolve symlinks first: AtomicWriteFile replaces the path it is given,
+    // so writing through the raw path would turn a symlink into a regular
+    // file and silently fork its content away from the target.
+    let target = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        // New file (create): nothing to resolve yet.
+        Err(_) => path.to_path_buf(),
+    };
     let mut file = atomic_write_file::AtomicWriteFile::options()
-        .open(path)
+        .open(&target)
         .map_err(|e| e.to_string())?;
     file.write_all(content).map_err(|e| e.to_string())?;
     file.commit().map_err(|e| e.to_string())?;
@@ -862,9 +875,12 @@ mod tests {
             insert_after_line("a\nb\nc", 1, "X\n").unwrap(),
             "a\nX\nb\nc"
         );
+        // Appending after a last line with no trailing newline supplies the
+        // separator itself; "Z" must not glue onto "c".
+        assert_eq!(insert_after_line("a\nb\nc", 3, "Z").unwrap(), "a\nb\nc\nZ");
         assert_eq!(
-            insert_after_line("a\nb\nc", 3, "\nZ").unwrap(),
-            "a\nb\nc\nZ"
+            insert_after_line("a\nb\nc\n", 3, "Z\n").unwrap(),
+            "a\nb\nc\nZ\n"
         );
         assert!(
             insert_after_line("a\nb", 5, "x")
@@ -977,6 +993,42 @@ mod tests {
         );
         assert!(!edit.is_error, "{}", result_text(&edit));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "for x in y:\n");
+    }
+
+    /// Editing through a symlink must rewrite the *target*, not replace the
+    /// symlink with a regular file (which forks the content).
+    #[test]
+    fn str_replace_through_symlink_edits_target() {
+        let tmp = temp_dir();
+        let target = write_file(&tmp.0, "real.md", "old text\n");
+        let link = tmp.0.join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_str = link.to_string_lossy().into_owned();
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: link_str.clone(),
+                view_range: None,
+            },
+        );
+        assert!(!view.is_error, "{}", result_text(&view));
+
+        let edit = dispatch(
+            &harness,
+            ParsedInput::StrReplace {
+                path: link_str,
+                old_str: "old text".into(),
+                new_str: "new text".into(),
+            },
+        );
+        assert!(!edit.is_error, "{}", result_text(&edit));
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "symlink must survive the edit"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new text\n");
     }
 
     #[test]

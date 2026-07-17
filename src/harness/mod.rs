@@ -590,7 +590,6 @@ mod tests {
                     "command": { "type": "string" }
                 }
             }),
-            input_examples: vec![],
         };
         let injected = inject_host_field(spec);
         assert!(

@@ -8,7 +8,7 @@ use std::time::Duration;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
 
-use super::discover::{AutoIndexTarget, discover_auto_index_targets};
+use super::discover::discover_auto_index_targets;
 use super::index::{Hit, SearchIndex, is_under, read_text_file, resolve_path, walk_text_files};
 
 /// Shared engine handle (cheap to clone).
@@ -116,17 +116,21 @@ impl TextSearchEngine {
         std::thread::Builder::new()
             .name("myco-text-search-watch".into())
             .spawn(move || {
+                // One runtime for the thread's lifetime; building one per
+                // event turns a busy tree (a build writing target/) into a
+                // runtime-construction storm.
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
                 while let Ok(msg) = event_rx.recv() {
                     let eng = eng.clone();
                     // Best-effort: block_on is fine on a dedicated thread.
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    if let Ok(rt) = rt {
-                        rt.block_on(async {
-                            eng.apply_watch_msg(msg).await;
-                        });
-                    }
+                    rt.block_on(async {
+                        eng.apply_watch_msg(msg).await;
+                    });
                 }
             })
             .ok();
@@ -234,18 +238,25 @@ impl TextSearchEngine {
             state.pending.insert(path_key(&resolved), job_id);
 
             // Persistent watcher for this root (dir) or parent of a single file.
-            let watch_target = if resolved.is_dir() {
-                resolved.clone()
+            // A single-file root watches its parent NON-recursively: for a
+            // repo-root AGENTS.md the parent is the whole project tree, and a
+            // recursive watch there costs one inotify watch per subdirectory
+            // plus an event for every build artifact write.
+            let (watch_target, watch_mode) = if resolved.is_dir() {
+                (resolved.clone(), RecursiveMode::Recursive)
             } else {
-                resolved
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| resolved.clone())
+                (
+                    resolved
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| resolved.clone()),
+                    RecursiveMode::NonRecursive,
+                )
             };
             if let Some(tx) = state.event_tx.clone() {
                 match build_watcher(tx, resolved.clone()) {
                     Ok(mut w) => {
-                        if let Err(e) = w.watch(&watch_target, RecursiveMode::Recursive) {
+                        if let Err(e) = w.watch(&watch_target, watch_mode) {
                             // Still index; live updates may be missing.
                             if let Some(r) = state.roots.iter_mut().find(|r| r.path == resolved) {
                                 r.error = Some(format!("watcher install failed: {e}"));
@@ -524,18 +535,28 @@ impl TextSearchEngine {
                 if !under {
                     return;
                 }
-                if let Some(text) = tokio::task::spawn_blocking({
+                let text = tokio::task::spawn_blocking({
                     let path = path.clone();
                     move || read_text_file(&path)
                 })
                 .await
                 .ok()
-                .flatten()
-                {
-                    let mut st = self.inner.lock().await;
-                    st.index.upsert_file(&path, text);
-                    let _ = st.index.commit();
+                .flatten();
+                let mut st = self.inner.lock().await;
+                match text {
+                    Some(text) => {
+                        st.index.upsert_file(&path, text);
+                    }
+                    // Unreadable now: renames/moves arrive as Modify events
+                    // carrying the *old* path (inotify `Name(From)`), never as
+                    // Remove — and a file can also grow past the size cap.
+                    // Either way, keeping the old entry would leave stale
+                    // content searchable forever; drop it.
+                    None => {
+                        st.index.remove_file(&path);
+                    }
                 }
+                let _ = st.index.commit();
             }
             WatchMsg::Remove(path) => {
                 let mut st = self.inner.lock().await;
@@ -583,10 +604,6 @@ fn build_watcher(
         notify::Config::default(),
     )
 }
-
-// silence unused import in non-test
-#[allow(dead_code)]
-fn _auto_target_type(_: AutoIndexTarget) {}
 
 #[cfg(test)]
 mod tests {

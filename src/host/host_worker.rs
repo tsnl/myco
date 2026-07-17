@@ -99,7 +99,7 @@ impl HostWorker {
         W: AsyncWriteExt + Unpin,
     {
         match msg {
-            Request::Hello { agent_id: _ } => {
+            Request::Hello => {
                 let response = Response::HelloOk {
                     name: self.name.clone(),
                     version: env!("CARGO_PKG_VERSION").to_string(),

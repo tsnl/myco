@@ -198,12 +198,24 @@ impl Agent {
             let output = match accumulate_generate(stream, sink, context, cancel.clone()).await {
                 Ok(output) => output,
                 Err(GenerateOrCancel::Cancelled) => return self.finish_cancelled(),
-                Err(GenerateOrCancel::Generate(e)) => {
-                    return Err(AgentInteractionError::GenerateError(e));
-                }
+                Err(GenerateOrCancel::Generate(e)) => return self.finish_generate_error(e),
             };
 
             match output.turn_end_reason {
+                // A tool_use stop with zero accumulated tool calls is malformed
+                // (e.g. a content block the accumulator ignored). Retrying with
+                // unchanged history would loop generate forever, and pushing an
+                // empty ToolResults message is rejected by the API — fail loud.
+                TurnEndReason::ToolUse if output.tool_uses.is_empty() => {
+                    self.history.push(Message::AssistantMessage {
+                        content: output.content,
+                        tool_uses: vec![],
+                        turn_end_reason: Some(TurnEndReason::ToolUse),
+                    });
+                    return self.finish_generate_error(GenerateError::MalformedResponseError(
+                        "turn ended in tool_use but streamed zero tool uses".into(),
+                    ));
+                }
                 TurnEndReason::ToolUse => {
                     // Persist full content (including thinking summaries) for session
                     // resume/UI. Backends strip thinking when composing the next request.
@@ -260,6 +272,20 @@ impl Agent {
             context: self.context.clone(),
         });
         Err(AgentInteractionError::Cancelled)
+    }
+
+    /// Errors end the turn too: sinks key section/state resets off
+    /// `TurnFinished`, so skipping it on error leaves the next turn's output
+    /// rendering glued to this one's (and an open `Thinking:` line dangling).
+    fn finish_generate_error(
+        &self,
+        error: GenerateError,
+    ) -> Result<Vec<Content>, AgentInteractionError> {
+        self.sink.emit(AgentEvent::TurnFinished {
+            reason: TurnEndReason::Other("generate_error".into()),
+            context: self.context.clone(),
+        });
+        Err(AgentInteractionError::GenerateError(error))
     }
 
     async fn dispatch_tool_use(&self, tool_use: ToolUse, cancel: CancelToken) -> ToolResult {
@@ -478,7 +504,6 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false,
                 }),
-                input_examples: vec![],
             }]
         }
 
@@ -876,6 +901,33 @@ mod tests {
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         assert_eq!(agent.history().len(), 1);
         assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
+    }
+
+    /// A tool_use stop with zero streamed tool uses must fail loud, not loop
+    /// generate forever on unchanged history or push empty ToolResults.
+    #[tokio::test]
+    async fn tool_use_stop_with_zero_tool_uses_errors_not_loops() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![Content::Text { text: "hmm".into() }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::ToolUse,
+        }]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let err = agent
+            .interact(
+                vec![Content::Text { text: "hi".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect_err("malformed turn should error");
+        assert!(matches!(err, AgentInteractionError::GenerateError(_)));
+        // History stays well-formed: user + assistant, no ToolResults message.
+        assert_eq!(agent.history().len(), 2);
+        assert!(matches!(
+            agent.history()[1],
+            Message::AssistantMessage { .. }
+        ));
     }
 
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.

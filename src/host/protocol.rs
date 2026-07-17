@@ -11,11 +11,7 @@ use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// First message after connect; worker replies with [`Response::HelloOk`].
-    Hello {
-        /// Optional agent id if already known (informational for V1).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<uuid::Uuid>,
-    },
+    Hello,
     /// Execute one tool use. Worker responds with [`Response::ToolResult`].
     ToolCall {
         /// Correlation id (unique per in-flight call on this pipe).
@@ -91,22 +87,6 @@ impl Response {
         writer.flush().await.map_err(|e| format!("flush: {e}"))?;
         Ok(())
     }
-}
-
-pub fn encode_request(msg: &Request) -> Result<Vec<u8>, String> {
-    msg.encode()
-}
-
-pub fn encode_response(msg: &Response) -> Result<Vec<u8>, String> {
-    msg.encode()
-}
-
-pub fn decode_request(line: &str) -> Result<Request, String> {
-    Request::decode(line)
-}
-
-pub fn decode_response(line: &str) -> Result<Response, String> {
-    Response::decode(line)
 }
 
 #[cfg(test)]
