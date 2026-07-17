@@ -12,8 +12,7 @@ pub use agent::{
     uuid_simple_hex,
 };
 pub use transcript::{
-    SECTION_RULE, USER_RULE, format_tool_invocation, print_session_history,
-    write_session_history,
+    SECTION_RULE, USER_RULE, format_tool_invocation, print_session_history, write_session_history,
 };
 
 use std::fs;
@@ -340,7 +339,6 @@ impl Session {
             .ok_or_else(|| "no matching link".to_string())?;
         Ok(self.links.remove(idx))
     }
-
 }
 
 // ---------------------------------------------------------------------------

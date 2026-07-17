@@ -909,18 +909,14 @@ mod tests {
     async fn tool_use_stop_with_zero_tool_uses_errors_not_loops() {
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![GenerateOutput {
-            content: vec![Content::Text {
-                text: "hmm".into(),
-            }],
+            content: vec![Content::Text { text: "hmm".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::ToolUse,
         }]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
-                vec![Content::Text {
-                    text: "hi".into(),
-                }],
+                vec![Content::Text { text: "hi".into() }],
                 crate::core::CancelToken::new(),
             )
             .await
@@ -928,7 +924,10 @@ mod tests {
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         // History stays well-formed: user + assistant, no ToolResults message.
         assert_eq!(agent.history().len(), 2);
-        assert!(matches!(agent.history()[1], Message::AssistantMessage { .. }));
+        assert!(matches!(
+            agent.history()[1],
+            Message::AssistantMessage { .. }
+        ));
     }
 
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.

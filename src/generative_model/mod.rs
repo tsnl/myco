@@ -710,8 +710,7 @@ mod tests {
     #[test]
     fn sse_parser_joins_multiline_data_and_skips_done() {
         let mut parser = SseParser::default();
-        let events =
-            parser.push(b"data: a\ndata: b\n\ndata: [DONE]\n\nevent: x\ndata: c\r\n\r\n");
+        let events = parser.push(b"data: a\ndata: b\n\ndata: [DONE]\n\nevent: x\ndata: c\r\n\r\n");
         assert_eq!(events, vec!["a\nb".to_string(), "c".to_string()]);
     }
 

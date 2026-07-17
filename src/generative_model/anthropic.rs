@@ -105,10 +105,10 @@ impl AnthropicGenerativeModel {
                     auth_header.parse().unwrap(),
                     // Never echo the token into the error: it ends up in logs.
                     auth_value.parse().map_err(|e| {
-                            ModelCreationError::BadConfig(format!(
+                        ModelCreationError::BadConfig(format!(
                             "auth token is not a valid HTTP header value: {e}"
-                            ))
-                        })?,
+                        ))
+                    })?,
                 ),
                 (
                     "anthropic-version".parse().unwrap(),

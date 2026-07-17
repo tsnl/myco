@@ -128,10 +128,10 @@ impl TextSearchEngine {
                 while let Ok(msg) = event_rx.recv() {
                     let eng = eng.clone();
                     // Best-effort: block_on is fine on a dedicated thread.
-                        rt.block_on(async {
-                            eng.apply_watch_msg(msg).await;
-                        });
-                    }
+                    rt.block_on(async {
+                        eng.apply_watch_msg(msg).await;
+                    });
+                }
             })
             .ok();
 
@@ -246,9 +246,9 @@ impl TextSearchEngine {
                 (resolved.clone(), RecursiveMode::Recursive)
             } else {
                 (
-                resolved
-                    .parent()
-                    .map(|p| p.to_path_buf())
+                    resolved
+                        .parent()
+                        .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| resolved.clone()),
                     RecursiveMode::NonRecursive,
                 )
@@ -542,11 +542,11 @@ impl TextSearchEngine {
                 .await
                 .ok()
                 .flatten();
-                    let mut st = self.inner.lock().await;
+                let mut st = self.inner.lock().await;
                 match text {
                     Some(text) => {
-                    st.index.upsert_file(&path, text);
-                }
+                        st.index.upsert_file(&path, text);
+                    }
                     // Unreadable now: renames/moves arrive as Modify events
                     // carrying the *old* path (inotify `Name(From)`), never as
                     // Remove — and a file can also grow past the size cap.

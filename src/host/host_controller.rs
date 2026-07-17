@@ -334,36 +334,33 @@ impl HostController {
         };
 
         let (write_tx, pending, dead) = {
-        let mut slot = conn.lock().await;
+            let mut slot = conn.lock().await;
             // A connection whose reader/writer exited (host died, protocol
             // desync) sits in the slot looking alive; drop it — Conn::drop
             // kills the child — so the path below can respawn cleanly.
-            if slot
-                .as_ref()
-                .is_some_and(|c| c.dead.load(Ordering::SeqCst))
-            {
+            if slot.as_ref().is_some_and(|c| c.dead.load(Ordering::SeqCst)) {
                 *slot = None;
             }
-        if slot.is_none() {
-            if !connect_if_needed {
-                return Err("not connected".into());
-            }
-            match connect_with_timeout(config, *connect_timeout_secs).await {
-                Ok(c) => {
-                    if let Ok(mut err) = last_error.lock() {
-                        *err = None;
-                    }
-                    *slot = Some(c);
+            if slot.is_none() {
+                if !connect_if_needed {
+                    return Err("not connected".into());
                 }
-                Err(e) => {
-                    if let Ok(mut err) = last_error.lock() {
-                        *err = Some(e.clone());
+                match connect_with_timeout(config, *connect_timeout_secs).await {
+                    Ok(c) => {
+                        if let Ok(mut err) = last_error.lock() {
+                            *err = None;
+                        }
+                        *slot = Some(c);
                     }
-                    return Err(e);
+                    Err(e) => {
+                        if let Ok(mut err) = last_error.lock() {
+                            *err = Some(e.clone());
+                        }
+                        return Err(e);
+                    }
                 }
             }
-        }
-        let c = slot.as_ref().expect("connected");
+            let c = slot.as_ref().expect("connected");
             (
                 c.write_tx.clone(),
                 Arc::clone(&c.pending),
@@ -388,7 +385,7 @@ impl HostController {
         if write_tx.send(bytes).await.is_err() {
             dead.store(true, Ordering::SeqCst);
             let mut pending = pending.lock().await;
-                pending.remove(id);
+            pending.remove(id);
             let msg = "write: connection closed".to_string();
             if let Ok(mut err) = last_error.lock() {
                 *err = Some(msg.clone());
@@ -537,11 +534,7 @@ async fn read_line(r: &mut BufReader<ChildStdout>) -> Result<String, String> {
     }
 }
 
-async fn run_writer(
-    mut stdin: ChildStdin,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    dead: Arc<AtomicBool>,
-) {
+async fn run_writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>>, dead: Arc<AtomicBool>) {
     while let Some(bytes) = rx.recv().await {
         if write_all(&mut stdin, &bytes).await.is_err() {
             break;

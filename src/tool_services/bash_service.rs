@@ -916,9 +916,15 @@ where
 /// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
 /// with the child already dead, so anything still holding the pipes open is a
 /// stray grandchild whose future output we deliberately give up on.
-async fn drain_capture(stdout_task: tokio::task::JoinHandle<()>, stderr_task: tokio::task::JoinHandle<()>) {
+async fn drain_capture(
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+) {
     for mut task in [stdout_task, stderr_task] {
-        if tokio::time::timeout(EXEC_DRAIN_GRACE, &mut task).await.is_err() {
+        if tokio::time::timeout(EXEC_DRAIN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
             task.abort();
         }
     }
@@ -985,8 +991,8 @@ fn kill_session_process(session: &Session) {
         .map(|b| b.exited && b.eof_streams >= 2)
         .unwrap_or(false);
     if !group_done {
-    kill_process_group(session.pid);
-}
+        kill_process_group(session.pid);
+    }
 }
 
 fn spawn_waiter(mut child: Child, shared: Arc<SessionShared>) {
@@ -1829,7 +1835,10 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "stdin must be closed (instant EOF), took {elapsed:?}: {text}"
         );
-        assert!(text.contains("0"), "wc -c on null stdin reads 0 bytes: {text}");
+        assert!(
+            text.contains("0"),
+            "wc -c on null stdin reads 0 bytes: {text}"
+        );
     }
 
     /// Timeout must kill the whole process group, not just the outer `bash -c`.
