@@ -106,6 +106,20 @@ struct Args {
     /// Path to harness config (hosts). Default: $MYCO_CONFIG or ~/.myco/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// `--mode server`: address to bind the HTTP server. Default: 127.0.0.1.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
+    /// `--mode server`: HTTP port. Default: 8000 (matches Trunk.toml's /api proxy).
+    #[arg(long, default_value_t = 8000)]
+    port: u16,
+
+    /// `--mode server`: directory of built GUI assets to serve at `/`
+    /// (e.g. `dist` after `trunk build`). Omit for API-only dev mode: run
+    /// `trunk serve` for the client + hot-reload; it proxies `/api` to this server.
+    #[arg(long)]
+    dist: Option<PathBuf>,
 }
 
 fn parse_effort_arg(s: &str) -> Result<Effort, String> {
@@ -118,6 +132,8 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
+    /// HTTP server for the web GUI (`/api` + built client).
+    Server,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +151,7 @@ async fn main() {
     match args.mode {
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
+        Mode::Server => run_server(args).await,
     }
 }
 
@@ -144,6 +161,63 @@ async fn main() {
 async fn run_host(args: Args) {
     if let Err(e) = HostWorker::standard(args.name).serve_stdio().await {
         eprintln!("myco host error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `--mode server`: HTTP frontend over the same harness/sessions/hosts as the
+/// CLI. Serves `/api` (REST + SSE) and, when `--dist` is given, the built GUI at
+/// `/`. In dev, run `trunk serve` for the client (hot-reload) and let it proxy
+/// `/api` to this server.
+///
+/// Uses [`Application`] so system prompt, model construction, and
+/// `session_meta` / `session_history` match the interactive CLI.
+async fn run_server(args: Args) {
+    let config_path = match &args.config {
+        Some(p) => p.clone(),
+        None => default_config_path().unwrap_or_else(|e| {
+            eprintln!("Failed to resolve config path: {e}");
+            std::process::exit(2);
+        }),
+    };
+    let harness_config = load_harness_config(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config {}: {e}", config_path.display());
+        std::process::exit(2);
+    });
+
+    let ssh_report = ensure_remote_ssh_identities(&harness_config.remote_hosts);
+    print_preflight_report(&ssh_report);
+
+    let app = Application::attach(harness_config, args.effort, args.debug_dump_api_requests)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to attach harness: {e}");
+            eprintln!("config: {}", config_path.display());
+            std::process::exit(1);
+        });
+    print_host_status(app.harness());
+
+    let dist_dir = args.dist.clone();
+    match &dist_dir {
+        Some(d) => println!(
+            "myco server: http://{}:{}  (serving GUI from {})",
+            args.bind,
+            args.port,
+            d.display()
+        ),
+        None => println!(
+            "myco server: http://{}:{}  (API only; run `trunk serve` for the GUI + hot-reload)",
+            args.bind, args.port
+        ),
+    }
+
+    let server_config = myco::ServerConfig {
+        bind: args.bind.clone(),
+        port: args.port,
+        dist_dir,
+    };
+    if let Err(e) = myco::serve_http(app, server_config).await {
+        eprintln!("myco server error: {e}");
         std::process::exit(1);
     }
 }

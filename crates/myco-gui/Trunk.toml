@@ -1,0 +1,6 @@
+[serve]
+port = 8080
+
+# Dev hot-reload: proxy API + SSE to the `myco --mode server` backend on :8000.
+[[proxy]]
+backend = "http://127.0.0.1:8000/api"

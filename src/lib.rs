@@ -5,6 +5,7 @@ pub mod harness;
 pub mod host;
 pub mod manual;
 pub mod prompts;
+pub mod server;
 pub mod session;
 pub mod text_search;
 pub mod tool_services;
@@ -21,6 +22,7 @@ pub use harness::{
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
+pub use server::{ServerConfig, serve as serve_http};
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,
     EventSink, NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
