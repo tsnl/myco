@@ -46,7 +46,6 @@ impl ToolService for SessionHistoryTool {
             name: "session_history".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 
@@ -91,7 +90,10 @@ impl SessionHistoryTool {
                 let index = input
                     .index
                     .ok_or_else(|| "expand requires index".to_string())?;
-                let max_chars = input.max_chars.unwrap_or(HARD_MAX_CHARS).min(HARD_MAX_CHARS);
+                let max_chars = input
+                    .max_chars
+                    .unwrap_or(HARD_MAX_CHARS)
+                    .min(HARD_MAX_CHARS);
                 Ok(format_expand(
                     &session,
                     index,
@@ -161,10 +163,7 @@ fn format_stats(session: &Session) -> String {
         session.summary_path().display(),
         session.is_hidden(),
         session.kind,
-        session
-            .parent_session_id
-            .as_deref()
-            .unwrap_or("(none)"),
+        session.parent_session_id.as_deref().unwrap_or("(none)"),
         session.messages.len(),
         users,
         assistants,
@@ -193,10 +192,12 @@ fn format_expand(
     tool_use_id: Option<&str>,
     max_chars: usize,
 ) -> Result<String, String> {
-    let msg = session
-        .messages
-        .get(index)
-        .ok_or_else(|| format!("index {index} out of range ({} messages)", session.messages.len()))?;
+    let msg = session.messages.get(index).ok_or_else(|| {
+        format!(
+            "index {index} out of range ({} messages)",
+            session.messages.len()
+        )
+    })?;
     if let Some(tid) = tool_use_id {
         return expand_tool(msg, tid, max_chars);
     }
@@ -221,7 +222,9 @@ fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<Str
                     ));
                 }
             }
-            Err(format!("tool_use_id {tool_use_id:?} not in this assistant message"))
+            Err(format!(
+                "tool_use_id {tool_use_id:?} not in this assistant message"
+            ))
         }
         Message::ToolResults { tool_use_results } => {
             for r in tool_use_results {
@@ -235,7 +238,9 @@ fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<Str
                     ));
                 }
             }
-            Err(format!("tool_use_id {tool_use_id:?} not in this tool_results message"))
+            Err(format!(
+                "tool_use_id {tool_use_id:?} not in this tool_results message"
+            ))
         }
         _ => Err("tool_use_id expand requires an assistant or tool_results message".into()),
     }
@@ -258,7 +263,10 @@ fn format_search(session: &Session, query: &str, max_results: usize) -> String {
         out.push_str(&format!(
             "  [{i}] {}  {}\n",
             message_kind(&session.messages[i]),
-            truncate(&preview_message(&session.messages[i], 120).replace('\n', " "), 120)
+            truncate(
+                &preview_message(&session.messages[i], 120).replace('\n', " "),
+                120
+            )
         ));
     }
     out
@@ -368,4 +376,3 @@ enum ActionKind {
     Search,
     WriteSummary,
 }
-

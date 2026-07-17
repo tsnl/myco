@@ -188,21 +188,21 @@ async fn run_interactive(args: Args) {
         harness_config,
         vec![session_tool, history_tool],
     )
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to attach harness: {e}");
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to attach harness: {e}");
+        eprintln!(
+            "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
+        );
+        if !ssh_report.is_clean() || !ssh_report.agent_ok {
             eprintln!(
-                "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
-            );
-            if !ssh_report.is_clean() || !ssh_report.agent_ok {
-                eprintln!(
-                    "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
+                "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
                      try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
-                );
-            }
-            eprintln!("config: {}", config_path.display());
-            std::process::exit(1);
-        });
+            );
+        }
+        eprintln!("config: {}", config_path.display());
+        std::process::exit(1);
+    });
     print_host_status(&harness);
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
@@ -525,7 +525,10 @@ async fn run_compact(
         SessionKind::Compact,
         Some(predecessor.id.clone()),
     );
-    worker_session.title = Some(format!("compact {}", &predecessor.id[..8.min(predecessor.id.len())]));
+    worker_session.title = Some(format!(
+        "compact {}",
+        &predecessor.id[..8.min(predecessor.id.len())]
+    ));
     if let Err(e) = worker_session.save() {
         eprintln!("warning: could not save compact worker session: {e}");
     }
@@ -564,10 +567,7 @@ async fn run_compact(
     let prompt = compact_subagent_prompt(&predecessor.id);
     let cancel = myco::CancelToken::new();
     let result = worker
-        .interact(
-            vec![Content::Text { text: prompt }],
-            cancel,
-        )
+        .interact(vec![Content::Text { text: prompt }], cancel)
         .await;
 
     worker_session.messages = worker.history().to_vec();

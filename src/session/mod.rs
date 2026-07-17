@@ -8,10 +8,13 @@ mod agent;
 mod compact;
 mod transcript;
 
-pub use compact::{CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair, select_tail};
 pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext,
     uuid_simple_hex,
+};
+pub use compact::{
+    CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
+    select_tail,
 };
 pub use transcript::{
     SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_assistant, format_tool_invocation,

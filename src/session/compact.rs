@@ -100,11 +100,7 @@ pub fn link_compact_pair(predecessor: &mut Session, successor: &Session) -> Resu
 }
 
 /// Select the last `user_turns` well-formed user turns (user → … → assistant end).
-pub fn select_tail(
-    messages: &[Message],
-    user_turns: usize,
-    tool_body_max: usize,
-) -> Vec<Message> {
+pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize) -> Vec<Message> {
     if user_turns == 0 || messages.is_empty() {
         return Vec::new();
     }
@@ -117,9 +113,7 @@ pub fn select_tail(
     if user_idxs.is_empty() {
         return Vec::new();
     }
-    let start_user = user_idxs
-        .len()
-        .saturating_sub(user_turns);
+    let start_user = user_idxs.len().saturating_sub(user_turns);
     let start = user_idxs[start_user];
 
     // Extend backward if we would start mid tool loop (shouldn't for UserMessage start).
@@ -127,10 +121,10 @@ pub fn select_tail(
     // Ensure we don't end mid tool_use without results: if last is Assistant with tool_uses
     // and no following ToolResults, drop that incomplete assistant.
     let mut end = slice.len();
-    if let Some(Message::AssistantMessage { tool_uses, .. }) = slice.last() {
-        if !tool_uses.is_empty() {
-            end = end.saturating_sub(1);
-        }
+    if let Some(Message::AssistantMessage { tool_uses, .. }) = slice.last()
+        && !tool_uses.is_empty()
+    {
+        end = end.saturating_sub(1);
     }
     let mut out: Vec<Message> = slice[..end].to_vec();
     for m in &mut out {
@@ -194,23 +188,19 @@ Rules:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::uuid_simple_hex;
     use crate::generative_model::{ToolResult, ToolUse, TurnEndReason};
+    use crate::session::uuid_simple_hex;
     use serde_json::json;
 
     fn user(text: &str) -> Message {
         Message::UserMessage {
-            content: vec![Content::Text {
-                text: text.into(),
-            }],
+            content: vec![Content::Text { text: text.into() }],
         }
     }
 
     fn assistant_end(text: &str) -> Message {
         Message::AssistantMessage {
-            content: vec![Content::Text {
-                text: text.into(),
-            }],
+            content: vec![Content::Text { text: text.into() }],
             tool_uses: vec![],
             turn_end_reason: Some(TurnEndReason::EndTurn),
         }
@@ -256,7 +246,10 @@ mod tests {
         assert!(matches!(tail[0], Message::UserMessage { .. }));
         // mid + new = 2 user turns including tool loop
         assert!(tail.len() >= 5, "tail={tail:?}");
-        assert!(matches!(tail.last(), Some(Message::AssistantMessage { .. })));
+        assert!(matches!(
+            tail.last(),
+            Some(Message::AssistantMessage { .. })
+        ));
     }
 
     #[test]
@@ -294,9 +287,11 @@ mod tests {
         assert_eq!(out.predecessor_id, pred.id);
         assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
         assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
-        assert!(std::fs::read_to_string(pred.summary_path())
-            .unwrap()
-            .contains("Do the thing"));
+        assert!(
+            std::fs::read_to_string(pred.summary_path())
+                .unwrap()
+                .contains("Do the thing")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
