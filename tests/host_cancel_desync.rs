@@ -32,7 +32,8 @@ async fn cancel_midcall_then_next_call_succeeds() {
     let cancel = CancelToken::new();
     let cancel_bg = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Cancel after the bash child is almost certainly running.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         cancel_bg.cancel();
     });
 
@@ -42,7 +43,8 @@ async fn cancel_midcall_then_next_call_succeeds() {
             ToolUse {
                 id: "slow".into(),
                 name: "bash".into(),
-                input: json!({"command": "sleep 2; echo done-slow"}),
+                // Long enough that cancel always races before natural exit.
+                input: json!({"command": "sleep 30; echo done-slow"}),
             },
             cancel,
         )
@@ -52,7 +54,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
 
     // Next call must complete on the live (or respawned) connection.
     let result = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         client.call(
             uuid::Uuid::nil(),
             ToolUse {

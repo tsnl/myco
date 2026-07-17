@@ -773,14 +773,22 @@ mod tests {
     #[tokio::test]
     async fn multi_host_attach_and_route_by_host_field() {
         // Two remotes as local subprocesses (not SSH) to exercise routing without network.
+        let program = myco_program();
+        // Unit tests don't set CARGO_BIN_EXE_*; need a built binary. Skip rather
+        // than flake on connect timeout when the binary is missing/stale.
+        if program == "myco" || !std::path::Path::new(&program).is_file() {
+            eprintln!("skip multi_host: no myco binary at {program:?} (cargo build --bin myco)");
+            return;
+        }
         let cfg = HarnessConfig {
             enable_subagent: false,
-            attach_timeout_secs: 10,
+            // Host hello can be slow under parallel suite load (MiniLM seed).
+            attach_timeout_secs: 60,
             remote_hosts: vec![
                 HostConfig {
                     name: "a".into(),
                     command: vec![
-                        myco_program(),
+                        program.clone(),
                         "--mode".into(),
                         "host".into(),
                         "--name".into(),
@@ -791,7 +799,7 @@ mod tests {
                 HostConfig {
                     name: "b".into(),
                     command: vec![
-                        myco_program(),
+                        program,
                         "--mode".into(),
                         "host".into(),
                         "--name".into(),

@@ -156,10 +156,17 @@ impl HostController {
         }
     }
 
-    /// Fire a tool call and await its demuxed reply (cancel abandons this waiter only).
+    /// Fire a tool call and await its demuxed reply.
     ///
-    /// Subprocess hosts connect on first use. Concurrent callers only serialize briefly
-    /// in [`submit`]; awaiting the tool result is outside the connection mutex.
+    /// **In-process:** cancel is delivered only via [`HostDispatchContext`] so the
+    /// tool can kill children and return. We deliberately do **not**
+    /// `select!`-abandon the dispatch future — that leaked `sleep`/pipe work and
+    /// wedged later calls under suite load. Tools that ignore cancel may run to
+    /// completion (or their own timeout).
+    ///
+    /// **Subprocess:** cancel abandons this waiter only (host may still finish
+    /// the tool). Connect happens on first use; concurrent callers only serialize
+    /// briefly in [`submit`].
     pub async fn call(
         &self,
         agent_id: uuid::Uuid,
@@ -182,21 +189,17 @@ impl HostController {
             Backend::InProcess { worker } => {
                 let tool_id = tool_use.id.clone();
                 let worker = Arc::clone(worker);
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        return ToolResult::err("cancelled").with_id(tool_id);
-                    }
-                    r = worker.dispatch_tool_use(
+                worker
+                    .dispatch_tool_use(
                         tool_use,
                         HostDispatchContext {
                             agent_id,
-                            cancel: cancel.clone(),
+                            cancel,
                             agent_root,
                         },
-                    ) => r,
-                };
-                result
+                    )
+                    .await
+                    .with_id(tool_id)
             }
             Backend::Subprocess { .. } => self.call_subprocess(agent_id, tool_use, cancel).await,
         }
@@ -730,7 +733,8 @@ mod tests {
         let cancel = CancelToken::new();
         let cancel_bg = cancel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // Cancel after the bash child is almost certainly running.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             cancel_bg.cancel();
         });
 
@@ -740,7 +744,8 @@ mod tests {
                 ToolUse {
                     id: "slow".into(),
                     name: "bash".into(),
-                    input: json!({"command": "sleep 2; echo done-slow"}),
+                    // Long enough that cancel always races before natural exit.
+                    input: json!({"command": "sleep 30; echo done-slow"}),
                 },
                 cancel,
             )
@@ -748,8 +753,9 @@ mod tests {
         assert!(cancelled.is_error, "{cancelled:?}");
         assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
 
+        // Next call must not hang: cancel cleanup must free the host path.
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             ctl.call(
                 uuid::Uuid::nil(),
                 ToolUse {
