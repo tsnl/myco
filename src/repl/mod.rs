@@ -1,4 +1,4 @@
-//! Transport-agnostic application core.
+//! Transport-agnostic REPL core.
 //!
 //! Owns the shared [`Harness`], model/effort configuration, a multi-session
 //! registry, and the single source of truth for the system-prompt prologue and
@@ -132,7 +132,7 @@ impl ActiveSessionResolver for SessionRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Live session + Application
+// Live session + Repl
 // ---------------------------------------------------------------------------
 
 /// One open session: agent, metadata handle, cancel token, model id.
@@ -150,13 +150,13 @@ pub struct LiveSession {
     pub model: Model,
 }
 
-/// Shared application core: harness + config + multi-session registry.
+/// Shared REPL core: harness + config + multi-session registry.
 #[derive(Clone)]
-pub struct Application {
-    inner: Arc<ApplicationInner>,
+pub struct Repl {
+    inner: Arc<ReplInner>,
 }
 
-struct ApplicationInner {
+struct ReplInner {
     harness: Arc<Harness>,
     registry: Arc<SessionRegistry>,
     /// Open sessions keyed by session id.
@@ -165,9 +165,9 @@ struct ApplicationInner {
     debug_dump_api_requests: bool,
 }
 
-impl Application {
+impl Repl {
     /// Attach a harness with registry-backed `session_meta` + `session_history`
-    /// root services, and return the application core.
+    /// root services, and return the REPL core.
     pub async fn attach(
         config: HarnessConfig,
         default_effort: Effort,
@@ -181,7 +181,7 @@ impl Application {
         let harness =
             Harness::attach_with_root_services(config, vec![session_tool, history_tool]).await?;
         Ok(Self {
-            inner: Arc::new(ApplicationInner {
+            inner: Arc::new(ReplInner {
                 harness,
                 registry,
                 live: Mutex::new(HashMap::new()),
@@ -207,7 +207,7 @@ impl Application {
         self.inner.debug_dump_api_requests
     }
 
-    /// Build a model using this application's harness tools and system prompt.
+    /// Build a model using this REPL's harness tools and system prompt.
     pub fn build_model(
         &self,
         model_id: Model,
@@ -380,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn session_meta_via_registry_resolver() {
         let dir = std::env::temp_dir().join(format!(
-            "myco-app-meta-{}",
+            "myco-repl-meta-{}",
             crate::session::uuid_simple_hex(Uuid::new_v4())
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -435,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_registers_live_and_agent() {
         let dir = std::env::temp_dir().join(format!(
-            "myco-app-create-{}",
+            "myco-repl-create-{}",
             crate::session::uuid_simple_hex(Uuid::new_v4())
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -443,7 +443,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let app = Application::attach(
+        let repl = Repl::attach(
             crate::harness::HarnessConfig {
                 remote_hosts: vec![],
                 enable_subagent: false,
@@ -456,16 +456,16 @@ mod tests {
         .expect("attach");
 
         let sink = Arc::new(NullEventSink) as Arc<dyn EventSink>;
-        let live = app
+        let live = repl
             .create_session(Model::ClaudeHaiku45, None, sink)
             .expect("create");
         let agent_id = {
             let agent = live.agent.lock().await;
             agent.context().agent_id
         };
-        assert!(app.get_live(&live.active.id()).is_some());
+        assert!(repl.get_live(&live.active.id()).is_some());
         assert_eq!(
-            app.registry().resolve(agent_id).unwrap().id(),
+            repl.registry().resolve(agent_id).unwrap().id(),
             live.active.id()
         );
 

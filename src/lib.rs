@@ -1,18 +1,15 @@
-pub mod application;
 pub mod core;
 pub mod generative_model;
 pub mod harness;
 pub mod host;
 pub mod manual;
 pub mod prompts;
+pub mod repl;
 pub mod server;
 pub mod session;
 pub mod text_search;
 pub mod tool_services;
 
-pub use application::{
-    Application, LiveSession, SYSTEM_PROMPT_PROLOGUE, SessionRegistry, build_model,
-};
 pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
@@ -22,6 +19,7 @@ pub use harness::{
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
+pub use repl::{LiveSession, Repl, SYSTEM_PROMPT_PROLOGUE, SessionRegistry, build_model};
 pub use server::{ServerConfig, serve as serve_http};
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,

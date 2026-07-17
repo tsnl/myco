@@ -178,7 +178,7 @@ The seam is already in the codebase: **`EventSink`** separates *what happened*
 (runtime events) from *how it is shown* (CLI stdout vs. SSE broadcast). Extend
 that seam to the whole app.
 
-- **`src/application` (Phase 0, do FIRST):** a transport-agnostic `Application`
+- **`src/repl` (Phase 0, do FIRST):** a transport-agnostic `Repl`
   owning `Harness`, model/effort/debug config, the session registry
   (create/open/list live+saved), `build_model`, and the **single** system-prompt
   source. Exposes `run_turn(session, input, sink, cancel)` (sink injected) and
@@ -205,7 +205,7 @@ Phase 0 success criteria:
 - CLI behavior byte-identical (existing `transcript.rs` tests still pass).
 - Server behavior unchanged.
 - Lands as its **own PR under #13**; the GUI rewrite sits on top and consumes the
-  clean `Application`.
+  clean `Repl`.
 
 ### Deferred (described, NOT a Phase-0 assumption): "CLI as HTTP client"
 
@@ -220,9 +220,9 @@ The correct shape — enabled by Phase 0, opt-in later, **in-process default**
 (like `git`: local ops in-process, *also* speaks a wire protocol to remotes):
 
 ```
-myco                 → in-process Application   (default: fast, robust, no daemon)
+myco                 → in-process Repl   (default: fast, robust, no daemon)
 myco --connect URL   → HTTP client to a remote/hosted server   (future)
-myco --mode server   → serves Application over HTTP+SSE
+myco --mode server   → serves Repl over HTTP+SSE
 ```
 
 This unlocks the hosted/container/SSH-remote north star without making the local
@@ -231,7 +231,7 @@ phase, not a foundation.
 
 ### Shipping phases (GUI)
 
-- [x] **Phase 0 — `src/application` extraction** (own PR under #13). See above.
+- [x] **Phase 0 — `src/repl` extraction** (own PR under #13). See above.
 - [x] **Phase 1 — CLI-parity web UI (SHIP THIS FIRST).** Scrap the current GUI.
       Match the CLI experience almost exactly, with two deltas:
   - Horizontal rules are real `<hr/>`-style elements spanning the **full dialog

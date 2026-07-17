@@ -1,8 +1,8 @@
-//! Server state: thin HTTP adapter over the shared [`Application`] core.
+//! Server state: thin HTTP adapter over the shared [`Repl`] core.
 //!
 //! Session lifecycle, model construction, system prompt, and the
 //! `session_meta` / `session_history` root tools all live in
-//! [`crate::application`]. This module only owns:
+//! [`crate::repl`]. This module only owns:
 //! - a per-session broadcast bus (SSE fan-out) injected as the agent's
 //!   [`EventSink`] at open time;
 //! - the optional static GUI `dist_dir`.
@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::application::{Application, LiveSession};
 use crate::generative_model::{Effort, Model};
+use crate::repl::{LiveSession, Repl};
 use crate::session::{AgentEvent, EventSink, list_sessions};
 
 use super::wire::WireEvent;
@@ -42,14 +42,14 @@ impl EventSink for BroadcastSink {
     }
 }
 
-/// Shared, cloneable application state handed to every rocket route.
+/// Shared, cloneable server state handed to every rocket route.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<AppStateInner>,
 }
 
 struct AppStateInner {
-    app: Application,
+    repl: Repl,
     /// Per-session SSE buses, created when a session is first opened/created
     /// here (paired with the `BroadcastSink` injected into the agent).
     buses: Mutex<HashMap<String, broadcast::Sender<WireEvent>>>,
@@ -59,18 +59,18 @@ struct AppStateInner {
 }
 
 impl AppState {
-    pub fn new(app: Application, dist_dir: Option<PathBuf>) -> Self {
+    pub fn new(repl: Repl, dist_dir: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
-                app,
+                repl,
                 buses: Mutex::new(HashMap::new()),
                 dist_dir,
             }),
         }
     }
 
-    pub fn app(&self) -> &Application {
-        &self.inner.app
+    pub fn repl(&self) -> &Repl {
+        &self.inner.repl
     }
 
     /// Directory of built GUI assets, if production static serving is enabled.
@@ -79,11 +79,11 @@ impl AppState {
     }
 
     pub fn live_summaries(&self) -> Vec<(String, String, Option<String>)> {
-        self.inner.app.live_summaries()
+        self.inner.repl.live_summaries()
     }
 
     pub fn get_live(&self, id: &str) -> Option<Arc<LiveSession>> {
-        self.inner.app.get_live(id)
+        self.inner.repl.get_live(id)
     }
 
     /// Create a brand-new session and register it as live with an SSE bus.
@@ -94,20 +94,20 @@ impl AppState {
     ) -> Result<Arc<LiveSession>, String> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let sink = Arc::new(BroadcastSink::new(tx.clone())) as Arc<dyn EventSink>;
-        let live = self.inner.app.create_session(model, effort, sink)?;
+        let live = self.inner.repl.create_session(model, effort, sink)?;
         self.insert_bus(&live.active.id(), tx);
         Ok(live)
     }
 
     /// Open a saved session by id/prefix (or return it if already live).
     pub fn open_session(&self, id_or_prefix: &str) -> Result<Arc<LiveSession>, String> {
-        if let Some(existing) = self.inner.app.get_live(id_or_prefix) {
+        if let Some(existing) = self.inner.repl.get_live(id_or_prefix) {
             return Ok(existing);
         }
-        // Create the bus + sink only when Application will build a new agent.
+        // Create the bus + sink only when Repl will build a new agent.
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let sink = Arc::new(BroadcastSink::new(tx.clone())) as Arc<dyn EventSink>;
-        let live = self.inner.app.open_session(id_or_prefix, sink)?;
+        let live = self.inner.repl.open_session(id_or_prefix, sink)?;
         // If open_session returned an already-live session, do not overwrite
         // its bus (the sink we just built was unused).
         let id = live.active.id();

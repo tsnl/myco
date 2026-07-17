@@ -8,7 +8,7 @@
 //!
 //! The server reuses `~/.myco/{config,session}` exactly like `--mode interactive`;
 //! it is a second front-end, not a second runtime. Session lifecycle and model
-//! construction live in [`crate::application`]; this module is the HTTP adapter.
+//! construction live in [`crate::repl`]; this module is the HTTP adapter.
 
 mod routes;
 mod state;
@@ -16,7 +16,7 @@ mod wire;
 
 use std::path::PathBuf;
 
-use crate::application::Application;
+use crate::repl::Repl;
 
 pub use state::AppState;
 pub use wire::{WireContent, WireEvent};
@@ -31,14 +31,14 @@ pub struct ServerConfig {
 }
 
 /// Build and launch the rocket server. Blocks until shutdown.
-pub async fn serve(app: Application, config: ServerConfig) -> Result<(), String> {
+pub async fn serve(repl: Repl, config: ServerConfig) -> Result<(), String> {
     let ServerConfig {
         bind,
         port,
         dist_dir,
     } = config;
 
-    let state = AppState::new(app, dist_dir);
+    let state = AppState::new(repl, dist_dir);
 
     let figment = rocket::Config::figment()
         .merge(("address", bind))

@@ -2,7 +2,7 @@
 //!
 //! REST is JSON in/out; the live event feed is Server-Sent Events. All routes
 //! read/write the same session store and host pool as the CLI via
-//! [`crate::application::Application`].
+//! [`crate::repl::Repl`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,8 +15,8 @@ use rocket::{Shutdown, State, get, patch, post};
 use serde::{Deserialize, Serialize};
 
 use crate::CancelToken;
-use crate::application::LiveSession;
 use crate::generative_model::{Content, Effort, Model};
+use crate::repl::LiveSession;
 use crate::session::{Session, SessionLink};
 
 use super::state::AppState;
@@ -173,14 +173,14 @@ pub fn health(state: &State<AppState>) -> Json<Health> {
     Json(Health {
         name: "myco",
         version: env!("CARGO_PKG_VERSION"),
-        hosts: state.app().harness().host_status().len(),
+        hosts: state.repl().harness().host_status().len(),
     })
 }
 
 #[get("/api/hosts")]
 pub fn hosts(state: &State<AppState>) -> Json<Vec<HostView>> {
     let views = state
-        .app()
+        .repl()
         .harness()
         .host_status()
         .into_iter()
