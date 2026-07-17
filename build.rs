@@ -1,17 +1,22 @@
-//! Fetch MiniLM embedding assets into `src/text_search/embed_weights/` for
-//! `include_bytes!` / mmap. Candle loads safetensors (no ONNX Runtime).
+//! Fetch MiniLM embedding assets for `include_bytes!`. Candle loads safetensors
+//! (no ONNX Runtime).
+//!
+//! Assets are staged under `OUT_DIR/embed_weights/` (never the package source
+//! tree) so `cargo publish` verify stays valid and crates.io packages stay
+//! small. A generated `OUT_DIR/embed_assets.rs` exposes the byte slices.
 //!
 //! Env:
 //! - `MYCO_EMBED_OFFLINE=1` — never download; fail if any asset missing
 //! - `MYCO_EMBED_BASE_URL` — override HF base
-//! - `MYCO_EMBED_CACHE` — optional seed dir
+//! - `MYCO_EMBED_CACHE` — optional seed dir (also checks gitignored
+//!   `src/text_search/embed_weights/` as a convenience cache)
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const WEIGHTS_DIR: &str = "src/text_search/embed_weights";
+const SRC_WEIGHTS_DIR: &str = "src/text_search/embed_weights";
 const DEFAULT_BASE: &str =
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main";
 
@@ -19,6 +24,7 @@ struct Asset {
     local_name: &'static str,
     remote_path: &'static str,
     size: u64,
+    rust_const: &'static str,
 }
 
 const ASSETS: &[Asset] = &[
@@ -26,56 +32,66 @@ const ASSETS: &[Asset] = &[
         local_name: "model.safetensors",
         remote_path: "model.safetensors",
         size: 90868376,
+        rust_const: "MODEL_WEIGHTS",
     },
     Asset {
         local_name: "tokenizer.json",
         remote_path: "tokenizer.json",
         size: 466247,
+        rust_const: "TOKENIZER_JSON",
     },
     Asset {
         local_name: "config.json",
         remote_path: "config.json",
         size: 612,
+        rust_const: "CONFIG_JSON",
     },
 ];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let weights = manifest_dir.join(WEIGHTS_DIR);
-    let manifest_path = weights.join("MODEL.manifest");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let src_weights = manifest_dir.join(SRC_WEIGHTS_DIR);
+    let out_weights = out_dir.join("embed_weights");
+    let manifest_path = src_weights.join("MODEL.manifest");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     for a in ASSETS {
         println!(
             "cargo:rerun-if-changed={}",
-            weights.join(a.local_name).display()
+            src_weights.join(a.local_name).display()
         );
     }
     println!("cargo:rerun-if-env-changed=MYCO_EMBED_CACHE");
     println!("cargo:rerun-if-env-changed=MYCO_EMBED_OFFLINE");
     println!("cargo:rerun-if-env-changed=MYCO_EMBED_BASE_URL");
 
-    fs::create_dir_all(&weights).unwrap_or_else(|e| {
-        panic!("create {}: {e}", weights.display());
+    fs::create_dir_all(&out_weights).unwrap_or_else(|e| {
+        panic!("create {}: {e}", out_weights.display());
     });
 
     let shas = read_manifest_shas(&manifest_path);
     let base = env::var("MYCO_EMBED_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE.to_string());
     let offline = env::var_os("MYCO_EMBED_OFFLINE").is_some_and(|v| v != "0");
-    let cache = env::var_os("MYCO_EMBED_CACHE").map(PathBuf::from);
+    let mut seed_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(cache) = env::var_os("MYCO_EMBED_CACHE").map(PathBuf::from) {
+        seed_dirs.push(cache);
+    }
+    // Convenience: reuse a developer-local gitignored tree when present.
+    if src_weights.is_dir() {
+        seed_dirs.push(src_weights.clone());
+    }
 
     for asset in ASSETS {
-        let dest = weights.join(asset.local_name);
+        let dest = out_weights.join(asset.local_name);
         let want_sha = shas.get(asset.local_name).map(String::as_str);
-        // Size check: if manifest has size comment we trust sha primarily;
-        // allow size mismatch only when sha not present and file non-empty for tokenizer/config
-        // which can vary slightly — still use expected sizes from ASSETS.
         if asset_ok(&dest, asset.size, want_sha) {
             continue;
         }
 
-        if let Some(ref cache_root) = cache {
+        let mut seeded = false;
+        for cache_root in &seed_dirs {
             let candidates = [
                 cache_root.join(asset.local_name),
                 cache_root.join(asset.remote_path),
@@ -91,16 +107,21 @@ fn main() {
                     asset.local_name,
                     src.display()
                 );
-                continue;
+                seeded = true;
+                break;
             }
+        }
+        if seeded {
+            continue;
         }
 
         if offline {
             panic!(
                 "MYCO_EMBED_OFFLINE set but MiniLM asset missing/invalid: {}.\n\
-                 See {weights}/README.md",
+                 Seed OUT_DIR via MYCO_EMBED_CACHE or pre-populate \
+                 {src}/, or allow network + curl. See {src}/README.md",
                 dest.display(),
-                weights = weights.display()
+                src = src_weights.display()
             );
         }
 
@@ -110,8 +131,6 @@ fn main() {
         let url = format!("{}/{}", base.trim_end_matches('/'), asset.remote_path);
         download_curl(&url, &dest);
         if !asset_ok(&dest, asset.size, want_sha) {
-            // For tokenizer/config, if sha not in manifest, accept actual size after download
-            // when size was wrong in ASSETS constant (HF may revise).
             let len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
             if want_sha.is_none() && len > 0 && asset.local_name != "model.safetensors" {
                 println!(
@@ -132,10 +151,32 @@ fn main() {
         );
     }
 
+    write_embed_assets_rs(&out_dir, &out_weights);
+
     println!(
         "cargo:warning=MiniLM candle embed assets ready under {}",
-        weights.display()
+        out_weights.display()
     );
+}
+
+fn write_embed_assets_rs(out_dir: &Path, weights: &Path) {
+    let assets_rs = out_dir.join("embed_assets.rs");
+    let mut body = String::from(
+        "// @generated by build.rs — MiniLM assets staged under OUT_DIR/embed_weights\n",
+    );
+    for asset in ASSETS {
+        let path = weights.join(asset.local_name);
+        // Absolute path so include_bytes! works from any including module.
+        let path_lit = path
+            .to_str()
+            .unwrap_or_else(|| panic!("non-utf8 path {}", path.display()))
+            .replace('\\', "/");
+        body.push_str(&format!(
+            "pub static {}: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            asset.rust_const, path_lit
+        ));
+    }
+    fs::write(&assets_rs, body).unwrap_or_else(|e| panic!("write {}: {e}", assets_rs.display()));
 }
 
 fn asset_ok(path: &Path, size: u64, expected_sha: Option<&str>) -> bool {

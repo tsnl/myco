@@ -185,7 +185,7 @@ impl AnthropicGenerativeModel {
 
         let raw_response = self
             .client
-            .post(format!("{}/v1/messages", &self.backend.anthropic_base_url))
+            .post(format!("{}/v1/messages", self.backend.anthropic_base_url))
             .json(&request)
             .send()
             .await

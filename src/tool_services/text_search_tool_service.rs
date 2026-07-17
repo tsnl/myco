@@ -44,10 +44,9 @@ const SEMANTIC_SEARCH_DESC: &str = r#"
 Semantic search over persistently indexed roots using **Candle** (all-MiniLM-L6-v2)
 embeddings and cosine similarity. Best for skills / AGENTS.md intent queries
 ("how do I extract PDFs"). Same coverage rules as exact search.
-Weights are embedded at **compile time** from gitignored
-`src/text_search/embed_weights/` (build.rs downloads safetensors + tokenizer;
-no ONNX Runtime). Rebuild with curl if assets are missing (see
-embed_weights/README.md / harness-ops).
+Weights are embedded at **compile time** (`build.rs` stages MiniLM
+safetensors + tokenizer under `OUT_DIR`; no ONNX Runtime). Rebuild with curl
+if assets are missing (see embed_weights/README.md / harness-ops).
 
 Not a substitute for grep over a full repo. Prefer exact (Tantivy) search for symbols.
 "#;

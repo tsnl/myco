@@ -2,6 +2,7 @@ use super::*;
 use myco::generative_model::{GenerativeModelConfig, Model};
 
 #[tokio::test]
+#[ignore = "live provider API; run with: cargo test -- --ignored"]
 async fn test_openai_responses_model_messaging() {
     crate::test_utils::load_dotenv();
 

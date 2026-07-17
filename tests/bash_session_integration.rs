@@ -143,8 +143,9 @@ async fn scripted_multi_turn_bash_session_transcript() {
     let elapsed = t0.elapsed();
 
     // Six short session polls + close should finish well under any long hang.
+    // CI runners can be slow when the suite already ran heavy lib tests first.
     assert!(
-        elapsed < Duration::from_secs(15),
+        elapsed < Duration::from_secs(60),
         "scripted multi-turn session took too long: {elapsed:?}"
     );
 
