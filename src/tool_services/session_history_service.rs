@@ -159,7 +159,7 @@ fn format_stats(session: &Session) -> String {
         session.id,
         session.json_path().display(),
         session.summary_path().display(),
-        session.hidden,
+        session.is_hidden(),
         session.kind,
         session
             .parent_session_id

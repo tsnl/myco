@@ -58,7 +58,6 @@ pub fn compact_session(
     successor.scratchpad = predecessor.scratchpad.clone();
     successor.predecessor_id = Some(predecessor.id.clone());
     successor.kind = SessionKind::User;
-    successor.hidden = false;
 
     let mut resume = String::from("# Compaction resume\n\n");
     resume.push_str(summary_markdown.trim());
