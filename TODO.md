@@ -71,11 +71,12 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 
 ### Context lifecycle
 
-- [ ] **Compaction**
+- [ ] **Compaction** — design: [`docs/compaction.md`](docs/compaction.md)
   - Manual `/compact` (and/or tool).
   - Auto-compact when approaching context limit (threshold config).
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
+  - Plan: Zed-style successor session (archive full history → summary + tail); phased `/compact` then auto.
 - [ ] **Token + cost tracking**
   - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
     and session totals.
