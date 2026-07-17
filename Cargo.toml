@@ -8,7 +8,8 @@ homepage = "https://github.com/tsnl/myco"
 readme = "README.md"
 keywords = ["agent", "cli", "ssh", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-# license = "..."  # add when a LICENSE file is committed
+license = "MIT"
+
 
 [dependencies]
 async-trait = "0.1"

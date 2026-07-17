@@ -79,16 +79,18 @@ add/commit them if they are required to build.
 
 ### Embedding weights (MiniLM / Candle) — fully embedded in the binary
 
-Semantic search bakes all-MiniLM-L6-v2 (Candle) into `myco` at **compile time** (`build.rs` +
-`include_bytes!`). Runtime never reads weight files and never downloads from Hugging Face.
+Semantic search bakes all-MiniLM-L6-v2 (Candle) into `myco` at **compile time**
+(`build.rs` stages under `OUT_DIR` + `include_bytes!`). Runtime never reads weight
+files and never downloads from Hugging Face.
 
 | Stage | What you need |
 |-------|----------------|
 | **Running / shipping** | The **`myco` binary only** for that OS/CPU/libc. No model pack, no `embed_weights/` on the target. |
-| **Compiling from source** | Network + `curl` so `build.rs` can fetch assets (or an existing `src/text_search/embed_weights/` tree — those files may be **copied** between build hosts). |
+| **Compiling from source** | Network + `curl` so `build.rs` can fetch assets into `OUT_DIR` (or seed via `MYCO_EMBED_CACHE` / a local `src/text_search/embed_weights/` cache). |
 
-Source tarballs / `git archive` do not include the weight files (gitignored). That only
-matters when **building**; a finished binary already contains the weights. Details:
+Source tarballs / crates.io packages / `git archive` do not ship the ~87 MiB weight
+files (gitignored; not part of the package). That only matters when **building**; a
+finished binary already contains the weights. Details:
 `src/text_search/embed_weights/README.md`.
 
 Because weights are embedded, a **release only needs platform-matched binaries**. Do not scp
@@ -117,7 +119,7 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || { echo "cargo/rustc required on host"; exit 1; }
   command -v curl >/dev/null || { echo "curl required for build.rs embed assets"; exit 1; }
-  # build.rs fetches MiniLM assets and include_bytes! them into the binary.
+  # build.rs fetches MiniLM assets into OUT_DIR and include_bytes! them into the binary.
   cargo install --path ~/src/myco-src --force --locked --root "$HOME/.local"
   # ~/.local/bin is the usual remote install path in multi-host setups
   ~/.local/bin/myco --version
