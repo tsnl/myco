@@ -59,7 +59,6 @@ impl ToolService for SubagentService {
             name: "subagent".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 
@@ -99,6 +98,17 @@ impl SubagentService {
                 "subagent: agent_root is not AgentRootHandles",
             );
         };
+
+        // Subagents share the supervisor's harness, so `subagent` is in their
+        // tool list too; without a depth cap a confused (or prompt-injected)
+        // model recurses without bound — one live API session per level.
+        const MAX_SUBAGENT_DEPTH: usize = 2;
+        if root.context.depth >= MAX_SUBAGENT_DEPTH {
+            return generative_model::ToolResult::err(format!(
+                "subagent depth limit reached (max nesting {MAX_SUBAGENT_DEPTH}); \
+                 do the work directly instead of delegating further"
+            ));
+        }
 
         let model = match generative_model::new(GenerativeModelConfig {
             model: input.model,

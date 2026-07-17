@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -64,6 +64,11 @@ struct Conn {
     child: Child,
     write_tx: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
+    /// Set by the reader/writer tasks when the pipe dies. `submit` checks it
+    /// under the `pending` lock so no waiter can be registered against a dead
+    /// connection (it would hang forever — nothing reads replies anymore),
+    /// and clears the slot so the next call respawns the worker.
+    dead: Arc<AtomicBool>,
     reader_abort: tokio::task::AbortHandle,
     writer_abort: tokio::task::AbortHandle,
 }
@@ -123,11 +128,6 @@ impl HostController {
         })
     }
 
-    /// Backward-compatible name: same as [`new`] (lazy; no process yet).
-    pub async fn spawn(config: HostConfig) -> Result<Arc<Self>, String> {
-        Ok(Self::new(config))
-    }
-
     pub fn tool_specs(&self) -> &[ToolSpec] {
         &self.tools
     }
@@ -145,28 +145,6 @@ impl HostController {
             Backend::InProcess { .. } => true,
             Backend::Subprocess { conn, .. } => {
                 conn.try_lock().map(|g| g.is_some()).unwrap_or(false)
-            }
-        }
-    }
-
-    /// Spawn argv for subprocess hosts (empty for in-process).
-    pub fn command(&self) -> Vec<String> {
-        match &self.backend {
-            Backend::InProcess { .. } => Vec::new(),
-            Backend::Subprocess { config, .. } => config.command.clone(),
-        }
-    }
-
-    /// Display label for `/hosts` (e.g. `in-process` or the ssh command line).
-    pub fn display_command(&self) -> String {
-        match &self.backend {
-            Backend::InProcess { .. } => "in-process".into(),
-            Backend::Subprocess { config, .. } => {
-                if config.command.is_empty() {
-                    String::new()
-                } else {
-                    config.command.join(" ")
-                }
             }
         }
     }
@@ -333,9 +311,12 @@ impl HostController {
         }
     }
 
-    /// Register waiter + enqueue request; release conn mutex before await.
+    /// Register waiter + enqueue request.
     ///
-    /// When `connect_if_needed`, spawns the worker if `conn` is `None`.
+    /// When `connect_if_needed`, spawns the worker if `conn` is `None` (or
+    /// only holds a dead connection). The connection mutex is held to
+    /// (re)connect and clone handles — never across the channel send — so a
+    /// wedged host cannot block sibling submits or cancels on this controller.
     async fn submit(
         &self,
         id: &str,
@@ -352,7 +333,17 @@ impl HostController {
             return Err("submit on in-process host".into());
         };
 
+        let (write_tx, pending, dead) = {
         let mut slot = conn.lock().await;
+            // A connection whose reader/writer exited (host died, protocol
+            // desync) sits in the slot looking alive; drop it — Conn::drop
+            // kills the child — so the path below can respawn cleanly.
+            if slot
+                .as_ref()
+                .is_some_and(|c| c.dead.load(Ordering::SeqCst))
+            {
+                *slot = None;
+            }
         if slot.is_none() {
             if !connect_if_needed {
                 return Err("not connected".into());
@@ -373,20 +364,31 @@ impl HostController {
             }
         }
         let c = slot.as_ref().expect("connected");
+            (
+                c.write_tx.clone(),
+                Arc::clone(&c.pending),
+                Arc::clone(&c.dead),
+            )
+        };
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = c.pending.lock().await;
+            // Checking `dead` under the pending lock pairs with the reader
+            // setting `dead` *before* draining: a new waiter is either
+            // rejected here or is already registered when the reader drains.
+            // Either way nobody awaits a reply that can no longer come.
+            let mut pending = pending.lock().await;
+            if dead.load(Ordering::SeqCst) {
+                return Err("host connection lost".into());
+            }
             pending.insert(id.to_string(), tx);
         }
 
         let bytes = request.encode()?;
-        if c.write_tx.send(bytes).await.is_err() {
-            {
-                let mut pending = c.pending.lock().await;
+        if write_tx.send(bytes).await.is_err() {
+            dead.store(true, Ordering::SeqCst);
+            let mut pending = pending.lock().await;
                 pending.remove(id);
-            }
-            *slot = None;
             let msg = "write: connection closed".to_string();
             if let Ok(mut err) = last_error.lock() {
                 *err = Some(msg.clone());
@@ -396,11 +398,16 @@ impl HostController {
         Ok(rx)
     }
 
+    /// Best-effort removal of this call's waiter so cancel returns instantly.
+    /// `try_lock` so cancel is never stuck behind an in-flight connect; a
+    /// missed removal self-cleans when the reply arrives or the reader drains.
     async fn abandon(&self, id: &str) {
         let Backend::Subprocess { conn, .. } = &self.backend else {
             return;
         };
-        let slot = conn.lock().await;
+        let Ok(slot) = conn.try_lock() else {
+            return;
+        };
         if let Some(c) = slot.as_ref() {
             let mut pending = c.pending.lock().await;
             pending.remove(id);
@@ -460,7 +467,7 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
     let mut stdout = BufReader::new(stdout);
 
     // Hello before demux tasks.
-    let hello = Request::Hello { agent_id: None }.encode()?;
+    let hello = Request::Hello {}.encode()?;
     write_all(&mut stdin, &hello).await?;
     let line = read_line(&mut stdout).await?;
     let reply = Response::decode(&line)?;
@@ -480,19 +487,23 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_reader = Arc::clone(&pending);
+    let dead = Arc::new(AtomicBool::new(false));
+    let writer_dead = Arc::clone(&dead);
+    let reader_dead = Arc::clone(&dead);
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let writer = tokio::spawn(async move {
-        run_writer(stdin, write_rx).await;
+        run_writer(stdin, write_rx, writer_dead).await;
     });
     let reader = tokio::spawn(async move {
-        run_reader(stdout, pending_reader).await;
+        run_reader(stdout, pending_reader, reader_dead).await;
     });
 
     let conn = Conn {
         child,
         write_tx,
         pending,
+        dead,
         reader_abort: reader.abort_handle(),
         writer_abort: writer.abort_handle(),
     };
@@ -526,31 +537,33 @@ async fn read_line(r: &mut BufReader<ChildStdout>) -> Result<String, String> {
     }
 }
 
-async fn run_writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn run_writer(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    dead: Arc<AtomicBool>,
+) {
     while let Some(bytes) = rx.recv().await {
         if write_all(&mut stdin, &bytes).await.is_err() {
             break;
         }
     }
+    dead.store(true, Ordering::SeqCst);
 }
 
+/// Demux loop. Exits on EOF or on a connection-fatal `Error{id:None}` from
+/// the worker (undecodable request — agent/worker version skew); either way
+/// the connection is poisoned: `dead` is set *before* draining `pending`
+/// (see `submit` for the pairing), then every waiter gets an error instead
+/// of hanging on a reply that can no longer come.
 async fn run_reader(
     mut stdout: BufReader<ChildStdout>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
+    dead: Arc<AtomicBool>,
 ) {
-    loop {
+    let exit_message = loop {
         let line = match read_line(&mut stdout).await {
             Ok(l) => l,
-            Err(_) => {
-                let mut pending = pending.lock().await;
-                for (_, tx) in pending.drain() {
-                    let _ = tx.send(Response::Error {
-                        id: None,
-                        message: "host closed stdout".into(),
-                    });
-                }
-                return;
-            }
+            Err(_) => break "host closed stdout".to_string(),
         };
         let msg = match Response::decode(&line) {
             Ok(m) => m,
@@ -582,15 +595,20 @@ async fn run_reader(
                     let _ = tx.send(msg);
                 }
             }
-            Response::Error { id: None, .. } => {
-                let mut pending = pending.lock().await;
-                for (_, tx) in pending.drain() {
-                    let _ = tx.send(msg.clone());
-                }
-                return;
+            Response::Error { id: None, message } => {
+                break format!("host protocol error: {message}");
             }
             Response::HelloOk { .. } => {}
         }
+    };
+
+    dead.store(true, Ordering::SeqCst);
+    let mut pending = pending.lock().await;
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Response::Error {
+            id: None,
+            message: exit_message.clone(),
+        });
     }
 }
 
@@ -724,6 +742,42 @@ mod tests {
             tool_text(&result).contains("hello-after-cancel"),
             "{result:?}"
         );
+    }
+
+    /// A host that dies after hello must *fail* calls, never hang them: the
+    /// reader's exit poisons the connection, and the next call drops the dead
+    /// conn and respawns instead of registering a waiter nobody will answer.
+    #[tokio::test]
+    async fn dead_host_fails_calls_and_respawns_instead_of_hanging() {
+        let hello = "{\"type\":\"hello_ok\",\"name\":\"fake\",\"version\":\"0\",\"tools\":[]}";
+        let ctl = HostController::new(HostConfig {
+            name: "dies".into(),
+            // Answers the hello handshake, then exits immediately.
+            command: vec![
+                "bash".into(),
+                "-c".into(),
+                format!("read -r _line; printf '%s\\n' '{hello}'"),
+            ],
+            ssh_destination: None,
+        });
+
+        for attempt in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                ctl.call(
+                    uuid::Uuid::nil(),
+                    ToolUse {
+                        id: format!("t{attempt}"),
+                        name: "bash".into(),
+                        input: json!({"command": "echo hi"}),
+                    },
+                    CancelToken::new(),
+                ),
+            )
+            .await
+            .expect("call against dead host must fail fast, not hang");
+            assert!(result.is_error, "attempt {attempt}: {result:?}");
+        }
     }
 
     #[tokio::test]
