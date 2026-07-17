@@ -27,7 +27,8 @@ process; host tools (`bash`, editor, `manual`, text search, `lynx_tui_browser`) 
 Article ids: `overview`, `cli`, `harness-ops`.
 
 Quick map (details in `manual`):
-- Config: `~/.myco/config.toml` (or `$MYCO_CONFIG`) — `[[remote_hosts]]` only; local is always on.
+- Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host; local is always on.
+  `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only (`enable_subagent`, `attach_timeout_secs`, `remote_myco`).
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).

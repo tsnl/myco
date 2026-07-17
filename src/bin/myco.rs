@@ -107,7 +107,8 @@ struct Args {
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
     effort: Effort,
 
-    /// Path to harness config (hosts). Default: $MYCO_CONFIG or ~/.myco/config.toml.
+    /// Path to myco config (knobs; hosts come from ~/.ssh/config).
+    /// Default: $MYCO_CONFIG or ~/.myco/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -201,7 +202,7 @@ async fn run_interactive(args: Args) {
     .unwrap_or_else(|e| {
         eprintln!("Failed to attach harness: {e}");
         eprintln!(
-            "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
+            "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
         );
         if !ssh_report.is_clean() || !ssh_report.agent_ok {
             eprintln!(
@@ -864,8 +865,10 @@ Each USER header shows `USER <used>/<max>` context tokens when the provider
 reported usage on the previous generate (0/max until then).
 
 Hosts:
-  Local is always enabled in-process (no subprocess). Remotes: ~/.myco/config.toml
-  (`[[remote_hosts]]` with explicit SSH fields; or --config / $MYCO_CONFIG).
+  Local is always enabled in-process (no subprocess). Remotes come from
+  ~/.ssh/config: every concrete Host alias is a lazy `ssh <alias> myco --mode
+  host` remote. ~/.myco/config.toml (or --config / $MYCO_CONFIG) holds knobs
+  only (enable_subagent, attach_timeout_secs, remote_myco).
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host.
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for

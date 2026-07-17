@@ -78,10 +78,26 @@ speaks the Responses API at `{base}/responses`):
 If neither xAI/OpenAI key is set, the OpenAI Responses backend also accepts
 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` as a fallback token source.
 
-### (Optional) Remote Hosts Config
+### (Optional) Remote Hosts
 
-If you want to use `myco` with one or more remote hosts, you can configure this in
-`~/.myco/config.toml`.
+Remote hosts come straight from `~/.ssh/config`: every concrete `Host` alias
+(no `*`/`?` wildcards, no `!` negations) is available as a myco host of the same
+name, attached lazily as `ssh <alias> myco --mode host`. Put user, port,
+identities, `ProxyJump`, … in `~/.ssh/config` as usual; myco always adds
+`-o BatchMode=yes`, so keys must be loaded in `ssh-agent`. `Include`d files are
+not read — aliases myco should see must be in the main `~/.ssh/config`.
+
+```ssh-config
+# ~/.ssh/config
+Host tsnl-desktop
+  HostName tsnl-desktop.yellow-submarine.ts.net
+
+Host gpu
+  HostName ec2-12-34-56-78.compute-1.amazonaws.com
+  User ubuntu
+```
+
+Optional knobs live in `~/.myco/config.toml`:
 
 ```toml
 # ~/.myco/config.toml
@@ -91,13 +107,9 @@ enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use.
 attach_timeout_secs = 10
 
-[[remote_hosts]]
-name = "tsnl-desktop"
-ssh = "tsnl-desktop.yellow-submarine.ts.net"
-
-[[remote_hosts]]
-name = "gpu"
-ssh = "ubuntu@ec2-12-34-56-78.compute-1.amazonaws.com"
+# Binary to run on remotes (default "myco"); must be on the PATH used by
+# non-interactive SSH, or an absolute path.
+# remote_myco = "myco"
 ```
 
 ## Develop

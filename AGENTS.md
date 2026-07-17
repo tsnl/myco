@@ -73,7 +73,7 @@ myco (interactive) / Agent
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
-| `src/harness/` | Host pool, config (`[[remote_hosts]]`), SSH preflight, subagent service |
+| `src/harness/` | Host pool, config (`~/.ssh/config` hosts + `~/.myco/config.toml` knobs), SSH preflight, subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok) backends |
@@ -155,7 +155,7 @@ cargo run --locked --bin myco
 ## What not to do
 
 - Don’t rename the **host** domain (`host` tool field, `--mode host`,
-  `/hosts`, `[[remote_hosts]]`, `src/host/`) for cosmetic synonyms without an
+  `/hosts`, `src/host/`) for cosmetic synonyms without an
   explicit, breakage-aware migration plan.
 - Don’t scp prebuilt `myco` binaries across mismatched OS/arch/libc; build on
   the target or use a matching asset (`harness-ops`).
