@@ -64,10 +64,6 @@ struct Conn {
     child: Child,
     write_tx: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
-    /// Set by the reader/writer tasks when the pipe dies. `submit` checks it
-    /// under the `pending` lock so no waiter can be registered against a dead
-    /// connection (it would hang forever — nothing reads replies anymore),
-    /// and clears the slot so the next call respawns the worker.
     dead: Arc<AtomicBool>,
     reader_abort: tokio::task::AbortHandle,
     writer_abort: tokio::task::AbortHandle,
@@ -464,7 +460,7 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
     let mut stdout = BufReader::new(stdout);
 
     // Hello before demux tasks.
-    let hello = Request::Hello {}.encode()?;
+    let hello = Request::Hello.encode()?;
     write_all(&mut stdin, &hello).await?;
     let line = read_line(&mut stdout).await?;
     let reply = Response::decode(&line)?;

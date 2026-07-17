@@ -11,7 +11,7 @@ use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// First message after connect; worker replies with [`Response::HelloOk`].
-    Hello {},
+    Hello,
     /// Execute one tool use. Worker responds with [`Response::ToolResult`].
     ToolCall {
         /// Correlation id (unique per in-flight call on this pipe).
