@@ -48,7 +48,7 @@ impl HostWorker {
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ManualService::new()) as Arc<dyn ToolService>,
-Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
+            Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
             // Auto-indexes .claude/skills, SKILL.md dirs, AGENTS.md under cwd.
             Arc::new(TextSearchToolService::new()) as Arc<dyn ToolService>,
         ]
@@ -120,7 +120,8 @@ Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
                         HostDispatchContext {
                             agent_id,
                             cancel: CancelToken::new(),
-                         agent_root: None, },
+                            agent_root: None,
+                        },
                     )
                     .await;
                 let response = Response::ToolResult { id, result };
@@ -194,7 +195,9 @@ Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
     }
 }
 
-fn build_tool_to_service_map(services: &[Arc<dyn ToolService>]) -> HashMap<String, Arc<dyn ToolService>> {
+fn build_tool_to_service_map(
+    services: &[Arc<dyn ToolService>],
+) -> HashMap<String, Arc<dyn ToolService>> {
     let mut map = HashMap::new();
     for service in services {
         for tool_spec in service.tool_specs() {

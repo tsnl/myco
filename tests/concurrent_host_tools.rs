@@ -2,15 +2,15 @@
 
 use std::time::{Duration, Instant};
 
-use myco::{Agent, NullEventSink};
+use futures::stream;
+use myco::core::AsyncStream;
 use myco::core::CancelToken;
 use myco::generative_model::{
     Content, GenerateError, GenerateOutput, GenerativeModel, Message, MessagePart, ToolUse,
     TurnEndReason,
 };
 use myco::harness::{Harness, HarnessConfig};
-use myco::core::AsyncStream;
-use futures::stream;
+use myco::{Agent, NullEventSink};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,10 +28,7 @@ impl ScriptedModel {
 }
 
 impl GenerativeModel for ScriptedModel {
-    fn generate(
-        &self,
-        _input: &[Message],
-    ) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, _input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let output = self
             .scripts
             .lock()
@@ -205,10 +202,7 @@ async fn agent_concurrent_bash_and_editor_complete() {
     .await
     .expect("attach local host");
 
-    let tmp = std::env::temp_dir().join(format!(
-        "myco-concurrent-edit-{}.txt",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("myco-concurrent-edit-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let path = tmp.to_string_lossy().to_string();
 
@@ -230,9 +224,7 @@ async fn agent_concurrent_bash_and_editor_complete() {
             turn_end_reason: TurnEndReason::ToolUse,
         },
         GenerateOutput {
-            content: vec![Content::Text {
-                text: "ok".into(),
-            }],
+            content: vec![Content::Text { text: "ok".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
         },

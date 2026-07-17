@@ -1266,37 +1266,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "myco"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "atomic-write-file",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "chrono",
- "clap",
- "dirs",
- "dotenvy",
- "futures",
- "notify",
- "regex",
- "reqwest",
- "rocket",
- "rustyline",
- "schemars",
- "serde",
- "serde_json",
- "tantivy",
- "thiserror 2.0.18",
- "tokenizers",
- "tokio",
- "toml",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "htmlescape"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1971,6 +1940,37 @@ name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
+
+[[package]]
+name = "myco"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "atomic-write-file",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "chrono",
+ "clap",
+ "dirs",
+ "dotenvy",
+ "futures",
+ "notify",
+ "regex",
+ "reqwest",
+ "rocket",
+ "rustyline",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "toml",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "native-tls"

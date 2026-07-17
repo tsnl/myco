@@ -3,18 +3,16 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::generative_model::{
-    self, BackendConfig, Content, Effort, GenerativeModelConfig, Model,
-};
+use myco::generative_model::{self, BackendConfig, Content, Effort, GenerativeModelConfig, Model};
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, Session, SessionListEntry, RECENT_SESSION_LIMIT, SECTION_RULE, USER_RULE,
+    ActiveSession, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry, USER_RULE,
     format_session_detail, format_session_list_line, format_tool_invocation, list_sessions,
     print_session_history, resolve_and_load_session,
 };
@@ -187,7 +185,9 @@ async fn run_interactive(args: Args) {
         .await
         .unwrap_or_else(|e| {
             eprintln!("Failed to attach harness: {e}");
-            eprintln!("hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn");
+            eprintln!(
+                "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
+            );
             if !ssh_report.is_clean() || !ssh_report.agent_ok {
                 eprintln!(
                     "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
@@ -210,11 +210,9 @@ async fn run_interactive(args: Args) {
 
     load_readline_history(&mut editor, &active_session);
 
-    let session_label = active_session.with(|s| {
-        match &s.title {
-            Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
-            _ => s.id.clone(),
-        }
+    let session_label = active_session.with(|s| match &s.title {
+        Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
+        _ => s.id.clone(),
     });
     println!(
         "myco: model={model_id}  effort={effort}  session={session_label}  config={}  hosts=[{}]  default=local  (/help for commands)",
@@ -745,7 +743,10 @@ fn print_host_status(harness: &Harness) {
 fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
     let history = agent.history();
     // Never create a file for a session that has never had a turn.
-    if history.is_empty() && session.snapshot().messages.is_empty() && !session.snapshot().json_path().exists() {
+    if history.is_empty()
+        && session.snapshot().messages.is_empty()
+        && !session.snapshot().json_path().exists()
+    {
         return Ok(());
     }
     if history.is_empty() && !session.snapshot().json_path().exists() {
@@ -1217,7 +1218,6 @@ impl EventSink for CliEventSink {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 
 #[cfg(test)]
 mod tests {

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
-    format_link_one_line, format_session_detail, format_session_list_line, list_all_sessions,
-    list_sessions, normalize_pr_url, parse_pr_fields, ActiveSession, Session, SessionLink,
+    ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
+    format_session_list_line, list_all_sessions, list_sessions, normalize_pr_url, parse_pr_fields,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -134,10 +134,7 @@ impl SessionMetaTool {
 
     fn action_set_title(&self, title: Option<String>) -> Result<String, String> {
         self.active.with_mut(|session| {
-            let cleared = title
-                .as_ref()
-                .map(|t| t.trim().is_empty())
-                .unwrap_or(true);
+            let cleared = title.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true);
             if cleared {
                 session.set_title(None)?;
             } else {
@@ -231,9 +228,7 @@ impl SessionMetaTool {
                     input.path.as_deref(),
                 )?
             } else {
-                return Err(
-                    "remove_link requires index, or url, or host (+ optional path)".into(),
-                );
+                return Err("remove_link requires index, or url, or host (+ optional path)".into());
             };
             session.touch();
             session.save()?;
@@ -328,9 +323,9 @@ enum LinkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CancelToken;
     use crate::generative_model::Model;
     use crate::tool_services::{HostDispatchContext, ToolService};
-    use crate::CancelToken;
     use std::sync::Arc;
 
     fn tool_with_session(session: Session) -> (SessionMetaTool, ActiveSession) {

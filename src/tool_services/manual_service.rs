@@ -100,8 +100,8 @@ enum ActionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, ToolUse};
     use crate::CancelToken;
+    use crate::generative_model::{Content, ToolUse};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -119,7 +119,8 @@ mod tests {
         HostDispatchContext {
             agent_id: uuid::Uuid::nil(),
             cancel: CancelToken::new(),
-         agent_root: None, }
+            agent_root: None,
+        }
     }
 
     #[tokio::test]

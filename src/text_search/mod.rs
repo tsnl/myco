@@ -13,7 +13,7 @@ mod embed_model;
 mod engine;
 mod index;
 
-pub use discover::{discover_auto_index_targets, AutoIndexTarget};
+pub use discover::{AutoIndexTarget, discover_auto_index_targets};
 pub use engine::{
     DropReport, IndexReport, SearchHit, SearchOptions, SearchReport, TextSearchEngine,
 };

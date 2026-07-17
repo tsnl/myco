@@ -8,13 +8,13 @@ mod agent;
 mod transcript;
 
 pub use agent::{
-    uuid_simple_hex, Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink,
-    TraceContext,
+    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext,
+    uuid_simple_hex,
 };
 pub use transcript::{
-    ensure_response, format_tool_invocation, print_session_history, truncate_display_string,
-    truncate_json_strings, write_block, write_response_open, write_session_history, SECTION_RULE,
-    TOOL_DISPLAY_STRING_MAX, USER_RULE,
+    SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_response, format_tool_invocation,
+    print_session_history, truncate_display_string, truncate_json_strings, write_block,
+    write_response_open, write_session_history,
 };
 
 use std::fs;
@@ -151,11 +151,7 @@ impl ActiveSession {
     }
 
     /// Update messages from the agent and persist when they changed (or `force`).
-    pub fn persist_messages(
-        &self,
-        messages: &[Message],
-        force: bool,
-    ) -> Result<(), String> {
+    pub fn persist_messages(&self, messages: &[Message], force: bool) -> Result<(), String> {
         let mut session = self.lock();
         if force || messages.len() != session.messages.len() {
             session.messages = messages.to_vec();
@@ -338,9 +334,7 @@ impl Session {
             .position(|l| match l {
                 SessionLink::GitHubPr {
                     url: existing_url, ..
-                } => url
-                    .map(|u| urls_equal(existing_url, u))
-                    .unwrap_or(false),
+                } => url.map(|u| urls_equal(existing_url, u)).unwrap_or(false),
                 SessionLink::Worktree {
                     host: h, path: p, ..
                 } => {
@@ -446,7 +440,6 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
     })
 }
 
-
 /// Load a session by id/prefix, or the most recent when `id_or_prefix` is `None`.
 pub fn resolve_and_load_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
     match id_or_prefix {
@@ -541,10 +534,7 @@ pub fn truncate_snippet(s: &str, max: usize) -> String {
 }
 
 pub fn auto_title_from_text(text: &str) -> Option<String> {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())?;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     normalize_title(line).ok()
 }
 
@@ -561,7 +551,10 @@ pub fn normalize_title(raw: &str) -> Result<String, String> {
         return Err("title must be non-empty".into());
     }
     if one_line.chars().count() > MAX_TITLE_CHARS {
-        let trimmed: String = one_line.chars().take(MAX_TITLE_CHARS.saturating_sub(1)).collect();
+        let trimmed: String = one_line
+            .chars()
+            .take(MAX_TITLE_CHARS.saturating_sub(1))
+            .collect();
         return Ok(format!("{trimmed}…"));
     }
     Ok(one_line)
@@ -764,13 +757,9 @@ pub fn normalize_pr_url(raw: &str) -> Result<String, String> {
         }
     }
 
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| {
-            format!(
-                "PR url must be a github.com pull request URL or org/repo#N (got {raw:?})"
-            )
-        })?;
+    let rest = url.strip_prefix("https://github.com/").ok_or_else(|| {
+        format!("PR url must be a github.com pull request URL or org/repo#N (got {raw:?})")
+    })?;
     let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
     // org/repo/pull/N
     if parts.len() >= 4 && parts[2] == "pull" {
@@ -960,20 +949,21 @@ mod tests {
     fn active_session_auto_title_once() {
         let dir = temp_session_root();
         // SAFETY: test-only env override; serial unit tests.
-        unsafe { std::env::set_var("MYCO_HOME", &dir); }
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
         let s = ActiveSession::new(Session::new(Model::ClaudeHaiku45));
         assert!(
             s.maybe_auto_title_from_user_text("First line\n\nmore")
                 .unwrap()
         );
         assert_eq!(s.snapshot().title.as_deref(), Some("First line"));
-        assert!(
-            !s.maybe_auto_title_from_user_text("Second")
-                .unwrap()
-        );
+        assert!(!s.maybe_auto_title_from_user_text("Second").unwrap());
         assert_eq!(s.snapshot().title.as_deref(), Some("First line"));
         let _ = fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("MYCO_HOME"); }
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
     }
 
     #[test]

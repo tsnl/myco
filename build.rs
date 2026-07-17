@@ -107,11 +107,7 @@ fn main() {
         if dest.is_file() {
             let _ = fs::remove_file(&dest);
         }
-        let url = format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            asset.remote_path
-        );
+        let url = format!("{}/{}", base.trim_end_matches('/'), asset.remote_path);
         download_curl(&url, &dest);
         if !asset_ok(&dest, asset.size, want_sha) {
             // For tokenizer/config, if sha not in manifest, accept actual size after download

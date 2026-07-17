@@ -16,12 +16,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::core::CancelToken;
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
-use crate::host::protocol::{Request, Response};
 use crate::host::HostWorker;
+use crate::host::protocol::{Request, Response};
 use crate::tool_services::HostDispatchContext;
 
 /// Configuration for one remote host endpoint (spawn argv).
@@ -142,10 +142,9 @@ impl HostController {
     pub fn is_connected(&self) -> bool {
         match &self.backend {
             Backend::InProcess { .. } => true,
-            Backend::Subprocess { conn, .. } => conn
-                .try_lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false),
+            Backend::Subprocess { conn, .. } => {
+                conn.try_lock().map(|g| g.is_some()).unwrap_or(false)
+            }
         }
     }
 
@@ -280,11 +279,10 @@ impl HostController {
             Ok(Response::Error { message, .. }) => {
                 ToolResult::err(format!("host {:?}: {message}", self.name)).with_id(tool_id)
             }
-            Ok(other) => ToolResult::err(format!(
-                "host {:?}: unexpected reply: {other:?}",
-                self.name
-            ))
-            .with_id(tool_id),
+            Ok(other) => {
+                ToolResult::err(format!("host {:?}: unexpected reply: {other:?}", self.name))
+                    .with_id(tool_id)
+            }
             Err(_closed) => {
                 ToolResult::err(format!("host {:?}: connection closed", self.name)).with_id(tool_id)
             }
@@ -501,7 +499,9 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
 }
 
 async fn write_all(w: &mut ChildStdin, bytes: &[u8]) -> Result<(), String> {
-    w.write_all(bytes).await.map_err(|e| format!("write: {e}"))?;
+    w.write_all(bytes)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
     w.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
 }
@@ -563,9 +563,7 @@ async fn run_reader(
                     let _ = tx.send(msg);
                 }
             }
-            Response::Error {
-                id: Some(id), ..
-            } => {
+            Response::Error { id: Some(id), .. } => {
                 let mut pending = pending.lock().await;
                 if let Some(tx) = pending.remove(id) {
                     let _ = tx.send(msg);
@@ -665,11 +663,9 @@ mod tests {
             CancelToken::new(),
         );
 
-        let (ra, rb) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(a, b)
-        })
-        .await
-        .expect("concurrent host calls hung");
+        let (ra, rb) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(a, b) })
+            .await
+            .expect("concurrent host calls hung");
 
         let wall = t0.elapsed();
         assert!(!ra.is_error, "a: {ra:?}");
@@ -722,7 +718,10 @@ mod tests {
         .await
         .expect("next call timed out");
         assert!(!result.is_error, "{result:?}");
-        assert!(tool_text(&result).contains("hello-after-cancel"), "{result:?}");
+        assert!(
+            tool_text(&result).contains("hello-after-cancel"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

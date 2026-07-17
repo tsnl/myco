@@ -8,15 +8,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use myco::generative_model::{
-    Content, GenerateOutput, Message, ToolUse, TurnEndReason,
-};
+use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
 use myco::harness::{Harness, HarnessConfig};
 use myco::{Agent, NullEventSink};
 use serde_json::json;
 
 mod test_utils;
-use test_utils::{format_transcript, ScriptedModel};
+use test_utils::{ScriptedModel, format_transcript};
 
 fn tool_text(result: &myco::generative_model::ToolResult) -> String {
     result
@@ -48,9 +46,7 @@ fn turn_tool_use(tool_uses: Vec<ToolUse>) -> GenerateOutput {
 
 fn turn_end(text: &str) -> GenerateOutput {
     GenerateOutput {
-        content: vec![Content::Text {
-            text: text.into(),
-        }],
+        content: vec![Content::Text { text: text.into() }],
         tool_uses: vec![],
         turn_end_reason: TurnEndReason::EndTurn,
     }
@@ -157,7 +153,11 @@ async fn scripted_multi_turn_bash_session_transcript() {
         Content::Text { text } => assert_eq!(text, "multi-turn bash session ok"),
         other => panic!("expected final text reply, got {other:?}"),
     }
-    assert_eq!(model.remaining(), 0, "all scripted turns should be consumed");
+    assert_eq!(
+        model.remaining(),
+        0,
+        "all scripted turns should be consumed"
+    );
 
     let history = agent.history();
     let transcript = format_transcript(history);

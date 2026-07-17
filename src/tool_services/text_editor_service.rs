@@ -710,9 +710,10 @@ mod tests {
 
     /// HostWorker with a single shared [`TextEditorService`] (stateful read LMT map).
     fn harness() -> Arc<HostWorker> {
-        Arc::new(HostWorker::new("test", vec![
-            Arc::new(TextEditorService::new()) as Arc<dyn ToolService>
-        ]))
+        Arc::new(HostWorker::new(
+            "test",
+            vec![Arc::new(TextEditorService::new()) as Arc<dyn ToolService>],
+        ))
     }
 
     fn dispatch(harness: &Arc<HostWorker>, input: ParsedInput) -> generative_model::ToolResult {
@@ -721,7 +722,8 @@ mod tests {
             HostDispatchContext {
                 agent_id: uuid::Uuid::nil(),
                 cancel: crate::core::CancelToken::new(),
-             agent_root: None, },
+                agent_root: None,
+            },
         ))
     }
 

@@ -6,10 +6,7 @@ use myco::generative_model::{Content, Message, ToolResult, ToolUse};
 pub fn format_transcript(history: &[Message]) -> String {
     let mut out = String::new();
     for (i, msg) in history.iter().enumerate() {
-        out.push_str(&format!(
-            "===== message[{i}] {} =====\n",
-            message_kind(msg)
-        ));
+        out.push_str(&format!("===== message[{i}] {} =====\n", message_kind(msg)));
         match msg {
             Message::UserMessage { content } => {
                 for c in content {
@@ -54,9 +51,7 @@ fn format_content(c: &Content) -> String {
     match c {
         Content::Text { text } => format!("text: {text}\n"),
         Content::Image { .. } => "image: <omitted>\n".into(),
-        Content::Thinking {
-            text, redacted, ..
-        } => {
+        Content::Thinking { text, redacted, .. } => {
             if *redacted {
                 "thinking: <redacted>\n".into()
             } else {

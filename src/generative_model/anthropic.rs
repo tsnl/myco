@@ -149,8 +149,7 @@ impl AnthropicGenerativeModel {
             }])
         };
 
-        let (thinking, output_config) =
-            thinking_request_fields(self.model, self.backend.effort);
+        let (thinking, output_config) = thinking_request_fields(self.model, self.backend.effort);
         // Anthropic requires max_tokens > thinking.budget_tokens for non-adaptive
         // extended thinking (e.g. Haiku). Adaptive thinking has no budget field.
         let mut max_tokens = self.backend.max_tokens_per_generate;
@@ -906,7 +905,10 @@ struct AnthropicOutputConfig {
 fn thinking_request_fields(
     model: Model,
     effort: Option<Effort>,
-) -> (Option<AnthropicThinkingConfig>, Option<AnthropicOutputConfig>) {
+) -> (
+    Option<AnthropicThinkingConfig>,
+    Option<AnthropicOutputConfig>,
+) {
     let Some(effort) = effort else {
         return (None, None);
     };
@@ -1115,7 +1117,10 @@ mod tests {
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
-        assert_eq!(json["thinking"]["budget_tokens"], Effort::Medium.budget_tokens());
+        assert_eq!(
+            json["thinking"]["budget_tokens"],
+            Effort::Medium.budget_tokens()
+        );
         assert!(json.get("output_config").is_none());
     }
 
@@ -1186,7 +1191,6 @@ mod tests {
         assert!(matches!(msgs[0].content[1], AnthropicContent::Text { .. }));
     }
 
-    
     #[test]
     fn thinking_delta_maps_to_content_delta() {
         let mut acc = StreamAccumulator::default();
@@ -1227,9 +1231,7 @@ mod tests {
         let parts = acc
             .handle_event(AnthropicStreamEvent::ContentBlockStart {
                 index: 1,
-                content_block: AnthropicStreamContentBlock::Text {
-                    text: "hi".into(),
-                },
+                content_block: AnthropicStreamContentBlock::Text { text: "hi".into() },
             })
             .unwrap();
         // content_index is remapped: thinking occupied content slot 0, text is 1.
@@ -1272,7 +1274,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn test_stream_accumulator_text_and_tool_index_remap() {
         let mut acc = StreamAccumulator::default();
 

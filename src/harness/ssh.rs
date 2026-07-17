@@ -60,7 +60,9 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
 
     let ssh_targets = ssh_host_targets(hosts);
     if ssh_targets.is_empty() {
-        report.notes.push("no SSH-backed hosts in config; skipping agent preflight".into());
+        report
+            .notes
+            .push("no SSH-backed hosts in config; skipping agent preflight".into());
         return report;
     }
     report.had_ssh_hosts = true;
@@ -76,7 +78,10 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
                     ));
                 }
                 for p in paths {
-                    identity_hosts.entry(p).or_default().insert(host_name.clone());
+                    identity_hosts
+                        .entry(p)
+                        .or_default()
+                        .insert(host_name.clone());
                 }
             }
             Err(e) => {
@@ -88,7 +93,9 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     }
 
     if identity_hosts.is_empty() {
-        report.notes.push("no identity files discovered for SSH hosts".into());
+        report
+            .notes
+            .push("no identity files discovered for SSH hosts".into());
         // Still check agent reachability for diagnostics.
         match agent_fingerprints() {
             Ok((status, _)) => {
@@ -147,10 +154,14 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
         match run_ssh_add_apple_load_keychain() {
             Ok(msg) => {
                 if !msg.is_empty() {
-                    report.notes.push(format!("ssh-add --apple-load-keychain: {msg}"));
+                    report
+                        .notes
+                        .push(format!("ssh-add --apple-load-keychain: {msg}"));
                 }
             }
-            Err(e) => report.notes.push(format!("ssh-add --apple-load-keychain failed: {e}")),
+            Err(e) => report
+                .notes
+                .push(format!("ssh-add --apple-load-keychain failed: {e}")),
         }
         if let Ok((status, fps)) = agent_fingerprints() {
             report.agent_status = status;
@@ -198,10 +209,7 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
             .get(&path)
             .map(|s| join_hosts(s))
             .unwrap_or_else(|| "?".into());
-        eprintln!(
-            "ssh-agent: unlocking {} (hosts: {hosts})",
-            path.display()
-        );
+        eprintln!("ssh-agent: unlocking {} (hosts: {hosts})", path.display());
         match interactive_ssh_add(&path) {
             Ok(()) => {
                 report.added.push(path.clone());
@@ -405,12 +413,10 @@ fn expand_user_path(raw: &str) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            // dirs crate is a dependency of the package.
-            dirs::home_dir()
-        })
+    std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
+        // dirs crate is a dependency of the package.
+        dirs::home_dir()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +483,10 @@ fn identity_fingerprint(path: &Path) -> Result<String, String> {
             if let Some(fp) = stdout.split_whitespace().find(|t| t.starts_with("SHA256:")) {
                 return Ok(fp.to_string());
             }
-            last_err = format!("no SHA256 fingerprint in ssh-keygen output for {}", cand.display());
+            last_err = format!(
+                "no SHA256 fingerprint in ssh-keygen output for {}",
+                cand.display()
+            );
         } else {
             last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if last_err.is_empty() {
@@ -541,9 +550,7 @@ fn interactive_ssh_add(path: &Path) -> Result<(), String> {
         }
     }
 
-    let status = cmd
-        .status()
-        .map_err(|e| format!("spawn ssh-add: {e}"))?;
+    let status = cmd.status().map_err(|e| format!("spawn ssh-add: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -598,7 +605,10 @@ mod tests {
             "stark07".into(),
             "myco".into(),
         ];
-        assert_eq!(ssh_destination_from_command(&cmd).as_deref(), Some("stark07"));
+        assert_eq!(
+            ssh_destination_from_command(&cmd).as_deref(),
+            Some("stark07")
+        );
     }
 
     #[test]
@@ -624,7 +634,10 @@ mod tests {
             "devbox".into(),
             "true".into(),
         ];
-        assert_eq!(ssh_destination_from_command(&cmd).as_deref(), Some("devbox"));
+        assert_eq!(
+            ssh_destination_from_command(&cmd).as_deref(),
+            Some("devbox")
+        );
     }
 
     #[test]
@@ -637,19 +650,17 @@ mod tests {
     /// Smoke: talk to the real agent and (if present) ssh -G workstation.
     #[test]
     fn preflight_smoke_with_real_agent() {
-        let hosts = vec![
-            HostConfig {
-                name: "workstation".into(),
-                command: vec![
-                    "ssh".into(),
-                    "-o".into(),
-                    "BatchMode=yes".into(),
-                    "workstation".into(),
-                    "true".into(),
-                ],
-                ssh_destination: Some("workstation".into()),
-            },
-        ];
+        let hosts = vec![HostConfig {
+            name: "workstation".into(),
+            command: vec![
+                "ssh".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "workstation".into(),
+                "true".into(),
+            ],
+            ssh_destination: Some("workstation".into()),
+        }];
         let report = ensure_remote_ssh_identities(&hosts);
         assert!(report.had_ssh_hosts);
         // Agent should be reachable in the developer environment; if not, surface status.
@@ -666,10 +677,7 @@ mod tests {
         let id_rsa = expand_user_path("~/.ssh/id_rsa");
         if report.agent_ok && id_rsa.exists() {
             assert!(
-                report
-                    .still_missing
-                    .iter()
-                    .all(|(p, _)| p != &id_rsa),
+                report.still_missing.iter().all(|(p, _)| p != &id_rsa),
                 "id_rsa still missing: {:?}",
                 report.still_missing
             );

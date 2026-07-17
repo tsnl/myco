@@ -139,7 +139,10 @@ impl BashService {
                 command,
                 cwd,
                 timeout_ms,
-            } => self.run_oneshot(&command, cwd.as_deref(), timeout_ms, cancel).await,
+            } => {
+                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, cancel)
+                    .await
+            }
             Action::Start {
                 session_id,
                 command,
@@ -186,15 +189,8 @@ impl BashService {
                 idle_ms,
                 max_bytes,
             } => {
-                self.session_read(
-                    &session_id,
-                    owner,
-                    timeout_ms,
-                    idle_ms,
-                    max_bytes,
-                    cancel,
-                )
-                .await
+                self.session_read(&session_id, owner, timeout_ms, idle_ms, max_bytes, cancel)
+                    .await
             }
             Action::Close { session_id } => self.session_close(&session_id, owner).await,
             Action::List => self.session_list(owner),
@@ -553,7 +549,9 @@ impl BashService {
                     ));
                 }
             }
-            sessions.remove(session_id).expect("session present after check")
+            sessions
+                .remove(session_id)
+                .expect("session present after check")
         };
 
         // Drop stdin (EOF). The waiter task owns the Child with kill_on_drop.
@@ -691,12 +689,7 @@ impl BashService {
         };
 
         let Some(mut stdin) = stdin_slot else {
-            let exited = shared
-                .buffer
-                .lock()
-                .ok()
-                .map(|b| b.exited)
-                .unwrap_or(false);
+            let exited = shared.buffer.lock().ok().map(|b| b.exited).unwrap_or(false);
             if exited {
                 return Err(format!(
                     "session {session_id:?} has exited; close it and start a new one"
@@ -781,14 +774,7 @@ impl BashService {
             return Err("cancelled".into());
         }
         Ok(collect_output(
-            &shared,
-            session_id,
-            owner,
-            &cmdline,
-            timeout_ms,
-            idle_ms,
-            max_bytes,
-            &cancel,
+            &shared, session_id, owner, &cmdline, timeout_ms, idle_ms, max_bytes, &cancel,
         )
         .await)
     }
@@ -869,7 +855,10 @@ impl SessionSnapshot {
     fn format(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("session_id: {}\n", self.session_id));
-        out.push_str(&format!("owner: {}\n", crate::session::uuid_simple_hex(self.owner)));
+        out.push_str(&format!(
+            "owner: {}\n",
+            crate::session::uuid_simple_hex(self.owner)
+        ));
         out.push_str(&format!("cmdline: {:?}\n", self.cmdline));
         out.push_str(&format!("status: {}\n", self.status.as_str()));
         out.push_str(&format!("exit_code: {:?}\n", self.exit_code));
@@ -892,9 +881,7 @@ impl SessionSnapshot {
                 );
             }
             SnapshotStatus::Truncated => {
-                out.push_str(
-                    "(output truncated at max_bytes; more may be buffered — call read)\n",
-                );
+                out.push_str("(output truncated at max_bytes; more may be buffered — call read)\n");
             }
             SnapshotStatus::Running => {
                 out.push_str("(session still running; call read/write/close as needed)\n");
@@ -988,11 +975,7 @@ async fn collect_output(
     let max_bytes = max_bytes.max(1);
 
     let mut last_activity = Instant::now();
-    let mut last_total = shared
-        .buffer
-        .lock()
-        .map(|b| b.total_bytes)
-        .unwrap_or(0);
+    let mut last_total = shared.buffer.lock().map(|b| b.total_bytes).unwrap_or(0);
     let already_pending = shared
         .buffer
         .lock()
@@ -1278,9 +1261,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             } else if input.session_id.is_some() {
                 ActionKind::Read
             } else {
-                return Err(
-                    "missing action (and no command/session_id to infer one from)".into(),
-                );
+                return Err("missing action (and no command/session_id to infer one from)".into());
             }
         }
     };
@@ -1427,16 +1408,18 @@ mod tests {
     }
 
     fn harness() -> Arc<HostWorker> {
-        Arc::new(HostWorker::new("test", vec![
-            Arc::new(BashService::new()) as Arc<dyn ToolService>
-        ]))
+        Arc::new(HostWorker::new(
+            "test",
+            vec![Arc::new(BashService::new()) as Arc<dyn ToolService>],
+        ))
     }
 
     fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
         HostDispatchContext {
             agent_id,
             cancel: crate::core::CancelToken::new(),
-         agent_root: None, }
+            agent_root: None,
+        }
     }
 
     async fn dispatch(harness: Arc<HostWorker>, input: Input) -> generative_model::ToolResult {
@@ -1511,8 +1494,7 @@ mod tests {
             "cd",
             "cd /tmp; ls",
         ] {
-            let input: Input =
-                serde_json::from_value(json!({"command": command})).unwrap();
+            let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
             let err = resolve_action(&input).unwrap_err();
             assert!(
                 err.contains("must not start with `cd`") && err.contains("`cwd`"),
@@ -1522,8 +1504,7 @@ mod tests {
 
         // Not a leading shell `cd` word — allowed.
         for command in ["cdo something", "echo cd /tmp", "true && cd /tmp"] {
-            let input: Input =
-                serde_json::from_value(json!({"command": command})).unwrap();
+            let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
             assert!(
                 resolve_action(&input).is_ok(),
                 "should allow command={command:?}"
@@ -1763,9 +1744,7 @@ mod tests {
         let marker_s = marker.to_string_lossy().into_owned();
         // Unique sleep arg so we can find the grandchild without matching other tests.
         let sleep_tag = format!("17.{}", uuid::Uuid::new_v4().as_u128() % 100_000);
-        let command = format!(
-            "sleep {sleep_tag}; echo still-alive > {marker_s}"
-        );
+        let command = format!("sleep {sleep_tag}; echo still-alive > {marker_s}");
 
         let t0 = Instant::now();
         let result = dispatch_json(
@@ -1800,7 +1779,9 @@ mod tests {
             .expect("ps");
         let ps_text = String::from_utf8_lossy(&ps.stdout);
         assert!(
-            !ps_text.lines().any(|l| l.contains(&format!("sleep {sleep_tag}"))),
+            !ps_text
+                .lines()
+                .any(|l| l.contains(&format!("sleep {sleep_tag}"))),
             "grandchild sleep should have been process-group killed; still running:\n{ps_text}"
         );
         assert!(
@@ -1813,9 +1794,10 @@ mod tests {
     #[tokio::test]
     async fn exec_cancel_kills_runaway() {
         let service = Arc::new(BashService::new());
-        let harness = Arc::new(HostWorker::new("test", vec![
-            service.clone() as Arc<dyn ToolService>,
-        ]));
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![service.clone() as Arc<dyn ToolService>],
+        ));
         let cancel = crate::core::CancelToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
@@ -1833,7 +1815,8 @@ mod tests {
                 HostDispatchContext {
                     agent_id: uuid::Uuid::nil(),
                     cancel,
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
         let elapsed = t0.elapsed();
@@ -1950,11 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_cd_prefix_at_dispatch() {
         let harness = harness();
-        let result = dispatch_json(
-            harness,
-            json!({"command": "cd /tmp && pwd"}),
-        )
-        .await;
+        let result = dispatch_json(harness, json!({"command": "cd /tmp && pwd"})).await;
         assert!(result.is_error, "cd-prefixed command should fail");
         let text = result_text(&result);
         assert!(
@@ -1979,7 +1958,11 @@ mod tests {
         )
         .await;
         let elapsed = t0.elapsed();
-        assert!(result.is_error, "expected tool error, got: {}", result_text(&result));
+        assert!(
+            result.is_error,
+            "expected tool error, got: {}",
+            result_text(&result)
+        );
         let text = result_text(&result);
         assert!(
             text.contains("exceeds max") && text.contains(&MAX_EXEC_TIMEOUT_MS.to_string()),
@@ -2007,7 +1990,11 @@ mod tests {
         )
         .await;
         let elapsed = t0.elapsed();
-        assert!(result.is_error, "expected tool error, got: {}", result_text(&result));
+        assert!(
+            result.is_error,
+            "expected tool error, got: {}",
+            result_text(&result)
+        );
         let text = result_text(&result);
         assert!(
             text.contains("exceeds max") && text.contains(&MAX_TIMEOUT_MS.to_string()),
@@ -2463,9 +2450,10 @@ mod tests {
     #[tokio::test]
     async fn session_foreign_owner_rejected() {
         let service = Arc::new(BashService::new());
-        let harness = Arc::new(HostWorker::new("test", vec![
-            service.clone() as Arc<dyn ToolService>,
-        ]));
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![service.clone() as Arc<dyn ToolService>],
+        ));
         let owner_a = uuid::Uuid::new_v4();
         let owner_b = uuid::Uuid::new_v4();
         let id = unique_id("own");
@@ -2483,7 +2471,8 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
         assert!(!start.is_error, "start: {}", result_text(&start));
@@ -2505,7 +2494,8 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_b,
                     cancel: crate::core::CancelToken::new(),
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
         assert!(write.is_error, "foreign write should fail");
@@ -2529,11 +2519,20 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
-        assert!(!write_ok.is_error, "owner write: {}", result_text(&write_ok));
-        assert!(result_text(&write_ok).contains("yep"), "{}", result_text(&write_ok));
+        assert!(
+            !write_ok.is_error,
+            "owner write: {}",
+            result_text(&write_ok)
+        );
+        assert!(
+            result_text(&write_ok).contains("yep"),
+            "{}",
+            result_text(&write_ok)
+        );
 
         let _ = harness
             .dispatch_tool_use(
@@ -2541,7 +2540,8 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
     }
@@ -2549,9 +2549,10 @@ mod tests {
     #[tokio::test]
     async fn agent_drop_reaps_owned_sessions() {
         let service = Arc::new(BashService::new());
-        let harness = Arc::new(HostWorker::new("test", vec![
-            service.clone() as Arc<dyn ToolService>,
-        ]));
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![service.clone() as Arc<dyn ToolService>],
+        ));
         let agent_id = uuid::Uuid::new_v4();
         let id = unique_id("reap");
 
@@ -2569,7 +2570,8 @@ mod tests {
                 HostDispatchContext {
                     agent_id,
                     cancel: crate::core::CancelToken::new(),
-                 agent_root: None, },
+                    agent_root: None,
+                },
             )
             .await;
         assert!(!start.is_error, "start: {}", result_text(&start));
@@ -2600,6 +2602,4 @@ mod tests {
             );
         }
     }
-
-
 }

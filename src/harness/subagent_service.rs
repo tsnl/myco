@@ -4,12 +4,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::Harness;
 use crate::core::Async;
 use crate::generative_model::{self, Content, GenerativeModelConfig, Message, Model};
 use crate::prompts;
-use crate::session::{uuid_simple_hex, Agent, AgentEvent, EventSink, TraceContext};
+use crate::session::{Agent, AgentEvent, EventSink, TraceContext, uuid_simple_hex};
 use crate::tool_services::{HostDispatchContext, ToolService};
-use crate::Harness;
 
 const SUBAGENT_SYSTEM_PROMPT_PROLOGUE: &str = r#"
 You are a subagent being instructed by a supervisor agent.

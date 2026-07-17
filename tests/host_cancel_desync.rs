@@ -48,10 +48,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
         )
         .await;
     assert!(cancelled.is_error, "{cancelled:?}");
-    assert!(
-        tool_text(&cancelled).contains("cancelled"),
-        "{cancelled:?}"
-    );
+    assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
 
     // Next call must complete on the live (or respawned) connection.
     let result = tokio::time::timeout(

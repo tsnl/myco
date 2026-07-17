@@ -19,7 +19,15 @@ pub trait GenerativeModel: Send + Sync {
 /// Serde / JSON Schema use the same canonical wire strings as [`Model::api_id`].
 /// Extra aliases are accepted on deserialize only (for CLI / human input).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
 )]
 pub enum Model {
     // Anthropic Messages API
@@ -339,8 +347,12 @@ impl ToolResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Content {
-    Text { text: String },
-    Image { source: String },
+    Text {
+        text: String,
+    },
+    Image {
+        source: String,
+    },
     /// Model thinking *summary* (session history + live UI).
     ///
     /// Stored in agent/session history for resume, but **stripped when backends
@@ -364,11 +376,7 @@ impl Content {
 
 /// Clone only answer blocks (`Text` / `Image`), dropping thinking.
 pub fn answer_content(content: &[Content]) -> Vec<Content> {
-    content
-        .iter()
-        .filter(|c| c.is_answer())
-        .cloned()
-        .collect()
+    content.iter().filter(|c| c.is_answer()).cloned().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -383,8 +391,12 @@ pub enum MessagePart {
 
 #[derive(Debug, Clone)]
 pub enum ContentStart {
-    Text { index: usize },
-    Image { index: usize },
+    Text {
+        index: usize,
+    },
+    Image {
+        index: usize,
+    },
     Thinking {
         index: usize,
         signature: Option<String>,
@@ -551,9 +563,8 @@ impl GenerateOutput {
                     source.push_str(&delta);
                 }
                 MessagePart::ContentDelta(ContentDelta::Thinking { index, delta }) => {
-                    let Some(Some(Content::Thinking {
-                        text, redacted, ..
-                    })) = content.get_mut(index)
+                    let Some(Some(Content::Thinking { text, redacted, .. })) =
+                        content.get_mut(index)
                     else {
                         return Err(GenerateError::MalformedResponseError(format!(
                             "Malformed stream: thinking delta index {index} is out of bounds \
@@ -651,7 +662,6 @@ pub enum ModelCreationError {
 mod tests {
     use super::*;
 
-    
     #[tokio::test]
     async fn accumulate_thinking_then_text() {
         use futures::stream;
@@ -697,7 +707,7 @@ mod tests {
         assert_eq!(answer_content(&output.content).len(), 1);
     }
 
-#[test]
+    #[test]
     fn default_backend_matches_model_kind() {
         assert_eq!(
             BackendConfig::default_for_model(Model::ClaudeHaiku45).kind(),
@@ -789,18 +799,14 @@ mod tests {
         let messages = vec![
             Message::UserMessage {
                 content: vec![
-                    Content::Text {
-                        text: "hi".into(),
-                    },
+                    Content::Text { text: "hi".into() },
                     Content::Image {
                         source: "data".into(),
                     },
                 ],
             },
             Message::AssistantMessage {
-                content: vec![Content::Text {
-                    text: "ok".into(),
-                }],
+                content: vec![Content::Text { text: "ok".into() }],
                 tool_uses: vec![ToolUse {
                     id: "t1".into(),
                     name: "bash".into(),
@@ -825,9 +831,11 @@ mod tests {
         ];
         let json = serde_json::to_string(&messages).expect("serialize");
         let back: Vec<Message> = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&messages).unwrap());
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
     }
-
 }
 
 #[derive(thiserror::Error, Debug)]

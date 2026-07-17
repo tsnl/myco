@@ -187,7 +187,9 @@ impl BrowserService {
                     "timed out"
                 };
                 if partial.trim().is_empty() {
-                    return Err(format!("lynx_tui_browser {why} after {timeout_secs}s (no output)"));
+                    return Err(format!(
+                        "lynx_tui_browser {why} after {timeout_secs}s (no output)"
+                    ));
                 }
                 let mut out = format!("status: {why}\nurl: {url}\npartial: true\n\n");
                 out.push_str(&truncate_bytes(&partial, max_bytes));
@@ -229,10 +231,7 @@ impl BrowserService {
                     ));
                 }
                 if !stderr.trim().is_empty() {
-                    out.push_str(&format!(
-                        "stderr: {}\n",
-                        stderr.trim().replace('\n', " | ")
-                    ));
+                    out.push_str(&format!("stderr: {}\n", stderr.trim().replace('\n', " | ")));
                 }
                 out.push('\n');
                 out.push_str(&truncate_bytes(&stdout, max_bytes));
@@ -374,12 +373,21 @@ mod tests {
         assert_eq!(specs.len(), 1);
         let d = &specs[0].description;
         assert!(d.contains("web search") || d.contains("Web search"), "{d}");
-        assert!(d.contains("browsing") || d.contains("Simple browsing"), "{d}");
+        assert!(
+            d.contains("browsing") || d.contains("Simple browsing"),
+            "{d}"
+        );
         assert!(d.contains("list_links"), "{d}");
         assert!(d.contains("References"), "{d}");
-        assert!(d.contains("lite.duckduckgo.com") || d.contains("bing.com"), "{d}");
+        assert!(
+            d.contains("lite.duckduckgo.com") || d.contains("bing.com"),
+            "{d}"
+        );
         // Default keeps link IDs (no -nolist unless list_links=false).
-        assert!(d.contains("default true") || d.contains("list_links=true"), "{d}");
+        assert!(
+            d.contains("default true") || d.contains("list_links=true"),
+            "{d}"
+        );
     }
 
     #[test]

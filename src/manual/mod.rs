@@ -46,11 +46,7 @@ pub fn article(id: &str) -> Option<&'static Article> {
 
 /// Known article ids, comma-separated (for error messages).
 pub fn known_ids() -> String {
-    ARTICLES
-        .iter()
-        .map(|a| a.id)
-        .collect::<Vec<_>>()
-        .join(", ")
+    ARTICLES.iter().map(|a| a.id).collect::<Vec<_>>().join(", ")
 }
 
 /// Catalog text for the `manual` tool `list` action and CLI help footer.

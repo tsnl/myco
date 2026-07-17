@@ -8,10 +8,8 @@ use std::time::Duration;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
 
-use super::discover::{discover_auto_index_targets, AutoIndexTarget};
-use super::index::{
-    is_under, read_text_file, resolve_path, walk_text_files, Hit, SearchIndex,
-};
+use super::discover::{AutoIndexTarget, discover_auto_index_targets};
+use super::index::{Hit, SearchIndex, is_under, read_text_file, resolve_path, walk_text_files};
 
 /// Shared engine handle (cheap to clone).
 ///
@@ -277,10 +275,7 @@ impl TextSearchEngine {
         let watching = {
             let st = self.inner.lock().await;
             st.watchers.contains_key(&path_key(&resolved))
-                && st
-                    .roots
-                    .iter()
-                    .any(|r| r.path == resolved && r.ready)
+                && st.roots.iter().any(|r| r.path == resolved && r.ready)
         };
 
         Ok(IndexReport {
@@ -335,7 +330,9 @@ impl TextSearchEngine {
             if let Some(r) = st.roots.iter_mut().find(|r| r.path == root) {
                 r.ready = true;
                 // Keep watcher error notes if any; clear crawl errors.
-                if r.error.as_ref().is_some_and(|e| e.starts_with("tantivy") || e.contains("commit"))
+                if r.error
+                    .as_ref()
+                    .is_some_and(|e| e.starts_with("tantivy") || e.contains("commit"))
                 {
                     r.error = None;
                 }
@@ -413,14 +410,11 @@ impl TextSearchEngine {
         };
 
         // Wait until covering roots are ready (or fail if none).
-        let roots_used = self
-            .wait_for_coverage(filter.as_deref())
-            .await?;
+        let roots_used = self.wait_for_coverage(filter.as_deref()).await?;
 
         let mut st = self.inner.lock().await;
         let hits_raw: Vec<Hit> = if semantic {
-            st.index
-                .search_semantic(&query, filter.as_deref(), limit)?
+            st.index.search_semantic(&query, filter.as_deref(), limit)?
         } else {
             st.index.search_exact(&query, filter.as_deref(), limit)?
         };
@@ -456,10 +450,7 @@ impl TextSearchEngine {
     }
 
     /// Ensure `path` (or entire forest if None) has ready covering roots.
-    async fn wait_for_coverage(
-        &self,
-        path: Option<&Path>,
-    ) -> Result<Vec<PathBuf>, String> {
+    async fn wait_for_coverage(&self, path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             {
@@ -472,11 +463,8 @@ impl TextSearchEngine {
                     );
                 }
                 if let Some(p) = path {
-                    let covering: Vec<_> = st
-                        .roots
-                        .iter()
-                        .filter(|r| is_under(&r.path, p))
-                        .collect();
+                    let covering: Vec<_> =
+                        st.roots.iter().filter(|r| is_under(&r.path, p)).collect();
                     if covering.is_empty() {
                         return Err(format!(
                             "path {} is not under any indexed root. Indexed roots: {}. \
@@ -623,7 +611,10 @@ mod tests {
 
         let eng = TextSearchEngine::start_for_tests();
         let report = eng.index_directory(dir.join("skills")).await.unwrap();
-        assert!(report.watching || report.status.contains("persistently indexed"), "{report:?}");
+        assert!(
+            report.watching || report.status.contains("persistently indexed"),
+            "{report:?}"
+        );
 
         // Wait for ready
         for _ in 0..100 {

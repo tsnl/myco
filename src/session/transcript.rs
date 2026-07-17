@@ -377,9 +377,9 @@ mod tests {
         assert!(rendered.contains("Thinking: secret-thought-aaa\n"));
         assert!(rendered.contains("Thinking: secret-thought-bbb\n"));
         // Blank line between consecutive thinking paragraphs.
-        assert!(rendered.contains(
-            "Thinking: secret-thought-aaa\n\nThinking: secret-thought-bbb\n"
-        ));
+        assert!(
+            rendered.contains("Thinking: secret-thought-aaa\n\nThinking: secret-thought-bbb\n")
+        );
         assert!(rendered.contains("Thinking: secret-thought-bbb\n\ndone\n"));
         assert!(rendered.contains("RESPONSE\n"));
     }

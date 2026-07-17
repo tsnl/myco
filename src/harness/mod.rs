@@ -9,27 +9,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::session::{EventSink, TraceContext};
 use crate::core::{Async, CancelToken};
 use crate::generative_model;
+use crate::session::{EventSink, TraceContext};
 use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    default_config_path, example_config_toml, load_harness_config, parse_harness_config_str,
-    FileConfig, FileRemoteHost,
+    FileConfig, FileRemoteHost, default_config_path, example_config_toml, load_harness_config,
+    parse_harness_config_str,
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
-pub use crate::host::{HostController, HostConfig};
+pub use crate::host::{HostConfig, HostController};
 
 mod subagent_service;
 pub use subagent_service::{AgentRootHandles, SubagentService};
 
 mod ssh;
 pub use ssh::{
-    ensure_remote_ssh_identities, print_preflight_report, ssh_destination_from_command,
-    SshAgentPreflightReport,
+    SshAgentPreflightReport, ensure_remote_ssh_identities, print_preflight_report,
+    ssh_destination_from_command,
 };
 
 /// Structured SSH fields for one remote host (from config).
@@ -57,7 +57,8 @@ impl RemoteHostConfig {
                 continue;
             }
             // Avoid duplicating BatchMode if the user listed it.
-            if opt.eq_ignore_ascii_case("BatchMode=yes") || opt.eq_ignore_ascii_case("BatchMode=Yes")
+            if opt.eq_ignore_ascii_case("BatchMode=yes")
+                || opt.eq_ignore_ascii_case("BatchMode=Yes")
             {
                 continue;
             }
@@ -371,11 +372,7 @@ impl Harness {
         self.host_names()
             .into_iter()
             .map(|name| {
-                let command = self
-                    .host_commands
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default();
+                let command = self.host_commands.get(&name).cloned().unwrap_or_default();
                 let client = self.hosts.get(&name).expect("host map key");
                 HostStatus {
                     connected: client.is_connected(),
@@ -432,16 +429,16 @@ impl Harness {
             };
 
             // Root handles for in-process local (subagent etc.); remotes ignore.
-            let agent_root: Option<Arc<dyn std::any::Any + Send + Sync>> =
-                if client.is_in_process() {
-                    Some(Arc::new(crate::harness::AgentRootHandles {
-                        harness: self.clone(),
-                        sink,
-                        context: context.clone(),
-                    }) as Arc<dyn std::any::Any + Send + Sync>)
-                } else {
-                    None
-                };
+            let agent_root: Option<Arc<dyn std::any::Any + Send + Sync>> = if client.is_in_process()
+            {
+                Some(Arc::new(crate::harness::AgentRootHandles {
+                    harness: self.clone(),
+                    sink,
+                    context: context.clone(),
+                }) as Arc<dyn std::any::Any + Send + Sync>)
+            } else {
+                None
+            };
 
             client
                 .call_with_root(context.agent_id, tool_use, cancel, agent_root)
@@ -579,10 +576,7 @@ mod tests {
             input: json!({"command": "echo", "host": "devbox", "timeout_ms": 500}),
         };
         strip_host_field(&mut tu);
-        assert_eq!(
-            tu.input,
-            json!({"command": "echo", "timeout_ms": 500})
-        );
+        assert_eq!(tu.input, json!({"command": "echo", "timeout_ms": 500}));
     }
 
     #[test]
@@ -644,10 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn root_only_tools_keep_host_field_and_run_local() {
+        use crate::CancelToken;
         use crate::generative_model::{Content, Model};
         use crate::session::{ActiveSession, Session};
         use crate::tool_services::SessionMetaTool;
-        use crate::CancelToken;
 
         let dir = std::env::temp_dir().join(format!(
             "myco-root-only-host-{}",
@@ -793,7 +787,7 @@ mod tests {
                         "--name".into(),
                         "a".into(),
                     ],
-                    ssh_destination: None
+                    ssh_destination: None,
                 },
                 HostConfig {
                     name: "b".into(),
@@ -804,7 +798,7 @@ mod tests {
                         "--name".into(),
                         "b".into(),
                     ],
-                    ssh_destination: None
+                    ssh_destination: None,
                 },
             ],
         };
@@ -814,7 +808,12 @@ mod tests {
         assert_eq!(status.len(), 3); // local + a + b
         let local = status.iter().find(|s| s.name == "local").unwrap();
         assert!(local.connected && local.in_process);
-        assert!(status.iter().filter(|s| s.name != "local").all(|s| !s.connected));
+        assert!(
+            status
+                .iter()
+                .filter(|s| s.name != "local")
+                .all(|s| !s.connected)
+        );
 
         // Default → local (in-process).
         let r = harness

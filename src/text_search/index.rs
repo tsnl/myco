@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{Query, QueryParser};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value,
-    STORED, STRING,
+    Field, IndexRecordOption, STORED, STRING, Schema, TantivyDocument, TextFieldIndexing,
+    TextOptions, Value,
 };
-use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
+use tantivy::{Index, IndexWriter, ReloadPolicy, Term, doc};
 
 /// Hard caps so accidental huge trees don't blow memory.
 pub const MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -233,7 +233,10 @@ impl SearchIndex {
         };
 
         let top = searcher
-            .search(&tq, &TopDocs::with_limit(limit.saturating_mul(4).max(limit)))
+            .search(
+                &tq,
+                &TopDocs::with_limit(limit.saturating_mul(4).max(limit)),
+            )
             .map_err(|e| format!("tantivy search: {e}"))?;
 
         let prefix = path_prefix.map(path_key);
@@ -262,11 +265,7 @@ impl SearchIndex {
                         .get_first(self.body_field)
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    (
-                        None,
-                        None,
-                        truncate(body.lines().next().unwrap_or(""), 240),
-                    )
+                    (None, None, truncate(body.lines().next().unwrap_or(""), 240))
                 }
             };
             hits.push(Hit {
@@ -309,10 +308,7 @@ impl SearchIndex {
                 scored.push((score, key.clone()));
             }
         }
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
         let mut hits = Vec::with_capacity(scored.len());
@@ -372,10 +368,7 @@ fn first_queryish_line(lines: &[String], query: &str) -> String {
             return truncate(line, 240);
         }
     }
-    lines
-        .first()
-        .map(|l| truncate(l, 240))
-        .unwrap_or_default()
+    lines.first().map(|l| truncate(l, 240)).unwrap_or_default()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -402,7 +395,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     // vectors stored L2-normalized
     dot
 }
-
 
 fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     let clipped: String = text.chars().take(MAX_EMBED_CHARS).collect();

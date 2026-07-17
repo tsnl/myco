@@ -141,11 +141,7 @@ impl ToolService for TextSearchToolService {
                             ));
                         }
                     };
-                    match self
-                        .engine
-                        .search_exact(search_opts(input))
-                        .await
-                    {
+                    match self.engine.search_exact(search_opts(input)).await {
                         Ok(r) => ToolResult::text(format_search_report(&r)),
                         Err(e) => ToolResult::err(e),
                     }
@@ -159,11 +155,7 @@ impl ToolService for TextSearchToolService {
                             ));
                         }
                     };
-                    match self
-                        .engine
-                        .search_semantic(search_opts(input))
-                        .await
-                    {
+                    match self.engine.search_semantic(search_opts(input)).await {
                         Ok(r) => ToolResult::text(format_search_report(&r)),
                         Err(e) => ToolResult::err(e),
                     }
@@ -283,8 +275,8 @@ struct DropInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::ToolUse;
     use crate::CancelToken;
+    use crate::generative_model::ToolUse;
     use serde_json::json;
     use std::fs;
     use std::time::Duration;

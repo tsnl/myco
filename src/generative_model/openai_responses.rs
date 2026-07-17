@@ -963,7 +963,6 @@ mod tests {
         assert!(events[1].contains("output_text.delta"));
     }
 
-
     #[test]
     fn stream_accumulator_reasoning_to_thinking() {
         let mut acc = StreamAccumulator::default();
@@ -971,7 +970,9 @@ mod tests {
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
-                item: ResponsesOutputItem::Reasoning { id: Some("r1".into()) },
+                item: ResponsesOutputItem::Reasoning {
+                    id: Some("r1".into()),
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -1019,7 +1020,9 @@ mod tests {
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
-                item: ResponsesOutputItem::Reasoning { id: Some("r1".into()) },
+                item: ResponsesOutputItem::Reasoning {
+                    id: Some("r1".into()),
+                },
             })
             .unwrap();
         assert!(matches!(

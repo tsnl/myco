@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::core::CancelToken;
 use crate::generative_model::{
-    self, answer_content, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel,
-    Message, MessagePart, ToolResult, ToolUse, TurnEndReason,
+    self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
+    MessagePart, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
 
@@ -82,15 +82,9 @@ pub enum AgentEvent {
         depth: usize,
     },
     /// Incremental assistant text (for streaming UX).
-    TextDelta {
-        text: String,
-        context: TraceContext,
-    },
+    TextDelta { text: String, context: TraceContext },
     /// Incremental thinking *summary* text (streamed for UI; also stored in history).
-    ThinkingDelta {
-        text: String,
-        context: TraceContext,
-    },
+    ThinkingDelta { text: String, context: TraceContext },
     ToolStarted {
         tool_use: ToolUse,
         context: TraceContext,
@@ -503,10 +497,7 @@ mod tests {
                     .push((tool_use.id.clone(), started));
                 tokio::time::sleep(self.delay).await;
                 let ended = Instant::now();
-                self.ends
-                    .lock()
-                    .unwrap()
-                    .push((tool_use.id.clone(), ended));
+                self.ends.lock().unwrap().push((tool_use.id.clone(), ended));
                 ToolResult::text(format!("done:{}", tool_use.id))
             })
         }
@@ -642,9 +633,7 @@ mod tests {
                     let part = if step == 0 {
                         MessagePart::MessageStart
                     } else if step == 1 {
-                        MessagePart::ContentStart(generative_model::ContentStart::Text {
-                            index: 0,
-                        })
+                        MessagePart::ContentStart(generative_model::ContentStart::Text { index: 0 })
                     } else if step <= chunks + 1 {
                         tokio::time::sleep(delay).await;
                         MessagePart::ContentDelta(ContentDelta::Text {
@@ -677,12 +666,7 @@ mod tests {
 
         let t0 = Instant::now();
         let err = agent
-            .interact(
-                vec![Content::Text {
-                    text: "go".into(),
-                }],
-                cancel,
-            )
+            .interact(vec![Content::Text { text: "go".into() }], cancel)
             .await
             .expect_err("should cancel");
         let elapsed = t0.elapsed();
@@ -730,12 +714,7 @@ mod tests {
 
         let t0 = Instant::now();
         let err = agent
-            .interact(
-                vec![Content::Text {
-                    text: "run".into(),
-                }],
-                cancel,
-            )
+            .interact(vec![Content::Text { text: "run".into() }], cancel)
             .await
             .expect_err("should cancel");
         let elapsed = t0.elapsed();
@@ -787,11 +766,7 @@ mod tests {
             &self,
             _input: &[Message],
         ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
-            let maybe = self
-                .scripts
-                .lock()
-                .expect("scripts lock")
-                .pop_front();
+            let maybe = self.scripts.lock().expect("scripts lock").pop_front();
             match maybe {
                 Some(output) => {
                     // Reuse ScriptedModel streaming shape via a one-shot queue.
@@ -877,9 +852,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
-                vec![Content::Text {
-                    text: "hi".into(),
-                }],
+                vec![Content::Text { text: "hi".into() }],
                 crate::core::CancelToken::new(),
             )
             .await

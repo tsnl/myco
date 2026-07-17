@@ -5,7 +5,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use candle_core::{Device, Tensor, DType};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -59,16 +59,16 @@ fn load_minilm() -> Result<CandleEmbedder, String> {
     }
 
     let device = Device::Cpu;
-    let config: Config = serde_json::from_slice(CONFIG_JSON)
-        .map_err(|e| format!("parse config.json: {e}"))?;
+    let config: Config =
+        serde_json::from_slice(CONFIG_JSON).map_err(|e| format!("parse config.json: {e}"))?;
 
     // Buffered safetensors (weights already in the binary via include_bytes!).
     let vb = VarBuilder::from_buffered_safetensors(MODEL_WEIGHTS.to_vec(), DTYPE, &device)
         .map_err(|e| format!("safetensors: {e}"))?;
     let model = BertModel::load(vb, &config).map_err(|e| format!("BertModel::load: {e}"))?;
 
-    let mut tokenizer = Tokenizer::from_bytes(TOKENIZER_JSON)
-        .map_err(|e| format!("tokenizer: {e}"))?;
+    let mut tokenizer =
+        Tokenizer::from_bytes(TOKENIZER_JSON).map_err(|e| format!("tokenizer: {e}"))?;
     let _ = tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
         ..Default::default()
@@ -121,9 +121,7 @@ impl CandleEmbedder {
             .map_err(|e| format!("mask dtype: {e}"))?
             .unsqueeze(2)
             .map_err(|e| format!("mask unsqueeze: {e}"))?;
-        let sum_mask = mask_f
-            .sum(1)
-            .map_err(|e| format!("sum_mask: {e}"))?;
+        let sum_mask = mask_f.sum(1).map_err(|e| format!("sum_mask: {e}"))?;
         let summed = embeddings
             .broadcast_mul(&mask_f)
             .map_err(|e| format!("mask mul: {e}"))?
@@ -189,9 +187,7 @@ mod tests {
         let a = embed_text("extract text from PDF documents").unwrap();
         let b = embed_text("parse PDF files and forms").unwrap();
         let c = embed_text("banana bread recipe with muffins").unwrap();
-        let sim = |x: &[f32], y: &[f32]| -> f32 {
-            x.iter().zip(y).map(|(u, v)| u * v).sum()
-        };
+        let sim = |x: &[f32], y: &[f32]| -> f32 { x.iter().zip(y).map(|(u, v)| u * v).sum() };
         assert!(
             sim(&a, &b) > sim(&a, &c),
             "pdf-pdf {} vs pdf-banana {}",

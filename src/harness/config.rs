@@ -140,14 +140,12 @@ pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read config {}: {e}", path.display()))?;
-    parse_harness_config_str(&text)
-        .map_err(|e| format!("parse config {}: {e}", path.display()))
+    parse_harness_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
 }
 
 /// Parse a TOML config string into [`HarnessConfig`].
 pub fn parse_harness_config_str(text: &str) -> Result<HarnessConfig, String> {
-    let file: FileConfig =
-        toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
+    let file: FileConfig = toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
     file.into_harness_config()
 }
 
@@ -215,7 +213,10 @@ identity_file = "~/.ssh/id_ed25519"
         assert!(cmd.windows(2).any(|w| w == ["-o", "ConnectTimeout=5"]));
         assert!(cmd.windows(2).any(|w| w == ["-p", "2222"]));
         assert!(cmd.windows(2).any(|w| w == ["-l", "alice"]));
-        assert!(cmd.windows(2).any(|w| w[0] == "-i" && w[1].contains("id_ed25519")));
+        assert!(
+            cmd.windows(2)
+                .any(|w| w[0] == "-i" && w[1].contains("id_ed25519"))
+        );
         assert!(cmd.iter().any(|s| s == "devbox"));
         assert!(cmd.iter().any(|s| s == "myco"));
         assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
