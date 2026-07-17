@@ -50,6 +50,30 @@ cargo install myco
 myco
 ```
 
+### Web GUI (`myco --mode server`)
+
+A browser frontend (`crates/myco-gui`, Yew/wasm) over the **same** harness,
+sessions, and hosts as the CLI: monitor multiple sessions concurrently, watch
+streaming turns, and expand running tools/subagents.
+
+```bash
+# Production: build the client, then serve API + GUI from one process:
+trunk build                       # emits crates/myco-gui/dist/
+myco --mode server --dist crates/myco-gui/dist
+# → http://127.0.0.1:8000  (API at /api, GUI at /)
+```
+
+```bash
+# Development (hot-reload): run the API server (no --dist) and Trunk together:
+myco --mode server                # API only, on :8000
+trunk serve                       # client on :8080, proxies /api → :8000
+# → http://127.0.0.1:8080  (edits to crates/myco-gui reload live)
+```
+
+`--bind`/`--port` override the address (default `127.0.0.1:8000`, matching
+`Trunk.toml`'s `/api` proxy). The server reuses `~/.myco/{config,session}` just
+like the CLI — it is a second front-end, not a second runtime.
+
 ### LLM API credentials
 
 `myco` loads a `.env` from the current directory (via `dotenvy`) and also reads

@@ -164,6 +164,101 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ---
 
+## myco-gui — web frontend + shared core (PR #13 and its stack)
+
+Goal: a web UI that looks like **a slightly more polished CLI**, sharing the
+runtime with the CLI so the two never diverge. **The CLI stays first-class**: it
+must remain usable over a dumb pipe (`tee`, a COM port, a monochrome printer) —
+print speed notwithstanding. The GUI is a second *presentation*, never a second
+*runtime*.
+
+### Architecture principle — one core, thin presentations
+
+The seam is already in the codebase: **`EventSink`** separates *what happened*
+(runtime events) from *how it is shown* (CLI stdout vs. SSE broadcast). Extend
+that seam to the whole app.
+
+- **`src/application` (Phase 0, do FIRST):** a transport-agnostic `Application`
+  owning `Harness`, model/effort/debug config, the session registry
+  (create/open/list live+saved), `build_model`, and the **single** system-prompt
+  source. Exposes `run_turn(session, input, sink, cancel)` (sink injected) and
+  command handlers that return **data structs**, not printed strings.
+- **CLI (`src/bin/myco.rs`):** thin adapter = readline loop + `CliEventSink` +
+  char-rules rendering of the returned structs.
+- **Server (`src/server/*`):** thin adapter = rocket/SSE + `BroadcastSink` +
+  JSON of the same structs.
+- **Litmus test for every fn:** does it decide *what the app does* or *how it is
+  displayed*? Core gets the *what*; CLI/GUI keep the *how*. Never unify
+  presentation — the CLI's char rules and the GUI's `<hr>`/color divs are meant
+  to differ. Unify **logic + data structs only**.
+
+Known drift to kill in Phase 0 (already two copies):
+- `SYSTEM_PROMPT_PROLOGUE` (defined in both `server/state.rs` and `bin/myco.rs`).
+- `build_model` (backend config, effort, tool specs, prompt assembly).
+- Session lifecycle (new/resume/model-parse/history-load).
+- Session/host presentation DTOs (`server::messages_view` vs CLI
+  `format_session_detail` / `print_host_status`): core returns `SessionDetail` /
+  `HostStatus`; CLI formats to text, GUI serializes to JSON.
+
+Phase 0 success criteria:
+- `SYSTEM_PROMPT_PROLOGUE` and `build_model` each exist **once**.
+- CLI behavior byte-identical (existing `transcript.rs` tests still pass).
+- Server behavior unchanged.
+- Lands as its **own PR under #13**; the GUI rewrite sits on top and consumes the
+  clean `Application`.
+
+### Deferred (described, NOT a Phase-0 assumption): "CLI as HTTP client"
+
+Tempting end state (LSP / Docker / Jupyter-kernel style): the server is the only
+runtime; both CLI and GUI are clients. **Do not require this for the CLI.** It
+regresses the explicit robustness goal (a pure-HTTP CLI depends on a socket + SSE
++ a healthy daemon; in-process depends on none of that) and front-loads daemon
+lifecycle complexity (stale servers, port conflicts, version skew, zombies) we
+do not need yet.
+
+The correct shape — enabled by Phase 0, opt-in later, **in-process default**
+(like `git`: local ops in-process, *also* speaks a wire protocol to remotes):
+
+```
+myco                 → in-process Application   (default: fast, robust, no daemon)
+myco --connect URL   → HTTP client to a remote/hosted server   (future)
+myco --mode server   → serves Application over HTTP+SSE
+```
+
+This unlocks the hosted/container/SSH-remote north star without making the local
+CLI pay a daemon tax. Same Phase-0 work either way; the client driver is a later
+phase, not a foundation.
+
+### Shipping phases (GUI)
+
+- [ ] **Phase 0 — `src/application` extraction** (own PR under #13). See above.
+- [ ] **Phase 1 — CLI-parity web UI (SHIP THIS FIRST).** Scrap the current GUI.
+      Match the CLI experience almost exactly, with two deltas:
+  - Horizontal rules are real `<hr/>`-style elements spanning the **full dialog
+    width**, not printed box-drawing chars fixed at 72 cols.
+  - Use **color** to delineate outputs (USER / ASSISTANT / ERROR / thinking /
+    tools).
+  - Sections/headers mirror the CLI: `USER` (double rule), `ASSISTANT` (thin
+    rule), `ERROR`; `Thinking: …` paragraphs; `name(<pretty json>)` tool paras;
+    `USER used/max` context tokens.
+  - Scope: **no** session management beyond `/session`; **no** autocomplete.
+    Just render the transcript as a slightly-more-polished CLI. Then ship.
+- [ ] **Phase 2 — Markdown in output.** Input stays raw text; after Enter, past
+      messages render as Markdown. Do **not** vary header font sizes — keep `#`
+      prefixes as the header indicator, but always render headers **bold**.
+      Respect `*`/`_` italics and hyperlinks.
+- [ ] **Phase 3 — Interactivity.** Click-to-expand tool use + subagent
+      invocations; per-stream bash blocks (exit code / stdout / stderr); subagent
+      links (`myco-session://<id>` recognized + rendered as a hyperlink to the
+      subagent's session). Tab autocomplete + popups.
+- [ ] **Phase 4 — Session management + multitasking.** Multi-session sidebar,
+      concurrent sessions, session **search** (index all session JSON) replacing
+      the top-left title, **archive** sessions (+ button). Split user "notes"
+      (collapsible right-side panel, half-width) from the agent scratchpad.
+      (Search + archive may each be their own PR below #13; decide ordering.)
+
+---
+
 ### Features
 
 - [x] Powerful text search and indexing (v1)
