@@ -100,6 +100,36 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 
 ---
 
+## P2.5 — `myco-gui` (browser frontend)
+
+Richer client over the **same** harness/sessions/hosts as the CLI. Must not
+outrank P0 trust / P1 long-session work (see `AGENTS.md` ranking). Design:
+[`docs/myco-gui.md`](docs/myco-gui.md).
+
+- [ ] **`myco --mode server`** — new `Mode::Server` in `src/bin/myco.rs`; reuses
+      `load_harness_config` / `Harness` / `~/.myco` session store. Serves HTTP
+      via `rocket` (already a dep, currently unused). `--port` (default 8000,
+      matches `Trunk.toml`), `--bind` (default `127.0.0.1`).
+- [ ] **Session registry + read-only API** — list saved+live sessions, GET
+      metadata + transcript (`/api/sessions`, `/api/sessions/{id}`).
+- [ ] **Live turn** — `POST /api/sessions/{id}/messages` + `/events` stream
+      (SSE) wired to a real `Agent` + `EventSink`; `serde` for `AgentEvent` /
+      `ToolUse` / `TurnEndReason` behind the server boundary (no wire concerns
+      in the core CLI path). `TraceContext` already carries subagent/depth nesting.
+- [ ] **Cancel + metadata** — `POST /cancel` (`CancelToken`), `PATCH` for
+      title/scratchpad/links (backed by `session_meta`).
+- [ ] **GUI (`crates/myco-gui`, Yew/wasm, already scaffolded)** — multi-session
+      sidebar, expandable running-process/subagent/host-fanout tree, host
+      dashboard, transcript parity with the CLI (RESPONSE / `Thinking:` summary /
+      tool invocations). Built by `trunk` (dev proxy `/api` → `:8000`); **not**
+      in the root cargo/clippy/test matrix.
+- [ ] **Hosted, later** — containerized `--mode server`: persist all sessions
+      (volume-mount `~/.myco`), SSH into user remotes (`RemoteHostConfig`).
+      Adds auth / per-user isolation / secrets / TLS — out of scope until the
+      local GUI earns its keep.
+
+---
+
 ## P2 — Daily coding comfort
 
 Muscle-memory gaps vs Claude Code / Codex / OpenCode.
