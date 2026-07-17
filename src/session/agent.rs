@@ -223,6 +223,8 @@ impl Agent {
             let output = match accumulate_generate(stream, sink, context, cancel.clone()).await {
                 Ok(output) => output,
                 Err(GenerateOrCancel::Cancelled) => return self.finish_cancelled(),
+                // finish_generate_error emits TurnFinished so live ASSISTANT closes
+                // before the CLI opens an ERROR section.
                 Err(GenerateOrCancel::Generate(e)) => return self.finish_generate_error(e),
             };
 

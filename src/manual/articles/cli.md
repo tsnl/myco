@@ -30,8 +30,9 @@ Startup banner prints model, session, config path, hosts, and default host.
 - `.env` in cwd is loaded at startup. Full tables: `myco --help overview`.
 
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
-summary inside a unified RESPONSE section; it is stored in session history for resume/Ctrl-L
-but stripped from provider requests.
+summary inside a unified ASSISTANT section; it is stored in session history for resume/Ctrl-L
+but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
+ERROR section (live only; not stored in session history).
 
 Each live USER header is `USER <used>/<max>` (context tokens used / model window). `used` is 0
 until a provider usage report arrives.
