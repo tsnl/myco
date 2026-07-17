@@ -9,7 +9,8 @@ use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, list_all_sessions, list_sessions, normalize_pr_url, parse_pr_fields,
+    format_session_list_line, list_all_sessions, list_all_sessions_including_hidden,
+    list_sessions_filtered, normalize_pr_url, parse_pr_fields,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -24,7 +25,8 @@ Actions:
 - get: metadata for the current session (default) or another session via `session_id`
   (id or unique prefix). Always includes the on-disk file path and timestamps.
 - list: enumerate sessions (id, created, updated, title, link counts, path). Optional
-  `limit` (default 20; 0 = all readable sessions).
+  `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
+  workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
 - set_title: set or clear (`title` null/empty clears) the **current** session title.
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
 - add_link: attach a GitHub PR or worktree to the **current** session (deduped).
@@ -86,7 +88,7 @@ impl SessionMetaTool {
         let action = input.action.clone().unwrap_or(ActionKind::Get);
         match action {
             ActionKind::Get => self.action_get(input.session_id.as_deref()),
-            ActionKind::List => self.action_list(input.limit),
+            ActionKind::List => self.action_list(input.limit, input.include_hidden.unwrap_or(false)),
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => {
                 let text = input.scratchpad.unwrap_or_default();
@@ -107,12 +109,16 @@ impl SessionMetaTool {
         Ok(format_session_detail(&session))
     }
 
-    fn action_list(&self, limit: Option<usize>) -> Result<String, String> {
+    fn action_list(&self, limit: Option<usize>, include_hidden: bool) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
         let list = if limit == 0 {
-            list_all_sessions()?
+            if include_hidden {
+                list_all_sessions_including_hidden()?
+            } else {
+                list_all_sessions()?
+            }
         } else {
-            list_sessions(limit)?
+            list_sessions_filtered(limit, include_hidden)?
         };
         if list.is_empty() {
             return Ok("(no sessions)\n".into());
@@ -261,6 +267,9 @@ struct Input {
     /// Max sessions for `list` (default 20; 0 = all).
     #[serde(default)]
     limit: Option<usize>,
+    /// When true, `list` includes hidden sessions (subagents, compact workers).
+    #[serde(default)]
+    include_hidden: Option<bool>,
     /// New title for `set_title`. Empty/null clears.
     #[serde(default)]
     title: Option<String>,

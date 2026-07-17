@@ -19,7 +19,8 @@ pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink,
-    SESSION_FILE_VERSION, Session, SessionLink, SessionListEntry, TraceContext, uuid_simple_hex,
+    SESSION_FILE_VERSION, Session, SessionKind, SessionLink, SessionListEntry, TraceContext,
+    uuid_simple_hex,
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{

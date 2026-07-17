@@ -1231,6 +1231,9 @@ mod tests {
             title: Some("roundtrip".into()),
             links: vec![],
             scratchpad: String::new(),
+            hidden: false,
+            parent_session_id: None,
+            kind: myco::SessionKind::User,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 

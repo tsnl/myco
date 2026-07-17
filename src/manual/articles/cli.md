@@ -6,7 +6,7 @@ You cannot press these yourself — tell the user which command to run.
 |---------|---------|
 | `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
 | `/session` | Current session metadata (title, links, scratchpad, path) |
-| `/sessions` | Recent sessions (titles + link counts) |
+| `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
 | `/resume [id]` | Load conversation memory |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
