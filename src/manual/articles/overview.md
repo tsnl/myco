@@ -19,7 +19,8 @@ myco (interactive) / Agent
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
-  **local** host worker (standard tools plus root-only services such as `session_meta` / `subagent`).
+  **local** host worker (standard tools plus root-only services such as `session_meta` /
+  `subagent` / `memory`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
   text search) over NDJSON via SSH.
 - **Subagents** stay in the agent process and share this harness (same host pool).
@@ -32,6 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
+| `~/.myco/memory/memory-<ts>.md` | Shared cross-agent, cross-session memory (timestamped append-only entries; see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
@@ -101,6 +103,15 @@ Responses). Empty credentials fail model creation at startup.
   time). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
   `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
   code trees; only register small repeated scopes.
+
+## Cross-session memory
+
+Root-only `memory` tool (agent process; shared by supervisor and subagents, across
+sessions). Entries under `~/.myco/memory/` are **timestamped append-only** — appends never
+rewrite earlier content, so concurrent sessions do not conflict. Files rotate at a size
+cap; `exact_search` (Tantivy) and `semantic_search` (MiniLM) index one document per entry
+of the **latest** memory file only. Older files stay on disk for bash/grep; there is no
+GC/pruning yet. Distinct from the per-session `session_meta` scratchpad.
 
 ## Product limits (V1)
 
