@@ -29,9 +29,9 @@ Runs a subagent with the specified prompt as input.
 Single-shot, no multi-turn conversation, though the subagent may use multiple turns to process tool
 calls before replying.
 
-Creates a **hidden** session under `~/.myco/session/` whose id equals the subagent UUID (same as
-runtime agent_id). Hidden sessions are omitted from default `/sessions` / `session_meta list` but
-are fully accessible via get-by-id or `list` with `include_hidden: true`.
+Creates a session under `~/.myco/session/` with `kind: subagent` (not visible in default listings)
+whose id equals the subagent UUID (same as runtime agent_id). Accessible via get-by-id or
+`session_meta list` with `include_hidden: true`.
 
 The `model` field must be one of the supported model ids (see the tool input schema enum).
 "#;

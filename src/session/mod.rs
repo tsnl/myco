@@ -60,6 +60,18 @@ impl SessionKind {
     pub fn is_user(&self) -> bool {
         matches!(self, SessionKind::User)
     }
+
+    /// Visible in default `/sessions` / bare `--resume` / `session_meta list`.
+    ///
+    /// Visibility is derived from kind (not a separate stored flag): only
+    /// [`SessionKind::User`] sessions are visible.
+    pub fn is_visible(self) -> bool {
+        matches!(self, SessionKind::User)
+    }
+
+    pub fn is_hidden(self) -> bool {
+        !self.is_visible()
+    }
 }
 
 /// Full conversation session document.
@@ -80,14 +92,11 @@ pub struct Session {
     /// Per-session markdown scratchpad.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scratchpad: String,
-    /// When true, omit from default `/sessions` and bare `--resume` / list.
-    /// Still loadable by id and listed when `include_hidden` is set.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hidden: bool,
     /// Session / agent that spawned this one (subagent, compact worker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// Classification for filtering and UI.
+    /// Classification for filtering and UI. Visibility is derived via
+    /// [`SessionKind::is_visible`] (only [`SessionKind::User`] is listed by default).
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
 }
@@ -129,7 +138,6 @@ pub struct SessionListEntry {
     pub title: Option<String>,
     pub snippet: String,
     pub link_counts: LinkCounts,
-    pub hidden: bool,
     pub kind: SessionKind,
     pub parent_session_id: Option<String>,
 }
@@ -240,21 +248,32 @@ impl Session {
             title: None,
             links: Vec::new(),
             scratchpad: String::new(),
-            hidden: false,
             parent_session_id: None,
             kind: SessionKind::User,
         }
     }
 
-    /// Hidden worker session (subagent / compact) with optional parent link.
+    /// Whether this session appears in default listings (derived from [`Self::kind`]).
+    pub fn is_visible(&self) -> bool {
+        self.kind.is_visible()
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.kind.is_hidden()
+    }
+
+    /// Worker session (subagent / compact). Kind must be non-user so it is hidden.
     pub fn new_hidden(
         model: Model,
         id: impl Into<String>,
         kind: SessionKind,
         parent_session_id: Option<String>,
     ) -> Self {
+        debug_assert!(
+            kind.is_hidden(),
+            "new_hidden requires a non-user SessionKind"
+        );
         let mut s = Self::new_with_id(model, id);
-        s.hidden = true;
         s.kind = kind;
         s.parent_session_id = parent_session_id;
         s
@@ -461,7 +480,7 @@ pub fn list_sessions_filtered(
     for path in iter_session_json_files(&root)? {
         match session_list_entry_from_path(&path) {
             Ok(entry) => {
-                if include_hidden || !entry.hidden {
+                if include_hidden || entry.kind.is_visible() {
                     metas.push(entry);
                 }
             }
@@ -500,7 +519,6 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         title: session.title,
         snippet,
         link_counts: LinkCounts::from_links(&session.links),
-        hidden: session.hidden,
         kind: session.kind,
         parent_session_id: session.parent_session_id,
     })
@@ -664,7 +682,7 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
             entry.link_counts.prs, entry.link_counts.worktrees
         )
     };
-    let hidden = if entry.hidden {
+    let hidden = if entry.kind.is_hidden() {
         format!("  [{}]", entry.kind)
     } else {
         String::new()
@@ -693,7 +711,7 @@ pub fn format_session_detail(session: &Session) -> String {
     out.push_str(&format!("kind:      {}\n", session.kind));
     out.push_str(&format!(
         "hidden:    {}\n",
-        if session.hidden { "true" } else { "false" }
+        if session.is_hidden() { "true" } else { "false" }
     ));
     if let Some(parent) = session.parent_session_id.as_deref() {
         out.push_str(&format!("parent:    {parent}\n"));
@@ -1006,7 +1024,6 @@ mod tests {
                 note: None,
             }],
             scratchpad: "notes".into(),
-            hidden: false,
             parent_session_id: None,
             kind: SessionKind::User,
         };
@@ -1112,7 +1129,7 @@ mod tests {
         );
 
         let all = list_sessions_filtered(0, true).unwrap();
-        assert!(all.iter().any(|e| e.id == hidden.id && e.hidden));
+        assert!(all.iter().any(|e| e.id == hidden.id && e.kind.is_hidden()));
 
         // Bare resume resolves most recent *visible* session.
         let resumed = resolve_and_load_session(None).unwrap();
@@ -1120,7 +1137,7 @@ mod tests {
 
         // Explicit id still loads hidden.
         let loaded = Session::load_by_id_or_prefix(&hidden.id).unwrap();
-        assert!(loaded.hidden);
+        assert!(loaded.is_hidden());
         assert_eq!(loaded.kind, SessionKind::Subagent);
         assert_eq!(
             loaded.parent_session_id.as_deref(),
@@ -1134,18 +1151,18 @@ mod tests {
     }
 
     #[test]
-    fn old_session_json_defaults_hidden_false() {
+    fn old_session_json_defaults_kind_user() {
         let dir = temp_session_root();
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.json");
-        // No hidden/kind/parent fields — serde defaults.
+        // No kind/parent fields — serde defaults to user (visible).
         fs::write(
             &path,
             br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
         )
         .unwrap();
         let s = Session::load(&path).unwrap();
-        assert!(!s.hidden);
+        assert!(!s.is_hidden());
         assert_eq!(s.kind, SessionKind::User);
         assert!(s.parent_session_id.is_none());
         let _ = fs::remove_dir_all(&dir);
