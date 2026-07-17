@@ -75,9 +75,12 @@ Default CLI model is **`grok-4.5-build`**. Override with `myco --model <id>`.
 | `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required; see fallback) |
 | `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
 
-Token resolution for OpenAI Responses: `OPENAI_API_KEY` → `XAI_API_KEY` →
-`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `OPENAI_BASE_URL` →
-`XAI_API_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+Token resolution for OpenAI Responses: `XAI_API_KEY` → `OPENAI_API_KEY` →
+`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `XAI_API_BASE_URL` →
+`OPENAI_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+
+All resolution happens in one startup step (`myco::config::Config`), which also
+loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`).
 
 Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
 Responses). Empty credentials fail model creation at startup.

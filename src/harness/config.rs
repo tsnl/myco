@@ -4,7 +4,7 @@
 //! Only remote hosts are listed; each is described with explicit SSH fields
 //! rather than a free-form spawn command.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{HarnessConfig, HostConfig, RemoteHostConfig};
 
@@ -124,16 +124,9 @@ impl FileConfig {
     }
 }
 
-/// Default config path: `$MYCO_CONFIG` or `~/.myco/config.toml`.
-pub fn default_config_path() -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("MYCO_CONFIG") {
-        return Ok(PathBuf::from(p));
-    }
-    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(home.join(".myco").join("config.toml"))
-}
-
 /// Load harness config from `path`. Missing file → [`HarnessConfig::default`].
+/// Path defaulting (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`) lives
+/// in [`crate::config::Config`].
 pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
     if !path.exists() {
         return Ok(HarnessConfig::default());

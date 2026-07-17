@@ -16,8 +16,7 @@ use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    FileConfig, FileRemoteHost, default_config_path, example_config_toml, load_harness_config,
-    parse_harness_config_str,
+    FileConfig, FileRemoteHost, example_config_toml, load_harness_config, parse_harness_config_str,
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).

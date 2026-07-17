@@ -18,9 +18,9 @@ use myco::session::{
     print_session_history, resolve_and_load_session, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, EventSink, Harness, NullEventSink, SessionHistoryTool, SessionKind,
-    SessionMetaTool, TraceContext, default_config_path, ensure_remote_ssh_identities,
-    load_harness_config, print_preflight_report, prompts, uuid_simple_hex,
+    Agent, AgentEvent, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
+    SessionHistoryTool, SessionKind, SessionMetaTool, TraceContext, ensure_remote_ssh_identities,
+    print_preflight_report, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -164,22 +164,22 @@ async fn run_host(args: Args) {
 async fn run_interactive(args: Args) {
     let model_id = parse_model_or_exit(&args.model);
 
-    let config_path = match &args.config {
-        Some(p) => p.clone(),
-        None => default_config_path().unwrap_or_else(|e| {
-            eprintln!("Failed to resolve config path: {e}");
-            std::process::exit(2);
-        }),
-    };
-    let harness_config = load_harness_config(&config_path).unwrap_or_else(|e| {
-        eprintln!("Failed to load config {}: {e}", config_path.display());
+    // One explicit resolution step: backend credentials/base URLs, harness
+    // hosts (--config → $MYCO_CONFIG → ~/.myco/config.toml), and TTY state.
+    // Everything downstream reads this, not the env.
+    let app_config = Config::resolve(ConfigUserSettings {
+        harness_config_path: args.config.clone(),
+        ..Default::default()
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {e}");
         std::process::exit(2);
     });
 
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
     // passphrase-protected / security-key identities via the existing ssh-agent
     // before attach so OpenSSH never tries to prompt on the host pipe.
-    let ssh_report = ensure_remote_ssh_identities(&harness_config.remote_hosts);
+    let ssh_report = ensure_remote_ssh_identities(&app_config.harness.remote_hosts);
     print_preflight_report(&ssh_report);
 
     // Session handle first so `session_meta` can share it with the agent harness.
@@ -194,7 +194,7 @@ async fn run_interactive(args: Args) {
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let harness = Harness::attach_with_root_services(
-        harness_config,
+        app_config.harness.clone(),
         vec![session_tool, history_tool],
     )
     .await
@@ -209,7 +209,7 @@ async fn run_interactive(args: Args) {
                      try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
             );
         }
-        eprintln!("config: {}", config_path.display());
+        eprintln!("config: {}", app_config.harness_config_path.display());
         std::process::exit(1);
     });
     print_host_status(&harness);
@@ -221,7 +221,13 @@ async fn run_interactive(args: Args) {
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
-    let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
+    let model = build_model(
+        model_id,
+        &harness,
+        debug_dump_api_requests,
+        effort,
+        &app_config,
+    );
     let sink = Arc::new(CliEventSink::new());
     let mut agent = Agent::new(model, harness.clone(), sink);
     agent.set_context_window_tokens(model_id.context_window_tokens());
@@ -237,7 +243,7 @@ async fn run_interactive(args: Args) {
     });
     println!(
         "myco: model={model_id}  effort={effort}  session={session_label}  config={}  hosts=[{}]  default=local  (/help for commands)",
-        config_path.display(),
+        app_config.harness_config_path.display(),
         harness.host_names().join(", "),
     );
     if resuming {
@@ -253,6 +259,7 @@ async fn run_interactive(args: Args) {
         &mut effort,
         debug_dump_api_requests,
         ctrl_l,
+        &app_config,
     )
     .await;
 
@@ -280,8 +287,9 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
+    app_config: &Config,
 ) -> Arc<dyn generative_model::GenerativeModel> {
-    let mut backend_config = BackendConfig::default_for_model(model_id);
+    let mut backend_config = app_config.backend_config(model_id);
     match &mut backend_config {
         BackendConfig::Anthropic(c) => {
             if debug_dump_api_requests {
@@ -391,6 +399,7 @@ async fn run_repl(
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
+    app_config: &Config,
 ) {
     loop {
         println!("{USER_RULE}");
@@ -442,6 +451,7 @@ async fn run_repl(
                 model_id,
                 effort,
                 debug_dump_api_requests,
+                app_config,
             );
             continue;
         }
@@ -709,6 +719,7 @@ fn handle_meta(
     model_id: Model,
     effort: &mut Effort,
     debug_dump_api_requests: bool,
+    app_config: &Config,
 ) {
     match cmd {
         MetaCommand::Help => print_help(),
@@ -751,7 +762,13 @@ fn handle_meta(
                 Ok(next) if next == *effort => println!("effort={effort}  (unchanged)"),
                 Ok(next) => {
                     *effort = next;
-                    let model = build_model(model_id, harness, debug_dump_api_requests, *effort);
+                    let model = build_model(
+                        model_id,
+                        harness,
+                        debug_dump_api_requests,
+                        *effort,
+                        app_config,
+                    );
                     agent.set_model(model);
                     agent.set_context_window_tokens(model_id.context_window_tokens());
                     println!("effort={effort}");

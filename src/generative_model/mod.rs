@@ -155,15 +155,10 @@ impl BackendConfig {
     }
 
     /// Environment-based defaults for the protocol that serves `model`.
+    /// Resolution lives in [`crate::config`]; this is the lazy env-only path
+    /// for callers without an application config (subagents, tests).
     pub fn default_for_model(model: Model) -> Self {
-        match model.backend_kind() {
-            BackendKind::AnthropicMessages => {
-                BackendConfig::Anthropic(AnthropicBackendConfig::default_from_env())
-            }
-            BackendKind::OpenAIResponses => {
-                BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig::default_from_env())
-            }
-        }
+        crate::config::env_backend_config(model)
     }
 }
 
