@@ -84,6 +84,17 @@ impl AnthropicGenerativeModel {
             ));
         }
 
+        // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
+        // `x-api-key` header and rejects them as `Authorization: Bearer`;
+        // Bearer is the convention for gateway/OAuth tokens
+        // (ANTHROPIC_AUTH_TOKEN). Pick by token shape so ANTHROPIC_API_KEY
+        // works against the default base URL.
+        let token = &backend.anthropic_auth_token;
+        let (auth_header, auth_value) = if token.starts_with("sk-ant-") {
+            ("x-api-key", token.clone())
+        } else {
+            ("authorization", format!("Bearer {token}"))
+        };
         let client = reqwest::ClientBuilder::new()
             .default_headers(reqwest::header::HeaderMap::from_iter([
                 (
@@ -91,13 +102,11 @@ impl AnthropicGenerativeModel {
                     "application/json".parse().unwrap(),
                 ),
                 (
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {}", backend.anthropic_auth_token)
-                        .parse()
-                        .map_err(|e| {
+                    auth_header.parse().unwrap(),
+                    // Never echo the token into the error: it ends up in logs.
+                    auth_value.parse().map_err(|e| {
                             ModelCreationError::BadConfig(format!(
-                                "Invalid API key: {:?}: {e:?}",
-                                backend.anthropic_auth_token
+                            "auth token is not a valid HTTP header value: {e}"
                             ))
                         })?,
                 ),
@@ -288,6 +297,12 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
                         input: tool_use.input.clone(),
                     });
                 }
+                // A thinking-only turn (e.g. max_tokens hit mid-thinking)
+                // strips to nothing; the API rejects empty assistant content
+                // on every later request, permanently wedging the session.
+                if blocks.is_empty() {
+                    continue;
+                }
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
                     content: blocks,
@@ -333,7 +348,9 @@ async fn drive_anthropic_sse_stream(
     tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
 ) -> Result<(), GenerateError> {
     if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped; still drain so we surface a clean stop if possible.
+        // Consumer dropped (turn cancelled): stop reading so the response
+        // body drops and the provider stops generating/billing.
+        return Ok(());
     }
 
     let mut byte_stream = response.bytes_stream();
@@ -354,7 +371,7 @@ async fn drive_anthropic_sse_stream(
 
             for item in acc.handle_event(event)? {
                 if tx.send(Ok(item)).await.is_err() {
-                    // Consumer gone; keep processing so tool JSON validation still runs.
+                    return Ok(());
                 }
             }
 
@@ -374,51 +391,8 @@ async fn drive_anthropic_sse_stream(
 }
 
 //
-// SSE parsing + stream accumulation
+// Stream accumulation (`SseParser` is shared, in mod.rs)
 //
-
-#[derive(Default)]
-struct SseParser {
-    buffer: String,
-    pending_data_lines: Vec<String>,
-}
-
-impl SseParser {
-    /// Push a chunk of bytes and return complete `data:` payloads (one per SSE event).
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-
-        let mut events = Vec::new();
-        while let Some(newline_at) = self.buffer.find('\n') {
-            let mut line = self.buffer.drain(..=newline_at).collect::<String>();
-            if line.ends_with('\n') {
-                line.pop();
-            }
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if !self.pending_data_lines.is_empty() {
-                    events.push(self.pending_data_lines.join("\n"));
-                    self.pending_data_lines.clear();
-                }
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.strip_prefix(' ').unwrap_or(data);
-                if data.trim() == "[DONE]" {
-                    continue;
-                }
-                self.pending_data_lines.push(data.to_string());
-            }
-            // Ignore event:/id:/retry:/comments — JSON `type` is authoritative.
-        }
-
-        events
-    }
-}
 
 /// Maps Anthropic's unified content-block indices onto separate content/tool-use index spaces.
 #[derive(Default)]
@@ -971,6 +945,11 @@ enum AnthropicStopReason {
     PauseTurn,
     #[serde(rename = "refusal")]
     Refusal,
+    /// The API grows stop reasons over time (`model_context_window_exceeded`
+    /// arrived in 2025); an unknown one must not fail the whole message_delta
+    /// event and discard an already-streamed generation.
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<AnthropicStopReason> for TurnEndReason {
@@ -984,6 +963,7 @@ impl From<AnthropicStopReason> for TurnEndReason {
             }
             AnthropicStopReason::PauseTurn => TurnEndReason::Other("Anthropic::PauseTurn".into()),
             AnthropicStopReason::Refusal => TurnEndReason::Other("Anthropic::Refusal".into()),
+            AnthropicStopReason::Unknown => TurnEndReason::Other("Anthropic::Unknown".into()),
         }
     }
 }

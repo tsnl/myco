@@ -99,12 +99,12 @@ impl OpenAIResponsesGenerativeModel {
                 ),
                 (
                     reqwest::header::AUTHORIZATION,
+                    // Never echo the token into the error: it ends up in logs.
                     format!("Bearer {}", backend.auth_token)
                         .parse()
                         .map_err(|e| {
                             ModelCreationError::BadConfig(format!(
-                                "Invalid API key: {:?}: {e:?}",
-                                backend.auth_token
+                                "auth token is not a valid HTTP header value: {e}"
                             ))
                         })?,
                 ),
@@ -137,9 +137,14 @@ impl OpenAIResponsesGenerativeModel {
         input: &[ResponsesInputItem],
     ) -> Result<reqwest::Response, GenerateError> {
         // Best-effort enablement across OpenAI-compatible gateways.
-        // Unknown fields are typically ignored by servers that don't support them.
+        // Unknown fields are typically ignored by servers that don't support
+        // them — but an unknown *value* is a 400: `max` is Anthropic-only
+        // (Responses accepts minimal|low|medium|high), so clamp it.
         let reasoning = self.backend.effort.map(|effort| ResponsesReasoningConfig {
-            effort: Some(effort.as_str()),
+            effort: Some(match effort {
+                Effort::Max => Effort::High.as_str(),
+                other => other.as_str(),
+            }),
         });
         let request = ResponsesCreateRequest {
             model: self.model.api_id(),
@@ -258,10 +263,14 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                 tool_uses,
                 turn_end_reason: _,
             } => {
-                if !content.is_empty() {
+                // Test the *rendered* text: a thinking-only turn has non-empty
+                // `content` that renders to "", and an empty assistant item is
+                // rejected by providers on every later request.
+                let text = content_to_input_text(content);
+                if !text.is_empty() {
                     out.push(ResponsesInputItem::Message {
                         role: "assistant".into(),
-                        content: content_to_input_text(content),
+                        content: text,
                     });
                 }
                 for tool_use in tool_uses {
@@ -320,7 +329,9 @@ async fn drive_responses_sse_stream(
     tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
 ) -> Result<(), GenerateError> {
     if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped.
+        // Consumer dropped (turn cancelled): stop reading so the response
+        // body drops and the provider stops generating/billing.
+        return Ok(());
     }
 
     let mut byte_stream = response.bytes_stream();
@@ -343,7 +354,9 @@ async fn drive_responses_sse_stream(
 
             for item in acc.handle_event(event)? {
                 if tx.send(Ok(item)).await.is_err() {
-                    // Consumer gone.
+                    // Consumer dropped (turn cancelled): stop reading so the
+                    // response body drops and the provider stops generating.
+                    return Ok(());
                 }
             }
 
@@ -359,47 +372,6 @@ async fn drive_responses_sse_stream(
 
     acc.finish()?;
     Ok(())
-}
-
-#[derive(Default)]
-struct SseParser {
-    buffer: String,
-    pending_data_lines: Vec<String>,
-}
-
-impl SseParser {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-
-        let mut events = Vec::new();
-        while let Some(newline_at) = self.buffer.find('\n') {
-            let mut line = self.buffer.drain(..=newline_at).collect::<String>();
-            if line.ends_with('\n') {
-                line.pop();
-            }
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if !self.pending_data_lines.is_empty() {
-                    events.push(self.pending_data_lines.join("\n"));
-                    self.pending_data_lines.clear();
-                }
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.strip_prefix(' ').unwrap_or(data);
-                if data.trim() == "[DONE]" {
-                    continue;
-                }
-                self.pending_data_lines.push(data.to_string());
-            }
-        }
-
-        events
-    }
 }
 
 /// Maps Responses `output_index` slots onto separate content / tool-use index spaces.
