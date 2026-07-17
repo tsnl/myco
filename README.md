@@ -104,6 +104,14 @@ cargo test --locked --lib
 cargo run --locked --bin myco
 ```
 
+Optional local pre-commit (same bar as CI: `cargo fmt --check` + `cargo clippy -D warnings`):
+
+```bash
+bash scripts/install-pre-commit-hooks.sh
+```
+
+Bypass once with `git commit --no-verify`.
+
 NOTE: Semantic search embeds **all-MiniLM-L6-v2** via **Candle** (no ONNX Runtime) at
 **compile time**. `build.rs` downloads via **`hf-hub`** into the shared Hub cache
 (`~/.cache/huggingface` / `HF_HOME`), stages under `OUT_DIR`, and bakes weights
