@@ -1,5 +1,8 @@
 # `myco`
 
+[![Crates.io](https://img.shields.io/crates/v/myco.svg)](https://crates.io/crates/myco)
+[![CI](https://github.com/tsnl/myco/actions/workflows/ci.yml/badge.svg)](https://github.com/tsnl/myco/actions/workflows/ci.yml)
+
 A minimalist coding agent that works across your machines over SSH.
 
 Run `myco` on your laptop. It edits files, runs shells, and searches code on the
