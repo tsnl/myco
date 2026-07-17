@@ -1,3 +1,4 @@
+pub mod application;
 pub mod core;
 pub mod generative_model;
 pub mod harness;
@@ -8,6 +9,9 @@ pub mod session;
 pub mod text_search;
 pub mod tool_services;
 
+pub use application::{
+    Application, LiveSession, SYSTEM_PROMPT_PROLOGUE, SessionRegistry, build_model,
+};
 pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
@@ -25,6 +29,6 @@ pub use session::{
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ManualService, SessionHistoryTool, SessionMetaTool,
-    TextSearchToolService, ToolService,
+    ActiveSessionResolver, BrowserService, HostDispatchContext, ManualService, SessionHistoryTool,
+    SessionMetaTool, TextSearchToolService, ToolService,
 };

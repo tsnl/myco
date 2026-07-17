@@ -31,6 +31,15 @@ pub use browser_service::BrowserService;
 pub mod text_search_tool_service;
 pub use text_search_tool_service::TextSearchToolService;
 
+/// Resolve the interactive [`crate::session::ActiveSession`] for a calling agent.
+///
+/// Used by [`SessionMetaTool`] so multi-session front-ends can route `session_meta`
+/// to the correct document via [`HostDispatchContext::agent_id`]. Implementations
+/// may fall back (e.g. sole live session for unregistered subagent ids).
+pub trait ActiveSessionResolver: Send + Sync + 'static {
+    fn resolve(&self, agent_id: uuid::Uuid) -> Option<crate::session::ActiveSession>;
+}
+
 /// Ambient context for host tool-service invocations.
 #[derive(Clone)]
 pub struct HostDispatchContext {

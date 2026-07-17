@@ -9,7 +9,7 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::generative_model::{self, BackendConfig, Content, Effort, GenerativeModelConfig, Model};
+use myco::generative_model::{self, Content, Effort, GenerativeModelConfig, Model};
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry,
@@ -18,9 +18,9 @@ use myco::session::{
     print_session_history, resolve_and_load_session, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, EventSink, Harness, NullEventSink, SessionHistoryTool, SessionKind,
-    SessionMetaTool, TraceContext, default_config_path, ensure_remote_ssh_identities,
-    load_harness_config, print_preflight_report, prompts, uuid_simple_hex,
+    Agent, AgentEvent, Application, EventSink, Harness, NullEventSink, SessionKind, TraceContext,
+    default_config_path, ensure_remote_ssh_identities, load_harness_config, print_preflight_report,
+    prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -36,10 +36,6 @@ use rustyline::{
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const SYSTEM_PROMPT_PROLOGUE: &str = r#"
-You are a helpful assistant running in an agentic harness with unfettered computer access.
-"#;
 
 const DEFAULT_MODEL_NAME: &str = "grok-4.5-build";
 const SLASH_COMMANDS: &[&str] = &[
@@ -173,45 +169,60 @@ async fn run_interactive(args: Args) {
     let ssh_report = ensure_remote_ssh_identities(&harness_config.remote_hosts);
     print_preflight_report(&ssh_report);
 
-    // Session handle first so `session_meta` can share it with the agent harness.
+    // Application owns harness + session registry + root services (session_meta, history).
     let resuming = args.resume.is_some();
-    let initial_session = match args.resume {
-        Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
-        None => Session::new(model_id),
-    };
-    let active_session = ActiveSession::new(initial_session);
-
-    let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
-    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let harness = Harness::attach_with_root_services(
-        harness_config,
-        vec![session_tool, history_tool],
-    )
-    .await
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to attach harness: {e}");
-        eprintln!(
-            "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
-        );
-        if !ssh_report.is_clean() || !ssh_report.agent_ok {
-            eprintln!(
-                "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
-                     try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
-            );
-        }
-        eprintln!("config: {}", config_path.display());
-        std::process::exit(1);
-    });
-    print_host_status(&harness);
-    // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
-    let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
-    let sink = Arc::new(CliEventSink::new());
-    let mut agent = Agent::new(model, harness.clone(), sink);
-    agent.set_context_window_tokens(model_id.context_window_tokens());
-    agent.set_history(active_session.snapshot().messages.clone());
+    let app = Application::attach(harness_config, effort, debug_dump_api_requests)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to attach harness: {e}");
+            eprintln!(
+                "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
+            );
+            if !ssh_report.is_clean() || !ssh_report.agent_ok {
+                eprintln!(
+                    "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
+                         try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
+                );
+            }
+            eprintln!("config: {}", config_path.display());
+            std::process::exit(1);
+        });
+    let harness = app.harness().clone();
+    print_host_status(&harness);
+
+    let sink = Arc::new(CliEventSink::new()) as Arc<dyn EventSink>;
+    let live = match args.resume {
+        Some(id_opt) => {
+            // Preserve interactive picker / most-recent behavior via existing loader.
+            let session = load_resume_session_or_exit(id_opt.as_deref());
+            let id = session.id.clone();
+            // Prefer Application::open_session so registry + LiveSession are wired.
+            app.open_session(&id, sink).unwrap_or_else(|e| {
+                eprintln!("resume failed: {e}");
+                std::process::exit(2);
+            })
+        }
+        None => app
+            .create_session(model_id, Some(effort), sink)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to create session: {e}");
+                std::process::exit(1);
+            }),
+    };
+    // CLI is single-session: hold the agent lock for the lifetime of the REPL.
+    let mut agent = live.agent.lock().await;
+    // open_session uses default effort; honor CLI flag if different.
+    if resuming {
+        let model = app.build_model(model_id, effort).unwrap_or_else(|e| {
+            eprintln!("Failed to create model: {e}");
+            std::process::exit(1);
+        });
+        agent.set_model(model);
+        agent.set_context_window_tokens(model_id.context_window_tokens());
+    }
+    let active_session = live.active.clone();
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -231,6 +242,8 @@ async fn run_interactive(args: Args) {
     }
 
     run_repl(
+        &app,
+        &live,
         &mut agent,
         &active_session,
         &mut editor,
@@ -267,34 +280,7 @@ fn build_model(
     debug_dump_api_requests: bool,
     effort: Effort,
 ) -> Arc<dyn generative_model::GenerativeModel> {
-    let mut backend_config = BackendConfig::default_for_model(model_id);
-    match &mut backend_config {
-        BackendConfig::Anthropic(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            // Always enable thinking; effort controls how hard the model thinks.
-            c.effort = Some(effort);
-        }
-        BackendConfig::OpenAIResponses(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            c.effort = Some(effort);
-        }
-    }
-
-    generative_model::new(GenerativeModelConfig {
-        model: model_id,
-        tools: harness.tool_specs(),
-        system_prompt: [
-            SYSTEM_PROMPT_PROLOGUE,
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
-        ]
-        .join("\n"),
-        backend_config: Some(backend_config),
-    })
-    .unwrap_or_else(|e| {
+    myco::build_model(model_id, harness, debug_dump_api_requests, effort).unwrap_or_else(|e| {
         eprintln!("Failed to create model: {e}");
         std::process::exit(1);
     })
@@ -369,6 +355,8 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_repl(
+    app: &Application,
+    live: &std::sync::Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -416,11 +404,13 @@ async fn run_repl(
         }
         if let Some(cmd) = parse_meta(&input) {
             if matches!(cmd, MetaCommand::Compact) {
-                run_compact(agent, session, editor, harness.clone(), model_id).await;
+                run_compact(app, live, agent, session, editor, harness.clone(), model_id).await;
                 continue;
             }
             handle_meta(
                 cmd,
+                app,
+                live,
                 agent,
                 session,
                 editor,
@@ -499,6 +489,8 @@ async fn run_user_turn(
 // ---------------------------------------------------------------------------
 
 async fn run_compact(
+    app: &Application,
+    live: &std::sync::Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -620,8 +612,10 @@ async fn run_compact(
     if let Err(e) = save_readline_history(editor, session) {
         eprintln!("warning: could not save history: {e}");
     }
+    let old_id = session.id();
     session.replace(successor.clone());
     agent.set_history(successor.messages.clone());
+    app.rekey_live_session(&old_id, live);
     reload_readline_history(editor, session);
     clear_and_reprint(agent);
     println!(
@@ -688,6 +682,8 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
 #[allow(clippy::too_many_arguments)]
 fn handle_meta(
     cmd: MetaCommand<'_>,
+    app: &Application,
+    live: &std::sync::Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -709,8 +705,10 @@ fn handle_meta(
         MetaCommand::Hosts => print_host_status(harness),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
+            let old_id = session.id();
             session.replace(Session::new(model_id));
             agent.set_history(Vec::new());
+            app.rekey_live_session(&old_id, live);
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
             clear_and_reprint(agent);
@@ -720,7 +718,9 @@ fn handle_meta(
             save_before_switch(agent, session, editor);
             match resolve_resume_session(arg) {
                 Ok(loaded) => {
+                    let old_id = session.id();
                     install_session(agent, editor, session, &loaded);
+                    app.rekey_live_session(&old_id, live);
                     println!(
                         "resumed session={}  messages={}",
                         session.id(),
