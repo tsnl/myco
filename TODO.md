@@ -150,9 +150,9 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Uncategorized bugs
 
-- [x] Fix empty RESPONSE block if just tool use.
+- [x] Fix empty ASSISTANT block if just tool use.
   - Always request thinking/reasoning (default effort=high; `/effort`, `--effort`).
-    UI always shows summary-only `Thinking: …` inside RESPONSE (not a separate
+    UI always shows summary-only `Thinking: …` inside ASSISTANT (not a separate
     section). Thinking is stored in session history for resume and stripped from
     provider requests. OpenAI path ignores raw `reasoning_text` deltas.
 - [x] Stray empty sessions on resume list

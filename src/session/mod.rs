@@ -12,7 +12,9 @@ pub use agent::{
     uuid_simple_hex,
 };
 pub use transcript::{
-    SECTION_RULE, USER_RULE, format_tool_invocation, print_session_history, write_session_history,
+    SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_assistant, format_tool_invocation,
+    print_session_history, truncate_display_string, truncate_json_strings, write_assistant_open,
+    write_block, write_error_open, write_error_section, write_session_history,
 };
 
 use std::fs;

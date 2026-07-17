@@ -14,7 +14,7 @@ use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry, USER_RULE,
     format_session_detail, format_session_list_line, format_tool_invocation, list_sessions,
-    print_session_history, resolve_and_load_session,
+    print_session_history, resolve_and_load_session, write_error_section,
 };
 #[cfg(test)]
 use myco::uuid_simple_hex;
@@ -464,7 +464,14 @@ async fn run_user_turn(
             println!();
             println!("(cancelled)");
         }
-        Err(e) => eprintln!("\nError: {e}"),
+        Err(e) => {
+            // Close any open ASSISTANT stream state and show a headed ERROR section.
+            // Generate failures (context overflow, provider errors) are live-only —
+            // not stored in session history — so resume/Ctrl-L will not replay them.
+            let _ = write_error_section(&mut std::io::stdout(), &e.to_string());
+            let _ = std::io::stdout().flush();
+            println!();
+        }
     }
 
     sigint_task.abort();
@@ -681,8 +688,9 @@ Shortcuts:
   Ctrl-D                Save and quit
 
 Thinking/reasoning is always requested (default effort=high). The UI shows a
-`Thinking: …` summary inside RESPONSE; it is stored in session history for
+`Thinking: …` summary inside ASSISTANT; it is stored in session history for
 resume but stripped from provider requests. Change effort with `/effort`.
+Generate failures open a headed ERROR section (live only; not in history).
 
 Each USER header shows `USER <used>/<max>` context tokens when the provider
 reported usage on the previous generate (0/max until then).
@@ -967,22 +975,23 @@ fn session_id_completions(prefix: &str) -> Vec<String> {
 
 /// Live stdout rendering for the root agent.
 ///
-/// Only two headed sections: USER (printed by the REPL) and RESPONSE.
-/// Thinking summaries, tool invocations, and answer text are all paragraphs
-/// inside a single RESPONSE section for the whole agent turn (including
-/// multi-step tool loops). Thinking is also stored in session history for
-/// resume (backends strip it on the next API request).
+/// Headed sections: USER (printed by the REPL), ASSISTANT (this sink), and
+/// ERROR (printed by the REPL on generate failure). Thinking summaries, tool
+/// invocations, and answer text are paragraphs inside a single ASSISTANT
+/// section for the whole agent turn (including multi-step tool loops).
+/// Thinking is also stored in session history for resume (backends strip it
+/// on the next API request). ERROR sections are live-only and not replayed.
 ///
-/// Opening a RESPONSE section:
-/// blank line + thin `SECTION_RULE` + `RESPONSE` + blank line, then body.
+/// Opening an ASSISTANT section:
+/// blank line + thin `SECTION_RULE` + `ASSISTANT` + blank line, then body.
 struct CliEventSink {
     state: Mutex<SinkState>,
 }
 
 struct SinkState {
     at_line_start: bool,
-    /// Whether the RESPONSE header is already open for this agent turn.
-    response_open: bool,
+    /// Whether the ASSISTANT header is already open for this agent turn.
+    assistant_open: bool,
     /// True after a finished paragraph so the next one gets a blank line.
     need_blank: bool,
     /// True while streaming answer text (no blank lines between text deltas).
@@ -997,7 +1006,7 @@ impl CliEventSink {
         Self {
             state: Mutex::new(SinkState {
                 at_line_start: true,
-                response_open: false,
+                assistant_open: false,
                 need_blank: false,
                 in_text_stream: false,
                 thinking_line_open: false,
@@ -1022,9 +1031,9 @@ impl CliEventSink {
         });
     }
 
-    /// Open RESPONSE once per agent turn (multi-step tool loops stay in one section).
-    fn ensure_response(&self) {
-        let need_open = self.with_state(|s| !s.response_open);
+    /// Open ASSISTANT once per agent turn (multi-step tool loops stay in one section).
+    fn ensure_assistant(&self) {
+        let need_open = self.with_state(|s| !s.assistant_open);
         if !need_open {
             return;
         }
@@ -1032,17 +1041,17 @@ impl CliEventSink {
         self.ensure_line_start();
         println!();
         println!("{SECTION_RULE}");
-        println!("RESPONSE");
+        println!("ASSISTANT");
         println!();
         self.with_state(|s| {
             s.at_line_start = true;
-            s.response_open = true;
+            s.assistant_open = true;
             s.need_blank = false;
         });
         let _ = std::io::stdout().flush();
     }
 
-    /// Blank line before a subsequent paragraph inside RESPONSE.
+    /// Blank line before a subsequent paragraph inside ASSISTANT.
     fn separate_paragraph_if_needed(&self) {
         let need_blank = self.with_state(|s| s.need_blank);
         if need_blank {
@@ -1085,8 +1094,8 @@ impl EventSink for CliEventSink {
                 if text.is_empty() {
                     return;
                 }
-                // Always show thinking summaries inside RESPONSE as `Thinking: …`.
-                self.ensure_response();
+                // Always show thinking summaries inside ASSISTANT as `Thinking: …`.
+                self.ensure_assistant();
                 let starting = self.with_state(|s| !s.thinking_line_open);
                 if starting {
                     // End answer-text stream so thinking is its own paragraph.
@@ -1119,7 +1128,7 @@ impl EventSink for CliEventSink {
                     return;
                 }
                 self.finish_thinking_line();
-                self.ensure_response();
+                self.ensure_assistant();
                 // Blank-separate only when starting a new text paragraph after
                 // thinking/tools — never between chunks of the same stream.
                 let start_new = self.with_state(|s| !s.in_text_stream && s.need_blank);
@@ -1140,9 +1149,9 @@ impl EventSink for CliEventSink {
             } => {
                 self.finish_thinking_line();
                 self.ensure_line_start();
-                // Close RESPONSE for the next user turn (REPL prints USER next).
+                // Close ASSISTANT for the next user turn (REPL prints USER next).
                 self.with_state(|s| {
-                    s.response_open = false;
+                    s.assistant_open = false;
                     s.need_blank = false;
                     s.in_text_stream = false;
                 });
@@ -1160,7 +1169,7 @@ impl EventSink for CliEventSink {
                         s.need_blank = true;
                     }
                 });
-                self.ensure_response();
+                self.ensure_assistant();
                 self.separate_paragraph_if_needed();
                 print!(
                     "{}",

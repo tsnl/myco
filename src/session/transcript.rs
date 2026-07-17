@@ -1,7 +1,9 @@
 //! Sectioned transcript layout for session restore and CLI display.
 //!
-//! Only two headed sections in the UI: USER (double rule) and RESPONSE (thin rule).
-//! Thinking summaries and tool invocations are paragraphs inside RESPONSE.
+//! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule), and
+//! ERROR (thin rule). Thinking summaries and tool invocations are paragraphs
+//! inside ASSISTANT. ERROR is used for live generate failures (not stored in
+//! session history).
 
 use std::io::Write;
 
@@ -11,18 +13,27 @@ use crate::generative_model::{Content, Message};
 pub const USER_RULE: &str =
     "════════════════════════════════════════════════════════════════════════";
 
-/// Thin 72-col rule before each RESPONSE section header (USER uses USER_RULE).
+/// Thin 72-col rule before ASSISTANT / ERROR section headers (USER uses USER_RULE).
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
 /// Max chars for string values inside pretty-printed tool inputs (display only).
 pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
 
-/// Write a RESPONSE section open: blank line, thin rule, header, blank line, then body.
-pub fn write_response_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+/// Write an ASSISTANT section open: blank line, thin rule, header, blank line, then body.
+pub fn write_assistant_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
     writeln!(out)?;
     writeln!(out, "{SECTION_RULE}")?;
-    writeln!(out, "RESPONSE")?;
+    writeln!(out, "ASSISTANT")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Write an ERROR section open: blank line, thin rule, header, blank line, then body.
+pub fn write_error_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "{SECTION_RULE}")?;
+    writeln!(out, "ERROR")?;
     writeln!(out)?;
     Ok(())
 }
@@ -36,9 +47,15 @@ pub fn write_block(out: &mut impl Write, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn ensure_response(out: &mut impl Write, open: &mut bool) -> std::io::Result<()> {
+/// Write a full ERROR section with body text (trailing newline ensured).
+pub fn write_error_section(out: &mut impl Write, text: &str) -> std::io::Result<()> {
+    write_error_open(out)?;
+    write_block(out, text)
+}
+
+pub fn ensure_assistant(out: &mut impl Write, open: &mut bool) -> std::io::Result<()> {
     if !*open {
-        write_response_open(out)?;
+        write_assistant_open(out)?;
         *open = true;
     }
     Ok(())
@@ -46,12 +63,13 @@ pub fn ensure_response(out: &mut impl Write, open: &mut bool) -> std::io::Result
 
 /// Replay saved messages with the same section layout as the live REPL.
 ///
-/// Only USER / RESPONSE headers. Thinking summaries and tools are paragraphs
-/// inside RESPONSE. Thinking is stored in session history for resume, but
-/// backends strip it when composing API requests.
+/// Only USER / ASSISTANT headers. Thinking summaries and tools are paragraphs
+/// inside ASSISTANT. Thinking is stored in session history for resume, but
+/// backends strip it when composing API requests. Live ERROR sections are not
+/// part of history and are not replayed here.
 pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std::io::Result<()> {
-    let mut response_open = false;
-    // True when the RESPONSE body already has a finished paragraph (text or tool).
+    let mut assistant_open = false;
+    // True when the ASSISTANT body already has a finished paragraph (text or tool).
     let mut need_blank = false;
 
     for msg in messages {
@@ -72,8 +90,8 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                 writeln!(out, "USER")?;
                 writeln!(out)?;
                 write_block(out, &text)?;
-                // Next assistant turn opens a fresh RESPONSE section.
-                response_open = false;
+                // Next assistant turn opens a fresh ASSISTANT section.
+                assistant_open = false;
                 need_blank = false;
             }
             Message::AssistantMessage {
@@ -82,7 +100,7 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                 for c in content {
                     match c {
                         Content::Text { text } if !text.is_empty() => {
-                            ensure_response(out, &mut response_open)?;
+                            ensure_assistant(out, &mut assistant_open)?;
                             if need_blank {
                                 writeln!(out)?;
                             }
@@ -97,7 +115,7 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                             } else {
                                 text.clone()
                             };
-                            ensure_response(out, &mut response_open)?;
+                            ensure_assistant(out, &mut assistant_open)?;
                             if need_blank {
                                 writeln!(out)?;
                             }
@@ -109,7 +127,7 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                     }
                 }
                 for tu in tool_uses {
-                    ensure_response(out, &mut response_open)?;
+                    ensure_assistant(out, &mut assistant_open)?;
                     if need_blank {
                         writeln!(out)?;
                     }
@@ -161,7 +179,7 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
     }
 }
 
-/// Render `name(<pretty json>)` for tool paragraphs inside RESPONSE.
+/// Render `name(<pretty json>)` for tool paragraphs inside ASSISTANT.
 ///
 /// Long string values are truncated first, then objects/arrays are pretty-printed
 /// with 2-space indent; scalars stay compact. Always ends with a trailing newline.
@@ -234,22 +252,23 @@ mod tests {
         assert!(rendered.contains(USER_RULE));
         assert!(rendered.contains("USER\n\nhello\n"));
         assert!(!rendered.contains("> hello"));
-        // Tools live inside RESPONSE (no TOOL header). One RESPONSE open per turn.
-        assert!(rendered.contains(&format!("{SECTION_RULE}\nRESPONSE\n\nhi there\n")));
+        // Tools live inside ASSISTANT (no TOOL header). One ASSISTANT open per turn.
+        assert!(rendered.contains(&format!("{SECTION_RULE}\nASSISTANT\n\nhi there\n")));
         assert!(!rendered.contains("TOOL\n"));
-        // Pretty-printed tool JSON as a RESPONSE paragraph (blank line after text).
+        assert!(!rendered.contains("RESPONSE\n"));
+        // Pretty-printed tool JSON as an ASSISTANT paragraph (blank line after text).
         assert!(rendered.contains("hi there\n\nbash({\n  \"command\": \"echo hi\"\n})\n"));
         // Blank line before section rule/header.
         assert!(rendered.contains("\n\n────────────────────────────────"));
         // Tool results silent.
         assert!(!rendered.contains("toolu_1"));
-        // Multi-step assistant messages (tool loop) stay in one RESPONSE section.
+        // Multi-step assistant messages (tool loop) stay in one ASSISTANT section.
         assert!(rendered.contains("done\n"));
-        assert_eq!(rendered.matches("RESPONSE\n").count(), 1);
+        assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
     }
 
     #[test]
-    fn write_session_history_thinking_and_tools_in_response() {
+    fn write_session_history_thinking_and_tools_in_assistant() {
         let messages = vec![
             Message::UserMessage {
                 content: vec![Content::Text { text: "q".into() }],
@@ -286,18 +305,30 @@ mod tests {
 
         assert!(!rendered.contains("THINKING\n"));
         assert!(!rendered.contains("TOOL\n"));
-        // Thinking replayed as a RESPONSE paragraph (same prefix as live UI).
+        // Thinking replayed as an ASSISTANT paragraph (same prefix as live UI).
         assert!(rendered.contains(&format!(
-            "{SECTION_RULE}\nRESPONSE\n\nThinking: step a\nstep b\n"
+            "{SECTION_RULE}\nASSISTANT\n\nThinking: step a\nstep b\n"
         )));
         assert!(rendered.contains("Thinking: step a\nstep b\n\nanswer\n"));
-        // Tools are paragraphs inside RESPONSE, blank-separated.
+        // Tools are paragraphs inside ASSISTANT, blank-separated.
         assert!(rendered.contains("answer\n\nbash({\n  \"command\": \"echo 1\"\n})\n"));
         assert!(rendered.contains(")\n\nbash({\n  \"command\": \"echo 2\"\n})\n"));
-        assert_eq!(rendered.matches("RESPONSE\n").count(), 1);
+        assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
+    }
+
+    #[test]
+    fn write_error_section_layout() {
+        let mut buf = Vec::new();
+        write_error_section(&mut buf, "context length exceeded").unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains(&format!(
+            "{SECTION_RULE}\nERROR\n\ncontext length exceeded\n"
+        )));
+        // Leading blank line before the section rule.
+        assert!(rendered.starts_with('\n'));
     }
 
     #[test]
@@ -381,6 +412,6 @@ mod tests {
             rendered.contains("Thinking: secret-thought-aaa\n\nThinking: secret-thought-bbb\n")
         );
         assert!(rendered.contains("Thinking: secret-thought-bbb\n\ndone\n"));
-        assert!(rendered.contains("RESPONSE\n"));
+        assert!(rendered.contains("ASSISTANT\n"));
     }
 }
