@@ -201,6 +201,17 @@ impl Model {
             Model::ClaudeHaiku45 | Model::Grok45Build => false,
         }
     }
+
+    /// Context window for UX (`USER n/m`) and auto-compact heuristics.
+    pub fn context_window_tokens(self) -> u64 {
+        match self {
+            Model::ClaudeFable5 => 1_000_000,
+            Model::ClaudeOpus48 => 1_000_000,
+            Model::ClaudeSonnet5 => 1_000_000,
+            Model::ClaudeHaiku45 => 200_000,
+            Model::Grok45Build => 500_000,
+        }
+    }
 }
 
 impl std::fmt::Display for Model {
@@ -371,6 +382,28 @@ pub enum MessagePart {
     ToolUseStart(ToolUseStart),
     ToolUseDelta(ToolUseDelta),
     TurnEndReason(TurnEndReason),
+    /// Provider token usage for this generate call (may appear mid-stream or at end).
+    Usage(TokenUsage),
+}
+
+/// Token counts reported by a provider for one generate call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Best estimate of context occupied by the prompt (input + cache reads when present).
+    pub fn context_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +450,8 @@ pub struct GenerateOutput {
     pub content: Vec<Content>,
     pub tool_uses: Vec<ToolUse>,
     pub turn_end_reason: TurnEndReason,
+    /// Last usage observed on the stream, if the provider reported any.
+    pub usage: Option<TokenUsage>,
 }
 
 impl GenerateOutput {
@@ -462,6 +497,7 @@ impl GenerateOutput {
         let mut content: Vec<Option<Content>> = Vec::new();
         let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
         let mut turn_end_reason = None;
+        let mut usage = None;
 
         let mut stream = pin!(stream);
 
@@ -584,6 +620,9 @@ impl GenerateOutput {
                 MessagePart::TurnEndReason(reason) => {
                     turn_end_reason = Some(reason);
                 }
+                MessagePart::Usage(u) => {
+                    usage = Some(u);
+                }
             }
         }
 
@@ -622,6 +661,7 @@ impl GenerateOutput {
             content,
             tool_uses,
             turn_end_reason,
+            usage,
         })
     }
 }
@@ -710,6 +750,15 @@ mod tests {
         assert!(Model::ClaudeSonnet5.uses_adaptive_thinking());
         assert!(!Model::ClaudeHaiku45.uses_adaptive_thinking());
         assert!(!Model::Grok45Build.uses_adaptive_thinking());
+    }
+
+    #[test]
+    fn context_window_tokens_per_model() {
+        assert_eq!(Model::ClaudeFable5.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeOpus48.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeSonnet5.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeHaiku45.context_window_tokens(), 200_000);
+        assert_eq!(Model::Grok45Build.context_window_tokens(), 500_000);
     }
 
     #[test]

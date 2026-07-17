@@ -41,6 +41,7 @@ fn turn_tool_use(tool_uses: Vec<ToolUse>) -> GenerateOutput {
         content: vec![],
         tool_uses,
         turn_end_reason: TurnEndReason::ToolUse,
+        usage: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn turn_end(text: &str) -> GenerateOutput {
         content: vec![Content::Text { text: text.into() }],
         tool_uses: vec![],
         turn_end_reason: TurnEndReason::EndTurn,
+        usage: None,
     }
 }
 
