@@ -622,6 +622,9 @@ impl StreamAccumulator {
                     }
                 };
                 self.stop_reason = Some(reason.clone());
+                if let Some(u) = response.usage {
+                    out.push(MessagePart::Usage(u.into_token_usage()));
+                }
                 out.push(MessagePart::TurnEndReason(reason));
                 self.finished = true;
             }
@@ -842,6 +845,37 @@ struct ResponsesCompletedBody {
     incomplete_details: Option<ResponsesIncompleteDetails>,
     #[serde(default)]
     error: Option<serde_json::Value>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesInputTokensDetails>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ResponsesInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl ResponsesUsage {
+    fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+        crate::generative_model::TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self
+                .input_tokens_details
+                .and_then(|d| d.cached_tokens),
+            cache_creation_tokens: None,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1100,6 +1134,7 @@ mod tests {
                     status: Some("completed".into()),
                     incomplete_details: None,
                     error: None,
+                    usage: None,
                 },
             })
             .unwrap();
@@ -1125,6 +1160,7 @@ mod tests {
                     status: Some("completed".into()),
                     incomplete_details: None,
                     error: None,
+                    usage: None,
                 },
             })
             .unwrap();
@@ -1180,6 +1216,7 @@ mod tests {
                         reason: Some("content_filter".into()),
                     }),
                     error: None,
+                    usage: None,
                 },
             })
             .unwrap_err();

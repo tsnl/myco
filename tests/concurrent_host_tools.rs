@@ -130,6 +130,7 @@ async fn agent_concurrent_host_bash_tools_complete() {
                 bash_tool("t3", "printf THREE"),
             ],
             turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
         },
         GenerateOutput {
             content: vec![Content::Text {
@@ -137,6 +138,7 @@ async fn agent_concurrent_host_bash_tools_complete() {
             }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
         },
     ]);
 
@@ -222,11 +224,13 @@ async fn agent_concurrent_bash_and_editor_complete() {
                 },
             ],
             turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
         },
         GenerateOutput {
             content: vec![Content::Text { text: "ok".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
         },
     ]);
 

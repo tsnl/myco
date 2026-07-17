@@ -205,6 +205,7 @@ async fn run_interactive(args: Args) {
     let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new());
     let mut agent = Agent::new(model, harness.clone(), sink);
+    agent.set_context_window_tokens(model_id.context_window_tokens());
     agent.set_history(active_session.snapshot().messages.clone());
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
@@ -374,7 +375,12 @@ async fn run_repl(
 ) {
     loop {
         println!("{USER_RULE}");
-        println!("USER");
+        let used = agent
+            .last_usage()
+            .map(|u| u.context_tokens())
+            .unwrap_or(0);
+        let max = agent.context_window_tokens();
+        println!("USER {used}/{max}");
         println!();
         // No "> " prefix; body is typed on the line after the USER header.
         // Multiline: Alt-Enter / Shift-Enter / Ctrl-J inserts a newline in-buffer;
@@ -579,6 +585,7 @@ fn handle_meta(
                     *effort = next;
                     let model = build_model(model_id, harness, debug_dump_api_requests, *effort);
                     agent.set_model(model);
+                    agent.set_context_window_tokens(model_id.context_window_tokens());
                     println!("effort={effort}");
                 }
                 Err(e) => eprintln!("{e}"),
@@ -679,6 +686,9 @@ Shortcuts:
 Thinking/reasoning is always requested (default effort=high). The UI shows a
 `Thinking: …` summary inside RESPONSE; it is stored in session history for
 resume but stripped from provider requests. Change effort with `/effort`.
+
+Each USER header shows `USER <used>/<max>` context tokens when the provider
+reported usage on the previous generate (0/max until then).
 
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes: ~/.myco/config.toml

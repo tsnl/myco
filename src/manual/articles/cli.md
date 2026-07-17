@@ -32,3 +32,6 @@ Startup banner prints model, session, config path, hosts, and default host.
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
 summary inside a unified RESPONSE section; it is stored in session history for resume/Ctrl-L
 but stripped from provider requests.
+
+Each live USER header is `USER <used>/<max>` (context tokens used / model window). `used` is 0
+until a provider usage report arrives.

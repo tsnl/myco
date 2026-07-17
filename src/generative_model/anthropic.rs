@@ -583,7 +583,10 @@ impl StreamAccumulator {
                 }
             }
             AnthropicStreamEvent::ContentBlockStop { .. } => {}
-            AnthropicStreamEvent::MessageDelta { delta } => {
+            AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                if let Some(u) = usage {
+                    out.push(MessagePart::Usage(u.into_token_usage()));
+                }
                 if let Some(stop_reason) = delta.stop_reason {
                     if matches!(stop_reason, AnthropicStopReason::Refusal) {
                         return Err(GenerateError::RefusalError(
@@ -659,7 +662,11 @@ enum AnthropicStreamEvent {
         index: usize,
     },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: AnthropicMessageDelta },
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -717,6 +724,29 @@ enum AnthropicDelta {
 #[derive(Debug, serde::Deserialize)]
 struct AnthropicMessageDelta {
     stop_reason: Option<AnthropicStopReason>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+impl AnthropicUsage {
+    fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+        crate::generative_model::TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_input_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+        }
+    }
 }
 
 //
@@ -1327,6 +1357,7 @@ mod tests {
             delta: AnthropicMessageDelta {
                 stop_reason: Some(AnthropicStopReason::ToolUse),
             },
+            usage: None,
         })
         .unwrap();
         acc.handle_event(AnthropicStreamEvent::MessageStop).unwrap();

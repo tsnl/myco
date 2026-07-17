@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::core::CancelToken;
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, ToolResult, ToolUse, TurnEndReason, answer_content,
+    MessagePart, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
 
@@ -99,6 +99,11 @@ pub enum AgentEvent {
         reason: TurnEndReason,
         context: TraceContext,
     },
+    /// Provider usage for the most recent generate call (may fire multiple times per user turn).
+    Usage {
+        usage: TokenUsage,
+        context: TraceContext,
+    },
     /// An agent session ended. Optional harness-written log path for nested/transcript agents.
     AgentFinished {
         log_path: Option<String>,
@@ -130,6 +135,10 @@ pub struct Agent {
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
+    /// Last provider usage observed (input-side context estimate for the next USER header).
+    last_usage: Option<TokenUsage>,
+    /// Context window for the active model (tokens).
+    context_window_tokens: u64,
 }
 
 impl Agent {
@@ -153,6 +162,8 @@ impl Agent {
             sink,
             context,
             history: Vec::new(),
+            last_usage: None,
+            context_window_tokens: 200_000,
         }
     }
 
@@ -168,6 +179,20 @@ impl Agent {
     /// Swap the generative model (e.g. mid-session `/effort` rebuild). History is kept.
     pub fn set_model(&mut self, model: Arc<dyn GenerativeModel>) {
         self.model = model;
+    }
+
+    /// Set the context window used for the USER `N/M` token header.
+    pub fn set_context_window_tokens(&mut self, tokens: u64) {
+        self.context_window_tokens = tokens.max(1);
+    }
+
+    pub fn context_window_tokens(&self) -> u64 {
+        self.context_window_tokens
+    }
+
+    /// Last observed prompt/context token usage (from the provider), if any.
+    pub fn last_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
     }
 
     pub fn context(&self) -> &TraceContext {
@@ -200,6 +225,14 @@ impl Agent {
                 Err(GenerateOrCancel::Cancelled) => return self.finish_cancelled(),
                 Err(GenerateOrCancel::Generate(e)) => return self.finish_generate_error(e),
             };
+
+            if let Some(usage) = output.usage {
+                self.last_usage = Some(usage);
+                self.sink.emit(AgentEvent::Usage {
+                    usage,
+                    context: self.context.clone(),
+                });
+            }
 
             match output.turn_end_reason {
                 // A tool_use stop with zero accumulated tool calls is malformed
@@ -568,6 +601,7 @@ mod tests {
                     },
                 ],
                 turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
             },
             GenerateOutput {
                 content: vec![Content::Text {
@@ -575,6 +609,7 @@ mod tests {
                 }],
                 tool_uses: vec![],
                 turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
             },
         ]);
 
@@ -732,6 +767,7 @@ mod tests {
                 input: json!({}),
             }],
             turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
         }]);
         // No EndTurn scripted — cancel during tools must stop without another generate.
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
@@ -842,6 +878,7 @@ mod tests {
                     input: json!({}),
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
             }],
             "provider 500 after tools",
         );
@@ -949,6 +986,7 @@ mod tests {
                     input: json!({}),
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
             }],
             "simulated crash after tools",
         );
@@ -974,6 +1012,7 @@ mod tests {
             }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
         }]);
         let mut resumed = Agent::new(resume_model, harness2, Arc::new(NullEventSink));
         resumed.set_history(snapshot);

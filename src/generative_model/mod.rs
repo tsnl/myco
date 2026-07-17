@@ -201,6 +201,18 @@ impl Model {
             Model::ClaudeHaiku45 | Model::Grok45Build => false,
         }
     }
+
+    /// Conservative context window (input+output) for UX and auto-compact heuristics.
+    pub fn context_window_tokens(self) -> u64 {
+        match self {
+            // Wire ids today are standard windows; [1m] aliases can raise later.
+            Model::ClaudeFable5
+            | Model::ClaudeOpus48
+            | Model::ClaudeSonnet5
+            | Model::ClaudeHaiku45
+            | Model::Grok45Build => 200_000,
+        }
+    }
 }
 
 impl std::fmt::Display for Model {
@@ -371,6 +383,28 @@ pub enum MessagePart {
     ToolUseStart(ToolUseStart),
     ToolUseDelta(ToolUseDelta),
     TurnEndReason(TurnEndReason),
+    /// Provider token usage for this generate call (may appear mid-stream or at end).
+    Usage(TokenUsage),
+}
+
+/// Token counts reported by a provider for one generate call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Best estimate of context occupied by the prompt (input + cache reads when present).
+    pub fn context_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +451,8 @@ pub struct GenerateOutput {
     pub content: Vec<Content>,
     pub tool_uses: Vec<ToolUse>,
     pub turn_end_reason: TurnEndReason,
+    /// Last usage observed on the stream, if the provider reported any.
+    pub usage: Option<TokenUsage>,
 }
 
 impl GenerateOutput {
@@ -462,6 +498,7 @@ impl GenerateOutput {
         let mut content: Vec<Option<Content>> = Vec::new();
         let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
         let mut turn_end_reason = None;
+        let mut usage = None;
 
         let mut stream = pin!(stream);
 
@@ -584,6 +621,9 @@ impl GenerateOutput {
                 MessagePart::TurnEndReason(reason) => {
                     turn_end_reason = Some(reason);
                 }
+                MessagePart::Usage(u) => {
+                    usage = Some(u);
+                }
             }
         }
 
@@ -622,6 +662,7 @@ impl GenerateOutput {
             content,
             tool_uses,
             turn_end_reason,
+            usage,
         })
     }
 }
