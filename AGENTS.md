@@ -143,9 +143,9 @@ cargo test --locked --test integration_test   # and other tests/ binaries as nee
 cargo run --locked --bin myco
 ```
 
-- First build may download MiniLM assets via `build.rs` into `OUT_DIR` (needs
-  `curl` + network unless `MYCO_EMBED_OFFLINE=1` with `MYCO_EMBED_CACHE` or a
-  pre-seeded `src/text_search/embed_weights/` cache).
+- First build may download MiniLM assets via `build.rs` (`hf-hub` → shared
+  Hugging Face cache → `OUT_DIR`) unless `MYCO_EMBED_OFFLINE=1` with a warm
+  hub cache / `MYCO_EMBED_CACHE` / pre-seeded `src/text_search/embed_weights/`.
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.

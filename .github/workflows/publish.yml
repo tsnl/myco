@@ -28,6 +28,10 @@ permissions:
   pull-requests: read
   checks: read
 
+env:
+  # Shared hub cache path for hf-hub / huggingface_hub (GHA-friendly).
+  HF_HOME: ${{ github.workspace }}/.hf
+
 jobs:
   publish:
     name: Publish Package
@@ -39,11 +43,13 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
-      - name: Cache MiniLM embed weights
+      - name: Cache MiniLM embed weights (hub + flat seed)
         uses: actions/cache@v4
         with:
-          path: src/text_search/embed_weights
-          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+          path: |
+            .hf/hub
+            src/text_search/embed_weights
+          key: minilm-hfhub-v1-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
 
       - name: Seed MiniLM embed weights
         run: bash scripts/seed-minilm-weights.sh

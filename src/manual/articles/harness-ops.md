@@ -108,7 +108,7 @@ files and never downloads from Hugging Face.
 | Stage | What you need |
 |-------|----------------|
 | **Running / shipping** | The **`myco` binary only** for that OS/CPU/libc. No model pack, no `embed_weights/` on the target. |
-| **Compiling from source** | Network + `curl` so `build.rs` can fetch assets into `OUT_DIR` (or seed via `MYCO_EMBED_CACHE` / a local `src/text_search/embed_weights/` cache). |
+| **Compiling from source** | Network so `build.rs` (`hf-hub`) can populate the shared Hub cache and stage into `OUT_DIR` (or seed via warm `HF_HOME` / `MYCO_EMBED_CACHE` / `src/text_search/embed_weights/`). |
 
 Source tarballs / crates.io packages / `git archive` do not ship the ~87 MiB weight
 files (gitignored; not part of the package). That only matters when **building**; a
@@ -140,15 +140,14 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || { echo "cargo/rustc required on host"; exit 1; }
-  command -v curl >/dev/null || { echo "curl required for build.rs embed assets"; exit 1; }
-  # build.rs fetches MiniLM assets into OUT_DIR and include_bytes! them into the binary.
+  # build.rs uses hf-hub (shared HF cache) then stages MiniLM assets into OUT_DIR.
   cargo install --path ~/src/myco-src --force --locked --root "$HOME/.local"
   # ~/.local/bin is the usual remote install path in multi-host setups
   ~/.local/bin/myco --version
 '
 ```
 
-- Require **Rust/cargo** (and `curl` for `build.rs`) when building from source. Prefer a
+- Require **Rust/cargo** (and network once for `hf-hub` MiniLM assets, or a warm Hub cache) when building from source. Prefer a
   prebuilt **same-platform** binary when available (weights already inside).
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with

@@ -40,8 +40,9 @@ Quick map (details in `manual`):
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
   `myco --version`). **Separately** ensure MiniLM embed weights are available for the
-  build (`build.rs` curls safetensors into `OUT_DIR` — weights are **not** in
-  git archive / crates.io / GitHub source tarballs). Never scp prebuilt
+  build (`build.rs` uses `hf-hub` into the shared Hugging Face cache, then
+  stages into `OUT_DIR` — weights are **not** in git archive / crates.io /
+  GitHub source tarballs). Never scp prebuilt
   binaries across machines (glibc/arch mismatch).
 
 ---

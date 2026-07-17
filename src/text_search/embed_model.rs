@@ -1,8 +1,8 @@
 //! Offline MiniLM embedder via **Candle** (no ONNX Runtime / ort).
 //!
-//! `build.rs` fetches sentence-transformers/all-MiniLM-L6-v2 safetensors +
-//! tokenizer into `OUT_DIR/embed_weights/` and generates `embed_assets.rs`.
-//! Runtime never hits HF or ORT.
+//! `build.rs` fetches sentence-transformers/all-MiniLM-L6-v2 via `hf-hub`
+//! (shared Hub cache), stages into `OUT_DIR/embed_weights/`, and generates
+//! `embed_assets.rs`. Runtime never hits HF or ORT.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -32,8 +32,8 @@ fn embedder() -> Result<std::sync::MutexGuard<'static, CandleEmbedder>, String> 
         Err(e) => Err(format!(
             "MiniLM (Candle) embedder init failed: {e}. \
              Assets are staged by build.rs into OUT_DIR (include_bytes via embed_assets.rs). \
-             Rebuild with network + curl, or set MYCO_EMBED_CACHE / seed \
-             src/text_search/embed_weights/. See embed_weights/README.md and \
+             Rebuild with network (hf-hub), or set MYCO_EMBED_CACHE / seed \
+             src/text_search/embed_weights/ / warm HF_HOME. See embed_weights/README.md and \
              `myco --help harness-ops`."
         )),
     });

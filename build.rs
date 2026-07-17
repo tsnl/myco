@@ -1,24 +1,32 @@
 //! Fetch MiniLM embedding assets for `include_bytes!`. Candle loads safetensors
 //! (no ONNX Runtime).
 //!
-//! Assets are staged under `OUT_DIR/embed_weights/` (never the package source
-//! tree) so `cargo publish` verify stays valid and crates.io packages stay
-//! small. A generated `OUT_DIR/embed_assets.rs` exposes the byte slices.
+//! Downloads go through the **`hf-hub`** crate (Rust counterpart of Python
+//! `huggingface_hub`), which stores blobs in the shared Hub cache
+//! (`HF_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`). Assets are
+//! then copied into `OUT_DIR/embed_weights/` so `include_bytes!` works without
+//! modifying the package source tree (`cargo publish` safe).
 //!
 //! Env:
-//! - `MYCO_EMBED_OFFLINE=1` — never download; fail if any asset missing
-//! - `MYCO_EMBED_BASE_URL` — override HF base
-//! - `MYCO_EMBED_CACHE` — optional seed dir (also checks gitignored
+//! - `MYCO_EMBED_OFFLINE=1` — never hit the network; fail if assets are not
+//!   already in a seed dir or the Hub cache
+//! - `MYCO_EMBED_CACHE` — optional flat seed dir (also checks gitignored
 //!   `src/text_search/embed_weights/` as a convenience cache)
+//! - `HF_HOME` / `HF_HUB_CACHE` / `HF_ENDPOINT` / `HF_TOKEN` — standard Hub
+//!   vars honored by `hf-hub` (`ApiBuilder::from_env`)
+//! - `MYCO_EMBED_ENDPOINT` — optional Hub base URL override (same as
+//!   `HF_ENDPOINT`; kept for myco-specific docs)
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use hf_hub::api::sync::ApiBuilder;
+
 const SRC_WEIGHTS_DIR: &str = "src/text_search/embed_weights";
-const DEFAULT_BASE: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main";
+const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
 struct Asset {
     local_name: &'static str,
@@ -65,14 +73,17 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=MYCO_EMBED_CACHE");
     println!("cargo:rerun-if-env-changed=MYCO_EMBED_OFFLINE");
-    println!("cargo:rerun-if-env-changed=MYCO_EMBED_BASE_URL");
+    println!("cargo:rerun-if-env-changed=MYCO_EMBED_ENDPOINT");
+    println!("cargo:rerun-if-env-changed=HF_HOME");
+    println!("cargo:rerun-if-env-changed=HF_HUB_CACHE");
+    println!("cargo:rerun-if-env-changed=HF_ENDPOINT");
+    println!("cargo:rerun-if-env-changed=HF_TOKEN");
 
     fs::create_dir_all(&out_weights).unwrap_or_else(|e| {
         panic!("create {}: {e}", out_weights.display());
     });
 
     let shas = read_manifest_shas(&manifest_path);
-    let base = env::var("MYCO_EMBED_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE.to_string());
     let offline = env::var_os("MYCO_EMBED_OFFLINE").is_some_and(|v| v != "0");
     let mut seed_dirs: Vec<PathBuf> = Vec::new();
     if let Some(cache) = env::var_os("MYCO_EMBED_CACHE").map(PathBuf::from) {
@@ -82,6 +93,15 @@ fn main() {
     if src_weights.is_dir() {
         seed_dirs.push(src_weights.clone());
     }
+
+    // Lazy online Hub client — only constructed if something still needs a download.
+    let mut hub_repo = None;
+    // Offline-only view of the shared HF cache (no network).
+    let offline_cache = if offline {
+        Some(hf_hub::Cache::from_env().model(MODEL_ID.to_string()))
+    } else {
+        None
+    };
 
     for asset in ASSETS {
         let dest = out_weights.join(asset.local_name);
@@ -115,39 +135,75 @@ fn main() {
             continue;
         }
 
-        if offline {
+        // Prefer an already-populated shared Hub cache (works offline too).
+        if let Some(cache_repo) = offline_cache.as_ref() {
+            if let Some(cached) = cache_repo.get(asset.remote_path) {
+                if asset_ok(&cached, asset.size, want_sha)
+                    || (want_sha.is_none()
+                        && asset.local_name != "model.safetensors"
+                        && fs::metadata(&cached).map(|m| m.len()).unwrap_or(0) > 0)
+                {
+                    fs::copy(&cached, &dest).unwrap_or_else(|e| {
+                        panic!("copy {} → {}: {e}", cached.display(), dest.display());
+                    });
+                    println!(
+                        "cargo:warning=MiniLM asset {} from offline HF cache {}",
+                        asset.local_name,
+                        cached.display()
+                    );
+                    continue;
+                }
+            }
             panic!(
                 "MYCO_EMBED_OFFLINE set but MiniLM asset missing/invalid: {}.\n\
-                 Seed OUT_DIR via MYCO_EMBED_CACHE or pre-populate \
-                 {src}/, or allow network + curl. See {src}/README.md",
+                 Not found in MYCO_EMBED_CACHE / {src}/ / HF hub cache.\n\
+                 Seed via network once (unset MYCO_EMBED_OFFLINE), or set MYCO_EMBED_CACHE.\n\
+                 See {src}/README.md",
                 dest.display(),
                 src = src_weights.display()
             );
         }
 
-        if dest.is_file() {
-            let _ = fs::remove_file(&dest);
+        if hub_repo.is_none() {
+            hub_repo = Some(build_hub_repo());
         }
-        let url = format!("{}/{}", base.trim_end_matches('/'), asset.remote_path);
-        download_curl(&url, &dest);
-        if !asset_ok(&dest, asset.size, want_sha) {
-            let len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        let repo = hub_repo.as_ref().unwrap();
+
+        // `get` reuses the shared HF hub cache when present; downloads only on miss.
+        let cached = match repo.get(asset.remote_path) {
+            Ok(p) => p,
+            Err(e) => panic!(
+                "hf-hub failed to fetch {} from {MODEL_ID}: {e}\n\
+                 See {src}/README.md",
+                asset.remote_path,
+                src = src_weights.display()
+            ),
+        };
+
+        if !asset_ok(&cached, asset.size, want_sha) {
+            let len = fs::metadata(&cached).map(|m| m.len()).unwrap_or(0);
             if want_sha.is_none() && len > 0 && asset.local_name != "model.safetensors" {
                 println!(
                     "cargo:warning=MiniLM {} size {len} (expected {}); accepting",
                     asset.local_name, asset.size
                 );
-                continue;
+            } else {
+                panic!(
+                    "MiniLM asset {} failed integrity from hub cache {} (size={len}, expected {})",
+                    asset.local_name,
+                    cached.display(),
+                    asset.size
+                );
             }
-            let _ = fs::remove_file(&dest);
-            panic!(
-                "MiniLM asset {} failed integrity after download (size={len}, expected {}) from {url}",
-                asset.local_name, asset.size
-            );
         }
+
+        fs::copy(&cached, &dest).unwrap_or_else(|e| {
+            panic!("copy {} → {}: {e}", cached.display(), dest.display());
+        });
         println!(
-            "cargo:warning=downloaded MiniLM asset {} ({} bytes)",
-            asset.local_name, asset.size
+            "cargo:warning=MiniLM asset {} from hf-hub cache {}",
+            asset.local_name,
+            cached.display()
         );
     }
 
@@ -157,6 +213,25 @@ fn main() {
         "cargo:warning=MiniLM candle embed assets ready under {}",
         out_weights.display()
     );
+}
+
+fn build_hub_repo() -> hf_hub::api::sync::ApiRepo {
+    let mut builder = ApiBuilder::from_env().with_progress(false);
+
+    // Prefer explicit myco override, then leave HF_ENDPOINT (from_env) alone.
+    if let Ok(endpoint) = env::var("MYCO_EMBED_ENDPOINT") {
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if !endpoint.is_empty() {
+            builder = builder.with_endpoint(endpoint);
+        }
+    } else if env::var_os("HF_ENDPOINT").is_none() {
+        builder = builder.with_endpoint(DEFAULT_ENDPOINT.to_string());
+    }
+
+    let api = builder.build().unwrap_or_else(|e| {
+        panic!("hf-hub ApiBuilder failed: {e}");
+    });
+    api.model(MODEL_ID.to_string())
 }
 
 fn write_embed_assets_rs(out_dir: &Path, weights: &Path) {
@@ -227,42 +302,6 @@ fn read_manifest_shas(path: &Path) -> std::collections::HashMap<String, String> 
         }
     }
     map
-}
-
-fn download_curl(url: &str, dest: &Path) {
-    let partial = dest.with_extension(format!(
-        "{}.partial",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
-    ));
-    let _ = fs::remove_file(&partial);
-    eprintln!("cargo:warning=downloading {url} → {}", dest.display());
-    let status = Command::new("curl")
-        .args([
-            "-fL",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "--connect-timeout",
-            "30",
-            "-o",
-        ])
-        .arg(&partial)
-        .arg(url)
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            fs::rename(&partial, dest).unwrap_or_else(|e| panic!("rename partial: {e}"));
-        }
-        Ok(s) => {
-            let _ = fs::remove_file(&partial);
-            panic!("curl failed (exit {s}) downloading {url}");
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&partial);
-            panic!("curl not runnable ({e})");
-        }
-    }
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
