@@ -1,6 +1,6 @@
 # `myco`
 
-A coding agent that works across your machines over SSH.
+A minimalist coding agent that works across your machines over SSH.
 
 Run `myco` on your laptop. It edits files, runs shells, and searches code on the
 local machine **and** on remotes you configure — one session, many hosts.
@@ -17,7 +17,7 @@ local machine **and** on remotes you configure — one session, many hosts.
 - **Sub-agents for long work.** Spin off focused agents so the main thread stays
   small and cheap.
 - **Skills and project guidance stay searchable.** Hosts auto-index skill packs
-  and `AGENTS.md` / `CLAUDE.md` so the agent can find how *you* work.
+  and `AGENTS.md` / `CLAUDE.md` so the agent can find how _you_ work.
 - **Coming later:** multiplayer (multiple humans in the same agent workspace).
 
 ## Requirements
@@ -44,10 +44,10 @@ Responses API). Pass `--model <id>` for Claude models.
 **Anthropic Messages** (Claude: `claude-haiku-4-5`, `claude-sonnet-4-6`,
 `claude-opus-4-8`, `claude-fable-5`, …):
 
-| Variable | Role |
-| -------- | ---- |
-| `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | Bearer token (required) |
-| `ANTHROPIC_BASE_URL` | API base (default `https://api.anthropic.com`) |
+| Variable                                      | Role                                           |
+| --------------------------------------------- | ---------------------------------------------- |
+| `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | Bearer token (required)                        |
+| `ANTHROPIC_BASE_URL`                          | API base (default `https://api.anthropic.com`) |
 
 ```bash
 cat <<-EOF | tee .env
@@ -59,9 +59,9 @@ EOF
 **xAI / OpenAI Responses** (default model `grok-4.5-build`; also any gateway that
 speaks the Responses API at `{base}/responses`):
 
-| Variable | Role |
-| -------- | ---- |
-| `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required) |
+| Variable                                | Role                                     |
+| --------------------------------------- | ---------------------------------------- |
+| `XAI_API_KEY` or `OPENAI_API_KEY`       | Bearer token (required)                  |
 | `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
 
 If neither xAI/OpenAI key is set, the OpenAI Responses backend also accepts
