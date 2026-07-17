@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Ensure MiniLM assets exist under src/text_search/embed_weights/ for build.rs
-# (seed/cache). Files are gitignored; only README + MODEL.manifest are tracked.
+# Prefetch MiniLM assets so build.rs (hf-hub) can hit a warm cache.
+#
+# Primary seed path remains a flat directory that build.rs accepts via
+# MYCO_EMBED_CACHE or the gitignored src/text_search/embed_weights/ tree.
+# After the first real cargo build, blobs also live under the shared Hub
+# cache (HF_HUB_CACHE / $HF_HOME/hub / ~/.cache/huggingface/hub), which is
+# what worktrees and GHA should reuse.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIR="$ROOT/src/text_search/embed_weights"
-MANIFEST="$DIR/MODEL.manifest"
-BASE="${MYCO_EMBED_BASE_URL:-https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main}"
+MODEL_ID="sentence-transformers/all-MiniLM-L6-v2"
+MANIFEST="$ROOT/src/text_search/embed_weights/MODEL.manifest"
+SEED_DIR="${MYCO_EMBED_CACHE:-$ROOT/src/text_search/embed_weights}"
+
+ENDPOINT="${MYCO_EMBED_ENDPOINT:-${HF_ENDPOINT:-https://huggingface.co}}"
+ENDPOINT="${ENDPOINT%/}"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -16,13 +24,13 @@ sha256_file() {
   fi
 }
 
-mkdir -p "$DIR"
+mkdir -p "$SEED_DIR"
 
 need_download=0
 while read -r hash name rest; do
   [[ -z "${hash:-}" || "$hash" == \#* ]] && continue
   name="${name#./}"
-  path="$DIR/$name"
+  path="$SEED_DIR/$name"
   if [[ ! -f "$path" ]]; then
     echo "missing $name"
     need_download=1
@@ -36,25 +44,25 @@ while read -r hash name rest; do
 done < <(grep -v '^[[:space:]]*#' "$MANIFEST" | grep -v '^[[:space:]]*$')
 
 if [[ "$need_download" -eq 0 ]]; then
-  echo "MiniLM embed weights already present and match MODEL.manifest"
-  ls -la "$DIR"
+  echo "MiniLM embed weights already present under $SEED_DIR"
+  ls -la "$SEED_DIR"
   exit 0
 fi
 
-echo "Seeding MiniLM assets from $BASE into $DIR"
+echo "Seeding MiniLM assets for $MODEL_ID into $SEED_DIR"
 for name in model.safetensors tokenizer.json config.json; do
-  dest="$DIR/$name"
+  dest="$SEED_DIR/$name"
   tmp="$dest.partial"
   rm -f "$tmp"
   curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 \
-    -o "$tmp" "$BASE/$name"
+    -o "$tmp" "$ENDPOINT/$MODEL_ID/resolve/main/$name"
   mv "$tmp" "$dest"
 done
 
 while read -r hash name rest; do
   [[ -z "${hash:-}" || "$hash" == \#* ]] && continue
   name="${name#./}"
-  path="$DIR/$name"
+  path="$SEED_DIR/$name"
   got="$(sha256_file "$path")"
   if [[ "$got" != "$hash" ]]; then
     echo "ERROR: after download, sha256 mismatch for $name (got $got want $hash)" >&2
@@ -62,5 +70,5 @@ while read -r hash name rest; do
   fi
 done < <(grep -v '^[[:space:]]*#' "$MANIFEST" | grep -v '^[[:space:]]*$')
 
-echo "MiniLM embed weights seeded"
-ls -la "$DIR"
+echo "MiniLM embed weights seeded under $SEED_DIR"
+ls -la "$SEED_DIR"

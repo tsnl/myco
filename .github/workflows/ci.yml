@@ -32,14 +32,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Cache MiniLM embed weights
-        uses: actions/cache@v4
-        with:
-          # Developer/seed cache under the gitignored weights dir. build.rs copies
-          # into OUT_DIR; only README + MODEL.manifest are in git. Bump the key
-          # prefix when the cache was poisoned with docs-only content.
-          path: src/text_search/embed_weights
-          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Cache Hugging Face Hub (MiniLM)
+        uses: ./.github/actions/cache-hf-hub
       - name: Seed MiniLM embed weights
         run: bash scripts/seed-minilm-weights.sh
       - name: cargo clippy
@@ -53,11 +47,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Cache MiniLM embed weights
-        uses: actions/cache@v4
-        with:
-          path: src/text_search/embed_weights
-          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Cache Hugging Face Hub (MiniLM)
+        uses: ./.github/actions/cache-hf-hub
       - name: Seed MiniLM embed weights
         run: bash scripts/seed-minilm-weights.sh
       - name: cargo test (offline)

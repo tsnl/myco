@@ -24,7 +24,7 @@ local machine **and** on remotes you configure — one session, many hosts.
 
 - API credentials for the model backend you pick (see below)
 - **Rust / cargo** (stable)
-- **`curl`** — `build.rs` fetches MiniLM safetensors at compile time
+- Network on first build — `build.rs` uses **`hf-hub`** to fetch MiniLM safetensors into the shared Hugging Face cache
 - Extra binaries on `PATH`
   - Required: `ssh`, `lynx` (web-browser), `uv`, `bash`
   - Recommended: `git`, `gh`, `curl`
@@ -105,13 +105,12 @@ cargo run --locked --bin myco
 ```
 
 NOTE: Semantic search embeds **all-MiniLM-L6-v2** via **Candle** (no ONNX Runtime) at
-**compile time**. Assets are downloaded by `build.rs` into
-`src/text_search/embed_weights/` and baked into the binary — nothing large is in git.
+**compile time**. `build.rs` downloads via **`hf-hub`** into the shared Hub cache
+(`~/.cache/huggingface` / `HF_HOME`), stages under `OUT_DIR`, and bakes weights
+into the binary — nothing large is in git. Worktrees reuse the same cache.
 
 ```bash
-BASE=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
-mkdir -p src/text_search/embed_weights
-curl -fL -o src/text_search/embed_weights/model.safetensors "$BASE/model.safetensors"
-curl -fL -o src/text_search/embed_weights/tokenizer.json "$BASE/tokenizer.json"
-curl -fL -o src/text_search/embed_weights/config.json "$BASE/config.json"
+# optional offline seed (usually unnecessary after one successful build)
+bash scripts/seed-minilm-weights.sh
+# or: export MYCO_EMBED_CACHE=/path/to/flat-dir-with-the-three-files
 ```
