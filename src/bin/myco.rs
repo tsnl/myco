@@ -999,10 +999,6 @@ impl CliEventSink {
     }
 }
 
-fn plus_prefix(depth: usize) -> String {
-    "+".repeat(depth.saturating_add(1))
-}
-
 impl CliEventSink {
     fn with_state<R>(&self, f: impl FnOnce(&mut SinkState) -> R) -> R {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1154,13 +1150,11 @@ impl EventSink for CliEventSink {
                     s.in_text_stream = false;
                 });
             }
-            AgentEvent::ToolStarted { tool_use, context } => {
-                let prefix = plus_prefix(context.depth);
-                let name = if context.depth == 0 {
-                    tool_use.name.clone()
-                } else {
-                    format!("{prefix}{}", tool_use.name)
-                };
+            // Root agent only — hide nested subagent tool spam (and other depth>0 noise).
+            AgentEvent::ToolStarted {
+                tool_use,
+                context: TraceContext { depth: 0, .. },
+            } => {
                 // End any open text stream so the tool is its own paragraph.
                 self.finish_thinking_line();
                 self.with_state(|s| {
@@ -1171,44 +1165,16 @@ impl EventSink for CliEventSink {
                 });
                 self.ensure_response();
                 self.separate_paragraph_if_needed();
-                print!("{}", format_tool_invocation(&name, &tool_use.input));
+                print!(
+                    "{}",
+                    format_tool_invocation(&tool_use.name, &tool_use.input)
+                );
                 self.with_state(|s| {
                     s.at_line_start = true;
                     s.in_text_stream = false;
                 });
                 self.note_paragraph();
                 let _ = std::io::stdout().flush();
-            }
-            AgentEvent::AgentStarted {
-                agent_id,
-                model,
-                depth,
-                ..
-            } if depth >= 1 => {
-                let prefix = plus_prefix(depth.saturating_sub(1));
-                let model_label = if model.is_empty() {
-                    String::new()
-                } else {
-                    format!(" model={model}")
-                };
-                self.write_response_paragraph(&format!(
-                    "{prefix}Agent: start {}{model_label}",
-                    uuid_simple_hex(agent_id)
-                ));
-            }
-            AgentEvent::AgentFinished {
-                is_error,
-                context,
-                log_path,
-                ..
-            } if context.depth >= 1 => {
-                let prefix = plus_prefix(context.depth.saturating_sub(1));
-                let status = if is_error { "error" } else { "done" };
-                let line = match log_path {
-                    Some(p) => format!("{prefix}Agent: {status}  log={p}"),
-                    None => format!("{prefix}Agent: {status}"),
-                };
-                self.write_response_paragraph(&line);
             }
             _ => {}
         }
