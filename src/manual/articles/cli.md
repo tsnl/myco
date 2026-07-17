@@ -20,6 +20,15 @@ You cannot press these yourself — tell the user which command to run.
 
 Startup banner prints model, session, config path, hosts, and default host.
 
+### Models & env (quick)
+
+- Default model: `grok-4.5-build` (`--model` to change).
+- Claude models need `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` (optional
+  `ANTHROPIC_BASE_URL`).
+- Grok / OpenAI Responses need `XAI_API_KEY` or `OPENAI_API_KEY` (optional
+  `XAI_API_BASE_URL` / `OPENAI_BASE_URL`; default base `https://api.x.ai/v1`).
+- `.env` in cwd is loaded at startup. Full tables: `myco --help overview`.
+
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
 summary inside a unified RESPONSE section; it is stored in session history for resume/Ctrl-L
 but stripped from provider requests.

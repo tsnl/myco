@@ -1,14 +1,14 @@
 # Myco overview
 
-You are running inside **myco**, a mycelial multi-scale agent runtime: supervisors, subagents, and
-host-bound tools form the same pattern at every level.
+**myco** is a coding agent CLI: one conversation can drive tools on your laptop and on remote
+machines over SSH. Supervisors can spawn subagents; tools run on **hosts** (local or remote).
 
 ## Architecture (one sentence)
 
-**Agents orchestrate agents; hosts (hands) run tools on machines.** The **local** host is always
-enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
+**Agents orchestrate; hosts run tools on machines.** The **local** host is always enabled
+**in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
 `myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
-Subagents share the supervisor harness and host pool (self-similar structure).
+Subagents share the supervisor harness and host pool.
 
 ```
 myco (interactive) / Agent
@@ -54,6 +54,33 @@ ssh = "devbox"                 # Host alias, hostname, or user@host
   ProxyJump / User in `~/.ssh/config` when possible.
 - Remotes need `myco` on the **remote** PATH (or set `myco = "/abs/path/myco"`).
 - Missing config file → local-only (safe default). There is no `default_host` setting; default is always `local`.
+
+## API credentials & models
+
+Loaded from the process environment; `dotenvy` also loads a `.env` in the cwd at startup.
+Default CLI model is **`grok-4.5-build`**. Override with `myco --model <id>`.
+
+**Anthropic Messages** (Claude models: `claude-haiku-4-5`, `claude-sonnet-4-6`,
+`claude-opus-4-8`, `claude-fable-5`, …):
+
+| Variable | Role |
+|----------|------|
+| `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | Bearer token (required) |
+| `ANTHROPIC_BASE_URL` | API base (default `https://api.anthropic.com`) |
+
+**OpenAI Responses** (xAI Grok `grok-4.5-build`, or any Responses-compatible gateway):
+
+| Variable | Role |
+|----------|------|
+| `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required; see fallback) |
+| `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
+
+Token resolution for OpenAI Responses: `OPENAI_API_KEY` → `XAI_API_KEY` →
+`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `OPENAI_BASE_URL` →
+`XAI_API_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+
+Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
+Responses). Empty credentials fail model creation at startup.
 
 ## Host routing
 

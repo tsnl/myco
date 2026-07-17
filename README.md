@@ -1,36 +1,30 @@
 # `myco`
 
-Mycelial multi-scale agent runtime.
+A coding agent that works across your machines over SSH.
 
-**Myco** is a coding agent whose structure repeats at every scale: supervisors
-delegate to subagents, subagents share the same harness and host pool, and tools
-run on **hosts** (local and remote). Brain/hands is one thread; multi-level agent
-orchestration is the network — a mycelium of agency.
+Run `myco` on your laptop. It edits files, runs shells, and searches code on the
+local machine **and** on remotes you configure — one session, many hosts.
 
-```
-                  ┌─ Agent (supervisor)
-                  │    ├── subagent ──► Agent (same harness / host pool)
-                  │    │                  └── tools → hosts …
-                  │    └── tools ─────────────────────┐
-                  ▼                                   ▼
-            Harness (routing)                    Host pool
-         local | remote | …              bash, editor, search, …
-```
+## Why use it?
 
-- **Local host** is always in-process (no subprocess).
-- **Remotes** use `ssh … myco --mode host` over NDJSON.
-- The same `myco` binary is the interactive agent **and** the remote host worker.
-- **Subagents** share the supervisor’s harness so orchestration and execution stay
-  one system at every level.
-
-Formerly developed as [`honk`](https://github.com/tsnl/honk); this repository is the
-continued home under the **myco** name.
+- **One agent, many machines.** Point tools at `local` or a named remote (`devbox`,
+  GPU box, CI host). Remotes attach over SSH on demand; you stay in a single
+  conversation.
+- **Real computer use.** Bash (including multi-turn sessions), a surgical file
+  editor, text-mode browsing, and indexed search (keyword + semantic) on each host.
+- **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
+  conversation history live under `~/.myco/` — pick up later with `/resume`.
+- **Sub-agents for long work.** Spin off focused agents so the main thread stays
+  small and cheap.
+- **Skills and project guidance stay searchable.** Hosts auto-index skill packs
+  and `AGENTS.md` / `CLAUDE.md` so the agent can find how *you* work.
+- **Coming later:** multiplayer (multiple humans in the same agent workspace).
 
 ## Requirements
 
 - **Rust / cargo** (stable)
 - **`curl`** — `build.rs` fetches MiniLM safetensors at compile time
-- API credentials for your generative backend (see env below)
+- API credentials for the model backend you pick (see below)
 
 Optional: `trunk` + `wasm32-unknown-unknown` only if you build **`crates/myco-gui`**.
 
@@ -39,13 +33,48 @@ Optional: `trunk` + `wasm32-unknown-unknown` only if you build **`crates/myco-gu
 ```bash
 # From the crate root:
 cargo build --locked
+```
 
-# Credentials (example — Anthropic-compatible endpoint):
+### API credentials
+
+`myco` loads a `.env` from the current directory (via `dotenvy`) and also reads
+the process environment. Defaults: model **`grok-4.5-build`** (xAI / OpenAI
+Responses API). Pass `--model <id>` for Claude models.
+
+**Anthropic Messages** (Claude: `claude-haiku-4-5`, `claude-sonnet-4-6`,
+`claude-opus-4-8`, `claude-fable-5`, …):
+
+| Variable | Role |
+| -------- | ---- |
+| `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | Bearer token (required) |
+| `ANTHROPIC_BASE_URL` | API base (default `https://api.anthropic.com`) |
+
+```bash
 cat <<-EOF | tee .env
-export ANTHROPIC_BASE_URL=...
-export ANTHROPIC_AUTH_TOKEN=...
+export ANTHROPIC_AUTH_TOKEN=sk-ant-...
+# export ANTHROPIC_BASE_URL=https://api.anthropic.com   # optional override
 EOF
-# or put the same exports in your shell profile
+```
+
+**xAI / OpenAI Responses** (default model `grok-4.5-build`; also any gateway that
+speaks the Responses API at `{base}/responses`):
+
+| Variable | Role |
+| -------- | ---- |
+| `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required) |
+| `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
+
+If neither xAI/OpenAI key is set, the OpenAI Responses backend also accepts
+`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` as a fallback token source.
+
+```bash
+cat <<-EOF | tee .env
+export XAI_API_KEY=xai-...
+# export XAI_API_BASE_URL=https://api.x.ai/v1   # optional
+# Or OpenAI-compatible:
+# export OPENAI_API_KEY=sk-...
+# export OPENAI_BASE_URL=https://api.openai.com/v1
+EOF
 ```
 
 Install the CLI (user prefix):
@@ -58,27 +87,16 @@ myco --version
 Config (remotes only; local needs no entry): `~/.myco/config.toml` — see
 `myco --help overview` / `harness-ops`.
 
-### Migrating from honk
-
-| Honk | Myco |
-|------|------|
-| binary `honk` | binary `myco` |
-| `~/.honk/` | `~/.myco/` |
-| `$HONK_CONFIG`, `$HONK_HOME`, … | `$MYCO_CONFIG`, `$MYCO_HOME`, … |
-| repo path `.honk/` (worktrees, skills, subagent logs) | `.myco/` |
-| config key `honk = "…"` (remote binary) | `myco = "…"` (legacy key `honk` still accepted) |
-
-```bash
-mv ~/.honk ~/.myco   # or cp -a
-# edit remote binary paths if they still point at `honk`
-```
-
 ## Use
 
 ```bash
-# Interactive agent CLI
+# Interactive agent CLI (default model: grok-4.5-build)
 myco
-# or from a checkout without install:
+
+# Claude via Anthropic env vars
+myco --model claude-sonnet-4-6
+
+# From a checkout without install:
 cargo run --locked --bin myco
 ```
 
@@ -94,19 +112,19 @@ release only needs **platform-matched binaries** — no separate model files at 
 - **Same OS/arch/libc:** install that binary (weights already inside).
 - **Mismatched platforms:** build on the target (or use a matching release asset); do
   not scp binaries across glibc/arch boundaries.
-- **Source builds:** weight *files* under `src/text_search/embed_weights/` may be
+- **Source builds:** weight _files_ under `src/text_search/embed_weights/` may be
   **copied** between build machines, or fetched by `build.rs` / curl.
 
 See `myco --help harness-ops`.
 
 ## Architecture (crate)
 
-| Piece              | Role                                                            |
-| ------------------ | --------------------------------------------------------------- |
-| `myco` binary      | Agent CLI + `--mode host` for remote workers                    |
-| Host tools         | `bash`, editor, `manual`, text search (Tantivy + Candle MiniLM) |
-| Local tools        | `subagent`, `session_meta`                                      |
-| `crates/myco-gui`  | Optional Yew UI (separate from the CLI path above)              |
+| Piece             | Role                                                            |
+| ----------------- | --------------------------------------------------------------- |
+| `myco` binary     | Agent CLI + `--mode host` for remote workers                    |
+| Host tools        | `bash`, editor, `manual`, text search (Tantivy + Candle MiniLM) |
+| Local tools       | `subagent`, `session_meta`                                      |
+| `crates/myco-gui` | Optional Yew UI (separate from the CLI path above)              |
 
 Sessions and metadata live under `~/.myco/` (not edited as raw JSON by the agent —
 use `session_meta`).

@@ -3,7 +3,7 @@
 Semantic search uses **Candle** + **all-MiniLM-L6-v2** (no ONNX Runtime).
 
 `build.rs` fetches assets into this directory; `include_bytes!` bakes them into
-the `honk` binary. Only this README and `MODEL.manifest` are tracked in git.
+the `myco` binary. Only this README and `MODEL.manifest` are tracked in git.
 
 | File | Source |
 |------|--------|
