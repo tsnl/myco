@@ -334,7 +334,11 @@ impl HostController {
             // A connection whose reader/writer exited (host died, protocol
             // desync) sits in the slot looking alive; drop it — Conn::drop
             // kills the child — so the path below can respawn cleanly.
-            if slot.as_ref().is_some_and(|c| c.dead.load(Ordering::SeqCst)) {
+            // Also poll the child: reader/writer tasks may not have run yet
+            // after an immediate post-hello exit, so `dead` can lag.
+            if slot.as_mut().is_some_and(|c| {
+                c.dead.load(Ordering::SeqCst) || c.child.try_wait().ok().flatten().is_some()
+            }) {
                 *slot = None;
             }
             if slot.is_none() {
@@ -355,6 +359,19 @@ impl HostController {
                         return Err(e);
                     }
                 }
+            }
+            // Fresh connect can still race: host exits right after hello,
+            // before the reader task observes EOF. Reject immediately rather
+            // than registering a waiter nobody will answer.
+            if slot.as_mut().is_some_and(|c| {
+                c.dead.load(Ordering::SeqCst) || c.child.try_wait().ok().flatten().is_some()
+            }) {
+                *slot = None;
+                let msg = "host connection lost".to_string();
+                if let Ok(mut err) = last_error.lock() {
+                    *err = Some(msg.clone());
+                }
+                return Err(msg);
             }
             let c = slot.as_ref().expect("connected");
             (
@@ -480,13 +497,14 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_reader = Arc::clone(&pending);
+    let pending_writer = Arc::clone(&pending);
     let dead = Arc::new(AtomicBool::new(false));
     let writer_dead = Arc::clone(&dead);
     let reader_dead = Arc::clone(&dead);
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let writer = tokio::spawn(async move {
-        run_writer(stdin, write_rx, writer_dead).await;
+        run_writer(stdin, write_rx, pending_writer, writer_dead).await;
     });
     let reader = tokio::spawn(async move {
         run_reader(stdout, pending_reader, reader_dead).await;
@@ -530,13 +548,31 @@ async fn read_line(r: &mut BufReader<ChildStdout>) -> Result<String, String> {
     }
 }
 
-async fn run_writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>>, dead: Arc<AtomicBool>) {
-    while let Some(bytes) = rx.recv().await {
+async fn run_writer(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
+    dead: Arc<AtomicBool>,
+) {
+    let exit_message = loop {
+        let Some(bytes) = rx.recv().await else {
+            break "host write channel closed".to_string();
+        };
         if write_all(&mut stdin, &bytes).await.is_err() {
-            break;
+            break "host write failed".to_string();
         }
-    }
+    };
+    // Same contract as run_reader: poison first, then drain. A waiter that
+    // registered after the reader already drained (host died mid-hello) but
+    // before this write failed must still be failed, not left hanging.
     dead.store(true, Ordering::SeqCst);
+    let mut pending = pending.lock().await;
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Response::Error {
+            id: None,
+            message: exit_message.clone(),
+        });
+    }
 }
 
 /// Demux loop. Exits on EOF or on a connection-fatal `Error{id:None}` from
