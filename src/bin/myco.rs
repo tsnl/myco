@@ -12,15 +12,15 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use myco::generative_model::{self, BackendConfig, Content, Effort, GenerativeModelConfig, Model};
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry, USER_RULE,
-    format_session_detail, format_session_list_line, format_tool_invocation, list_sessions,
+    ActiveSession, CompactOptions, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry,
+    USER_RULE, compact_session, compact_subagent_prompt, format_session_detail,
+    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
     print_session_history, resolve_and_load_session, write_error_section,
 };
-#[cfg(test)]
-use myco::uuid_simple_hex;
 use myco::{
-    Agent, AgentEvent, EventSink, Harness, SessionMetaTool, TraceContext, default_config_path,
-    ensure_remote_ssh_identities, load_harness_config, print_preflight_report, prompts,
+    Agent, AgentEvent, EventSink, Harness, NullEventSink, SessionHistoryTool, SessionKind,
+    SessionMetaTool, TraceContext, default_config_path, ensure_remote_ssh_identities,
+    load_harness_config, print_preflight_report, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -53,6 +53,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/resume",
     "/effort",
     "/title",
+    "/compact",
 ];
 
 // ---------------------------------------------------------------------------
@@ -182,7 +183,11 @@ async fn run_interactive(args: Args) {
 
     let session_tool =
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
-    let harness = Harness::attach_with_root_services(harness_config, vec![session_tool])
+    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
+    let harness = Harness::attach_with_root_services(
+        harness_config,
+        vec![session_tool, history_tool],
+    )
         .await
         .unwrap_or_else(|e| {
             eprintln!("Failed to attach harness: {e}");
@@ -229,7 +234,7 @@ async fn run_interactive(args: Args) {
         &mut agent,
         &active_session,
         &mut editor,
-        &harness,
+        harness.clone(),
         model_id,
         &mut effort,
         debug_dump_api_requests,
@@ -367,7 +372,7 @@ async fn run_repl(
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
-    harness: &Harness,
+    harness: Arc<Harness>,
     model_id: Model,
     effort: &mut Effort,
     debug_dump_api_requests: bool,
@@ -410,12 +415,16 @@ async fn run_repl(
             break;
         }
         if let Some(cmd) = parse_meta(&input) {
+            if matches!(cmd, MetaCommand::Compact) {
+                run_compact(agent, session, editor, harness.clone(), model_id).await;
+                continue;
+            }
             handle_meta(
                 cmd,
                 agent,
                 session,
                 editor,
-                harness,
+                harness.as_ref(),
                 model_id,
                 effort,
                 debug_dump_api_requests,
@@ -486,6 +495,145 @@ async fn run_user_turn(
 }
 
 // ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+async fn run_compact(
+    agent: &mut Agent,
+    session: &ActiveSession,
+    editor: &mut Editor<ReplHelper, DefaultHistory>,
+    harness: Arc<Harness>,
+    model_id: Model,
+) {
+    if let Err(e) = session.persist_messages(agent.history(), true) {
+        eprintln!("compact: failed to persist current session: {e}");
+        return;
+    }
+    let predecessor = session.snapshot();
+    if predecessor.messages.is_empty() {
+        eprintln!("compact: session is empty");
+        return;
+    }
+
+    println!("compacting session={} …", predecessor.id);
+
+    let worker_id = uuid::Uuid::new_v4();
+    let worker_hex = uuid_simple_hex(worker_id);
+    let mut worker_session = Session::new_hidden(
+        model_id,
+        worker_hex.clone(),
+        SessionKind::Compact,
+        Some(predecessor.id.clone()),
+    );
+    worker_session.title = Some(format!("compact {}", &predecessor.id[..8.min(predecessor.id.len())]));
+    if let Err(e) = worker_session.save() {
+        eprintln!("warning: could not save compact worker session: {e}");
+    }
+
+    let model = match generative_model::new(GenerativeModelConfig {
+        model: model_id,
+        tools: harness.tool_specs(),
+        system_prompt: [
+            "You are a myco compaction worker. Follow the user instruction exactly. \
+             Prefer session_history over bash for reading sessions.",
+            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+        ]
+        .join("\n\n"),
+        backend_config: None,
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("compact: failed to create model: {e:?}");
+            return;
+        }
+    };
+
+    let sink = Arc::new(NullEventSink);
+    let mut worker = Agent::with_context(
+        model,
+        harness.clone(),
+        sink,
+        TraceContext {
+            agent_id: worker_id,
+            depth: 1,
+            parent_tool_use_id: None,
+        },
+    );
+    worker.set_context_window_tokens(model_id.context_window_tokens());
+
+    let prompt = compact_subagent_prompt(&predecessor.id);
+    let cancel = myco::CancelToken::new();
+    let result = worker
+        .interact(
+            vec![Content::Text { text: prompt }],
+            cancel,
+        )
+        .await;
+
+    worker_session.messages = worker.history().to_vec();
+    worker_session.touch();
+    let _ = worker_session.save();
+
+    match result {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("compact: worker failed: {e}");
+            return;
+        }
+    }
+
+    let summary_path = predecessor.summary_path();
+    let summary = match std::fs::read_to_string(&summary_path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            eprintln!(
+                "compact: worker finished but summary file is empty ({})",
+                summary_path.display()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "compact: worker finished but summary missing at {}: {e}",
+                summary_path.display()
+            );
+            return;
+        }
+    };
+
+    let (successor, outcome) =
+        match compact_session(&predecessor, &summary, model_id, &CompactOptions::default()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("compact: failed to build successor: {e}");
+                return;
+            }
+        };
+
+    let mut pred = predecessor;
+    if let Err(e) = link_compact_pair(&mut pred, &successor) {
+        eprintln!("compact: failed to link sessions: {e}");
+        return;
+    }
+
+    // Switch live REPL to successor.
+    if let Err(e) = save_readline_history(editor, session) {
+        eprintln!("warning: could not save history: {e}");
+    }
+    session.replace(successor.clone());
+    agent.set_history(successor.messages.clone());
+    reload_readline_history(editor, session);
+    clear_and_reprint(agent);
+    println!(
+        "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
+        outcome.successor_id,
+        outcome.predecessor_id,
+        outcome.tail_messages,
+        outcome.summary_path.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Meta-commands
 // ---------------------------------------------------------------------------
 
@@ -499,6 +647,7 @@ enum MetaCommand<'a> {
     /// `None` → print current effort; `Some` → set effort.
     Effort(Option<&'a str>),
     Title(Option<&'a str>),
+    Compact,
 }
 
 fn is_exit_command(input: &str) -> bool {
@@ -527,6 +676,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
         (Some("resume"), arg) => Some(MetaCommand::Resume(arg.filter(|s| !s.is_empty()))),
         (Some("effort"), arg) => Some(MetaCommand::Effort(arg.filter(|s| !s.is_empty()))),
         (Some("title"), arg) => Some(MetaCommand::Title(arg)),
+        (Some("compact"), _) => Some(MetaCommand::Compact),
         _ if head.starts_with('/') || head.starts_with(':') => {
             eprintln!("Unknown command: {head}  (try /help)");
             Some(MetaCommand::Help)
@@ -626,6 +776,9 @@ fn handle_meta(
                 }
             }
         },
+        MetaCommand::Compact => {
+            // Handled asynchronously in run_repl.
+        }
     }
 }
 
@@ -677,6 +830,7 @@ Commands:
   /new                  Start a new session (saves current; clears display)
   /effort [level]       Show or set reasoning effort (low|medium|high|max)
   /title [text]         Show or set session title (empty text clears)
+  /compact              Compact context into a successor session (summary + tail)
   /exit, /quit          Save and quit  (also: exit, quit, :q, Ctrl-D)
 
 Shortcuts:
@@ -1249,6 +1403,8 @@ mod tests {
             scratchpad: String::new(),
             parent_session_id: None,
             kind: myco::SessionKind::User,
+            predecessor_id: None,
+            successor_id: None,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 
