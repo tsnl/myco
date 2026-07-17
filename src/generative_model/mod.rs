@@ -202,15 +202,14 @@ impl Model {
         }
     }
 
-    /// Conservative context window (input+output) for UX and auto-compact heuristics.
+    /// Context window for UX (`USER n/m`) and auto-compact heuristics.
     pub fn context_window_tokens(self) -> u64 {
         match self {
-            // Wire ids today are standard windows; [1m] aliases can raise later.
-            Model::ClaudeFable5
-            | Model::ClaudeOpus48
-            | Model::ClaudeSonnet5
-            | Model::ClaudeHaiku45
-            | Model::Grok45Build => 200_000,
+            Model::ClaudeFable5 => 1_000_000,
+            Model::ClaudeOpus48 => 1_000_000,
+            Model::ClaudeSonnet5 => 1_000_000,
+            Model::ClaudeHaiku45 => 200_000,
+            Model::Grok45Build => 500_000,
         }
     }
 }
@@ -751,6 +750,15 @@ mod tests {
         assert!(Model::ClaudeSonnet5.uses_adaptive_thinking());
         assert!(!Model::ClaudeHaiku45.uses_adaptive_thinking());
         assert!(!Model::Grok45Build.uses_adaptive_thinking());
+    }
+
+    #[test]
+    fn context_window_tokens_per_model() {
+        assert_eq!(Model::ClaudeFable5.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeOpus48.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeSonnet5.context_window_tokens(), 1_000_000);
+        assert_eq!(Model::ClaudeHaiku45.context_window_tokens(), 200_000);
+        assert_eq!(Model::Grok45Build.context_window_tokens(), 500_000);
     }
 
     #[test]
