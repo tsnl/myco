@@ -33,11 +33,14 @@ Only register scopes you will query repeatedly (skills, docs, a small package).
 
 const EXACT_SEARCH_DESC: &str = r#"
 Exact full-text search over the **Tantivy** index of persistently watched roots
-(query parser / BM25). Requires the path to fall under a registered root (auto
-skills roots count). Waits only if an initial crawl for a covering root is still running.
+(query parser / BM25). Matches **file body** and **path/filename** tokens
+(e.g. `SKILL.md`, skill folder names). Requires the path to fall under a
+registered root (auto skills roots count). Waits only if an initial crawl for a
+covering root is still running.
 
-Prefer this for identifiers, skill names, and literal phrases in indexed content.
-For huge unindexed trees, use bash + rg instead of index_directory.
+Prefer this for identifiers, skill names, filenames, and literal phrases in
+indexed content. For huge unindexed trees, use bash + rg instead of
+index_directory.
 "#;
 
 const SEMANTIC_SEARCH_DESC: &str = r#"

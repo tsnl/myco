@@ -1,8 +1,8 @@
 //! Incremental text search over watched directory trees.
 //!
-//! Exact search uses **Tantivy** (in-RAM). Semantic search uses **Candle**
-//! (MiniLM, weights embedded at compile time) with cosine similarity
-//! over per-file embeddings.
+//! Exact search uses **Tantivy** (in-RAM) over file bodies and path/filename
+//! tokens. Semantic search uses **Candle** (MiniLM, weights embedded at compile
+//! time) with cosine similarity over per-file embeddings.
 //!
 //! Used for agent skills / project guidance discovery and optional manual
 //! indexing. Symlinks are never followed. Search requires the target path to

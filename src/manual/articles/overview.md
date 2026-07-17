@@ -92,7 +92,8 @@ Responses). Empty credentials fail model creation at startup.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
   idle, or DOWN after a failed remote connect.
 - **Text search** (per host): persistent watched roots via `index_directory` /
-  `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy) /
+  `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
+  file bodies **and** path/filename tokens) /
   `indexed_semantic_text_search` (Candle **MiniLM**, weights baked in at compile
   time). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
   `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large

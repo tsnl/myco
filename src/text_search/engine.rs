@@ -453,7 +453,7 @@ impl TextSearchEngine {
                  Prefer for skills / AGENTS.md intent; use exact for identifiers."
                     .into()
             } else {
-                "exact = Tantivy full-text over indexed files. \
+                "exact = Tantivy full-text over indexed file bodies and path/filename tokens. \
                  For large unindexed code trees, prefer bash + rg/grep instead of indexing."
                     .into()
             },

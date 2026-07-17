@@ -10,9 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 # Required checks for branch protection / publish wait_for_checks:
-#   CI / Check Formatting
-#   CI / Lint
-#   CI / Test
+#   Check Formatting, Lint, Test  (job names; see publish.yml)
 jobs:
   fmt:
     name: Check Formatting
@@ -37,8 +35,13 @@ jobs:
       - name: Cache MiniLM embed weights
         uses: actions/cache@v4
         with:
+          # Developer/seed cache under the gitignored weights dir. build.rs copies
+          # into OUT_DIR; only README + MODEL.manifest are in git. Bump the key
+          # prefix when the cache was poisoned with docs-only content.
           path: src/text_search/embed_weights
-          key: minilm-embed-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Seed MiniLM embed weights
+        run: bash scripts/seed-minilm-weights.sh
       - name: cargo clippy
         # Root package targets (lib, bins, tests). Not crates/myco-gui / trunk.
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -54,7 +57,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src/text_search/embed_weights
-          key: minilm-embed-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+          key: minilm-embed-v2-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Seed MiniLM embed weights
+        run: bash scripts/seed-minilm-weights.sh
       - name: cargo test (offline)
         # Full suite, no live provider calls. Live Anthropic/xAI tests are
         # #[ignore] — run locally with: cargo test -- --ignored
