@@ -91,7 +91,6 @@ impl ToolService for BashService {
                 instead. (`write` stdin may still send interactive `cd` into a live shell.)"
                 .to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 
@@ -417,7 +416,6 @@ impl BashService {
         spawn_waiter(child, Arc::clone(&shared));
 
         let session = Session {
-            id: session_id.to_string(),
             owner,
             cmdline: cmdline.to_string(),
             stdin: Mutex::new(Some(child_stdin)),
@@ -776,8 +774,6 @@ impl BashService {
 // --- session internals -------------------------------------------------------
 
 struct Session {
-    #[allow(dead_code)]
-    id: String,
     /// Agent that started this session; only this agent may write/read/close it.
     owner: Uuid,
     cmdline: String,

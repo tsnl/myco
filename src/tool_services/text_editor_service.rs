@@ -29,7 +29,6 @@ impl ToolService for TextEditorService {
             // at runtime after conversion — schemars would emit root `oneOf` for that enum,
             // which Anthropic rejects (missing `input_schema.type`).
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 

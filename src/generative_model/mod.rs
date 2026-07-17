@@ -265,22 +265,6 @@ pub enum Message {
         turn_end_reason: Option<TurnEndReason>,
     },
 }
-impl Message {
-    pub fn role(&self) -> Role {
-        match self {
-            Message::UserMessage { .. } => Role::User,
-            Message::ToolResults { .. } => Role::User,
-            Message::AssistantMessage { .. } => Role::Assistant,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Role {
-    User,
-    Assistant,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnEndReason {
     EndTurn,
@@ -295,9 +279,6 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// Often empty; omit on the wire when so (host hello, sessions, etc.).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input_examples: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

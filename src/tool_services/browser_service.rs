@@ -70,7 +70,6 @@ impl ToolService for BrowserService {
             name: "lynx_tui_browser".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
-            input_examples: vec![],
         }]
     }
 

@@ -22,7 +22,6 @@ impl ToolService for LetterCounterTool {
                 },
                 "required": ["word", "letter"]
             }),
-            input_examples: vec![],
         }]
     }
 

@@ -12,9 +12,8 @@ pub use agent::{
     uuid_simple_hex,
 };
 pub use transcript::{
-    SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_response, format_tool_invocation,
-    print_session_history, truncate_display_string, truncate_json_strings, write_block,
-    write_response_open, write_session_history,
+    SECTION_RULE, USER_RULE, format_tool_invocation, print_session_history,
+    write_session_history,
 };
 
 use std::fs;
@@ -156,7 +155,7 @@ impl ActiveSession {
         if force || messages.len() != session.messages.len() {
             session.messages = messages.to_vec();
             session.touch();
-            session.save_locked()?;
+            session.save()?;
         }
         Ok(())
     }
@@ -170,7 +169,7 @@ impl ActiveSession {
         if let Some(title) = auto_title_from_text(text) {
             session.title = Some(title);
             session.touch();
-            session.save_locked()?;
+            session.save()?;
             return Ok(true);
         }
         Ok(false)
@@ -216,11 +215,6 @@ impl Session {
         }
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         atomically_write(&path, &json)
-    }
-
-    /// Save using paths derived from `self.id` (caller holds lock).
-    fn save_locked(&self) -> Result<(), String> {
-        self.save()
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -347,17 +341,6 @@ impl Session {
         Ok(self.links.remove(idx))
     }
 
-    pub fn display_title(&self) -> String {
-        if let Some(t) = &self.title
-            && !t.is_empty()
-        {
-            return t.clone();
-        }
-        first_user_text_from_messages(&self.messages)
-            .map(|s| truncate_snippet(&s, SESSION_LIST_SNIPPET))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(untitled)".into())
-    }
 }
 
 // ---------------------------------------------------------------------------

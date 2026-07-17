@@ -504,7 +504,6 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false,
                 }),
-                input_examples: vec![],
             }]
         }
 
