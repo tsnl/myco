@@ -104,6 +104,14 @@ cargo test --locked --lib
 cargo run --locked --bin myco
 ```
 
+Optional local pre-commit (same bar as CI: `cargo fmt --check` + `cargo clippy -D warnings`):
+
+```bash
+bash scripts/install-pre-commit-hooks.sh
+```
+
+Bypass once with `git commit --no-verify`.
+
 NOTE: Semantic search embeds **all-MiniLM-L6-v2** via **Candle** (no ONNX Runtime) at
 **compile time**. Assets are downloaded by `build.rs` into
 `src/text_search/embed_weights/` and baked into the binary — nothing large is in git.

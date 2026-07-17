@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Git pre-commit: same formatting + lint bar as CI (fmt + clippy).
+# Install with: bash scripts/install-pre-commit-hooks.sh
+# Bypass once: git commit --no-verify
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "==> cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "==> cargo clippy --locked --all-targets -- -D warnings"
+cargo clippy --locked --all-targets -- -D warnings
+
+echo "pre-commit checks passed"
