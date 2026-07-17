@@ -16,12 +16,12 @@ use myco::session::{
     format_session_detail, format_session_list_line, format_tool_invocation, list_sessions,
     print_session_history, resolve_and_load_session,
 };
+#[cfg(test)]
+use myco::uuid_simple_hex;
 use myco::{
     Agent, AgentEvent, EventSink, Harness, SessionMetaTool, TraceContext, default_config_path,
     ensure_remote_ssh_identities, load_harness_config, print_preflight_report, prompts,
 };
-#[cfg(test)]
-use myco::uuid_simple_hex;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -1066,8 +1066,7 @@ impl CliEventSink {
         });
         let _ = std::io::stdout().flush();
     }
-
-    }
+}
 
 impl EventSink for CliEventSink {
     fn emit(&self, event: AgentEvent) {
