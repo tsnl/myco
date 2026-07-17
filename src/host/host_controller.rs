@@ -37,6 +37,7 @@ pub struct HostConfig {
 }
 
 /// How the controller talks to its worker.
+#[allow(clippy::large_enum_variant)] // Subprocess carries Conn state; InProcess is tiny.
 enum Backend {
     /// Always-ready in-process worker (no child, no NDJSON).
     InProcess { worker: Arc<HostWorker> },
@@ -409,10 +410,10 @@ impl HostController {
 
 impl Drop for HostController {
     fn drop(&mut self) {
-        if let Backend::Subprocess { conn, .. } = &self.backend {
-            if let Ok(mut slot) = conn.try_lock() {
-                *slot = None;
-            }
+        if let Backend::Subprocess { conn, .. } = &self.backend
+            && let Ok(mut slot) = conn.try_lock()
+        {
+            *slot = None;
         }
     }
 }
@@ -575,10 +576,10 @@ async fn run_reader(
                     .keys()
                     .find(|k| k.starts_with("agent_finished:"))
                     .cloned();
-                if let Some(k) = key {
-                    if let Some(tx) = pending.remove(&k) {
-                        let _ = tx.send(msg);
-                    }
+                if let Some(k) = key
+                    && let Some(tx) = pending.remove(&k)
+                {
+                    let _ = tx.send(msg);
                 }
             }
             Response::Error { id: None, .. } => {
@@ -639,17 +640,18 @@ mod tests {
         assert!(ctl.is_connected());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_calls_pipeline_in_process() {
         let ctl = HostController::local_in_process();
 
+        // Real sleeps must overlap: serial would be ~2s, concurrent ~1s (+ slack).
         let t0 = Instant::now();
         let a = ctl.call(
             uuid::Uuid::nil(),
             ToolUse {
                 id: "a".into(),
                 name: "bash".into(),
-                input: json!({"command": "sleep 0.25; echo AAA", "timeout_ms": 5000}),
+                input: json!({"command": "sleep 1; echo AAA", "timeout_ms": 10000}),
             },
             CancelToken::new(),
         );
@@ -658,7 +660,7 @@ mod tests {
             ToolUse {
                 id: "b".into(),
                 name: "bash".into(),
-                input: json!({"command": "sleep 0.25; echo BBB", "timeout_ms": 5000}),
+                input: json!({"command": "sleep 1; echo BBB", "timeout_ms": 10000}),
             },
             CancelToken::new(),
         );
@@ -673,8 +675,8 @@ mod tests {
         assert!(tool_text(&ra).contains("AAA"), "{ra:?}");
         assert!(tool_text(&rb).contains("BBB"), "{rb:?}");
         assert!(
-            wall < Duration::from_millis(900),
-            "expected concurrent overlap, wall={wall:?}"
+            wall < Duration::from_millis(1700),
+            "expected concurrent overlap (~1s), wall={wall:?}"
         );
     }
 

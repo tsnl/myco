@@ -196,6 +196,7 @@ impl SubagentService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_subagent_log(
     path: &Path,
     agent_id: uuid::Uuid,

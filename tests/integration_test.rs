@@ -13,10 +13,9 @@ mod test_utils;
 async fn test_agent_tool_use() {
     test_utils::load_dotenv();
 
-    let harness =
-        Harness::local_with_services(vec![
-            Arc::new(test_tools::LetterCounterTool::default()) as Arc<dyn ToolService>
-        ]);
+    let harness = Harness::local_with_services(vec![
+        Arc::new(test_tools::LetterCounterTool) as Arc<dyn ToolService>
+    ]);
 
     let model = generative_model::new(GenerativeModelConfig {
         model: Model::ClaudeHaiku45,

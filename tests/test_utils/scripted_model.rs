@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Scripted generative model for integration tests.
 //!
 //! Each `generate` call consumes the next pre-baked [`GenerateOutput`] (FIFO)

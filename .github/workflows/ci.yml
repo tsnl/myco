@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache MiniLM embed weights
+        uses: actions/cache@v4
+        with:
+          path: src/text_search/embed_weights
+          key: minilm-embed-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: cargo clippy
+        # Root package targets (lib, bins, tests, examples, benches). Not crates/myco-gui.
+        # Build.rs fetches MiniLM once; weights cached after first run.
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache MiniLM embed weights
+        uses: actions/cache@v4
+        with:
+          path: src/text_search/embed_weights
+          key: minilm-embed-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Unit tests (lib)
+        run: cargo test --locked --lib
+      - name: Offline integration tests
+        # Scripted-model / host-pipe tests — no provider API keys required.
+        # Skips tests/integration_test.rs and generative_model live suites
+        # (those need ANTHROPIC_* / XAI_* — see live-models job).
+        run: |
+          cargo test --locked \
+            --test bash_session_integration \
+            --test concurrent_host_tools \
+            --test host_cancel_desync
+
+  live-models:
+    name: Live model tests
+    runs-on: ubuntu-latest
+    # Only when credentials are configured (repo secrets). PRs from forks never
+    # receive secrets, so this job is a no-op there.
+    if: ${{ vars.ENABLE_LIVE_MODEL_TESTS == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache MiniLM embed weights
+        uses: actions/cache@v4
+        with:
+          path: src/text_search/embed_weights
+          key: minilm-embed-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest', 'build.rs') }}
+      - name: Live Anthropic / OpenAI Responses tests
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XAI_API_BASE_URL: ${{ secrets.XAI_API_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: |
+          if [ -z "${ANTHROPIC_AUTH_TOKEN}${ANTHROPIC_API_KEY}${XAI_API_KEY}${OPENAI_API_KEY}" ]; then
+            echo "No provider secrets set; failing live-models job."
+            exit 1
+          fi
+          cargo test --locked --test integration_test

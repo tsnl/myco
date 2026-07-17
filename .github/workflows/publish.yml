@@ -1,0 +1,93 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to publish from"
+        required: true
+        default: "main"
+        type: string
+      bump_type:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run: skip automated commit, push, and publish"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: read
+  checks: read
+
+jobs:
+  publish:
+    name: Publish Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Semver bump and cargo publish
+        id: publish
+        uses: tsnl/semver-bump-and-cargo-publish@v1
+        with:
+          branch: ${{ github.event.inputs.branch }}
+          bump_type: ${{ github.event.inputs.bump_type }}
+          dry_run: ${{ github.event.inputs.dry_run }}
+          cargo_registry_token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          pat_token: ${{ secrets.PAT_TOKEN }}
+          # Match CI job names exactly as shown under commit checks:
+          #   CI / Check Formatting, CI / Lint, CI / Test
+          wait_for_checks: "CI / Check Formatting, CI / Lint, CI / Test"
+          check_wait_interval: "60"
+          check_timeout_count: "30"
+          rust_toolchain: "stable"
+          git_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          git_user_name: "github-actions[bot]"
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.publish.outputs.published == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.publish.outputs.tag_name }}
+          name: ${{ steps.publish.outputs.new_version }}
+          generate_release_notes: true
+          body: |
+            Published **${{ steps.publish.outputs.package_name }}** `${{ steps.publish.outputs.new_version }}`
+            (was `${{ steps.publish.outputs.old_version }}`).
+
+            crates.io: https://crates.io/crates/${{ steps.publish.outputs.package_name }}
+
+            Install:
+            ```bash
+            cargo install myco --locked
+            # or from this tag:
+            cargo install --git https://github.com/${{ github.repository }} --tag ${{ steps.publish.outputs.tag_name }} --locked
+            ```
+
+            Platform-matched binaries are not attached here yet; build on the target
+            host (MiniLM weights are baked in at compile time). See `myco --help harness-ops`.
+
+      - name: Summary
+        run: |
+          {
+            echo "## Publish summary"
+            echo "- **Package**: ${{ steps.publish.outputs.package_name }}"
+            echo "- **Branch**: ${{ github.event.inputs.branch }}"
+            echo "- **Version**: ${{ steps.publish.outputs.old_version }} → ${{ steps.publish.outputs.new_version }}"
+            echo "- **Tag**: ${{ steps.publish.outputs.tag_name }}"
+            echo "- **crates.io**: ${{ steps.publish.outputs.published }}"
+            echo "- **Dry run**: ${{ github.event.inputs.dry_run }}"
+          } >> "$GITHUB_STEP_SUMMARY"

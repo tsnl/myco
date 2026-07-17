@@ -332,6 +332,7 @@ impl BashService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn session_start(
         &self,
         session_id: &str,
@@ -463,12 +464,12 @@ impl BashService {
         }
 
         // Optional initial stdin, then collect a first snapshot.
-        if let Some(data) = stdin {
-            if let Err(e) = self.write_to_session(session_id, data).await {
-                return generative_model::ToolResult::err(format!(
-                    "session {session_id:?} started but initial stdin write failed: {e}"
-                ));
-            }
+        if let Some(data) = stdin
+            && let Err(e) = self.write_to_session(session_id, data).await
+        {
+            return generative_model::ToolResult::err(format!(
+                "session {session_id:?} started but initial stdin write failed: {e}"
+            ));
         }
 
         let snapshot = self
@@ -480,6 +481,7 @@ impl BashService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn session_write(
         &self,
         session_id: &str,
@@ -722,12 +724,11 @@ impl BashService {
         }
 
         self.return_stdin(session_id, stdin);
-        if let Ok(sessions) = self.sessions.lock() {
-            if let Some(session) = sessions.get(session_id) {
-                if let Ok(mut t) = session.last_used.lock() {
-                    *t = Instant::now();
-                }
-            }
+        if let Ok(sessions) = self.sessions.lock()
+            && let Some(session) = sessions.get(session_id)
+            && let Ok(mut t) = session.last_used.lock()
+        {
+            *t = Instant::now();
         }
         shared.notify.notify_waiters();
         Ok(())
@@ -960,6 +961,7 @@ fn spawn_waiter(mut child: Child, shared: Arc<SessionShared>) {
 ///
 /// Bytes returned are removed from the buffer so subsequent reads only see new data.
 /// On cancel, returns whatever is buffered with `TimedOut` status (session stays live).
+#[allow(clippy::too_many_arguments)]
 async fn collect_output(
     shared: &Arc<SessionShared>,
     session_id: &str,

@@ -360,6 +360,7 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 // REPL
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_repl(
     agent: &mut Agent,
     session: &ActiveSession,
@@ -523,6 +524,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_meta(
     cmd: MetaCommand<'_>,
     agent: &mut Agent,
@@ -706,9 +708,7 @@ fn print_host_status(harness: &Harness) {
     for s in statuses {
         // Local: always ok/in-process. Remotes: idle until first tool use; ok while
         // connected; DOWN after connect error.
-        let state = if s.in_process {
-            "ok"
-        } else if s.connected {
+        let state = if s.in_process || s.connected {
             "ok"
         } else if s.error.is_some() {
             "DOWN"
@@ -774,10 +774,10 @@ fn save_readline_history(
 
 fn load_readline_history(editor: &mut Editor<ReplHelper, DefaultHistory>, session: &ActiveSession) {
     let history_path = session.with(|s| s.history_path());
-    if let Err(e) = editor.load_history(&history_path) {
-        if history_path.exists() {
-            eprintln!("warning: could not load readline history: {e}");
-        }
+    if let Err(e) = editor.load_history(&history_path)
+        && history_path.exists()
+    {
+        eprintln!("warning: could not load readline history: {e}");
     }
 }
 
@@ -886,36 +886,36 @@ impl Completer for ReplHelper {
         }
 
         // `/resume <prefix>` → session ids.
-        if let Some(rest) = before.strip_prefix("/resume") {
-            if rest.starts_with(char::is_whitespace) {
-                let prefix = rest.trim_start();
-                let start = before.len() - prefix.len();
-                let pairs = session_id_completions(prefix)
-                    .into_iter()
-                    .map(|id| Pair {
-                        display: id.clone(),
-                        replacement: id,
-                    })
-                    .collect();
-                return Ok((start, pairs));
-            }
+        if let Some(rest) = before.strip_prefix("/resume")
+            && rest.starts_with(char::is_whitespace)
+        {
+            let prefix = rest.trim_start();
+            let start = before.len() - prefix.len();
+            let pairs = session_id_completions(prefix)
+                .into_iter()
+                .map(|id| Pair {
+                    display: id.clone(),
+                    replacement: id,
+                })
+                .collect();
+            return Ok((start, pairs));
         }
 
         // `/effort <level>` → low|medium|high|max.
-        if let Some(rest) = before.strip_prefix("/effort") {
-            if rest.starts_with(char::is_whitespace) {
-                let prefix = rest.trim_start().to_ascii_lowercase();
-                let start = before.len() - rest.trim_start().len();
-                let pairs = ["low", "medium", "high", "max"]
-                    .into_iter()
-                    .filter(|level| level.starts_with(prefix.as_str()))
-                    .map(|level| Pair {
-                        display: level.to_string(),
-                        replacement: level.to_string(),
-                    })
-                    .collect();
-                return Ok((start, pairs));
-            }
+        if let Some(rest) = before.strip_prefix("/effort")
+            && rest.starts_with(char::is_whitespace)
+        {
+            let prefix = rest.trim_start().to_ascii_lowercase();
+            let start = before.len() - rest.trim_start().len();
+            let pairs = ["low", "medium", "high", "max"]
+                .into_iter()
+                .filter(|level| level.starts_with(prefix.as_str()))
+                .map(|level| Pair {
+                    display: level.to_string(),
+                    replacement: level.to_string(),
+                })
+                .collect();
+            return Ok((start, pairs));
         }
 
         // Complete slash commands from the start of the line.

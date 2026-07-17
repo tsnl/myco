@@ -183,7 +183,7 @@ impl HostWorker {
             });
         }
 
-        while let Some(_) = in_flight.join_next().await {}
+        while in_flight.join_next().await.is_some() {}
         Ok(())
     }
 

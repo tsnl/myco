@@ -2,6 +2,13 @@
 name = "myco"
 version = "0.1.0"
 edition = "2024"
+description = "Multi-host coding agent CLI (local in-process + SSH remotes)"
+repository = "https://github.com/tsnl/myco"
+homepage = "https://github.com/tsnl/myco"
+readme = "README.md"
+keywords = ["agent", "cli", "ssh", "coding"]
+categories = ["command-line-utilities", "development-tools"]
+# license = "..."  # add when a LICENSE file is committed
 
 [dependencies]
 async-trait = "0.1"

@@ -348,10 +348,10 @@ impl Session {
     }
 
     pub fn display_title(&self) -> String {
-        if let Some(t) = &self.title {
-            if !t.is_empty() {
-                return t.clone();
-            }
+        if let Some(t) = &self.title
+            && !t.is_empty()
+        {
+            return t.clone();
         }
         first_user_text_from_messages(&self.messages)
             .map(|s| truncate_snippet(&s, SESSION_LIST_SNIPPET))
@@ -411,7 +411,7 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
         }
     }
 
-    metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
     if limit > 0 {
         metas.truncate(limit);
     }
@@ -658,10 +658,10 @@ pub fn format_link_one_line(link: &SessionLink) -> String {
             if let (Some(r), Some(n)) = (repo, number) {
                 s = format!("pr {r}#{n} ({url})");
             }
-            if let Some(n) = note {
-                if !n.is_empty() {
-                    s.push_str(&format!(" — {n}"));
-                }
+            if let Some(n) = note
+                && !n.is_empty()
+            {
+                s.push_str(&format!(" — {n}"));
             }
             s
         }
@@ -672,15 +672,15 @@ pub fn format_link_one_line(link: &SessionLink) -> String {
             note,
         } => {
             let mut s = format!("worktree host={host} path={path}");
-            if let Some(b) = branch {
-                if !b.is_empty() {
-                    s.push_str(&format!(" branch={b}"));
-                }
+            if let Some(b) = branch
+                && !b.is_empty()
+            {
+                s.push_str(&format!(" branch={b}"));
             }
-            if let Some(n) = note {
-                if !n.is_empty() {
-                    s.push_str(&format!(" — {n}"));
-                }
+            if let Some(n) = note
+                && !n.is_empty()
+            {
+                s.push_str(&format!(" — {n}"));
             }
             s
         }
@@ -705,8 +705,9 @@ fn validate_link(link: &SessionLink) -> Result<(), String> {
             if path.is_empty() {
                 return Err("worktree path must be non-empty".into());
             }
-            if !path.starts_with('/') && !(path.len() >= 3 && path.as_bytes()[1] == b':') {
-                // Allow Unix absolute and Windows drive paths; reject relative.
+            // Allow Unix absolute and Windows drive paths; reject relative.
+            let windows_abs = path.len() >= 3 && path.as_bytes()[1] == b':';
+            if !path.starts_with('/') && !windows_abs {
                 return Err("worktree path must be absolute".into());
             }
             Ok(())
@@ -728,16 +729,18 @@ pub fn normalize_pr_url(raw: &str) -> Result<String, String> {
     }
 
     // org/repo#123
-    if let Some((repo, num)) = s.split_once('#') {
-        if repo.contains('/') && !repo.contains("://") && num.chars().all(|c| c.is_ascii_digit()) {
-            let num: u32 = num
-                .parse()
-                .map_err(|_| format!("invalid PR number in {s:?}"))?;
-            if num == 0 {
-                return Err("PR number must be > 0".into());
-            }
-            return Ok(format!("https://github.com/{repo}/pull/{num}"));
+    if let Some((repo, num)) = s.split_once('#')
+        && repo.contains('/')
+        && !repo.contains("://")
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        let num: u32 = num
+            .parse()
+            .map_err(|_| format!("invalid PR number in {s:?}"))?;
+        if num == 0 {
+            return Err("PR number must be > 0".into());
         }
+        return Ok(format!("https://github.com/{repo}/pull/{num}"));
     }
 
     let mut url = s.to_string();
@@ -749,12 +752,12 @@ pub fn normalize_pr_url(raw: &str) -> Result<String, String> {
     }
 
     // org/repo/pull/123
-    if !url.contains("://") {
-        if let Some((repo, rest)) = url.split_once("/pull/") {
-            if repo.contains('/') && rest.chars().all(|c| c.is_ascii_digit()) {
-                url = format!("https://github.com/{repo}/pull/{rest}");
-            }
-        }
+    if !url.contains("://")
+        && let Some((repo, rest)) = url.split_once("/pull/")
+        && repo.contains('/')
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        url = format!("https://github.com/{repo}/pull/{rest}");
     }
 
     let rest = url.strip_prefix("https://github.com/").ok_or_else(|| {
@@ -762,15 +765,15 @@ pub fn normalize_pr_url(raw: &str) -> Result<String, String> {
     })?;
     let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
     // org/repo/pull/N
-    if parts.len() >= 4 && parts[2] == "pull" {
-        if let Ok(n) = parts[3].parse::<u32>() {
-            if n > 0 {
-                return Ok(format!(
-                    "https://github.com/{}/{}/pull/{n}",
-                    parts[0], parts[1]
-                ));
-            }
-        }
+    if parts.len() >= 4
+        && parts[2] == "pull"
+        && let Ok(n) = parts[3].parse::<u32>()
+        && n > 0
+    {
+        return Ok(format!(
+            "https://github.com/{}/{}/pull/{n}",
+            parts[0], parts[1]
+        ));
     }
     Err(format!(
         "PR url must be a github.com pull request URL or org/repo#N (got {raw:?})"

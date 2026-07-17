@@ -546,13 +546,11 @@ impl StreamAccumulator {
                     }));
                 }
                 match self.output_kinds[output_index] {
-                    Some(OutputKind::Thinking { index }) => {
-                        if !delta.is_empty() {
-                            out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                                index,
-                                delta,
-                            }));
-                        }
+                    Some(OutputKind::Thinking { index }) if !delta.is_empty() => {
+                        out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
+                            index,
+                            delta,
+                        }));
                     }
                     // If this index was already opened as normal text, don't corrupt it.
                     _ => {}

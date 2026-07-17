@@ -80,18 +80,18 @@ fn main() {
                 cache_root.join(asset.local_name),
                 cache_root.join(asset.remote_path),
             ];
-            if let Some(src) = candidates.into_iter().find(|p| p.is_file()) {
-                if asset_ok(&src, asset.size, want_sha) {
-                    fs::copy(&src, &dest).unwrap_or_else(|e| {
-                        panic!("copy {} → {}: {e}", src.display(), dest.display());
-                    });
-                    println!(
-                        "cargo:warning=MiniLM asset {} seeded from {}",
-                        asset.local_name,
-                        src.display()
-                    );
-                    continue;
-                }
+            if let Some(src) = candidates.into_iter().find(|p| p.is_file())
+                && asset_ok(&src, asset.size, want_sha)
+            {
+                fs::copy(&src, &dest).unwrap_or_else(|e| {
+                    panic!("copy {} → {}: {e}", src.display(), dest.display());
+                });
+                println!(
+                    "cargo:warning=MiniLM asset {} seeded from {}",
+                    asset.local_name,
+                    src.display()
+                );
+                continue;
             }
         }
 
@@ -231,17 +231,17 @@ fn sha256_file(path: &Path) -> Result<String, String> {
             cmd.arg(a);
         }
         cmd.arg(path);
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout);
-                let hash = s
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if hash.len() == 64 {
-                    return Ok(hash);
-                }
+        if let Ok(out) = cmd.output()
+            && out.status.success()
+        {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let hash = s
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if hash.len() == 64 {
+                return Ok(hash);
             }
         }
     }

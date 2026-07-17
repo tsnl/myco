@@ -162,27 +162,27 @@ pub fn default_local_host_command() -> Vec<String> {
 
 pub(crate) fn myco_program() -> String {
     // cargo integration tests set this when the package builds the binary.
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_myco") {
-        if std::path::Path::new(&path).is_file() {
-            return path;
-        }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_myco")
+        && std::path::Path::new(&path).is_file()
+    {
+        return path;
     }
     // Sibling of current exe (installed layout / `cargo run` target dir).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for name in ["myco", "myco.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        // Unit tests run as target/debug/deps/… — walk up to target/{debug,release}/.
+        if let Some(parent) = dir.parent() {
             for name in ["myco", "myco.exe"] {
-                let candidate = dir.join(name);
+                let candidate = parent.join(name);
                 if candidate.is_file() {
                     return candidate.to_string_lossy().into_owned();
-                }
-            }
-            // Unit tests run as target/debug/deps/… — walk up to target/{debug,release}/.
-            if let Some(parent) = dir.parent() {
-                for name in ["myco", "myco.exe"] {
-                    let candidate = parent.join(name);
-                    if candidate.is_file() {
-                        return candidate.to_string_lossy().into_owned();
-                    }
                 }
             }
         }

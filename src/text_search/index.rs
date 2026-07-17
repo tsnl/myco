@@ -251,10 +251,11 @@ impl SearchIndex {
             let Some(path_str) = path_val.as_str() else {
                 continue;
             };
-            if let Some(ref p) = prefix {
-                if path_str != p.as_str() && !path_str.starts_with(&(p.clone() + "/")) {
-                    continue;
-                }
+            if let Some(ref p) = prefix
+                && path_str != p.as_str()
+                && !path_str.starts_with(&(p.clone() + "/"))
+            {
+                continue;
             }
             let path = PathBuf::from(path_str);
             let rec = self.files.get(path_str);
@@ -298,10 +299,11 @@ impl SearchIndex {
 
         let mut scored: Vec<(f32, String)> = Vec::new();
         for (key, vec) in &self.vectors {
-            if let Some(ref p) = prefix {
-                if key != p && !key.starts_with(&(p.clone() + "/")) {
-                    continue;
-                }
+            if let Some(ref p) = prefix
+                && key != p
+                && !key.starts_with(&(p.clone() + "/"))
+            {
+                continue;
             }
             let score = cosine(&q_vec, vec);
             if score > 0.0 {

@@ -194,7 +194,7 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
         for path in missing {
             let hosts = identity_hosts
                 .get(&path)
-                .map(|s| join_hosts(s))
+                .map(join_hosts)
                 .unwrap_or_default();
             report.still_missing.push((
                 path.clone(),
@@ -207,7 +207,7 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     for path in missing {
         let hosts = identity_hosts
             .get(&path)
-            .map(|s| join_hosts(s))
+            .map(join_hosts)
             .unwrap_or_else(|| "?".into());
         eprintln!("ssh-agent: unlocking {} (hosts: {hosts})", path.display());
         match interactive_ssh_add(&path) {
@@ -399,15 +399,15 @@ fn identity_files_for_alias(alias: &str) -> Result<Vec<PathBuf>, String> {
 }
 
 fn expand_user_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
-    if raw == "~" {
-        if let Some(home) = home_dir() {
-            return home;
-        }
+    if raw == "~"
+        && let Some(home) = home_dir()
+    {
+        return home;
     }
     PathBuf::from(raw)
 }

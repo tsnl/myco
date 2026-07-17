@@ -107,7 +107,7 @@ fn walk_discover(
                 });
             } else if AGENTS_NAMES.iter().any(|n| name == *n) {
                 out.insert(AutoIndexTarget {
-                    path: path,
+                    path,
                     reason: "AGENTS.md / CLAUDE.md",
                 });
             }

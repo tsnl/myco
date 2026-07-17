@@ -327,13 +327,11 @@ async fn accumulate_generate(
                 context: context.clone(),
             });
         }
-        MessagePart::ContentDelta(ContentDelta::Thinking { delta, .. }) => {
-            if !delta.is_empty() {
-                sink.emit(AgentEvent::ThinkingDelta {
-                    text: delta.clone(),
-                    context: context.clone(),
-                });
-            }
+        MessagePart::ContentDelta(ContentDelta::Thinking { delta, .. }) if !delta.is_empty() => {
+            sink.emit(AgentEvent::ThinkingDelta {
+                text: delta.clone(),
+                context: context.clone(),
+            });
         }
         _ => {}
     });
@@ -503,11 +501,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_tool_uses_overlap_and_preserve_order() {
         let starts = Arc::new(Mutex::new(Vec::new()));
         let ends = Arc::new(Mutex::new(Vec::new()));
-        let delay = Duration::from_millis(80);
+        // Long enough that serial execution is unambiguous even under CI load.
+        let delay = Duration::from_millis(300);
 
         // Two distinct tool names so the harness router can host both (same service type).
         let slow_a = Arc::new(SlowService {
@@ -601,10 +600,15 @@ mod tests {
             "expected overlapping execution: last_start={last_start:?} first_end={first_end:?} starts={starts:?} ends={ends:?}"
         );
 
-        // Wall clock should be ~1 delay, not ~2 (serial would be ~160ms+).
+        // Wall clock should be ~1 delay, not ~2. Allow headroom for CI load.
+        assert!(
+            wall < delay + delay + Duration::from_millis(200),
+            "expected concurrent wall time ~1 delay, got {wall:?} (delay={delay:?})"
+        );
+        // Still clearly faster than fully serial (2*delay).
         assert!(
             wall < delay + delay,
-            "expected concurrent wall time < 2*delay, got {wall:?} (delay={delay:?})"
+            "wall {wall:?} looks serial for delay={delay:?}"
         );
     }
 
@@ -649,7 +653,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_during_generate_returns_cancelled() {
         let harness = Harness::local_with_services(vec![]);
         let model = Arc::new(SlowStreamModel {
@@ -683,13 +687,14 @@ mod tests {
         assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_during_slow_tool_records_cancelled_result() {
         let starts = Arc::new(Mutex::new(Vec::new()));
         let ends = Arc::new(Mutex::new(Vec::new()));
         let slow = Arc::new(SlowService {
             name: "slow_a".into(),
-            delay: Duration::from_millis(500),
+            // Long enough that a delayed cancel still hits mid-tool under load.
+            delay: Duration::from_secs(5),
             starts: starts.clone(),
             ends: ends.clone(),
         });
@@ -707,8 +712,19 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let cancel = crate::core::CancelToken::new();
         let cancel2 = cancel.clone();
+        let starts_bg = starts.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Cancel only after the tool has started (not a fixed sleep race).
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if !starts_bg.lock().unwrap().is_empty() {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             cancel2.cancel();
         });
 
@@ -720,7 +736,7 @@ mod tests {
         let elapsed = t0.elapsed();
         assert!(matches!(err, AgentInteractionError::Cancelled));
         assert!(
-            elapsed < Duration::from_millis(400),
+            elapsed < Duration::from_secs(2),
             "should not wait full tool delay, took {elapsed:?}"
         );
 
