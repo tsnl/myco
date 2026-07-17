@@ -8,7 +8,9 @@ use crate::Harness;
 use crate::core::Async;
 use crate::generative_model::{self, Content, GenerativeModelConfig, Message, Model};
 use crate::prompts;
-use crate::session::{Agent, AgentEvent, EventSink, TraceContext, uuid_simple_hex};
+use crate::session::{
+    Agent, AgentEvent, EventSink, Session, SessionKind, TraceContext, uuid_simple_hex,
+};
 use crate::tool_services::{HostDispatchContext, ToolService};
 
 const SUBAGENT_SYSTEM_PROMPT_PROLOGUE: &str = r#"
@@ -27,6 +29,10 @@ Runs a subagent with the specified prompt as input.
 Single-shot, no multi-turn conversation, though the subagent may use multiple turns to process tool
 calls before replying.
 
+Creates a session under `~/.myco/session/` with `kind: subagent` (not visible in default listings)
+whose id equals the subagent UUID (same as runtime agent_id). Accessible via get-by-id or
+`session_meta list` with `include_hidden: true`.
+
 The `model` field must be one of the supported model ids (see the tool input schema enum).
 "#;
 
@@ -42,8 +48,9 @@ pub struct AgentRootHandles {
 /// Spawns a one-shot subagent that shares the supervisor's harness and event sink.
 ///
 /// Only useful when registered on the root in-process local worker (needs
-/// [`AgentRootHandles`]). Writes a durable transcript to
-/// `.myco/subagent-logs/{agent_id}.log`.
+/// [`AgentRootHandles`]). Persists a **hidden** [`Session`] under
+/// `~/.myco/session/` with `id == agent_id` (same hex as runtime correlation).
+/// Also writes a debug transcript to `.myco/subagent-logs/{agent_id}.log`.
 #[derive(Default)]
 pub struct SubagentService {}
 
@@ -121,6 +128,18 @@ impl SubagentService {
         let agent_id_hex = uuid_simple_hex(agent_id);
         let log_path = PathBuf::from(SUBAGENT_LOG_DIR).join(format!("{agent_id_hex}.log"));
 
+        let parent_session_id = uuid_simple_hex(root.context.agent_id);
+        let mut worker_session = Session::new_hidden(
+            input.model,
+            agent_id_hex.clone(),
+            SessionKind::Subagent,
+            Some(parent_session_id.clone()),
+        );
+        worker_session.title = Some(format!("subagent of {parent_session_id}"));
+        if let Err(e) = worker_session.save() {
+            eprintln!("warning: failed to create hidden subagent session {agent_id_hex}: {e}");
+        }
+
         let child_context = root
             .context
             .child_agent(agent_id, Some(parent_tool_use_id.clone()));
@@ -141,8 +160,9 @@ impl SubagentService {
         );
 
         let id_notice = format!(
-            "Your subagent UUID is {agent_id_hex}. Write durable details to `{}` if needed; \
-             a transcript will also be saved there by the harness.",
+            "Your subagent UUID is {agent_id_hex} (hidden session id). \
+             Write durable details to `{}` if needed; the harness also persists \
+             this session under ~/.myco/session/ and a debug log at that path.",
             log_path.display()
         );
 
@@ -157,6 +177,13 @@ impl SubagentService {
                 ctx.cancel.clone(),
             )
             .await;
+
+        // Persist full history into the hidden session (source of truth).
+        worker_session.messages = subagent.history().to_vec();
+        worker_session.touch();
+        if let Err(e) = worker_session.save() {
+            eprintln!("warning: failed to save hidden subagent session {agent_id_hex}: {e}");
+        }
 
         if let Err(e) = write_subagent_log(
             &log_path,
@@ -185,9 +212,11 @@ impl SubagentService {
                     .collect::<Vec<_>>()
                     .join("\n");
                 generative_model::ToolResult::text(if text.is_empty() {
-                    format!("(subagent {agent_id_hex} finished with no text)")
+                    format!(
+                        "(subagent {agent_id_hex} finished with no text; hidden session={agent_id_hex})"
+                    )
                 } else {
-                    text
+                    format!("{text}\n\n(subagent session={agent_id_hex})")
                 })
             }
             Err(e) => generative_model::ToolResult::err(format!("subagent failed: {e}")),

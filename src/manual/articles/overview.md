@@ -29,7 +29,7 @@ myco (interactive) / Agent
 | Path | Role |
 |------|------|
 | `~/.myco/config.toml` | Remote hosts (`[[remote_hosts]]`). Local is always on. Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. |
+| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 

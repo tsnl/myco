@@ -32,6 +32,48 @@ pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
 pub const MAX_SCRATCHPAD_BYTES: usize = 64 * 1024;
 
+/// Why this session exists. Default [`SessionKind::User`] for interactive chats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// Interactive / user-visible conversation (REPL, successor after compact).
+    #[default]
+    User,
+    /// Nested agent run (`subagent` tool). Hidden by default in listings.
+    Subagent,
+    /// Compaction worker. Hidden by default in listings.
+    Compact,
+}
+
+impl std::fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionKind::User => write!(f, "user"),
+            SessionKind::Subagent => write!(f, "subagent"),
+            SessionKind::Compact => write!(f, "compact"),
+        }
+    }
+}
+
+impl SessionKind {
+    /// Serde skip helper: omit `kind` on disk when it is the default.
+    pub fn is_user(&self) -> bool {
+        matches!(self, SessionKind::User)
+    }
+
+    /// Visible in default `/sessions` / bare `--resume` / `session_meta list`.
+    ///
+    /// Visibility is derived from kind (not a separate stored flag): only
+    /// [`SessionKind::User`] sessions are visible.
+    pub fn is_visible(self) -> bool {
+        matches!(self, SessionKind::User)
+    }
+
+    pub fn is_hidden(self) -> bool {
+        !self.is_visible()
+    }
+}
+
 /// Full conversation session document.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
@@ -50,6 +92,13 @@ pub struct Session {
     /// Per-session markdown scratchpad.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scratchpad: String,
+    /// Session / agent that spawned this one (subagent, compact worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Classification for filtering and UI. Visibility is derived via
+    /// [`SessionKind::is_visible`] (only [`SessionKind::User`] is listed by default).
+    #[serde(default, skip_serializing_if = "SessionKind::is_user")]
+    pub kind: SessionKind,
 }
 
 /// Structured association stored on a session.
@@ -89,6 +138,8 @@ pub struct SessionListEntry {
     pub title: Option<String>,
     pub snippet: String,
     pub link_counts: LinkCounts,
+    pub kind: SessionKind,
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -181,10 +232,15 @@ impl ActiveSession {
 
 impl Session {
     pub fn new(model: Model) -> Self {
+        Self::new_with_id(model, uuid_simple_hex(Uuid::new_v4()))
+    }
+
+    /// Create a session with an explicit id (same hex as agent id).
+    pub fn new_with_id(model: Model, id: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
             version: SESSION_FILE_VERSION,
-            id: uuid_simple_hex(Uuid::new_v4()),
+            id: id.into(),
             created_at: now,
             updated_at: now,
             model: model.to_string(),
@@ -192,7 +248,35 @@ impl Session {
             title: None,
             links: Vec::new(),
             scratchpad: String::new(),
+            parent_session_id: None,
+            kind: SessionKind::User,
         }
+    }
+
+    /// Whether this session appears in default listings (derived from [`Self::kind`]).
+    pub fn is_visible(&self) -> bool {
+        self.kind.is_visible()
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.kind.is_hidden()
+    }
+
+    /// Worker session (subagent / compact). Kind must be non-user so it is hidden.
+    pub fn new_hidden(
+        model: Model,
+        id: impl Into<String>,
+        kind: SessionKind,
+        parent_session_id: Option<String>,
+    ) -> Self {
+        debug_assert!(
+            kind.is_hidden(),
+            "new_hidden requires a non-user SessionKind"
+        );
+        let mut s = Self::new_with_id(model, id);
+        s.kind = kind;
+        s.parent_session_id = parent_session_id;
+        s
     }
 
     pub fn touch(&mut self) {
@@ -379,6 +463,14 @@ pub fn atomically_write(path: &Path, content: &[u8]) -> Result<(), String> {
 }
 
 pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_filtered(limit, /*include_hidden*/ false)
+}
+
+/// List sessions. When `include_hidden` is false, subagent/compact sessions are omitted.
+pub fn list_sessions_filtered(
+    limit: usize,
+    include_hidden: bool,
+) -> Result<Vec<SessionListEntry>, String> {
     let root = session_root()?;
     if !root.exists() {
         return Ok(Vec::new());
@@ -387,7 +479,11 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
     let mut metas = Vec::new();
     for path in iter_session_json_files(&root)? {
         match session_list_entry_from_path(&path) {
-            Ok(entry) => metas.push(entry),
+            Ok(entry) => {
+                if include_hidden || entry.kind.is_visible() {
+                    metas.push(entry);
+                }
+            }
             Err(_) => continue, // skip corrupt / wrong-version files
         }
     }
@@ -399,9 +495,14 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
     Ok(metas)
 }
 
-/// List every readable session (no limit). Wrong-version files are omitted.
+/// List every readable **visible** session (no limit). Wrong-version files are omitted.
 pub fn list_all_sessions() -> Result<Vec<SessionListEntry>, String> {
     list_sessions(0)
+}
+
+/// List every readable session including hidden (no limit).
+pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_filtered(0, true)
 }
 
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
@@ -418,6 +519,8 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         title: session.title,
         snippet,
         link_counts: LinkCounts::from_links(&session.links),
+        kind: session.kind,
+        parent_session_id: session.parent_session_id,
     })
 }
 
@@ -579,14 +682,20 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
             entry.link_counts.prs, entry.link_counts.worktrees
         )
     };
+    let hidden = if entry.kind.is_hidden() {
+        format!("  [{}]", entry.kind)
+    } else {
+        String::new()
+    };
     format!(
-        "  {:>2}. {}  {}  model={}  msgs={}{}  {}",
+        "  {:>2}. {}  {}  model={}  msgs={}{}{}  {}",
         index,
         entry.id,
         entry.updated_at.to_rfc3339(),
         entry.model,
         entry.message_count,
         links,
+        hidden,
         label
     )
 }
@@ -599,6 +708,14 @@ pub fn format_session_detail(session: &Session) -> String {
     out.push_str(&format!("updated:   {}\n", session.updated_at.to_rfc3339()));
     out.push_str(&format!("model:     {}\n", session.model));
     out.push_str(&format!("messages:  {}\n", session.messages.len()));
+    out.push_str(&format!("kind:      {}\n", session.kind));
+    out.push_str(&format!(
+        "hidden:    {}\n",
+        if session.is_hidden() { "true" } else { "false" }
+    ));
+    if let Some(parent) = session.parent_session_id.as_deref() {
+        out.push_str(&format!("parent:    {parent}\n"));
+    }
     out.push_str(&format!(
         "title:     {}\n",
         session
@@ -790,7 +907,16 @@ fn urls_equal(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::generative_model::{Content, Message};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
+
+    /// Serialize tests that mutate `MYCO_HOME` (process-global env).
+    fn myco_home_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn temp_session_root() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -898,6 +1024,8 @@ mod tests {
                 note: None,
             }],
             scratchpad: "notes".into(),
+            parent_session_id: None,
+            kind: SessionKind::User,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 
@@ -931,8 +1059,9 @@ mod tests {
 
     #[test]
     fn active_session_auto_title_once() {
+        let _guard = myco_home_lock();
         let dir = temp_session_root();
-        // SAFETY: test-only env override; serial unit tests.
+        // SAFETY: test-only env override; held under myco_home_lock.
         unsafe {
             std::env::set_var("MYCO_HOME", &dir);
         }
@@ -957,5 +1086,85 @@ mod tests {
         assert!(s.set_scratchpad(big).is_err());
         s.set_scratchpad("ok".into()).unwrap();
         assert_eq!(s.scratchpad, "ok");
+    }
+
+    #[test]
+    fn hidden_default_false_and_omitted_from_list() {
+        let _guard = myco_home_lock();
+        let dir = temp_session_root();
+        // SAFETY: test-only env override; held under myco_home_lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let mut visible = Session::new(Model::ClaudeHaiku45);
+        visible.messages.push(Message::UserMessage {
+            content: vec![Content::Text {
+                text: "visible".into(),
+            }],
+        });
+        visible.save().unwrap();
+
+        let mut hidden = Session::new_hidden(
+            Model::ClaudeHaiku45,
+            "bbccddeeff00112233445566778899aa",
+            SessionKind::Subagent,
+            Some(visible.id.clone()),
+        );
+        hidden.messages.push(Message::UserMessage {
+            content: vec![Content::Text {
+                text: "hidden subagent".into(),
+            }],
+        });
+        hidden.save().unwrap();
+
+        let listed = list_sessions(0).unwrap();
+        assert!(
+            listed.iter().any(|e| e.id == visible.id),
+            "visible missing: {listed:?}"
+        );
+        assert!(
+            listed.iter().all(|e| e.id != hidden.id),
+            "hidden should be filtered: {listed:?}"
+        );
+
+        let all = list_sessions_filtered(0, true).unwrap();
+        assert!(all.iter().any(|e| e.id == hidden.id && e.kind.is_hidden()));
+
+        // Bare resume resolves most recent *visible* session.
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, visible.id);
+
+        // Explicit id still loads hidden.
+        let loaded = Session::load_by_id_or_prefix(&hidden.id).unwrap();
+        assert!(loaded.is_hidden());
+        assert_eq!(loaded.kind, SessionKind::Subagent);
+        assert_eq!(
+            loaded.parent_session_id.as_deref(),
+            Some(visible.id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
+    }
+
+    #[test]
+    fn old_session_json_defaults_kind_user() {
+        let dir = temp_session_root();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.json");
+        // No kind/parent fields — serde defaults to user (visible).
+        fs::write(
+            &path,
+            br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
+        )
+        .unwrap();
+        let s = Session::load(&path).unwrap();
+        assert!(!s.is_hidden());
+        assert_eq!(s.kind, SessionKind::User);
+        assert!(s.parent_session_id.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
