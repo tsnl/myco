@@ -94,8 +94,9 @@ myco (interactive) / Agent
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
-- **Embedding weights** are compile-time (`build.rs` → `include_bytes!`). Ship
-  platform-matched binaries; do not scp across glibc/arch boundaries.
+- **Embedding weights** are compile-time (`build.rs` stages under `OUT_DIR` →
+  `include_bytes!`). Ship platform-matched binaries; do not scp across
+  glibc/arch boundaries.
 
 ## Code style
 
@@ -142,8 +143,9 @@ cargo test --locked --test integration_test   # and other tests/ binaries as nee
 cargo run --locked --bin myco
 ```
 
-- First build may download MiniLM assets via `build.rs` (needs `curl` + network
-  unless `MYCO_EMBED_OFFLINE=1` with pre-seeded `src/text_search/embed_weights/`).
+- First build may download MiniLM assets via `build.rs` into `OUT_DIR` (needs
+  `curl` + network unless `MYCO_EMBED_OFFLINE=1` with `MYCO_EMBED_CACHE` or a
+  pre-seeded `src/text_search/embed_weights/` cache).
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.

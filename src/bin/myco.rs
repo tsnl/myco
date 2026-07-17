@@ -19,8 +19,9 @@ use myco::session::{
 use myco::{
     Agent, AgentEvent, EventSink, Harness, SessionMetaTool, TraceContext, default_config_path,
     ensure_remote_ssh_identities, load_harness_config, print_preflight_report, prompts,
-    uuid_simple_hex,
 };
+#[cfg(test)]
+use myco::uuid_simple_hex;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -1066,17 +1067,7 @@ impl CliEventSink {
         let _ = std::io::stdout().flush();
     }
 
-    /// Write a finished paragraph (tool line / agent status) inside RESPONSE.
-    fn write_response_paragraph(&self, line: &str) {
-        self.finish_thinking_line();
-        self.ensure_response();
-        self.separate_paragraph_if_needed();
-        println!("{line}");
-        self.with_state(|s| s.at_line_start = true);
-        self.note_paragraph();
-        let _ = std::io::stdout().flush();
     }
-}
 
 impl EventSink for CliEventSink {
     fn emit(&self, event: AgentEvent) {
