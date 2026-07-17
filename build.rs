@@ -137,22 +137,21 @@ fn main() {
 
         // Prefer an already-populated shared Hub cache (works offline too).
         if let Some(cache_repo) = offline_cache.as_ref() {
-            if let Some(cached) = cache_repo.get(asset.remote_path) {
-                if asset_ok(&cached, asset.size, want_sha)
+            if let Some(cached) = cache_repo.get(asset.remote_path)
+                && (asset_ok(&cached, asset.size, want_sha)
                     || (want_sha.is_none()
                         && asset.local_name != "model.safetensors"
-                        && fs::metadata(&cached).map(|m| m.len()).unwrap_or(0) > 0)
-                {
-                    fs::copy(&cached, &dest).unwrap_or_else(|e| {
-                        panic!("copy {} → {}: {e}", cached.display(), dest.display());
-                    });
-                    println!(
-                        "cargo:warning=MiniLM asset {} from offline HF cache {}",
-                        asset.local_name,
-                        cached.display()
-                    );
-                    continue;
-                }
+                        && fs::metadata(&cached).map(|m| m.len()).unwrap_or(0) > 0))
+            {
+                fs::copy(&cached, &dest).unwrap_or_else(|e| {
+                    panic!("copy {} → {}: {e}", cached.display(), dest.display());
+                });
+                println!(
+                    "cargo:warning=MiniLM asset {} from offline HF cache {}",
+                    asset.local_name,
+                    cached.display()
+                );
+                continue;
             }
             panic!(
                 "MYCO_EMBED_OFFLINE set but MiniLM asset missing/invalid: {}.\n\
