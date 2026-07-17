@@ -10,6 +10,7 @@ You cannot press these yourself — tell the user which command to run.
 | `/resume [id]` | Load conversation memory |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
+| `/compact` | Compact into successor session (summary + recent tail) |
 | `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
 | `/help` | Full help |
 | Alt-Enter / Shift-Enter / Ctrl-J | Multiline input |

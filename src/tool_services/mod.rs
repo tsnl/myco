@@ -22,6 +22,9 @@ pub use manual_service::ManualService;
 pub mod meta_tool_service;
 pub use meta_tool_service::SessionMetaTool;
 
+pub mod session_history_service;
+pub use session_history_service::SessionHistoryTool;
+
 pub mod browser_service;
 pub use browser_service::BrowserService;
 

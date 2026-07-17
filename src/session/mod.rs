@@ -5,11 +5,16 @@
 //! files: only [`SESSION_FILE_VERSION`] is accepted.
 
 mod agent;
+mod compact;
 mod transcript;
 
 pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext,
     uuid_simple_hex,
+};
+pub use compact::{
+    CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
+    select_tail,
 };
 pub use transcript::{
     SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_assistant, format_tool_invocation,
@@ -101,6 +106,12 @@ pub struct Session {
     /// [`SessionKind::is_visible`] (only [`SessionKind::User`] is listed by default).
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
+    /// Session this one was compacted from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_id: Option<String>,
+    /// Session created by compacting this one, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_id: Option<String>,
 }
 
 /// Structured association stored on a session.
@@ -252,6 +263,8 @@ impl Session {
             scratchpad: String::new(),
             parent_session_id: None,
             kind: SessionKind::User,
+            predecessor_id: None,
+            successor_id: None,
         }
     }
 
@@ -262,6 +275,11 @@ impl Session {
 
     pub fn is_hidden(&self) -> bool {
         self.kind.is_hidden()
+    }
+
+    /// Sibling summary file written by compact workers: `{id}.summary.md`.
+    pub fn summary_path(&self) -> PathBuf {
+        session_file_path(&self.id, "summary.md")
     }
 
     /// Worker session (subagent / compact). Kind must be non-user so it is hidden.
@@ -718,6 +736,12 @@ pub fn format_session_detail(session: &Session) -> String {
     if let Some(parent) = session.parent_session_id.as_deref() {
         out.push_str(&format!("parent:    {parent}\n"));
     }
+    if let Some(id) = session.predecessor_id.as_deref() {
+        out.push_str(&format!("predecessor: {id}\n"));
+    }
+    if let Some(id) = session.successor_id.as_deref() {
+        out.push_str(&format!("successor:   {id}\n"));
+    }
     out.push_str(&format!(
         "title:     {}\n",
         session
@@ -905,19 +929,24 @@ fn urls_equal(a: &str, b: &str) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Serialize tests that mutate `MYCO_HOME` (process-global env).
+#[cfg(test)]
+pub(crate) fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::generative_model::{Content, Message};
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
-    /// Serialize tests that mutate `MYCO_HOME` (process-global env).
     fn myco_home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_myco_home_for_test()
     }
 
     fn temp_session_root() -> PathBuf {
@@ -1028,6 +1057,8 @@ mod tests {
             scratchpad: "notes".into(),
             parent_session_id: None,
             kind: SessionKind::User,
+            predecessor_id: None,
+            successor_id: None,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 
