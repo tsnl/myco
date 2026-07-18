@@ -24,7 +24,8 @@ plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
-Startup banner prints model, session, config path, hosts, and default host.
+Startup banner is one lean line: model and session. SSH preflight problems
+print as a WARNING block after it; hosts via `/hosts`.
 
 ### Models & config (quick)
 
