@@ -34,7 +34,8 @@ const MAX_EXEC_TIMEOUT_MS: u64 = 1_800_000;
 const STDIN_WRITE_TIMEOUT_MS: u64 = 5_000;
 /// Default "no new bytes for this long ⇒ done collecting".
 const DEFAULT_IDLE_MS: u64 = 300;
-/// Default max bytes returned per tool call.
+/// Default max bytes returned per tool call: session drain cap and per-stream
+/// exec cap. Bounds how much one bash call can put into model context.
 const DEFAULT_MAX_BYTES: usize = 32_768;
 /// Soft cap on concurrent sessions per harness.
 const MAX_SESSIONS: usize = 8;
@@ -70,9 +71,13 @@ impl ToolService for BashService {
                 - exec (default): one-shot `bash -c <command>`; **blocks until the process \
                 exits** (or `timeout_ms`, default {DEFAULT_EXEC_TIMEOUT_MS} ms / \
                 {exec_default_s}s; max {MAX_EXEC_TIMEOUT_MS} ms / {exec_max_min} min). \
-                Returns exit code, signal, stdout, stderr. Prefer `exec` for finite commands \
-                (builds, tests, installs). Raise `timeout_ms` when the job may exceed \
-                {exec_default_s}s.\n\
+                Returns exit code, signal, stdout, stderr. Each stream is capped at \
+                `max_bytes` (default {DEFAULT_MAX_BYTES}): over the cap, the head and tail \
+                are kept and the middle is elided with a `[... N bytes omitted ...]` marker. \
+                Elided exec output is unrecoverable — pipe through grep/head/tail or \
+                redirect to a file when you expect a flood, or raise `max_bytes` when you \
+                truly need more. Prefer `exec` for finite commands (builds, tests, \
+                installs). Raise `timeout_ms` when the job may exceed {exec_default_s}s.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
                 `session_id`. `command` is the program line (default: `bash -i`). Optional \
                 `stdin` is written after spawn. Returns a snapshot; the process keeps \
@@ -147,8 +152,9 @@ impl BashService {
                 command,
                 cwd,
                 timeout_ms,
+                max_bytes,
             } => {
-                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, cancel)
+                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, max_bytes, cancel)
                     .await
             }
             Action::Start {
@@ -212,12 +218,15 @@ impl BashService {
     /// timeout or cancel the child is killed and partial stdout/stderr are
     /// returned. The final pipe drain is bounded too (`EXEC_DRAIN_GRACE`):
     /// a backgrounded grandchild that inherits the pipes must not hold the
-    /// result hostage past the child's own exit.
+    /// result hostage past the child's own exit. Every return path caps each
+    /// stream at `max_bytes` (see `truncate_middle_lossy`) so one flooding
+    /// command cannot saturate the model context.
     async fn run_oneshot(
         &self,
         command: &str,
         cwd: Option<&str>,
         timeout_ms: u64,
+        max_bytes: usize,
         cancel: crate::core::CancelToken,
     ) -> generative_model::ToolResult {
         let mut cmd = tokio::process::Command::new("bash");
@@ -281,8 +290,8 @@ impl BashService {
                     "exec cancelled\n\
                      stdout:\n{}\n\
                      stderr:\n{}",
-                    String::from_utf8_lossy(&out),
-                    String::from_utf8_lossy(&err),
+                    truncate_middle_lossy(&out, max_bytes),
+                    truncate_middle_lossy(&err, max_bytes),
                 ))
             }
             Outcome::TimedOut => {
@@ -300,8 +309,8 @@ impl BashService {
                      stdout:\n{}\n\
                      stderr:\n{}\n\
                      (exec timed out after {timeout_ms}ms; process group killed)\n",
-                    String::from_utf8_lossy(&out),
-                    String::from_utf8_lossy(&err),
+                    truncate_middle_lossy(&out, max_bytes),
+                    truncate_middle_lossy(&err, max_bytes),
                 ))
             }
             Outcome::Status(status) => {
@@ -316,8 +325,8 @@ impl BashService {
                          stderr:\n{}",
                         status.code(),
                         status.signal(),
-                        String::from_utf8_lossy(&out),
-                        String::from_utf8_lossy(&err),
+                        truncate_middle_lossy(&out, max_bytes),
+                        truncate_middle_lossy(&err, max_bytes),
                     )),
                     Err(error) => generative_model::ToolResult::err(format!(
                         "Error executing command: {error}"
@@ -922,6 +931,30 @@ where
     })
 }
 
+/// Cap one exec stream at `max_bytes`, keeping the head and tail halves and
+/// eliding the middle with a marker.
+///
+/// Unlike session output (buffered; the agent can `read` the rest later),
+/// exec output is gone once the call returns, so the cut must keep the most
+/// informative parts — and those are the ends: build/test tools print the
+/// root-cause error first and the failure summary last. Cuts are byte-exact;
+/// a split UTF-8 char renders as U+FFFD at the seam.
+fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
+    if bytes.len() <= max_bytes {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let head_len = max_bytes.div_ceil(2);
+    let tail_len = max_bytes / 2;
+    let omitted = bytes.len() - head_len - tail_len;
+    format!(
+        "{}\n[... {omitted} bytes omitted ({} bytes total, max_bytes={max_bytes}); \
+         filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",
+        String::from_utf8_lossy(&bytes[..head_len]),
+        bytes.len(),
+        String::from_utf8_lossy(&bytes[bytes.len() - tail_len..]),
+    )
+}
+
 /// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
 /// with the child already dead, so anything still holding the pipes open is a
 /// stray grandchild whose future output we deliberately give up on.
@@ -1218,7 +1251,9 @@ pub struct Input {
     /// Idle gap in milliseconds with no new output before returning (start/write/read). Default 300.
     #[serde(default)]
     idle_ms: Option<u64>,
-    /// Max bytes of combined stdout+stderr to return (start/write/read). Default 32768.
+    /// Max bytes of output to return. Default 32768.
+    /// - start/write/read: combined stdout+stderr drain cap; excess stays buffered — `read` again for more.
+    /// - exec: per-stream cap; head and tail are kept, the middle elided. Elided bytes are unrecoverable.
     #[serde(default)]
     max_bytes: Option<usize>,
 }
@@ -1243,6 +1278,7 @@ enum Action {
         command: String,
         cwd: Option<String>,
         timeout_ms: u64,
+        max_bytes: usize,
     },
     Start {
         session_id: String,
@@ -1363,6 +1399,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 command,
                 cwd,
                 timeout_ms: exec_timeout(input)?,
+                max_bytes,
             })
         }
         ActionKind::Start => {
@@ -1534,10 +1571,12 @@ mod tests {
                 command,
                 cwd,
                 timeout_ms,
+                max_bytes,
             } => {
                 assert_eq!(command, "echo hi");
                 assert_eq!(cwd, None);
                 assert_eq!(timeout_ms, DEFAULT_EXEC_TIMEOUT_MS);
+                assert_eq!(max_bytes, DEFAULT_MAX_BYTES);
             }
             _ => panic!("expected Exec"),
         }
@@ -1733,6 +1772,133 @@ mod tests {
         assert!(
             err.contains("exceeds max") && err.contains(&MAX_EXEC_TIMEOUT_MS.to_string()),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        // At or under the cap: untouched, no marker.
+        assert_eq!(truncate_middle_lossy(b"hello", 5), "hello");
+        assert_eq!(truncate_middle_lossy(b"", 5), "");
+
+        // Over the cap: head + marker + tail, omitted count exact.
+        let bytes: Vec<u8> = (0..26).map(|i| b'a' + i).collect();
+        let text = truncate_middle_lossy(&bytes, 10);
+        assert!(text.starts_with("abcde"), "{text}");
+        assert!(text.ends_with("vwxyz"), "{text}");
+        assert!(text.contains("16 bytes omitted"), "{text}");
+        assert!(text.contains("26 bytes total"), "{text}");
+        assert!(text.contains("max_bytes=10"), "{text}");
+
+        // Odd cap: head gets the extra byte; total kept is still the cap.
+        let text = truncate_middle_lossy(&bytes, 5);
+        assert!(text.starts_with("abc"), "{text}");
+        assert!(text.ends_with("yz"), "{text}");
+        assert!(text.contains("21 bytes omitted"), "{text}");
+    }
+
+    /// A flooding exec must come back capped — head and tail survive, the
+    /// middle is elided — instead of saturating the model context.
+    #[tokio::test]
+    async fn exec_truncates_flood_keeping_head_and_tail() {
+        let harness = harness();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "seq 1 100000",
+                "max_bytes": 2000,
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("Exit code: Some(0)"), "{text}");
+        // First lines survive (root-cause errors live at the head)…
+        assert!(text.contains("stdout:\n1\n2\n"), "{text}");
+        // …last lines survive (summaries live at the tail)…
+        assert!(text.contains("100000"), "{text}");
+        // …and the middle is elided with an honest marker.
+        assert!(text.contains("bytes omitted"), "{text}");
+        assert!(
+            text.len() < 4_000,
+            "result should be near the 2000-byte cap, got {} bytes: {text}",
+            text.len()
+        );
+    }
+
+    /// The default cap applies when `max_bytes` is omitted: unbounded floods
+    /// must not pass through whole.
+    #[tokio::test]
+    async fn exec_default_max_bytes_caps_output() {
+        let harness = harness();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                // ~1.2 MB of stdout, far over the 32 KiB default.
+                "command": "seq 1 200000",
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("bytes omitted"), "{text}");
+        assert!(
+            text.len() < DEFAULT_MAX_BYTES + 2_048,
+            "result should be near the {DEFAULT_MAX_BYTES}-byte default cap, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// stdout and stderr are capped independently: a flooding stdout must not
+    /// starve stderr diagnostics, and both keep their ends.
+    #[tokio::test]
+    async fn exec_truncates_streams_independently() {
+        let harness = harness();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "seq 1 50000; { echo ERR-HEAD; seq 1 50000; echo ERR-TAIL; } 1>&2",
+                "max_bytes": 1000,
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert_eq!(
+            text.matches("bytes omitted").count(),
+            2,
+            "both streams should be truncated: {text}"
+        );
+        assert!(text.contains("ERR-HEAD"), "{text}");
+        assert!(text.contains("ERR-TAIL"), "{text}");
+    }
+
+    /// A runaway that floods then hangs: the timeout path must return capped
+    /// output too — the flood is exactly when the cap matters most.
+    #[tokio::test]
+    async fn exec_timeout_output_is_truncated() {
+        let harness = harness();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "seq 1 100000; sleep 30",
+                "timeout_ms": 2_000,
+                "max_bytes": 1000,
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("timed_out"), "{text}");
+        assert!(text.contains("bytes omitted"), "{text}");
+        assert!(
+            text.len() < 3_000,
+            "timed-out result should be capped, got {} bytes: {text}",
+            text.len()
         );
     }
 
