@@ -76,6 +76,7 @@ Inputs (must match the workflow):
 | `branch` | e.g. `main` | Branch to checkout and bump |
 | `bump_type` | `patch` / `minor` / `major` | Semver |
 | `dry_run` | `true` / `false` | Default in UI is dry-run |
+| `release_notes` | markdown string | Optional; prepended to the GitHub Release body above the install boilerplate |
 
 ## Choose bump type
 

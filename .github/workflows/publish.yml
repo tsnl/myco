@@ -22,6 +22,11 @@ on:
         required: false
         default: true
         type: boolean
+      release_notes:
+        description: "Detailed release-notes markdown prepended to the GitHub Release body (optional)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -72,6 +77,10 @@ jobs:
           name: ${{ steps.publish.outputs.new_version }}
           generate_release_notes: true
           body: |
+            ${{ github.event.inputs.release_notes }}
+
+            ---
+
             Published **${{ steps.publish.outputs.package_name }}** `${{ steps.publish.outputs.new_version }}`
             (was `${{ steps.publish.outputs.old_version }}`).
 
