@@ -866,9 +866,9 @@ reported usage on the previous generate (0/max until then).
 
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from
-  ~/.ssh/config: every concrete Host alias is a lazy `ssh <alias> myco --mode
-  host` remote. ~/.myco/config.toml (or --config / $MYCO_CONFIG) holds knobs
-  only (enable_subagent, attach_timeout_secs, remote_myco).
+  ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
+  `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
+  $MYCO_CONFIG) holds knobs only (enable_subagent, attach_timeout_secs).
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host.
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for

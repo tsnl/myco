@@ -28,11 +28,11 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 ## Finding configured hosts
 
 - **Local** is always present (in-process); it is never configured.
-- Remotes are the concrete `Host` aliases in **`~/.ssh/config`** (wildcard `*`/`?`,
-  negated `!` patterns, and `Include`d files are ignored; alias `local` is reserved).
-  Host name == alias == SSH destination.
+- Remotes are the concrete `Host` aliases in **`~/.ssh/config`** (`Include`s are
+  followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
+  is reserved). Host name == alias == SSH destination.
 - **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
-  `enable_subagent`, `attach_timeout_secs`, `remote_myco` (remote binary, default `"myco"`).
+  `enable_subagent`, `attach_timeout_secs`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
 - Tell the user to run **`/hosts`** for live attach status (local ok/in-process; remotes idle / ok / DOWN); you cannot run slash-commands.
@@ -167,7 +167,7 @@ When tools fail or the user asks why something is broken, investigate with tools
 1. **Host down / unavailable**
    - **Local** never needs a host subprocess; if local tools fail, debug the agent process itself.
    - Read `~/.ssh/config` for `Host` aliases (remote names == destinations);
-     `~/.myco/config.toml` (or `$MYCO_CONFIG`) only for knobs like `remote_myco`.
+     `~/.myco/config.toml` (or `$MYCO_CONFIG`) only for knobs.
    - On remote: `ssh -o BatchMode=yes <alias> 'which myco; myco --help'` via the
      **local** host's bash. If missing/outdated: install a **binary built for that
      platform** (release asset — weights already embedded), or **build on that host**

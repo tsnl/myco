@@ -82,10 +82,10 @@ If neither xAI/OpenAI key is set, the OpenAI Responses backend also accepts
 
 Remote hosts come straight from `~/.ssh/config`: every concrete `Host` alias
 (no `*`/`?` wildcards, no `!` negations) is available as a myco host of the same
-name, attached lazily as `ssh <alias> myco --mode host`. Put user, port,
-identities, `ProxyJump`, … in `~/.ssh/config` as usual; myco always adds
-`-o BatchMode=yes`, so keys must be loaded in `ssh-agent`. `Include`d files are
-not read — aliases myco should see must be in the main `~/.ssh/config`.
+name, attached lazily as `ssh <alias> myco --mode host`. `Include` directives
+are followed. Put user, port, identities, `ProxyJump`, … in `~/.ssh/config` as
+usual; myco always adds `-o BatchMode=yes`, so keys must be loaded in
+`ssh-agent`, and `myco` must be on the remote PATH used by non-interactive SSH.
 
 ```ssh-config
 # ~/.ssh/config
@@ -106,10 +106,6 @@ enable_subagent = true
 
 # Per-remote connect timeout in seconds on first tool use.
 attach_timeout_secs = 10
-
-# Binary to run on remotes (default "myco"); must be on the PATH used by
-# non-interactive SSH, or an absolute path.
-# remote_myco = "myco"
 ```
 
 ## Develop

@@ -28,8 +28,8 @@ myco (interactive) / Agent
 
 | Path | Role |
 |------|------|
-| `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`, `remote_myco`. Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
+| `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
@@ -40,16 +40,15 @@ Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
-# Binary to run on remotes (default "myco"); PATH for non-interactive SSH.
-# remote_myco = "myco"
 ```
 
 - Remote hosts come from `~/.ssh/config`: each concrete `Host` alias attaches as
-  `ssh -o BatchMode=yes <alias> myco --mode host`. Put user / port / identity /
-  `ProxyJump` in `~/.ssh/config`; wildcard (`*`/`?`) and negated (`!`) patterns
-  and `Include`d files are ignored. The alias `local` is reserved (skipped).
-- Remotes need `myco` on the **remote** PATH used by non-interactive SSH (or set
-  `remote_myco = "/abs/path/myco"`).
+  `ssh -o BatchMode=yes <alias> myco --mode host`. `Include` directives are
+  followed. Put user / port / identity / `ProxyJump` in `~/.ssh/config`;
+  wildcard (`*`/`?`) and negated (`!`) patterns are ignored. The alias `local`
+  is reserved (skipped).
+- Remotes need `myco` on the **remote** PATH used by non-interactive SSH
+  (`~/.local/bin` and `~/.cargo/bin` are common).
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
 ## API credentials & models
