@@ -223,8 +223,6 @@ async fn run_interactive(args: Args) {
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new());
-    // Fresh runtime agent id per process; the durable session id rides along
-    // separately so hosts can key per-session artifacts across resumptions.
     let mut agent = Agent::with_context(
         model,
         harness.clone(),
@@ -582,8 +580,6 @@ async fn run_compact(
         sink,
         TraceContext {
             agent_id: worker_id,
-            // Compact workers are non-resumable: their hidden session id is
-            // stably their agent id's hex.
             session_id: Some(worker_hex.clone()),
             depth: 1,
             parent_tool_use_id: None,

@@ -38,8 +38,8 @@ pub struct HostDispatchContext {
     /// ownership. A runtime identity — fresh per resumption.
     pub agent_id: uuid::Uuid,
     /// Durable conversation session behind this call, if any; keys per-session
-    /// host artifacts (exec output dumps). Decoupled from `agent_id`: one
-    /// session sees many agent ids across resumptions.
+    /// host artifacts (exec output dumps). See [`crate::session::TraceContext`]
+    /// for why this is decoupled from `agent_id`.
     pub session_id: Option<String>,
     /// Cancel signal for the in-flight call / agent turn.
     pub cancel: CancelToken,

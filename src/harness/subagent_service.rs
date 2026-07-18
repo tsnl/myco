@@ -127,10 +127,7 @@ impl SubagentService {
         let agent_id = uuid::Uuid::new_v4();
         let agent_id_hex = uuid_simple_hex(agent_id);
         let log_path = PathBuf::from(SUBAGENT_LOG_DIR).join(format!("{agent_id_hex}.log"));
-
-        // Link to the parent's durable session; a root agent's runtime id is
-        // deliberately not a session id, so fall back to it only when the
-        // parent has no backing session (bare/test contexts).
+        // Bare contexts (tests) have no backing session; fall back to the runtime id.
         let parent_session_id = root
             .context
             .session_id
@@ -150,8 +147,6 @@ impl SubagentService {
         let mut child_context = root
             .context
             .child_agent(agent_id, Some(parent_tool_use_id.clone()));
-        // Subagents are non-resumable, so their hidden session id is stably
-        // their agent id's hex.
         child_context.session_id = Some(agent_id_hex.clone());
 
         root.sink.emit(AgentEvent::AgentStarted {
