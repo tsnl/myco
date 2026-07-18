@@ -1,9 +1,10 @@
 //! Sectioned transcript layout for session restore and CLI display.
 //!
-//! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule), and
-//! ERROR (thin rule). Thinking summaries and tool invocations are paragraphs
-//! inside ASSISTANT. ERROR is used for live generate failures (not stored in
-//! session history).
+//! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule),
+//! ERROR (thin rule), and WARNING (thin rule). Thinking summaries and tool
+//! invocations are paragraphs inside ASSISTANT. ERROR is used for live
+//! generate failures, WARNING for startup preflight problems; both are
+//! live-only (not stored in session history).
 
 use std::io::Write;
 
@@ -13,7 +14,7 @@ use crate::generative_model::{Content, Message};
 pub const USER_RULE: &str =
     "════════════════════════════════════════════════════════════════════════";
 
-/// Thin 72-col rule before ASSISTANT / ERROR section headers (USER uses USER_RULE).
+/// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER uses USER_RULE).
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
@@ -63,6 +64,11 @@ impl Palette {
         self.paint("1;31", text)
     }
 
+    /// WARNING rule + header: bold yellow.
+    pub fn warning(&self, text: &str) -> String {
+        self.paint("1;33", text)
+    }
+
     /// Thinking paragraphs: dim.
     pub fn thinking(&self, text: &str) -> String {
         self.paint("2", text)
@@ -101,6 +107,18 @@ pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> st
     writeln!(out)?;
     writeln!(out, "{}", palette.error(SECTION_RULE))?;
     writeln!(out, "{}", palette.error("ERROR"))?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Write a WARNING section open: blank line, thin rule, header, blank line, then body.
+pub fn write_warning_open(
+    out: &mut (impl Write + ?Sized),
+    palette: Palette,
+) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "{}", palette.warning(SECTION_RULE))?;
+    writeln!(out, "{}", palette.warning("WARNING"))?;
     writeln!(out)?;
     Ok(())
 }
@@ -414,6 +432,20 @@ mod tests {
         )));
         // Leading blank line before the section rule.
         assert!(rendered.starts_with('\n'));
+    }
+
+    #[test]
+    fn write_warning_open_layout() {
+        let mut buf = Vec::new();
+        write_warning_open(&mut buf, Palette::plain()).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert_eq!(rendered, format!("\n{SECTION_RULE}\nWARNING\n\n"));
+
+        let mut buf = Vec::new();
+        write_warning_open(&mut buf, Palette::colored(true)).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("\x1b[0;1;33mWARNING\x1b[0m\n"));
+        assert!(rendered.contains(&format!("\x1b[0;1;33m{SECTION_RULE}\x1b[0m\n")));
     }
 
     #[test]

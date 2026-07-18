@@ -11,13 +11,15 @@
 //! - `ssh -G` IdentityFile discovery
 //! - existing-agent queries (`ssh-add -l`) and interactive unlock (`ssh-add`,
 //!   `--apple-load-keychain` / `--apple-use-keychain` on macOS)
-//! - CLI-facing preflight report + printing
+//! - CLI-facing preflight report + WARNING-block printing (silent when clean)
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::HostConfig;
+use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
 #[derive(Debug, Default, Clone)]
@@ -41,6 +43,38 @@ pub struct SshAgentPreflightReport {
 impl SshAgentPreflightReport {
     pub fn is_clean(&self) -> bool {
         self.still_missing.is_empty()
+    }
+
+    /// Write preflight problems as a WARNING section (thin rule + header +
+    /// body) to `out` — stdout live, or any buffer in tests. Writes nothing on
+    /// the happy path (no SSH hosts, or agent reachable with no keys missing).
+    /// The palette styles only the rule + header; body lines stay plain.
+    pub fn write_warning_section(
+        &self,
+        out: &mut impl Write,
+        palette: Palette,
+    ) -> std::io::Result<()> {
+        if !self.had_ssh_hosts || (self.agent_ok && self.is_clean()) {
+            return Ok(());
+        }
+        write_warning_open(out, palette)?;
+        if !self.agent_ok {
+            writeln!(out, "ssh-agent: {}", self.agent_status)?;
+        }
+        for (p, why) in &self.still_missing {
+            writeln!(out, "missing key {}: {why}", p.display())?;
+        }
+        for note in &self.notes {
+            writeln!(out, "note: {note}")?;
+        }
+        if !self.still_missing.is_empty() {
+            writeln!(
+                out,
+                "hint: run `ssh-add <key>` (macOS: `ssh-add --apple-use-keychain <key>`) \
+                 then `/hosts` after reconnect, or restart myco"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -229,42 +263,14 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     report
 }
 
-/// Print a concise preflight summary to stderr.
-pub fn print_preflight_report(report: &SshAgentPreflightReport) {
-    if !report.had_ssh_hosts {
-        return;
-    }
-
-    if report.agent_ok {
-        let n_loaded = report.already_loaded.len() + report.added.len();
-        eprintln!(
-            "ssh-agent: ok ({} identit{} loaded for remote hosts)",
-            n_loaded,
-            if n_loaded == 1 { "y" } else { "ies" }
-        );
-    } else {
-        eprintln!("ssh-agent: {}", report.agent_status);
-    }
-
-    for p in &report.added {
-        eprintln!("ssh-agent: added {}", p.display());
-    }
-    for (p, why) in &report.still_missing {
-        eprintln!("ssh-agent: missing {}: {why}", p.display());
-    }
-    for note in &report.notes {
-        // Keep noise down: only show notes when something is wrong or we added keys.
-        if !report.still_missing.is_empty() || !report.agent_ok || !report.added.is_empty() {
-            eprintln!("ssh-agent: note: {note}");
-        }
-    }
-
-    if !report.still_missing.is_empty() {
-        eprintln!(
-            "ssh-agent: hint: run `ssh-add <key>` (macOS: `ssh-add --apple-use-keychain <key>`) \
-             then `/hosts` after reconnect, or restart myco"
-        );
-    }
+/// Print preflight problems as a WARNING block on stdout, after the startup
+/// banner and before the first USER block. Happy path (agent reachable, no
+/// keys missing) prints nothing.
+/// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
+pub fn print_preflight_report(report: &SshAgentPreflightReport, palette: Palette) {
+    let mut out = std::io::stdout();
+    let _ = report.write_warning_section(&mut out, palette);
+    let _ = out.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +644,91 @@ mod tests {
             ssh_destination_from_command(&cmd).as_deref(),
             Some("devbox")
         );
+    }
+
+    fn warning_output(report: &SshAgentPreflightReport) -> String {
+        let mut buf = Vec::new();
+        report
+            .write_warning_section(&mut buf, Palette::plain())
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn warning_header_is_painted_when_colored() {
+        let report = SshAgentPreflightReport {
+            had_ssh_hosts: true,
+            agent_ok: false,
+            agent_status: "agent down".into(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        report
+            .write_warning_section(&mut buf, Palette::colored(true))
+            .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // Rule + header carry the warning style; body lines stay plain.
+        assert!(out.contains("\x1b[0;1;33mWARNING\x1b[0m\n"));
+        assert!(out.contains("\nssh-agent: agent down\n"));
+    }
+
+    #[test]
+    fn warning_silent_on_happy_path() {
+        let report = SshAgentPreflightReport {
+            had_ssh_hosts: true,
+            agent_ok: true,
+            agent_status: "2 key(s) in agent".into(),
+            already_loaded: vec![PathBuf::from("/home/u/.ssh/id_ed25519")],
+            notes: vec!["host \"x\": ssh -G listed no IdentityFile".into()],
+            ..Default::default()
+        };
+        assert_eq!(warning_output(&report), "");
+    }
+
+    #[test]
+    fn warning_silent_without_ssh_hosts() {
+        // Default report: no SSH hosts (agent_ok=false is irrelevant then).
+        assert_eq!(warning_output(&SshAgentPreflightReport::default()), "");
+    }
+
+    #[test]
+    fn warning_reports_unreachable_agent() {
+        let report = SshAgentPreflightReport {
+            had_ssh_hosts: true,
+            agent_ok: false,
+            agent_status: "Could not open a connection to your authentication agent.".into(),
+            notes: vec!["ssh-agent not reachable".into()],
+            ..Default::default()
+        };
+        let out = warning_output(&report);
+        // Full section layout: blank line, thin rule, header, blank line, body.
+        assert!(out.contains(&format!(
+            "{}\nWARNING\n\nssh-agent: Could not open a connection",
+            crate::session::SECTION_RULE
+        )));
+        assert!(out.starts_with('\n'));
+        assert!(out.contains("note: ssh-agent not reachable"));
+        // Hint only accompanies missing keys.
+        assert!(!out.contains("hint:"));
+    }
+
+    #[test]
+    fn warning_reports_missing_keys_with_hint() {
+        let report = SshAgentPreflightReport {
+            had_ssh_hosts: true,
+            agent_ok: true,
+            agent_status: "1 key(s) in agent".into(),
+            still_missing: vec![(
+                PathBuf::from("/home/u/.ssh/id_rsa"),
+                "not in agent (needed by workstation); no TTY for ssh-add".into(),
+            )],
+            ..Default::default()
+        };
+        let out = warning_output(&report);
+        assert!(out.contains("WARNING\n\nmissing key /home/u/.ssh/id_rsa: not in agent"));
+        assert!(out.contains("hint: run `ssh-add <key>`"));
+        // Agent is fine; no agent status line.
+        assert!(!out.contains("ssh-agent:"));
     }
 
     #[test]
