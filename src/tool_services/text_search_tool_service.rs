@@ -74,6 +74,13 @@ impl TextSearchToolService {
         }
     }
 
+    /// Service for tool-spec listing only: no engine threads, no auto-index.
+    pub fn spec_only() -> Self {
+        Self {
+            engine: TextSearchEngine::detached(),
+        }
+    }
+
     #[cfg(test)]
     fn new_for_tests(engine: TextSearchEngine) -> Self {
         Self { engine }

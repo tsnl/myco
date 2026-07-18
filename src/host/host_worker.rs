@@ -44,22 +44,33 @@ impl HostWorker {
 
     /// Standard service list for building an extended local worker.
     pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
+        // Auto-indexes .claude/skills, SKILL.md dirs, AGENTS.md under cwd.
+        Self::services_with_search(TextSearchToolService::new())
+    }
+
+    fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ManualService::new()) as Arc<dyn ToolService>,
             Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
-            // Auto-indexes .claude/skills, SKILL.md dirs, AGENTS.md under cwd.
-            Arc::new(TextSearchToolService::new()) as Arc<dyn ToolService>,
+            Arc::new(search) as Arc<dyn ToolService>,
         ]
     }
 
     /// Tool catalog advertised by [`Self::standard`] (no process required).
     ///
     /// Used by lazy [`crate::host::HostController`] so the harness can route
-    /// host tools without connecting.
+    /// host tools without connecting. Spec listing must not start engines:
+    /// attach and every remote controller call this, and a throwaway
+    /// [`TextSearchToolService::new`] would kick off a redundant background
+    /// crawl + embed of cwd each time.
     pub fn standard_tool_specs() -> Vec<generative_model::ToolSpec> {
-        Self::standard("local").tool_specs()
+        Self::new(
+            "local",
+            Self::services_with_search(TextSearchToolService::spec_only()),
+        )
+        .tool_specs()
     }
 
     pub fn name(&self) -> &str {

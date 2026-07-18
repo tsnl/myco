@@ -9,7 +9,9 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
 
 use super::discover::discover_auto_index_targets;
-use super::index::{Hit, SearchIndex, is_under, read_text_file, resolve_path, walk_text_files};
+use super::index::{
+    Hit, SearchIndex, embed_for_index, is_under, read_text_file, resolve_path, walk_text_files,
+};
 
 /// Shared engine handle (cheap to clone).
 ///
@@ -142,7 +144,12 @@ impl TextSearchEngine {
             handle.spawn(async move {
                 // Tiny delay so host hello isn't contending with first walk.
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                let targets = discover_auto_index_targets(&cwd);
+                // The discovery walk is synchronous filesystem work — keep it
+                // off the executor (crawl_root embeds off-executor too).
+                let targets =
+                    tokio::task::spawn_blocking(move || discover_auto_index_targets(&cwd))
+                        .await
+                        .unwrap_or_default();
                 for t in targets {
                     let _ = eng.index_directory(t.path).await;
                 }
@@ -152,9 +159,12 @@ impl TextSearchEngine {
         engine
     }
 
-    /// Test helper: no auto-index, no watch thread required beyond normal.
-    #[cfg(test)]
-    pub fn start_for_tests() -> Self {
+    /// Engine with no watch-event bridge and no auto-index crawl.
+    ///
+    /// For instances that exist only to list tool specs (and for tests):
+    /// [`Self::start`] spawns a watcher thread and a background crawl that
+    /// embeds files — work a throwaway instance must never kick off.
+    pub fn detached() -> Self {
         let (event_tx, _event_rx) = std::sync::mpsc::channel::<WatchMsg>();
         let index = SearchIndex::new().expect("tantivy ram index");
         Self {
@@ -168,6 +178,12 @@ impl TextSearchEngine {
             })),
             job_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Test helper: alias of [`Self::detached`].
+    #[cfg(test)]
+    pub fn start_for_tests() -> Self {
+        Self::detached()
     }
 
     /// Register `path` as a **persistently indexed** root.
@@ -314,16 +330,26 @@ impl TextSearchEngine {
         .map_err(|e| format!("walk join: {e}"))?;
 
         for f in files {
-            let text = tokio::task::spawn_blocking({
+            // Read *and* embed on the blocking pool: MiniLM inference (and the
+            // one-time model load on first use) is seconds of synchronous CPU.
+            // On an executor thread it would starve timers and in-flight tool
+            // calls — a current_thread runtime wedges entirely, which showed up
+            // as agent tests "hanging" whenever a Harness auto-indexed cwd.
+            let loaded = tokio::task::spawn_blocking({
                 let f = f.clone();
-                move || read_text_file(&f)
+                move || {
+                    read_text_file(&f).map(|text| {
+                        let vector = embed_for_index(&text).ok();
+                        (text, vector)
+                    })
+                }
             })
             .await
             .ok()
             .flatten();
-            if let Some(text) = text {
+            if let Some((text, vector)) = loaded {
                 let mut st = self.inner.lock().await;
-                st.index.upsert_file(&f, text);
+                st.index.upsert_file(&f, text, vector);
             }
         }
 
@@ -423,11 +449,25 @@ impl TextSearchEngine {
         // Wait until covering roots are ready (or fail if none).
         let roots_used = self.wait_for_coverage(filter.as_deref()).await?;
 
-        let mut st = self.inner.lock().await;
-        let hits_raw: Vec<Hit> = if semantic {
-            st.index.search_semantic(&query, filter.as_deref(), limit)?
+        // Embed the query on the blocking pool, before taking the state lock
+        // (same rule as crawl_root: candle never runs on an executor thread).
+        let q_vec = if semantic {
+            let q = query.clone();
+            Some(
+                tokio::task::spawn_blocking(move || embed_for_index(&q))
+                    .await
+                    .map_err(|e| format!("embed join: {e}"))??,
+            )
         } else {
-            st.index.search_exact(&query, filter.as_deref(), limit)?
+            None
+        };
+
+        let mut st = self.inner.lock().await;
+        let hits_raw: Vec<Hit> = match &q_vec {
+            Some(v) => st
+                .index
+                .search_semantic(&query, v, filter.as_deref(), limit)?,
+            None => st.index.search_exact(&query, filter.as_deref(), limit)?,
         };
         let hits = hits_raw
             .into_iter()
@@ -535,17 +575,23 @@ impl TextSearchEngine {
                 if !under {
                     return;
                 }
-                let text = tokio::task::spawn_blocking({
+                // Read + embed on the blocking pool (see crawl_root).
+                let loaded = tokio::task::spawn_blocking({
                     let path = path.clone();
-                    move || read_text_file(&path)
+                    move || {
+                        read_text_file(&path).map(|text| {
+                            let vector = embed_for_index(&text).ok();
+                            (text, vector)
+                        })
+                    }
                 })
                 .await
                 .ok()
                 .flatten();
                 let mut st = self.inner.lock().await;
-                match text {
-                    Some(text) => {
-                        st.index.upsert_file(&path, text);
+                match loaded {
+                    Some((text, vector)) => {
+                        st.index.upsert_file(&path, text, vector);
                     }
                     // Unreadable now: renames/moves arrive as Modify events
                     // carrying the *old* path (inotify `Name(From)`), never as
