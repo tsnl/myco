@@ -14,7 +14,7 @@ pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
     RemoteHostConfig, SshAgentPreflightReport, SubagentService, default_local_host_command,
-    ensure_remote_ssh_identities, example_config_toml, load_harness_config, print_preflight_report,
+    ensure_remote_ssh_identities, example_config_toml, load_file_config, print_preflight_report,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;

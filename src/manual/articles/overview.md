@@ -36,6 +36,7 @@ myco (interactive) / Agent
 Minimal config shape:
 
 ```toml
+# model = "grok-4.5-build"    # default CLI model (--model overrides)
 enable_subagent = true
 
 # Local is always enabled in-process — do not list it here.
@@ -58,7 +59,8 @@ ssh = "devbox"                 # Host alias, hostname, or user@host
 ## API credentials & models
 
 Loaded from the process environment; `dotenvy` also loads a `.env` in the cwd at startup.
-Default CLI model is **`grok-4.5-build`**. Override with `myco --model <id>`.
+Default CLI model is **`grok-4.5-build`**; set `model = "<id>"` in config.toml to change
+it, or pass `myco --model <id>` (flag wins).
 
 **Anthropic Messages** (Claude models: `claude-haiku-4-5`, `claude-sonnet-4-6`,
 `claude-opus-4-8`, `claude-fable-5`, …):

@@ -7,10 +7,14 @@
 use std::path::Path;
 
 use super::{HarnessConfig, HostConfig, RemoteHostConfig};
+use crate::generative_model::Model;
 
 /// On-disk config file shape.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FileConfig {
+    /// Default model for the interactive CLI (`--model` overrides).
+    #[serde(default)]
+    pub model: Option<Model>,
     /// When false, do not register the in-process `subagent` tool.
     #[serde(default = "default_true")]
     pub enable_subagent: bool,
@@ -26,6 +30,7 @@ pub struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            model: None,
             enable_subagent: default_true(),
             attach_timeout_secs: default_attach_timeout_secs(),
             remote_hosts: Vec::new(),
@@ -124,16 +129,18 @@ impl FileConfig {
     }
 }
 
-/// Load harness config from `path`. Missing file → [`HarnessConfig::default`].
-/// Path defaulting (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`) lives
-/// in [`crate::config::Config`].
-pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
+/// Load the on-disk config from `path`. Missing file → [`FileConfig::default`].
+/// Path defaulting (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`) and
+/// host validation ([`FileConfig::into_harness_config`]) live in
+/// [`crate::config::Config`].
+pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
     if !path.exists() {
-        return Ok(HarnessConfig::default());
+        return Ok(FileConfig::default());
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read config {}: {e}", path.display()))?;
-    parse_harness_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
+    toml::from_str(&text)
+        .map_err(|e| format!("parse config {}: invalid config TOML: {e}", path.display()))
 }
 
 /// Parse a TOML config string into [`HarnessConfig`].
@@ -149,6 +156,9 @@ pub fn example_config_toml() -> String {
 #
 # The local host is always enabled in-process (no subprocess, not listed here).
 # Host tools that omit `host` run on local.
+
+# Default model for the interactive CLI (--model overrides).
+# model = "grok-4.5-build"
 
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
@@ -214,6 +224,16 @@ identity_file = "~/.ssh/id_ed25519"
         assert!(cmd.iter().any(|s| s == "myco"));
         assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
         assert!(cmd.windows(2).any(|w| w == ["--name", "devbox"]));
+    }
+
+    #[test]
+    fn model_key_parses_with_aliases() {
+        let file: FileConfig = toml::from_str("model = \"claude-opus-4-8\"").unwrap();
+        assert_eq!(file.model, Some(Model::ClaudeOpus48));
+        let file: FileConfig = toml::from_str("model = \"claude-opus-4.8\"").unwrap();
+        assert_eq!(file.model, Some(Model::ClaudeOpus48));
+        assert_eq!(FileConfig::default().model, None);
+        assert!(toml::from_str::<FileConfig>("model = \"gpt-99\"").is_err());
     }
 
     #[test]

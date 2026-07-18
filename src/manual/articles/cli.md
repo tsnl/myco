@@ -23,7 +23,7 @@ Startup banner prints model, session, config path, hosts, and default host.
 
 ### Models & env (quick)
 
-- Default model: `grok-4.5-build` (`--model` to change).
+- Default model: `grok-4.5-build` (config.toml `model` or `--model` to change; flag wins).
 - Claude models need `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` (optional
   `ANTHROPIC_BASE_URL`).
 - Grok / OpenAI Responses need `XAI_API_KEY` or `OPENAI_API_KEY` (optional

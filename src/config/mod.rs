@@ -4,9 +4,10 @@
 //! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), reads the
 //! process environment, and produces fully resolved settings — per-backend
 //! credentials/base URLs, the harness/host-pool config loaded from disk
-//! (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), and the color
-//! decision for stdout rendering. Downstream code checks the resolved fields;
-//! nothing else reads these environment variables.
+//! (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), the interactive
+//! default model (`--model` → config file `model` → [`DEFAULT_MODEL`]), and
+//! the color decision for stdout rendering. Downstream code checks the
+//! resolved fields; nothing else reads these environment variables.
 //!
 //! Credential fallbacks: `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` double
 //! as the fallback credential for the OpenAI and xAI backends, and
@@ -23,11 +24,14 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::generative_model::{self, BackendKind, Model};
-use crate::harness::{HarnessConfig, load_harness_config};
+use crate::harness::{FileConfig, HarnessConfig, load_file_config};
 
 pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+
+/// Interactive CLI model when neither `--model` nor the config file sets one.
+pub const DEFAULT_MODEL: Model = Model::Grok45Build;
 
 // ---------------------------------------------------------------------------
 // Per-backend resolved credentials
@@ -147,6 +151,9 @@ pub struct ConfigUserSettings {
     /// Harness config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
     pub harness_config_path: Option<PathBuf>,
+    /// Model id override (CLI `--model`), parsed during resolve.
+    /// `None` → config file `model` → [`DEFAULT_MODEL`].
+    pub model: Option<String>,
 }
 
 /// Fully resolved application configuration. Build once at startup with
@@ -166,28 +173,30 @@ pub struct Config {
     pub harness_config_path: PathBuf,
     /// Host-pool config from that path. Missing file → local-only default.
     pub harness: HarnessConfig,
+    /// Interactive default model (override → config file `model` → [`DEFAULT_MODEL`]).
+    pub model: Model,
 }
 
 impl Config {
     /// Resolve from the real process environment, stdout TTY state, and the
-    /// harness config file. Errors carry the offending path.
+    /// config file. Errors carry the offending path.
     pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
         Self::resolve_with(
             settings,
             |k| std::env::var(k).ok(),
             stdout_is_tty,
-            load_harness_config,
+            load_file_config,
         )
     }
 
-    /// Resolution against an injected environment and harness-config loader
+    /// Resolution against an injected environment and config-file loader
     /// (tests, embedders). Empty environment values are treated as unset.
     pub fn resolve_with(
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
         stdout_is_tty: bool,
-        load_harness: impl FnOnce(&Path) -> Result<HarnessConfig, String>,
+        load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
@@ -197,11 +206,19 @@ impl Config {
             color,
             stdout_is_tty: tty_override,
             harness_config_path,
+            model: model_override,
         } = settings;
 
         let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
         let harness_config_path = resolve_harness_config_path(harness_config_path, &env)?;
-        let harness = load_harness(&harness_config_path)?;
+        let file = load_file(&harness_config_path)?;
+        let model = match model_override {
+            Some(s) => s.parse::<Model>()?,
+            None => file.model.unwrap_or(DEFAULT_MODEL),
+        };
+        let harness = file
+            .into_harness_config()
+            .map_err(|e| format!("config {}: {e}", harness_config_path.display()))?;
         let (anthropic, openai, xai) = resolve_credentials(anthropic, openai, xai, &env);
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
 
@@ -213,6 +230,7 @@ impl Config {
             colors_enabled,
             harness_config_path,
             harness,
+            model,
         })
     }
 
@@ -382,10 +400,7 @@ mod tests {
         env: impl Fn(&str) -> Option<String>,
         stdout_is_tty: bool,
     ) -> Config {
-        Config::resolve_with(settings, env, stdout_is_tty, |_| {
-            Ok(HarnessConfig::default())
-        })
-        .unwrap()
+        Config::resolve_with(settings, env, stdout_is_tty, |_| Ok(FileConfig::default())).unwrap()
     }
 
     fn resolve(pairs: &[(&str, &str)]) -> Config {
@@ -605,7 +620,7 @@ mod tests {
         };
         let cfg = Config::resolve_with(settings, env_of(&[]), false, |p| {
             assert_eq!(p, Path::new("/tmp/h.toml"));
-            Ok(HarnessConfig {
+            Ok(FileConfig {
                 attach_timeout_secs: 42,
                 ..Default::default()
             })
@@ -621,5 +636,44 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("invalid config TOML"));
+    }
+
+    #[test]
+    fn model_override_beats_file_beats_default() {
+        assert_eq!(resolve(&[]).model, DEFAULT_MODEL);
+
+        let file_model = |_: &Path| {
+            Ok(FileConfig {
+                model: Some(Model::ClaudeOpus48),
+                ..Default::default()
+            })
+        };
+        let cfg = Config::resolve_with(
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            false,
+            file_model,
+        )
+        .unwrap();
+        assert_eq!(cfg.model, Model::ClaudeOpus48);
+
+        // Override wins over the file; CLI aliases are accepted.
+        let settings = ConfigUserSettings {
+            model: Some("claude-haiku-4.5".into()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve_with(settings, env_of(&[]), false, file_model).unwrap();
+        assert_eq!(cfg.model, Model::ClaudeHaiku45);
+    }
+
+    #[test]
+    fn invalid_model_override_errors() {
+        let settings = ConfigUserSettings {
+            model: Some("gpt-99".into()),
+            ..Default::default()
+        };
+        let err = Config::resolve_with(settings, env_of(&[]), false, |_| Ok(FileConfig::default()))
+            .unwrap_err();
+        assert!(err.contains("Unknown model"), "{err}");
     }
 }

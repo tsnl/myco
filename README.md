@@ -57,7 +57,8 @@ myco
 
 `myco` loads a `.env` from the current directory (via `dotenvy`) and also reads
 the process environment. Defaults: model **`grok-4.5-build`** (xAI / OpenAI
-Responses API). Pass `--model <id>` for Claude models.
+Responses API). Pass `--model <id>` for Claude models, or set a default with
+`model = "<id>"` in `~/.myco/config.toml` (flag wins).
 
 **Anthropic Messages** (Claude: `claude-haiku-4-5`, `claude-sonnet-4-6`,
 `claude-opus-4-8`, `claude-fable-5`, …):
@@ -85,6 +86,9 @@ If you want to use `myco` with one or more remote hosts, you can configure this 
 
 ```toml
 # ~/.myco/config.toml
+
+# Default model for the interactive CLI (--model overrides).
+# model = "claude-opus-4-8"
 
 enable_subagent = true
 

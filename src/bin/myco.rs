@@ -41,7 +41,6 @@ const SYSTEM_PROMPT_PROLOGUE: &str = r#"
 You are a helpful assistant running in an agentic harness with unfettered computer access.
 "#;
 
-const DEFAULT_MODEL_NAME: &str = "grok-4.5-build";
 const SLASH_COMMANDS: &[&str] = &[
     "/help",
     "/exit",
@@ -90,9 +89,10 @@ struct Args {
     #[arg(long, default_value = "local")]
     name: String,
 
-    /// Model id (e.g. claude-haiku-4-5, claude-opus-4-8, claude-sonnet-4-6, grok-4.5-build)
-    #[arg(long, default_value = DEFAULT_MODEL_NAME)]
-    model: String,
+    /// Model id (e.g. claude-haiku-4-5, claude-opus-4-8, claude-sonnet-4-6, grok-4.5-build).
+    /// Default: `model` from config.toml, else grok-4.5-build.
+    #[arg(long)]
+    model: Option<String>,
 
     /// Dump provider request bodies to stderr
     #[arg(long)]
@@ -162,19 +162,19 @@ async fn run_host(args: Args) {
 }
 
 async fn run_interactive(args: Args) {
-    let model_id = parse_model_or_exit(&args.model);
-
     // One explicit resolution step: backend credentials/base URLs, harness
-    // hosts (--config → $MYCO_CONFIG → ~/.myco/config.toml), and TTY state.
-    // Everything downstream reads this, not the env.
+    // hosts and default model (--config → $MYCO_CONFIG → ~/.myco/config.toml),
+    // and TTY state. Everything downstream reads this, not the env.
     let app_config = Config::resolve(ConfigUserSettings {
         harness_config_path: args.config.clone(),
+        model: args.model.clone(),
         ..Default::default()
     })
     .unwrap_or_else(|e| {
         eprintln!("Failed to load config: {e}");
         std::process::exit(2);
     });
+    let model_id = app_config.model;
 
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
     // passphrase-protected / security-key identities via the existing ssh-agent
@@ -273,13 +273,6 @@ async fn run_interactive(args: Args) {
     if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
         println!("session={}", active_session.id());
     }
-}
-
-fn parse_model_or_exit(name: &str) -> Model {
-    name.parse().unwrap_or_else(|e| {
-        eprintln!("Invalid --model: {e}");
-        std::process::exit(2);
-    })
 }
 
 fn build_model(
