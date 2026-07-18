@@ -50,10 +50,32 @@ impl HostWorker {
         Self::new(name, Self::services_with_search(search))
     }
 
-    /// Standard service list for building an extended local worker.
-    /// No indexing happens at construction (see [`Self::standard_with_search`]).
+    /// Standard service list for building an extended local worker: the
+    /// dispatchers behind [`Self::standard_tool_specs`]. No indexing happens
+    /// at construction (see [`Self::standard_with_search`]).
     pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
         Self::services_with_search(TextSearchToolService::new())
+    }
+
+    /// Tool catalog advertised by [`Self::standard`] — pure static data, no
+    /// services constructed.
+    ///
+    /// Used by the harness for routing and by lazy
+    /// [`crate::host::HostController`]s to advertise tools before any
+    /// connection exists. Concatenates the same per-service `specs()` the
+    /// live services serve; a test pins this against a real worker so the
+    /// two can never drift.
+    pub fn standard_tool_specs() -> Vec<generative_model::ToolSpec> {
+        [
+            BashService::specs(),
+            TextEditorService::specs(),
+            ManualService::specs(),
+            BrowserService::specs(),
+            TextSearchToolService::specs(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub(crate) fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
@@ -64,21 +86,6 @@ impl HostWorker {
             Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
             Arc::new(search) as Arc<dyn ToolService>,
         ]
-    }
-
-    /// Tool catalog advertised by [`Self::standard`] (no process required).
-    ///
-    /// Used by lazy [`crate::host::HostController`] so the harness can route
-    /// host tools without connecting. Spec listing must not start engines:
-    /// attach and every remote controller call this, and a throwaway
-    /// [`TextSearchToolService::new`] would kick off a redundant background
-    /// crawl + embed of cwd each time.
-    pub fn standard_tool_specs() -> Vec<generative_model::ToolSpec> {
-        Self::new(
-            "local",
-            Self::services_with_search(TextSearchToolService::spec_only()),
-        )
-        .tool_specs()
     }
 
     pub fn name(&self) -> &str {
@@ -255,4 +262,22 @@ where
 {
     let mut guard = writer.lock().await;
     msg.write_to(&mut *guard).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The static catalog and a live standard worker must advertise the same
+    /// tools: [`HostWorker::standard_tool_specs`] is what routing trusts
+    /// before any worker exists, so it must never drift from what workers
+    /// actually serve.
+    #[test]
+    fn standard_catalog_matches_standard_worker() {
+        let catalog =
+            serde_json::to_value(HostWorker::standard_tool_specs()).expect("catalog json");
+        let advertised =
+            serde_json::to_value(HostWorker::standard("x").tool_specs()).expect("advertised json");
+        assert_eq!(catalog, advertised);
+    }
 }
