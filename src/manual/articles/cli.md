@@ -13,11 +13,16 @@ You cannot press these yourself — tell the user which command to run.
 | `/compact` | Compact into successor session (summary + recent tail) |
 | `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
 | `/help` | Full help |
-| Alt-Enter / Shift-Enter / Ctrl-J | Multiline input |
+| Alt-Enter / Ctrl-J | Multiline input |
 | Enter | Submit |
 | Ctrl-C | Cancel line at prompt; cancel in-flight turn while running |
 | Ctrl-L | Clear scrollback and reprint the conversation (empty prompt only) |
 | Ctrl-D / `/exit` | Save and quit |
+
+Shift-Enter does **not** insert a newline in most terminals: they transmit it as
+plain Enter, so it submits the message. If the user reports this, tell them to
+use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
+which reports key modifiers.)
 
 Startup banner prints model, session, config path, hosts, and default host.
 

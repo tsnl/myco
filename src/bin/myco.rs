@@ -222,7 +222,7 @@ async fn run_interactive(args: Args) {
         _ => s.id.clone(),
     });
     println!(
-        "myco: model={model_id}  effort={effort}  session={session_label}  config={}  hosts=[{}]  default=local  (/help for commands)",
+        "myco: model={model_id}  effort={effort}  session={session_label}  config={}  hosts=[{}]  default=local  (/help for commands; newline: Alt-Enter or Ctrl-J)",
         config_path.display(),
         harness.host_names().join(", "),
     );
@@ -332,7 +332,10 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
     });
     editor.set_helper(Some(ReplHelper));
     // Multiline: insert a newline without submitting. Enter still accepts the buffer.
-    // Bind common "insert newline" chords used by terminals / coding agents.
+    // Alt-Enter arrives as ESC+CR and Ctrl-J as 0x0A, so both are distinguishable
+    // in any terminal. Shift-Enter is bound too, but most terminals transmit it as
+    // plain CR -- identical to Enter, so it submits instead; the binding only fires
+    // on the Windows console, whose API reports modifiers. Advertise Alt-Enter.
     // (EventHandler is not Clone, so each bind gets its own Simple(Cmd::Newline).)
     editor.bind_sequence(
         KeyEvent(KeyCode::Enter, Modifiers::ALT),
@@ -385,8 +388,8 @@ async fn run_repl(
         println!("USER {used}/{max}");
         println!();
         // No "> " prefix; body is typed on the line after the USER header.
-        // Multiline: Alt-Enter / Shift-Enter / Ctrl-J inserts a newline in-buffer;
-        // plain Enter submits the whole buffer to the agent.
+        // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
+        // submits the whole buffer to the agent.
         let line = match editor.readline("") {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
@@ -835,8 +838,11 @@ Commands:
 
 Shortcuts:
   Enter                 Submit the current buffer
-  Alt-Enter / Shift-Enter / Ctrl-J
-                        Insert a newline (multiline input)
+  Alt-Enter / Ctrl-J    Insert a newline (multiline input)
+                        Note: most terminals send Shift-Enter as plain Enter,
+                        which submits -- use Alt-Enter or Ctrl-J instead.
+                        (Shift-Enter does insert a newline on the Windows
+                        console, which reports modifiers.)
   Ctrl-C                Cancel current line at prompt; cancel in-flight turn while running
   Ctrl-L                Clear scrollback and reprint the conversation (empty prompt only)
   Ctrl-D                Save and quit
