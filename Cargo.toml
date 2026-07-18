@@ -34,6 +34,7 @@ url = "2"
 uuid = { version = "1.23.2", features = ["v4", "serde"] }
 notify = "8.2.0"
 tantivy = "0.22"
+ssh2-config = "0.7.1"
 
 [build-dependencies]
 # Sync Hub client (ureq + native-tls); shares ~/.cache/huggingface with Python huggingface_hub.

@@ -1,7 +1,7 @@
 //! Compile-time Myco manual: markdown articles embedded via [`include_str!`].
 //!
 //! Used by the `manual` host tool and by `myco --help [article]`.
-//! Always-on agent policy (worktrees, computer-use, coding norms) lives in
+//! Always-on agent policy (worktrees, computer-use, coding norms, user authority) lives in
 //! [`crate::prompts`] instead.
 
 /// One embedded manual page.

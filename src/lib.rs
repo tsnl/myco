@@ -11,9 +11,9 @@ pub mod tool_services;
 pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
-    RemoteHostConfig, SshAgentPreflightReport, SubagentService, default_config_path,
-    default_local_host_command, ensure_remote_ssh_identities, example_config_toml,
-    load_harness_config, print_preflight_report,
+    SshAgentPreflightReport, SubagentService, default_config_path, default_local_host_command,
+    default_ssh_config_path, ensure_remote_ssh_identities, example_config_toml,
+    load_harness_config, print_preflight_report, ssh_config_host_aliases,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;

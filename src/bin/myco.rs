@@ -107,7 +107,8 @@ struct Args {
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
     effort: Effort,
 
-    /// Path to harness config (hosts). Default: $MYCO_CONFIG or ~/.myco/config.toml.
+    /// Path to myco config (knobs; hosts come from ~/.ssh/config).
+    /// Default: $MYCO_CONFIG or ~/.myco/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -146,7 +147,16 @@ async fn main() {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name).serve_stdio().await {
+    // Owner request: index skills / AGENTS.md under the worker's cwd.
+    // Construction alone never indexes (tests rely on that).
+    let search = myco::TextSearchToolService::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search.auto_index_under(cwd);
+    }
+    if let Err(e) = HostWorker::standard_with_search(args.name, search)
+        .serve_stdio()
+        .await
+    {
         eprintln!("myco host error: {e}");
         std::process::exit(1);
     }
@@ -192,7 +202,7 @@ async fn run_interactive(args: Args) {
     .unwrap_or_else(|e| {
         eprintln!("Failed to attach harness: {e}");
         eprintln!(
-            "hint: check ~/.myco/config.toml ([[remote_hosts]]); local needs no binary spawn"
+            "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
         );
         if !ssh_report.is_clean() || !ssh_report.agent_ok {
             eprintln!(
@@ -204,6 +214,11 @@ async fn run_interactive(args: Args) {
         std::process::exit(1);
     });
     print_host_status(&harness);
+    // Owner request: index skills / AGENTS.md under the launch directory.
+    // Attach alone never indexes (tests rely on that).
+    if let Ok(cwd) = std::env::current_dir() {
+        harness.auto_index_local(cwd);
+    }
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
@@ -856,8 +871,10 @@ Each USER header shows `USER <used>/<max>` context tokens when the provider
 reported usage on the previous generate (0/max until then).
 
 Hosts:
-  Local is always enabled in-process (no subprocess). Remotes: ~/.myco/config.toml
-  (`[[remote_hosts]]` with explicit SSH fields; or --config / $MYCO_CONFIG).
+  Local is always enabled in-process (no subprocess). Remotes come from
+  ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
+  `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
+  $MYCO_CONFIG) holds knobs only (enable_subagent, attach_timeout_secs).
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host.
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for

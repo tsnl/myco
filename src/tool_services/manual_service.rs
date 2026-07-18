@@ -11,7 +11,7 @@ use super::{HostDispatchContext, ToolService};
 const TOOL_DESCRIPTION: &str = r#"
 Browse Myco runtime manual articles (overview, CLI, tools, harness-ops). Articles are
 embedded at compile time (same text as `myco --help <id>`). Worktrees, computer-use, and
-coding norms live in the always-on system prompt (not this catalog).
+coding norms and user-authority policy live in the always-on system prompt (not this catalog).
 
 Actions:
 - list (default): catalog of article ids + one-line summaries.
@@ -46,13 +46,20 @@ impl ManualService {
     }
 }
 
-impl ToolService for ManualService {
-    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+impl ManualService {
+    /// Tool schemas served by this service (static: no instance required).
+    pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "manual".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
+    }
+}
+
+impl ToolService for ManualService {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+        Self::specs()
     }
 
     fn dispatch_tool_use(

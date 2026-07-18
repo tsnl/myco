@@ -16,8 +16,8 @@ use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    FileConfig, FileRemoteHost, default_config_path, example_config_toml, load_harness_config,
-    parse_harness_config_str,
+    FileConfig, default_config_path, default_ssh_config_path, example_config_toml,
+    load_harness_config, parse_file_config_str, ssh_config_host_aliases, ssh_spawn_command,
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
@@ -31,67 +31,6 @@ pub use ssh::{
     SshAgentPreflightReport, ensure_remote_ssh_identities, print_preflight_report,
     ssh_destination_from_command,
 };
-
-/// Structured SSH fields for one remote host (from config).
-#[derive(Debug, Clone)]
-pub struct RemoteHostConfig {
-    pub name: String,
-    /// SSH destination (alias, hostname, or `user@host`).
-    pub ssh: String,
-    /// Remote binary (default `"myco"`).
-    pub myco: String,
-    /// Extra `-o key=value` options (BatchMode always added).
-    pub ssh_options: Vec<String>,
-    pub identity_file: Option<String>,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-}
-
-impl RemoteHostConfig {
-    /// Build the argv for `ssh … myco --mode host --name <name>`.
-    pub fn spawn_command(&self) -> Vec<String> {
-        let mut cmd = vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()];
-        for opt in &self.ssh_options {
-            let opt = opt.trim();
-            if opt.is_empty() {
-                continue;
-            }
-            // Avoid duplicating BatchMode if the user listed it.
-            if opt.eq_ignore_ascii_case("BatchMode=yes")
-                || opt.eq_ignore_ascii_case("BatchMode=Yes")
-            {
-                continue;
-            }
-            cmd.push("-o".into());
-            cmd.push(opt.to_string());
-        }
-        if let Some(id) = &self.identity_file {
-            let id = id.trim();
-            if !id.is_empty() {
-                cmd.push("-i".into());
-                cmd.push(id.to_string());
-            }
-        }
-        if let Some(port) = self.port {
-            cmd.push("-p".into());
-            cmd.push(port.to_string());
-        }
-        if let Some(user) = &self.user {
-            let user = user.trim();
-            if !user.is_empty() {
-                cmd.push("-l".into());
-                cmd.push(user.to_string());
-            }
-        }
-        cmd.push(self.ssh.clone());
-        cmd.push(self.myco.clone());
-        cmd.push("--mode".into());
-        cmd.push("host".into());
-        cmd.push("--name".into());
-        cmd.push(self.name.clone());
-        cmd
-    }
-}
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -126,6 +65,9 @@ pub struct Harness {
     root_only_tool_names: std::collections::HashSet<String>,
     /// Cached tool specs advertised to the model (host field injected for multi-host tools).
     tool_specs: Vec<generative_model::ToolSpec>,
+    /// Local host's text-search engine. Attach never indexes; the owning
+    /// process opts in via [`Self::auto_index_local`].
+    local_search: crate::text_search::TextSearchEngine,
 }
 
 /// How to construct a harness.
@@ -266,8 +208,13 @@ impl Harness {
             }
         }
 
+        // Keep the local engine handle on the harness so the owning process
+        // can request auto-indexing after attach; attach itself never indexes.
+        let local_search = crate::text_search::TextSearchEngine::new();
         let mut local_services: Vec<Arc<dyn ToolService>> =
-            crate::host::HostWorker::standard_services();
+            crate::host::HostWorker::services_with_search(
+                crate::tool_services::TextSearchToolService::with_engine(local_search.clone()),
+            );
         local_services.extend(root_extras);
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
@@ -292,7 +239,17 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            local_search,
         }))
+    }
+
+    /// Owner opt-in: discover and index skills / AGENTS.md under `cwd` on the
+    /// in-process local host (background crawl on the blocking pool).
+    ///
+    /// Called by the interactive CLI entrypoint. Tests that merely attach a
+    /// harness never index anything.
+    pub fn auto_index_local(&self, cwd: std::path::PathBuf) {
+        self.local_search.auto_index_under(cwd);
     }
 
     /// Test helper: attach only the in-process local host, no subagent.
@@ -307,7 +264,10 @@ impl Harness {
     /// In-process harness for unit tests: local host only, with the given services
     /// (plus the standard catalog).
     pub fn local_with_services(extra: Vec<Arc<dyn ToolService>>) -> Arc<Self> {
-        let standard = crate::host::HostWorker::standard_services();
+        let local_search = crate::text_search::TextSearchEngine::new();
+        let standard = crate::host::HostWorker::services_with_search(
+            crate::tool_services::TextSearchToolService::with_engine(local_search.clone()),
+        );
         let mut host_tool_names = std::collections::HashSet::new();
         let mut root_only_tool_names = std::collections::HashSet::new();
         let mut tool_specs = Vec::new();
@@ -344,6 +304,7 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            local_search,
         })
     }
 
@@ -713,29 +674,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_spawn_command_shape() {
-        let r = RemoteHostConfig {
-            name: "devbox".into(),
-            ssh: "devbox".into(),
-            myco: "myco".into(),
-            ssh_options: vec!["ConnectTimeout=5".into()],
-            identity_file: Some("~/.ssh/id".into()),
-            port: Some(22),
-            user: Some("alice".into()),
-        };
-        let cmd = r.spawn_command();
-        assert_eq!(cmd[0], "ssh");
-        assert!(cmd.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
-        assert!(cmd.windows(2).any(|w| w == ["-o", "ConnectTimeout=5"]));
-        assert!(cmd.windows(2).any(|w| w == ["-i", "~/.ssh/id"]));
-        assert!(cmd.windows(2).any(|w| w == ["-p", "22"]));
-        assert!(cmd.windows(2).any(|w| w == ["-l", "alice"]));
-        assert!(cmd.iter().any(|s| s == "devbox"));
-        assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
-        assert!(cmd.windows(2).any(|w| w == ["--name", "devbox"]));
-    }
-
     #[tokio::test]
     async fn local_is_always_present_and_connected() {
         let harness = Harness::attach(HarnessConfig {
@@ -768,6 +706,93 @@ mod tests {
         assert!(!r.is_error, "{r:?}");
         let text = tool_text(&r);
         assert!(text.contains("on-local"), "{text}");
+    }
+
+    /// Attaching a harness must not index anything: auto-indexing is an
+    /// explicit owner request, so tests never pay discovery/embedding work.
+    #[tokio::test]
+    async fn attach_does_not_auto_index() {
+        let harness = Harness::attach(HarnessConfig {
+            enable_subagent: false,
+            ..HarnessConfig::default()
+        })
+        .await
+        .expect("attach");
+
+        // Give any (buggy) background indexing a chance to register roots.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let r = harness
+            .clone()
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t".into(),
+                    name: "indexed_exact_text_search".into(),
+                    input: json!({"query": "anything"}),
+                },
+                Arc::new(crate::NullEventSink),
+                TraceContext::default(),
+                CancelToken::new(),
+            )
+            .await;
+        assert!(r.is_error, "search must fail with empty index: {r:?}");
+        assert!(
+            tool_text(&r).contains("no directories indexed"),
+            "{}",
+            tool_text(&r)
+        );
+    }
+
+    /// The owner's explicit request is what makes discovery targets
+    /// (AGENTS.md & co.) searchable.
+    #[tokio::test]
+    async fn auto_index_local_is_owner_opt_in() {
+        let dir = std::env::temp_dir().join(format!("myco-owner-index-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "# guidance\nunique_owner_optin_token here\n",
+        )
+        .unwrap();
+
+        let harness = Harness::attach(HarnessConfig {
+            enable_subagent: false,
+            ..HarnessConfig::default()
+        })
+        .await
+        .expect("attach");
+        harness.auto_index_local(dir.clone());
+
+        // The crawl is a background task; poll until the root is searchable.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let hit = loop {
+            let r = harness
+                .clone()
+                .dispatch_tool_use(
+                    ToolUse {
+                        id: "t".into(),
+                        name: "indexed_exact_text_search".into(),
+                        input: json!({"query": "unique_owner_optin_token"}),
+                    },
+                    Arc::new(crate::NullEventSink),
+                    TraceContext::default(),
+                    CancelToken::new(),
+                )
+                .await;
+            if !r.is_error && tool_text(&r).contains("AGENTS.md") {
+                break r;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("owner-requested auto-index never became searchable: {r:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            tool_text(&hit).contains("unique_owner_optin_token"),
+            "{hit:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -138,7 +138,11 @@ impl SearchIndex {
     }
 
     /// Upsert file. Returns false if skipped (binary, too large, caps).
-    pub fn upsert_file(&mut self, path: &Path, text: String) -> bool {
+    ///
+    /// `vector` is the file's precomputed [`embed_for_index`] embedding
+    /// (`None` ⇒ exact search only). Embedding is the caller's job so this
+    /// method stays cheap under the engine lock — see [`embed_for_index`].
+    pub fn upsert_file(&mut self, path: &Path, text: String, vector: Option<Vec<f32>>) -> bool {
         if self.files.len() >= MAX_FILES && !self.contains_file(path) {
             return false;
         }
@@ -193,8 +197,8 @@ impl SearchIndex {
             return false;
         }
 
-        // Embedding (best-effort; exact search still works if embed fails)
-        if let Ok(vec) = embed_text(&text) {
+        // Best-effort semantic vector; exact search still works without one.
+        if let Some(vec) = vector {
             self.vectors.insert(key.clone(), vec);
         }
 
@@ -324,9 +328,13 @@ impl SearchIndex {
     }
 
     /// Semantic search: cosine over MiniLM vectors.
+    ///
+    /// `q_vec` is the query's precomputed [`embed_for_index`] embedding
+    /// (embedding is the caller's job — see [`embed_for_index`]).
     pub fn search_semantic(
         &mut self,
         query: &str,
+        q_vec: &[f32],
         path_prefix: Option<&Path>,
         limit: usize,
     ) -> Result<Vec<Hit>, String> {
@@ -334,7 +342,6 @@ impl SearchIndex {
         if q.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let q_vec = embed_text(q)?;
         let prefix = path_prefix.map(path_key);
 
         let mut scored: Vec<(f32, String)> = Vec::new();
@@ -345,7 +352,7 @@ impl SearchIndex {
             {
                 continue;
             }
-            let score = cosine(&q_vec, vec);
+            let score = cosine(q_vec, vec);
             if score > 0.0 {
                 scored.push((score, key.clone()));
             }
@@ -479,9 +486,16 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot
 }
 
-fn embed_text(text: &str) -> Result<Vec<f32>, String> {
+/// Clip and embed file/query text for the semantic index (L2-normalized
+/// MiniLM vector via Candle).
+///
+/// This is heavy synchronous CPU work — the first call in a process also
+/// loads the BERT model, which takes seconds (tens of seconds in debug
+/// builds). Callers on an async runtime must run it via `spawn_blocking`:
+/// on an executor thread it starves timers and sibling tasks, and wedges
+/// current-thread runtimes outright.
+pub(crate) fn embed_for_index(text: &str) -> Result<Vec<f32>, String> {
     let clipped: String = text.chars().take(MAX_EMBED_CHARS).collect();
-    // L2-normalized MiniLM vector (Candle; no ORT).
     crate::text_search::embed_model::embed_text(&clipped)
 }
 
@@ -597,10 +611,12 @@ mod tests {
         idx.upsert_file(
             Path::new("/tmp/a/SKILL.md"),
             "---\nname: pdf\ndescription: Extract PDF text and forms\n---\n# PDF skill\n".into(),
+            None,
         );
         idx.upsert_file(
             Path::new("/tmp/a/other.md"),
             "unrelated content about bananas\n".into(),
+            None,
         );
         idx.commit().unwrap();
         let hits = idx.search_exact("PDF forms", None, 10).unwrap();
@@ -614,10 +630,12 @@ mod tests {
         idx.upsert_file(
             Path::new("/tmp/skills/publish/SKILL.md"),
             "---\nname: publish\ndescription: ship releases\n---\n".into(),
+            None,
         );
         idx.upsert_file(
             Path::new("/tmp/skills/publish/notes.txt"),
             "no skill marker here, just notes\n".into(),
+            None,
         );
         idx.commit().unwrap();
 
@@ -644,18 +662,22 @@ mod tests {
     fn semantic_search_basic() {
         let mut idx = SearchIndex::new().unwrap();
         // Uses compile-time embedded MiniLM (Candle; build.rs).
-        embed_text("warmup").expect("MiniLM embedder must load offline");
+        embed_for_index("warmup").expect("MiniLM embedder must load offline");
+        let skill = "---\nname: pdf\ndescription: Extract PDF text and fill forms\n---\n";
+        let other = "recipe for banana bread and muffins\n";
         idx.upsert_file(
             Path::new("/tmp/a/SKILL.md"),
-            "---\nname: pdf\ndescription: Extract PDF text and fill forms\n---\n".into(),
+            skill.into(),
+            embed_for_index(skill).ok(),
         );
         idx.upsert_file(
             Path::new("/tmp/a/other.md"),
-            "recipe for banana bread and muffins\n".into(),
+            other.into(),
+            embed_for_index(other).ok(),
         );
-        let hits = idx
-            .search_semantic("extract documents and forms", None, 5)
-            .unwrap();
+        let q = "extract documents and forms";
+        let q_vec = embed_for_index(q).unwrap();
+        let hits = idx.search_semantic(q, &q_vec, None, 5).unwrap();
         assert!(!hits.is_empty(), "{hits:?}");
         assert!(hits[0].path.ends_with("SKILL.md"), "{hits:?}");
     }

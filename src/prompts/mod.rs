@@ -1,8 +1,8 @@
 //! Shared system-prompt fragments for root agents and subagents.
 //!
-//! Always-on agent policy (worktrees, computer-use, coding norms) lives here.
-//! Longer runtime docs live in [`crate::manual`] and are browsed via the `manual`
-//! host tool / `myco --help [id]`.
+//! Always-on agent policy (worktrees, computer-use, coding norms, user authority)
+//! lives here. Longer runtime docs live in [`crate::manual`] and are browsed via
+//! the `manual` host tool / `myco --help [id]`.
 
 /// Epilogue appended to every agent system prompt (root + subagent).
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
@@ -27,7 +27,9 @@ process; host tools (`bash`, editor, `manual`, text search, `lynx_tui_browser`) 
 Article ids: `overview`, `cli`, `harness-ops`.
 
 Quick map (details in `manual`):
-- Config: `~/.myco/config.toml` (or `$MYCO_CONFIG`) — `[[remote_hosts]]` only; local is always on.
+- Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
+  local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
+  (`enable_subagent`, `attach_timeout_secs`).
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
@@ -60,6 +62,8 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     include_str!("fragments/computer-use.md"),
     "\n---\n\n",
     include_str!("fragments/coding-norms.md"),
+    "\n---\n\n",
+    include_str!("fragments/user-authority.md"),
     "\n",
 );
 
@@ -72,6 +76,8 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Git worktrees for new features"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Computer use"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Think Before Coding"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));

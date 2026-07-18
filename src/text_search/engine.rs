@@ -9,12 +9,17 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
 
 use super::discover::discover_auto_index_targets;
-use super::index::{Hit, SearchIndex, is_under, read_text_file, resolve_path, walk_text_files};
+use super::index::{
+    Hit, SearchIndex, embed_for_index, is_under, read_text_file, resolve_path, walk_text_files,
+};
 
 /// Shared engine handle (cheap to clone).
 ///
 /// Holds a forest of **persistently indexed roots**. Each root is watched with
 /// `notify` and kept incrementally up to date until [`TextSearchEngine::drop_directory_index`].
+///
+/// Nothing is indexed until explicitly requested ([`Self::auto_index_under`]
+/// or `index_directory`).
 #[derive(Clone)]
 pub struct TextSearchEngine {
     inner: Arc<Mutex<EngineState>>,
@@ -92,9 +97,20 @@ pub struct SearchReport {
     pub note: String,
 }
 
+impl Default for TextSearchEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TextSearchEngine {
-    /// Create engine and kick off auto-discovery indexing under `cwd` (async).
-    pub fn start(cwd: PathBuf) -> Self {
+    /// Create an engine with a live watch-event bridge and an empty index.
+    ///
+    /// Construction never indexes anything: indexing is an explicit request
+    /// ([`Self::auto_index_under`] from the owning process, or the
+    /// `index_directory` tool), so building a harness/worker in tests has no
+    /// background side effects.
+    pub fn new() -> Self {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<WatchMsg>();
         let index = SearchIndex::new().expect("tantivy ram index");
         let inner = Arc::new(Mutex::new(EngineState {
@@ -135,26 +151,40 @@ impl TextSearchEngine {
             })
             .ok();
 
-        // Auto-index skills / AGENTS.md (and .claude/skills) under cwd.
-        // Skip when no Tokio runtime (e.g. listing standard tool specs in unit tests).
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let eng = engine.clone();
-            handle.spawn(async move {
-                // Tiny delay so host hello isn't contending with first walk.
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let targets = discover_auto_index_targets(&cwd);
-                for t in targets {
-                    let _ = eng.index_directory(t.path).await;
-                }
-            });
-        }
-
         engine
     }
 
-    /// Test helper: no auto-index, no watch thread required beyond normal.
+    /// Owner opt-in: discover and index skills / AGENTS.md (and
+    /// `.claude/skills`) under `cwd` in the background.
+    ///
+    /// Called by the process entrypoints (interactive CLI, `--mode host`) —
+    /// never from constructors, so tests see no auto-indexing. Requires an
+    /// ambient Tokio runtime; the crawl itself runs on the blocking pool.
+    pub fn auto_index_under(&self, cwd: PathBuf) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let eng = self.clone();
+        handle.spawn(async move {
+            // Tiny delay so host hello isn't contending with first walk.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // The discovery walk is synchronous filesystem work — keep it
+            // off the executor (crawl_root embeds off-executor too).
+            let targets = tokio::task::spawn_blocking(move || discover_auto_index_targets(&cwd))
+                .await
+                .unwrap_or_default();
+            for t in targets {
+                let _ = eng.index_directory(t.path).await;
+            }
+        });
+    }
+
+    /// Test-only engine with no watch-event bridge thread.
+    ///
+    /// (Catalog listing no longer needs an engine at all — schemas are
+    /// static; see `HostWorker::standard_tool_specs`.)
     #[cfg(test)]
-    pub fn start_for_tests() -> Self {
+    pub fn detached() -> Self {
         let (event_tx, _event_rx) = std::sync::mpsc::channel::<WatchMsg>();
         let index = SearchIndex::new().expect("tantivy ram index");
         Self {
@@ -314,16 +344,26 @@ impl TextSearchEngine {
         .map_err(|e| format!("walk join: {e}"))?;
 
         for f in files {
-            let text = tokio::task::spawn_blocking({
+            // Read *and* embed on the blocking pool: MiniLM inference (and the
+            // one-time model load on first use) is seconds of synchronous CPU.
+            // On an executor thread it would starve timers and in-flight tool
+            // calls — a current_thread runtime wedges entirely, which showed up
+            // as agent tests "hanging" whenever a Harness auto-indexed cwd.
+            let loaded = tokio::task::spawn_blocking({
                 let f = f.clone();
-                move || read_text_file(&f)
+                move || {
+                    read_text_file(&f).map(|text| {
+                        let vector = embed_for_index(&text).ok();
+                        (text, vector)
+                    })
+                }
             })
             .await
             .ok()
             .flatten();
-            if let Some(text) = text {
+            if let Some((text, vector)) = loaded {
                 let mut st = self.inner.lock().await;
-                st.index.upsert_file(&f, text);
+                st.index.upsert_file(&f, text, vector);
             }
         }
 
@@ -423,11 +463,25 @@ impl TextSearchEngine {
         // Wait until covering roots are ready (or fail if none).
         let roots_used = self.wait_for_coverage(filter.as_deref()).await?;
 
-        let mut st = self.inner.lock().await;
-        let hits_raw: Vec<Hit> = if semantic {
-            st.index.search_semantic(&query, filter.as_deref(), limit)?
+        // Embed the query on the blocking pool, before taking the state lock
+        // (same rule as crawl_root: candle never runs on an executor thread).
+        let q_vec = if semantic {
+            let q = query.clone();
+            Some(
+                tokio::task::spawn_blocking(move || embed_for_index(&q))
+                    .await
+                    .map_err(|e| format!("embed join: {e}"))??,
+            )
         } else {
-            st.index.search_exact(&query, filter.as_deref(), limit)?
+            None
+        };
+
+        let mut st = self.inner.lock().await;
+        let hits_raw: Vec<Hit> = match &q_vec {
+            Some(v) => st
+                .index
+                .search_semantic(&query, v, filter.as_deref(), limit)?,
+            None => st.index.search_exact(&query, filter.as_deref(), limit)?,
         };
         let hits = hits_raw
             .into_iter()
@@ -535,17 +589,23 @@ impl TextSearchEngine {
                 if !under {
                     return;
                 }
-                let text = tokio::task::spawn_blocking({
+                // Read + embed on the blocking pool (see crawl_root).
+                let loaded = tokio::task::spawn_blocking({
                     let path = path.clone();
-                    move || read_text_file(&path)
+                    move || {
+                        read_text_file(&path).map(|text| {
+                            let vector = embed_for_index(&text).ok();
+                            (text, vector)
+                        })
+                    }
                 })
                 .await
                 .ok()
                 .flatten();
                 let mut st = self.inner.lock().await;
-                match text {
-                    Some(text) => {
-                        st.index.upsert_file(&path, text);
+                match loaded {
+                    Some((text, vector)) => {
+                        st.index.upsert_file(&path, text, vector);
                     }
                     // Unreadable now: renames/moves arrive as Modify events
                     // carrying the *old* path (inotify `Name(From)`), never as
@@ -626,7 +686,7 @@ mod tests {
         )
         .unwrap();
 
-        let eng = TextSearchEngine::start_for_tests();
+        let eng = TextSearchEngine::detached();
         let report = eng.index_directory(dir.join("skills")).await.unwrap();
         assert!(
             report.watching || report.status.contains("persistently indexed"),
@@ -661,7 +721,7 @@ mod tests {
         fs::write(dir.join("a/b/x.md"), "hello child unique_token_xyz\n").unwrap();
         fs::write(dir.join("a/y.md"), "hello parent unique_token_xyz\n").unwrap();
 
-        let eng = TextSearchEngine::start_for_tests();
+        let eng = TextSearchEngine::detached();
         eng.index_directory(dir.join("a/b")).await.unwrap();
         for _ in 0..100 {
             if eng.list_roots().await.iter().any(|(_, r, _)| *r) {
@@ -697,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_requires_index() {
-        let eng = TextSearchEngine::start_for_tests();
+        let eng = TextSearchEngine::detached();
         let err = eng
             .search_exact(SearchOptions {
                 query: "x".into(),
