@@ -23,8 +23,9 @@ const DEFAULT_WIDTH: u32 = 100;
 const MAX_WIDTH: u32 = 400;
 const DEFAULT_MAX_BYTES: usize = 200_000;
 const HARD_MAX_BYTES: usize = 1_000_000;
-
-const TOOL_DESCRIPTION: &str = r#"
+fn tool_description() -> String {
+    format!(
+        r#"
 Text-mode browser (`lynx_tui_browser`) for simple web browsing and web search via the lynx TUI engine. Dumps a public
 HTTP(S) URL to plaintext via `lynx -dump` (requires `lynx` on the host PATH:
 `brew install lynx` / `apt install lynx`).
@@ -48,11 +49,13 @@ Parameters:
 - url (required): http or https URL (page or search-results URL)
 - list_links (optional, default true): emit lynx link IDs + References list;
   false → `-nolist` (no References appendix)
-- width (optional, default 100, max 400): dump column width (`-width=`)
-- max_bytes (optional, default 200000, hard max 1000000): truncate stdout
-- timeout_secs (optional, default 30, hard max 120)
+- width (optional, default {DEFAULT_WIDTH}, max {MAX_WIDTH}): dump column width (`-width=`)
+- max_bytes (optional, default {DEFAULT_MAX_BYTES}, hard max {HARD_MAX_BYTES}): truncate stdout
+- timeout_secs (optional, default {DEFAULT_TIMEOUT_SECS}, hard max {MAX_TIMEOUT_SECS})
 - host (optional): routing host; default local
-"#;
+"#
+    )
+}
 
 /// Runs `lynx -dump` on behalf of the agent. Host-placed (standard catalog).
 #[derive(Default)]
@@ -67,7 +70,7 @@ impl BrowserService {
     pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "lynx_tui_browser".to_string(),
-            description: TOOL_DESCRIPTION.to_string(),
+            description: tool_description(),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
     }
@@ -393,6 +396,17 @@ mod tests {
             d.contains("default true") || d.contains("list_links=true"),
             "{d}"
         );
+        // Stated defaults/limits must be the ones actually enforced.
+        for needle in [
+            DEFAULT_WIDTH.to_string(),
+            MAX_WIDTH.to_string(),
+            DEFAULT_MAX_BYTES.to_string(),
+            HARD_MAX_BYTES.to_string(),
+            DEFAULT_TIMEOUT_SECS.to_string(),
+            MAX_TIMEOUT_SECS.to_string(),
+        ] {
+            assert!(d.contains(&needle), "description missing {needle}: {d}");
+        }
     }
 
     #[test]

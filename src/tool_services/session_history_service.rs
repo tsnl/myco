@@ -8,23 +8,28 @@ use crate::session::Session;
 
 use super::{HostDispatchContext, ToolService};
 
-const TOOL_DESCRIPTION: &str = r#"
+const DEFAULT_MAX_CHARS: usize = 2_000;
+const HARD_MAX_CHARS: usize = 32_000;
+
+fn tool_description() -> String {
+    format!(
+        r#"
 Explore a conversation session transcript by id (or unique prefix). Works for visible and
 **hidden** sessions (subagents, compact workers).
 
 Actions:
 - stats: message count, rough char size, role breakdown, path, hidden/kind/parent.
-- range: messages [start, end) with truncated previews (default max_chars per message body).
+- range: messages [start, end) with truncated previews (max_chars per message body,
+  default {DEFAULT_MAX_CHARS}, hard max {HARD_MAX_CHARS}).
 - expand: full text for one message index (or a tool_use / tool_result body by tool id).
 - search: case-insensitive substring over text + tool names; returns matching indices.
-- write_summary: write markdown summary next to the session file (`{id}.summary.md`).
+- write_summary: write markdown summary next to the session file (`{{id}}.summary.md`).
   Used by compaction workers; prefer this over free-form filesystem writes.
 
 Do not dump entire long sessions into context — use stats/search/range, expand only what you need.
-"#;
-
-const DEFAULT_MAX_CHARS: usize = 2_000;
-const HARD_MAX_CHARS: usize = 32_000;
+"#
+    )
+}
 
 pub struct SessionHistoryTool;
 
@@ -44,7 +49,7 @@ impl ToolService for SessionHistoryTool {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "session_history".to_string(),
-            description: TOOL_DESCRIPTION.to_string(),
+            description: tool_description(),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
     }
@@ -375,4 +380,22 @@ enum ActionKind {
     Expand,
     Search,
     WriteSummary,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tool description is the model-facing contract: it must state the
+    /// defaults/limits actually enforced, not stale hardcoded copies.
+    #[test]
+    fn tool_description_states_actual_defaults() {
+        let specs = SessionHistoryTool::new().tool_specs();
+        let d = &specs[0].description;
+        for needle in [DEFAULT_MAX_CHARS.to_string(), HARD_MAX_CHARS.to_string()] {
+            assert!(d.contains(&needle), "description missing {needle}: {d}");
+        }
+        // `format!` must not have swallowed the literal `{id}` placeholder.
+        assert!(d.contains("{id}.summary.md"), "{d}");
+    }
 }
