@@ -733,6 +733,7 @@ mod tests {
         futures::executor::block_on(harness.dispatch_tool_use(
             tool_use(input),
             HostDispatchContext {
+                session_id: None,
                 agent_id: uuid::Uuid::nil(),
                 cancel: crate::core::CancelToken::new(),
                 agent_root: None,

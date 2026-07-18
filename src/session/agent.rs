@@ -28,8 +28,14 @@ pub fn uuid_simple_hex(id: Uuid) -> String {
 /// not UUIDs and must round-trip unchanged to the model API.
 #[derive(Debug, Clone)]
 pub struct TraceContext {
-    /// Stable id for this agent session (root or subagent).
+    /// Stable id for this running agent (root or subagent). A runtime identity:
+    /// every resumption of a conversation gets a fresh agent id.
     pub agent_id: Uuid,
+    /// Durable conversation session this agent serves (`~/.myco/session/` id),
+    /// if any. Deliberately decoupled from [`Self::agent_id`]: one session sees
+    /// many agent ids across resumptions. Subagents/compact workers are
+    /// non-resumable, so theirs happens to be their agent id's hex.
+    pub session_id: Option<String>,
     /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
     pub depth: usize,
     /// Tool use that is currently in flight / spawned this nested work, if any.
@@ -41,6 +47,7 @@ impl Default for TraceContext {
     fn default() -> Self {
         Self {
             agent_id: Uuid::nil(),
+            session_id: None,
             depth: 0,
             parent_tool_use_id: None,
         }
@@ -51,14 +58,19 @@ impl TraceContext {
     pub fn root() -> Self {
         Self {
             agent_id: Uuid::new_v4(),
+            session_id: None,
             depth: 0,
             parent_tool_use_id: None,
         }
     }
 
+    /// Child context for a nested agent. The child gets no session id here:
+    /// spawners that persist a session for the child (subagent service) set
+    /// [`Self::session_id`] themselves.
     pub fn child_agent(&self, agent_id: Uuid, parent_tool_use_id: Option<String>) -> Self {
         Self {
             agent_id,
+            session_id: None,
             depth: self.depth + 1,
             parent_tool_use_id,
         }
@@ -332,6 +344,7 @@ impl Agent {
         // Tools run in the same agent session; only parent_tool_use_id updates for correlation.
         let dispatch_context = TraceContext {
             agent_id: self.context.agent_id,
+            session_id: self.context.session_id.clone(),
             depth: self.context.depth,
             parent_tool_use_id: Some(tool_use.id.clone()),
         };

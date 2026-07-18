@@ -34,8 +34,13 @@ pub use text_search_tool_service::TextSearchToolService;
 /// Ambient context for host tool-service invocations.
 #[derive(Clone)]
 pub struct HostDispatchContext {
-    /// Agent that owns this call (root or subagent); used for session ownership.
+    /// Agent that owns this call (root or subagent); used for bash session
+    /// ownership. A runtime identity — fresh per resumption.
     pub agent_id: uuid::Uuid,
+    /// Durable conversation session behind this call, if any; keys per-session
+    /// host artifacts (exec output dumps). Decoupled from `agent_id`: one
+    /// session sees many agent ids across resumptions.
+    pub session_id: Option<String>,
     /// Cancel signal for the in-flight call / agent turn.
     pub cancel: CancelToken,
     /// Set by the agent harness for **in-process** dispatches only.
@@ -50,6 +55,7 @@ impl HostDispatchContext {
     pub fn bare(agent_id: uuid::Uuid, cancel: CancelToken) -> Self {
         Self {
             agent_id,
+            session_id: None,
             cancel,
             agent_root: None,
         }

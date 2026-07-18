@@ -477,11 +477,12 @@ pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
 /// Per-session artifact directory, a sibling of the session json:
 /// `session/{shard}/{id}/`.
 ///
-/// Hosts mirror this layout under their own `~/.myco` (keyed by the agent id
+/// Hosts mirror this layout under their own `~/.myco` (keyed by the session id
 /// they receive with each tool call), so deleting the session json plus this
-/// directory on each host removes every trace of a session. Errors instead of
-/// falling back to a relative path: artifact writes from an arbitrary cwd are
-/// worse than skipping the write.
+/// directory on each host removes every trace of a session. Artifacts inside
+/// reference each other by relative name only, keeping the folder portable
+/// (copy/move-safe). Errors instead of falling back to a relative path:
+/// artifact writes from an arbitrary cwd are worse than skipping the write.
 pub fn session_dir_path(id: &str) -> Result<PathBuf, String> {
     let shard = &id[..2.min(id.len())];
     Ok(session_root()?.join(shard).join(id))

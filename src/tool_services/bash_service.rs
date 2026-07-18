@@ -79,9 +79,10 @@ impl ToolService for BashService {
                 `max_bytes` (default {DEFAULT_MAX_BYTES}): over the cap, the head and tail \
                 are kept and the middle is elided with a `[... N bytes omitted ...]` marker. \
                 Before eliding, the full stream is saved verbatim on the executing host \
-                under `~/.myco/session/<shard>/<session>/tool_output/`, and the marker \
-                names the exact file — search it there (grep/head/tail) instead of \
-                re-running the command; don't cat a dump whole. Prefer `exec` for finite \
+                in the session folder (`~/.myco/session/<shard>/<session>/`), and the \
+                marker names the file relative to it (`tool_output/<tool_use_id>.stdout`) \
+                — search it there (grep/head/tail) instead of re-running the command; \
+                don't cat a dump whole. Prefer `exec` for finite \
                 commands (builds, tests, installs). Raise `timeout_ms` when the job may \
                 exceed {exec_default_s}s.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
@@ -133,8 +134,7 @@ impl ToolService for BashService {
                 Err(e) => return generative_model::ToolResult::err(e),
             };
             // Owner is the agent that issued this tool call (root or subagent).
-            self.execute(action, ctx.agent_id, &tool_use.id, ctx.cancel)
-                .await
+            self.execute(action, &tool_use.id, ctx).await
         })
     }
 
@@ -148,7 +148,7 @@ impl BashService {
         Self::default()
     }
 
-    /// Test constructor: dump exec output under `root/{agent_hex}/tool_output`
+    /// Test constructor: dump exec output under `root/{session_id}/tool_output`
     /// instead of the real `~/.myco` session tree.
     #[cfg(test)]
     fn with_dump_root(root: std::path::PathBuf) -> Self {
@@ -161,10 +161,11 @@ impl BashService {
     async fn execute(
         &self,
         action: Action,
-        owner: Uuid,
         tool_use_id: &str,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
+        let owner = ctx.agent_id;
+        let cancel = ctx.cancel;
         match action {
             Action::Exec {
                 command,
@@ -172,7 +173,7 @@ impl BashService {
                 timeout_ms,
                 max_bytes,
             } => {
-                let dump = self.exec_dump(owner, tool_use_id);
+                let dump = self.exec_dump(ctx.session_id.as_deref(), tool_use_id);
                 self.run_oneshot(
                     &command,
                     cwd.as_deref(),
@@ -239,14 +240,16 @@ impl BashService {
 
     /// Where one exec call's over-cap streams are dumped verbatim: the
     /// conversation-session directory (layout mirrored on every host, keyed by
-    /// the owning agent id), one `<tool_use_id>.stdout` / `.stderr` pair per
-    /// tool use. `None` when this host cannot resolve `~/.myco` — dumping is
-    /// best-effort and must never fail the tool call.
-    fn exec_dump(&self, owner: Uuid, tool_use_id: &str) -> Option<ExecDump> {
-        let hex = crate::session::uuid_simple_hex(owner);
+    /// the session id sent with the call), one `<tool_use_id>.stdout` /
+    /// `.stderr` pair per tool use. `None` when the call has no backing
+    /// session or this host cannot resolve `~/.myco` — dumping is best-effort
+    /// and must never fail the tool call.
+    fn exec_dump(&self, session_id: Option<&str>, tool_use_id: &str) -> Option<ExecDump> {
+        // Session ids arrive over the wire; sanitize before touching the fs.
+        let session_id = sanitize_file_stem(session_id?);
         let session_dir = match &self.dump_root {
-            Some(root) => root.join(&hex),
-            None => crate::session::session_dir_path(&hex).ok()?,
+            Some(root) => root.join(&session_id),
+            None => crate::session::session_dir_path(&session_id).ok()?,
         };
         Some(ExecDump {
             dir: session_dir.join("tool_output"),
@@ -1009,12 +1012,15 @@ fn sanitize_file_stem(raw: &str) -> String {
 ///
 /// Unlike session output (buffered; the agent can `read` the rest later),
 /// exec output is gone once the call returns, so before eliding, the full
-/// stream is written verbatim to `dump` and the marker names that path: the
-/// agent can search the file post-hoc instead of re-running the command. The
-/// write is best-effort — on failure the marker falls back to re-run advice.
-/// The kept ends carry the signal either way: build/test tools print the
-/// root-cause error first and the failure summary last. Cuts are byte-exact;
-/// a split UTF-8 char renders as U+FFFD at the seam.
+/// stream is written verbatim to `dump` and the marker names the file: the
+/// agent can search it post-hoc instead of re-running the command. The marker
+/// names it **relative to the session folder** (`tool_output/<id>.<ext>`),
+/// never absolutely, so a session folder stays portable — it can be copied or
+/// moved without invalidating references in the transcript. The write is
+/// best-effort — on failure the marker falls back to re-run advice. The kept
+/// ends carry the signal either way: build/test tools print the root-cause
+/// error first and the failure summary last. Cuts are byte-exact; a split
+/// UTF-8 char renders as U+FFFD at the seam.
 async fn cap_exec_stream(
     bytes: &[u8],
     max_bytes: usize,
@@ -1032,8 +1038,8 @@ async fn cap_exec_stream(
         None => None,
     };
     let hint = match &saved {
-        Some(path) => format!(
-            "full {ext} saved verbatim on this host at {path} — \
+        Some(name) => format!(
+            "full {ext} saved verbatim in this host's session folder as {name} — \
              search it there (grep/head/tail), don't re-run the command"
         ),
         None => "filter with grep/head/tail, redirect to a file, or raise max_bytes".to_string(),
@@ -1046,12 +1052,13 @@ async fn cap_exec_stream(
     )
 }
 
-/// Best-effort verbatim write of one stream; returns the path on success.
+/// Best-effort verbatim write of one stream; returns the session-folder-
+/// relative name (`tool_output/<stem>.<ext>`) on success.
 async fn save_dump(dump: &ExecDump, ext: &str, bytes: &[u8]) -> Option<String> {
-    let path = dump.dir.join(format!("{}.{ext}", dump.stem));
+    let name = format!("{}.{ext}", dump.stem);
     tokio::fs::create_dir_all(&dump.dir).await.ok()?;
-    tokio::fs::write(&path, bytes).await.ok()?;
-    Some(path.display().to_string())
+    tokio::fs::write(dump.dir.join(&name), bytes).await.ok()?;
+    Some(format!("tool_output/{name}"))
 }
 
 /// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
@@ -1621,9 +1628,13 @@ mod tests {
         std::env::temp_dir().join(format!("myco-dump-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Session id carried by test dispatches; exec dumps land under it.
+    const TEST_SESSION_ID: &str = "test-session";
+
     fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
         HostDispatchContext {
             agent_id,
+            session_id: Some(TEST_SESSION_ID.to_string()),
             cancel: crate::core::CancelToken::new(),
             agent_root: None,
         }
@@ -1933,21 +1944,47 @@ mod tests {
         assert!(!result.is_error, "{}", result_text(&result));
         let text = result_text(&result);
 
-        // Dumped under <root>/<agent-hex>/tool_output/<tool_use_id>.stdout;
-        // dispatch_json uses the nil agent and tool_use id "test".
-        let dir = root
-            .join(crate::session::uuid_simple_hex(uuid::Uuid::nil()))
-            .join("tool_output");
+        // Dumped under <root>/<session-id>/tool_output/<tool_use_id>.stdout;
+        // dispatch_json carries TEST_SESSION_ID and tool_use id "test".
+        let dir = root.join(TEST_SESSION_ID).join("tool_output");
         let stdout_path = dir.join("test.stdout");
         let dumped = std::fs::read_to_string(&stdout_path).expect("dump file written");
         let expected: String = (1..=100_000).map(|i| format!("{i}\n")).collect();
         assert_eq!(dumped, expected, "dump must be verbatim");
-        // The marker names the exact path.
-        assert!(text.contains(&stdout_path.display().to_string()), "{text}");
+        // The marker names the file relative to the session folder only —
+        // never an absolute path — so the folder stays portable.
+        assert!(text.contains("tool_output/test.stdout"), "{text}");
+        assert!(
+            !text.contains(&root.display().to_string()),
+            "marker must not leak the absolute session location: {text}"
+        );
         // stderr stayed under the cap: no file for it.
         assert!(!dir.join("test.stderr").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A call with no backing session (bare context) truncates without
+    /// dumping: nothing on disk, marker falls back to re-run advice.
+    #[tokio::test]
+    async fn exec_without_session_truncates_without_dump() {
+        let root = unique_dump_root();
+        let service = Arc::new(BashService::with_dump_root(root.clone()));
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![service as Arc<dyn ToolService>],
+        ));
+        let result = harness
+            .dispatch_tool_use(
+                tool_use_json(json!({"command": "seq 1 100000", "max_bytes": 1000})),
+                HostDispatchContext::bare(uuid::Uuid::nil(), crate::core::CancelToken::new()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("bytes omitted"), "{text}");
+        assert!(!text.contains("tool_output/"), "{text}");
+        assert!(!root.exists(), "no dump without a session id: {root:?}");
     }
 
     /// Under the cap nothing is dumped — no per-call disk litter.
@@ -2284,6 +2321,7 @@ mod tests {
                     "timeout_ms": 10_000,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: uuid::Uuid::nil(),
                     cancel,
                     agent_root: None,
@@ -2940,6 +2978,7 @@ mod tests {
                     "idle_ms": 100,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2963,6 +3002,7 @@ mod tests {
                     "stdin": "nope\n",
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_b,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2988,6 +3028,7 @@ mod tests {
                     "idle_ms": 200,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -3009,6 +3050,7 @@ mod tests {
             .dispatch_tool_use(
                 tool_use_json(json!({"action": "close", "session_id": id})),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -3039,6 +3081,7 @@ mod tests {
                     "idle_ms": 100,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,

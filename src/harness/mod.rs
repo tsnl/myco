@@ -463,7 +463,13 @@ impl Harness {
             };
 
             client
-                .call_with_root(context.agent_id, tool_use, cancel, agent_root)
+                .call_with_root(
+                    context.agent_id,
+                    context.session_id.clone(),
+                    tool_use,
+                    cancel,
+                    agent_root,
+                )
                 .await
         })
     }

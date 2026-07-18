@@ -33,6 +33,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
     // Same-task delayed cancel (avoids spawn scheduling races under suite load).
     let mut call = std::pin::pin!(client.call(
         uuid::Uuid::nil(),
+        None,
         ToolUse {
             id: "slow".into(),
             name: "bash".into(),
@@ -58,6 +59,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
         Duration::from_secs(30),
         client.call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "next".into(),
                 name: "bash".into(),
@@ -79,6 +81,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
     let again = client
         .call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "again".into(),
                 name: "bash".into(),
@@ -98,6 +101,7 @@ async fn drop_midcall_then_next_call_succeeds() {
     // Simulate agent tokio::select! dropping the call future on Ctrl-C.
     let slow = client.call(
         uuid::Uuid::nil(),
+        None,
         ToolUse {
             id: "slow".into(),
             name: "bash".into(),
@@ -114,6 +118,7 @@ async fn drop_midcall_then_next_call_succeeds() {
         Duration::from_secs(10),
         client.call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "next".into(),
                 name: "bash".into(),

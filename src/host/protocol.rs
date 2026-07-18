@@ -16,8 +16,13 @@ pub enum Request {
     ToolCall {
         /// Correlation id (unique per in-flight call on this pipe).
         id: String,
-        /// Agent that owns this call (session ownership on the host).
+        /// Agent that owns this call (bash session ownership on the host).
         agent_id: uuid::Uuid,
+        /// Conversation session this call belongs to, keying per-session host
+        /// artifacts (exec output dumps). Optional and defaulted so lines from
+        /// older controllers still decode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         tool_use: ToolUse,
     },
     /// Reap agent-owned host state (bash sessions, …).
@@ -100,6 +105,7 @@ mod tests {
         let msg = Request::ToolCall {
             id: "1".into(),
             agent_id: uuid::Uuid::nil(),
+            session_id: Some("cafe".into()),
             tool_use: ToolUse {
                 id: "toolu_1".into(),
                 name: "bash".into(),
@@ -110,10 +116,27 @@ mod tests {
         assert!(line.contains(r#""type":"tool_call""#));
         let back = Request::decode(&line).unwrap();
         match back {
-            Request::ToolCall { id, tool_use, .. } => {
+            Request::ToolCall {
+                id,
+                session_id,
+                tool_use,
+                ..
+            } => {
                 assert_eq!(id, "1");
+                assert_eq!(session_id.as_deref(), Some("cafe"));
                 assert_eq!(tool_use.name, "bash");
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Wire compat: tool_call lines from controllers that predate `session_id`
+    /// must still decode (field is defaulted, not required).
+    #[test]
+    fn request_tool_call_decodes_without_session_id() {
+        let line = r#"{"type":"tool_call","id":"1","agent_id":"00000000-0000-0000-0000-000000000000","tool_use":{"id":"t","name":"bash","input":{}}}"#;
+        match Request::decode(line).unwrap() {
+            Request::ToolCall { session_id, .. } => assert_eq!(session_id, None),
             other => panic!("unexpected {other:?}"),
         }
     }
