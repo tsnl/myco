@@ -1,20 +1,21 @@
 //! Root-only `memory` tool: persistent memory shared across agents and sessions.
 //!
-//! One memory document per machine under `~/.myco/memory/`. Updates are
-//! **timestamped append-only** entries written with `O_APPEND`, so concurrent
-//! sessions/subagents never rewrite each other. When the current file reaches
-//! [`MEMORY_ROTATE_BYTES`] the next append starts a new timestamped file; only
-//! the **latest** file is indexed for search (older files stay on disk for
-//! bash/grep — GC/pruning is future work).
+//! One memory document per machine under `~/.myco/memory/`, stored
+//! maildir-style so no locks (or `O_APPEND`) are needed even on weakly
+//! consistent network filesystems: every update is a **write-once** entry file
+//! (`{YYYY-MM}/{utc-ms-timestamp}-{id}.md`) and readers resolve the document
+//! by listing entries in name (= time) order. Nothing is rewritten in place,
+//! so concurrent sessions/subagents cannot conflict. Timestamp shard dirs
+//! bound directory size and make GC a directory delete (not automated yet).
 //!
 //! Search uses a dedicated in-RAM [`SearchIndex`] with one document per entry
-//! (pseudo-path `<file>#L<start_line>`), refreshed from disk before each query
-//! so appends from other myco processes are visible. Pure appends index only
-//! the new tail; any other on-disk change rebuilds the index. File reads and
-//! MiniLM embedding run on the blocking pool (same rule as the engine: candle
-//! never runs on an executor thread).
+//! file, covering only the **latest shard**; older shards stay on disk for
+//! bash/grep. The shard listing is diffed before each query so entries from
+//! concurrent myco processes appear and hand-deleted files drop out. File
+//! reads and MiniLM embedding run on the blocking pool (same rule as the
+//! engine: candle never runs on an executor thread).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,22 +33,22 @@ const TOOL_DESCRIPTION: &str = r#"
 Persistent memory shared across agents and sessions (one document per machine, under
 `~/.myco/memory/`).
 
-Entries are timestamped and **append-only**: appends never rewrite earlier content, so
-concurrent sessions and subagents cannot conflict. Files rotate at a size cap; searches
-cover only the **latest** memory file (older files stay on disk for bash/grep; no GC yet).
+Every update is a **write-once** timestamped entry file (`{YYYY-MM}/{timestamp}-{id}.md`)
+— nothing is rewritten in place and no locks are taken, so concurrent sessions and
+subagents never conflict. Readers resolve the document by listing entries in name
+(= time) order. Searches cover only the latest month shard; older shards stay on disk
+for bash/grep (GC = delete a shard dir; not automated yet).
 
 Actions:
 - append: add a timestamped entry (markdown). Keep entries short and durable — user
   preferences, project facts, decisions, gotchas. Not a scratchpad: use session_meta
   set_scratchpad for session-local notes.
-- exact_search: Tantivy full-text over entries of the latest memory file (identifiers,
+- exact_search: Tantivy full-text over entries of the latest shard (identifiers,
   literal phrases). Hits are file:line refs you can open with the editor.
 - semantic_search: Candle MiniLM cosine over per-entry embeddings (intent queries like
   "how does the user prefer commits formatted").
 "#;
 
-/// Rotate to a new timestamped file once the current one reaches this size.
-pub const MEMORY_ROTATE_BYTES: u64 = 256 * 1024;
 const MAX_APPEND_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_RESULTS: usize = 10;
 const MAX_MAX_RESULTS: usize = 100;
@@ -55,31 +56,22 @@ const MAX_MAX_RESULTS: usize = 100;
 /// Root-only tool service backed by `~/.myco/memory/` (see module docs).
 pub struct MemoryService {
     dir_override: Option<PathBuf>,
-    rotate_bytes: u64,
     state: tokio::sync::Mutex<IndexState>,
 }
 
 struct IndexState {
     index: SearchIndex,
-    /// Latest memory file currently indexed.
-    file: Option<PathBuf>,
-    /// Full text of `file` at last refresh; prefix check detects pure appends.
-    text: String,
-    /// Pseudo-path key (`<file>#L<line>`) → entry info for formatting hits.
-    entries: HashMap<String, EntryInfo>,
-}
-
-struct EntryInfo {
-    start_line: usize,
-    header: String,
+    /// Shard dir currently indexed.
+    shard: Option<PathBuf>,
+    /// Indexed entry files: path key → header line (for hit display).
+    entries: HashMap<String, String>,
 }
 
 impl IndexState {
     fn new() -> Self {
         Self {
             index: SearchIndex::new().expect("tantivy ram index"),
-            file: None,
-            text: String::new(),
+            shard: None,
             entries: HashMap::new(),
         }
     }
@@ -89,16 +81,14 @@ impl MemoryService {
     pub fn new() -> Self {
         Self {
             dir_override: None,
-            rotate_bytes: MEMORY_ROTATE_BYTES,
             state: tokio::sync::Mutex::new(IndexState::new()),
         }
     }
 
     #[cfg(test)]
-    fn with_dir_for_tests(dir: PathBuf, rotate_bytes: u64) -> Self {
+    fn with_dir_for_tests(dir: PathBuf) -> Self {
         Self {
             dir_override: Some(dir),
-            rotate_bytes,
             state: tokio::sync::Mutex::new(IndexState::new()),
         }
     }
@@ -161,7 +151,7 @@ impl ToolService for MemoryService {
 }
 
 impl MemoryService {
-    /// Append one timestamped entry (creating / rotating the memory file as needed).
+    /// Write one entry as a new unique file (never touches existing files).
     fn append(&self, agent_id: uuid::Uuid, text: &str) -> Result<String, String> {
         let text = text.trim_end();
         if text.trim().is_empty() {
@@ -175,48 +165,32 @@ impl MemoryService {
             ));
         }
 
-        let dir = self.dir()?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-
         let now = Utc::now();
-        let (file, rotated) = match latest_memory_file(&dir) {
-            Some(f) if std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0) < self.rotate_bytes => {
-                (f, false)
-            }
-            existing => {
-                // Millisecond stamp keeps names unique and lexicographically ordered.
-                // A same-millisecond rotation race lands both appends in one file —
-                // harmless (append mode), it just rotates a little later.
-                let name = format!("memory-{}.md", now.format("%Y%m%dT%H%M%S%3fZ"));
-                (dir.join(name), existing.is_some())
-            }
-        };
+        let shard = self.dir()?.join(now.format("%Y-%m").to_string());
+        std::fs::create_dir_all(&shard).map_err(|e| format!("create {}: {e}", shard.display()))?;
 
         let header = format!(
             "## {} agent={}",
             now.format("%Y-%m-%dT%H:%M:%SZ"),
             &uuid_simple_hex(agent_id)[..8]
         );
-        // Leading newline guards against a previous partial line; parsers treat
-        // any `## ` line as an entry start, so interleaved appends stay separable.
-        let entry = format!("\n{header}\n\n{text}\n");
+        // Millisecond stamp keeps names in time order; the random suffix makes
+        // them unique across hosts/processes without O_EXCL coordination.
+        let name = format!(
+            "{}-{}.md",
+            now.format("%Y%m%dT%H%M%S%3fZ"),
+            &uuid_simple_hex(uuid::Uuid::new_v4())[..8]
+        );
+        let path = shard.join(name);
         let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file)
-            .map_err(|e| format!("open {}: {e}", file.display()))?;
-        f.write_all(entry.as_bytes())
-            .map_err(|e| format!("append {}: {e}", file.display()))?;
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        f.write_all(format!("{header}\n\n{text}\n").as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
 
-        Ok(format!(
-            "appended\nfile={}{}\n{header}\n",
-            file.display(),
-            if rotated {
-                " (rotated: previous file hit the size cap; searches cover only this file)"
-            } else {
-                ""
-            }
-        ))
+        Ok(format!("appended\nfile={}\n{header}\n", path.display()))
     }
 
     async fn search(
@@ -246,178 +220,164 @@ impl MemoryService {
         };
 
         let mut state = self.state.lock().await;
-        let file = refresh_index(&mut state, &dir).await?;
+        let shard = refresh_index(&mut state, dir).await?;
         let hits = match &q_vec {
             Some(v) => state.index.search_semantic(&query, v, None, limit)?,
             None => state.index.search_exact(&query, None, limit)?,
         };
-        Ok(format_report(semantic, &file, &hits, &state.entries))
+        Ok(format_report(semantic, &shard, &hits, &state.entries))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Store: latest file discovery, entry parsing, index refresh
+// Store: shard/entry listing, index refresh
 // ---------------------------------------------------------------------------
 
-fn latest_memory_file(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
+/// Entry files in `shard`, any order (`{timestamp}-{id}.md`; leading digit).
+fn entry_files(shard: &Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(shard) else {
+        return Vec::new();
+    };
+    read.flatten()
         .map(|e| e.path())
         .filter(|p| {
             p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.ends_with(".md") && n.starts_with(|c: char| c.is_ascii_digit())
+                })
+        })
+        .collect()
+}
+
+/// Newest timestamp shard that contains entry files, with its entries.
+fn latest_populated_shard(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut shards: Vec<PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("memory-") && n.ends_with(".md"))
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit() || c == '-'))
         })
-        .max()
-}
-
-struct ParsedEntry {
-    start_line: usize,
-    byte_start: usize,
-    text: String,
-}
-
-/// Split the file into entries at lines starting with `## `. Non-blank text
-/// before the first header (hand edits) becomes one preamble entry.
-fn parse_entries(text: &str) -> Vec<ParsedEntry> {
-    let mut entries: Vec<ParsedEntry> = Vec::new();
-    let mut byte = 0usize;
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        let starts_entry = line.starts_with("## ");
-        if starts_entry || entries.is_empty() {
-            if !starts_entry && line.trim().is_empty() {
-                byte += line.len();
-                continue;
-            }
-            entries.push(ParsedEntry {
-                start_line: i + 1,
-                byte_start: byte,
-                text: String::new(),
-            });
+        .collect();
+    shards.sort();
+    for shard in shards.into_iter().rev() {
+        let files = entry_files(&shard);
+        if !files.is_empty() {
+            return Some((shard, files));
         }
-        entries
-            .last_mut()
-            .expect("entry pushed above")
-            .text
-            .push_str(line);
-        byte += line.len();
     }
-    entries
+    None
 }
 
-/// Sync the index with the latest memory file; returns that file's path.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Sync the index with the latest shard; returns that shard's path.
 ///
-/// Unchanged file → no work. Pure append (old text is a prefix) → upsert only
-/// entries overlapping the new bytes. Anything else (rotation, external edit,
-/// truncation) → full rebuild. Reading and embedding run on the blocking pool;
-/// the caller's state lock only guards cheap index mutations.
-async fn refresh_index(state: &mut IndexState, dir: &Path) -> Result<PathBuf, String> {
-    let latest = latest_memory_file(dir).ok_or_else(|| {
-        format!(
-            "no memory recorded yet (no memory-*.md under {}). Use memory append first.",
-            dir.display()
-        )
-    })?;
-    let text = tokio::task::spawn_blocking({
-        let latest = latest.clone();
-        move || {
-            std::fs::read_to_string(&latest).map_err(|e| format!("read {}: {e}", latest.display()))
-        }
+/// Entry files are write-once, so the diff is by name only: unseen files are
+/// read and embedded on the blocking pool, deleted files drop out, and a shard
+/// change (new month, GC) resets the index. The caller's state lock only
+/// guards cheap index mutations.
+async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<PathBuf, String> {
+    let listed = tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        move || latest_populated_shard(&dir)
     })
     .await
-    .map_err(|e| format!("read join: {e}"))??;
+    .map_err(|e| format!("list join: {e}"))?;
+    let Some((shard, files)) = listed else {
+        return Err(format!(
+            "no memory recorded yet (no entry files under {}). Use memory append first.",
+            dir.display()
+        ));
+    };
 
-    let same_file = state.file.as_deref() == Some(latest.as_path());
-    if same_file && text == state.text {
-        return Ok(latest);
-    }
-
-    let pure_append = same_file && text.len() > state.text.len() && text.starts_with(&state.text);
-    if !pure_append {
+    if state.shard.as_ref() != Some(&shard) {
         for key in state.entries.keys() {
             state.index.remove_file(Path::new(key));
         }
         state.entries.clear();
+        state.shard = Some(shard.clone());
     }
-    let indexed_up_to = if pure_append { state.text.len() } else { 0 };
 
-    // Entries entirely inside the already-indexed prefix are unchanged; embed
-    // the rest off the executor (best-effort vectors, exact search regardless).
-    let changed: Vec<ParsedEntry> = parse_entries(&text)
-        .into_iter()
-        .filter(|e| e.byte_start + e.text.len() > indexed_up_to)
+    let current: HashSet<String> = files.iter().map(|p| path_key(p)).collect();
+    let gone: Vec<String> = state
+        .entries
+        .keys()
+        .filter(|k| !current.contains(*k))
+        .cloned()
         .collect();
-    let embedded = tokio::task::spawn_blocking(move || {
-        changed
+    for key in &gone {
+        state.index.remove_file(Path::new(key));
+        state.entries.remove(key);
+    }
+
+    let new_files: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| !state.entries.contains_key(&path_key(p)))
+        .collect();
+    if new_files.is_empty() && gone.is_empty() {
+        return Ok(shard);
+    }
+
+    // Read + embed off the executor (best-effort vectors; exact regardless).
+    let loaded = tokio::task::spawn_blocking(move || {
+        new_files
             .into_iter()
-            .map(|e| {
-                let vector = embed_for_index(&e.text).ok();
-                (e, vector)
+            .filter_map(|p| {
+                let text = std::fs::read_to_string(&p).ok()?;
+                let vector = embed_for_index(&text).ok();
+                Some((p, text, vector))
             })
             .collect::<Vec<_>>()
     })
     .await
     .map_err(|e| format!("embed join: {e}"))?;
 
-    for (entry, vector) in embedded {
-        let key = format!("{}#L{}", latest.display(), entry.start_line);
-        let header = entry.text.lines().next().unwrap_or("").trim().to_string();
-        state.index.upsert_file(Path::new(&key), entry.text, vector);
-        state.entries.insert(
-            key,
-            EntryInfo {
-                start_line: entry.start_line,
-                header,
-            },
-        );
+    for (path, text, vector) in loaded {
+        let header = text.lines().next().unwrap_or("").trim().to_string();
+        let key = path_key(&path);
+        state.index.upsert_file(&path, text, vector);
+        state.entries.insert(key, header);
     }
     state.index.commit()?;
-    state.file = Some(latest.clone());
-    state.text = text;
-    Ok(latest)
+    Ok(shard)
 }
 
 fn format_report(
     semantic: bool,
-    file: &Path,
+    shard: &Path,
     hits: &[Hit],
-    entries: &HashMap<String, EntryInfo>,
+    entries: &HashMap<String, String>,
 ) -> String {
     let mut out = format!(
-        "mode={}\nmemory_file={} ({} entries indexed; latest memory file only)\nhits: {}\n",
+        "mode={}\nmemory_shard={} ({} entries indexed; latest shard only)\nhits: {}\n",
         if semantic {
             "semantic_candle"
         } else {
             "exact_tantivy"
         },
-        file.display(),
+        shard.display(),
         entries.len(),
         hits.len(),
     );
     for (i, h) in hits.iter().enumerate() {
-        let key = h.path.to_string_lossy().into_owned();
-        let info = entries.get(&key);
-        let file_disp = key
-            .rsplit_once("#L")
-            .map(|(f, _)| f.to_string())
-            .unwrap_or_else(|| key.clone());
-        // Hit line numbers are entry-relative; report absolute file lines.
-        let line = match (h.line_number, info) {
-            (Some(n), Some(info)) => info.start_line + n - 1,
-            (_, Some(info)) => info.start_line,
-            _ => 1,
-        };
+        let header = entries.get(&path_key(&h.path)).map(String::as_str);
         out.push_str(&format!(
-            "\n[{}] score={:.4} {file_disp}:{line}\n",
+            "\n[{}] score={:.4} {}:{}\n",
             i + 1,
-            h.score
+            h.score,
+            h.path.display(),
+            h.line_number.unwrap_or(1),
         ));
-        if let Some(info) = info
-            && !info.header.is_empty()
+        if let Some(header) = header
+            && !header.is_empty()
         {
-            out.push_str(&format!("  {}\n", info.header));
+            out.push_str(&format!("  {header}\n"));
         }
         let body = h
             .line_text
@@ -426,7 +386,7 @@ fn format_report(
             .filter(|s| !s.is_empty())
             .or_else(|| Some(h.snippet.trim_end()).filter(|s| !s.is_empty()));
         if let Some(body) = body
-            && info.is_none_or(|i| i.header != body)
+            && header != Some(body)
         {
             out.push_str(&format!("  {body}\n"));
         }
@@ -508,12 +468,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_then_exact_search_sees_new_entries() {
+    async fn each_append_is_a_new_write_once_file_and_searchable() {
         let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(
-            dir.clone(),
-            MEMORY_ROTATE_BYTES,
-        ));
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
         let r = call(
             &svc,
@@ -532,7 +489,7 @@ mod tests {
             "hits should be file:line refs: {text}"
         );
 
-        // Second append lands in the same file and is picked up incrementally.
+        // Second append is a new file in the same shard, picked up incrementally.
         let r = call(
             &svc,
             json!({"action": "append", "text": "CI runs on unique_token_ci_gadget"}),
@@ -544,9 +501,19 @@ mod tests {
             json!({"action": "exact_search", "query": "unique_token_ci_gadget"}),
         )
         .await;
-        let text = tool_text(&r);
-        assert!(text.contains("unique_token_ci_gadget"), "{text}");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "one memory file");
+        assert!(
+            tool_text(&r).contains("unique_token_ci_gadget"),
+            "{}",
+            tool_text(&r)
+        );
+
+        let shards: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(shards.len(), 1, "one shard dir");
+        assert_eq!(
+            entry_files(&shards[0].path()).len(),
+            2,
+            "one file per append"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -554,10 +521,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_search_ranks_relevant_entry() {
         let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(
-            dir.clone(),
-            MEMORY_ROTATE_BYTES,
-        ));
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
         for text in [
             "Extract PDF text and fill forms with the pdf skill",
@@ -584,19 +548,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_covers_only_latest_file() {
+    async fn search_covers_only_latest_shard() {
         let dir = tmp_dir();
-        // Cap of 1 byte: any non-empty file rotates on the next append.
-        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone(), 1));
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        let r = call(&svc, json!({"action": "append", "text": "old_token_alpha"})).await;
-        assert!(!r.is_error, "{r:?}");
-        // Millisecond filename stamps: ensure the rotated file sorts strictly later.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Old shard left behind by an earlier month.
+        let old = dir.join("2000-01");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(
+            old.join("20000101T000000000Z-deadbeef.md"),
+            "## 2000-01-01T00:00:00Z agent=deadbeef\n\nold_token_alpha\n",
+        )
+        .unwrap();
+
         let r = call(&svc, json!({"action": "append", "text": "new_token_beta"})).await;
         assert!(!r.is_error, "{r:?}");
-        assert!(tool_text(&r).contains("rotated"), "{}", tool_text(&r));
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "two memory files");
 
         let r = call(
             &svc,
@@ -617,7 +583,7 @@ mod tests {
         assert!(!r.is_error, "{r:?}");
         assert!(
             tool_text(&r).contains("hits: 0"),
-            "old file must not be indexed: {}",
+            "old shard must not be indexed: {}",
             tool_text(&r)
         );
 
@@ -625,34 +591,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_edit_triggers_full_rebuild() {
+    async fn deleted_entry_files_drop_out_of_the_index() {
         let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(
-            dir.clone(),
-            MEMORY_ROTATE_BYTES,
-        ));
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
         let r = call(&svc, json!({"action": "append", "text": "stale_token_one"})).await;
         assert!(!r.is_error, "{r:?}");
+        let keep = call(&svc, json!({"action": "append", "text": "kept_token_two"})).await;
+        assert!(!keep.is_error, "{keep:?}");
+
         let r = call(
             &svc,
             json!({"action": "exact_search", "query": "stale_token_one"}),
         )
         .await;
-        assert!(
-            tool_text(&r).contains("stale_token_one"),
-            "{}",
-            tool_text(&r)
-        );
+        let text = tool_text(&r);
+        assert!(text.contains("stale_token_one"), "{text}");
+        let stale_file = text
+            .lines()
+            .find_map(|l| l.split_whitespace().find(|w| w.contains(".md:")))
+            .and_then(|w| w.rsplit_once(':').map(|(p, _)| p.to_string()))
+            .expect("hit path in report");
 
-        // Hand-prune the file (not a pure append) — index must rebuild.
-        let file = latest_memory_file(&dir).unwrap();
-        fs::write(
-            &file,
-            "## 2026-01-01T00:00:00Z agent=deadbeef\n\nfresh_token_two\n",
-        )
-        .unwrap();
-
+        // GC by hand: deleting an entry file drops it on the next search.
+        fs::remove_file(&stale_file).unwrap();
         let r = call(
             &svc,
             json!({"action": "exact_search", "query": "stale_token_one"}),
@@ -661,11 +623,11 @@ mod tests {
         assert!(tool_text(&r).contains("hits: 0"), "{}", tool_text(&r));
         let r = call(
             &svc,
-            json!({"action": "exact_search", "query": "fresh_token_two"}),
+            json!({"action": "exact_search", "query": "kept_token_two"}),
         )
         .await;
         assert!(
-            tool_text(&r).contains("fresh_token_two"),
+            tool_text(&r).contains("kept_token_two"),
             "{}",
             tool_text(&r)
         );
@@ -676,10 +638,7 @@ mod tests {
     #[tokio::test]
     async fn errors_are_actionable() {
         let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(
-            dir.clone(),
-            MEMORY_ROTATE_BYTES,
-        ));
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
         let r = call(&svc, json!({"action": "exact_search", "query": "anything"})).await;
         assert!(r.is_error);
@@ -704,21 +663,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_entries_splits_on_headers_and_keeps_offsets() {
-        let text = "\n## t1 agent=aa\n\nfirst\n\n## t2 agent=bb\n\nsecond\n";
-        let entries = parse_entries(text);
-        assert_eq!(entries.len(), 2, "{:?}", entries.len());
-        assert_eq!(entries[0].start_line, 2);
-        assert!(entries[0].text.contains("first"));
-        assert!(!entries[0].text.contains("second"));
-        assert_eq!(entries[1].start_line, 6);
-        assert!(entries[1].text.contains("second"));
-        // Offsets partition the text after the skipped blank preamble.
-        assert_eq!(entries[0].byte_start, 1);
-        assert_eq!(entries[1].byte_start + entries[1].text.len(), text.len());
     }
 
     #[test]
