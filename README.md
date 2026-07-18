@@ -79,6 +79,13 @@ speaks the Responses API at `{base}/responses`):
 If neither xAI/OpenAI key is set, the OpenAI Responses backend also accepts
 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` as a fallback token source.
 
+### Colors
+
+Transcript sections (USER / ASSISTANT / ERROR headers, thinking, tool names)
+are colored by default when stdout is a TTY. Control with `--color
+auto|always|never`; `auto` also honors `NO_COLOR`, `CLICOLOR_FORCE`, and
+`TERM=dumb`. Piped output and session files stay plain.
+
 ### (Optional) Remote Hosts Config
 
 If you want to use `myco` with one or more remote hosts, you can configure this in

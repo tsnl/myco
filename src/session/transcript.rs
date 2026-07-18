@@ -20,20 +20,87 @@ pub const SECTION_RULE: &str =
 /// Max chars for string values inside pretty-printed tool inputs (display only).
 pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
 
+/// ANSI styling for transcript rendering. Disabled → byte-identical plain
+/// output, so files, logs, and piped stdout never carry escape codes. The CLI
+/// resolves the flag once at startup ([`crate::config::Config::colors_enabled`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Palette {
+    pub enabled: bool,
+}
+
+impl Palette {
+    /// No styling: session files, subagent logs, non-TTY output.
+    pub const fn plain() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn colored(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    /// Leading `0;` clears any style left open by an interrupted stream
+    /// before applying `sgr`, so headers stay legible after a cancel.
+    fn paint(&self, sgr: &str, text: &str) -> String {
+        if self.enabled {
+            format!("\x1b[0;{sgr}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// USER rule + header: bold cyan.
+    pub fn user(&self, text: &str) -> String {
+        self.paint("1;36", text)
+    }
+
+    /// ASSISTANT rule + header: bold green.
+    pub fn assistant(&self, text: &str) -> String {
+        self.paint("1;32", text)
+    }
+
+    /// ERROR rule + header: bold red.
+    pub fn error(&self, text: &str) -> String {
+        self.paint("1;31", text)
+    }
+
+    /// Thinking paragraphs: dim.
+    pub fn thinking(&self, text: &str) -> String {
+        self.paint("2", text)
+    }
+
+    /// Tool name in tool-invocation paragraphs: bold yellow.
+    pub fn tool_name(&self, text: &str) -> String {
+        self.paint("1;33", text)
+    }
+
+    /// Open the thinking style for a streamed line (deltas print in between;
+    /// close with [`Palette::reset`]).
+    pub fn thinking_on(&self) -> &'static str {
+        if self.enabled { "\x1b[0;2m" } else { "" }
+    }
+
+    pub fn reset(&self) -> &'static str {
+        if self.enabled { "\x1b[0m" } else { "" }
+    }
+}
+
 /// Write an ASSISTANT section open: blank line, thin rule, header, blank line, then body.
-pub fn write_assistant_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+pub fn write_assistant_open(
+    out: &mut (impl Write + ?Sized),
+    palette: Palette,
+) -> std::io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{SECTION_RULE}")?;
-    writeln!(out, "ASSISTANT")?;
+    writeln!(out, "{}", palette.assistant(SECTION_RULE))?;
+    writeln!(out, "{}", palette.assistant("ASSISTANT"))?;
     writeln!(out)?;
     Ok(())
 }
 
 /// Write an ERROR section open: blank line, thin rule, header, blank line, then body.
-pub fn write_error_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> std::io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{SECTION_RULE}")?;
-    writeln!(out, "ERROR")?;
+    writeln!(out, "{}", palette.error(SECTION_RULE))?;
+    writeln!(out, "{}", palette.error("ERROR"))?;
     writeln!(out)?;
     Ok(())
 }
@@ -48,14 +115,22 @@ pub fn write_block(out: &mut impl Write, text: &str) -> std::io::Result<()> {
 }
 
 /// Write a full ERROR section with body text (trailing newline ensured).
-pub fn write_error_section(out: &mut impl Write, text: &str) -> std::io::Result<()> {
-    write_error_open(out)?;
+pub fn write_error_section(
+    out: &mut impl Write,
+    text: &str,
+    palette: Palette,
+) -> std::io::Result<()> {
+    write_error_open(out, palette)?;
     write_block(out, text)
 }
 
-pub fn ensure_assistant(out: &mut impl Write, open: &mut bool) -> std::io::Result<()> {
+pub fn ensure_assistant(
+    out: &mut impl Write,
+    open: &mut bool,
+    palette: Palette,
+) -> std::io::Result<()> {
     if !*open {
-        write_assistant_open(out)?;
+        write_assistant_open(out, palette)?;
         *open = true;
     }
     Ok(())
@@ -67,7 +142,11 @@ pub fn ensure_assistant(out: &mut impl Write, open: &mut bool) -> std::io::Resul
 /// inside ASSISTANT. Thinking is stored in session history for resume, but
 /// backends strip it when composing API requests. Live ERROR sections are not
 /// part of history and are not replayed here.
-pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std::io::Result<()> {
+pub fn write_session_history(
+    out: &mut impl Write,
+    messages: &[Message],
+    palette: Palette,
+) -> std::io::Result<()> {
     let mut assistant_open = false;
     // True when the ASSISTANT body already has a finished paragraph (text or tool).
     let mut need_blank = false;
@@ -86,8 +165,8 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                 if text.is_empty() {
                     continue;
                 }
-                writeln!(out, "{USER_RULE}")?;
-                writeln!(out, "USER")?;
+                writeln!(out, "{}", palette.user(USER_RULE))?;
+                writeln!(out, "{}", palette.user("USER"))?;
                 writeln!(out)?;
                 write_block(out, &text)?;
                 // Next assistant turn opens a fresh ASSISTANT section.
@@ -100,7 +179,7 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                 for c in content {
                     match c {
                         Content::Text { text } if !text.is_empty() => {
-                            ensure_assistant(out, &mut assistant_open)?;
+                            ensure_assistant(out, &mut assistant_open, palette)?;
                             if need_blank {
                                 writeln!(out)?;
                             }
@@ -115,23 +194,27 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
                             } else {
                                 text.clone()
                             };
-                            ensure_assistant(out, &mut assistant_open)?;
+                            ensure_assistant(out, &mut assistant_open, palette)?;
                             if need_blank {
                                 writeln!(out)?;
                             }
                             // Same shape as the live sink: one `Thinking: …` paragraph.
-                            write_block(out, &format!("Thinking: {body}"))?;
+                            write_block(out, &palette.thinking(&format!("Thinking: {body}")))?;
                             need_blank = true;
                         }
                         _ => {}
                     }
                 }
                 for tu in tool_uses {
-                    ensure_assistant(out, &mut assistant_open)?;
+                    ensure_assistant(out, &mut assistant_open, palette)?;
                     if need_blank {
                         writeln!(out)?;
                     }
-                    write!(out, "{}", format_tool_invocation(&tu.name, &tu.input))?;
+                    write!(
+                        out,
+                        "{}",
+                        format_tool_invocation(&tu.name, &tu.input, palette)
+                    )?;
                     need_blank = true;
                 }
             }
@@ -141,9 +224,9 @@ pub fn write_session_history(out: &mut impl Write, messages: &[Message]) -> std:
     Ok(())
 }
 
-pub fn print_session_history(messages: &[Message]) {
+pub fn print_session_history(messages: &[Message], palette: Palette) {
     let mut out = std::io::stdout();
-    let _ = write_session_history(&mut out, messages);
+    let _ = write_session_history(&mut out, messages, palette);
     let _ = out.flush();
 }
 
@@ -183,7 +266,9 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
 ///
 /// Long string values are truncated first, then objects/arrays are pretty-printed
 /// with 2-space indent; scalars stay compact. Always ends with a trailing newline.
-pub fn format_tool_invocation(name: &str, input: &serde_json::Value) -> String {
+/// Only the tool name is styled; the JSON body stays plain.
+pub fn format_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
+    let name = palette.tool_name(name);
     let display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
     match &display {
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
@@ -246,7 +331,7 @@ mod tests {
     #[test]
     fn write_session_history_section_layout() {
         let mut buf = Vec::new();
-        write_session_history(&mut buf, &sample_messages()).unwrap();
+        write_session_history(&mut buf, &sample_messages(), Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
 
         assert!(rendered.contains(USER_RULE));
@@ -300,7 +385,7 @@ mod tests {
             },
         ];
         let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages).unwrap();
+        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
 
         assert!(!rendered.contains("THINKING\n"));
@@ -322,7 +407,7 @@ mod tests {
     #[test]
     fn write_error_section_layout() {
         let mut buf = Vec::new();
-        write_error_section(&mut buf, "context length exceeded").unwrap();
+        write_error_section(&mut buf, "context length exceeded", Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(rendered.contains(&format!(
             "{SECTION_RULE}\nERROR\n\ncontext length exceeded\n"
@@ -336,14 +421,21 @@ mod tests {
         let rendered = format_tool_invocation(
             "bash",
             &json!({"action": "start", "session_id": "s", "timeout_ms": 1000}),
+            Palette::plain(),
         );
         assert_eq!(
             rendered,
             "bash({\n  \"action\": \"start\",\n  \"session_id\": \"s\",\n  \"timeout_ms\": 1000\n})\n"
         );
         // Scalars stay compact.
-        assert_eq!(format_tool_invocation("x", &json!(42)), "x(42)\n");
-        assert_eq!(format_tool_invocation("x", &json!("hi")), "x(\"hi\")\n");
+        assert_eq!(
+            format_tool_invocation("x", &json!(42), Palette::plain()),
+            "x(42)\n"
+        );
+        assert_eq!(
+            format_tool_invocation("x", &json!("hi"), Palette::plain()),
+            "x(\"hi\")\n"
+        );
     }
 
     #[test]
@@ -357,6 +449,7 @@ mod tests {
                 "nested": { "blob": "b".repeat(TOOL_DISPLAY_STRING_MAX + 10) },
                 "items": ["short", "c".repeat(TOOL_DISPLAY_STRING_MAX + 1)],
             }),
+            Palette::plain(),
         );
         assert!(rendered.starts_with("write({"));
         assert!(rendered.contains("\"path\": \"f.txt\""));
@@ -367,8 +460,11 @@ mod tests {
         // Short strings unchanged.
         assert!(rendered.contains("\"items\": [\n    \"short\","));
         // Scalar long string.
-        let scalar =
-            format_tool_invocation("echo", &json!("d".repeat(TOOL_DISPLAY_STRING_MAX + 5)));
+        let scalar = format_tool_invocation(
+            "echo",
+            &json!("d".repeat(TOOL_DISPLAY_STRING_MAX + 5)),
+            Palette::plain(),
+        );
         assert!(scalar.starts_with("echo(\""));
         assert!(scalar.contains('…'));
         assert!(!scalar.contains(&"d".repeat(TOOL_DISPLAY_STRING_MAX + 5)));
@@ -402,7 +498,7 @@ mod tests {
             turn_end_reason: Some(TurnEndReason::EndTurn),
         }];
         let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages).unwrap();
+        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(!rendered.contains("THINKING\n"));
         assert!(rendered.contains("Thinking: secret-thought-aaa\n"));
@@ -413,5 +509,66 @@ mod tests {
         );
         assert!(rendered.contains("Thinking: secret-thought-bbb\n\ndone\n"));
         assert!(rendered.contains("ASSISTANT\n"));
+    }
+
+    #[test]
+    fn plain_palette_emits_no_ansi() {
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &sample_messages(), Palette::plain()).unwrap();
+        write_error_section(&mut buf, "boom", Palette::plain()).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(!rendered.contains('\x1b'));
+        assert_eq!(Palette::plain().thinking_on(), "");
+        assert_eq!(Palette::plain().reset(), "");
+    }
+
+    #[test]
+    fn colored_palette_styles_headers_but_not_bodies() {
+        let palette = Palette::colored(true);
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &sample_messages(), palette).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+
+        // Headers and rules are wrapped in SGR sequences…
+        assert!(rendered.contains("\x1b[0;1;36mUSER\x1b[0m\n"));
+        assert!(rendered.contains(&format!("\x1b[0;1;36m{USER_RULE}\x1b[0m\n")));
+        assert!(rendered.contains("\x1b[0;1;32mASSISTANT\x1b[0m\n"));
+        // …while message bodies stay plain.
+        assert!(rendered.contains("\nhello\n"));
+        assert!(rendered.contains("\nhi there\n"));
+
+        let mut buf = Vec::new();
+        write_error_section(&mut buf, "boom", palette).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("\x1b[0;1;31mERROR\x1b[0m\n\nboom\n"));
+    }
+
+    #[test]
+    fn colored_tool_invocation_styles_only_the_name() {
+        let rendered = format_tool_invocation(
+            "bash",
+            &json!({"command": "echo hi"}),
+            Palette::colored(true),
+        );
+        assert!(rendered.starts_with("\x1b[0;1;33mbash\x1b[0m({"));
+        assert!(rendered.contains("\"command\": \"echo hi\""));
+        assert!(!rendered.contains("echo hi\x1b"));
+    }
+
+    #[test]
+    fn colored_thinking_paragraph_is_dimmed() {
+        let messages = vec![Message::AssistantMessage {
+            content: vec![Content::Thinking {
+                text: "pondering".into(),
+                signature: None,
+                redacted: false,
+            }],
+            tool_uses: vec![],
+            turn_end_reason: Some(TurnEndReason::EndTurn),
+        }];
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &messages, Palette::colored(true)).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("\x1b[0;2mThinking: pondering\x1b[0m\n"));
     }
 }

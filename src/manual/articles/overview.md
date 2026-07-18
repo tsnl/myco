@@ -82,7 +82,9 @@ Token resolution for OpenAI Responses: `XAI_API_KEY` → `OPENAI_API_KEY` →
 `OPENAI_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
 
 All resolution happens in one startup step (`myco::config::Config`), which also
-loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`).
+loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`)
+and decides color output: sections are colored when stdout is a TTY, controlled by
+`--color auto|always|never` plus `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`.
 
 Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
 Responses). Empty credentials fail model creation at startup.
