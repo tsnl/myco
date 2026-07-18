@@ -191,8 +191,8 @@ async fn run_interactive(args: Args) {
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
     // passphrase-protected / security-key identities via the existing ssh-agent
     // before attach so OpenSSH never tries to prompt on the host pipe.
+    // Problems are printed after the banner (WARNING block), not here.
     let ssh_report = ensure_remote_ssh_identities(&app_config.harness.remote_hosts);
-    print_preflight_report(&ssh_report);
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
@@ -254,11 +254,13 @@ async fn run_interactive(args: Args) {
         _ => s.id.clone(),
     });
     // Extremely lean startup: one line. Hosts via /hosts, effort via /effort,
-    // config path via attach-failure hints. SSH preflight problems (if any)
-    // already printed a WARNING block above; the happy path is silent.
+    // config path via attach-failure hints.
     println!(
         "myco: model={model_id}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
     );
+    // SSH preflight problems open a WARNING block after the banner, before the
+    // first USER block; the happy path is silent.
+    print_preflight_report(&ssh_report);
     if resuming {
         print_session_history(agent.history(), palette);
     }

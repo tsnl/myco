@@ -255,8 +255,9 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     report
 }
 
-/// Print preflight problems as a WARNING block on stderr, before the first
-/// USER block. Happy path (agent reachable, no keys missing) prints nothing.
+/// Print preflight problems as a WARNING block on stderr, after the startup
+/// banner and before the first USER block. Happy path (agent reachable, no
+/// keys missing) prints nothing.
 /// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
 pub fn print_preflight_report(report: &SshAgentPreflightReport) {
     if let Some(body) = report.warning_text() {
