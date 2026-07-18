@@ -1,0 +1,6 @@
+{
+  "branch": "main",
+  "bump_type": "minor",
+  "dry_run": "true",
+  "notes_path": ".github/release-notes-v0.2.0.md"
+}
