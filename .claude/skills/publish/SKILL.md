@@ -78,6 +78,45 @@ Inputs (must match the workflow):
 | `dry_run` | `true` / `false` | Default in UI is dry-run |
 | `release_notes` | markdown string | Optional; prepended to the GitHub Release body above the install boilerplate |
 
+## Fallback: publishing without dispatch access (agent sessions)
+
+Remote agent integrations can usually push to their `claude/*` session
+branch but get **403 on POST /dispatches**, so `gh workflow run` and the
+Actions UI are unavailable to them. `publish.yml` has a push trigger for
+this case: on any `claude/**` branch, committing a change to
+`.github/publish-request.json` runs the same publish job with parameters
+from that file:
+
+```json
+{
+  "request_id": "v0.2.1-dry-run-1",
+  "branch": "main",
+  "bump_type": "patch",
+  "dry_run": "true",
+  "notes_path": ".github/release-notes-v0.2.1.md"
+}
+```
+
+- `branch` is what gets published (checked out, bumped, tagged) — the
+  session branch only hosts the trigger.
+- `notes_path` points at a committed markdown file used as the top of the
+  GitHub Release body; write it before requesting a real publish.
+- `request_id` is inert; change it to re-fire with otherwise-identical
+  parameters.
+- Same sequence as dispatch: push with `dry_run: "true"` first, then flip
+  to `"false"` and push again.
+- Remove the request file (and notes file, if desired) from the branch
+  once the release is verified.
+
+**Check-wait caveat**: `tsnl/semver-bump-and-cargo-publish@v1` waits for
+check runs on the workflow's *trigger commit*, not on the tip of the
+`branch` being published. CI does not normally run on `claude/**`
+branches (no push trigger, and there may be no PR), so a push-triggered
+publish stalls in the wait loop until timeout unless CI runs on that
+exact commit. Until the action is fixed to wait on the publish branch
+HEAD, temporarily add your session branch to `ci.yml`'s `on.push.branches`
+in the same commit as the publish request, and remove it during cleanup.
+
 ## Choose bump type
 
 - **patch** — bugfixes, docs, CI, no public API change
