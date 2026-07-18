@@ -29,15 +29,15 @@ myco (interactive) / Agent
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
+| `$MYCO_HOME/config.toml` (default `~/.myco`) | Knobs only: `model`, `enable_subagent`, `attach_timeout_secs`. Override the file path with `$MYCO_CONFIG`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
-Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
+Minimal config shape (hosts are **not** listed here):
 
 ```toml
-# model = "grok-4.5-build"    # default CLI model (--model overrides)
+model = "grok-4.5-build"    # required: the CLI model (--model overrides)
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
@@ -55,8 +55,8 @@ attach_timeout_secs = 10
 ## API credentials & models
 
 Loaded from the process environment; `dotenvy` also loads a `.env` in the cwd at startup.
-Default CLI model is **`grok-4.5-build`**; set `model = "<id>"` in config.toml to change
-it, or pass `myco --model <id>` (flag wins).
+The CLI model comes from `model = "<id>"` in config.toml or `myco --model <id>`
+(flag wins). Startup errors when neither is set — there is no built-in default.
 
 **Anthropic Messages** (Claude models: `claude-haiku-4-5`, `claude-sonnet-4-6`,
 `claude-opus-4-8`, `claude-fable-5`, …):
@@ -78,7 +78,7 @@ Token resolution for OpenAI Responses: `XAI_API_KEY` → `OPENAI_API_KEY` →
 `OPENAI_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
 
 All resolution happens in one startup step (`myco::config::Config`), which also
-loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`)
+loads the config file (`$MYCO_CONFIG` → `$MYCO_HOME/config.toml` → `~/.myco/config.toml`)
 and decides color output: sections are colored when stdout is a TTY, controlled by
 `--color auto|always|never` plus `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`.
 

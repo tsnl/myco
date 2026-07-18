@@ -23,7 +23,8 @@ use crate::generative_model::Model;
 /// from `~/.ssh/config`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FileConfig {
-    /// Default model for the interactive CLI (`--model` overrides).
+    /// Model for the interactive CLI (`--model` overrides). Startup requires
+    /// one of the two — there is no built-in default.
     #[serde(default)]
     pub model: Option<Model>,
     /// When false, do not register the in-process `subagent` tool.
@@ -131,8 +132,9 @@ pub fn default_ssh_config_path() -> Result<PathBuf, String> {
 }
 
 /// Load the on-disk knobs/model config from `path`. Missing file →
-/// [`FileConfig::default`]. Path defaulting (`--config` → `$MYCO_CONFIG` →
-/// `~/.myco/config.toml`) lives in [`crate::config::Config`].
+/// [`FileConfig::default`]. Path defaulting (`$MYCO_CONFIG` →
+/// `$MYCO_HOME/config.toml` → `~/.myco/config.toml`) lives in
+/// [`crate::config::Config`].
 pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
     if !path.exists() {
         return Ok(FileConfig::default());
@@ -174,8 +176,8 @@ pub fn parse_file_config_str(text: &str) -> Result<FileConfig, String> {
 
 /// Example config written by docs / first-run hints.
 pub fn example_config_toml() -> String {
-    r#"# Myco harness config (~/.myco/config.toml)
-# Override path with MYCO_CONFIG or myco --config.
+    r#"# Myco harness config ($MYCO_HOME/config.toml, default ~/.myco/config.toml;
+# override the file path with $MYCO_CONFIG).
 #
 # The local host is always enabled in-process. Remote hosts are NOT listed
 # here: every concrete `Host` alias in ~/.ssh/config (no wildcards; Includes
@@ -183,8 +185,8 @@ pub fn example_config_toml() -> String {
 # `ssh <alias> myco --mode host`. Put user / port / identity / ProxyJump in
 # ~/.ssh/config; `myco` must be on the remote PATH non-interactive SSH uses.
 
-# Default model for the interactive CLI (--model overrides).
-# model = "grok-4.5-build"
+# Model for the interactive CLI. Required (or pass --model each run).
+model = "grok-4.5-build"
 
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).

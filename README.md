@@ -37,15 +37,16 @@ embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
 ## Use
 
 ```bash
-myco    # default model: grok-4.5-build; pass --model <id> for Claude models
+myco    # model comes from ~/.myco/config.toml or --model <id>
 ```
 
 Set API credentials for your backend first (Anthropic Messages or xAI / OpenAI
 Responses; read from the process environment, and a `.env` in the cwd is also
 loaded). The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
-`myco --help overview` once installed. Set a default model with
-`model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript
+`myco --help overview` once installed. Set the model with `model = "<id>"`
+in `~/.myco/config.toml` or pass `--model` (flag wins; startup errors when
+neither is set). Transcript
 sections are colored when stdout is a TTY (`--color auto|always|never`;
 `NO_COLOR` / `CLICOLOR_FORCE` honored).
 

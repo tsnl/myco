@@ -3,12 +3,12 @@
 //! Runs once at application startup: [`Config::resolve`] takes optional
 //! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), reads the
 //! process environment, and produces fully resolved settings — per-backend
-//! credentials/base URLs, the host pool (knobs from `--config` →
-//! `$MYCO_CONFIG` → `~/.myco/config.toml`; remote hosts from `~/.ssh/config`
-//! `Host` aliases), the interactive default model (`--model` → config file
-//! `model` → [`DEFAULT_MODEL`]), and the color decision for stdout rendering.
-//! Downstream code checks the resolved fields; nothing else reads these
-//! environment variables.
+//! credentials/base URLs, the host pool (knobs from `$MYCO_CONFIG` →
+//! `$MYCO_HOME/config.toml` → `~/.myco/config.toml`; remote hosts from
+//! `~/.ssh/config` `Host` aliases), the interactive model (`--model` →
+//! config file `model`; startup errors when neither is set), and the color
+//! decision for stdout rendering. Downstream code checks the resolved fields;
+//! nothing else reads these environment variables.
 //!
 //! Credential fallbacks: `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` double
 //! as the fallback credential for the OpenAI and xAI backends, and
@@ -16,10 +16,11 @@
 //! served over the OpenAI Responses protocol).
 //!
 //! Out of scope, deliberately: `.env` loading (dotenvy runs in `main` before
-//! resolution so this module sees its effect), `MYCO_HOME` (session storage
-//! root; read by session code that also runs in `--mode host` workers where
-//! no `Config` exists), and per-tool lookups like `MYCO_LYNX` (resolved at
-//! tool-call time on whichever host runs the tool).
+//! resolution so this module sees its effect), session storage under
+//! `$MYCO_HOME` (read by session code that also runs in `--mode host` workers
+//! where no `Config` exists; this module only uses it to default the config
+//! path), and per-tool lookups like `MYCO_LYNX` (resolved at tool-call time
+//! on whichever host runs the tool).
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -30,9 +31,6 @@ use crate::harness::{FileConfig, HarnessConfig, load_file_config, load_ssh_host_
 pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
-
-/// Interactive CLI model when neither `--model` nor the config file sets one.
-pub const DEFAULT_MODEL: Model = Model::Grok45Build;
 
 // ---------------------------------------------------------------------------
 // Per-backend resolved credentials
@@ -149,11 +147,8 @@ pub struct ConfigUserSettings {
     pub color: ColorMode,
     /// Override TTY detection (tests / embedders). `None` → detect from stdout.
     pub stdout_is_tty: Option<bool>,
-    /// Harness config file override (CLI `--config`).
-    /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
-    pub harness_config_path: Option<PathBuf>,
     /// Model id override (CLI `--model`), parsed during resolve.
-    /// `None` → config file `model` → [`DEFAULT_MODEL`].
+    /// `None` → config file `model`; resolution errors when neither is set.
     pub model: Option<String>,
 }
 
@@ -170,12 +165,12 @@ pub struct Config {
     /// Final color decision for stdout rendering ([`ColorMode`] + env overrides + TTY).
     pub colors_enabled: bool,
     /// Path the harness config was loaded from
-    /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
+    /// (`$MYCO_CONFIG` → `$MYCO_HOME/config.toml` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
-    /// Interactive default model (override → config file `model` → [`DEFAULT_MODEL`]).
+    /// Interactive model (override → config file `model`; required).
     pub model: Model,
 }
 
@@ -211,16 +206,20 @@ impl Config {
             xai,
             color,
             stdout_is_tty: tty_override,
-            harness_config_path,
             model: model_override,
         } = settings;
 
         let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
-        let harness_config_path = resolve_harness_config_path(harness_config_path, &env)?;
+        let harness_config_path = resolve_harness_config_path(&env)?;
         let file = load_file(&harness_config_path)?;
         let model = match model_override {
             Some(s) => s.parse::<Model>()?,
-            None => file.model.unwrap_or(DEFAULT_MODEL),
+            None => file.model.ok_or_else(|| {
+                format!(
+                    "no model configured: set `model = \"<id>\"` in {} or pass --model <id>",
+                    harness_config_path.display()
+                )
+            })?,
         };
         let harness = file.into_harness_config(ssh_aliases()?);
         let (anthropic, openai, xai) = resolve_credentials(anthropic, openai, xai, &env);
@@ -261,16 +260,14 @@ pub fn env_backend_config(model: Model) -> generative_model::BackendConfig {
     protocol_backend_config(&anthropic, &xai, model)
 }
 
-/// `--config` override → `$MYCO_CONFIG` → `~/.myco/config.toml`.
-fn resolve_harness_config_path(
-    override_path: Option<PathBuf>,
-    env: &impl Fn(&str) -> Option<String>,
-) -> Result<PathBuf, String> {
-    if let Some(p) = override_path {
-        return Ok(p);
-    }
+/// `$MYCO_CONFIG` (explicit file) → `$MYCO_HOME/config.toml` →
+/// `~/.myco/config.toml` (the default `MYCO_HOME`, matching session storage).
+fn resolve_harness_config_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     if let Some(p) = env("MYCO_CONFIG") {
         return Ok(PathBuf::from(p));
+    }
+    if let Some(home) = env("MYCO_HOME") {
+        return Ok(PathBuf::from(home).join("config.toml"));
     }
     let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
     Ok(home.join(".myco").join("config.toml"))
@@ -408,10 +405,18 @@ mod tests {
             settings,
             env,
             stdout_is_tty,
-            |_| Ok(FileConfig::default()),
+            |_| Ok(test_file_config()),
             || Ok(Vec::new()),
         )
         .unwrap()
+    }
+
+    /// Loader for tests not about model resolution: any model, so resolve succeeds.
+    fn test_file_config() -> FileConfig {
+        FileConfig {
+            model: Some(Model::Grok45Build),
+            ..Default::default()
+        }
     }
 
     fn resolve(pairs: &[(&str, &str)]) -> Config {
@@ -604,20 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn harness_config_path_override_beats_env_beats_home_default() {
-        let settings = ConfigUserSettings {
-            harness_config_path: Some(PathBuf::from("/tmp/x.toml")),
-            ..Default::default()
-        };
-        let cfg = resolve_cfg(settings, env_of(&[("MYCO_CONFIG", "/env/y.toml")]), false);
-        assert_eq!(cfg.harness_config_path, PathBuf::from("/tmp/x.toml"));
-
+    fn config_path_myco_config_beats_myco_home_beats_home_default() {
         let cfg = resolve_cfg(
             Default::default(),
-            env_of(&[("MYCO_CONFIG", "/env/y.toml")]),
+            env_of(&[("MYCO_CONFIG", "/env/y.toml"), ("MYCO_HOME", "/mh")]),
             false,
         );
         assert_eq!(cfg.harness_config_path, PathBuf::from("/env/y.toml"));
+
+        let cfg = resolve_cfg(Default::default(), env_of(&[("MYCO_HOME", "/mh")]), false);
+        assert_eq!(cfg.harness_config_path, PathBuf::from("/mh/config.toml"));
 
         let cfg = resolve_cfg(Default::default(), env_of(&[]), false);
         assert!(cfg.harness_config_path.ends_with(".myco/config.toml"));
@@ -625,17 +626,14 @@ mod tests {
 
     #[test]
     fn harness_loader_gets_resolved_path_and_result_is_stored() {
-        let settings = ConfigUserSettings {
-            harness_config_path: Some(PathBuf::from("/tmp/h.toml")),
-            ..Default::default()
-        };
         let cfg = Config::resolve_with(
-            settings,
-            env_of(&[]),
+            ConfigUserSettings::default(),
+            env_of(&[("MYCO_CONFIG", "/tmp/h.toml")]),
             false,
             |p| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
                 Ok(FileConfig {
+                    model: Some(Model::Grok45Build),
                     attach_timeout_secs: 42,
                     ..Default::default()
                 })
@@ -663,9 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn model_override_beats_file_beats_default() {
-        assert_eq!(resolve(&[]).model, DEFAULT_MODEL);
-
+    fn model_override_beats_file_and_missing_model_errors() {
         let file_model = |_: &Path| {
             Ok(FileConfig {
                 model: Some(Model::ClaudeOpus48),

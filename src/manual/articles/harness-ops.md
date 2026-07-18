@@ -31,7 +31,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 - Remotes are the concrete `Host` aliases in **`~/.ssh/config`** (`Include`s are
   followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
   is reserved). Host name == alias == SSH destination.
-- **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
+- **`$MYCO_HOME/config.toml`** (default `~/.myco`; or `$MYCO_CONFIG`) holds knobs only:
   `enable_subagent`, `attach_timeout_secs`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.

@@ -1,7 +1,6 @@
 use std::{
     fs,
     io::Write,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -90,7 +89,7 @@ struct Args {
     name: String,
 
     /// Model id (e.g. claude-haiku-4-5, claude-opus-4-8, claude-sonnet-4-6, grok-4.5-build).
-    /// Default: `model` from config.toml, else grok-4.5-build.
+    /// Overrides `model` in config.toml; startup errors when neither is set.
     #[arg(long)]
     model: Option<String>,
 
@@ -106,11 +105,6 @@ struct Args {
     /// Change mid-session with `/effort`.
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
     effort: Effort,
-
-    /// Path to myco config (knobs; hosts come from ~/.ssh/config).
-    /// Default: $MYCO_CONFIG or ~/.myco/config.toml.
-    #[arg(long)]
-    config: Option<PathBuf>,
 
     /// Color output (auto|always|never). Auto colors only when stdout is a TTY
     /// and respects NO_COLOR / CLICOLOR_FORCE.
@@ -173,10 +167,9 @@ async fn run_host(args: Args) {
 
 async fn run_interactive(args: Args) {
     // One explicit resolution step: backend credentials/base URLs, harness
-    // hosts and default model (--config → $MYCO_CONFIG → ~/.myco/config.toml),
-    // and the color decision. Everything downstream reads this, not the env.
+    // hosts and default model ($MYCO_CONFIG → $MYCO_HOME/config.toml), and
+    // the color decision. Everything downstream reads this, not the env.
     let app_config = Config::resolve(ConfigUserSettings {
-        harness_config_path: args.config.clone(),
         model: args.model.clone(),
         color: args.color,
         ..Default::default()
@@ -900,8 +893,9 @@ reported usage on the previous generate (0/max until then).
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
-  `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
-  $MYCO_CONFIG) holds knobs only (enable_subagent, attach_timeout_secs).
+  `ssh <alias> myco --mode host` remote. $MYCO_HOME/config.toml (default
+  ~/.myco; or $MYCO_CONFIG) holds knobs only (model, enable_subagent,
+  attach_timeout_secs).
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host.
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
