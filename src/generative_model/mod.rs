@@ -79,6 +79,16 @@ pub enum Model {
     Gpt56Terra,
     #[serde(rename = "openai/gpt-5.6-luna", alias = "gpt-5.6-luna")]
     Gpt56Luna,
+    // Anthropic via OpenRouter. No bare aliases: bare `claude-*` ids mean the
+    // native Anthropic Messages backend; the vendor prefix opts into OpenRouter.
+    #[serde(rename = "anthropic/claude-fable-5")]
+    ClaudeFable5OpenRouter,
+    #[serde(rename = "anthropic/claude-opus-4.8")]
+    ClaudeOpus48OpenRouter,
+    #[serde(rename = "anthropic/claude-sonnet-4.6")]
+    ClaudeSonnet46OpenRouter,
+    #[serde(rename = "anthropic/claude-haiku-4.5")]
+    ClaudeHaiku45OpenRouter,
 }
 
 /// Which API protocol a model is served over.
@@ -201,6 +211,10 @@ impl Model {
             Model::Gpt56Sol => "openai/gpt-5.6-sol",
             Model::Gpt56Terra => "openai/gpt-5.6-terra",
             Model::Gpt56Luna => "openai/gpt-5.6-luna",
+            Model::ClaudeFable5OpenRouter => "anthropic/claude-fable-5",
+            Model::ClaudeOpus48OpenRouter => "anthropic/claude-opus-4.8",
+            Model::ClaudeSonnet46OpenRouter => "anthropic/claude-sonnet-4.6",
+            Model::ClaudeHaiku45OpenRouter => "anthropic/claude-haiku-4.5",
         }
     }
 
@@ -219,7 +233,11 @@ impl Model {
             | Model::Gemini31ProPreview
             | Model::Gpt56Sol
             | Model::Gpt56Terra
-            | Model::Gpt56Luna => BackendKind::OpenAIResponses,
+            | Model::Gpt56Luna
+            | Model::ClaudeFable5OpenRouter
+            | Model::ClaudeOpus48OpenRouter
+            | Model::ClaudeSonnet46OpenRouter
+            | Model::ClaudeHaiku45OpenRouter => BackendKind::OpenAIResponses,
         }
     }
 
@@ -239,6 +257,8 @@ impl Model {
     pub fn uses_adaptive_thinking(self) -> bool {
         match self {
             Model::ClaudeFable5 | Model::ClaudeOpus48 | Model::ClaudeSonnet5 => true,
+            // OpenRouter-served models never use the Anthropic Messages
+            // thinking config; effort goes over `reasoning.effort` instead.
             Model::ClaudeHaiku45
             | Model::Grok45Build
             | Model::KimiK3
@@ -248,7 +268,11 @@ impl Model {
             | Model::Gemini31ProPreview
             | Model::Gpt56Sol
             | Model::Gpt56Terra
-            | Model::Gpt56Luna => false,
+            | Model::Gpt56Luna
+            | Model::ClaudeFable5OpenRouter
+            | Model::ClaudeOpus48OpenRouter
+            | Model::ClaudeSonnet46OpenRouter
+            | Model::ClaudeHaiku45OpenRouter => false,
         }
     }
 
@@ -268,7 +292,11 @@ impl Model {
             | Model::Gemini31ProPreview
             | Model::Gpt56Sol
             | Model::Gpt56Terra
-            | Model::Gpt56Luna => 1_000_000,
+            | Model::Gpt56Luna
+            | Model::ClaudeFable5OpenRouter
+            | Model::ClaudeOpus48OpenRouter
+            | Model::ClaudeSonnet46OpenRouter => 1_000_000,
+            Model::ClaudeHaiku45OpenRouter => 200_000,
         }
     }
 }
@@ -303,6 +331,10 @@ impl std::str::FromStr for Model {
             "openai/gpt-5.6-sol" | "gpt-5.6-sol" => Ok(Model::Gpt56Sol),
             "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Ok(Model::Gpt56Terra),
             "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Ok(Model::Gpt56Luna),
+            "anthropic/claude-fable-5" => Ok(Model::ClaudeFable5OpenRouter),
+            "anthropic/claude-opus-4.8" => Ok(Model::ClaudeOpus48OpenRouter),
+            "anthropic/claude-sonnet-4.6" => Ok(Model::ClaudeSonnet46OpenRouter),
+            "anthropic/claude-haiku-4.5" => Ok(Model::ClaudeHaiku45OpenRouter),
             other => Err(format!("Unknown model: {other:?}")),
         }
     }
@@ -816,7 +848,7 @@ mod tests {
         );
     }
 
-    const OPENROUTER_MODELS: [Model; 8] = [
+    const OPENROUTER_MODELS: [Model; 12] = [
         Model::KimiK3,
         Model::DeepSeekV4Pro,
         Model::DeepSeekV4Flash,
@@ -825,6 +857,10 @@ mod tests {
         Model::Gpt56Sol,
         Model::Gpt56Terra,
         Model::Gpt56Luna,
+        Model::ClaudeFable5OpenRouter,
+        Model::ClaudeOpus48OpenRouter,
+        Model::ClaudeSonnet46OpenRouter,
+        Model::ClaudeHaiku45OpenRouter,
     ];
 
     #[test]
@@ -837,10 +873,19 @@ mod tests {
                 "{model}"
             );
             assert!(!model.uses_adaptive_thinking(), "{model}");
-            assert_eq!(model.context_window_tokens(), 1_000_000, "{model}");
         }
         assert!(!Model::Grok45Build.served_via_openrouter());
         assert!(!Model::ClaudeFable5.served_via_openrouter());
+        // Windows mirror the native listings (Haiku is the 200K outlier).
+        assert_eq!(Model::KimiK3.context_window_tokens(), 1_000_000);
+        assert_eq!(
+            Model::ClaudeOpus48OpenRouter.context_window_tokens(),
+            1_000_000
+        );
+        assert_eq!(
+            Model::ClaudeHaiku45OpenRouter.context_window_tokens(),
+            200_000
+        );
     }
 
     #[test]
@@ -870,6 +915,27 @@ mod tests {
             (Model::Gpt56Sol, "openai/gpt-5.6-sol", "gpt-5.6-sol"),
             (Model::Gpt56Terra, "openai/gpt-5.6-terra", "gpt-5.6-terra"),
             (Model::Gpt56Luna, "openai/gpt-5.6-luna", "gpt-5.6-luna"),
+            // Anthropic slugs have no short alias: bare ids stay native.
+            (
+                Model::ClaudeFable5OpenRouter,
+                "anthropic/claude-fable-5",
+                "anthropic/claude-fable-5",
+            ),
+            (
+                Model::ClaudeOpus48OpenRouter,
+                "anthropic/claude-opus-4.8",
+                "anthropic/claude-opus-4.8",
+            ),
+            (
+                Model::ClaudeSonnet46OpenRouter,
+                "anthropic/claude-sonnet-4.6",
+                "anthropic/claude-sonnet-4.6",
+            ),
+            (
+                Model::ClaudeHaiku45OpenRouter,
+                "anthropic/claude-haiku-4.5",
+                "anthropic/claude-haiku-4.5",
+            ),
         ];
         for (model, canonical, short) in cases {
             assert_eq!(canonical.parse::<Model>().unwrap(), model);
@@ -886,6 +952,20 @@ mod tests {
                 model
             );
         }
+        // Bare Claude ids must keep resolving to the native Anthropic backend,
+        // not the vendor-prefixed OpenRouter variants.
+        assert_eq!(
+            "claude-opus-4.8".parse::<Model>().unwrap(),
+            Model::ClaudeOpus48
+        );
+        assert_eq!(
+            "claude-fable-5".parse::<Model>().unwrap(),
+            Model::ClaudeFable5
+        );
+        assert_eq!(
+            "claude-haiku-4.5".parse::<Model>().unwrap(),
+            Model::ClaudeHaiku45
+        );
     }
 
     #[test]

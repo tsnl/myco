@@ -88,8 +88,14 @@ and decides color output: sections are colored when stdout is a TTY, controlled 
 protocol): `moonshotai/kimi-k3`, `deepseek/deepseek-v4-pro`,
 `deepseek/deepseek-v4-flash`, `google/gemini-3.5-flash`,
 `google/gemini-3.1-pro-preview`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`,
-`openai/gpt-5.6-luna`. The vendor prefix may be dropped on the CLI
-(`--model kimi-k3`).
+`openai/gpt-5.6-luna`, `anthropic/claude-fable-5`, `anthropic/claude-opus-4.8`,
+`anthropic/claude-sonnet-4.6`, `anthropic/claude-haiku-4.5`. The vendor prefix
+may be dropped on the CLI (`--model kimi-k3`) — except for Anthropic slugs,
+whose bare ids mean the native Anthropic backend.
+
+Claude via OpenRouter is for single-key setups. With an Anthropic key, prefer
+the bare `claude-*` ids: the native backend keeps prompt caching and adaptive
+thinking, which the generic Responses path does not.
 
 | Variable | Role |
 |----------|------|
