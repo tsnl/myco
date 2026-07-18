@@ -98,11 +98,12 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - Directory convention (user + project); load as prompt/procedures or slash-skills.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
 - [x] **Optional cross-session memory** — root-only `memory` tool: immutable UUIDed,
-      timestamped, titled entries as write-once files under `~/.myco/memory/{YYYY-MM}/`
-      (create/delete only; lock-free, safe on weakly consistent filesystems);
-      list/read plus exact + semantic entry search over the whole store. Entries
-      persist until explicitly deleted — no GC/pruning by design (revisit if the
-      store or index ever gets big enough to hurt).
+      timestamped, titled entries as write-once uuid-keyed files under
+      `~/.myco/memory/{uuid[..2]}/` with RFC-822-style headers (create/delete only;
+      lock-free, safe on weakly consistent filesystems); list/read plus exact +
+      semantic entry search over the whole store. Entries persist until explicitly
+      deleted — no GC/pruning by design (revisit if the store or index ever gets
+      big enough to hurt).
 
 ---
 

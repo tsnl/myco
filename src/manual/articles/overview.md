@@ -33,7 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/memory/{YYYY-MM}/{ts}-{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUIDed entry files; see below). |
+| `~/.myco/memory/{uuid[..2]}/{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUID-keyed entry files; see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
@@ -109,15 +109,16 @@ Responses). Empty credentials fail model creation at startup.
 Root-only `memory` tool (agent process; shared by supervisor and subagents, across
 sessions). The document is a set of **atomic entries** — immutable, UUIDed,
 timestamped, titled — that are only ever created (`append` with title + body) or
-deleted (`delete` by id). Each entry is a write-once file under
-`~/.myco/memory/{YYYY-MM}/` — nothing is rewritten in place and no locks are taken, so
-concurrent sessions cannot conflict even on weakly consistent network filesystems;
-readers resolve the document by listing entries in name (= time) order. `list` gives a
-compact id/timestamp/title index, `read` returns full entries (document view, or one by
-id), and `search` queries per-entry (mode `exact` = Tantivy, `semantic` = MiniLM) with
+deleted (`delete` by id). Each entry is a write-once file keyed by its uuid under
+`~/.myco/memory/{uuid[..2]}/` (same fanout as the session store), carrying an
+RFC-822-style header block (`Id` / `Date` / `Date-Local` / `Agent` / `Title`, then a
+blank line and the markdown body) — nothing is rewritten in place and no locks are
+taken, so concurrent sessions cannot conflict even on weakly consistent network
+filesystems; readers order the document by the `Date` header. `list` gives a compact
+id/date/title index, `read` returns full entries (document view, or one by id), and
+`search` queries per-entry (mode `exact` = Tantivy, `semantic` = MiniLM) with
 entry-shaped hits. **Every entry stays indexed and readable until explicitly deleted**
-— the month dirs are a storage layout detail, not a retention policy; there is no
-GC/pruning. Distinct from the per-session `session_meta` scratchpad.
+— there is no GC/pruning. Distinct from the per-session `session_meta` scratchpad.
 
 ## Product limits (V1)
 

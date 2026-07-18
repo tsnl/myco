@@ -4,22 +4,24 @@
 //! timestamped, titled. Entries are only ever created or deleted — nothing is
 //! rewritten in place and no locks are taken, so concurrent sessions and
 //! subagents are safe even on weakly consistent network filesystems
-//! (maildir's write-once-unique-name pattern). Each entry is one file,
-//! `~/.myco/memory/{YYYY-MM}/{utc-ms-timestamp}-{uuid}.md`:
+//! (maildir's write-once-unique-name pattern). Each entry is one file keyed
+//! by its uuid, `~/.myco/memory/{uuid[..2]}/{uuid}.md` (same fanout layout as
+//! the session store), with an RFC-822-style header block:
 //!
 //! ```text
-//! {uuid}
-//! {UTC timestamp} ({local timestamp} local) agent={hex8}
-//! # {title}
+//! Id: {uuid}
+//! Date: {UTC timestamp, ms}
+//! Date-Local: {local timestamp, ms, with offset}
+//! Agent: {hex8}
+//! Title: {title}
 //!
 //! {body}
 //! ```
 //!
-//! Readers resolve the document by listing entries in name (= time) order,
-//! joining with two blank lines. The timestamp shard dirs are a storage
-//! layout detail (they keep directories small) with no visibility semantics:
-//! **every entry stays indexed and readable until explicitly deleted**.
-//! GC/pruning is deliberately out of scope for now.
+//! Readers resolve the document by ordering entries on their `Date` header
+//! (fixed-width UTC, so lexicographic = chronological), joining with two
+//! blank lines. **Every entry stays indexed and readable until explicitly
+//! deleted**; GC/pruning is deliberately out of scope for now.
 //!
 //! Search uses a dedicated in-RAM [`SearchIndex`] with one document per
 //! entry, diffed against the store listing before each query so entries from
@@ -46,19 +48,20 @@ Persistent memory shared across agents and sessions (one document per machine, u
 `~/.myco/memory/`).
 
 The document is a set of **atomic entries** — immutable, UUIDed, timestamped, titled.
-Entries are only ever created or deleted (each is a write-once file; nothing is rewritten
-in place, no locks), so concurrent sessions and subagents never conflict. Every entry
-stays indexed and readable **until explicitly deleted** — to correct a stale fact, append
-the corrected entry and delete the old one.
+Entries are only ever created or deleted (each is a write-once file keyed by its uuid,
+with an RFC-822-style header block; nothing is rewritten in place, no locks), so
+concurrent sessions and subagents never conflict. Every entry stays indexed and readable
+**until explicitly deleted** — to correct a stale fact, append the corrected entry and
+delete the old one.
 
 Actions:
 - append: add an entry. Requires `title` (short one-line label) and `text` (markdown
-  body); UUID + timestamp are added automatically and the id is returned. Keep entries
-  short, durable, one fact each — user preferences, project facts, decisions, gotchas.
-  Not a scratchpad: use session_meta set_scratchpad for session-local notes.
+  body); Id/Date/Agent headers are added automatically and the id is returned. Keep
+  entries short, durable, one fact each — user preferences, project facts, decisions,
+  gotchas. Not a scratchpad: use session_meta set_scratchpad for session-local notes.
 - delete: remove one entry by `id` (uuid from append/list/search results; unique prefix
   ok). The deleted entry is echoed back, so a mistaken delete can be re-appended.
-- list: compact index of all entries (id, timestamp, title), newest first.
+- list: compact index of all entries (id, date, title), newest first.
 - read: full entries — the document in time order (last `max_results`, default 50), or
   one entry via `id`.
 - search: query entries. `mode` = "exact" (default; Tantivy full-text — identifiers,
@@ -85,8 +88,8 @@ struct IndexState {
 
 struct EntryMeta {
     id: String,
-    /// Timestamp/attribution line (entry line 2).
-    stamp: String,
+    /// `Date` header value (UTC).
+    date: String,
     title: String,
 }
 
@@ -184,7 +187,7 @@ impl ToolService for MemoryService {
 }
 
 impl MemoryService {
-    /// Create one immutable entry as a new unique file.
+    /// Create one immutable entry as a new uuid-keyed file.
     fn append(&self, agent_id: uuid::Uuid, title: &str, text: &str) -> Result<String, String> {
         let title = normalize_title(title).map_err(|e| format!("append title: {e}"))?;
         let text = text.trim_end();
@@ -199,31 +202,31 @@ impl MemoryService {
             ));
         }
 
-        let now = Utc::now();
-        let shard = self.dir()?.join(now.format("%Y-%m").to_string());
+        let id = uuid_simple_hex(uuid::Uuid::new_v4());
+        let shard = self.dir()?.join(&id[..2]);
         std::fs::create_dir_all(&shard).map_err(|e| format!("create {}: {e}", shard.display()))?;
 
-        let id = uuid_simple_hex(uuid::Uuid::new_v4());
-        let stamp = format!(
-            "{} ({} local) agent={}",
-            now.format("%Y-%m-%dT%H:%M:%SZ"),
-            now.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S%:z"),
+        // Millisecond Date keeps the document orderable (fixed-width UTC;
+        // lexicographic = chronological). Unknown headers are ignored on read,
+        // so the block is forward-extensible.
+        let now = Utc::now();
+        let header = format!(
+            "Id: {id}\nDate: {}\nDate-Local: {}\nAgent: {}\nTitle: {title}\n",
+            now.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+            now.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S%.3f%:z"),
             &uuid_simple_hex(agent_id)[..8]
         );
-        // Millisecond stamp keeps names in time order; the uuid makes them
-        // unique across hosts/processes and is the entry's stable id.
-        let name = format!("{}-{id}.md", now.format("%Y%m%dT%H%M%S%3fZ"));
-        let path = shard.join(name);
+        let path = shard.join(format!("{id}.md"));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|e| format!("create {}: {e}", path.display()))?;
-        f.write_all(format!("{id}\n{stamp}\n# {title}\n\n{text}\n").as_bytes())
+        f.write_all(format!("{header}\n{text}\n").as_bytes())
             .map_err(|e| format!("write {}: {e}", path.display()))?;
 
         Ok(format!(
-            "appended\nid={id}\ntitle={title}\nfile={}\n{stamp}\n",
+            "appended\nid={id}\ntitle={title}\nfile={}\n",
             path.display()
         ))
     }
@@ -260,7 +263,7 @@ impl MemoryService {
             dir.display()
         );
         for e in loaded.iter().rev() {
-            out.push_str(&format!("  {}  {}  {}\n", e.id, e.utc_stamp(), e.title));
+            out.push_str(&format!("  {}  {}  {}\n", e.id, e.date, e.title));
         }
         Ok(out)
     }
@@ -341,10 +344,10 @@ impl MemoryService {
 }
 
 // ---------------------------------------------------------------------------
-// Store: entry listing, id resolve, index refresh
+// Store: entry listing, id resolve, header parsing, index refresh
 // ---------------------------------------------------------------------------
 
-/// Timestamp shard dirs under `dir` (storage layout only; no visibility semantics).
+/// Uuid-prefix shard dirs under `dir` (two hex chars; storage fanout only).
 fn shard_dirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -355,42 +358,34 @@ fn shard_dirs(dir: &Path) -> Vec<PathBuf> {
             p.is_dir()
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit() || c == '-'))
+                    .is_some_and(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit()))
         })
         .collect()
 }
 
-/// Entry files in `shard`, any order (`{timestamp}-{uuid}.md`; leading digit).
+/// Entry files in `shard`, any order (`{uuid}.md`).
 fn entry_files(shard: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(shard) else {
         return Vec::new();
     };
     read.flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.ends_with(".md") && n.starts_with(|c: char| c.is_ascii_digit())
-                })
-        })
+        .filter(|p| p.is_file() && entry_uuid(p).is_some())
         .collect()
 }
 
-/// Every entry file in the store, sorted by filename (= time order).
+/// Every entry file in the store (unordered; readers sort by `Date` header).
 fn all_entry_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = shard_dirs(dir)
+    shard_dirs(dir)
         .iter()
         .flat_map(|s| entry_files(s))
-        .collect();
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    files
+        .collect()
 }
 
-/// Entry uuid from a `{timestamp}-{uuid}.md` filename.
+/// Entry uuid from a `{uuid}.md` filename.
 fn entry_uuid(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?.strip_suffix(".md")?;
-    let (_, id) = name.rsplit_once('-')?;
-    (!id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())).then(|| id.to_string())
+    let id = path.file_name()?.to_str()?.strip_suffix(".md")?;
+    (id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())).then(|| id.to_string())
 }
 
 /// One entry file whose uuid matches `id` (unique prefix ok).
@@ -401,7 +396,16 @@ fn resolve_entry_file(dir: &Path, id: &str) -> Result<PathBuf, String> {
             "entry id must be a hex uuid (unique prefix ok, min 4 chars), got {id:?}"
         ));
     }
-    let matches: Vec<PathBuf> = all_entry_files(dir)
+    // Uuid-keyed paths: a full id is a direct lookup, a prefix scans only its
+    // two-hex shard dir.
+    if id.len() == 32 {
+        let path = dir.join(&id[..2]).join(format!("{id}.md"));
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("no entry matching id {id:?}"));
+    }
+    let matches: Vec<PathBuf> = entry_files(&dir.join(&id[..2]))
         .into_iter()
         .filter(|f| entry_uuid(f).is_some_and(|u| u.starts_with(&id)))
         .collect();
@@ -421,38 +425,50 @@ fn resolve_entry_file(dir: &Path, id: &str) -> Result<PathBuf, String> {
 
 struct LoadedEntry {
     id: String,
-    stamp: String,
+    date: String,
     title: String,
     text: String,
 }
 
-impl LoadedEntry {
-    /// UTC part of the stamp line (first whitespace token).
-    fn utc_stamp(&self) -> &str {
-        self.stamp.split_whitespace().next().unwrap_or("")
+/// Value of an RFC-822-style `Name: value` line when the name matches.
+fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (n, v) = line.split_once(':')?;
+    if n.trim().eq_ignore_ascii_case(name) {
+        Some(v.trim())
+    } else {
+        None
     }
 }
 
 fn parse_entry(path: &Path, text: String) -> LoadedEntry {
-    // Filename is authoritative for the id; body line 1 is the readable fallback.
-    let id = entry_uuid(path)
-        .or_else(|| text.lines().next().map(|l| l.trim().to_string()))
-        .unwrap_or_default();
-    let stamp = text.lines().nth(1).unwrap_or("").trim().to_string();
-    let title_line = text.lines().nth(2).unwrap_or("").trim();
-    let title = title_line
-        .strip_prefix("# ")
-        .unwrap_or(title_line)
-        .to_string();
+    let mut id_header = String::new();
+    let mut date = String::new();
+    let mut title = String::new();
+    // Header block: `Name: value` lines up to the first blank line.
+    // Unknown names are ignored (forward compatibility).
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some(v) = header_value(line, "id") {
+            id_header = v.to_string();
+        } else if let Some(v) = header_value(line, "date") {
+            date = v.to_string();
+        } else if let Some(v) = header_value(line, "title") {
+            title = v.to_string();
+        }
+    }
+    // Filename is authoritative for the id; the Id header is the fallback.
+    let id = entry_uuid(path).unwrap_or(id_header);
     LoadedEntry {
         id,
-        stamp,
+        date,
         title,
         text,
     }
 }
 
-/// All entries in time (= name) order, fully loaded. Errors when the store is empty.
+/// All entries in `Date` order, fully loaded. Errors when the store is empty.
 fn load_all_entries(dir: &Path) -> Result<Vec<LoadedEntry>, String> {
     let files = all_entry_files(dir);
     if files.is_empty() {
@@ -461,20 +477,23 @@ fn load_all_entries(dir: &Path) -> Result<Vec<LoadedEntry>, String> {
             dir.display()
         ));
     }
-    Ok(files
+    let mut loaded: Vec<LoadedEntry> = files
         .into_iter()
         .filter_map(|p| {
             let text = std::fs::read_to_string(&p).ok()?;
             Some(parse_entry(&p, text))
         })
-        .collect())
+        .collect();
+    // Fixed-width UTC Date: lexicographic = chronological; id breaks ties.
+    loaded.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.id.cmp(&b.id)));
+    Ok(loaded)
 }
 
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Sync the index with the store (all entries, every shard).
+/// Sync the index with the store (all entries).
 ///
 /// Entry files are immutable, so the diff is by name only: unseen files are
 /// read and embedded on the blocking pool, deleted files drop out. The
@@ -535,13 +554,20 @@ async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<(), Strin
             key,
             EntryMeta {
                 id: entry.id,
-                stamp: entry.stamp,
+                date: entry.date,
                 title: entry.title,
             },
         );
     }
     state.index.commit()?;
     Ok(())
+}
+
+/// Header lines the hit display already covers (id/date/title rows).
+fn is_known_header_line(line: &str) -> bool {
+    ["id", "date", "date-local", "agent", "title"]
+        .iter()
+        .any(|n| header_value(line, n).is_some())
 }
 
 fn format_report(
@@ -570,9 +596,10 @@ fn format_report(
             meta.map(|m| m.id.as_str()).unwrap_or("?"),
             meta.map(|m| m.title.as_str()).unwrap_or(""),
         ));
-        let stamp = meta.map(|m| m.stamp.as_str()).unwrap_or("");
-        if !stamp.is_empty() {
-            out.push_str(&format!("  {stamp}\n"));
+        if let Some(meta) = meta
+            && !meta.date.is_empty()
+        {
+            out.push_str(&format!("  {}\n", meta.date));
         }
         let body = h
             .line_text
@@ -580,13 +607,9 @@ fn format_report(
             .map(str::trim_end)
             .filter(|s| !s.is_empty())
             .or_else(|| Some(h.snippet.trim_end()).filter(|s| !s.is_empty()));
-        // Skip echoing lines the header already shows (title/stamp/id rows).
+        // Skip echoing header rows the hit display already covers.
         if let Some(body) = body
-            && body != stamp
-            && meta.is_none_or(|m| {
-                let plain = body.strip_prefix("# ").unwrap_or(body);
-                plain != m.title && body != m.id
-            })
+            && !is_known_header_line(body)
         {
             out.push_str(&format!("  {body}\n"));
         }
@@ -603,7 +626,7 @@ struct Input {
     /// Short one-line label for `append` (required there).
     #[serde(default)]
     title: Option<String>,
-    /// Entry markdown body for `append` (UUID + timestamp added automatically).
+    /// Entry markdown body for `append` (Id/Date/Agent headers added automatically).
     #[serde(default)]
     text: Option<String>,
     /// Entry id for `delete` / `read` (uuid from results; unique prefix ok).
@@ -693,15 +716,17 @@ mod tests {
         r
     }
 
-    /// Entry file in an old month shard, as an earlier session would have left it.
-    fn write_old_shard_entry(dir: &Path) {
-        let old = dir.join("2000-01");
-        fs::create_dir_all(&old).unwrap();
+    /// Entry file as an earlier session would have left it (old Date).
+    fn write_old_entry(dir: &Path) {
+        let shard = dir.join("de");
+        fs::create_dir_all(&shard).unwrap();
         fs::write(
-            old.join("20000101T000000000Z-deadbeefdeadbeefdeadbeefdeadbeef.md"),
-            "deadbeefdeadbeefdeadbeefdeadbeef\n\
-             2000-01-01T00:00:00Z (2000-01-01T00:00:00+00:00 local) agent=deadbeef\n\
-             # Old fact\n\
+            shard.join("deadbeefdeadbeefdeadbeefdeadbeef.md"),
+            "Id: deadbeefdeadbeefdeadbeefdeadbeef\n\
+             Date: 2000-01-01T00:00:00.000Z\n\
+             Date-Local: 2000-01-01T00:00:00.000+00:00\n\
+             Agent: deadbeef\n\
+             Title: Old fact\n\
              \n\
              old_token_alpha\n",
         )
@@ -709,17 +734,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_makes_titled_uuid_entries_and_search_is_entry_shaped() {
+    async fn append_writes_uuid_keyed_header_entries_and_search_is_entry_shaped() {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
         let r = append(&svc, "Git workflow", "user prefers rebase-first workflow").await;
         let id = appended_id(&r);
         assert_eq!(id.len(), 32, "{id}");
+
+        // Path is keyed by uuid: {dir}/{id[..2]}/{id}.md, headers RFC-822 style.
+        let path = dir.join(&id[..2]).join(format!("{id}.md"));
+        assert!(path.is_file(), "{}", path.display());
+        let content = fs::read_to_string(&path).unwrap();
         assert!(
-            tool_text(&r).contains("title=Git workflow"),
-            "{}",
-            tool_text(&r)
+            content.starts_with(&format!("Id: {id}\nDate: ")),
+            "{content}"
+        );
+        assert!(content.contains("\nTitle: Git workflow\n"), "{content}");
+        assert!(content.contains("\nAgent: "), "{content}");
+        assert!(
+            content.contains("\n\nuser prefers rebase-first workflow"),
+            "{content}"
         );
 
         let r = call(&svc, json!({"action": "search", "query": "rebase"})).await;
@@ -745,27 +780,20 @@ mod tests {
             "{}",
             tool_text(&r)
         );
-
-        let shards: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(shards.len(), 1, "one shard dir");
-        assert_eq!(
-            entry_files(&shards[0].path()).len(),
-            2,
-            "one file per append"
-        );
+        assert_eq!(all_entry_files(&dir).len(), 2, "one file per append");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn entries_persist_across_shards_until_deleted() {
+    async fn entries_persist_until_deleted() {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        write_old_shard_entry(&dir);
+        write_old_entry(&dir);
         append(&svc, "New fact", "new_token_beta").await;
 
-        // Old-shard entries are first-class: searchable, listed, and read in order.
+        // Old entries are first-class: searchable, listed, and read in Date order.
         let r = call(
             &svc,
             json!({"action": "search", "query": "old_token_alpha"}),
@@ -785,7 +813,7 @@ mod tests {
         let text = tool_text(&r);
         let old = text.find("old_token_alpha").unwrap();
         let new = text.find("new_token_beta").unwrap();
-        assert!(old < new, "time order across shards: {text}");
+        assert!(old < new, "Date order: {text}");
 
         // Explicit delete is the only way an entry leaves the document.
         let r = call(&svc, json!({"action": "delete", "id": "deadbeefdead"})).await;
@@ -835,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_returns_document_in_time_order_or_one_entry() {
+    async fn read_returns_document_in_date_order_or_one_entry() {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
@@ -872,7 +900,7 @@ mod tests {
             text.contains("alpha body") && !text.contains("beta body"),
             "{text}"
         );
-        assert!(text.contains("# Alpha fact"), "{text}");
+        assert!(text.contains("Title: Alpha fact"), "{text}");
 
         let _ = fs::remove_dir_all(&dir);
     }
