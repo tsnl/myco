@@ -16,16 +16,16 @@
 //! ```
 //!
 //! Readers resolve the document by listing entries in name (= time) order,
-//! joining with two blank lines. Timestamp shard dirs bound directory size
-//! and make GC a directory delete (not automated yet).
+//! joining with two blank lines. The timestamp shard dirs are a storage
+//! layout detail (they keep directories small) with no visibility semantics:
+//! **every entry stays indexed and readable until explicitly deleted**.
+//! GC/pruning is deliberately out of scope for now.
 //!
-//! Search, list, and the document view cover only the **latest shard**
-//! (delete / read-by-id reach all shards); older shards stay on disk for
-//! bash/grep. Search uses a dedicated in-RAM [`SearchIndex`] with one
-//! document per entry, diffed against the shard listing before each query so
-//! entries from concurrent myco processes appear and deleted files drop out.
-//! File reads and MiniLM embedding run on the blocking pool (same rule as the
-//! engine: candle never runs on an executor thread).
+//! Search uses a dedicated in-RAM [`SearchIndex`] with one document per
+//! entry, diffed against the store listing before each query so entries from
+//! concurrent myco processes appear and deleted files drop out. File reads
+//! and MiniLM embedding run on the blocking pool (same rule as the engine:
+//! candle never runs on an executor thread).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -47,10 +47,9 @@ Persistent memory shared across agents and sessions (one document per machine, u
 
 The document is a set of **atomic entries** — immutable, UUIDed, timestamped, titled.
 Entries are only ever created or deleted (each is a write-once file; nothing is rewritten
-in place, no locks), so concurrent sessions and subagents never conflict. To correct a
-stale fact: append the corrected entry, then delete the old one. Search/list/read cover
-the latest month shard; delete and read-by-id reach all shards (older shards stay on disk
-for bash/grep; GC = delete a shard dir, not automated yet).
+in place, no locks), so concurrent sessions and subagents never conflict. Every entry
+stays indexed and readable **until explicitly deleted** — to correct a stale fact, append
+the corrected entry and delete the old one.
 
 Actions:
 - append: add an entry. Requires `title` (short one-line label) and `text` (markdown
@@ -59,7 +58,7 @@ Actions:
   Not a scratchpad: use session_meta set_scratchpad for session-local notes.
 - delete: remove one entry by `id` (uuid from append/list/search results; unique prefix
   ok). The deleted entry is echoed back, so a mistaken delete can be re-appended.
-- list: compact index of entries (id, timestamp, title), newest first.
+- list: compact index of all entries (id, timestamp, title), newest first.
 - read: full entries — the document in time order (last `max_results`, default 50), or
   one entry via `id`.
 - search: query entries. `mode` = "exact" (default; Tantivy full-text — identifiers,
@@ -80,8 +79,6 @@ pub struct MemoryService {
 
 struct IndexState {
     index: SearchIndex,
-    /// Shard dir currently indexed.
-    shard: Option<PathBuf>,
     /// Indexed entry files: path key → entry metadata (for hit display).
     entries: HashMap<String, EntryMeta>,
 }
@@ -97,7 +94,6 @@ impl IndexState {
     fn new() -> Self {
         Self {
             index: SearchIndex::new().expect("tantivy ram index"),
-            shard: None,
             entries: HashMap::new(),
         }
     }
@@ -249,17 +245,19 @@ impl MemoryService {
         .map_err(|e| format!("delete join: {e}"))?
     }
 
-    /// Compact index of the latest shard's entries, newest first.
+    /// Compact index of all entries, newest first.
     async fn list(&self) -> Result<String, String> {
         let dir = self.dir()?;
-        let entries = tokio::task::spawn_blocking(move || load_latest_shard_entries(&dir))
-            .await
-            .map_err(|e| format!("list join: {e}"))??;
-        let (shard, loaded) = entries;
+        let loaded = {
+            let dir = dir.clone();
+            tokio::task::spawn_blocking(move || load_all_entries(&dir))
+                .await
+                .map_err(|e| format!("list join: {e}"))??
+        };
         let mut out = format!(
-            "memory entries: {} (shard {}; newest first; latest shard only)\n",
+            "memory entries: {} ({}; newest first)\n",
             loaded.len(),
-            shard.display()
+            dir.display()
         );
         for e in loaded.iter().rev() {
             out.push_str(&format!("  {}  {}  {}\n", e.id, e.utc_stamp(), e.title));
@@ -281,17 +279,19 @@ impl MemoryService {
         }
 
         let max = max_entries.clamp(1, MAX_MAX_RESULTS);
-        let entries = tokio::task::spawn_blocking(move || load_latest_shard_entries(&dir))
-            .await
-            .map_err(|e| format!("read join: {e}"))??;
-        let (shard, loaded) = entries;
+        let loaded = {
+            let dir = dir.clone();
+            tokio::task::spawn_blocking(move || load_all_entries(&dir))
+                .await
+                .map_err(|e| format!("read join: {e}"))??
+        };
         let total = loaded.len();
         let shown = &loaded[total.saturating_sub(max)..];
         let mut out = format!(
-            "memory document: showing {} of {} entries (shard {}; time order; latest shard only)\n---\n",
+            "memory document: showing {} of {} entries ({}; time order)\n---\n",
             shown.len(),
             total,
-            shard.display()
+            dir.display()
         );
         out.push_str(
             &shown
@@ -331,26 +331,25 @@ impl MemoryService {
         };
 
         let mut state = self.state.lock().await;
-        let shard = refresh_index(&mut state, dir).await?;
+        refresh_index(&mut state, dir.clone()).await?;
         let hits = match &q_vec {
             Some(v) => state.index.search_semantic(&query, v, None, limit)?,
             None => state.index.search_exact(&query, None, limit)?,
         };
-        Ok(format_report(semantic, &shard, &hits, &state.entries))
+        Ok(format_report(semantic, &dir, &hits, &state.entries))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Store: shard/entry listing, id resolve, index refresh
+// Store: entry listing, id resolve, index refresh
 // ---------------------------------------------------------------------------
 
-/// Timestamp shard dirs under `dir`, name-sorted ascending.
+/// Timestamp shard dirs under `dir` (storage layout only; no visibility semantics).
 fn shard_dirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut shards: Vec<PathBuf> = read
-        .flatten()
+    read.flatten()
         .map(|e| e.path())
         .filter(|p| {
             p.is_dir()
@@ -358,9 +357,7 @@ fn shard_dirs(dir: &Path) -> Vec<PathBuf> {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit() || c == '-'))
         })
-        .collect();
-    shards.sort();
-    shards
+        .collect()
 }
 
 /// Entry files in `shard`, any order (`{timestamp}-{uuid}.md`; leading digit).
@@ -379,6 +376,16 @@ fn entry_files(shard: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Every entry file in the store, sorted by filename (= time order).
+fn all_entry_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = shard_dirs(dir)
+        .iter()
+        .flat_map(|s| entry_files(s))
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    files
+}
+
 /// Entry uuid from a `{timestamp}-{uuid}.md` filename.
 fn entry_uuid(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?.strip_suffix(".md")?;
@@ -386,18 +393,7 @@ fn entry_uuid(path: &Path) -> Option<String> {
     (!id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())).then(|| id.to_string())
 }
 
-/// Newest timestamp shard that contains entry files, with its entries.
-fn latest_populated_shard(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    for shard in shard_dirs(dir).into_iter().rev() {
-        let files = entry_files(&shard);
-        if !files.is_empty() {
-            return Some((shard, files));
-        }
-    }
-    None
-}
-
-/// One entry file (all shards) whose uuid matches `id` (unique prefix ok).
+/// One entry file whose uuid matches `id` (unique prefix ok).
 fn resolve_entry_file(dir: &Path, id: &str) -> Result<PathBuf, String> {
     let id = id.trim().to_ascii_lowercase();
     if id.len() < 4 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -405,14 +401,10 @@ fn resolve_entry_file(dir: &Path, id: &str) -> Result<PathBuf, String> {
             "entry id must be a hex uuid (unique prefix ok, min 4 chars), got {id:?}"
         ));
     }
-    let mut matches: Vec<PathBuf> = Vec::new();
-    for shard in shard_dirs(dir) {
-        for file in entry_files(&shard) {
-            if entry_uuid(&file).is_some_and(|u| u.starts_with(&id)) {
-                matches.push(file);
-            }
-        }
-    }
+    let matches: Vec<PathBuf> = all_entry_files(dir)
+        .into_iter()
+        .filter(|f| entry_uuid(f).is_some_and(|u| u.starts_with(&id)))
+        .collect();
     match matches.as_slice() {
         [] => Err(format!("no entry matching id {id:?}")),
         [one] => Ok(one.clone()),
@@ -460,55 +452,45 @@ fn parse_entry(path: &Path, text: String) -> LoadedEntry {
     }
 }
 
-/// Latest shard's entries in time (= name) order, fully loaded.
-fn load_latest_shard_entries(dir: &Path) -> Result<(PathBuf, Vec<LoadedEntry>), String> {
-    let Some((shard, mut files)) = latest_populated_shard(dir) else {
+/// All entries in time (= name) order, fully loaded. Errors when the store is empty.
+fn load_all_entries(dir: &Path) -> Result<Vec<LoadedEntry>, String> {
+    let files = all_entry_files(dir);
+    if files.is_empty() {
         return Err(format!(
             "no memory recorded yet (no entry files under {}). Use memory append first.",
             dir.display()
         ));
-    };
-    files.sort();
-    let loaded = files
+    }
+    Ok(files
         .into_iter()
         .filter_map(|p| {
             let text = std::fs::read_to_string(&p).ok()?;
             Some(parse_entry(&p, text))
         })
-        .collect();
-    Ok((shard, loaded))
+        .collect())
 }
 
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Sync the index with the latest shard; returns that shard's path.
+/// Sync the index with the store (all entries, every shard).
 ///
 /// Entry files are immutable, so the diff is by name only: unseen files are
-/// read and embedded on the blocking pool, deleted files drop out, and a shard
-/// change (new month, GC) resets the index. The caller's state lock only
-/// guards cheap index mutations.
-async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<PathBuf, String> {
-    let listed = tokio::task::spawn_blocking({
+/// read and embedded on the blocking pool, deleted files drop out. The
+/// caller's state lock only guards cheap index mutations.
+async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<(), String> {
+    let files = tokio::task::spawn_blocking({
         let dir = dir.clone();
-        move || latest_populated_shard(&dir)
+        move || all_entry_files(&dir)
     })
     .await
     .map_err(|e| format!("list join: {e}"))?;
-    let Some((shard, files)) = listed else {
+    if files.is_empty() {
         return Err(format!(
             "no memory recorded yet (no entry files under {}). Use memory append first.",
             dir.display()
         ));
-    };
-
-    if state.shard.as_ref() != Some(&shard) {
-        for key in state.entries.keys() {
-            state.index.remove_file(Path::new(key));
-        }
-        state.entries.clear();
-        state.shard = Some(shard.clone());
     }
 
     let current: HashSet<String> = files.iter().map(|p| path_key(p)).collect();
@@ -528,7 +510,7 @@ async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<PathBuf, 
         .filter(|p| !state.entries.contains_key(&path_key(p)))
         .collect();
     if new_files.is_empty() && gone.is_empty() {
-        return Ok(shard);
+        return Ok(());
     }
 
     // Read + embed off the executor (best-effort vectors; exact regardless).
@@ -559,23 +541,23 @@ async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<PathBuf, 
         );
     }
     state.index.commit()?;
-    Ok(shard)
+    Ok(())
 }
 
 fn format_report(
     semantic: bool,
-    shard: &Path,
+    dir: &Path,
     hits: &[Hit],
     entries: &HashMap<String, EntryMeta>,
 ) -> String {
     let mut out = format!(
-        "mode={}\nmemory_shard={} ({} entries indexed; latest shard only)\nhits: {}\n",
+        "mode={}\nmemory={} ({} entries indexed)\nhits: {}\n",
         if semantic {
             "semantic_candle"
         } else {
             "exact_tantivy"
         },
-        shard.display(),
+        dir.display(),
         entries.len(),
         hits.len(),
     );
@@ -711,6 +693,21 @@ mod tests {
         r
     }
 
+    /// Entry file in an old month shard, as an earlier session would have left it.
+    fn write_old_shard_entry(dir: &Path) {
+        let old = dir.join("2000-01");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(
+            old.join("20000101T000000000Z-deadbeefdeadbeefdeadbeefdeadbeef.md"),
+            "deadbeefdeadbeefdeadbeefdeadbeef\n\
+             2000-01-01T00:00:00Z (2000-01-01T00:00:00+00:00 local) agent=deadbeef\n\
+             # Old fact\n\
+             \n\
+             old_token_alpha\n",
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn append_makes_titled_uuid_entries_and_search_is_entry_shaped() {
         let dir = tmp_dir();
@@ -736,7 +733,7 @@ mod tests {
             "search results are entry-shaped, not file refs: {text}"
         );
 
-        // Second append is a new file in the same shard, picked up incrementally.
+        // Second append is a new file, picked up incrementally.
         append(&svc, "CI host", "CI runs on unique_token_ci_gadget").await;
         let r = call(
             &svc,
@@ -755,6 +752,60 @@ mod tests {
             entry_files(&shards[0].path()).len(),
             2,
             "one file per append"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn entries_persist_across_shards_until_deleted() {
+        let dir = tmp_dir();
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
+
+        write_old_shard_entry(&dir);
+        append(&svc, "New fact", "new_token_beta").await;
+
+        // Old-shard entries are first-class: searchable, listed, and read in order.
+        let r = call(
+            &svc,
+            json!({"action": "search", "query": "old_token_alpha"}),
+        )
+        .await;
+        let text = tool_text(&r);
+        assert!(text.contains("old_token_alpha"), "{text}");
+        assert!(text.contains("Old fact"), "{text}");
+        let r = call(&svc, json!({"action": "list"})).await;
+        let text = tool_text(&r);
+        assert!(text.contains("memory entries: 2"), "{text}");
+        assert!(
+            text.contains("Old fact") && text.contains("New fact"),
+            "{text}"
+        );
+        let r = call(&svc, json!({"action": "read"})).await;
+        let text = tool_text(&r);
+        let old = text.find("old_token_alpha").unwrap();
+        let new = text.find("new_token_beta").unwrap();
+        assert!(old < new, "time order across shards: {text}");
+
+        // Explicit delete is the only way an entry leaves the document.
+        let r = call(&svc, json!({"action": "delete", "id": "deadbeefdead"})).await;
+        assert!(!r.is_error, "{r:?}");
+        assert!(
+            tool_text(&r).contains("old_token_alpha"),
+            "{}",
+            tool_text(&r)
+        );
+        let r = call(
+            &svc,
+            json!({"action": "search", "query": "old_token_alpha"}),
+        )
+        .await;
+        assert!(tool_text(&r).contains("hits: 0"), "{}", tool_text(&r));
+        let r = call(&svc, json!({"action": "list"})).await;
+        assert!(
+            tool_text(&r).contains("memory entries: 1"),
+            "{}",
+            tool_text(&r)
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -895,64 +946,6 @@ mod tests {
         if let Some(banana) = text.find("banana") {
             assert!(pdf < banana, "{text}");
         }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn search_and_list_cover_only_latest_shard() {
-        let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
-
-        // Old shard left behind by an earlier month.
-        let old = dir.join("2000-01");
-        fs::create_dir_all(&old).unwrap();
-        fs::write(
-            old.join("20000101T000000000Z-deadbeefdeadbeefdeadbeefdeadbeef.md"),
-            "deadbeefdeadbeefdeadbeefdeadbeef\n\
-             2000-01-01T00:00:00Z (2000-01-01T00:00:00+00:00 local) agent=deadbeef\n\
-             # Old fact\n\
-             \n\
-             old_token_alpha\n",
-        )
-        .unwrap();
-
-        append(&svc, "New fact", "new_token_beta").await;
-
-        let r = call(&svc, json!({"action": "search", "query": "new_token_beta"})).await;
-        assert!(
-            tool_text(&r).contains("new_token_beta"),
-            "{}",
-            tool_text(&r)
-        );
-        let r = call(
-            &svc,
-            json!({"action": "search", "query": "old_token_alpha"}),
-        )
-        .await;
-        assert!(!r.is_error, "{r:?}");
-        assert!(
-            tool_text(&r).contains("hits: 0"),
-            "old shard must not be indexed: {}",
-            tool_text(&r)
-        );
-        let r = call(&svc, json!({"action": "list"})).await;
-        assert!(!tool_text(&r).contains("Old fact"), "{}", tool_text(&r));
-
-        // Delete and read-by-id still reach old shards.
-        let r = call(&svc, json!({"action": "read", "id": "deadbeefdead"})).await;
-        assert!(
-            tool_text(&r).contains("old_token_alpha"),
-            "{}",
-            tool_text(&r)
-        );
-        let r = call(&svc, json!({"action": "delete", "id": "deadbeefdead"})).await;
-        assert!(!r.is_error, "{r:?}");
-        assert!(
-            tool_text(&r).contains("old_token_alpha"),
-            "{}",
-            tool_text(&r)
-        );
 
         let _ = fs::remove_dir_all(&dir);
     }

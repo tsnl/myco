@@ -115,10 +115,9 @@ concurrent sessions cannot conflict even on weakly consistent network filesystem
 readers resolve the document by listing entries in name (= time) order. `list` gives a
 compact id/timestamp/title index, `read` returns full entries (document view, or one by
 id), and `search` queries per-entry (mode `exact` = Tantivy, `semantic` = MiniLM) with
-entry-shaped hits. Search/list/document view cover the **latest shard** only; delete and
-read-by-id reach all shards. Older shards stay on disk for bash/grep; GC (delete old
-shard dirs) is not automated yet. Distinct from the per-session `session_meta`
-scratchpad.
+entry-shaped hits. **Every entry stays indexed and readable until explicitly deleted**
+— the month dirs are a storage layout detail, not a retention policy; there is no
+GC/pruning. Distinct from the per-session `session_meta` scratchpad.
 
 ## Product limits (V1)
 

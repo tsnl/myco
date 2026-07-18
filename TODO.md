@@ -100,8 +100,9 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [x] **Optional cross-session memory** — root-only `memory` tool: immutable UUIDed,
       timestamped, titled entries as write-once files under `~/.myco/memory/{YYYY-MM}/`
       (create/delete only; lock-free, safe on weakly consistent filesystems);
-      list/read plus exact + semantic entry search over the latest shard
-      (per-entry index; GC/pruning still open).
+      list/read plus exact + semantic entry search over the whole store. Entries
+      persist until explicitly deleted — no GC/pruning by design (revisit if the
+      store or index ever gets big enough to hurt).
 
 ---
 
