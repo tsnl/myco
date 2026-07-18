@@ -63,13 +63,18 @@ impl ToolService for BashService {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "bash".to_string(),
-            description: "Executes bash commands and manages long-lived interactive sessions \
+            // Defaults/limits are embedded from the constants above so the
+            // model-facing contract can never drift from the code.
+            description: format!(
+                "Executes bash commands and manages long-lived interactive sessions \
                 (shells, Python REPLs, SSH, etc.).\n\n\
                 Actions:\n\
                 - exec (default): one-shot `bash -c <command>`; **blocks until the process \
-                exits** (or `timeout_ms`, default 60000 ms / 60s; max 1800000 ms / 30 min). \
+                exits** (or `timeout_ms`, default {DEFAULT_EXEC_TIMEOUT_MS} ms / \
+                {exec_default_s}s; max {MAX_EXEC_TIMEOUT_MS} ms / {exec_max_min} min). \
                 Returns exit code, signal, stdout, stderr. Prefer `exec` for finite commands \
-                (builds, tests, installs). Raise `timeout_ms` when the job may exceed 60s.\n\
+                (builds, tests, installs). Raise `timeout_ms` when the job may exceed \
+                {exec_default_s}s.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
                 `session_id`. `command` is the program line (default: `bash -i`). Optional \
                 `stdin` is written after spawn. Returns a snapshot; the process keeps \
@@ -80,16 +85,22 @@ impl ToolService for BashService {
                 - close: kill and reap a session.\n\
                 - list: list live sessions.\n\n\
                 For start/write/read, the child runs in the background. Each call waits until \
-                an idle gap (`idle_ms`, default 300), a hard timeout (`timeout_ms`, default \
-                30000 ms / 30s; max 1800000 ms / 30 min), a byte cap (`max_bytes`, default \
-                32768), or process exit — then returns partial output with status timed_out / \
-                truncated / running while the session stays live. Raise `timeout_ms` when you \
-                need to wait longer for quiet interactive programs.\n\n\
+                an idle gap (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
+                (`timeout_ms`, default {DEFAULT_TIMEOUT_MS} ms / {session_default_s}s; max \
+                {MAX_TIMEOUT_MS} ms / {session_max_min} min), a byte cap (`max_bytes`, \
+                default {DEFAULT_MAX_BYTES}), or process exit — then returns partial output \
+                with status timed_out / truncated / running while the session stays live. \
+                Raise `timeout_ms` when you need to wait longer for quiet interactive \
+                programs.\n\n\
                 **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
                 process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
                 Tool uses whose `command` starts with `cd` are **rejected** — use `cwd` \
-                instead. (`write` stdin may still send interactive `cd` into a live shell.)"
-                .to_string(),
+                instead. (`write` stdin may still send interactive `cd` into a live shell.)",
+                exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
+                exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
+                session_default_s = DEFAULT_TIMEOUT_MS / 1000,
+                session_max_min = MAX_TIMEOUT_MS / 60_000,
+            ),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
     }
@@ -1538,6 +1549,24 @@ mod tests {
     fn rejects_empty_input() {
         let input: Input = serde_json::from_value(json!({})).unwrap();
         assert!(resolve_action(&input).is_err());
+    }
+
+    /// The tool description is the model-facing contract: it must state the
+    /// defaults/limits actually enforced, not stale hardcoded copies.
+    #[test]
+    fn tool_description_states_actual_defaults() {
+        let specs = BashService::new().tool_specs();
+        let d = &specs[0].description;
+        for needle in [
+            DEFAULT_EXEC_TIMEOUT_MS.to_string(),
+            MAX_EXEC_TIMEOUT_MS.to_string(),
+            DEFAULT_TIMEOUT_MS.to_string(),
+            MAX_TIMEOUT_MS.to_string(),
+            DEFAULT_IDLE_MS.to_string(),
+            DEFAULT_MAX_BYTES.to_string(),
+        ] {
+            assert!(d.contains(&needle), "description missing {needle}: {d}");
+        }
     }
 
     #[test]
