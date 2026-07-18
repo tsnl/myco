@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      # Publish fallback branch: the Publish workflow's check-wait looks for
+      # check runs on its trigger commit, which lives here and has no PR.
+      - claude/publish-release-notes-a7uka1
   pull_request:
   workflow_dispatch:
 
