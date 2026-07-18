@@ -50,6 +50,11 @@ hosts, or lies about resume.
 - **Module docs state role and invariants**, not a walkthrough of the file.
   Comments teach *why* and constraints; they never narrate what the next line
   does.
+- **The only comments that ship in a PR are comments that should live in the
+  codebase.** A comment that narrates the change, addresses a reviewer, or
+  restates a design discussion belongs in the PR description or commit
+  message, not the code. If it would not make sense to a reader who never saw
+  the PR, cut it.
 - **Terminology stays stable.** Prefer **host** (execution place for tools:
   `local` in-process or remote worker) over “machine/node/target” in code,
   config, tool schemas, and CLI. User-facing marketing may say “machines”;
