@@ -5,7 +5,7 @@ hosts look wrong, or the user asks you to update `myco` / explain the harness.
 
 ## Host PATH prerequisites
 
-Same executables as README **Requirements** (extra binaries on `PATH`). Install on each machine
+Same executables as the README **Install** section (extra binaries on `PATH`). Install on each machine
 that runs the agent and/or host tools; remotes need what their host tools spawn, not only the
 agent laptop.
 
