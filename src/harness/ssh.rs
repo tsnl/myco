@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::HostConfig;
-use crate::session::write_warning_open;
+use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
 #[derive(Debug, Default, Clone)]
@@ -48,11 +48,16 @@ impl SshAgentPreflightReport {
     /// Write preflight problems as a WARNING section (thin rule + header +
     /// body) to `out` — stdout live, or any buffer in tests. Writes nothing on
     /// the happy path (no SSH hosts, or agent reachable with no keys missing).
-    pub fn write_warning_section(&self, out: &mut impl Write) -> std::io::Result<()> {
+    /// The palette styles only the rule + header; body lines stay plain.
+    pub fn write_warning_section(
+        &self,
+        out: &mut impl Write,
+        palette: Palette,
+    ) -> std::io::Result<()> {
         if !self.had_ssh_hosts || (self.agent_ok && self.is_clean()) {
             return Ok(());
         }
-        write_warning_open(out)?;
+        write_warning_open(out, palette)?;
         if !self.agent_ok {
             writeln!(out, "ssh-agent: {}", self.agent_status)?;
         }
@@ -262,9 +267,9 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
 /// banner and before the first USER block. Happy path (agent reachable, no
 /// keys missing) prints nothing.
 /// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
-pub fn print_preflight_report(report: &SshAgentPreflightReport) {
+pub fn print_preflight_report(report: &SshAgentPreflightReport, palette: Palette) {
     let mut out = std::io::stdout();
-    let _ = report.write_warning_section(&mut out);
+    let _ = report.write_warning_section(&mut out, palette);
     let _ = out.flush();
 }
 
@@ -643,8 +648,28 @@ mod tests {
 
     fn warning_output(report: &SshAgentPreflightReport) -> String {
         let mut buf = Vec::new();
-        report.write_warning_section(&mut buf).unwrap();
+        report
+            .write_warning_section(&mut buf, Palette::plain())
+            .unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn warning_header_is_painted_when_colored() {
+        let report = SshAgentPreflightReport {
+            had_ssh_hosts: true,
+            agent_ok: false,
+            agent_status: "agent down".into(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        report
+            .write_warning_section(&mut buf, Palette::colored(true))
+            .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // Rule + header carry the warning style; body lines stay plain.
+        assert!(out.contains("\x1b[0;1;33mWARNING\x1b[0m\n"));
+        assert!(out.contains("\nssh-agent: agent down\n"));
     }
 
     #[test]

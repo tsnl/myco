@@ -260,7 +260,7 @@ async fn run_interactive(args: Args) {
     );
     // SSH preflight problems open a WARNING block after the banner, before the
     // first USER block; the happy path is silent.
-    print_preflight_report(&ssh_report);
+    print_preflight_report(&ssh_report, palette);
     if resuming {
         print_session_history(agent.history(), palette);
     }
