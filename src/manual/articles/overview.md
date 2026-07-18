@@ -33,7 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/memory/{YYYY-MM}/{ts}-{id}.md` | Shared cross-agent, cross-session memory (write-once timestamped entry files; see below). |
+| `~/.myco/memory/{YYYY-MM}/{ts}-{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUIDed entry files; see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
@@ -107,13 +107,15 @@ Responses). Empty credentials fail model creation at startup.
 ## Cross-session memory
 
 Root-only `memory` tool (agent process; shared by supervisor and subagents, across
-sessions). Every update is a **write-once** timestamped entry file under
-`~/.myco/memory/{YYYY-MM}/` — nothing is rewritten in place and no locks are taken, so
-concurrent sessions cannot conflict even on weakly consistent network filesystems;
-readers resolve the document by listing entries in name (= time) order. `exact_search`
-(Tantivy) and `semantic_search` (MiniLM) index one document per entry, covering the
-**latest shard** only. Older shards stay on disk for bash/grep; GC (delete old shard
-dirs) is not automated yet. Distinct from the per-session `session_meta` scratchpad.
+sessions). The document is a set of **atomic entries** — immutable, UUIDed,
+timestamped — that are only ever created (`append`) or deleted (`delete` by id).
+Each entry is a write-once file under `~/.myco/memory/{YYYY-MM}/` — nothing is
+rewritten in place and no locks are taken, so concurrent sessions cannot conflict even
+on weakly consistent network filesystems; readers resolve the document by listing
+entries in name (= time) order. `exact_search` (Tantivy) and `semantic_search` (MiniLM)
+index one document per entry, covering the **latest shard** only. Older shards stay on
+disk for bash/grep; GC (delete old shard dirs) is not automated yet. Distinct from the
+per-session `session_meta` scratchpad.
 
 ## Product limits (V1)
 
