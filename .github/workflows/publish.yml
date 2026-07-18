@@ -22,6 +22,23 @@ on:
         required: false
         default: true
         type: boolean
+      release_notes:
+        description: "Detailed release-notes markdown prepended to the GitHub Release body (optional)"
+        required: false
+        default: ""
+        type: string
+  # Fallback for agent sessions that can push but cannot POST /dispatches
+  # (e.g. the Claude Code GitHub integration gets 403 there): committing
+  # .github/publish-request.json to a claude/* branch runs the same job with
+  # parameters read from that file. The paths filter is the gate — ordinary
+  # development pushes never touch this file. Publishing still targets the
+  # "branch" value inside the request (normally main); the pushed branch only
+  # hosts the trigger.
+  push:
+    branches:
+      - "claude/**"
+    paths:
+      - ".github/publish-request.json"
 
 permissions:
   contents: write
@@ -33,9 +50,44 @@ jobs:
     name: Publish Package
     runs-on: ubuntu-latest
     steps:
+      # First checkout: the trigger ref, only to read the request file on push
+      # events. The second checkout below switches to the publish branch.
+      - uses: actions/checkout@v4
+
+      - name: Resolve publish parameters
+        id: params
+        env:
+          DISPATCH_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            branch="${{ github.event.inputs.branch }}"
+            bump_type="${{ github.event.inputs.bump_type }}"
+            dry_run="${{ github.event.inputs.dry_run }}"
+            printf '%s\n' "$DISPATCH_NOTES" > "$RUNNER_TEMP/notes.md"
+          else
+            req=.github/publish-request.json
+            branch="$(jq -er .branch "$req")"
+            bump_type="$(jq -er .bump_type "$req")"
+            dry_run="$(jq -er .dry_run "$req")"
+            notes_path="$(jq -er .notes_path "$req")"
+            cp "$notes_path" "$RUNNER_TEMP/notes.md"
+          fi
+          case "$bump_type" in patch|minor|major) ;; *)
+            echo "::error::bump_type must be patch|minor|major (got '$bump_type')"; exit 1 ;;
+          esac
+          case "$dry_run" in true|false) ;; *)
+            echo "::error::dry_run must be 'true' or 'false' (got '$dry_run')"; exit 1 ;;
+          esac
+          [ -n "$branch" ] || { echo "::error::branch must be non-empty"; exit 1; }
+          {
+            echo "branch=$branch"
+            echo "bump_type=$bump_type"
+            echo "dry_run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ steps.params.outputs.branch }}
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
@@ -47,11 +99,14 @@ jobs:
 
       - name: Semver bump and cargo publish
         id: publish
-        uses: tsnl/semver-bump-and-cargo-publish@v1
+        # v1.0.4: waits for checks on the publish branch HEAD (not the trigger
+        # commit), which the push-triggered fallback above depends on. Pinned
+        # by SHA; safe to move back to @v1 once that tag includes this commit.
+        uses: tsnl/semver-bump-and-cargo-publish@d5a83f38ef1c7d2d4949a98e0425a466efa70c92
         with:
-          branch: ${{ github.event.inputs.branch }}
-          bump_type: ${{ github.event.inputs.bump_type }}
-          dry_run: ${{ github.event.inputs.dry_run }}
+          branch: ${{ steps.params.outputs.branch }}
+          bump_type: ${{ steps.params.outputs.bump_type }}
+          dry_run: ${{ steps.params.outputs.dry_run }}
           cargo_registry_token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           pat_token: ${{ secrets.PAT_TOKEN }}
           # Match GitHub Actions check-run *names* (job names), not branch-protection
@@ -64,37 +119,47 @@ jobs:
           git_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
           git_user_name: "github-actions[bot]"
 
+      - name: Assemble release body
+        if: ${{ steps.params.outputs.dry_run != 'true' && steps.publish.outputs.published == 'true' }}
+        run: |
+          cp "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/release-body.md"
+          cat >> "$RUNNER_TEMP/release-body.md" <<'BOILERPLATE'
+
+          ---
+
+          Published **${{ steps.publish.outputs.package_name }}** `${{ steps.publish.outputs.new_version }}`
+          (was `${{ steps.publish.outputs.old_version }}`).
+
+          crates.io: https://crates.io/crates/${{ steps.publish.outputs.package_name }}
+
+          Install:
+          ```bash
+          cargo install myco --locked
+          # or from this tag:
+          cargo install --git https://github.com/${{ github.repository }} --tag ${{ steps.publish.outputs.tag_name }} --locked
+          ```
+
+          Platform-matched binaries are not attached here yet; build on the target
+          host (MiniLM weights are baked in at compile time). See `myco --help harness-ops`.
+          BOILERPLATE
+
       - name: Create GitHub Release
-        if: ${{ github.event.inputs.dry_run != 'true' && steps.publish.outputs.published == 'true' }}
+        if: ${{ steps.params.outputs.dry_run != 'true' && steps.publish.outputs.published == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.publish.outputs.tag_name }}
           name: ${{ steps.publish.outputs.new_version }}
           generate_release_notes: true
-          body: |
-            Published **${{ steps.publish.outputs.package_name }}** `${{ steps.publish.outputs.new_version }}`
-            (was `${{ steps.publish.outputs.old_version }}`).
-
-            crates.io: https://crates.io/crates/${{ steps.publish.outputs.package_name }}
-
-            Install:
-            ```bash
-            cargo install myco --locked
-            # or from this tag:
-            cargo install --git https://github.com/${{ github.repository }} --tag ${{ steps.publish.outputs.tag_name }} --locked
-            ```
-
-            Platform-matched binaries are not attached here yet; build on the target
-            host (MiniLM weights are baked in at compile time). See `myco --help harness-ops`.
+          body_path: ${{ runner.temp }}/release-body.md
 
       - name: Summary
         run: |
           {
             echo "## Publish summary"
             echo "- **Package**: ${{ steps.publish.outputs.package_name }}"
-            echo "- **Branch**: ${{ github.event.inputs.branch }}"
+            echo "- **Branch**: ${{ steps.params.outputs.branch }}"
             echo "- **Version**: ${{ steps.publish.outputs.old_version }} → ${{ steps.publish.outputs.new_version }}"
             echo "- **Tag**: ${{ steps.publish.outputs.tag_name }}"
             echo "- **crates.io**: ${{ steps.publish.outputs.published }}"
-            echo "- **Dry run**: ${{ github.event.inputs.dry_run }}"
+            echo "- **Dry run**: ${{ steps.params.outputs.dry_run }}"
           } >> "$GITHUB_STEP_SUMMARY"

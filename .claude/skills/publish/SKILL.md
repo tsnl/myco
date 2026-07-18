@@ -76,6 +76,42 @@ Inputs (must match the workflow):
 | `branch` | e.g. `main` | Branch to checkout and bump |
 | `bump_type` | `patch` / `minor` / `major` | Semver |
 | `dry_run` | `true` / `false` | Default in UI is dry-run |
+| `release_notes` | markdown string | Optional; prepended to the GitHub Release body above the install boilerplate |
+
+## Fallback: publishing without dispatch access (agent sessions)
+
+Remote agent integrations can usually push to their `claude/*` session
+branch but get **403 on POST /dispatches**, so `gh workflow run` and the
+Actions UI are unavailable to them. `publish.yml` has a push trigger for
+this case: on any `claude/**` branch, committing a change to
+`.github/publish-request.json` runs the same publish job with parameters
+from that file:
+
+```json
+{
+  "request_id": "v0.2.1-dry-run-1",
+  "branch": "main",
+  "bump_type": "patch",
+  "dry_run": "true",
+  "notes_path": ".github/release-notes-v0.2.1.md"
+}
+```
+
+- `branch` is what gets published (checked out, bumped, tagged) — the
+  session branch only hosts the trigger.
+- `notes_path` points at a committed markdown file used as the top of the
+  GitHub Release body; write it before requesting a real publish.
+- `request_id` is inert; change it to re-fire with otherwise-identical
+  parameters.
+- Same sequence as dispatch: push with `dry_run: "true"` first, then flip
+  to `"false"` and push again.
+- Remove the request file (and notes file, if desired) from the branch
+  once the release is verified.
+
+The semver action (v1.0.4+, pinned by SHA in publish.yml) waits for
+check runs on the publish branch's checked-out HEAD — for `main`, the
+checks its CI push run already produced — so no CI configuration is
+needed on the request branch itself.
 
 ## Choose bump type
 
