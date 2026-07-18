@@ -79,7 +79,7 @@ myco (interactive) / Agent
 | `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok) backends |
 | `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
-| `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms) |
+| `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |
 | `crates/myco-gui/` | Optional Yew UI — not on the critical CLI path |
 | `tests/` | Integration tests (bash sessions, concurrent host tools, …) |
 
@@ -126,6 +126,8 @@ Agent workflow defaults (also in system prompt fragments):
 3. **Surgical changes** — touch only what the task requires; clean up only
    orphans *you* created.
 4. **Goal-driven** — write the failing check or repro, then make it pass.
+5. **User authority** — never force-merge / admin-bypass checks or land PRs
+   without explicit user approval (see prompt fragment `user-authority`).
 
 ### Feature work layout
 
@@ -163,6 +165,9 @@ cargo run --locked --bin myco
   the binary at compile time.
 - Don’t edit `~/.myco/session/*.json` by hand from the agent — use
   `session_meta`.
+- Don’t force-merge PRs, bypass branch protection/required checks, or use
+  admin privileges to override the user’s review workflow without explicit
+  approval in the conversation.
 
 ## Backlog pointer
 

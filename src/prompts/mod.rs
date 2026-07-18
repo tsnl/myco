@@ -1,8 +1,8 @@
 //! Shared system-prompt fragments for root agents and subagents.
 //!
-//! Always-on agent policy (worktrees, computer-use, coding norms) lives here.
-//! Longer runtime docs live in [`crate::manual`] and are browsed via the `manual`
-//! host tool / `myco --help [id]`.
+//! Always-on agent policy (worktrees, computer-use, coding norms, user authority)
+//! lives here. Longer runtime docs live in [`crate::manual`] and are browsed via
+//! the `manual` host tool / `myco --help [id]`.
 
 /// Epilogue appended to every agent system prompt (root + subagent).
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
@@ -60,6 +60,8 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     include_str!("fragments/computer-use.md"),
     "\n---\n\n",
     include_str!("fragments/coding-norms.md"),
+    "\n---\n\n",
+    include_str!("fragments/user-authority.md"),
     "\n",
 );
 
@@ -72,6 +74,8 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Git worktrees for new features"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Computer use"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Think Before Coding"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));

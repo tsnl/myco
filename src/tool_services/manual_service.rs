@@ -11,7 +11,7 @@ use super::{HostDispatchContext, ToolService};
 const TOOL_DESCRIPTION: &str = r#"
 Browse Myco runtime manual articles (overview, CLI, tools, harness-ops). Articles are
 embedded at compile time (same text as `myco --help <id>`). Worktrees, computer-use, and
-coding norms live in the always-on system prompt (not this catalog).
+coding norms and user-authority policy live in the always-on system prompt (not this catalog).
 
 Actions:
 - list (default): catalog of article ids + one-line summaries.
