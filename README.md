@@ -5,12 +5,24 @@
 
 A minimalist coding agent that works across your machines over SSH.
 
-Run `myco` on your laptop: one conversation that edits files, runs shells
-(including multi-turn sessions), browses in text mode, and searches code
-(keyword + semantic) on the local machine **and** on every concrete `Host`
-alias in your `~/.ssh/config` — no host setup beyond SSH itself. Sessions are
-resumable (`/resume`), sub-agents keep long work cheap, and skill packs /
-`AGENTS.md` stay indexed so the agent can find how _you_ work.
+Run `myco` on your laptop. It edits files, runs shells, and searches code on
+the local machine **and** on every concrete `Host` alias in your
+`~/.ssh/config` — one session, many hosts, no setup beyond SSH itself.
+
+## Why use it?
+
+- **One agent, many machines.** Point tools at `local` or any `Host` alias from
+  your ssh config (`devbox`, GPU box, CI host). Remotes attach over SSH on
+  demand; you stay in a single conversation.
+- **Real computer use.** Bash (including multi-turn sessions), a surgical file
+  editor, text-mode browsing, and indexed search (keyword + semantic) on each host.
+- **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
+  conversation history live under `~/.myco/` — pick up later with `/resume`.
+- **Sub-agents for long work.** Spin off focused agents so the main thread stays
+  small and cheap.
+- **Skills and project guidance stay searchable.** Hosts auto-index skill packs
+  and `AGENTS.md` / `CLAUDE.md` so the agent can find how _you_ work.
+- **Coming later:** multiplayer (multiple humans in the same agent workspace).
 
 ## Install
 
@@ -28,13 +40,11 @@ embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
 myco    # default model: grok-4.5-build; pass --model <id> for Claude models
 ```
 
-Credentials come from the process environment (a `.env` in the cwd is also
-loaded):
-
-| Backend                                | Variables                                                                        |
-| -------------------------------------- | -------------------------------------------------------------------------------- |
-| **Anthropic Messages** (`claude-*`)    | `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`; optional `ANTHROPIC_BASE_URL`     |
-| **xAI / OpenAI Responses** (`grok-*`)  | `XAI_API_KEY` or `OPENAI_API_KEY`; optional `XAI_API_BASE_URL` / `OPENAI_BASE_URL` |
+Set API credentials for your backend first (Anthropic Messages or xAI / OpenAI
+Responses; read from the process environment, and a `.env` in the cwd is also
+loaded). The exact variables are documented in the
+[overview article](src/manual/articles/overview.md) — also available as
+`myco --help overview` once installed.
 
 Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by
