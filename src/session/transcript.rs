@@ -134,12 +134,6 @@ pub fn write_error_section(
     write_block(out, text)
 }
 
-/// Write a full WARNING section with body text (trailing newline ensured).
-pub fn write_warning_section(out: &mut impl Write, text: &str) -> std::io::Result<()> {
-    write_warning_open(out)?;
-    write_block(out, text)
-}
-
 pub fn ensure_assistant(
     out: &mut impl Write,
     open: &mut bool,
@@ -433,15 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn write_warning_section_layout() {
+    fn write_warning_open_layout() {
         let mut buf = Vec::new();
-        write_warning_section(&mut buf, "ssh-agent: not reachable").unwrap();
+        write_warning_open(&mut buf).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
-        assert!(rendered.contains(&format!(
-            "{SECTION_RULE}\nWARNING\n\nssh-agent: not reachable\n"
-        )));
-        // Leading blank line before the section rule.
-        assert!(rendered.starts_with('\n'));
+        assert_eq!(rendered, format!("\n{SECTION_RULE}\nWARNING\n\n"));
     }
 
     #[test]
