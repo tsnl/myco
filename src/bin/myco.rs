@@ -146,7 +146,16 @@ async fn main() {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name).serve_stdio().await {
+    // Owner request: index skills / AGENTS.md under the worker's cwd.
+    // Construction alone never indexes (tests rely on that).
+    let search = myco::TextSearchToolService::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search.auto_index_under(cwd);
+    }
+    if let Err(e) = HostWorker::standard_with_search(args.name, search)
+        .serve_stdio()
+        .await
+    {
         eprintln!("myco host error: {e}");
         std::process::exit(1);
     }
@@ -204,6 +213,11 @@ async fn run_interactive(args: Args) {
         std::process::exit(1);
     });
     print_host_status(&harness);
+    // Owner request: index skills / AGENTS.md under the launch directory.
+    // Attach alone never indexes (tests rely on that).
+    if let Ok(cwd) = std::env::current_dir() {
+        harness.auto_index_local(cwd);
+    }
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;

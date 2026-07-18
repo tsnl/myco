@@ -42,24 +42,43 @@ impl HostWorker {
         Self::new(name, Self::standard_services())
     }
 
+    /// Standard worker whose owner supplies the text-search service — use
+    /// when the owner keeps a handle to request auto-indexing
+    /// ([`TextSearchToolService::auto_index_under`]). Construction itself
+    /// never indexes.
+    pub fn standard_with_search(name: impl Into<String>, search: TextSearchToolService) -> Self {
+        Self::new(name, Self::services_with_search(search))
+    }
+
     /// Standard service list for building an extended local worker.
+    /// No indexing happens at construction (see [`Self::standard_with_search`]).
     pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
+        Self::services_with_search(TextSearchToolService::new())
+    }
+
+    pub(crate) fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ManualService::new()) as Arc<dyn ToolService>,
             Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
-            // Auto-indexes .claude/skills, SKILL.md dirs, AGENTS.md under cwd.
-            Arc::new(TextSearchToolService::new()) as Arc<dyn ToolService>,
+            Arc::new(search) as Arc<dyn ToolService>,
         ]
     }
 
     /// Tool catalog advertised by [`Self::standard`] (no process required).
     ///
     /// Used by lazy [`crate::host::HostController`] so the harness can route
-    /// host tools without connecting.
+    /// host tools without connecting. Spec listing must not start engines:
+    /// attach and every remote controller call this, and a throwaway
+    /// [`TextSearchToolService::new`] would kick off a redundant background
+    /// crawl + embed of cwd each time.
     pub fn standard_tool_specs() -> Vec<generative_model::ToolSpec> {
-        Self::standard("local").tool_specs()
+        Self::new(
+            "local",
+            Self::services_with_search(TextSearchToolService::spec_only()),
+        )
+        .tool_specs()
     }
 
     pub fn name(&self) -> &str {

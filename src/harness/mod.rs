@@ -126,6 +126,9 @@ pub struct Harness {
     root_only_tool_names: std::collections::HashSet<String>,
     /// Cached tool specs advertised to the model (host field injected for multi-host tools).
     tool_specs: Vec<generative_model::ToolSpec>,
+    /// Local host's text-search engine. Attach never indexes; the owning
+    /// process opts in via [`Self::auto_index_local`].
+    local_search: crate::text_search::TextSearchEngine,
 }
 
 /// How to construct a harness.
@@ -266,8 +269,13 @@ impl Harness {
             }
         }
 
+        // Keep the local engine handle on the harness so the owning process
+        // can request auto-indexing after attach; attach itself never indexes.
+        let local_search = crate::text_search::TextSearchEngine::new();
         let mut local_services: Vec<Arc<dyn ToolService>> =
-            crate::host::HostWorker::standard_services();
+            crate::host::HostWorker::services_with_search(
+                crate::tool_services::TextSearchToolService::with_engine(local_search.clone()),
+            );
         local_services.extend(root_extras);
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
@@ -292,7 +300,17 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            local_search,
         }))
+    }
+
+    /// Owner opt-in: discover and index skills / AGENTS.md under `cwd` on the
+    /// in-process local host (background crawl on the blocking pool).
+    ///
+    /// Called by the interactive CLI entrypoint. Tests that merely attach a
+    /// harness never index anything.
+    pub fn auto_index_local(&self, cwd: std::path::PathBuf) {
+        self.local_search.auto_index_under(cwd);
     }
 
     /// Test helper: attach only the in-process local host, no subagent.
@@ -307,7 +325,10 @@ impl Harness {
     /// In-process harness for unit tests: local host only, with the given services
     /// (plus the standard catalog).
     pub fn local_with_services(extra: Vec<Arc<dyn ToolService>>) -> Arc<Self> {
-        let standard = crate::host::HostWorker::standard_services();
+        let local_search = crate::text_search::TextSearchEngine::new();
+        let standard = crate::host::HostWorker::services_with_search(
+            crate::tool_services::TextSearchToolService::with_engine(local_search.clone()),
+        );
         let mut host_tool_names = std::collections::HashSet::new();
         let mut root_only_tool_names = std::collections::HashSet::new();
         let mut tool_specs = Vec::new();
@@ -344,6 +365,7 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            local_search,
         })
     }
 
@@ -768,6 +790,93 @@ mod tests {
         assert!(!r.is_error, "{r:?}");
         let text = tool_text(&r);
         assert!(text.contains("on-local"), "{text}");
+    }
+
+    /// Attaching a harness must not index anything: auto-indexing is an
+    /// explicit owner request, so tests never pay discovery/embedding work.
+    #[tokio::test]
+    async fn attach_does_not_auto_index() {
+        let harness = Harness::attach(HarnessConfig {
+            enable_subagent: false,
+            ..HarnessConfig::default()
+        })
+        .await
+        .expect("attach");
+
+        // Give any (buggy) background indexing a chance to register roots.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let r = harness
+            .clone()
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t".into(),
+                    name: "indexed_exact_text_search".into(),
+                    input: json!({"query": "anything"}),
+                },
+                Arc::new(crate::NullEventSink),
+                TraceContext::default(),
+                CancelToken::new(),
+            )
+            .await;
+        assert!(r.is_error, "search must fail with empty index: {r:?}");
+        assert!(
+            tool_text(&r).contains("no directories indexed"),
+            "{}",
+            tool_text(&r)
+        );
+    }
+
+    /// The owner's explicit request is what makes discovery targets
+    /// (AGENTS.md & co.) searchable.
+    #[tokio::test]
+    async fn auto_index_local_is_owner_opt_in() {
+        let dir = std::env::temp_dir().join(format!("myco-owner-index-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "# guidance\nunique_owner_optin_token here\n",
+        )
+        .unwrap();
+
+        let harness = Harness::attach(HarnessConfig {
+            enable_subagent: false,
+            ..HarnessConfig::default()
+        })
+        .await
+        .expect("attach");
+        harness.auto_index_local(dir.clone());
+
+        // The crawl is a background task; poll until the root is searchable.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let hit = loop {
+            let r = harness
+                .clone()
+                .dispatch_tool_use(
+                    ToolUse {
+                        id: "t".into(),
+                        name: "indexed_exact_text_search".into(),
+                        input: json!({"query": "unique_owner_optin_token"}),
+                    },
+                    Arc::new(crate::NullEventSink),
+                    TraceContext::default(),
+                    CancelToken::new(),
+                )
+                .await;
+            if !r.is_error && tool_text(&r).contains("AGENTS.md") {
+                break r;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("owner-requested auto-index never became searchable: {r:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            tool_text(&hit).contains("unique_owner_optin_token"),
+            "{hit:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

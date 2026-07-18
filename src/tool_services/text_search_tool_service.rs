@@ -1,7 +1,8 @@
 //! Host tool service: incremental text search over watched directories.
 //!
-//! Thin wrapper around [`crate::text_search::TextSearchEngine`]. Auto-indexes
-//! skills and AGENTS.md at host start; agents may `index_directory` more.
+//! Thin wrapper around [`crate::text_search::TextSearchEngine`]. Construction
+//! never indexes: the owning process opts in via [`TextSearchToolService::auto_index_under`]
+//! (skills / AGENTS.md discovery), and agents may `index_directory` more.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,17 +67,29 @@ pub struct TextSearchToolService {
 }
 
 impl TextSearchToolService {
-    /// Build service and start engine (auto-index under process cwd).
+    /// Build service with an empty index. Nothing is indexed until the owner
+    /// calls [`Self::auto_index_under`] or the agent uses `index_directory`.
     pub fn new() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_engine(TextSearchEngine::new())
+    }
+
+    /// Build around an existing engine handle (shared with the owner, e.g. so
+    /// the harness can trigger auto-indexing after construction).
+    pub fn with_engine(engine: TextSearchEngine) -> Self {
+        Self { engine }
+    }
+
+    /// Service for tool-spec listing only: no engine threads, no auto-index.
+    pub fn spec_only() -> Self {
         Self {
-            engine: TextSearchEngine::start(cwd),
+            engine: TextSearchEngine::detached(),
         }
     }
 
-    #[cfg(test)]
-    fn new_for_tests(engine: TextSearchEngine) -> Self {
-        Self { engine }
+    /// Owner opt-in: background-discover and index skills / AGENTS.md under
+    /// `cwd` (see [`TextSearchEngine::auto_index_under`]).
+    pub fn auto_index_under(&self, cwd: PathBuf) {
+        self.engine.auto_index_under(cwd);
     }
 }
 
@@ -308,8 +321,8 @@ mod tests {
         )
         .unwrap();
 
-        let eng = TextSearchEngine::start_for_tests();
-        let svc = Arc::new(TextSearchToolService::new_for_tests(eng));
+        let eng = TextSearchEngine::detached();
+        let svc = Arc::new(TextSearchToolService::with_engine(eng));
 
         let idx = svc
             .clone()
