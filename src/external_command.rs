@@ -58,15 +58,6 @@ pub static LYNX: ExternalCommand = ExternalCommand {
     fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
 };
 
-pub static KILL: ExternalCommand = ExternalCommand {
-    name: "kill",
-    purpose: "cancelled bash/browser process groups cannot be reaped",
-    install_hint: "install kill (util-linux or procps)",
-    startup_check: StartupCheck::Always,
-    env_override: None,
-    fallback_dirs: &[],
-};
-
 pub static SSH: ExternalCommand = ExternalCommand {
     name: "ssh",
     purpose: "remote hosts cannot connect",
@@ -105,7 +96,7 @@ pub static PS: ExternalCommand = ExternalCommand {
 };
 
 /// Every registered program; the startup preflight iterates this.
-pub static ALL: &[&ExternalCommand] = &[&BASH, &LYNX, &KILL, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
+pub static ALL: &[&ExternalCommand] = &[&BASH, &LYNX, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(

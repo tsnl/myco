@@ -13,10 +13,10 @@ use tokio::process::Command;
 use url::Url;
 
 use crate::core::{Async, CancelToken};
-use crate::external_command::{KILL, LYNX};
+use crate::external_command::LYNX;
 use crate::generative_model::{self, ToolResult};
 
-use super::{HostDispatchContext, ToolService};
+use super::{HostDispatchContext, ToolService, kill_process_group};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -281,18 +281,6 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> String {
         b.len()
     ));
     out
-}
-
-fn kill_process_group(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    let _ = KILL
-        .command()
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[derive(

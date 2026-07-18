@@ -59,6 +59,22 @@ impl HostDispatchContext {
     }
 }
 
+/// Best-effort SIGKILL of a whole process group: `kill(2)` with `-pgid`.
+///
+/// Tool children are spawned with `.process_group(0)`, so the leader pid is
+/// also the pgid; killing only the leader would leave grandchildren orphaned
+/// under init. Direct syscall (no external `kill` binary), sync, and safe to
+/// call from `Drop`. Errors (e.g. group already gone) are ignored.
+pub(crate) fn kill_process_group(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    // SAFETY: kill(2) takes a pid and a signal number; no pointers involved.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
 /// A placeable host tool capability.
 pub trait ToolService: Send + Sync + 'static {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec>;
