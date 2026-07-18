@@ -28,33 +28,29 @@ myco (interactive) / Agent
 
 | Path | Role |
 |------|------|
-| `~/.myco/config.toml` | Remote hosts (`[[remote_hosts]]`). Local is always on. Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
+| `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
-Minimal config shape:
+Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
 
 ```toml
 # model = "grok-4.5-build"    # default CLI model (--model overrides)
 enable_subagent = true
-
-# Local is always enabled in-process — do not list it here.
-
-[[remote_hosts]]
-name = "devbox"
-ssh = "devbox"                 # Host alias, hostname, or user@host
-# myco = "myco"                # remote binary (default)
-# user = "alice"               # optional
-# port = 22                    # optional
-# identity_file = "~/.ssh/id"  # optional
-# ssh_options = ["ProxyJump=bastion"]
+# Per-remote connect timeout in seconds on first tool use (0 disables).
+attach_timeout_secs = 10
 ```
 
-- Remotes use explicit SSH fields; myco always adds `BatchMode=yes`. Prefer Host aliases /
-  ProxyJump / User in `~/.ssh/config` when possible.
-- Remotes need `myco` on the **remote** PATH (or set `myco = "/abs/path/myco"`).
-- Missing config file → local-only (safe default). There is no `default_host` setting; default is always `local`.
+- Remote hosts come from `~/.ssh/config`: each concrete `Host` alias attaches as
+  `ssh -o BatchMode=yes <alias> myco --mode host`. `Include` directives are
+  followed. Put user / port / identity / `ProxyJump` in `~/.ssh/config`;
+  wildcard (`*`/`?`) and negated (`!`) patterns are ignored. The alias `local`
+  is reserved (skipped).
+- Remotes need `myco` on the **remote** PATH used by non-interactive SSH
+  (`~/.local/bin` and `~/.cargo/bin` are common).
+- Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
 ## API credentials & models
 

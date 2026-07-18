@@ -16,7 +16,8 @@ use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    FileConfig, FileRemoteHost, example_config_toml, load_file_config, parse_harness_config_str,
+    FileConfig, default_ssh_config_path, example_config_toml, load_file_config,
+    load_ssh_host_aliases, parse_file_config_str, ssh_config_host_aliases, ssh_spawn_command,
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
@@ -30,67 +31,6 @@ pub use ssh::{
     SshAgentPreflightReport, ensure_remote_ssh_identities, print_preflight_report,
     ssh_destination_from_command,
 };
-
-/// Structured SSH fields for one remote host (from config).
-#[derive(Debug, Clone)]
-pub struct RemoteHostConfig {
-    pub name: String,
-    /// SSH destination (alias, hostname, or `user@host`).
-    pub ssh: String,
-    /// Remote binary (default `"myco"`).
-    pub myco: String,
-    /// Extra `-o key=value` options (BatchMode always added).
-    pub ssh_options: Vec<String>,
-    pub identity_file: Option<String>,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-}
-
-impl RemoteHostConfig {
-    /// Build the argv for `ssh … myco --mode host --name <name>`.
-    pub fn spawn_command(&self) -> Vec<String> {
-        let mut cmd = vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()];
-        for opt in &self.ssh_options {
-            let opt = opt.trim();
-            if opt.is_empty() {
-                continue;
-            }
-            // Avoid duplicating BatchMode if the user listed it.
-            if opt.eq_ignore_ascii_case("BatchMode=yes")
-                || opt.eq_ignore_ascii_case("BatchMode=Yes")
-            {
-                continue;
-            }
-            cmd.push("-o".into());
-            cmd.push(opt.to_string());
-        }
-        if let Some(id) = &self.identity_file {
-            let id = id.trim();
-            if !id.is_empty() {
-                cmd.push("-i".into());
-                cmd.push(id.to_string());
-            }
-        }
-        if let Some(port) = self.port {
-            cmd.push("-p".into());
-            cmd.push(port.to_string());
-        }
-        if let Some(user) = &self.user {
-            let user = user.trim();
-            if !user.is_empty() {
-                cmd.push("-l".into());
-                cmd.push(user.to_string());
-            }
-        }
-        cmd.push(self.ssh.clone());
-        cmd.push(self.myco.clone());
-        cmd.push("--mode".into());
-        cmd.push("host".into());
-        cmd.push("--name".into());
-        cmd.push(self.name.clone());
-        cmd
-    }
-}
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -732,29 +672,6 @@ mod tests {
         unsafe {
             std::env::remove_var("MYCO_HOME");
         }
-    }
-
-    #[test]
-    fn remote_spawn_command_shape() {
-        let r = RemoteHostConfig {
-            name: "devbox".into(),
-            ssh: "devbox".into(),
-            myco: "myco".into(),
-            ssh_options: vec!["ConnectTimeout=5".into()],
-            identity_file: Some("~/.ssh/id".into()),
-            port: Some(22),
-            user: Some("alice".into()),
-        };
-        let cmd = r.spawn_command();
-        assert_eq!(cmd[0], "ssh");
-        assert!(cmd.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
-        assert!(cmd.windows(2).any(|w| w == ["-o", "ConnectTimeout=5"]));
-        assert!(cmd.windows(2).any(|w| w == ["-i", "~/.ssh/id"]));
-        assert!(cmd.windows(2).any(|w| w == ["-p", "22"]));
-        assert!(cmd.windows(2).any(|w| w == ["-l", "alice"]));
-        assert!(cmd.iter().any(|s| s == "devbox"));
-        assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
-        assert!(cmd.windows(2).any(|w| w == ["--name", "devbox"]));
     }
 
     #[tokio::test]

@@ -179,11 +179,11 @@ impl TextSearchEngine {
         });
     }
 
-    /// Engine with no watch-event bridge thread.
+    /// Test-only engine with no watch-event bridge thread.
     ///
-    /// For instances that exist only to list tool specs (and for tests) —
-    /// even the bridge thread of [`Self::new`] is work a throwaway instance
-    /// must not spawn.
+    /// (Catalog listing no longer needs an engine at all — schemas are
+    /// static; see `HostWorker::standard_tool_specs`.)
+    #[cfg(test)]
     pub fn detached() -> Self {
         let (event_tx, _event_rx) = std::sync::mpsc::channel::<WatchMsg>();
         let index = SearchIndex::new().expect("tantivy ram index");

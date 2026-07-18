@@ -3,11 +3,12 @@
 //! Runs once at application startup: [`Config::resolve`] takes optional
 //! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), reads the
 //! process environment, and produces fully resolved settings — per-backend
-//! credentials/base URLs, the harness/host-pool config loaded from disk
-//! (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), the interactive
-//! default model (`--model` → config file `model` → [`DEFAULT_MODEL`]), and
-//! the color decision for stdout rendering. Downstream code checks the
-//! resolved fields; nothing else reads these environment variables.
+//! credentials/base URLs, the host pool (knobs from `--config` →
+//! `$MYCO_CONFIG` → `~/.myco/config.toml`; remote hosts from `~/.ssh/config`
+//! `Host` aliases), the interactive default model (`--model` → config file
+//! `model` → [`DEFAULT_MODEL`]), and the color decision for stdout rendering.
+//! Downstream code checks the resolved fields; nothing else reads these
+//! environment variables.
 //!
 //! Credential fallbacks: `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` double
 //! as the fallback credential for the OpenAI and xAI backends, and
@@ -24,7 +25,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::generative_model::{self, BackendKind, Model};
-use crate::harness::{FileConfig, HarnessConfig, load_file_config};
+use crate::harness::{FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases};
 
 pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -171,15 +172,17 @@ pub struct Config {
     /// Path the harness config was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
-    /// Host-pool config from that path. Missing file → local-only default.
+    /// Host pool: knobs from the config file (missing file → defaults) plus
+    /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
     /// Interactive default model (override → config file `model` → [`DEFAULT_MODEL`]).
     pub model: Model,
 }
 
 impl Config {
-    /// Resolve from the real process environment, stdout TTY state, and the
-    /// config file. Errors carry the offending path.
+    /// Resolve from the real process environment, stdout TTY state, the
+    /// config file, and `~/.ssh/config` host aliases. Errors carry the
+    /// offending path.
     pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
         Self::resolve_with(
@@ -187,16 +190,19 @@ impl Config {
             |k| std::env::var(k).ok(),
             stdout_is_tty,
             load_file_config,
+            load_ssh_host_aliases,
         )
     }
 
-    /// Resolution against an injected environment and config-file loader
-    /// (tests, embedders). Empty environment values are treated as unset.
+    /// Resolution against an injected environment, config-file loader, and
+    /// ssh-alias source (tests, embedders). Empty environment values are
+    /// treated as unset.
     pub fn resolve_with(
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
         stdout_is_tty: bool,
         load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
+        ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
@@ -216,9 +222,7 @@ impl Config {
             Some(s) => s.parse::<Model>()?,
             None => file.model.unwrap_or(DEFAULT_MODEL),
         };
-        let harness = file
-            .into_harness_config()
-            .map_err(|e| format!("config {}: {e}", harness_config_path.display()))?;
+        let harness = file.into_harness_config(ssh_aliases()?);
         let (anthropic, openai, xai) = resolve_credentials(anthropic, openai, xai, &env);
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
 
@@ -400,7 +404,14 @@ mod tests {
         env: impl Fn(&str) -> Option<String>,
         stdout_is_tty: bool,
     ) -> Config {
-        Config::resolve_with(settings, env, stdout_is_tty, |_| Ok(FileConfig::default())).unwrap()
+        Config::resolve_with(
+            settings,
+            env,
+            stdout_is_tty,
+            |_| Ok(FileConfig::default()),
+            || Ok(Vec::new()),
+        )
+        .unwrap()
     }
 
     fn resolve(pairs: &[(&str, &str)]) -> Config {
@@ -618,22 +629,35 @@ mod tests {
             harness_config_path: Some(PathBuf::from("/tmp/h.toml")),
             ..Default::default()
         };
-        let cfg = Config::resolve_with(settings, env_of(&[]), false, |p| {
-            assert_eq!(p, Path::new("/tmp/h.toml"));
-            Ok(FileConfig {
-                attach_timeout_secs: 42,
-                ..Default::default()
-            })
-        })
+        let cfg = Config::resolve_with(
+            settings,
+            env_of(&[]),
+            false,
+            |p| {
+                assert_eq!(p, Path::new("/tmp/h.toml"));
+                Ok(FileConfig {
+                    attach_timeout_secs: 42,
+                    ..Default::default()
+                })
+            },
+            || Ok(vec!["devbox".into()]),
+        )
         .unwrap();
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
+        // ssh aliases become the remote host pool.
+        assert_eq!(cfg.harness.remote_hosts.len(), 1);
+        assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
     }
 
     #[test]
     fn harness_load_error_propagates() {
-        let err = Config::resolve_with(ConfigUserSettings::default(), env_of(&[]), false, |_| {
-            Err("invalid config TOML".into())
-        })
+        let err = Config::resolve_with(
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            false,
+            |_| Err("invalid config TOML".into()),
+            || Ok(Vec::new()),
+        )
         .unwrap_err();
         assert!(err.contains("invalid config TOML"));
     }
@@ -653,6 +677,7 @@ mod tests {
             env_of(&[]),
             false,
             file_model,
+            || Ok(Vec::new()),
         )
         .unwrap();
         assert_eq!(cfg.model, Model::ClaudeOpus48);
@@ -662,7 +687,8 @@ mod tests {
             model: Some("claude-haiku-4.5".into()),
             ..Default::default()
         };
-        let cfg = Config::resolve_with(settings, env_of(&[]), false, file_model).unwrap();
+        let cfg = Config::resolve_with(settings, env_of(&[]), false, file_model, || Ok(Vec::new()))
+            .unwrap();
         assert_eq!(cfg.model, Model::ClaudeHaiku45);
     }
 
@@ -672,8 +698,14 @@ mod tests {
             model: Some("gpt-99".into()),
             ..Default::default()
         };
-        let err = Config::resolve_with(settings, env_of(&[]), false, |_| Ok(FileConfig::default()))
-            .unwrap_err();
+        let err = Config::resolve_with(
+            settings,
+            env_of(&[]),
+            false,
+            |_| Ok(FileConfig::default()),
+            || Ok(Vec::new()),
+        )
+        .unwrap_err();
         assert!(err.contains("Unknown model"), "{err}");
     }
 }

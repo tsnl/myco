@@ -50,6 +50,11 @@ hosts, or lies about resume.
 - **Module docs state role and invariants**, not a walkthrough of the file.
   Comments teach *why* and constraints; they never narrate what the next line
   does.
+- **The only comments that ship in a PR are comments that should live in the
+  codebase.** A comment that narrates the change, addresses a reviewer, or
+  restates a design discussion belongs in the PR description or commit
+  message, not the code. If it would not make sense to a reader who never saw
+  the PR, cut it.
 - **Terminology stays stable.** Prefer **host** (execution place for tools:
   `local` in-process or remote worker) over “machine/node/target” in code,
   config, tool schemas, and CLI. User-facing marketing may say “machines”;
@@ -74,7 +79,7 @@ myco (interactive) / Agent
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Startup resolution: backend credentials/base URLs, harness config file, color decision |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
-| `src/harness/` | Host pool, config (`[[remote_hosts]]`), SSH preflight, subagent service |
+| `src/harness/` | Host pool, config (`~/.ssh/config` hosts + `~/.myco/config.toml` knobs), SSH preflight, subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok) backends |
@@ -156,7 +161,7 @@ cargo run --locked --bin myco
 ## What not to do
 
 - Don’t rename the **host** domain (`host` tool field, `--mode host`,
-  `/hosts`, `[[remote_hosts]]`, `src/host/`) for cosmetic synonyms without an
+  `/hosts`, `src/host/`) for cosmetic synonyms without an
   explicit, breakage-aware migration plan.
 - Don’t scp prebuilt `myco` binaries across mismatched OS/arch/libc; build on
   the target or use a matching asset (`harness-ops`).

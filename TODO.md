@@ -39,7 +39,8 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
     - `generate_error_before_assistant_keeps_only_user`
     - `resume_after_tools_mid_turn_continues_cleanly`
   - CLI `/help` documents well-formed history on generate error / cancel (no stale caveat).
-- [ ] **Paste / newline submit** — chord newlines exist (Alt/Shift-Enter, Ctrl-J); no
+- [ ] **Paste / newline submit** — chord newlines exist (Alt-Enter, Ctrl-J; Shift-Enter
+      only on the Windows console — Unix terminals send it as plain Enter); no
       bracketed-paste handling. Terminal paste that injects bare newlines can still
       AcceptLine early (rustyline 15 default). Confirm on real paste; enable bracketed
       paste / filter if so.

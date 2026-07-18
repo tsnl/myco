@@ -5,7 +5,7 @@ hosts look wrong, or the user asks you to update `myco` / explain the harness.
 
 ## Host PATH prerequisites
 
-Same executables as README **Requirements** (extra binaries on `PATH`). Install on each machine
+Same executables as the README **Install** section (extra binaries on `PATH`). Install on each machine
 that runs the agent and/or host tools; remotes need what their host tools spawn, not only the
 agent laptop.
 
@@ -27,11 +27,14 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 
 ## Finding configured hosts
 
-- **Local** is always present (in-process); it does not appear under `[[remote_hosts]]`.
-- Remotes live in **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) as
-  `[[remote_hosts]]` entries (`name`, `ssh`, optional `myco` / `user` / `port` / …).
+- **Local** is always present (in-process); it is never configured.
+- Remotes are the concrete `Host` aliases in **`~/.ssh/config`** (`Include`s are
+  followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
+  is reserved). Host name == alias == SSH destination.
+- **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
+  `enable_subagent`, `attach_timeout_secs`.
 
-- Read that file with tools when you need remote names or SSH destinations.
+- Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
 - Tell the user to run **`/hosts`** for live attach status (local ok/in-process; remotes idle / ok / DOWN); you cannot run slash-commands.
 - Host tool field `host` must match a configured name (`local` or a remote `name`). Omitted → `local`.
 
@@ -122,7 +125,7 @@ release asset.
 ### Install on each remote host (build from source)
 
 ```bash
-HOST=devbox   # ssh destination / Host alias from remote_hosts.ssh
+HOST=devbox   # Host alias from ~/.ssh/config (== myco host name)
 # /tmp/myco-src.tgz is either a GitHub release source tarball or a local git archive.
 scp -o BatchMode=yes /tmp/myco-src.tgz "$HOST:/tmp/myco-src.tgz"
 ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
@@ -163,7 +166,8 @@ When tools fail or the user asks why something is broken, investigate with tools
 
 1. **Host down / unavailable**
    - **Local** never needs a host subprocess; if local tools fail, debug the agent process itself.
-   - Read `~/.myco/config.toml` (or `$MYCO_CONFIG`) for `[[remote_hosts]]` names and `ssh` destinations.
+   - Read `~/.ssh/config` for `Host` aliases (remote names == destinations);
+     `~/.myco/config.toml` (or `$MYCO_CONFIG`) only for knobs.
    - On remote: `ssh -o BatchMode=yes <alias> 'which myco; myco --help'` via the
      **local** host's bash. If missing/outdated: install a **binary built for that
      platform** (release asset — weights already embedded), or **build on that host**
@@ -188,5 +192,5 @@ When tools fail or the user asks why something is broken, investigate with tools
    - No mid-flight cancel over the host pipe yet; Ctrl-C cancels the agent turn locally.
    - You cannot invoke slash-commands; tell the user which to run.
 
-When helping the user change config, prefer **surgical edits** to `~/.myco/config.toml` and show
-a minimal diff. Ask before destructive remote installs.
+When helping the user change config, prefer **surgical edits** to `~/.ssh/config` (hosts) or
+`~/.myco/config.toml` (knobs) and show a minimal diff. Ask before destructive remote installs.
