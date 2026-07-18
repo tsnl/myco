@@ -40,26 +40,6 @@ impl Default for OpenAIResponsesBackendConfig {
     }
 }
 
-impl OpenAIResponsesBackendConfig {
-    pub fn default_from_env() -> Self {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .or_else(|_| std::env::var("XAI_API_BASE_URL"))
-            .unwrap_or_else(|_| "https://api.x.ai/v1".into());
-
-        let auth_token = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("XAI_API_KEY"))
-            .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .unwrap_or_default();
-
-        Self {
-            base_url,
-            auth_token,
-            ..Default::default()
-        }
-    }
-}
-
 /// Stateless OpenAI Responses driver. Conversation history is owned by the caller.
 pub struct OpenAIResponsesGenerativeModel {
     model: Model,

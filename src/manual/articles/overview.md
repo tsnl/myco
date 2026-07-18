@@ -37,6 +37,7 @@ myco (interactive) / Agent
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
 
 ```toml
+# model = "grok-4.5-build"    # default CLI model (--model overrides)
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
@@ -54,7 +55,8 @@ attach_timeout_secs = 10
 ## API credentials & models
 
 Loaded from the process environment; `dotenvy` also loads a `.env` in the cwd at startup.
-Default CLI model is **`grok-4.5-build`**. Override with `myco --model <id>`.
+Default CLI model is **`grok-4.5-build`**; set `model = "<id>"` in config.toml to change
+it, or pass `myco --model <id>` (flag wins).
 
 **Anthropic Messages** (Claude models: `claude-haiku-4-5`, `claude-sonnet-4-6`,
 `claude-opus-4-8`, `claude-fable-5`, …):
@@ -71,9 +73,14 @@ Default CLI model is **`grok-4.5-build`**. Override with `myco --model <id>`.
 | `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required; see fallback) |
 | `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
 
-Token resolution for OpenAI Responses: `OPENAI_API_KEY` → `XAI_API_KEY` →
-`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `OPENAI_BASE_URL` →
-`XAI_API_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+Token resolution for OpenAI Responses: `XAI_API_KEY` → `OPENAI_API_KEY` →
+`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `XAI_API_BASE_URL` →
+`OPENAI_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+
+All resolution happens in one startup step (`myco::config::Config`), which also
+loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`)
+and decides color output: sections are colored when stdout is a TTY, controlled by
+`--color auto|always|never` plus `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`.
 
 Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
 Responses). Empty credentials fail model creation at startup.

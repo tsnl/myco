@@ -41,19 +41,6 @@ impl Default for AnthropicBackendConfig {
     }
 }
 
-impl AnthropicBackendConfig {
-    pub fn default_from_env() -> Self {
-        Self {
-            anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".into()),
-            anthropic_auth_token: std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-                .unwrap_or_default(),
-            ..Default::default()
-        }
-    }
-}
-
 /// Stateless Anthropic driver. Conversation history is owned by the caller.
 pub struct AnthropicGenerativeModel {
     model: Model,

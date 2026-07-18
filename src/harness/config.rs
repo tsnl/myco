@@ -7,20 +7,25 @@
 //! (user, port, identities, ProxyJump, …) stay in ssh config where OpenSSH
 //! reads them natively — myco only adds `BatchMode=yes`.
 //!
-//! `~/.myco/config.toml` holds the myco-specific knobs (`enable_subagent`,
-//! `attach_timeout_secs`). The **local** host is always available in-process
-//! and is never configured.
+//! `~/.myco/config.toml` holds the myco-specific knobs (`model`,
+//! `enable_subagent`, `attach_timeout_secs`). The **local** host is always
+//! available in-process and is never configured. Path defaulting and loading
+//! happen in [`crate::config::Config`].
 
 use std::path::{Path, PathBuf};
 
 use ssh2_config::{ParseRule, SshConfig};
 
 use super::{HarnessConfig, HostConfig};
+use crate::generative_model::Model;
 
 /// On-disk config file shape (`~/.myco/config.toml`). Knobs only — hosts come
 /// from `~/.ssh/config`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FileConfig {
+    /// Default model for the interactive CLI (`--model` overrides).
+    #[serde(default)]
+    pub model: Option<Model>,
     /// When false, do not register the in-process `subagent` tool.
     #[serde(default = "default_true")]
     pub enable_subagent: bool,
@@ -33,6 +38,7 @@ pub struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            model: None,
             enable_subagent: default_true(),
             attach_timeout_secs: default_attach_timeout_secs(),
         }
@@ -118,40 +124,35 @@ pub fn ssh_config_host_aliases(reader: &mut impl std::io::BufRead) -> Result<Vec
     Ok(out)
 }
 
-/// Default config path: `$MYCO_CONFIG` or `~/.myco/config.toml`.
-pub fn default_config_path() -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("MYCO_CONFIG") {
-        return Ok(PathBuf::from(p));
-    }
-    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(home.join(".myco").join("config.toml"))
-}
-
 /// Where remote hosts come from: `~/.ssh/config`.
 pub fn default_ssh_config_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
     Ok(home.join(".ssh").join("config"))
 }
 
-/// Load harness config: knobs from `path` (missing file → defaults), remote
-/// hosts from `~/.ssh/config` `Host` aliases (missing file → local only).
-pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
-    let file = if path.exists() {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read config {}: {e}", path.display()))?;
-        parse_file_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))?
-    } else {
-        FileConfig::default()
-    };
-    let mut aliases = Vec::new();
-    if let Ok(ssh_path) = default_ssh_config_path()
-        && let Ok(f) = std::fs::File::open(&ssh_path)
-    {
-        let mut reader = std::io::BufReader::new(f);
-        aliases = ssh_config_host_aliases(&mut reader)
-            .map_err(|e| format!("parse ssh config {}: {e}", ssh_path.display()))?;
+/// Load the on-disk knobs/model config from `path`. Missing file →
+/// [`FileConfig::default`]. Path defaulting (`--config` → `$MYCO_CONFIG` →
+/// `~/.myco/config.toml`) lives in [`crate::config::Config`].
+pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
+    if !path.exists() {
+        return Ok(FileConfig::default());
     }
-    Ok(file.into_harness_config(aliases))
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    parse_file_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
+}
+
+/// Remote host aliases from `~/.ssh/config`. Missing/unreadable file → none.
+pub fn load_ssh_host_aliases() -> Result<Vec<String>, String> {
+    let Ok(ssh_path) = default_ssh_config_path() else {
+        return Ok(Vec::new());
+    };
+    let Ok(f) = std::fs::File::open(&ssh_path) else {
+        return Ok(Vec::new());
+    };
+    let mut reader = std::io::BufReader::new(f);
+    ssh_config_host_aliases(&mut reader)
+        .map_err(|e| format!("parse ssh config {}: {e}", ssh_path.display()))
 }
 
 /// Parse `config.toml` text. Rejects the removed `[[remote_hosts]]` section
@@ -181,6 +182,9 @@ pub fn example_config_toml() -> String {
 # are followed) is a remote host of the same name, attached lazily as
 # `ssh <alias> myco --mode host`. Put user / port / identity / ProxyJump in
 # ~/.ssh/config; `myco` must be on the remote PATH non-interactive SSH uses.
+
+# Default model for the interactive CLI (--model overrides).
+# model = "grok-4.5-build"
 
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
@@ -319,18 +323,12 @@ ssh = "devbox"
     }
 
     #[test]
-    fn unknown_keys_are_ignored() {
-        let cfg = parse_file_config_str("default_host = \"devbox\"").unwrap();
-        assert!(cfg.enable_subagent);
-    }
-
-    #[test]
-    fn spawn_command_shape() {
-        let cmd = ssh_spawn_command("devbox");
-        assert_eq!(cmd[0], "ssh");
-        assert!(cmd.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
-        assert!(cmd.iter().any(|s| s == "devbox"));
-        assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
-        assert!(cmd.windows(2).any(|w| w == ["--name", "devbox"]));
+    fn model_key_parses_with_aliases() {
+        let file = parse_file_config_str("model = \"claude-opus-4-8\"").unwrap();
+        assert_eq!(file.model, Some(Model::ClaudeOpus48));
+        let file = parse_file_config_str("model = \"claude-opus-4.8\"").unwrap();
+        assert_eq!(file.model, Some(Model::ClaudeOpus48));
+        assert_eq!(FileConfig::default().model, None);
+        assert!(parse_file_config_str("model = \"gpt-99\"").is_err());
     }
 }

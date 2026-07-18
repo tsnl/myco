@@ -44,7 +44,10 @@ Set API credentials for your backend first (Anthropic Messages or xAI / OpenAI
 Responses; read from the process environment, and a `.env` in the cwd is also
 loaded). The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
-`myco --help overview` once installed.
+`myco --help overview` once installed. Set a default model with
+`model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript
+sections are colored when stdout is a TTY (`--color auto|always|never`;
+`NO_COLOR` / `CLICOLOR_FORCE` honored).
 
 Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by

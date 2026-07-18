@@ -77,6 +77,7 @@ myco (interactive) / Agent
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
+| `src/config/` | Startup resolution: backend credentials/base URLs, harness config file, color decision |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
 | `src/harness/` | Host pool, config (`~/.ssh/config` hosts + `~/.myco/config.toml` knobs), SSH preflight, subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
