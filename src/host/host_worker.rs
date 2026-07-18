@@ -42,13 +42,21 @@ impl HostWorker {
         Self::new(name, Self::standard_services())
     }
 
+    /// Standard worker whose owner supplies the text-search service — use
+    /// when the owner keeps a handle to request auto-indexing
+    /// ([`TextSearchToolService::auto_index_under`]). Construction itself
+    /// never indexes.
+    pub fn standard_with_search(name: impl Into<String>, search: TextSearchToolService) -> Self {
+        Self::new(name, Self::services_with_search(search))
+    }
+
     /// Standard service list for building an extended local worker.
+    /// No indexing happens at construction (see [`Self::standard_with_search`]).
     pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
-        // Auto-indexes .claude/skills, SKILL.md dirs, AGENTS.md under cwd.
         Self::services_with_search(TextSearchToolService::new())
     }
 
-    fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
+    pub(crate) fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
