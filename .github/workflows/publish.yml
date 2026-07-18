@@ -99,7 +99,10 @@ jobs:
 
       - name: Semver bump and cargo publish
         id: publish
-        uses: tsnl/semver-bump-and-cargo-publish@v1
+        # v1.0.4: waits for checks on the publish branch HEAD (not the trigger
+        # commit), which the push-triggered fallback above depends on. Pinned
+        # by SHA; safe to move back to @v1 once that tag includes this commit.
+        uses: tsnl/semver-bump-and-cargo-publish@d5a83f38ef1c7d2d4949a98e0425a466efa70c92
         with:
           branch: ${{ steps.params.outputs.branch }}
           bump_type: ${{ steps.params.outputs.bump_type }}

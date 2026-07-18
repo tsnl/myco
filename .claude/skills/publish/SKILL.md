@@ -108,14 +108,10 @@ from that file:
 - Remove the request file (and notes file, if desired) from the branch
   once the release is verified.
 
-**Check-wait caveat**: `tsnl/semver-bump-and-cargo-publish@v1` waits for
-check runs on the workflow's *trigger commit*, not on the tip of the
-`branch` being published. CI does not normally run on `claude/**`
-branches (no push trigger, and there may be no PR), so a push-triggered
-publish stalls in the wait loop until timeout unless CI runs on that
-exact commit. Until the action is fixed to wait on the publish branch
-HEAD, temporarily add your session branch to `ci.yml`'s `on.push.branches`
-in the same commit as the publish request, and remove it during cleanup.
+The semver action (v1.0.4+, pinned by SHA in publish.yml) waits for
+check runs on the publish branch's checked-out HEAD — for `main`, the
+checks its CI push run already produced — so no CI configuration is
+needed on the request branch itself.
 
 ## Choose bump type
 
