@@ -1,8 +1,9 @@
-//! OpenAI Responses API backend (also used by xAI / Grok gateways).
+//! OpenAI Responses API backend (also used by xAI / Grok and OpenRouter gateways).
 //!
 //! Ref: https://platform.openai.com/docs/api-reference/responses
 //! Streaming: https://platform.openai.com/docs/guides/streaming-responses?api-mode=responses
 //! xAI: https://docs.x.ai/docs/guides/function-calling
+//! OpenRouter: https://openrouter.ai/docs/api/api-reference/responses/create-responses
 
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use super::*;
 /// OpenAI Responses API settings ([`BackendConfig::OpenAIResponses`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenAIResponsesBackendConfig {
-    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1`.
-    /// Requests go to `{base_url}/responses`.
+    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1` or
+    /// `https://openrouter.ai/api/v1`. Requests go to `{base_url}/responses`.
     pub base_url: String,
     pub auth_token: String,
     pub max_output_tokens: Option<usize>,
@@ -64,11 +65,14 @@ impl OpenAIResponsesGenerativeModel {
         }
 
         if backend.auth_token.is_empty() {
-            return Err(ModelCreationError::BadConfig(
-                "OpenAI Responses auth token is empty (set auth_token, OPENAI_API_KEY, \
-                 XAI_API_KEY, or ANTHROPIC_AUTH_TOKEN)"
-                    .into(),
-            ));
+            let hint = if config.model.served_via_openrouter() {
+                "set auth_token or OPENROUTER_API_KEY"
+            } else {
+                "set auth_token, OPENAI_API_KEY, XAI_API_KEY, or ANTHROPIC_AUTH_TOKEN"
+            };
+            return Err(ModelCreationError::BadConfig(format!(
+                "OpenAI Responses auth token is empty ({hint})"
+            )));
         }
 
         let client = reqwest::ClientBuilder::new()

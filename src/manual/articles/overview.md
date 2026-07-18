@@ -84,8 +84,21 @@ loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config
 and decides color output: sections are colored when stdout is a TTY, controlled by
 `--color auto|always|never` plus `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`.
 
+**OpenRouter** (vendor-prefixed slugs, served over the same OpenAI Responses
+protocol): `moonshotai/kimi-k3`, `deepseek/deepseek-v4-pro`,
+`deepseek/deepseek-v4-flash`, `google/gemini-3.5-flash`,
+`google/gemini-3.1-pro-preview`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`,
+`openai/gpt-5.6-luna`. The vendor prefix may be dropped on the CLI
+(`--model kimi-k3`).
+
+| Variable | Role |
+|----------|------|
+| `OPENROUTER_API_KEY` | Bearer token (required) |
+| `OPENROUTER_BASE_URL` | Base URL (default `https://openrouter.ai/api/v1`) |
+
 Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
-Responses). Empty credentials fail model creation at startup.
+Responses via xAI; vendor-prefixed slugs → OpenAI Responses via OpenRouter).
+Empty credentials fail model creation at startup.
 
 ## Host routing
 

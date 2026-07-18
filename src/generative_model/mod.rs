@@ -57,6 +57,28 @@ pub enum Model {
         alias = "grok-4.5-build[1m]"
     )]
     Grok45Build,
+    // OpenRouter gateway (OpenAI Responses protocol; canonical ids are the
+    // vendor-prefixed OpenRouter slugs, aliases drop the vendor prefix)
+    #[serde(rename = "moonshotai/kimi-k3", alias = "kimi-k3")]
+    KimiK3,
+    #[serde(rename = "deepseek/deepseek-v4-pro", alias = "deepseek-v4-pro")]
+    DeepSeekV4Pro,
+    #[serde(rename = "deepseek/deepseek-v4-flash", alias = "deepseek-v4-flash")]
+    DeepSeekV4Flash,
+    #[serde(rename = "google/gemini-3.5-flash", alias = "gemini-3.5-flash")]
+    Gemini35Flash,
+    #[serde(
+        rename = "google/gemini-3.1-pro-preview",
+        alias = "gemini-3.1-pro-preview",
+        alias = "gemini-3.1-pro"
+    )]
+    Gemini31ProPreview,
+    #[serde(rename = "openai/gpt-5.6-sol", alias = "gpt-5.6-sol")]
+    Gpt56Sol,
+    #[serde(rename = "openai/gpt-5.6-terra", alias = "gpt-5.6-terra")]
+    Gpt56Terra,
+    #[serde(rename = "openai/gpt-5.6-luna", alias = "gpt-5.6-luna")]
+    Gpt56Luna,
 }
 
 /// Which API protocol a model is served over.
@@ -171,6 +193,14 @@ impl Model {
             Model::ClaudeSonnet5 => "claude-sonnet-4-6",
             Model::ClaudeHaiku45 => "claude-haiku-4-5",
             Model::Grok45Build => "grok-4.5-build",
+            Model::KimiK3 => "moonshotai/kimi-k3",
+            Model::DeepSeekV4Pro => "deepseek/deepseek-v4-pro",
+            Model::DeepSeekV4Flash => "deepseek/deepseek-v4-flash",
+            Model::Gemini35Flash => "google/gemini-3.5-flash",
+            Model::Gemini31ProPreview => "google/gemini-3.1-pro-preview",
+            Model::Gpt56Sol => "openai/gpt-5.6-sol",
+            Model::Gpt56Terra => "openai/gpt-5.6-terra",
+            Model::Gpt56Luna => "openai/gpt-5.6-luna",
         }
     }
 
@@ -181,8 +211,24 @@ impl Model {
             | Model::ClaudeOpus48
             | Model::ClaudeSonnet5
             | Model::ClaudeHaiku45 => BackendKind::AnthropicMessages,
-            Model::Grok45Build => BackendKind::OpenAIResponses,
+            Model::Grok45Build
+            | Model::KimiK3
+            | Model::DeepSeekV4Pro
+            | Model::DeepSeekV4Flash
+            | Model::Gemini35Flash
+            | Model::Gemini31ProPreview
+            | Model::Gpt56Sol
+            | Model::Gpt56Terra
+            | Model::Gpt56Luna => BackendKind::OpenAIResponses,
         }
+    }
+
+    /// True when this model is served via the OpenRouter gateway by default.
+    ///
+    /// OpenRouter models use vendor-prefixed slugs (`vendor/model`); native
+    /// provider ids (`claude-*`, `grok-*`) have no `/`.
+    pub fn served_via_openrouter(self) -> bool {
+        self.api_id().contains('/')
     }
 
     /// Whether Anthropic thinking uses `thinking.type: "adaptive"` (+ effort)
@@ -193,7 +239,16 @@ impl Model {
     pub fn uses_adaptive_thinking(self) -> bool {
         match self {
             Model::ClaudeFable5 | Model::ClaudeOpus48 | Model::ClaudeSonnet5 => true,
-            Model::ClaudeHaiku45 | Model::Grok45Build => false,
+            Model::ClaudeHaiku45
+            | Model::Grok45Build
+            | Model::KimiK3
+            | Model::DeepSeekV4Pro
+            | Model::DeepSeekV4Flash
+            | Model::Gemini35Flash
+            | Model::Gemini31ProPreview
+            | Model::Gpt56Sol
+            | Model::Gpt56Terra
+            | Model::Gpt56Luna => false,
         }
     }
 
@@ -205,6 +260,15 @@ impl Model {
             Model::ClaudeSonnet5 => 1_000_000,
             Model::ClaudeHaiku45 => 200_000,
             Model::Grok45Build => 500_000,
+            // OpenRouter listings advertise ~1.05M for all of these; round down.
+            Model::KimiK3
+            | Model::DeepSeekV4Pro
+            | Model::DeepSeekV4Flash
+            | Model::Gemini35Flash
+            | Model::Gemini31ProPreview
+            | Model::Gpt56Sol
+            | Model::Gpt56Terra
+            | Model::Gpt56Luna => 1_000_000,
         }
     }
 }
@@ -229,6 +293,16 @@ impl std::str::FromStr for Model {
             }
             "claude-haiku-4-5" | "claude-haiku-4.5" => Ok(Model::ClaudeHaiku45),
             "grok-4.5-build" | "grok-4.5" | "grok-4.5-build[1m]" => Ok(Model::Grok45Build),
+            "moonshotai/kimi-k3" | "kimi-k3" => Ok(Model::KimiK3),
+            "deepseek/deepseek-v4-pro" | "deepseek-v4-pro" => Ok(Model::DeepSeekV4Pro),
+            "deepseek/deepseek-v4-flash" | "deepseek-v4-flash" => Ok(Model::DeepSeekV4Flash),
+            "google/gemini-3.5-flash" | "gemini-3.5-flash" => Ok(Model::Gemini35Flash),
+            "google/gemini-3.1-pro-preview" | "gemini-3.1-pro-preview" | "gemini-3.1-pro" => {
+                Ok(Model::Gemini31ProPreview)
+            }
+            "openai/gpt-5.6-sol" | "gpt-5.6-sol" => Ok(Model::Gpt56Sol),
+            "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Ok(Model::Gpt56Terra),
+            "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Ok(Model::Gpt56Luna),
             other => Err(format!("Unknown model: {other:?}")),
         }
     }
@@ -736,6 +810,82 @@ mod tests {
             BackendConfig::default_for_model(Model::Grok45Build).kind(),
             BackendKind::OpenAIResponses
         );
+        assert_eq!(
+            BackendConfig::default_for_model(Model::KimiK3).kind(),
+            BackendKind::OpenAIResponses
+        );
+    }
+
+    const OPENROUTER_MODELS: [Model; 8] = [
+        Model::KimiK3,
+        Model::DeepSeekV4Pro,
+        Model::DeepSeekV4Flash,
+        Model::Gemini35Flash,
+        Model::Gemini31ProPreview,
+        Model::Gpt56Sol,
+        Model::Gpt56Terra,
+        Model::Gpt56Luna,
+    ];
+
+    #[test]
+    fn openrouter_models_route_to_openai_responses_backend() {
+        for model in OPENROUTER_MODELS {
+            assert!(model.served_via_openrouter(), "{model}");
+            assert_eq!(
+                model.backend_kind(),
+                BackendKind::OpenAIResponses,
+                "{model}"
+            );
+            assert!(!model.uses_adaptive_thinking(), "{model}");
+            assert_eq!(model.context_window_tokens(), 1_000_000, "{model}");
+        }
+        assert!(!Model::Grok45Build.served_via_openrouter());
+        assert!(!Model::ClaudeFable5.served_via_openrouter());
+    }
+
+    #[test]
+    fn openrouter_ids_parse_display_and_serde_roundtrip() {
+        let cases = [
+            (Model::KimiK3, "moonshotai/kimi-k3", "kimi-k3"),
+            (
+                Model::DeepSeekV4Pro,
+                "deepseek/deepseek-v4-pro",
+                "deepseek-v4-pro",
+            ),
+            (
+                Model::DeepSeekV4Flash,
+                "deepseek/deepseek-v4-flash",
+                "deepseek-v4-flash",
+            ),
+            (
+                Model::Gemini35Flash,
+                "google/gemini-3.5-flash",
+                "gemini-3.5-flash",
+            ),
+            (
+                Model::Gemini31ProPreview,
+                "google/gemini-3.1-pro-preview",
+                "gemini-3.1-pro",
+            ),
+            (Model::Gpt56Sol, "openai/gpt-5.6-sol", "gpt-5.6-sol"),
+            (Model::Gpt56Terra, "openai/gpt-5.6-terra", "gpt-5.6-terra"),
+            (Model::Gpt56Luna, "openai/gpt-5.6-luna", "gpt-5.6-luna"),
+        ];
+        for (model, canonical, short) in cases {
+            assert_eq!(canonical.parse::<Model>().unwrap(), model);
+            assert_eq!(short.parse::<Model>().unwrap(), model);
+            assert_eq!(model.to_string(), canonical);
+            assert_eq!(model.api_id(), canonical);
+            // Serde canonical string matches api_id; short alias deserializes.
+            assert_eq!(
+                serde_json::to_value(model).unwrap(),
+                serde_json::json!(canonical)
+            );
+            assert_eq!(
+                serde_json::from_value::<Model>(serde_json::json!(short)).unwrap(),
+                model
+            );
+        }
     }
 
     #[test]

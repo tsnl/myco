@@ -82,7 +82,7 @@ myco (interactive) / Agent
 | `src/harness/` | Host pool, config (`~/.ssh/config` hosts + `~/.myco/config.toml` knobs), SSH preflight, subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok) backends |
+| `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok, OpenRouter) backends |
 | `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |

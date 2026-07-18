@@ -89,7 +89,8 @@ struct Args {
     #[arg(long, default_value = "local")]
     name: String,
 
-    /// Model id (e.g. claude-haiku-4-5, claude-opus-4-8, claude-sonnet-4-6, grok-4.5-build).
+    /// Model id (e.g. claude-opus-4-8, grok-4.5-build, or an OpenRouter slug like
+    /// moonshotai/kimi-k3, openai/gpt-5.6-sol; the vendor prefix may be dropped).
     /// Default: `model` from config.toml, else grok-4.5-build.
     #[arg(long)]
     model: Option<String>,
