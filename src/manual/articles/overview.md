@@ -108,14 +108,17 @@ Responses). Empty credentials fail model creation at startup.
 
 Root-only `memory` tool (agent process; shared by supervisor and subagents, across
 sessions). The document is a set of **atomic entries** — immutable, UUIDed,
-timestamped — that are only ever created (`append`) or deleted (`delete` by id).
-Each entry is a write-once file under `~/.myco/memory/{YYYY-MM}/` — nothing is
-rewritten in place and no locks are taken, so concurrent sessions cannot conflict even
-on weakly consistent network filesystems; readers resolve the document by listing
-entries in name (= time) order. `exact_search` (Tantivy) and `semantic_search` (MiniLM)
-index one document per entry, covering the **latest shard** only. Older shards stay on
-disk for bash/grep; GC (delete old shard dirs) is not automated yet. Distinct from the
-per-session `session_meta` scratchpad.
+timestamped, titled — that are only ever created (`append` with title + body) or
+deleted (`delete` by id). Each entry is a write-once file under
+`~/.myco/memory/{YYYY-MM}/` — nothing is rewritten in place and no locks are taken, so
+concurrent sessions cannot conflict even on weakly consistent network filesystems;
+readers resolve the document by listing entries in name (= time) order. `list` gives a
+compact id/timestamp/title index, `read` returns full entries (document view, or one by
+id), and `search` queries per-entry (mode `exact` = Tantivy, `semantic` = MiniLM) with
+entry-shaped hits. Search/list/document view cover the **latest shard** only; delete and
+read-by-id reach all shards. Older shards stay on disk for bash/grep; GC (delete old
+shard dirs) is not automated yet. Distinct from the per-session `session_meta`
+scratchpad.
 
 ## Product limits (V1)
 

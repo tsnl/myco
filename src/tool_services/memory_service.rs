@@ -1,7 +1,7 @@
 //! Root-only `memory` tool: persistent memory shared across agents and sessions.
 //!
 //! The memory document is a **set of atomic entries**: immutable, UUIDed,
-//! timestamped. Entries are only ever created or deleted — nothing is
+//! timestamped, titled. Entries are only ever created or deleted — nothing is
 //! rewritten in place and no locks are taken, so concurrent sessions and
 //! subagents are safe even on weakly consistent network filesystems
 //! (maildir's write-once-unique-name pattern). Each entry is one file,
@@ -10,6 +10,7 @@
 //! ```text
 //! {uuid}
 //! {UTC timestamp} ({local timestamp} local) agent={hex8}
+//! # {title}
 //!
 //! {body}
 //! ```
@@ -18,12 +19,13 @@
 //! joining with two blank lines. Timestamp shard dirs bound directory size
 //! and make GC a directory delete (not automated yet).
 //!
-//! Search uses a dedicated in-RAM [`SearchIndex`] with one document per entry
-//! file, covering only the **latest shard**; older shards stay on disk for
-//! bash/grep. The shard listing is diffed before each query so entries from
-//! concurrent myco processes appear and deleted files drop out. File reads
-//! and MiniLM embedding run on the blocking pool (same rule as the engine:
-//! candle never runs on an executor thread).
+//! Search, list, and the document view cover only the **latest shard**
+//! (delete / read-by-id reach all shards); older shards stay on disk for
+//! bash/grep. Search uses a dedicated in-RAM [`SearchIndex`] with one
+//! document per entry, diffed against the shard listing before each query so
+//! entries from concurrent myco processes appear and deleted files drop out.
+//! File reads and MiniLM embedding run on the blocking pool (same rule as the
+//! engine: candle never runs on an executor thread).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -34,7 +36,7 @@ use chrono::{Local, Utc};
 
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult, ToolUse};
-use crate::session::{myco_home, uuid_simple_hex};
+use crate::session::{myco_home, normalize_title, uuid_simple_hex};
 use crate::text_search::{Hit, SearchIndex, embed_for_index};
 
 use super::{HostDispatchContext, ToolService};
@@ -43,29 +45,32 @@ const TOOL_DESCRIPTION: &str = r#"
 Persistent memory shared across agents and sessions (one document per machine, under
 `~/.myco/memory/`).
 
-The document is a set of **atomic entries** — immutable, UUIDed, timestamped. Entries are
-only ever created or deleted (each is a write-once file `{YYYY-MM}/{timestamp}-{uuid}.md`;
-nothing is rewritten in place, no locks), so concurrent sessions and subagents never
-conflict. To correct a stale fact: append the corrected entry, then delete the old one.
-Searches cover only the latest month shard; older shards stay on disk for bash/grep
-(GC = delete a shard dir; not automated yet).
+The document is a set of **atomic entries** — immutable, UUIDed, timestamped, titled.
+Entries are only ever created or deleted (each is a write-once file; nothing is rewritten
+in place, no locks), so concurrent sessions and subagents never conflict. To correct a
+stale fact: append the corrected entry, then delete the old one. Search/list/read cover
+the latest month shard; delete and read-by-id reach all shards (older shards stay on disk
+for bash/grep; GC = delete a shard dir, not automated yet).
 
 Actions:
-- append: add an entry (markdown body; UUID + timestamp header added automatically).
-  Keep entries short, durable, one fact each — user preferences, project facts,
-  decisions, gotchas. Not a scratchpad: use session_meta set_scratchpad for
-  session-local notes. Returns the entry id.
-- delete: remove one entry by `id` (uuid from append/search results; unique prefix ok).
-  The deleted entry is echoed back, so a mistaken delete can be re-appended.
-- exact_search: Tantivy full-text over entries of the latest shard (identifiers,
-  literal phrases). Hits show entry ids and file:line refs.
-- semantic_search: Candle MiniLM cosine over per-entry embeddings (intent queries like
-  "how does the user prefer commits formatted").
+- append: add an entry. Requires `title` (short one-line label) and `text` (markdown
+  body); UUID + timestamp are added automatically and the id is returned. Keep entries
+  short, durable, one fact each — user preferences, project facts, decisions, gotchas.
+  Not a scratchpad: use session_meta set_scratchpad for session-local notes.
+- delete: remove one entry by `id` (uuid from append/list/search results; unique prefix
+  ok). The deleted entry is echoed back, so a mistaken delete can be re-appended.
+- list: compact index of entries (id, timestamp, title), newest first.
+- read: full entries — the document in time order (last `max_results`, default 50), or
+  one entry via `id`.
+- search: query entries. `mode` = "exact" (default; Tantivy full-text — identifiers,
+  literal phrases) or "semantic" (Candle MiniLM cosine — intent queries like "how does
+  the user prefer commits formatted"). Hits show entry ids for read/delete.
 "#;
 
 const MAX_APPEND_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_RESULTS: usize = 10;
-const MAX_MAX_RESULTS: usize = 100;
+const DEFAULT_READ_ENTRIES: usize = 50;
+const MAX_MAX_RESULTS: usize = 1000;
 
 /// Root-only tool service backed by `~/.myco/memory/` (see module docs).
 pub struct MemoryService {
@@ -85,6 +90,7 @@ struct EntryMeta {
     id: String,
     /// Timestamp/attribution line (entry line 2).
     stamp: String,
+    title: String,
 }
 
 impl IndexState {
@@ -147,28 +153,31 @@ impl ToolService for MemoryService {
                 Err(e) => return ToolResult::err(format!("invalid memory input: {e}")),
             };
             let result = match input.action {
-                ActionKind::Append => match input.text.as_deref() {
-                    Some(text) => self.append(ctx.agent_id, text),
-                    None => Err("append requires text".into()),
+                ActionKind::Append => match (input.title.as_deref(), input.text.as_deref()) {
+                    (Some(title), Some(text)) => self.append(ctx.agent_id, title, text),
+                    _ => Err("append requires title (short one-line label) and text".into()),
                 },
                 ActionKind::Delete => match input.id.as_deref() {
                     Some(id) => self.delete(id).await,
                     None => Err(
-                        "delete requires id (entry uuid from append/search results; \
+                        "delete requires id (entry uuid from append/list/search results; \
                          unique prefix ok)"
                             .into(),
                     ),
                 },
-                ActionKind::ExactSearch | ActionKind::SemanticSearch => {
-                    let semantic = matches!(input.action, ActionKind::SemanticSearch);
-                    match input.query.as_deref() {
-                        Some(query) => {
-                            let limit = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
-                            self.search(semantic, query, limit).await
-                        }
-                        None => Err(format!("{} requires query", input.action)),
-                    }
+                ActionKind::List => self.list().await,
+                ActionKind::Read => {
+                    let max = input.max_results.unwrap_or(DEFAULT_READ_ENTRIES);
+                    self.read(input.id.as_deref(), max).await
                 }
+                ActionKind::Search => match input.query.as_deref() {
+                    Some(query) => {
+                        let semantic = matches!(input.mode, Some(SearchMode::Semantic));
+                        let limit = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+                        self.search(semantic, query, limit).await
+                    }
+                    None => Err("search requires query".into()),
+                },
             };
             match result {
                 Ok(text) => ToolResult::text(text),
@@ -180,7 +189,8 @@ impl ToolService for MemoryService {
 
 impl MemoryService {
     /// Create one immutable entry as a new unique file.
-    fn append(&self, agent_id: uuid::Uuid, text: &str) -> Result<String, String> {
+    fn append(&self, agent_id: uuid::Uuid, title: &str, text: &str) -> Result<String, String> {
+        let title = normalize_title(title).map_err(|e| format!("append title: {e}"))?;
         let text = text.trim_end();
         if text.trim().is_empty() {
             return Err("append requires non-empty text".into());
@@ -213,56 +223,85 @@ impl MemoryService {
             .create_new(true)
             .open(&path)
             .map_err(|e| format!("create {}: {e}", path.display()))?;
-        f.write_all(format!("{id}\n{stamp}\n\n{text}\n").as_bytes())
+        f.write_all(format!("{id}\n{stamp}\n# {title}\n\n{text}\n").as_bytes())
             .map_err(|e| format!("write {}: {e}", path.display()))?;
 
         Ok(format!(
-            "appended\nid={id}\nfile={}\n{stamp}\n",
+            "appended\nid={id}\ntitle={title}\nfile={}\n{stamp}\n",
             path.display()
         ))
     }
 
     /// Delete one entry by uuid (or unique prefix), echoing its content.
     async fn delete(&self, id: &str) -> Result<String, String> {
-        let id = id.trim().to_ascii_lowercase();
-        if id.len() < 4 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!(
-                "delete id must be a hex entry uuid (unique prefix ok, min 4 chars), got {id:?}"
-            ));
-        }
         let dir = self.dir()?;
+        let id = id.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut matches: Vec<PathBuf> = Vec::new();
-            for shard in shard_dirs(&dir) {
-                for file in entry_files(&shard) {
-                    if entry_uuid(&file).is_some_and(|u| u.starts_with(&id)) {
-                        matches.push(file);
-                    }
-                }
-            }
-            match matches.as_slice() {
-                [] => Err(format!("no entry matching id {id:?}")),
-                [file] => {
-                    let content = std::fs::read_to_string(file).unwrap_or_default();
-                    std::fs::remove_file(file)
-                        .map_err(|e| format!("delete {}: {e}", file.display()))?;
-                    Ok(format!(
-                        "deleted {}\n--- deleted entry (append the body again to restore) ---\n{content}",
-                        file.display()
-                    ))
-                }
-                many => Err(format!(
-                    "ambiguous id {id:?}; candidates: {}",
-                    many.iter()
-                        .filter_map(|p| entry_uuid(p))
-                        .take(8)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            }
+            let file = resolve_entry_file(&dir, &id)?;
+            let content = std::fs::read_to_string(&file).unwrap_or_default();
+            std::fs::remove_file(&file).map_err(|e| format!("delete {}: {e}", file.display()))?;
+            Ok(format!(
+                "deleted {}\n--- deleted entry (append it again to restore) ---\n{content}",
+                file.display()
+            ))
         })
         .await
         .map_err(|e| format!("delete join: {e}"))?
+    }
+
+    /// Compact index of the latest shard's entries, newest first.
+    async fn list(&self) -> Result<String, String> {
+        let dir = self.dir()?;
+        let entries = tokio::task::spawn_blocking(move || load_latest_shard_entries(&dir))
+            .await
+            .map_err(|e| format!("list join: {e}"))??;
+        let (shard, loaded) = entries;
+        let mut out = format!(
+            "memory entries: {} (shard {}; newest first; latest shard only)\n",
+            loaded.len(),
+            shard.display()
+        );
+        for e in loaded.iter().rev() {
+            out.push_str(&format!("  {}  {}  {}\n", e.id, e.utc_stamp(), e.title));
+        }
+        Ok(out)
+    }
+
+    /// Full entries: the document in time order, or one entry by id.
+    async fn read(&self, id: Option<&str>, max_entries: usize) -> Result<String, String> {
+        let dir = self.dir()?;
+        if let Some(id) = id {
+            let id = id.to_string();
+            return tokio::task::spawn_blocking(move || {
+                let file = resolve_entry_file(&dir, &id)?;
+                std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))
+            })
+            .await
+            .map_err(|e| format!("read join: {e}"))?;
+        }
+
+        let max = max_entries.clamp(1, MAX_MAX_RESULTS);
+        let entries = tokio::task::spawn_blocking(move || load_latest_shard_entries(&dir))
+            .await
+            .map_err(|e| format!("read join: {e}"))??;
+        let (shard, loaded) = entries;
+        let total = loaded.len();
+        let shown = &loaded[total.saturating_sub(max)..];
+        let mut out = format!(
+            "memory document: showing {} of {} entries (shard {}; time order; latest shard only)\n---\n",
+            shown.len(),
+            total,
+            shard.display()
+        );
+        out.push_str(
+            &shown
+                .iter()
+                .map(|e| e.text.trim_end().to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n\n"),
+        );
+        out.push('\n');
+        Ok(out)
     }
 
     async fn search(
@@ -302,7 +341,7 @@ impl MemoryService {
 }
 
 // ---------------------------------------------------------------------------
-// Store: shard/entry listing, index refresh
+// Store: shard/entry listing, id resolve, index refresh
 // ---------------------------------------------------------------------------
 
 /// Timestamp shard dirs under `dir`, name-sorted ascending.
@@ -356,6 +395,88 @@ fn latest_populated_shard(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
         }
     }
     None
+}
+
+/// One entry file (all shards) whose uuid matches `id` (unique prefix ok).
+fn resolve_entry_file(dir: &Path, id: &str) -> Result<PathBuf, String> {
+    let id = id.trim().to_ascii_lowercase();
+    if id.len() < 4 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "entry id must be a hex uuid (unique prefix ok, min 4 chars), got {id:?}"
+        ));
+    }
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for shard in shard_dirs(dir) {
+        for file in entry_files(&shard) {
+            if entry_uuid(&file).is_some_and(|u| u.starts_with(&id)) {
+                matches.push(file);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [] => Err(format!("no entry matching id {id:?}")),
+        [one] => Ok(one.clone()),
+        many => Err(format!(
+            "ambiguous id {id:?}; candidates: {}",
+            many.iter()
+                .filter_map(|p| entry_uuid(p))
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+struct LoadedEntry {
+    id: String,
+    stamp: String,
+    title: String,
+    text: String,
+}
+
+impl LoadedEntry {
+    /// UTC part of the stamp line (first whitespace token).
+    fn utc_stamp(&self) -> &str {
+        self.stamp.split_whitespace().next().unwrap_or("")
+    }
+}
+
+fn parse_entry(path: &Path, text: String) -> LoadedEntry {
+    // Filename is authoritative for the id; body line 1 is the readable fallback.
+    let id = entry_uuid(path)
+        .or_else(|| text.lines().next().map(|l| l.trim().to_string()))
+        .unwrap_or_default();
+    let stamp = text.lines().nth(1).unwrap_or("").trim().to_string();
+    let title_line = text.lines().nth(2).unwrap_or("").trim();
+    let title = title_line
+        .strip_prefix("# ")
+        .unwrap_or(title_line)
+        .to_string();
+    LoadedEntry {
+        id,
+        stamp,
+        title,
+        text,
+    }
+}
+
+/// Latest shard's entries in time (= name) order, fully loaded.
+fn load_latest_shard_entries(dir: &Path) -> Result<(PathBuf, Vec<LoadedEntry>), String> {
+    let Some((shard, mut files)) = latest_populated_shard(dir) else {
+        return Err(format!(
+            "no memory recorded yet (no entry files under {}). Use memory append first.",
+            dir.display()
+        ));
+    };
+    files.sort();
+    let loaded = files
+        .into_iter()
+        .filter_map(|p| {
+            let text = std::fs::read_to_string(&p).ok()?;
+            Some(parse_entry(&p, text))
+        })
+        .collect();
+    Ok((shard, loaded))
 }
 
 fn path_key(path: &Path) -> String {
@@ -425,14 +546,17 @@ async fn refresh_index(state: &mut IndexState, dir: PathBuf) -> Result<PathBuf, 
     .map_err(|e| format!("embed join: {e}"))?;
 
     for (path, text, vector) in loaded {
-        // Filename is authoritative; body line 1 is the readable fallback.
-        let id = entry_uuid(&path)
-            .or_else(|| text.lines().next().map(|l| l.trim().to_string()))
-            .unwrap_or_default();
-        let stamp = text.lines().nth(1).unwrap_or("").trim().to_string();
+        let entry = parse_entry(&path, text.clone());
         let key = path_key(&path);
         state.index.upsert_file(&path, text, vector);
-        state.entries.insert(key, EntryMeta { id, stamp });
+        state.entries.insert(
+            key,
+            EntryMeta {
+                id: entry.id,
+                stamp: entry.stamp,
+                title: entry.title,
+            },
+        );
     }
     state.index.commit()?;
     Ok(shard)
@@ -458,12 +582,11 @@ fn format_report(
     for (i, h) in hits.iter().enumerate() {
         let meta = entries.get(&path_key(&h.path));
         out.push_str(&format!(
-            "\n[{}] score={:.4} id={} {}:{}\n",
+            "\n[{}] score={:.4} id={}  {}\n",
             i + 1,
             h.score,
             meta.map(|m| m.id.as_str()).unwrap_or("?"),
-            h.path.display(),
-            h.line_number.unwrap_or(1),
+            meta.map(|m| m.title.as_str()).unwrap_or(""),
         ));
         let stamp = meta.map(|m| m.stamp.as_str()).unwrap_or("");
         if !stamp.is_empty() {
@@ -475,9 +598,13 @@ fn format_report(
             .map(str::trim_end)
             .filter(|s| !s.is_empty())
             .or_else(|| Some(h.snippet.trim_end()).filter(|s| !s.is_empty()));
+        // Skip echoing lines the header already shows (title/stamp/id rows).
         if let Some(body) = body
             && body != stamp
-            && meta.is_none_or(|m| m.id != body)
+            && meta.is_none_or(|m| {
+                let plain = body.strip_prefix("# ").unwrap_or(body);
+                plain != m.title && body != m.id
+            })
         {
             out.push_str(&format!("  {body}\n"));
         }
@@ -491,16 +618,22 @@ fn format_report(
 #[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 struct Input {
     action: ActionKind,
-    /// Entry markdown body for `append` (UUID + timestamp header added automatically).
+    /// Short one-line label for `append` (required there).
+    #[serde(default)]
+    title: Option<String>,
+    /// Entry markdown body for `append` (UUID + timestamp added automatically).
     #[serde(default)]
     text: Option<String>,
-    /// Entry id for `delete` (uuid from append/search results; unique prefix ok).
+    /// Entry id for `delete` / `read` (uuid from results; unique prefix ok).
     #[serde(default)]
     id: Option<String>,
-    /// Query for `exact_search` / `semantic_search`.
+    /// Query for `search`.
     #[serde(default)]
     query: Option<String>,
-    /// Max hits (default 10, max 100).
+    /// Search mode: exact (default) or semantic.
+    #[serde(default)]
+    mode: Option<SearchMode>,
+    /// Max search hits (default 10) / max `read` entries (default 50).
     #[serde(default)]
     max_results: Option<usize>,
 }
@@ -510,19 +643,16 @@ struct Input {
 enum ActionKind {
     Append,
     Delete,
-    ExactSearch,
-    SemanticSearch,
+    List,
+    Read,
+    Search,
 }
 
-impl std::fmt::Display for ActionKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ActionKind::Append => write!(f, "append"),
-            ActionKind::Delete => write!(f, "delete"),
-            ActionKind::ExactSearch => write!(f, "exact_search"),
-            ActionKind::SemanticSearch => write!(f, "semantic_search"),
-        }
-    }
+#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchMode {
+    Exact,
+    Semantic,
 }
 
 #[cfg(test)]
@@ -531,6 +661,7 @@ mod tests {
     use crate::CancelToken;
     use serde_json::json;
     use std::fs;
+    use std::time::Duration;
 
     fn tmp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("myco-memory-{}", uuid::Uuid::new_v4()))
@@ -570,41 +701,46 @@ mod tests {
             .await
     }
 
-    #[tokio::test]
-    async fn each_append_is_a_new_immutable_uuid_entry_and_searchable() {
-        let dir = tmp_dir();
-        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
-
+    async fn append(svc: &Arc<MemoryService>, title: &str, text: &str) -> ToolResult {
         let r = call(
-            &svc,
-            json!({"action": "append", "text": "user prefers rebase-first workflow"}),
+            svc,
+            json!({"action": "append", "title": title, "text": text}),
         )
         .await;
         assert!(!r.is_error, "{r:?}");
+        r
+    }
+
+    #[tokio::test]
+    async fn append_makes_titled_uuid_entries_and_search_is_entry_shaped() {
+        let dir = tmp_dir();
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
+
+        let r = append(&svc, "Git workflow", "user prefers rebase-first workflow").await;
         let id = appended_id(&r);
         assert_eq!(id.len(), 32, "{id}");
-        assert!(tool_text(&r).contains("agent="), "{}", tool_text(&r));
+        assert!(
+            tool_text(&r).contains("title=Git workflow"),
+            "{}",
+            tool_text(&r)
+        );
 
-        let r = call(&svc, json!({"action": "exact_search", "query": "rebase"})).await;
+        let r = call(&svc, json!({"action": "search", "query": "rebase"})).await;
         assert!(!r.is_error, "{r:?}");
         let text = tool_text(&r);
         assert!(text.contains("rebase-first workflow"), "{text}");
         assert!(text.contains(&format!("id={id}")), "{text}");
+        assert!(text.contains("Git workflow"), "hits show titles: {text}");
         assert!(
-            text.contains(".md:"),
-            "hits should be file:line refs: {text}"
+            !text.contains(".md:"),
+            "search results are entry-shaped, not file refs: {text}"
         );
 
         // Second append is a new file in the same shard, picked up incrementally.
+        append(&svc, "CI host", "CI runs on unique_token_ci_gadget").await;
         let r = call(
             &svc,
-            json!({"action": "append", "text": "CI runs on unique_token_ci_gadget"}),
-        )
-        .await;
-        assert!(!r.is_error, "{r:?}");
-        let r = call(
-            &svc,
-            json!({"action": "exact_search", "query": "unique_token_ci_gadget"}),
+            json!({"action": "search", "query": "unique_token_ci_gadget"}),
         )
         .await;
         assert!(
@@ -625,13 +761,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_is_newest_first_with_ids_and_titles() {
+        let dir = tmp_dir();
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
+
+        let a = append(&svc, "Alpha fact", "alpha body").await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let b = append(&svc, "Beta fact", "beta body").await;
+
+        let r = call(&svc, json!({"action": "list"})).await;
+        assert!(!r.is_error, "{r:?}");
+        let text = tool_text(&r);
+        assert!(text.contains("memory entries: 2"), "{text}");
+        assert!(text.contains(&appended_id(&a)), "{text}");
+        assert!(text.contains(&appended_id(&b)), "{text}");
+        let alpha = text.find("Alpha fact").unwrap();
+        let beta = text.find("Beta fact").unwrap();
+        assert!(beta < alpha, "newest first: {text}");
+        assert!(!text.contains("alpha body"), "list is compact: {text}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_returns_document_in_time_order_or_one_entry() {
+        let dir = tmp_dir();
+        let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
+
+        let a = append(&svc, "Alpha fact", "alpha body").await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        append(&svc, "Beta fact", "beta body").await;
+
+        let r = call(&svc, json!({"action": "read"})).await;
+        assert!(!r.is_error, "{r:?}");
+        let text = tool_text(&r);
+        assert!(text.contains("showing 2 of 2"), "{text}");
+        let alpha = text.find("alpha body").unwrap();
+        let beta = text.find("beta body").unwrap();
+        assert!(alpha < beta, "time order: {text}");
+        assert!(
+            text.contains("\n\n\n"),
+            "two blank lines between entries: {text}"
+        );
+
+        // Tail cap keeps the most recent entries.
+        let r = call(&svc, json!({"action": "read", "max_results": 1})).await;
+        let text = tool_text(&r);
+        assert!(text.contains("showing 1 of 2"), "{text}");
+        assert!(
+            text.contains("beta body") && !text.contains("alpha body"),
+            "{text}"
+        );
+
+        // Read one entry by id (prefix ok).
+        let a_id = appended_id(&a);
+        let r = call(&svc, json!({"action": "read", "id": &a_id[..8]})).await;
+        let text = tool_text(&r);
+        assert!(
+            text.contains("alpha body") && !text.contains("beta body"),
+            "{text}"
+        );
+        assert!(text.contains("# Alpha fact"), "{text}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn delete_by_id_removes_entry_and_echoes_it() {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        let a = call(&svc, json!({"action": "append", "text": "stale_token_one"})).await;
+        let a = append(&svc, "Stale", "stale_token_one").await;
         let a_id = appended_id(&a);
-        let b = call(&svc, json!({"action": "append", "text": "kept_token_two"})).await;
+        let b = append(&svc, "Kept", "kept_token_two").await;
         let b_id = appended_id(&b);
 
         // Delete by full uuid; result echoes the entry for recovery.
@@ -643,15 +845,11 @@ mod tests {
 
         let r = call(
             &svc,
-            json!({"action": "exact_search", "query": "stale_token_one"}),
+            json!({"action": "search", "query": "stale_token_one"}),
         )
         .await;
         assert!(tool_text(&r).contains("hits: 0"), "{}", tool_text(&r));
-        let r = call(
-            &svc,
-            json!({"action": "exact_search", "query": "kept_token_two"}),
-        )
-        .await;
+        let r = call(&svc, json!({"action": "search", "query": "kept_token_two"})).await;
         assert!(
             tool_text(&r).contains("kept_token_two"),
             "{}",
@@ -677,17 +875,17 @@ mod tests {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        for text in [
+        append(
+            &svc,
+            "PDF extraction",
             "Extract PDF text and fill forms with the pdf skill",
-            "recipe for banana bread and muffins",
-        ] {
-            let r = call(&svc, json!({"action": "append", "text": text})).await;
-            assert!(!r.is_error, "{r:?}");
-        }
+        )
+        .await;
+        append(&svc, "Baking", "recipe for banana bread and muffins").await;
 
         let r = call(
             &svc,
-            json!({"action": "semantic_search", "query": "extract documents and forms"}),
+            json!({"action": "search", "mode": "semantic", "query": "extract documents and forms"}),
         )
         .await;
         assert!(!r.is_error, "{r:?}");
@@ -702,7 +900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_covers_only_latest_shard() {
+    async fn search_and_list_cover_only_latest_shard() {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
@@ -713,28 +911,23 @@ mod tests {
             old.join("20000101T000000000Z-deadbeefdeadbeefdeadbeefdeadbeef.md"),
             "deadbeefdeadbeefdeadbeefdeadbeef\n\
              2000-01-01T00:00:00Z (2000-01-01T00:00:00+00:00 local) agent=deadbeef\n\
+             # Old fact\n\
              \n\
              old_token_alpha\n",
         )
         .unwrap();
 
-        let r = call(&svc, json!({"action": "append", "text": "new_token_beta"})).await;
-        assert!(!r.is_error, "{r:?}");
+        append(&svc, "New fact", "new_token_beta").await;
 
-        let r = call(
-            &svc,
-            json!({"action": "exact_search", "query": "new_token_beta"}),
-        )
-        .await;
+        let r = call(&svc, json!({"action": "search", "query": "new_token_beta"})).await;
         assert!(
             tool_text(&r).contains("new_token_beta"),
             "{}",
             tool_text(&r)
         );
-
         let r = call(
             &svc,
-            json!({"action": "exact_search", "query": "old_token_alpha"}),
+            json!({"action": "search", "query": "old_token_alpha"}),
         )
         .await;
         assert!(!r.is_error, "{r:?}");
@@ -743,8 +936,16 @@ mod tests {
             "old shard must not be indexed: {}",
             tool_text(&r)
         );
+        let r = call(&svc, json!({"action": "list"})).await;
+        assert!(!tool_text(&r).contains("Old fact"), "{}", tool_text(&r));
 
-        // Delete still reaches old shards (search does not).
+        // Delete and read-by-id still reach old shards.
+        let r = call(&svc, json!({"action": "read", "id": "deadbeefdead"})).await;
+        assert!(
+            tool_text(&r).contains("old_token_alpha"),
+            "{}",
+            tool_text(&r)
+        );
         let r = call(&svc, json!({"action": "delete", "id": "deadbeefdead"})).await;
         assert!(!r.is_error, "{r:?}");
         assert!(
@@ -761,14 +962,12 @@ mod tests {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        let a = call(&svc, json!({"action": "append", "text": "stale_token_one"})).await;
-        assert!(!a.is_error, "{a:?}");
-        let keep = call(&svc, json!({"action": "append", "text": "kept_token_two"})).await;
-        assert!(!keep.is_error, "{keep:?}");
+        let a = append(&svc, "Stale", "stale_token_one").await;
+        append(&svc, "Kept", "kept_token_two").await;
 
         let r = call(
             &svc,
-            json!({"action": "exact_search", "query": "stale_token_one"}),
+            json!({"action": "search", "query": "stale_token_one"}),
         )
         .await;
         assert!(
@@ -785,15 +984,11 @@ mod tests {
         fs::remove_file(&stale_file).unwrap();
         let r = call(
             &svc,
-            json!({"action": "exact_search", "query": "stale_token_one"}),
+            json!({"action": "search", "query": "stale_token_one"}),
         )
         .await;
         assert!(tool_text(&r).contains("hits: 0"), "{}", tool_text(&r));
-        let r = call(
-            &svc,
-            json!({"action": "exact_search", "query": "kept_token_two"}),
-        )
-        .await;
+        let r = call(&svc, json!({"action": "search", "query": "kept_token_two"})).await;
         assert!(
             tool_text(&r).contains("kept_token_two"),
             "{}",
@@ -808,18 +1003,29 @@ mod tests {
         let dir = tmp_dir();
         let svc = Arc::new(MemoryService::with_dir_for_tests(dir.clone()));
 
-        let r = call(&svc, json!({"action": "exact_search", "query": "anything"})).await;
-        assert!(r.is_error);
-        assert!(
-            tool_text(&r).contains("no memory recorded yet"),
-            "{}",
-            tool_text(&r)
-        );
+        for action in ["search", "list", "read"] {
+            let r = call(&svc, json!({"action": action, "query": "anything"})).await;
+            assert!(r.is_error, "{action}");
+            assert!(
+                tool_text(&r).contains("no memory recorded yet"),
+                "{action}: {}",
+                tool_text(&r)
+            );
+        }
 
-        let r = call(&svc, json!({"action": "append", "text": "  \n "})).await;
+        let r = call(
+            &svc,
+            json!({"action": "append", "text": "body but no title"}),
+        )
+        .await;
         assert!(r.is_error);
+        assert!(tool_text(&r).contains("title"), "{}", tool_text(&r));
 
-        let r = call(&svc, json!({"action": "append"})).await;
+        let r = call(
+            &svc,
+            json!({"action": "append", "title": "t", "text": "  \n "}),
+        )
+        .await;
         assert!(r.is_error);
 
         let r = call(&svc, json!({"action": "delete"})).await;
@@ -829,7 +1035,7 @@ mod tests {
         let r = call(&svc, json!({"action": "delete", "id": "zz"})).await;
         assert!(r.is_error);
 
-        let r = call(&svc, json!({"action": "semantic_search"})).await;
+        let r = call(&svc, json!({"action": "search"})).await;
         assert!(r.is_error);
         assert!(
             tool_text(&r).contains("requires query"),
