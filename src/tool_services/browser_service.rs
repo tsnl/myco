@@ -265,7 +265,7 @@ fn parse_http_url(raw: &str) -> Result<Url, String> {
     }
 }
 
-fn resolve_lynx_bin() -> Option<String> {
+pub(crate) fn resolve_lynx_bin() -> Option<String> {
     if let Ok(p) = std::env::var("MYCO_LYNX")
         && !p.is_empty()
         && std::path::Path::new(&p).is_file()

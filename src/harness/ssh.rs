@@ -11,7 +11,8 @@
 //! - `ssh -G` IdentityFile discovery
 //! - existing-agent queries (`ssh-add -l`) and interactive unlock (`ssh-add`,
 //!   `--apple-load-keychain` / `--apple-use-keychain` on macOS)
-//! - CLI-facing preflight report + WARNING-block printing (silent when clean)
+//! - CLI-facing preflight report + WARNING-section body (silent when clean;
+//!   printed via the combined [`crate::harness::StartupPreflight`] block)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -45,6 +46,12 @@ impl SshAgentPreflightReport {
         self.still_missing.is_empty()
     }
 
+    /// The report warrants a WARNING body: SSH hosts exist and the agent is
+    /// unreachable or keys are still missing.
+    pub fn has_problems(&self) -> bool {
+        self.had_ssh_hosts && !(self.agent_ok && self.is_clean())
+    }
+
     /// Write preflight problems as a WARNING section (thin rule + header +
     /// body) to `out` — stdout live, or any buffer in tests. Writes nothing on
     /// the happy path (no SSH hosts, or agent reachable with no keys missing).
@@ -54,10 +61,16 @@ impl SshAgentPreflightReport {
         out: &mut impl Write,
         palette: Palette,
     ) -> std::io::Result<()> {
-        if !self.had_ssh_hosts || (self.agent_ok && self.is_clean()) {
+        if !self.has_problems() {
             return Ok(());
         }
         write_warning_open(out, palette)?;
+        self.write_body(out)
+    }
+
+    /// Body lines only (no rule/header) — shared with the combined startup
+    /// preflight block ([`crate::harness::StartupPreflight`]).
+    pub(crate) fn write_body(&self, out: &mut impl Write) -> std::io::Result<()> {
         if !self.agent_ok {
             writeln!(out, "ssh-agent: {}", self.agent_status)?;
         }
@@ -263,22 +276,12 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     report
 }
 
-/// Print preflight problems as a WARNING block on stdout, after the startup
-/// banner and before the first USER block. Happy path (agent reachable, no
-/// keys missing) prints nothing.
-/// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
-pub fn print_preflight_report(report: &SshAgentPreflightReport, palette: Palette) {
-    let mut out = std::io::stdout();
-    let _ = report.write_warning_section(&mut out, palette);
-    let _ = out.flush();
-}
-
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 
 /// `(configured_host_name, ssh_destination_alias)` for SSH-backed hosts.
-fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
+pub(crate) fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for h in hosts {
         if let Some(alias) = h

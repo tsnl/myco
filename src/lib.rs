@@ -12,10 +12,11 @@ pub mod tool_services;
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode};
 pub use core::CancelToken;
 pub use harness::{
-    AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
-    SshAgentPreflightReport, SubagentService, default_local_host_command, default_ssh_config_path,
-    ensure_remote_ssh_identities, example_config_toml, load_file_config, load_ssh_host_aliases,
-    print_preflight_report, ssh_config_host_aliases,
+    AgentRootHandles, ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController,
+    HostStatus, SshAgentPreflightReport, StartupPreflight, SubagentService,
+    default_local_host_command, default_ssh_config_path, ensure_remote_ssh_identities,
+    example_config_toml, load_file_config, load_ssh_host_aliases, print_startup_preflight,
+    ssh_config_host_aliases,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;

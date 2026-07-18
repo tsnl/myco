@@ -27,10 +27,15 @@ pub use crate::host::{HostConfig, HostController};
 mod subagent_service;
 pub use subagent_service::{AgentRootHandles, SubagentService};
 
+mod preflight;
+pub use preflight::{
+    ExecutableCheckReport, ExpectedExecutable, StartupPreflight, check_expected_executables,
+    print_startup_preflight,
+};
+
 mod ssh;
 pub use ssh::{
-    SshAgentPreflightReport, ensure_remote_ssh_identities, print_preflight_report,
-    ssh_destination_from_command,
+    SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_destination_from_command,
 };
 
 /// Snapshot of one configured host.

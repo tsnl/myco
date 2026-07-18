@@ -21,8 +21,8 @@ use myco::session::{
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
-    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, TraceContext, WrapMode,
-    ensure_remote_ssh_identities, print_preflight_report, prompts, uuid_simple_hex,
+    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
+    TraceContext, WrapMode, print_startup_preflight, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -209,11 +209,13 @@ async fn run_interactive(args: Args) {
     let model_key = catalog_model.spec.key.clone();
     let palette = Palette::colored(app_config.colors_enabled).with_wrap(app_config.wrap_width);
 
-    // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
-    // passphrase-protected / security-key identities via the existing ssh-agent
-    // before attach so OpenSSH never tries to prompt on the host pipe.
+    // Startup preflight: verify expected executables resolve (bash, lynx;
+    // OpenSSH tools when remotes are configured), then unlock SSH identities
+    // via the existing ssh-agent before attach — remote hosts use
+    // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never
+    // need to prompt on the host pipe.
     // Problems are printed after the banner (WARNING block), not here.
-    let ssh_report = ensure_remote_ssh_identities(&app_config.harness.remote_hosts);
+    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
@@ -237,7 +239,16 @@ async fn run_interactive(args: Args) {
         eprintln!(
             "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
         );
-        if !ssh_report.is_clean() || !ssh_report.agent_ok {
+        if !preflight.executables.is_clean() {
+            let names: Vec<&str> = preflight
+                .executables
+                .missing
+                .iter()
+                .map(|m| m.name)
+                .collect();
+            eprintln!("hint: missing executables: {}", names.join(", "));
+        }
+        if preflight.ssh.has_problems() {
             eprintln!(
                 "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
                      try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
@@ -273,9 +284,9 @@ async fn run_interactive(args: Args) {
     println!(
         "myco: model={model_key}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
     );
-    // SSH preflight problems open a WARNING block after the banner, before the
-    // first USER block; the happy path is silent.
-    print_preflight_report(&ssh_report, palette);
+    // Preflight problems (missing executables, ssh-agent) open one WARNING
+    // block after the banner, before the first USER block; happy path silent.
+    print_startup_preflight(&preflight, palette);
     if resuming {
         print_session_history(agent.history(), palette);
     }
