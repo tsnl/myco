@@ -1,7 +1,7 @@
-//! SSH support for remote hosts (config discovery, agent preflight).
+//! SSH support for remote hosts (identity discovery, agent preflight).
 //!
-//! All SSH-related harness logic lives here. Remotes are configured with explicit
-//! SSH fields; myco builds `ssh -o BatchMode=yes <dest> myco --mode host …`.
+//! All SSH-related harness logic lives here. Remotes are `Host` aliases from
+//! `~/.ssh/config`; myco builds `ssh -o BatchMode=yes <alias> myco --mode host …`.
 //! BatchMode is required because the NDJSON pipe is not a TTY — OpenSSH will
 //! never prompt for a key passphrase on that pipe. Identities must already be
 //! loaded in `ssh-agent` (or unlocked via macOS Keychain) before attach.

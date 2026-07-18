@@ -1,14 +1,24 @@
-//! Harness / host pool configuration (`~/.myco/config.toml`).
+//! Harness / host pool configuration.
 //!
-//! The **local** host is always available in-process (not configured here).
-//! Only remote hosts are listed; each is described with explicit SSH fields
-//! rather than a free-form spawn command.
+//! Remote hosts come from **`~/.ssh/config`**: every concrete `Host` alias
+//! (no `*`/`?` wildcards, no `!` negations) is a remote host of the same name,
+//! attached lazily as `ssh <alias> myco --mode host`. Parsing (including
+//! `Include` directives) is delegated to the `ssh2-config` crate; SSH details
+//! (user, port, identities, ProxyJump, …) stay in ssh config where OpenSSH
+//! reads them natively — myco only adds `BatchMode=yes`.
+//!
+//! `~/.myco/config.toml` holds the myco-specific knobs (`enable_subagent`,
+//! `attach_timeout_secs`). The **local** host is always available in-process
+//! and is never configured.
 
 use std::path::{Path, PathBuf};
 
-use super::{HarnessConfig, HostConfig, RemoteHostConfig};
+use ssh2_config::{ParseRule, SshConfig};
 
-/// On-disk config file shape.
+use super::{HarnessConfig, HostConfig};
+
+/// On-disk config file shape (`~/.myco/config.toml`). Knobs only — hosts come
+/// from `~/.ssh/config`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FileConfig {
     /// When false, do not register the in-process `subagent` tool.
@@ -18,9 +28,6 @@ pub struct FileConfig {
     /// `0` disables the timeout. (Config key kept as `attach_timeout_secs`.)
     #[serde(default = "default_attach_timeout_secs")]
     pub attach_timeout_secs: u64,
-    /// Remote hosts only. Local is always present and is not listed here.
-    #[serde(default)]
-    pub remote_hosts: Vec<FileRemoteHost>,
 }
 
 impl Default for FileConfig {
@@ -28,34 +35,8 @@ impl Default for FileConfig {
         Self {
             enable_subagent: default_true(),
             attach_timeout_secs: default_attach_timeout_secs(),
-            remote_hosts: Vec::new(),
         }
     }
-}
-
-/// One remote host: name + SSH destination / options (myco builds the argv).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct FileRemoteHost {
-    /// Logical host name for tool routing (`host` field). Must not be `"local"`.
-    pub name: String,
-    /// SSH destination: `~/.ssh/config` Host alias, hostname, or `user@host`.
-    pub ssh: String,
-    /// Remote binary to run after connect (default `"myco"`).
-    /// Accepts legacy key `honk` from pre-rename configs.
-    #[serde(default = "default_remote_myco", alias = "honk")]
-    pub myco: String,
-    /// Extra OpenSSH `-o key=value` options. `BatchMode=yes` is always applied.
-    #[serde(default)]
-    pub ssh_options: Vec<String>,
-    /// Optional identity file (`ssh -i`).
-    #[serde(default)]
-    pub identity_file: Option<String>,
-    /// Optional port (`ssh -p`).
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Optional login name (`ssh -l`). Prefer `user@host` in `ssh` when possible.
-    #[serde(default)]
-    pub user: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -66,62 +47,75 @@ fn default_attach_timeout_secs() -> u64 {
     10
 }
 
-fn default_remote_myco() -> String {
-    "myco".into()
-}
-
 impl FileConfig {
-    pub fn into_harness_config(self) -> Result<HarnessConfig, String> {
-        let mut remote_hosts = Vec::with_capacity(self.remote_hosts.len());
-        let mut seen = std::collections::HashSet::new();
-        for h in self.remote_hosts {
-            let name = h.name.trim().to_string();
-            if name.is_empty() {
-                return Err("remote host entry with empty name".into());
-            }
-            if name == "local" {
-                return Err(
-                    "remote host name \"local\" is reserved; local is always in-process".into(),
-                );
-            }
-            if !seen.insert(name.clone()) {
-                return Err(format!("duplicate remote host name {name:?}"));
-            }
-            let ssh = h.ssh.trim().to_string();
-            if ssh.is_empty() {
-                return Err(format!("remote host {name:?} has empty `ssh` destination"));
-            }
-            let myco = {
-                let t = h.myco.trim();
-                if t.is_empty() {
-                    default_remote_myco()
-                } else {
-                    t.to_string()
-                }
-            };
-            let remote = RemoteHostConfig {
-                name: name.clone(),
-                ssh,
-                myco,
-                ssh_options: h.ssh_options,
-                identity_file: h.identity_file.filter(|s| !s.trim().is_empty()),
-                port: h.port,
-                user: h.user.filter(|s| !s.trim().is_empty()),
-            };
-            let command = remote.spawn_command();
-            remote_hosts.push(HostConfig {
-                name,
-                command,
-                ssh_destination: Some(remote.ssh),
-            });
-        }
-
-        Ok(HarnessConfig {
+    /// Combine file knobs with `Host` aliases from `~/.ssh/config`.
+    ///
+    /// The reserved name `local` is skipped (always in-process, never SSH).
+    pub fn into_harness_config(self, ssh_aliases: Vec<String>) -> HarnessConfig {
+        let remote_hosts = ssh_aliases
+            .into_iter()
+            .filter(|a| a != "local")
+            .map(|alias| HostConfig {
+                command: ssh_spawn_command(&alias),
+                ssh_destination: Some(alias.clone()),
+                name: alias,
+            })
+            .collect();
+        HarnessConfig {
             remote_hosts,
             enable_subagent: self.enable_subagent,
             attach_timeout_secs: self.attach_timeout_secs,
-        })
+        }
     }
+}
+
+/// Argv for one remote: `ssh -o BatchMode=yes <alias> myco --mode host --name <alias>`.
+///
+/// BatchMode is required because the NDJSON pipe is not a TTY — OpenSSH must
+/// never prompt there. Everything else about the connection comes from
+/// `~/.ssh/config` for the alias. The remote `myco` must be on the PATH used
+/// by non-interactive SSH.
+pub fn ssh_spawn_command(alias: &str) -> Vec<String> {
+    vec![
+        "ssh".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        alias.into(),
+        "myco".into(),
+        "--mode".into(),
+        "host".into(),
+        "--name".into(),
+        alias.into(),
+    ]
+}
+
+/// Concrete `Host` aliases from an ssh config, in file order, deduped.
+///
+/// Parsing (quoting, `=` syntax, and `Include` directives — relative paths and
+/// globs resolve against `~/.ssh`) is delegated to `ssh2-config`. Wildcard
+/// (`*`/`?`) and negated (`!`) patterns are matching rules, not machines, and
+/// are skipped.
+pub fn ssh_config_host_aliases(reader: &mut impl std::io::BufRead) -> Result<Vec<String>, String> {
+    let config = SshConfig::default()
+        .parse(
+            reader,
+            ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for host in config.get_hosts() {
+        for clause in &host.pattern {
+            let alias = clause.pattern.as_str();
+            if clause.negated || alias.is_empty() || alias.contains('*') || alias.contains('?') {
+                continue;
+            }
+            if seen.insert(alias.to_string()) {
+                out.push(alias.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Default config path: `$MYCO_CONFIG` or `~/.myco/config.toml`.
@@ -133,20 +127,48 @@ pub fn default_config_path() -> Result<PathBuf, String> {
     Ok(home.join(".myco").join("config.toml"))
 }
 
-/// Load harness config from `path`. Missing file → [`HarnessConfig::default`].
-pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
-    if !path.exists() {
-        return Ok(HarnessConfig::default());
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read config {}: {e}", path.display()))?;
-    parse_harness_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
+/// Where remote hosts come from: `~/.ssh/config`.
+pub fn default_ssh_config_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+    Ok(home.join(".ssh").join("config"))
 }
 
-/// Parse a TOML config string into [`HarnessConfig`].
-pub fn parse_harness_config_str(text: &str) -> Result<HarnessConfig, String> {
-    let file: FileConfig = toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
-    file.into_harness_config()
+/// Load harness config: knobs from `path` (missing file → defaults), remote
+/// hosts from `~/.ssh/config` `Host` aliases (missing file → local only).
+pub fn load_harness_config(path: &Path) -> Result<HarnessConfig, String> {
+    let file = if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read config {}: {e}", path.display()))?;
+        parse_file_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))?
+    } else {
+        FileConfig::default()
+    };
+    let mut aliases = Vec::new();
+    if let Ok(ssh_path) = default_ssh_config_path()
+        && let Ok(f) = std::fs::File::open(&ssh_path)
+    {
+        let mut reader = std::io::BufReader::new(f);
+        aliases = ssh_config_host_aliases(&mut reader)
+            .map_err(|e| format!("parse ssh config {}: {e}", ssh_path.display()))?;
+    }
+    Ok(file.into_harness_config(aliases))
+}
+
+/// Parse `config.toml` text. Rejects the removed `[[remote_hosts]]` section
+/// rather than silently ignoring it.
+pub fn parse_file_config_str(text: &str) -> Result<FileConfig, String> {
+    let value: toml::Value =
+        toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
+    if value.get("remote_hosts").is_some() {
+        return Err(
+            "`[[remote_hosts]]` is no longer supported: remote hosts now come from \
+             `Host` aliases in ~/.ssh/config — remove the section"
+                .into(),
+        );
+    }
+    value
+        .try_into()
+        .map_err(|e| format!("invalid config TOML: {e}"))
 }
 
 /// Example config written by docs / first-run hints.
@@ -154,24 +176,16 @@ pub fn example_config_toml() -> String {
     r#"# Myco harness config (~/.myco/config.toml)
 # Override path with MYCO_CONFIG or myco --config.
 #
-# The local host is always enabled in-process (no subprocess, not listed here).
-# Host tools that omit `host` run on local.
+# The local host is always enabled in-process. Remote hosts are NOT listed
+# here: every concrete `Host` alias in ~/.ssh/config (no wildcards; Includes
+# are followed) is a remote host of the same name, attached lazily as
+# `ssh <alias> myco --mode host`. Put user / port / identity / ProxyJump in
+# ~/.ssh/config; `myco` must be on the remote PATH non-interactive SSH uses.
 
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 # Remotes connect lazily; startup does not wait for them.
 attach_timeout_secs = 10
-
-# Remote hosts: explicit SSH fields (myco builds `ssh -o BatchMode=yes …`).
-# Prefer Host aliases / ProxyJump / User in ~/.ssh/config when possible.
-# [[remote_hosts]]
-# name = "devbox"
-# ssh = "devbox"                 # Host alias, hostname, or user@host
-# # myco = "myco"                # remote binary (default)
-# # user = "alice"               # optional ssh -l
-# # port = 22                    # optional ssh -p
-# # identity_file = "~/.ssh/id"  # optional ssh -i
-# # ssh_options = ["ProxyJump=bastion"]  # extra -o key=value
 "#
     .to_string()
 }
@@ -180,98 +194,143 @@ attach_timeout_secs = 10
 mod tests {
     use super::*;
 
+    fn aliases_from(ssh_config: &str) -> Vec<String> {
+        ssh_config_host_aliases(&mut ssh_config.as_bytes()).unwrap()
+    }
+
+    fn harness_from(toml_text: &str, ssh_config: &str) -> HarnessConfig {
+        parse_file_config_str(toml_text)
+            .unwrap()
+            .into_harness_config(aliases_from(ssh_config))
+    }
+
     #[test]
-    fn empty_config_is_local_only() {
-        let cfg = parse_harness_config_str("").unwrap();
+    fn empty_config_and_no_ssh_hosts_is_local_only() {
+        let cfg = harness_from("", "");
         assert!(cfg.remote_hosts.is_empty());
         assert!(cfg.enable_subagent);
         assert_eq!(cfg.attach_timeout_secs, 10);
     }
 
     #[test]
-    fn remote_host_parse() {
-        let text = r#"
-enable_subagent = false
+    fn concrete_ssh_aliases_become_hosts() {
+        let ssh_config = r#"
+Host devbox
+    HostName devbox.example.com
+    User alice
+    Port 2222
 
+Host gpu bastion
+    IdentityFile ~/.ssh/id_ed25519
+"#;
+        let cfg = harness_from("enable_subagent = false", ssh_config);
+        assert!(!cfg.enable_subagent);
+        let names: Vec<_> = cfg.remote_hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["devbox", "gpu", "bastion"]);
+        let h = &cfg.remote_hosts[0];
+        assert_eq!(h.ssh_destination.as_deref(), Some("devbox"));
+        // No per-host SSH flags: user/port/identity are ssh config's job.
+        assert_eq!(
+            h.command,
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "devbox",
+                "myco",
+                "--mode",
+                "host",
+                "--name",
+                "devbox"
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_and_negated_patterns_are_skipped() {
+        let ssh_config = r#"
+Host *
+    ServerAliveInterval 60
+Host *.example.com prod-?? !prod-01 devbox
+    User deploy
+"#;
+        assert_eq!(aliases_from(ssh_config), ["devbox"]);
+    }
+
+    #[test]
+    fn keyword_variants_comments_and_quotes_parse() {
+        let ssh_config = r#"
+# Host commented-out
+host lower
+HOST=eq-form
+Host = spaced-eq
+  Host "quoted"
+Match host something
+    ProxyJump ignored
+"#;
+        // Comment lines and `Match` blocks never add hosts.
+        assert_eq!(
+            aliases_from(ssh_config),
+            ["lower", "eq-form", "spaced-eq", "quoted"]
+        );
+    }
+
+    #[test]
+    fn duplicate_aliases_deduped_in_order() {
+        assert_eq!(
+            aliases_from("Host a b\nHost b c\nHost a\n"),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn include_directives_are_followed() {
+        let dir = std::env::temp_dir().join(format!("myco-sshconf-include-{}", std::process::id()));
+        let confd = dir.join("conf.d");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(confd.join("a.conf"), "Host devbox\n  HostName a.example\n").unwrap();
+        std::fs::write(confd.join("b.conf"), "Host gpu\n").unwrap();
+        let main = format!("Include {}/conf.d/*.conf\n\nHost laptop\n", dir.display());
+        let aliases = ssh_config_host_aliases(&mut main.as_bytes()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(aliases.contains(&"devbox".to_string()), "{aliases:?}");
+        assert!(aliases.contains(&"gpu".to_string()), "{aliases:?}");
+        assert!(aliases.contains(&"laptop".to_string()), "{aliases:?}");
+    }
+
+    #[test]
+    fn local_alias_reserved_and_skipped() {
+        let cfg = harness_from("", "Host local devbox\n");
+        let names: Vec<_> = cfg.remote_hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["devbox"]);
+    }
+
+    #[test]
+    fn legacy_remote_hosts_section_rejected() {
+        let text = r#"
 [[remote_hosts]]
 name = "devbox"
 ssh = "devbox"
-ssh_options = ["ConnectTimeout=5"]
-port = 2222
-user = "alice"
-identity_file = "~/.ssh/id_ed25519"
 "#;
-        let cfg = parse_harness_config_str(text).unwrap();
-        assert!(!cfg.enable_subagent);
-        assert_eq!(cfg.remote_hosts.len(), 1);
-        let h = &cfg.remote_hosts[0];
-        assert_eq!(h.name, "devbox");
-        assert_eq!(h.ssh_destination.as_deref(), Some("devbox"));
-        let cmd = &h.command;
+        let err = parse_file_config_str(text).unwrap_err();
+        assert!(err.contains("no longer supported"), "{err}");
+        assert!(err.contains(".ssh/config"), "{err}");
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let cfg = parse_file_config_str("default_host = \"devbox\"").unwrap();
+        assert!(cfg.enable_subagent);
+    }
+
+    #[test]
+    fn spawn_command_shape() {
+        let cmd = ssh_spawn_command("devbox");
         assert_eq!(cmd[0], "ssh");
         assert!(cmd.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
-        assert!(cmd.windows(2).any(|w| w == ["-o", "ConnectTimeout=5"]));
-        assert!(cmd.windows(2).any(|w| w == ["-p", "2222"]));
-        assert!(cmd.windows(2).any(|w| w == ["-l", "alice"]));
-        assert!(
-            cmd.windows(2)
-                .any(|w| w[0] == "-i" && w[1].contains("id_ed25519"))
-        );
         assert!(cmd.iter().any(|s| s == "devbox"));
-        assert!(cmd.iter().any(|s| s == "myco"));
         assert!(cmd.windows(2).any(|w| w == ["--mode", "host"]));
         assert!(cmd.windows(2).any(|w| w == ["--name", "devbox"]));
-    }
-
-    #[test]
-    fn local_name_reserved() {
-        let text = r#"
-[[remote_hosts]]
-name = "local"
-ssh = "somewhere"
-"#;
-        let err = parse_harness_config_str(text).unwrap_err();
-        assert!(err.contains("reserved"), "{err}");
-    }
-
-    #[test]
-    fn empty_ssh_rejected() {
-        let text = r#"
-[[remote_hosts]]
-name = "x"
-ssh = "  "
-"#;
-        let err = parse_harness_config_str(text).unwrap_err();
-        assert!(err.contains("ssh"), "{err}");
-    }
-
-    #[test]
-    fn duplicate_name_rejected() {
-        let text = r#"
-[[remote_hosts]]
-name = "a"
-ssh = "a"
-[[remote_hosts]]
-name = "a"
-ssh = "b"
-"#;
-        let err = parse_harness_config_str(text).unwrap_err();
-        assert!(err.contains("duplicate"), "{err}");
-    }
-
-    #[test]
-    fn rejects_legacy_default_host_key() {
-        // serde ignores unknown fields by default only if we don't deny them.
-        // default_host is no longer a field; it is silently ignored unless we
-        // use deny_unknown_fields. Document that local is always default.
-        let text = r#"
-default_host = "devbox"
-[[remote_hosts]]
-name = "devbox"
-ssh = "devbox"
-"#;
-        // Unknown keys are ignored by serde by default — config still parses.
-        let cfg = parse_harness_config_str(text).unwrap();
-        assert_eq!(cfg.remote_hosts.len(), 1);
     }
 }
