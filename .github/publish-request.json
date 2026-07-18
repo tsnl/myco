@@ -1,7 +1,7 @@
 {
-  "request_id": "v0.3.0-publish-1",
+  "request_id": "post-v0.3.0-reset",
   "branch": "main",
   "bump_type": "minor",
-  "dry_run": "false",
+  "dry_run": "true",
   "notes_path": ".github/release-notes-v0.3.0.md"
 }

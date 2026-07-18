@@ -105,8 +105,12 @@ from that file:
   parameters.
 - Same sequence as dispatch: push with `dry_run: "true"` first, then flip
   to `"false"` and push again.
-- Remove the request file (and notes file, if desired) from the branch
-  once the release is verified.
+- After verifying the release, flip `dry_run` back to `"true"` (new
+  `request_id`) rather than deleting the request file: deleting it also
+  matches the paths filter and fires a run that fails in the params step,
+  while a `"true"` steady state is inert until deliberately edited and
+  turns any accidental re-fire (e.g. a rebase force-push) into a harmless
+  dry run. The flip itself fires one no-op dry run of the next version.
 
 The semver action (v1.0.4+, pinned by SHA in publish.yml) waits for
 check runs on the publish branch's checked-out HEAD — for `main`, the
