@@ -12,13 +12,13 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use myco::generative_model::{self, BackendConfig, Content, Effort, GenerativeModelConfig, Model};
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactOptions, RECENT_SESSION_LIMIT, SECTION_RULE, Session, SessionListEntry,
-    USER_RULE, compact_session, compact_subagent_prompt, format_session_detail,
+    ActiveSession, CompactOptions, Palette, RECENT_SESSION_LIMIT, SECTION_RULE, Session,
+    SessionListEntry, USER_RULE, compact_session, compact_subagent_prompt, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
     print_session_history, resolve_and_load_session, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
+    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
     SessionHistoryTool, SessionKind, SessionMetaTool, TraceContext, ensure_remote_ssh_identities,
     print_preflight_report, prompts, uuid_simple_hex,
 };
@@ -110,9 +110,18 @@ struct Args {
     /// Path to harness config (hosts). Default: $MYCO_CONFIG or ~/.myco/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Color output (auto|always|never). Auto colors only when stdout is a TTY
+    /// and respects NO_COLOR / CLICOLOR_FORCE.
+    #[arg(long, value_name = "WHEN", value_parser = parse_color_arg, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
 }
 
 fn parse_effort_arg(s: &str) -> Result<Effort, String> {
+    s.parse()
+}
+
+fn parse_color_arg(s: &str) -> Result<ColorMode, String> {
     s.parse()
 }
 
@@ -164,10 +173,11 @@ async fn run_host(args: Args) {
 async fn run_interactive(args: Args) {
     // One explicit resolution step: backend credentials/base URLs, harness
     // hosts and default model (--config → $MYCO_CONFIG → ~/.myco/config.toml),
-    // and TTY state. Everything downstream reads this, not the env.
+    // and the color decision. Everything downstream reads this, not the env.
     let app_config = Config::resolve(ConfigUserSettings {
         harness_config_path: args.config.clone(),
         model: args.model.clone(),
+        color: args.color,
         ..Default::default()
     })
     .unwrap_or_else(|e| {
@@ -175,6 +185,7 @@ async fn run_interactive(args: Args) {
         std::process::exit(2);
     });
     let model_id = app_config.model;
+    let palette = Palette::colored(app_config.colors_enabled);
 
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
     // passphrase-protected / security-key identities via the existing ssh-agent
@@ -228,7 +239,7 @@ async fn run_interactive(args: Args) {
         effort,
         &app_config,
     );
-    let sink = Arc::new(CliEventSink::new());
+    let sink = Arc::new(CliEventSink::new(palette));
     let mut agent = Agent::new(model, harness.clone(), sink);
     agent.set_context_window_tokens(model_id.context_window_tokens());
     agent.set_history(active_session.snapshot().messages.clone());
@@ -247,7 +258,7 @@ async fn run_interactive(args: Args) {
         harness.host_names().join(", "),
     );
     if resuming {
-        print_session_history(agent.history());
+        print_session_history(agent.history(), palette);
     }
 
     run_repl(
@@ -260,6 +271,7 @@ async fn run_interactive(args: Args) {
         debug_dump_api_requests,
         ctrl_l,
         &app_config,
+        palette,
     )
     .await;
 
@@ -393,12 +405,13 @@ async fn run_repl(
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
     app_config: &Config,
+    palette: Palette,
 ) {
     loop {
-        println!("{USER_RULE}");
+        println!("{}", palette.user(USER_RULE));
         let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
-        println!("USER {used}/{max}");
+        println!("{}", palette.user(&format!("USER {used}/{max}")));
         println!();
         // No "> " prefix; body is typed on the line after the USER header.
         // Multiline: Alt-Enter / Shift-Enter / Ctrl-J inserts a newline in-buffer;
@@ -419,7 +432,7 @@ async fn run_repl(
         // Ctrl-L on an empty buffer submits an empty line + sets this flag:
         // clear scrollback and reprint the conversation.
         if ctrl_l.swap(false, Ordering::SeqCst) {
-            clear_and_reprint(agent);
+            clear_and_reprint(agent, palette);
             continue;
         }
 
@@ -432,7 +445,7 @@ async fn run_repl(
         }
         if let Some(cmd) = parse_meta(&input) {
             if matches!(cmd, MetaCommand::Compact) {
-                run_compact(agent, session, editor, harness.clone(), model_id).await;
+                run_compact(agent, session, editor, harness.clone(), model_id, palette).await;
                 continue;
             }
             handle_meta(
@@ -445,11 +458,12 @@ async fn run_repl(
                 effort,
                 debug_dump_api_requests,
                 app_config,
+                palette,
             );
             continue;
         }
 
-        run_user_turn(agent, session, editor, input).await;
+        run_user_turn(agent, session, editor, input, palette).await;
     }
 }
 
@@ -458,6 +472,7 @@ async fn run_user_turn(
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     input: String,
+    palette: Palette,
 ) {
     let _ = editor.add_history_entry(&input);
     if let Err(e) = save_readline_history(editor, session) {
@@ -494,7 +509,7 @@ async fn run_user_turn(
             // Close any open ASSISTANT stream state and show a headed ERROR section.
             // Generate failures (context overflow, provider errors) are live-only —
             // not stored in session history — so resume/Ctrl-L will not replay them.
-            let _ = write_error_section(&mut std::io::stdout(), &e.to_string());
+            let _ = write_error_section(&mut std::io::stdout(), &e.to_string(), palette);
             let _ = std::io::stdout().flush();
             println!();
         }
@@ -521,6 +536,7 @@ async fn run_compact(
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
     model_id: Model,
+    palette: Palette,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), true) {
         eprintln!("compact: failed to persist current session: {e}");
@@ -640,7 +656,7 @@ async fn run_compact(
     session.replace(successor.clone());
     agent.set_history(successor.messages.clone());
     reload_readline_history(editor, session);
-    clear_and_reprint(agent);
+    clear_and_reprint(agent, palette);
     println!(
         "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
         outcome.successor_id,
@@ -713,6 +729,7 @@ fn handle_meta(
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     app_config: &Config,
+    palette: Palette,
 ) {
     match cmd {
         MetaCommand::Help => print_help(),
@@ -731,7 +748,7 @@ fn handle_meta(
             agent.set_history(Vec::new());
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
-            clear_and_reprint(agent);
+            clear_and_reprint(agent, palette);
             println!("new session={}", session.id());
         }
         MetaCommand::Resume(arg) => {
@@ -744,7 +761,7 @@ fn handle_meta(
                         session.id(),
                         agent.history().len()
                     );
-                    print_session_history(agent.history());
+                    print_session_history(agent.history(), palette);
                 }
                 Err(e) => eprintln!("resume failed: {e}"),
             }
@@ -1053,10 +1070,10 @@ fn print_session_list(list: &[SessionListEntry]) {
 /// Nuke scrollback + visible screen (same as `clear`), then reprint the whole
 /// conversation history so nothing is lost. Triggered by Ctrl-L; the prompt
 /// loop reprints the USER header on its next iteration.
-fn clear_and_reprint(agent: &Agent) {
+fn clear_and_reprint(agent: &Agent, palette: Palette) {
     print!("\x1B[3J\x1B[2J\x1B[1;1H");
     let _ = std::io::stdout().flush();
-    print_session_history(agent.history());
+    print_session_history(agent.history(), palette);
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1181,7 @@ fn session_id_completions(prefix: &str) -> Vec<String> {
 /// blank line + thin `SECTION_RULE` + `ASSISTANT` + blank line, then body.
 struct CliEventSink {
     state: Mutex<SinkState>,
+    palette: Palette,
 }
 
 struct SinkState {
@@ -1180,7 +1198,7 @@ struct SinkState {
 }
 
 impl CliEventSink {
-    fn new() -> Self {
+    fn new(palette: Palette) -> Self {
         Self {
             state: Mutex::new(SinkState {
                 at_line_start: true,
@@ -1190,6 +1208,7 @@ impl CliEventSink {
                 thinking_line_open: false,
                 thinking_buf: String::new(),
             }),
+            palette,
         }
     }
 }
@@ -1218,8 +1237,8 @@ impl CliEventSink {
         self.finish_thinking_line();
         self.ensure_line_start();
         println!();
-        println!("{SECTION_RULE}");
-        println!("ASSISTANT");
+        println!("{}", self.palette.assistant(SECTION_RULE));
+        println!("{}", self.palette.assistant("ASSISTANT"));
         println!();
         self.with_state(|s| {
             s.at_line_start = true;
@@ -1249,7 +1268,8 @@ impl CliEventSink {
         if !open {
             return;
         }
-        println!();
+        // Close the dim thinking style opened at line start.
+        println!("{}", self.palette.reset());
         self.with_state(|s| {
             s.thinking_line_open = false;
             s.thinking_buf.clear();
@@ -1290,7 +1310,8 @@ impl EventSink for CliEventSink {
                         s.thinking_buf = text.clone();
                         s.in_text_stream = false;
                     });
-                    print!("Thinking: {text}");
+                    // Dim stays open across deltas; finish_thinking_line resets.
+                    print!("{}Thinking: {text}", self.palette.thinking_on());
                 } else {
                     self.with_state(|s| s.thinking_buf.push_str(&text));
                     print!("{text}");
@@ -1351,7 +1372,7 @@ impl EventSink for CliEventSink {
                 self.separate_paragraph_if_needed();
                 print!(
                     "{}",
-                    format_tool_invocation(&tool_use.name, &tool_use.input)
+                    format_tool_invocation(&tool_use.name, &tool_use.input, self.palette)
                 );
                 self.with_state(|s| {
                     s.at_line_start = true;
