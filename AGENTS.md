@@ -95,7 +95,7 @@ myco (interactive) / Agent
   subprocess for the default host.
 - **Remotes are lazy** — connect on first tool use; soft-fail non-default hosts.
 - **Standard tool catalog is the same on every host**; root-only tools
-  (`session_meta`, `subagent`) are installed only on the in-process local worker.
+  (`session_meta`, `subagent`, `memory`) are installed only on the in-process local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;

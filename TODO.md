@@ -97,7 +97,13 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [ ] **Skills / skill packs**
   - Directory convention (user + project); load as prompt/procedures or slash-skills.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
-- [ ] **Optional cross-session memory** (`MEMORY.md`-style notes) — distinct from chat resume.
+- [x] **Optional cross-session memory** — root-only `memory` tool: immutable UUIDed,
+      timestamped, titled entries as write-once uuid-keyed files under
+      `~/.myco/memory/{uuid[..2]}/` with RFC-822-style headers (create/delete only;
+      lock-free, safe on weakly consistent filesystems); list/read plus exact +
+      semantic entry search over the whole store. Entries persist until explicitly
+      deleted — no GC/pruning by design (revisit if the store or index ever gets
+      big enough to hurt).
 
 ---
 
