@@ -1,5 +1,6 @@
 pub mod config;
 pub mod core;
+pub mod external_command;
 pub mod generative_model;
 pub mod harness;
 pub mod host;

@@ -26,8 +26,8 @@ which reports key modifiers.)
 
 Startup banner is one lean line: model and session. Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,
-`lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and ssh-agent
-issues; hosts via `/hosts`.
+`lynx`, `kill`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
+ssh-agent issues; hosts via `/hosts`.
 
 ### Models & config (quick)
 

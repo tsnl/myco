@@ -29,8 +29,7 @@ pub use subagent_service::{AgentRootHandles, SubagentService};
 
 mod preflight;
 pub use preflight::{
-    ExecutableCheckReport, ExpectedExecutable, StartupPreflight, check_expected_executables,
-    print_startup_preflight,
+    ExecutableCheckReport, StartupPreflight, check_expected_executables, print_startup_preflight,
 };
 
 mod ssh;

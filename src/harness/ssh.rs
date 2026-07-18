@@ -17,9 +17,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use super::HostConfig;
+use crate::external_command::{SSH, SSH_ADD, SSH_KEYGEN};
 use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
@@ -365,7 +366,8 @@ pub fn ssh_destination_from_command(command: &[String]) -> Option<String> {
 }
 
 fn identity_files_for_alias(alias: &str) -> Result<Vec<PathBuf>, String> {
-    let output = Command::new("ssh")
+    let output = SSH
+        .command()
         .args(["-G", alias])
         .output()
         .map_err(|e| format!("spawn ssh -G: {e}"))?;
@@ -434,7 +436,8 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Returns (human status line, set of SHA256 fingerprints without the `SHA256:` prefix normalization).
 fn agent_fingerprints() -> Result<(String, BTreeSet<String>), String> {
-    let output = Command::new("ssh-add")
+    let output = SSH_ADD
+        .command()
         .arg("-l")
         .output()
         .map_err(|e| format!("spawn ssh-add -l: {e}"))?;
@@ -483,7 +486,8 @@ fn identity_fingerprint(path: &Path) -> Result<String, String> {
 
     let mut last_err = String::new();
     for cand in candidates {
-        let output = Command::new("ssh-keygen")
+        let output = SSH_KEYGEN
+            .command()
             .args(["-lf", cand.to_str().unwrap_or_default()])
             .output()
             .map_err(|e| format!("spawn ssh-keygen: {e}"))?;
@@ -517,7 +521,8 @@ fn public_key_path(private: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn run_ssh_add_apple_load_keychain() -> Result<String, String> {
-    let output = Command::new("ssh-add")
+    let output = SSH_ADD
+        .command()
         .arg("--apple-load-keychain")
         .output()
         .map_err(|e| format!("spawn: {e}"))?;
@@ -537,7 +542,7 @@ fn interactive_ssh_add(path: &Path) -> Result<(), String> {
         return Err(format!("file does not exist: {}", path.display()));
     }
 
-    let mut cmd = Command::new("ssh-add");
+    let mut cmd = SSH_ADD.command();
     // Store passphrase in Keychain on macOS so later --apple-load-keychain works.
     if cfg!(target_os = "macos") {
         cmd.arg("--apple-use-keychain");

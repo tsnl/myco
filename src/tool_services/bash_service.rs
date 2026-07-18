@@ -10,6 +10,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Notify;
 
 use super::*;
+use crate::external_command::{BASH, KILL};
 
 use uuid::Uuid;
 
@@ -236,7 +237,7 @@ impl BashService {
         max_bytes: usize,
         cancel: crate::core::CancelToken,
     ) -> generative_model::ToolResult {
-        let mut cmd = tokio::process::Command::new("bash");
+        let mut cmd = BASH.tokio_command();
         cmd.args(["-c", command])
             // Never inherit stdin: in `--mode host` it is the NDJSON protocol
             // pipe, and a child that reads it (python, xargs, `read`…) would
@@ -383,7 +384,7 @@ impl BashService {
         }
 
         let cmdline = command.unwrap_or("bash -i");
-        let mut cmd = tokio::process::Command::new("bash");
+        let mut cmd = BASH.tokio_command();
         cmd.args(["-c", cmdline])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1017,7 +1018,8 @@ fn kill_process_group(pid: Option<u32>) {
         return;
     };
     // `kill -KILL -- -<pgid>` targets the whole group.
-    let _ = std::process::Command::new("kill")
+    let _ = KILL
+        .command()
         .args(["-KILL", "--", &format!("-{pid}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2084,7 +2086,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Grandchild must not still be running.
-        let ps = std::process::Command::new("ps")
+        let ps = crate::external_command::PS
+            .command()
             .args(["-ax", "-o", "pid=,command="])
             .output()
             .expect("ps");

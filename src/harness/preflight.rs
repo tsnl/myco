@@ -1,69 +1,24 @@
 //! Startup health check for expected executables + combined preflight WARNING.
 //!
-//! Interactive startup verifies that the external programs myco spawns actually
-//! resolve on the agent machine: `bash` and `lynx` for the standard local
-//! tools, plus the OpenSSH client tools when SSH-backed remotes are configured.
-//! Results fold into the same WARNING block as the ssh-agent preflight
-//! ([`SshAgentPreflightReport`]) — one section after the banner, silent when
-//! everything resolves. Remote hosts are not probed here; they report missing
-//! programs as tool errors at call time.
+//! Interactive startup verifies that the external programs myco spawns
+//! (declared in [`crate::external_command`]) actually resolve on the agent
+//! machine. Results fold into the same WARNING block as the ssh-agent
+//! preflight ([`SshAgentPreflightReport`]) — one section after the banner,
+//! silent when everything resolves. Remote hosts are not probed here; they
+//! report missing programs as tool errors at call time.
 
 use std::io::Write;
 
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
+use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
 use crate::session::{Palette, write_warning_open};
-
-/// One external program myco expects to resolve (PATH, or the tool's own
-/// override — `MYCO_LYNX` for lynx).
-#[derive(Debug, Clone)]
-pub struct ExpectedExecutable {
-    pub name: &'static str,
-    /// What breaks without it — printed on the WARNING line.
-    pub purpose: &'static str,
-    /// Short install pointer.
-    pub install_hint: &'static str,
-}
-
-/// Needed in every interactive session (standard local tools).
-const ALWAYS: &[ExpectedExecutable] = &[
-    ExpectedExecutable {
-        name: "bash",
-        purpose: "the bash tool cannot run commands",
-        install_hint: "install bash",
-    },
-    ExpectedExecutable {
-        name: "lynx",
-        purpose: "the lynx_tui_browser tool cannot fetch pages",
-        install_hint: "brew install lynx / apt install lynx, or set MYCO_LYNX",
-    },
-];
-
-/// Spawned by the SSH transport and the ssh-agent preflight; expected only
-/// when SSH-backed remote hosts are configured.
-const SSH_TOOLS: &[ExpectedExecutable] = &[
-    ExpectedExecutable {
-        name: "ssh",
-        purpose: "remote hosts cannot connect",
-        install_hint: "install the OpenSSH client",
-    },
-    ExpectedExecutable {
-        name: "ssh-add",
-        purpose: "ssh-agent preflight and key unlock cannot run",
-        install_hint: "install the OpenSSH client",
-    },
-    ExpectedExecutable {
-        name: "ssh-keygen",
-        purpose: "identity fingerprinting for the agent preflight cannot run",
-        install_hint: "install the OpenSSH client",
-    },
-];
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
 pub struct ExecutableCheckReport {
-    /// Expected executables that did not resolve.
-    pub missing: Vec<ExpectedExecutable>,
+    /// Registry entries that did not resolve.
+    pub missing: Vec<&'static ExternalCommand>,
 }
 
 impl ExecutableCheckReport {
@@ -76,7 +31,7 @@ impl ExecutableCheckReport {
     pub fn ssh_tools_missing(&self) -> bool {
         self.missing
             .iter()
-            .any(|m| SSH_TOOLS.iter().any(|s| s.name == m.name))
+            .any(|m| m.startup_check == StartupCheck::WithSshRemotes)
     }
 
     /// Body lines only (no rule/header); writes nothing when clean.
@@ -102,37 +57,18 @@ impl ExecutableCheckReport {
 pub fn check_expected_executables(hosts: &[HostConfig]) -> ExecutableCheckReport {
     let need_ssh = !ssh_host_targets(hosts).is_empty();
     ExecutableCheckReport {
-        missing: missing_executables(need_ssh, |exe| match exe.name {
-            // Same resolution the browser tool uses (MYCO_LYNX, then PATH).
-            "lynx" => crate::tool_services::browser_service::resolve_lynx_bin().is_some(),
-            name => on_path(name),
-        }),
+        missing: missing_executables(need_ssh, |c| c.is_installed()),
     }
 }
 
-/// Pure core: which expected executables fail to resolve.
+/// Pure core: which expected registry entries fail to resolve.
 fn missing_executables(
     need_ssh: bool,
-    resolves: impl Fn(&ExpectedExecutable) -> bool,
-) -> Vec<ExpectedExecutable> {
-    let mut expected: Vec<&ExpectedExecutable> = ALWAYS.iter().collect();
-    if need_ssh {
-        expected.extend(SSH_TOOLS.iter());
-    }
-    expected
-        .into_iter()
-        .filter(|e| !resolves(e))
-        .cloned()
+    resolves: impl Fn(&ExternalCommand) -> bool,
+) -> Vec<&'static ExternalCommand> {
+    expected_at_startup(need_ssh)
+        .filter(|c| !resolves(c))
         .collect()
-}
-
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| on_path_env(name, &p))
-}
-
-/// `name` is a file in some dir of the `PATH`-style value.
-fn on_path_env(name: &str, path: &std::ffi::OsStr) -> bool {
-    std::env::split_paths(path).any(|dir| !dir.as_os_str().is_empty() && dir.join(name).is_file())
 }
 
 /// Everything interactive startup checks before the first prompt: expected
@@ -196,7 +132,6 @@ pub fn print_startup_preflight(report: &StartupPreflight, palette: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn warning_output(pf: &StartupPreflight) -> String {
         let mut buf = Vec::new();
@@ -211,13 +146,16 @@ mod tests {
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "lynx"]);
+        assert_eq!(names, ["bash", "lynx", "kill"]);
 
         let names: Vec<_> = missing_executables(true, |_| false)
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "lynx", "ssh", "ssh-add", "ssh-keygen"]);
+        assert_eq!(
+            names,
+            ["bash", "lynx", "kill", "ssh", "ssh-add", "ssh-keygen"]
+        );
     }
 
     #[test]
@@ -301,26 +239,5 @@ mod tests {
             missing: missing_executables(true, |e| e.name != "ssh-add"),
         };
         assert!(no_ssh_add.ssh_tools_missing());
-    }
-
-    #[test]
-    fn path_probe_finds_only_files_in_listed_dirs() {
-        let dir = std::env::temp_dir().join(format!(
-            "myco-exec-check-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("present"), "#!/bin/sh\n").unwrap();
-
-        let path_var = std::env::join_paths([
-            PathBuf::new(), // empty entry must be ignored, not treated as cwd
-            PathBuf::from("/nonexistent-myco-dir"),
-            dir.clone(),
-        ])
-        .unwrap();
-        assert!(on_path_env("present", &path_var));
-        assert!(!on_path_env("absent", &path_var));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

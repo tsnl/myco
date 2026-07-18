@@ -78,6 +78,7 @@ myco (interactive) / Agent
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), config file, color decision |
+| `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
 | `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), startup preflight (executables + ssh-agent), subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
