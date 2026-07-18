@@ -77,12 +77,12 @@ myco (interactive) / Agent
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
-| `src/config/` | Startup resolution: backend credentials/base URLs, harness config file, color decision |
+| `src/config/` | Startup resolution: model catalog (`[gateways]`/`[models]` + `tokens.toml`), config file, color decision |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
-| `src/harness/` | Host pool, config (`~/.ssh/config` hosts + `~/.myco/config.toml` knobs), SSH preflight, subagent service |
+| `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), SSH preflight, subagent service |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Anthropic Messages + OpenAI Responses (xAI/Grok, OpenRouter) backends |
+| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |

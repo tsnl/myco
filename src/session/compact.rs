@@ -1,6 +1,6 @@
 //! Session compaction: archive predecessor, seed successor with summary + tail.
 
-use crate::generative_model::{Content, Message, Model};
+use crate::generative_model::{Content, Message};
 use crate::session::{Session, SessionKind};
 
 /// Options for [`compact_session`].
@@ -36,7 +36,7 @@ pub struct CompactOutcome {
 pub fn compact_session(
     predecessor: &Session,
     summary_markdown: &str,
-    model: Model,
+    model: &str,
     opts: &CompactOptions,
 ) -> Result<(Session, CompactOutcome), String> {
     if predecessor.messages.is_empty() {
@@ -272,7 +272,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let mut pred = Session::new(Model::ClaudeHaiku45);
+        let mut pred = Session::new("claude-haiku-4-5");
         pred.messages = vec![user("hello"), assistant_end("world")];
         pred.title = Some("t".into());
         pred.save().unwrap();
@@ -280,7 +280,7 @@ mod tests {
         let (succ, out) = compact_session(
             &pred,
             "## Goal\nDo the thing\n",
-            Model::ClaudeHaiku45,
+            "claude-haiku-4-5",
             &CompactOptions::default(),
         )
         .unwrap();

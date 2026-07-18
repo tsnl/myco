@@ -26,19 +26,17 @@ which reports key modifiers.)
 
 Startup banner prints model, session, config path, hosts, and default host.
 
-### Models & env (quick)
+### Models & config (quick)
 
-- Default model: `grok-4.5-build` (config.toml `model` or `--model` to change; flag wins).
-- Claude models need `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` (optional
-  `ANTHROPIC_BASE_URL`).
-- Grok / OpenAI Responses need `XAI_API_KEY` or `OPENAI_API_KEY` (optional
-  `XAI_API_BASE_URL` / `OPENAI_BASE_URL`; default base `https://api.x.ai/v1`).
-- OpenRouter models (vendor-prefixed ids like `moonshotai/kimi-k3`,
-  `deepseek/deepseek-v4-pro`, `google/gemini-3.5-flash`, `openai/gpt-5.6-sol`,
-  `anthropic/claude-opus-4.8`) need `OPENROUTER_API_KEY` (optional
-  `OPENROUTER_BASE_URL`). Bare `claude-*` ids stay on the native Anthropic
-  backend; the `anthropic/` prefix opts into OpenRouter.
-- `.env` in cwd is loaded at startup. Full tables: `myco --help overview`.
+- Models come from the `[gateways]` / `[models]` catalog in
+  `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
+  catalog key; default is config.toml `model`, or the sole configured entry.
+- A gateway holds `protocol` (`anthropic-messages` | `openai-responses`),
+  `base_url`, and `auth` (`env:VAR`, `token:NAME` from `~/.myco/tokens.toml`,
+  or `none`). A model names its gateway plus `api_id` (wire id) and a required
+  `context_window`.
+- Missing credentials error at model *use*, naming the env var / tokens key.
+- `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 

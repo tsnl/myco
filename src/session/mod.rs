@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::generative_model::{Message, Model};
+use crate::generative_model::Message;
 
 /// On-disk session schema version. Older files are rejected (WIP break).
 pub const SESSION_FILE_VERSION: u32 = 2;
@@ -245,19 +245,21 @@ impl ActiveSession {
 }
 
 impl Session {
-    pub fn new(model: Model) -> Self {
+    /// `model` is the catalog key from config.toml (recorded as metadata; a
+    /// resumed session runs on whatever model the CLI selects).
+    pub fn new(model: impl Into<String>) -> Self {
         Self::new_with_id(model, uuid_simple_hex(Uuid::new_v4()))
     }
 
     /// Create a session with an explicit id (same hex as agent id).
-    pub fn new_with_id(model: Model, id: impl Into<String>) -> Self {
+    pub fn new_with_id(model: impl Into<String>, id: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
             version: SESSION_FILE_VERSION,
             id: id.into(),
             created_at: now,
             updated_at: now,
-            model: model.to_string(),
+            model: model.into(),
             messages: Vec::new(),
             title: None,
             links: Vec::new(),
@@ -285,7 +287,7 @@ impl Session {
 
     /// Worker session (subagent / compact). Kind must be non-user so it is hidden.
     pub fn new_hidden(
-        model: Model,
+        model: impl Into<String>,
         id: impl Into<String>,
         kind: SessionKind,
         parent_session_id: Option<String>,
@@ -986,7 +988,7 @@ mod tests {
 
     #[test]
     fn link_dedup_pr_and_worktree() {
-        let mut s = Session::new(Model::ClaudeHaiku45);
+        let mut s = Session::new("claude-haiku-4-5");
         s.upsert_link(SessionLink::GitHubPr {
             url: "foo/bar#1".into(),
             repo: None,
@@ -1099,7 +1101,7 @@ mod tests {
         unsafe {
             std::env::set_var("MYCO_HOME", &dir);
         }
-        let s = ActiveSession::new(Session::new(Model::ClaudeHaiku45));
+        let s = ActiveSession::new(Session::new("claude-haiku-4-5"));
         assert!(
             s.maybe_auto_title_from_user_text("First line\n\nmore")
                 .unwrap()
@@ -1115,7 +1117,7 @@ mod tests {
 
     #[test]
     fn scratchpad_cap() {
-        let mut s = Session::new(Model::ClaudeHaiku45);
+        let mut s = Session::new("claude-haiku-4-5");
         let big = "a".repeat(MAX_SCRATCHPAD_BYTES + 1);
         assert!(s.set_scratchpad(big).is_err());
         s.set_scratchpad("ok".into()).unwrap();
@@ -1131,7 +1133,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let mut visible = Session::new(Model::ClaudeHaiku45);
+        let mut visible = Session::new("claude-haiku-4-5");
         visible.messages.push(Message::UserMessage {
             content: vec![Content::Text {
                 text: "visible".into(),
@@ -1140,7 +1142,7 @@ mod tests {
         visible.save().unwrap();
 
         let mut hidden = Session::new_hidden(
-            Model::ClaudeHaiku45,
+            "claude-haiku-4-5",
             "bbccddeeff00112233445566778899aa",
             SessionKind::Subagent,
             Some(visible.id.clone()),

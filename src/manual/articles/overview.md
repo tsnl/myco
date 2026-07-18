@@ -30,19 +30,30 @@ myco (interactive) / Agent
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Knobs only: `enable_subagent`, `attach_timeout_secs`. Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/tokens.toml` | Optional flat `NAME = "secret"` table for `auth = "token:NAME"` entries (always next to config.toml). Keeps secrets out of a shareable config. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/memory/{uuid[..2]}/{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUID-keyed entry files; see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
-Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here):
+Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
+top-level keys must come before the tables, per TOML):
 
 ```toml
-# model = "grok-4.5-build"    # default CLI model (--model overrides)
+model = "grok-4.5-build"      # default model key (--model overrides)
 enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
+
+[gateways.xai]
+protocol = "openai-responses"
+base_url = "https://api.x.ai/v1"
+auth = "env:XAI_API_KEY"
+
+[models."grok-4.5-build"]
+gateway = "xai"
+context_window = 500_000
 ```
 
 - Remote hosts come from `~/.ssh/config`: each concrete `Host` alias attaches as
@@ -54,57 +65,72 @@ attach_timeout_secs = 10
   (`~/.local/bin` and `~/.cargo/bin` are common).
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
-## API credentials & models
+## Models & credentials (the catalog)
 
-Loaded from the process environment; `dotenvy` also loads a `.env` in the cwd at startup.
-Default CLI model is **`grok-4.5-build`**; set `model = "<id>"` in config.toml to change
-it, or pass `myco --model <id>` (flag wins).
+Myco ships **no built-in models**: the `[gateways]` / `[models]` tables in
+config.toml are the entire catalog. A **gateway** is a place models are served
+from (`protocol` + `base_url` + `auth`); a **model** entry is the key you pass
+to `--model` (and what sessions record). Model-level fields override the
+referenced gateway; a model may also inline all three and skip `gateway`.
 
-**Anthropic Messages** (Claude models: `claude-haiku-4-5`, `claude-sonnet-4-6`,
-`claude-opus-4-8`, `claude-fable-5`, …):
+```toml
+[gateways.anthropic]
+protocol = "anthropic-messages"        # or "openai-responses"
+base_url = "https://api.anthropic.com"
+auth = "env:ANTHROPIC_API_KEY"
 
-| Variable | Role |
-|----------|------|
-| `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | Bearer token (required) |
-| `ANTHROPIC_BASE_URL` | API base (default `https://api.anthropic.com`) |
+[gateways.openrouter]
+protocol = "openai-responses"          # requests go to {base_url}/responses
+base_url = "https://openrouter.ai/api/v1"
+auth = "env:OPENROUTER_API_KEY"
 
-**OpenAI Responses** (xAI Grok `grok-4.5-build`, or any Responses-compatible gateway):
+[models.claude-opus-4-8]
+gateway = "anthropic"
+context_window = 1_000_000             # required on every model
 
-| Variable | Role |
-|----------|------|
-| `XAI_API_KEY` or `OPENAI_API_KEY` | Bearer token (required; see fallback) |
-| `XAI_API_BASE_URL` or `OPENAI_BASE_URL` | Base URL (default `https://api.x.ai/v1`) |
+[models.claude-haiku-4-5]
+gateway = "anthropic"
+thinking = "budget"                    # older models reject adaptive thinking
+context_window = 200_000
 
-Token resolution for OpenAI Responses: `XAI_API_KEY` → `OPENAI_API_KEY` →
-`ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`. Base URL: `XAI_API_BASE_URL` →
-`OPENAI_BASE_URL` → `https://api.x.ai/v1`. Requests go to `{base_url}/responses`.
+[models.kimi-k3]
+gateway = "openrouter"
+api_id = "moonshotai/kimi-k3"          # wire id; defaults to the key
+context_window = 1_000_000
 
-All resolution happens in one startup step (`myco::config::Config`), which also
-loads the harness config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`)
-and decides color output: sections are colored when stdout is a TTY, controlled by
-`--color auto|always|never` plus `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`.
+[models.local-qwen]                    # inline, no gateway ref
+protocol = "openai-responses"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+context_window = 32768
+```
 
-**OpenRouter** (vendor-prefixed slugs, served over the same OpenAI Responses
-protocol): `moonshotai/kimi-k3`, `deepseek/deepseek-v4-pro`,
-`deepseek/deepseek-v4-flash`, `google/gemini-3.5-flash`,
-`google/gemini-3.1-pro-preview`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`,
-`openai/gpt-5.6-luna`, `anthropic/claude-fable-5`, `anthropic/claude-opus-4.8`,
-`anthropic/claude-sonnet-4.6`, `anthropic/claude-haiku-4.5`. The vendor prefix
-may be dropped on the CLI (`--model kimi-k3`) — except for Anthropic slugs,
-whose bare ids mean the native Anthropic backend.
+Per-model fields: `api_id` (wire id, defaults to the key), required
+`context_window` (drives `USER n/m` + auto-compact), `thinking`
+(`anthropic-messages`: `adaptive` (default) | `budget` | `none`;
+`openai-responses`: `effort` (default) | `none`), `max_output_tokens`
+(default 8192).
 
-Claude via OpenRouter is for single-key setups. With an Anthropic key, prefer
-the bare `claude-*` ids: the native backend keeps prompt caching and adaptive
-thinking, which the generic Responses path does not.
+**Auth** is per gateway (or per model): `env:VAR` reads the process
+environment (`dotenvy` loads a `.env` from the cwd at startup), `token:NAME`
+reads `NAME` from `~/.myco/tokens.toml` (flat `NAME = "secret"`; sits next to
+config.toml so the config stays shareable), `none` sends no auth header
+(local servers). A missing credential does **not** fail startup resolution —
+the error (naming the env var / tokens key) surfaces when the model is used.
 
-| Variable | Role |
-|----------|------|
-| `OPENROUTER_API_KEY` | Bearer token (required) |
-| `OPENROUTER_BASE_URL` | Base URL (default `https://openrouter.ai/api/v1`) |
+Default model: `--model` → config.toml `model` → the sole `[models]` entry.
+Anything else is a startup error listing the configured keys. Rerouting a
+model through a different gateway is a config edit (e.g. point a
+`claude-opus-4-8` entry at `gateway = "openrouter"` with
+`api_id = "anthropic/claude-opus-4.8"`) — note the native Anthropic gateway
+keeps prompt caching and adaptive thinking, which generic Responses gateways
+do not.
 
-Backend is chosen from the model id (Claude → Anthropic Messages; Grok → OpenAI
-Responses via xAI; vendor-prefixed slugs → OpenAI Responses via OpenRouter).
-Empty credentials fail model creation at startup.
+All resolution happens in one startup step (`myco::config::Config`), which
+also loads the config file (`--config` → `$MYCO_CONFIG` →
+`~/.myco/config.toml`) and decides color output: sections are colored when
+stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
+`CLICOLOR_FORCE` / `TERM=dumb`.
 
 ## Host routing
 

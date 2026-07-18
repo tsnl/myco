@@ -16,8 +16,9 @@ use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    FileConfig, default_ssh_config_path, example_config_toml, load_file_config,
-    load_ssh_host_aliases, parse_file_config_str, ssh_config_host_aliases, ssh_spawn_command,
+    FileConfig, GatewayEntry, ModelEntry, default_ssh_config_path, example_config_toml,
+    load_file_config, load_ssh_host_aliases, parse_file_config_str, ssh_config_host_aliases,
+    ssh_spawn_command,
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
@@ -79,6 +80,9 @@ pub struct HarnessConfig {
     pub enable_subagent: bool,
     /// Per-remote connect timeout in seconds on first tool use (`0` disables it).
     pub attach_timeout_secs: u64,
+    /// Resolved model catalog for subagents (`crate::config`). Empty (default)
+    /// means the `subagent` tool rejects every model key.
+    pub models: crate::generative_model::ModelCatalog,
 }
 
 impl Default for HarnessConfig {
@@ -87,6 +91,7 @@ impl Default for HarnessConfig {
             remote_hosts: Vec::new(),
             enable_subagent: true,
             attach_timeout_secs: 10,
+            models: crate::generative_model::ModelCatalog::default(),
         }
     }
 }
@@ -193,7 +198,8 @@ impl Harness {
         // Root-only extras (subagent, session_meta, …) — local only; keep their schemas.
         let mut root_extras: Vec<Arc<dyn ToolService>> = Vec::new();
         if config.enable_subagent {
-            root_extras.push(Arc::new(SubagentService::new()) as Arc<dyn ToolService>);
+            root_extras
+                .push(Arc::new(SubagentService::new(config.models.clone())) as Arc<dyn ToolService>);
         }
         root_extras.extend(root_services);
 
@@ -599,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn root_only_tools_keep_host_field_and_run_local() {
         use crate::CancelToken;
-        use crate::generative_model::{Content, Model};
+        use crate::generative_model::Content;
         use crate::session::{ActiveSession, Session};
         use crate::tool_services::SessionMetaTool;
 
@@ -612,7 +618,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let active = ActiveSession::new(Session::new(Model::ClaudeHaiku45));
+        let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
         let meta = Arc::new(SessionMetaTool::new(active.clone())) as Arc<dyn ToolService>;
         let harness = Harness::local_with_services(vec![meta]);
 
@@ -833,6 +839,7 @@ mod tests {
                     ssh_destination: None,
                 },
             ],
+            ..Default::default()
         };
         let harness = Harness::attach(cfg).await.expect("attach");
         assert_eq!(harness.default_host(), "local");
@@ -908,6 +915,7 @@ mod tests {
                 command: vec!["/nonexistent/myco-please-fail".into()],
                 ssh_destination: None,
             }],
+            ..Default::default()
         };
         let harness = Harness::attach(cfg)
             .await

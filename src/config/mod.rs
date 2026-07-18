@@ -1,99 +1,99 @@
-//! Startup configuration resolved from the process environment.
+//! Startup configuration resolved from config.toml and the process environment.
 //!
 //! Runs once at application startup: [`Config::resolve`] takes optional
-//! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), reads the
-//! process environment, and produces fully resolved settings — per-backend
-//! credentials/base URLs, the host pool (knobs from `--config` →
-//! `$MYCO_CONFIG` → `~/.myco/config.toml`; remote hosts from `~/.ssh/config`
-//! `Host` aliases), the interactive default model (`--model` → config file
-//! `model` → [`DEFAULT_MODEL`]), and the color decision for stdout rendering.
-//! Downstream code checks the resolved fields; nothing else reads these
-//! environment variables.
+//! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), loads the
+//! config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), and
+//! produces fully resolved settings — the **model catalog**, the host pool
+//! (remote hosts from `~/.ssh/config` `Host` aliases), the default model key
+//! (`--model` → config file `model` → sole catalog entry), and the color
+//! decision for stdout rendering. Downstream code reads the resolved fields;
+//! nothing else reads these environment variables or files.
 //!
-//! Credential fallbacks: `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` double
-//! as the fallback credential for the OpenAI and xAI backends, and
-//! `OPENAI_API_KEY` / `OPENAI_BASE_URL` back-fill the xAI backend (Grok is
-//! served over the OpenAI Responses protocol).
+//! ## Model catalog
+//!
+//! Myco ships **no built-in models or gateways**: `[gateways.*]` and
+//! `[models.*]` in config.toml are the entire catalog (see
+//! [`crate::harness::example_config_toml`]). A model entry names a gateway (or
+//! inlines `protocol` / `base_url` / `auth`) plus per-model metadata
+//! (`api_id`, required `context_window`, `thinking`, `max_output_tokens`).
+//!
+//! Auth mechanisms: `env:VAR` (process environment), `token:NAME` (looked up
+//! in a flat `tokens.toml` next to config.toml — keeps secrets out of a
+//! shareable config), or `none` (local servers; no auth header sent).
+//! A missing credential is **not** a resolve error: it is reported when the
+//! model is actually used ([`ModelCatalog::get`]).
 //!
 //! Out of scope, deliberately: `.env` loading (dotenvy runs in `main` before
-//! resolution so this module sees its effect), `MYCO_HOME` (session storage
+//! resolution so `env:VAR` sees its effect), `MYCO_HOME` (session storage
 //! root; read by session code that also runs in `--mode host` workers where
 //! no `Config` exists), and per-tool lookups like `MYCO_LYNX` (resolved at
 //! tool-call time on whichever host runs the tool).
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::generative_model::{self, BackendKind, Model};
+use crate::generative_model::{
+    AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
+    OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
+};
 use crate::harness::{FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases};
 
-pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
-
-/// Interactive CLI model when neither `--model` nor the config file sets one.
-pub const DEFAULT_MODEL: Model = Model::Grok45Build;
+/// Default per-generate output token cap when a model entry sets none.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 
 // ---------------------------------------------------------------------------
-// Per-backend resolved credentials
+// Auth mechanisms
 // ---------------------------------------------------------------------------
 
-/// Anthropic Messages credentials/endpoint. After [`Config::resolve`],
-/// `base_url` is always populated (default applied); tokens stay `None` when
-/// absent — model creation reports the error only when this backend is used.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnthropicBackendConfig {
-    /// `ANTHROPIC_BASE_URL`, default `https://api.anthropic.com`.
-    pub base_url: Option<String>,
-    /// `ANTHROPIC_AUTH_TOKEN` (gateway/OAuth Bearer token).
-    pub auth_token: Option<String>,
-    /// `ANTHROPIC_API_KEY` (`sk-ant-…`, sent as `x-api-key`).
-    pub api_key: Option<String>,
+/// Parsed `auth` string from a gateway/model entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthRef {
+    /// `env:VAR` — read the process environment.
+    Env(String),
+    /// `token:NAME` — look up `NAME` in tokens.toml.
+    Token(String),
+    /// `none` — no credential; no auth header is sent.
+    None,
 }
 
-impl AnthropicBackendConfig {
-    /// Effective credential: auth token first, API key as fallback.
-    pub fn credential(&self) -> Option<&str> {
-        self.auth_token.as_deref().or(self.api_key.as_deref())
+impl AuthRef {
+    fn parse(s: &str) -> Result<Self, String> {
+        if let Some(var) = s.strip_prefix("env:") {
+            if var.is_empty() {
+                return Err("auth \"env:\" is missing a variable name".into());
+            }
+            return Ok(AuthRef::Env(var.to_string()));
+        }
+        if let Some(name) = s.strip_prefix("token:") {
+            if name.is_empty() {
+                return Err("auth \"token:\" is missing a tokens.toml key".into());
+            }
+            return Ok(AuthRef::Token(name.to_string()));
+        }
+        if s == "none" {
+            return Ok(AuthRef::None);
+        }
+        Err(format!(
+            "invalid auth {s:?}: expected \"env:VAR\", \"token:NAME\" (tokens.toml), or \"none\""
+        ))
     }
 }
 
-/// OpenAI Responses credentials/endpoint (no served models yet; resolved for
-/// a consistent surface). Same field semantics as [`AnthropicBackendConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OpenAIBackendConfig {
-    /// `OPENAI_BASE_URL`, default `https://api.openai.com/v1`.
-    pub base_url: Option<String>,
-    /// Fallback Bearer token copied from `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`.
-    pub auth_token: Option<String>,
-    /// `OPENAI_API_KEY`.
-    pub api_key: Option<String>,
-}
-
-impl OpenAIBackendConfig {
-    /// Effective credential: native API key first, borrowed auth token as fallback.
-    pub fn credential(&self) -> Option<&str> {
-        self.api_key.as_deref().or(self.auth_token.as_deref())
+/// Load `tokens.toml` (flat `NAME = "secret"` table). Missing file → empty:
+/// it only becomes an error when a model references `token:NAME`.
+pub fn load_tokens_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
     }
-}
-
-/// xAI (Grok over OpenAI Responses) credentials/endpoint. Same field
-/// semantics as [`AnthropicBackendConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct XAIBackendConfig {
-    /// `XAI_API_BASE_URL` → `OPENAI_BASE_URL`, default `https://api.x.ai/v1`.
-    pub base_url: Option<String>,
-    /// Fallback Bearer token copied from `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`.
-    pub auth_token: Option<String>,
-    /// `XAI_API_KEY` → `OPENAI_API_KEY`.
-    pub api_key: Option<String>,
-}
-
-impl XAIBackendConfig {
-    /// Effective credential: native API key first, borrowed auth token as fallback.
-    pub fn credential(&self) -> Option<&str> {
-        self.api_key.as_deref().or(self.auth_token.as_deref())
-    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read tokens {}: {e}", path.display()))?;
+    toml::from_str::<BTreeMap<String, String>>(&text).map_err(|e| {
+        format!(
+            "parse tokens {}: {e} (expected flat `NAME = \"secret\"` entries)",
+            path.display()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -140,49 +140,49 @@ impl std::str::FromStr for ColorMode {
 // ---------------------------------------------------------------------------
 
 /// Startup-time overrides supplied by the embedding application (CLI flags,
-/// tests). Any field set here wins over the environment.
+/// tests). Any field set here wins over file/environment resolution.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigUserSettings {
-    pub anthropic: AnthropicBackendConfig,
-    pub openai: OpenAIBackendConfig,
-    pub xai: XAIBackendConfig,
     pub color: ColorMode,
     /// Override TTY detection (tests / embedders). `None` → detect from stdout.
     pub stdout_is_tty: Option<bool>,
-    /// Harness config file override (CLI `--config`).
+    /// Config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
     pub harness_config_path: Option<PathBuf>,
-    /// Model id override (CLI `--model`), parsed during resolve.
-    /// `None` → config file `model` → [`DEFAULT_MODEL`].
+    /// Model key override (CLI `--model`).
+    /// `None` → config file `model` → sole catalog entry.
     pub model: Option<String>,
 }
 
 /// Fully resolved application configuration. Build once at startup with
 /// [`Config::resolve`]; everything downstream reads these fields instead of
-/// the environment.
+/// the environment or config files.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub anthropic: AnthropicBackendConfig,
-    pub openai: OpenAIBackendConfig,
-    pub xai: XAIBackendConfig,
     /// Whether stdout is a terminal (or the [`ConfigUserSettings`] override).
     pub stdout_is_tty: bool,
     /// Final color decision for stdout rendering ([`ColorMode`] + env overrides + TTY).
     pub colors_enabled: bool,
-    /// Path the harness config was loaded from
+    /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
+    /// Sibling `tokens.toml` holding literal credentials (`token:NAME`).
+    pub tokens_path: PathBuf,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
-    /// Interactive default model (override → config file `model` → [`DEFAULT_MODEL`]).
-    pub model: Model,
+    /// Model catalog resolved from `[gateways]` / `[models]`.
+    pub models: ModelCatalog,
+    /// Default model key (`--model` → config file `model` → sole entry).
+    /// Always present in the catalog; credential presence is still checked at
+    /// use time via [`ModelCatalog::get`].
+    pub model: String,
 }
 
 impl Config {
     /// Resolve from the real process environment, stdout TTY state, the
-    /// config file, and `~/.ssh/config` host aliases. Errors carry the
-    /// offending path.
+    /// config + tokens files, and `~/.ssh/config` host aliases. Errors carry
+    /// the offending path / entry name.
     pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
         Self::resolve_with(
@@ -191,24 +191,22 @@ impl Config {
             stdout_is_tty,
             load_file_config,
             load_ssh_host_aliases,
+            load_tokens_file,
         )
     }
 
-    /// Resolution against an injected environment, config-file loader, and
-    /// ssh-alias source (tests, embedders). Empty environment values are
-    /// treated as unset.
+    /// Resolution against injected environment / loaders (tests, embedders).
+    /// Empty environment values are treated as unset.
     pub fn resolve_with(
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
         stdout_is_tty: bool,
         load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
         ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
+        load_tokens: impl FnOnce(&Path) -> Result<BTreeMap<String, String>, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
-            anthropic,
-            openai,
-            xai,
             color,
             stdout_is_tty: tty_override,
             harness_config_path,
@@ -217,48 +215,30 @@ impl Config {
 
         let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
         let harness_config_path = resolve_harness_config_path(harness_config_path, &env)?;
+        let tokens_path = harness_config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("tokens.toml");
         let file = load_file(&harness_config_path)?;
-        let model = match model_override {
-            Some(s) => s.parse::<Model>()?,
-            None => file.model.unwrap_or(DEFAULT_MODEL),
-        };
-        let harness = file.into_harness_config(ssh_aliases()?);
-        let (anthropic, openai, xai) = resolve_credentials(anthropic, openai, xai, &env);
+        let tokens = load_tokens(&tokens_path)?;
+
+        let models = resolve_catalog(&file, &env, &tokens, &tokens_path)?;
+        let model = resolve_default_model(model_override, file.model.clone(), &models)?;
+
+        let mut harness = file.into_harness_config(ssh_aliases()?);
+        harness.models = models.clone();
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
 
         Ok(Self {
-            anthropic,
-            openai,
-            xai,
             stdout_is_tty,
             colors_enabled,
             harness_config_path,
+            tokens_path,
             harness,
+            models,
             model,
         })
     }
-
-    /// Provider backend settings for `model`, credentials copied from this
-    /// config. Model creation reports missing credentials.
-    pub fn backend_config(&self, model: Model) -> generative_model::BackendConfig {
-        protocol_backend_config(&self.anthropic, &self.xai, model)
-    }
-}
-
-/// Backend defaults for `model` resolved from the environment alone — no
-/// harness file I/O, infallible. The lazy path behind
-/// [`generative_model::BackendConfig::default_for_model`] (subagents, compact
-/// workers, tests); applications should build a full [`Config::resolve`] at
-/// startup instead.
-pub fn env_backend_config(model: Model) -> generative_model::BackendConfig {
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
-    let (anthropic, _openai, xai) = resolve_credentials(
-        AnthropicBackendConfig::default(),
-        OpenAIBackendConfig::default(),
-        XAIBackendConfig::default(),
-        &env,
-    );
-    protocol_backend_config(&anthropic, &xai, model)
 }
 
 /// `--config` override → `$MYCO_CONFIG` → `~/.myco/config.toml`.
@@ -276,84 +256,161 @@ fn resolve_harness_config_path(
     Ok(home.join(".myco").join("config.toml"))
 }
 
-fn resolve_credentials(
-    anthropic: AnthropicBackendConfig,
-    openai: OpenAIBackendConfig,
-    xai: XAIBackendConfig,
+/// Build the model catalog from `[gateways]` / `[models]`.
+///
+/// Hard errors here are config-shape problems (unknown gateway, missing
+/// protocol/base_url/auth, invalid auth string, incompatible thinking mode).
+/// Missing *credentials* are soft: recorded per-entry and reported when the
+/// model is actually used.
+fn resolve_catalog(
+    file: &FileConfig,
     env: &impl Fn(&str) -> Option<String>,
-) -> (
-    AnthropicBackendConfig,
-    OpenAIBackendConfig,
-    XAIBackendConfig,
-) {
-    // Anthropic credentials double as the fallback Bearer token for the
-    // OpenAI / xAI backends (one env setup drives every gateway).
-    let anthropic_fallback = env("ANTHROPIC_AUTH_TOKEN").or_else(|| env("ANTHROPIC_API_KEY"));
+    tokens: &BTreeMap<String, String>,
+    tokens_path: &Path,
+) -> Result<ModelCatalog, String> {
+    let mut entries = BTreeMap::new();
 
-    let anthropic = AnthropicBackendConfig {
-        base_url: anthropic
+    for (key, entry) in &file.models {
+        let gateway = match &entry.gateway {
+            Some(name) => Some(file.gateways.get(name).ok_or_else(|| {
+                format!(
+                    "model `{key}`: unknown gateway `{name}` (configured: [{}])",
+                    file.gateways.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?),
+            None => None,
+        };
+
+        let protocol = entry
+            .protocol
+            .or(gateway.map(|g| g.protocol))
+            .ok_or_else(|| {
+                format!("model `{key}`: no protocol — set `protocol` or reference a `gateway`")
+            })?;
+        let base_url = entry
             .base_url
-            .or_else(|| env("ANTHROPIC_BASE_URL"))
-            .or_else(|| Some(ANTHROPIC_DEFAULT_BASE_URL.into())),
-        auth_token: anthropic.auth_token.or_else(|| env("ANTHROPIC_AUTH_TOKEN")),
-        api_key: anthropic.api_key.or_else(|| env("ANTHROPIC_API_KEY")),
-    };
+            .clone()
+            .or_else(|| gateway.map(|g| g.base_url.clone()))
+            .ok_or_else(|| {
+                format!("model `{key}`: no base_url — set `base_url` or reference a `gateway`")
+            })?;
+        let auth_str = entry
+            .auth
+            .clone()
+            .or_else(|| gateway.map(|g| g.auth.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "model `{key}`: no auth — set `auth = \"env:VAR\" | \"token:NAME\" | \
+                     \"none\"` on the model or its gateway"
+                )
+            })?;
+        let auth = AuthRef::parse(&auth_str).map_err(|e| format!("model `{key}`: {e}"))?;
 
-    let openai = OpenAIBackendConfig {
-        base_url: openai
-            .base_url
-            .or_else(|| env("OPENAI_BASE_URL"))
-            .or_else(|| Some(OPENAI_DEFAULT_BASE_URL.into())),
-        auth_token: openai.auth_token.or_else(|| anthropic_fallback.clone()),
-        api_key: openai.api_key.or_else(|| env("OPENAI_API_KEY")),
-    };
+        let thinking = entry
+            .thinking
+            .unwrap_or_else(|| ThinkingMode::default_for(protocol));
+        if !thinking.compatible_with(protocol) {
+            return Err(format!(
+                "model `{key}`: thinking `{thinking}` is not valid for protocol `{protocol}` \
+                 (anthropic-messages: adaptive|budget|none; openai-responses: effort|none)"
+            ));
+        }
 
-    let xai = XAIBackendConfig {
-        base_url: xai
-            .base_url
-            .or_else(|| env("XAI_API_BASE_URL"))
-            .or_else(|| env("OPENAI_BASE_URL"))
-            .or_else(|| Some(XAI_DEFAULT_BASE_URL.into())),
-        auth_token: xai.auth_token.or_else(|| anthropic_fallback.clone()),
-        api_key: xai
-            .api_key
-            .or_else(|| env("XAI_API_KEY"))
-            .or_else(|| env("OPENAI_API_KEY")),
-    };
+        let (token, auth_error) = match auth {
+            AuthRef::None => (String::new(), None),
+            AuthRef::Env(var) => match env(&var) {
+                Some(v) => (v, None),
+                None => (
+                    String::new(),
+                    Some(format!(
+                        "model `{key}`: auth env var `{var}` is unset or empty"
+                    )),
+                ),
+            },
+            AuthRef::Token(name) => match tokens.get(&name) {
+                Some(v) => (v.clone(), None),
+                None => (
+                    String::new(),
+                    Some(format!(
+                        "model `{key}`: token `{name}` not found in {}",
+                        tokens_path.display()
+                    )),
+                ),
+            },
+        };
 
-    (anthropic, openai, xai)
+        let spec = ModelSpec {
+            key: key.clone(),
+            api_id: entry.api_id.clone().unwrap_or_else(|| key.clone()),
+            protocol,
+            thinking,
+            context_window_tokens: entry.context_window,
+        };
+        let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let backend = match protocol {
+            Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
+                anthropic_base_url: base_url,
+                anthropic_auth_token: token,
+                max_tokens_per_generate: max_output,
+                ..Default::default()
+            }),
+            Protocol::OpenAIResponses => {
+                BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig {
+                    base_url,
+                    auth_token: token,
+                    max_output_tokens: Some(max_output),
+                    ..Default::default()
+                })
+            }
+        };
+
+        entries.insert(
+            key.clone(),
+            CatalogModel {
+                spec,
+                backend,
+                auth_error,
+            },
+        );
+    }
+
+    Ok(ModelCatalog::new(entries))
 }
 
-/// Map resolved credentials onto the protocol backend settings for `model`.
-fn protocol_backend_config(
-    anthropic: &AnthropicBackendConfig,
-    xai: &XAIBackendConfig,
-    model: Model,
-) -> generative_model::BackendConfig {
-    match model.backend_kind() {
-        BackendKind::AnthropicMessages => {
-            generative_model::BackendConfig::Anthropic(generative_model::AnthropicBackendConfig {
-                anthropic_base_url: anthropic
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| ANTHROPIC_DEFAULT_BASE_URL.into()),
-                anthropic_auth_token: anthropic.credential().unwrap_or_default().to_string(),
-                ..Default::default()
-            })
+/// `--model` → config file `model` → sole catalog entry. The chosen key must
+/// exist in the catalog (credentials are checked later, at use).
+fn resolve_default_model(
+    override_key: Option<String>,
+    file_key: Option<String>,
+    catalog: &ModelCatalog,
+) -> Result<String, String> {
+    if let Some(key) = override_key.or(file_key) {
+        if !catalog.contains(&key) {
+            if catalog.is_empty() {
+                return Err(format!(
+                    "model {key:?} selected but no models are configured — define \
+                     [models] (and [gateways]) in config.toml"
+                ));
+            }
+            return Err(format!(
+                "unknown model {key:?}; configured models: [{}]",
+                catalog.keys().join(", ")
+            ));
         }
-        // Every current OpenAI Responses model is xAI Grok, so this protocol
-        // uses the xAI credentials (which already back-fill from the OpenAI
-        // variables).
-        BackendKind::OpenAIResponses => generative_model::BackendConfig::OpenAIResponses(
-            generative_model::OpenAIResponsesBackendConfig {
-                base_url: xai
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| XAI_DEFAULT_BASE_URL.into()),
-                auth_token: xai.credential().unwrap_or_default().to_string(),
-                ..Default::default()
-            },
+        return Ok(key);
+    }
+    match catalog.keys().as_slice() {
+        [] => Err(
+            "no models configured — define [models] (and [gateways]) in config.toml; \
+             see `myco --help overview` for the format"
+                .into(),
         ),
+        [only] => Ok(only.to_string()),
+        keys => Err(format!(
+            "no model selected — set `model = \"<key>\"` in config.toml or pass --model \
+             (configured: [{}])",
+            keys.join(", ")
+        )),
     }
 }
 
@@ -389,6 +446,7 @@ fn resolve_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::parse_file_config_str;
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -399,200 +457,396 @@ mod tests {
         }
     }
 
-    fn resolve_cfg(
+    const CATALOG: &str = r#"
+model = "kimi-k3"
+
+[gateways.openrouter]
+protocol = "openai-responses"
+base_url = "https://openrouter.ai/api/v1"
+auth = "env:OPENROUTER_API_KEY"
+
+[gateways.anthropic]
+protocol = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+auth = "env:ANTHROPIC_API_KEY"
+
+[models.kimi-k3]
+gateway = "openrouter"
+api_id = "moonshotai/kimi-k3"
+context_window = 1_000_000
+
+[models.opus]
+gateway = "anthropic"
+api_id = "claude-opus-4-8"
+context_window = 1_000_000
+
+[models.haiku-local]
+protocol = "anthropic-messages"
+base_url = "http://localhost:8080"
+auth = "none"
+thinking = "budget"
+api_id = "claude-haiku-4-5"
+context_window = 200_000
+"#;
+
+    fn resolve_toml(
+        toml_text: &'static str,
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
-        stdout_is_tty: bool,
-    ) -> Config {
+        tokens: BTreeMap<String, String>,
+    ) -> Result<Config, String> {
         Config::resolve_with(
             settings,
             env,
-            stdout_is_tty,
-            |_| Ok(FileConfig::default()),
+            false,
+            move |_| parse_file_config_str(toml_text),
             || Ok(Vec::new()),
+            move |_| Ok(tokens),
+        )
+    }
+
+    fn resolve_catalog_cfg(env_pairs: &[(&str, &str)]) -> Config {
+        resolve_toml(
+            CATALOG,
+            ConfigUserSettings::default(),
+            env_of(env_pairs),
+            BTreeMap::new(),
         )
         .unwrap()
     }
 
-    fn resolve(pairs: &[(&str, &str)]) -> Config {
-        resolve_cfg(ConfigUserSettings::default(), env_of(pairs), false)
-    }
-
     #[test]
-    fn empty_env_yields_defaults_and_no_credentials() {
-        let cfg = resolve(&[]);
-        assert_eq!(
-            cfg.anthropic.base_url.as_deref(),
-            Some(ANTHROPIC_DEFAULT_BASE_URL)
-        );
-        assert_eq!(
-            cfg.openai.base_url.as_deref(),
-            Some(OPENAI_DEFAULT_BASE_URL)
-        );
-        assert_eq!(cfg.xai.base_url.as_deref(), Some(XAI_DEFAULT_BASE_URL));
-        assert_eq!(cfg.anthropic.credential(), None);
-        assert_eq!(cfg.openai.credential(), None);
-        assert_eq!(cfg.xai.credential(), None);
-    }
-
-    #[test]
-    fn empty_env_values_are_unset() {
-        let cfg = resolve(&[("ANTHROPIC_AUTH_TOKEN", ""), ("ANTHROPIC_BASE_URL", "")]);
-        assert_eq!(cfg.anthropic.auth_token, None);
-        assert_eq!(
-            cfg.anthropic.base_url.as_deref(),
-            Some(ANTHROPIC_DEFAULT_BASE_URL)
-        );
-    }
-
-    #[test]
-    fn anthropic_auth_token_beats_api_key() {
-        let cfg = resolve(&[
-            ("ANTHROPIC_AUTH_TOKEN", "tok"),
-            ("ANTHROPIC_API_KEY", "sk-ant-key"),
-        ]);
-        assert_eq!(cfg.anthropic.auth_token.as_deref(), Some("tok"));
-        assert_eq!(cfg.anthropic.api_key.as_deref(), Some("sk-ant-key"));
-        assert_eq!(cfg.anthropic.credential(), Some("tok"));
-    }
-
-    #[test]
-    fn anthropic_api_key_alone_is_credential() {
-        let cfg = resolve(&[("ANTHROPIC_API_KEY", "sk-ant-key")]);
-        assert_eq!(cfg.anthropic.credential(), Some("sk-ant-key"));
-    }
-
-    #[test]
-    fn xai_prefers_native_key_over_openai_key() {
-        let cfg = resolve(&[("XAI_API_KEY", "xai"), ("OPENAI_API_KEY", "oai")]);
-        assert_eq!(cfg.xai.credential(), Some("xai"));
-        assert_eq!(cfg.openai.credential(), Some("oai"));
-    }
-
-    #[test]
-    fn openai_key_back_fills_xai() {
-        let cfg = resolve(&[("OPENAI_API_KEY", "oai")]);
-        assert_eq!(cfg.xai.api_key.as_deref(), Some("oai"));
-        assert_eq!(cfg.xai.credential(), Some("oai"));
-    }
-
-    #[test]
-    fn anthropic_token_is_fallback_for_openai_and_xai() {
-        let cfg = resolve(&[("ANTHROPIC_AUTH_TOKEN", "tok")]);
-        assert_eq!(cfg.openai.auth_token.as_deref(), Some("tok"));
-        assert_eq!(cfg.xai.auth_token.as_deref(), Some("tok"));
-        assert_eq!(cfg.openai.credential(), Some("tok"));
-        assert_eq!(cfg.xai.credential(), Some("tok"));
-        // Native keys still win over the borrowed token.
-        let cfg = resolve(&[("ANTHROPIC_AUTH_TOKEN", "tok"), ("XAI_API_KEY", "xai")]);
-        assert_eq!(cfg.xai.credential(), Some("xai"));
-    }
-
-    #[test]
-    fn xai_base_url_prefers_native_then_openai_then_default() {
-        let cfg = resolve(&[
-            ("XAI_API_BASE_URL", "https://x"),
-            ("OPENAI_BASE_URL", "https://o"),
-        ]);
-        assert_eq!(cfg.xai.base_url.as_deref(), Some("https://x"));
-        let cfg = resolve(&[("OPENAI_BASE_URL", "https://o")]);
-        assert_eq!(cfg.xai.base_url.as_deref(), Some("https://o"));
-        assert_eq!(
-            resolve(&[]).xai.base_url.as_deref(),
-            Some(XAI_DEFAULT_BASE_URL)
-        );
-    }
-
-    #[test]
-    fn user_settings_override_environment() {
-        let settings = ConfigUserSettings {
-            anthropic: AnthropicBackendConfig {
-                auth_token: Some("explicit".into()),
-                ..Default::default()
-            },
-            xai: XAIBackendConfig {
-                base_url: Some("https://gw".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let cfg = resolve_cfg(
-            settings,
-            env_of(&[
-                ("ANTHROPIC_AUTH_TOKEN", "env"),
-                ("XAI_API_BASE_URL", "https://env"),
-            ]),
-            false,
-        );
-        assert_eq!(cfg.anthropic.credential(), Some("explicit"));
-        assert_eq!(cfg.xai.base_url.as_deref(), Some("https://gw"));
-    }
-
-    #[test]
-    fn backend_config_maps_models_to_provider_settings() {
-        let cfg = resolve(&[("ANTHROPIC_AUTH_TOKEN", "tok"), ("XAI_API_KEY", "xai")]);
-        match cfg.backend_config(Model::ClaudeHaiku45) {
-            generative_model::BackendConfig::Anthropic(b) => {
-                assert_eq!(b.anthropic_base_url, ANTHROPIC_DEFAULT_BASE_URL);
-                assert_eq!(b.anthropic_auth_token, "tok");
-            }
-            other => panic!("expected Anthropic backend, got {other:?}"),
-        }
-        match cfg.backend_config(Model::Grok45Build) {
-            generative_model::BackendConfig::OpenAIResponses(b) => {
-                assert_eq!(b.base_url, XAI_DEFAULT_BASE_URL);
-                assert_eq!(b.auth_token, "xai");
+    fn gateway_ref_supplies_protocol_base_url_and_auth() {
+        let cfg = resolve_catalog_cfg(&[("OPENROUTER_API_KEY", "or-key")]);
+        let kimi = cfg.models.get("kimi-k3").unwrap();
+        assert_eq!(kimi.spec.key, "kimi-k3");
+        assert_eq!(kimi.spec.api_id, "moonshotai/kimi-k3");
+        assert_eq!(kimi.spec.protocol, Protocol::OpenAIResponses);
+        assert_eq!(kimi.spec.thinking, ThinkingMode::Effort);
+        assert_eq!(kimi.spec.context_window_tokens, 1_000_000);
+        match &kimi.backend {
+            BackendConfig::OpenAIResponses(b) => {
+                assert_eq!(b.base_url, "https://openrouter.ai/api/v1");
+                assert_eq!(b.auth_token, "or-key");
+                assert_eq!(b.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
             }
             other => panic!("expected OpenAI Responses backend, got {other:?}"),
         }
     }
 
     #[test]
+    fn inline_model_needs_no_gateway_and_auth_none_is_usable() {
+        let cfg = resolve_catalog_cfg(&[]);
+        let local = cfg.models.get("haiku-local").unwrap();
+        assert_eq!(local.spec.protocol, Protocol::AnthropicMessages);
+        assert_eq!(local.spec.thinking, ThinkingMode::Budget);
+        match &local.backend {
+            BackendConfig::Anthropic(b) => {
+                assert_eq!(b.anthropic_base_url, "http://localhost:8080");
+                assert_eq!(b.anthropic_auth_token, "");
+            }
+            other => panic!("expected Anthropic backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_env_credential_defers_until_use() {
+        // Resolves fine without the env vars…
+        let cfg = resolve_catalog_cfg(&[]);
+        // …the default model is still selected…
+        assert_eq!(cfg.model, "kimi-k3");
+        // …and the error surfaces on use, naming the mechanism.
+        let err = cfg.models.get("kimi-k3").unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
+        assert!(err.contains("kimi-k3"), "{err}");
+    }
+
+    #[test]
+    fn token_auth_reads_tokens_toml_and_missing_key_defers() {
+        let toml_text = r#"
+[models.proxy]
+protocol = "openai-responses"
+base_url = "https://proxy.corp/v1"
+auth = "token:corp"
+context_window = 100_000
+"#;
+        let cfg = resolve_toml(
+            toml_text,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            [("corp".to_string(), "sekrit".to_string())].into(),
+        )
+        .unwrap();
+        match &cfg.models.get("proxy").unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sekrit"),
+            other => panic!("unexpected backend {other:?}"),
+        }
+
+        let cfg = resolve_toml(
+            toml_text,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let err = cfg.models.get("proxy").unwrap_err();
+        assert!(err.contains("token `corp` not found"), "{err}");
+        assert!(err.contains("tokens.toml"), "{err}");
+    }
+
+    #[test]
+    fn config_shape_errors_name_the_model() {
+        let unknown_gateway = r#"
+[models.x]
+gateway = "nope"
+context_window = 1000
+"#;
+        let err = resolve_toml(
+            unknown_gateway,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("model `x`"), "{err}");
+        assert!(err.contains("unknown gateway `nope`"), "{err}");
+
+        let no_protocol = r#"
+[models.x]
+base_url = "https://h"
+auth = "none"
+context_window = 1000
+"#;
+        let err = resolve_toml(
+            no_protocol,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no protocol"), "{err}");
+
+        let bad_auth = r#"
+[models.x]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "keychain:oops"
+context_window = 1000
+"#;
+        let err = resolve_toml(
+            bad_auth,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid auth"), "{err}");
+        assert!(err.contains("env:VAR"), "{err}");
+    }
+
+    #[test]
+    fn incompatible_thinking_mode_is_a_resolve_error() {
+        let toml_text = r#"
+[models.x]
+protocol = "anthropic-messages"
+base_url = "https://h"
+auth = "none"
+thinking = "effort"
+context_window = 1000
+"#;
+        let err = resolve_toml(
+            toml_text,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("thinking `effort`"), "{err}");
+        assert!(err.contains("anthropic-messages"), "{err}");
+    }
+
+    #[test]
+    fn default_model_precedence_override_file_sole_entry() {
+        // --model override wins over the file key.
+        let cfg = resolve_toml(
+            CATALOG,
+            ConfigUserSettings {
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "opus");
+
+        // File key applies otherwise (CATALOG sets kimi-k3).
+        assert_eq!(resolve_catalog_cfg(&[]).model, "kimi-k3");
+
+        // A sole entry needs no selection at all.
+        let sole = r#"
+[models.only]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "none"
+context_window = 1000
+"#;
+        let cfg = resolve_toml(
+            sole,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "only");
+    }
+
+    #[test]
+    fn missing_model_selection_errors_are_actionable() {
+        // No models at all.
+        let err = resolve_toml(
+            "",
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no models configured"), "{err}");
+        assert!(err.contains("[models]"), "{err}");
+
+        // Multiple models, nothing selected.
+        let two = r#"
+[models.a]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "none"
+context_window = 1000
+
+[models.b]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "none"
+context_window = 1000
+"#;
+        let err = resolve_toml(
+            two,
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no model selected"), "{err}");
+        assert!(err.contains("[a, b]"), "{err}");
+
+        // Unknown selection lists the catalog.
+        let err = resolve_toml(
+            two,
+            ConfigUserSettings {
+                model: Some("c".into()),
+                ..Default::default()
+            },
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown model \"c\""), "{err}");
+        assert!(err.contains("[a, b]"), "{err}");
+    }
+
+    #[test]
+    fn auth_ref_parse_forms() {
+        assert_eq!(
+            AuthRef::parse("env:XAI_API_KEY").unwrap(),
+            AuthRef::Env("XAI_API_KEY".into())
+        );
+        assert_eq!(
+            AuthRef::parse("token:corp").unwrap(),
+            AuthRef::Token("corp".into())
+        );
+        assert_eq!(AuthRef::parse("none").unwrap(), AuthRef::None);
+        assert!(AuthRef::parse("env:").is_err());
+        assert!(AuthRef::parse("token:").is_err());
+        assert!(AuthRef::parse("sk-raw-secret").is_err());
+    }
+
+    #[test]
+    fn example_config_resolves_end_to_end() {
+        let cfg = Config::resolve_with(
+            ConfigUserSettings::default(),
+            env_of(&[("XAI_API_KEY", "xai")]),
+            false,
+            |_| parse_file_config_str(&crate::harness::example_config_toml()),
+            || Ok(Vec::new()),
+            |_| Ok(BTreeMap::new()),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "grok-4.5-build");
+        assert!(cfg.models.get("grok-4.5-build").is_ok());
+        // Anthropic entries resolve but defer their missing credential.
+        let err = cfg.models.get("claude-opus-4-8").unwrap_err();
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn tokens_path_sits_next_to_config() {
+        let cfg = resolve_toml(
+            CATALOG,
+            ConfigUserSettings {
+                harness_config_path: Some(PathBuf::from("/etc/myco/config.toml")),
+                ..Default::default()
+            },
+            env_of(&[]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.tokens_path, PathBuf::from("/etc/myco/tokens.toml"));
+    }
+
+    #[test]
     fn color_mode_always_and_never_override_everything() {
-        let env = env_of(&[("NO_COLOR", "1")]);
-        let always = ConfigUserSettings {
-            color: ColorMode::Always,
-            ..Default::default()
-        };
-        assert!(resolve_cfg(always, &env, false).colors_enabled);
-        let env = env_of(&[("CLICOLOR_FORCE", "1")]);
-        let never = ConfigUserSettings {
-            color: ColorMode::Never,
-            ..Default::default()
-        };
-        assert!(!resolve_cfg(never, &env, true).colors_enabled);
+        let cfg = resolve_toml(
+            CATALOG,
+            ConfigUserSettings {
+                color: ColorMode::Always,
+                ..Default::default()
+            },
+            env_of(&[("NO_COLOR", "1")]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(cfg.colors_enabled);
+        let cfg = resolve_toml(
+            CATALOG,
+            ConfigUserSettings {
+                color: ColorMode::Never,
+                stdout_is_tty: Some(true),
+                ..Default::default()
+            },
+            env_of(&[("CLICOLOR_FORCE", "1")]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(!cfg.colors_enabled);
     }
 
     #[test]
     fn auto_colors_follow_tty_and_env_overrides() {
-        // TTY drives the default.
-        assert!(resolve_cfg(Default::default(), env_of(&[]), true).colors_enabled);
-        assert!(!resolve_cfg(Default::default(), env_of(&[]), false).colors_enabled);
-        // NO_COLOR (non-empty) disables, even on a TTY, and beats CLICOLOR_FORCE.
-        let env = env_of(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]);
-        assert!(!resolve_cfg(Default::default(), &env, true).colors_enabled);
-        // Empty NO_COLOR is unset.
-        let env = env_of(&[("NO_COLOR", "")]);
-        assert!(resolve_cfg(Default::default(), &env, true).colors_enabled);
-        // CLICOLOR_FORCE forces colors without a TTY; "0" does not.
-        let env = env_of(&[("CLICOLOR_FORCE", "1")]);
-        assert!(resolve_cfg(Default::default(), &env, false).colors_enabled);
-        let env = env_of(&[("CLICOLOR_FORCE", "0")]);
-        assert!(!resolve_cfg(Default::default(), &env, false).colors_enabled);
-        // Dumb terminals stay plain.
-        let env = env_of(&[("TERM", "dumb")]);
-        assert!(!resolve_cfg(Default::default(), &env, true).colors_enabled);
-    }
-
-    #[test]
-    fn stdout_is_tty_setting_overrides_detection() {
-        let settings = ConfigUserSettings {
-            stdout_is_tty: Some(true),
-            ..Default::default()
+        let auto = |env_pairs: &[(&str, &str)], tty: bool| {
+            let env = env_of(env_pairs);
+            let env = |k: &str| env(k).filter(|v| !v.is_empty());
+            resolve_colors(ColorMode::Auto, &env, tty)
         };
-        let cfg = resolve_cfg(settings, env_of(&[]), false);
-        assert!(cfg.stdout_is_tty);
-        assert!(cfg.colors_enabled);
+        assert!(auto(&[], true));
+        assert!(!auto(&[], false));
+        // NO_COLOR (non-empty) disables, even on a TTY, and beats CLICOLOR_FORCE.
+        assert!(!auto(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")], true));
+        // Empty NO_COLOR is unset.
+        assert!(auto(&[("NO_COLOR", "")], true));
+        // CLICOLOR_FORCE forces colors without a TTY; "0" does not.
+        assert!(auto(&[("CLICOLOR_FORCE", "1")], false));
+        assert!(!auto(&[("CLICOLOR_FORCE", "0")], false));
+        // Dumb terminals stay plain.
+        assert!(!auto(&[("TERM", "dumb")], true));
     }
 
     #[test]
@@ -605,107 +859,74 @@ mod tests {
 
     #[test]
     fn harness_config_path_override_beats_env_beats_home_default() {
-        let settings = ConfigUserSettings {
-            harness_config_path: Some(PathBuf::from("/tmp/x.toml")),
-            ..Default::default()
+        let path_for = |override_path: Option<PathBuf>, env_pairs: &[(&str, &str)]| {
+            let env = env_of(env_pairs);
+            let env = move |k: &str| env(k).filter(|v: &String| !v.is_empty());
+            resolve_harness_config_path(override_path, &env).unwrap()
         };
-        let cfg = resolve_cfg(settings, env_of(&[("MYCO_CONFIG", "/env/y.toml")]), false);
-        assert_eq!(cfg.harness_config_path, PathBuf::from("/tmp/x.toml"));
-
-        let cfg = resolve_cfg(
-            Default::default(),
-            env_of(&[("MYCO_CONFIG", "/env/y.toml")]),
-            false,
+        assert_eq!(
+            path_for(
+                Some(PathBuf::from("/tmp/x.toml")),
+                &[("MYCO_CONFIG", "/env/y.toml")]
+            ),
+            PathBuf::from("/tmp/x.toml")
         );
-        assert_eq!(cfg.harness_config_path, PathBuf::from("/env/y.toml"));
-
-        let cfg = resolve_cfg(Default::default(), env_of(&[]), false);
-        assert!(cfg.harness_config_path.ends_with(".myco/config.toml"));
+        assert_eq!(
+            path_for(None, &[("MYCO_CONFIG", "/env/y.toml")]),
+            PathBuf::from("/env/y.toml")
+        );
+        assert!(path_for(None, &[]).ends_with(".myco/config.toml"));
     }
 
     #[test]
     fn harness_loader_gets_resolved_path_and_result_is_stored() {
-        let settings = ConfigUserSettings {
-            harness_config_path: Some(PathBuf::from("/tmp/h.toml")),
-            ..Default::default()
-        };
         let cfg = Config::resolve_with(
-            settings,
+            ConfigUserSettings {
+                harness_config_path: Some(PathBuf::from("/tmp/h.toml")),
+                ..Default::default()
+            },
             env_of(&[]),
             false,
             |p| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
-                Ok(FileConfig {
-                    attach_timeout_secs: 42,
-                    ..Default::default()
-                })
+                let mut file = parse_file_config_str(
+                    "[models.m]\nprotocol = \"openai-responses\"\n\
+                     base_url = \"https://h\"\nauth = \"none\"\ncontext_window = 1000\n",
+                )?;
+                file.attach_timeout_secs = 42;
+                Ok(file)
             },
             || Ok(vec!["devbox".into()]),
+            |_| Ok(BTreeMap::new()),
         )
         .unwrap();
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
-        // ssh aliases become the remote host pool.
         assert_eq!(cfg.harness.remote_hosts.len(), 1);
         assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
     }
 
     #[test]
-    fn harness_load_error_propagates() {
+    fn load_errors_propagate() {
         let err = Config::resolve_with(
             ConfigUserSettings::default(),
             env_of(&[]),
             false,
             |_| Err("invalid config TOML".into()),
             || Ok(Vec::new()),
+            |_| Ok(BTreeMap::new()),
         )
         .unwrap_err();
         assert!(err.contains("invalid config TOML"));
-    }
 
-    #[test]
-    fn model_override_beats_file_beats_default() {
-        assert_eq!(resolve(&[]).model, DEFAULT_MODEL);
-
-        let file_model = |_: &Path| {
-            Ok(FileConfig {
-                model: Some(Model::ClaudeOpus48),
-                ..Default::default()
-            })
-        };
-        let cfg = Config::resolve_with(
+        let err = Config::resolve_with(
             ConfigUserSettings::default(),
             env_of(&[]),
             false,
-            file_model,
+            |_| parse_file_config_str(""),
             || Ok(Vec::new()),
-        )
-        .unwrap();
-        assert_eq!(cfg.model, Model::ClaudeOpus48);
-
-        // Override wins over the file; CLI aliases are accepted.
-        let settings = ConfigUserSettings {
-            model: Some("claude-haiku-4.5".into()),
-            ..Default::default()
-        };
-        let cfg = Config::resolve_with(settings, env_of(&[]), false, file_model, || Ok(Vec::new()))
-            .unwrap();
-        assert_eq!(cfg.model, Model::ClaudeHaiku45);
-    }
-
-    #[test]
-    fn invalid_model_override_errors() {
-        let settings = ConfigUserSettings {
-            model: Some("gpt-99".into()),
-            ..Default::default()
-        };
-        let err = Config::resolve_with(
-            settings,
-            env_of(&[]),
-            false,
-            |_| Ok(FileConfig::default()),
-            || Ok(Vec::new()),
+            |_| Err("bad tokens.toml".into()),
         )
         .unwrap_err();
-        assert!(err.contains("Unknown model"), "{err}");
+        assert!(err.contains("bad tokens.toml"));
     }
 }

@@ -17,10 +17,9 @@ pub trait GenerativeModel: Send + Sync {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
 }
 
-/// Supported generative models. Wire IDs are provided by [`Model::api_id`].
+/// Wire protocol a model is served over.
 ///
-/// Serde / JSON Schema use the same canonical wire strings as [`Model::api_id`].
-/// Extra aliases are accepted on deserialize only (for CLI / human input).
+/// Serde strings are the config.toml `protocol` values.
 #[derive(
     Debug,
     Clone,
@@ -32,78 +31,174 @@ pub trait GenerativeModel: Send + Sync {
     serde::Deserialize,
     schemars::JsonSchema,
 )]
-pub enum Model {
-    // Anthropic Messages API
-    #[serde(rename = "claude-fable-5")]
-    ClaudeFable5,
-    #[serde(
-        rename = "claude-opus-4-8",
-        alias = "claude-opus-4.8",
-        alias = "claude-opus-4.8[1m]"
-    )]
-    ClaudeOpus48,
-    #[serde(
-        rename = "claude-sonnet-4-6",
-        alias = "claude-sonnet-5",
-        alias = "claude-sonnet-4.5"
-    )]
-    ClaudeSonnet5,
-    #[serde(rename = "claude-haiku-4-5", alias = "claude-haiku-4.5")]
-    ClaudeHaiku45,
-    // OpenAI Responses API (xAI / Grok gateways)
-    #[serde(
-        rename = "grok-4.5-build",
-        alias = "grok-4.5",
-        alias = "grok-4.5-build[1m]"
-    )]
-    Grok45Build,
-    // OpenRouter gateway (OpenAI Responses protocol; canonical ids are the
-    // vendor-prefixed OpenRouter slugs, aliases drop the vendor prefix)
-    #[serde(rename = "moonshotai/kimi-k3", alias = "kimi-k3")]
-    KimiK3,
-    #[serde(rename = "deepseek/deepseek-v4-pro", alias = "deepseek-v4-pro")]
-    DeepSeekV4Pro,
-    #[serde(rename = "deepseek/deepseek-v4-flash", alias = "deepseek-v4-flash")]
-    DeepSeekV4Flash,
-    #[serde(rename = "google/gemini-3.5-flash", alias = "gemini-3.5-flash")]
-    Gemini35Flash,
-    #[serde(
-        rename = "google/gemini-3.1-pro-preview",
-        alias = "gemini-3.1-pro-preview",
-        alias = "gemini-3.1-pro"
-    )]
-    Gemini31ProPreview,
-    #[serde(rename = "openai/gpt-5.6-sol", alias = "gpt-5.6-sol")]
-    Gpt56Sol,
-    #[serde(rename = "openai/gpt-5.6-terra", alias = "gpt-5.6-terra")]
-    Gpt56Terra,
-    #[serde(rename = "openai/gpt-5.6-luna", alias = "gpt-5.6-luna")]
-    Gpt56Luna,
-    // Anthropic via OpenRouter. No bare aliases: bare `claude-*` ids mean the
-    // native Anthropic Messages backend; the vendor prefix opts into OpenRouter.
-    #[serde(rename = "anthropic/claude-fable-5")]
-    ClaudeFable5OpenRouter,
-    #[serde(rename = "anthropic/claude-opus-4.8")]
-    ClaudeOpus48OpenRouter,
-    #[serde(rename = "anthropic/claude-sonnet-4.6")]
-    ClaudeSonnet46OpenRouter,
-    #[serde(rename = "anthropic/claude-haiku-4.5")]
-    ClaudeHaiku45OpenRouter,
-}
-
-/// Which API protocol a model is served over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BackendKind {
+pub enum Protocol {
+    #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+    #[serde(rename = "openai-responses")]
     OpenAIResponses,
 }
 
-impl std::fmt::Display for BackendKind {
+impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendKind::AnthropicMessages => f.write_str("Anthropic Messages"),
-            BackendKind::OpenAIResponses => f.write_str("OpenAI Responses"),
+            Protocol::AnthropicMessages => f.write_str("anthropic-messages"),
+            Protocol::OpenAIResponses => f.write_str("openai-responses"),
         }
+    }
+}
+
+/// How thinking/reasoning is requested for a model.
+///
+/// Serde strings are the config.toml `thinking` values. Compatibility is
+/// per-protocol (validated at catalog resolution): Anthropic Messages takes
+/// `adaptive` | `budget` | `none`; OpenAI Responses takes `effort` | `none`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    /// Anthropic `thinking.type: "adaptive"` + `output_config.effort`
+    /// (frontier models; older models reject it).
+    Adaptive,
+    /// Anthropic `thinking.type: "enabled"` + a `budget_tokens` mapped from
+    /// [`Effort`] (e.g. Haiku 4.5).
+    Budget,
+    /// OpenAI-style `reasoning.effort`.
+    Effort,
+    /// Do not request thinking.
+    None,
+}
+
+impl std::fmt::Display for ThinkingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ThinkingMode::Adaptive => "adaptive",
+            ThinkingMode::Budget => "budget",
+            ThinkingMode::Effort => "effort",
+            ThinkingMode::None => "none",
+        })
+    }
+}
+
+impl ThinkingMode {
+    /// Default mode when a catalog entry does not set `thinking`.
+    pub fn default_for(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::AnthropicMessages => ThinkingMode::Adaptive,
+            Protocol::OpenAIResponses => ThinkingMode::Effort,
+        }
+    }
+
+    /// Whether this mode is servable over `protocol`.
+    pub fn compatible_with(self, protocol: Protocol) -> bool {
+        match protocol {
+            Protocol::AnthropicMessages => {
+                matches!(
+                    self,
+                    ThinkingMode::Adaptive | ThinkingMode::Budget | ThinkingMode::None
+                )
+            }
+            Protocol::OpenAIResponses => {
+                matches!(self, ThinkingMode::Effort | ThinkingMode::None)
+            }
+        }
+    }
+}
+
+/// A resolved model: everything the protocol drivers need, minus credentials
+/// (those live in [`BackendConfig`]). Built by `crate::config` from the
+/// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
+/// models.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// Catalog key: what the user types after `--model` and what sessions
+    /// record. Distinct from `api_id` so one wire model can appear under
+    /// several keys (e.g. routed via different gateways).
+    pub key: String,
+    /// Wire id sent to the provider (the request `model` field).
+    pub api_id: String,
+    pub protocol: Protocol,
+    pub thinking: ThinkingMode,
+    /// Context window for UX (`USER n/m`) and auto-compact heuristics.
+    pub context_window_tokens: u64,
+}
+
+impl std::fmt::Display for ModelSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.key)
+    }
+}
+
+/// One usable catalog entry: spec plus the backend (gateway + credentials)
+/// that serves it.
+#[derive(Debug, Clone)]
+pub struct CatalogModel {
+    pub spec: ModelSpec,
+    pub backend: BackendConfig,
+    /// Set when the auth mechanism did not resolve (env var unset, tokens.toml
+    /// key missing). Reported by [`ModelCatalog::get`] when the model is
+    /// actually used — configuring a model without its credential is fine
+    /// until then.
+    pub auth_error: Option<String>,
+}
+
+/// Key → model catalog resolved from config.toml. Empty when the user has not
+/// configured any models.
+#[derive(Debug, Clone, Default)]
+pub struct ModelCatalog {
+    entries: std::collections::BTreeMap<String, CatalogModel>,
+}
+
+impl ModelCatalog {
+    pub fn new(entries: std::collections::BTreeMap<String, CatalogModel>) -> Self {
+        Self { entries }
+    }
+
+    /// Look up a usable model. Errors are user-actionable: unknown keys list
+    /// the configured catalog; entries with unresolved credentials report the
+    /// missing env var / tokens.toml key.
+    pub fn get(&self, key: &str) -> Result<&CatalogModel, String> {
+        let Some(entry) = self.entries.get(key) else {
+            if self.entries.is_empty() {
+                return Err(format!(
+                    "unknown model {key:?}: no models configured — define [models] \
+                     (and [gateways]) in config.toml"
+                ));
+            }
+            return Err(format!(
+                "unknown model {key:?}; configured models: [{}]",
+                self.keys().join(", ")
+            ));
+        };
+        if let Some(err) = &entry.auth_error {
+            return Err(err.clone());
+        }
+        Ok(entry)
+    }
+
+    /// Key exists (regardless of whether its credential resolved).
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub fn keys(&self) -> Vec<&str> {
+        self.entries.keys().map(String::as_str).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -168,10 +263,7 @@ impl std::str::FromStr for Effort {
     }
 }
 
-/// Optional provider-specific backend settings.
-///
-/// When omitted from [`GenerativeModelConfig`], a default is chosen from the model via
-/// [`BackendConfig::default_for_model`].
+/// Provider backend settings: gateway base URL, credential, per-request knobs.
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
     Anthropic(AnthropicBackendConfig),
@@ -179,182 +271,31 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
-    pub fn kind(&self) -> BackendKind {
+    pub fn protocol(&self) -> Protocol {
         match self {
-            BackendConfig::Anthropic(_) => BackendKind::AnthropicMessages,
-            BackendConfig::OpenAIResponses(_) => BackendKind::OpenAIResponses,
-        }
-    }
-
-    /// Environment-based defaults for the protocol that serves `model`.
-    /// Resolution lives in [`crate::config`]; this is the lazy env-only path
-    /// for callers without an application config (subagents, tests).
-    pub fn default_for_model(model: Model) -> Self {
-        crate::config::env_backend_config(model)
-    }
-}
-
-impl Model {
-    /// Model identifier sent to the provider API.
-    pub fn api_id(self) -> &'static str {
-        match self {
-            Model::ClaudeFable5 => "claude-fable-5",
-            Model::ClaudeOpus48 => "claude-opus-4-8",
-            Model::ClaudeSonnet5 => "claude-sonnet-4-6",
-            Model::ClaudeHaiku45 => "claude-haiku-4-5",
-            Model::Grok45Build => "grok-4.5-build",
-            Model::KimiK3 => "moonshotai/kimi-k3",
-            Model::DeepSeekV4Pro => "deepseek/deepseek-v4-pro",
-            Model::DeepSeekV4Flash => "deepseek/deepseek-v4-flash",
-            Model::Gemini35Flash => "google/gemini-3.5-flash",
-            Model::Gemini31ProPreview => "google/gemini-3.1-pro-preview",
-            Model::Gpt56Sol => "openai/gpt-5.6-sol",
-            Model::Gpt56Terra => "openai/gpt-5.6-terra",
-            Model::Gpt56Luna => "openai/gpt-5.6-luna",
-            Model::ClaudeFable5OpenRouter => "anthropic/claude-fable-5",
-            Model::ClaudeOpus48OpenRouter => "anthropic/claude-opus-4.8",
-            Model::ClaudeSonnet46OpenRouter => "anthropic/claude-sonnet-4.6",
-            Model::ClaudeHaiku45OpenRouter => "anthropic/claude-haiku-4.5",
-        }
-    }
-
-    /// Protocol / backend that serves this model by default.
-    pub fn backend_kind(self) -> BackendKind {
-        match self {
-            Model::ClaudeFable5
-            | Model::ClaudeOpus48
-            | Model::ClaudeSonnet5
-            | Model::ClaudeHaiku45 => BackendKind::AnthropicMessages,
-            Model::Grok45Build
-            | Model::KimiK3
-            | Model::DeepSeekV4Pro
-            | Model::DeepSeekV4Flash
-            | Model::Gemini35Flash
-            | Model::Gemini31ProPreview
-            | Model::Gpt56Sol
-            | Model::Gpt56Terra
-            | Model::Gpt56Luna
-            | Model::ClaudeFable5OpenRouter
-            | Model::ClaudeOpus48OpenRouter
-            | Model::ClaudeSonnet46OpenRouter
-            | Model::ClaudeHaiku45OpenRouter => BackendKind::OpenAIResponses,
-        }
-    }
-
-    /// True when this model is served via the OpenRouter gateway by default.
-    ///
-    /// OpenRouter models use vendor-prefixed slugs (`vendor/model`); native
-    /// provider ids (`claude-*`, `grok-*`) have no `/`.
-    pub fn served_via_openrouter(self) -> bool {
-        self.api_id().contains('/')
-    }
-
-    /// Whether Anthropic thinking uses `thinking.type: "adaptive"` (+ effort)
-    /// rather than manual `thinking.type: "enabled"` with `budget_tokens`.
-    ///
-    /// Opus 4.8 / Fable 5 reject `enabled` with HTTP 400. Sonnet 4.6 still accepts
-    /// budgets but they are deprecated. Haiku 4.5 requires the manual form.
-    pub fn uses_adaptive_thinking(self) -> bool {
-        match self {
-            Model::ClaudeFable5 | Model::ClaudeOpus48 | Model::ClaudeSonnet5 => true,
-            // OpenRouter-served models never use the Anthropic Messages
-            // thinking config; effort goes over `reasoning.effort` instead.
-            Model::ClaudeHaiku45
-            | Model::Grok45Build
-            | Model::KimiK3
-            | Model::DeepSeekV4Pro
-            | Model::DeepSeekV4Flash
-            | Model::Gemini35Flash
-            | Model::Gemini31ProPreview
-            | Model::Gpt56Sol
-            | Model::Gpt56Terra
-            | Model::Gpt56Luna
-            | Model::ClaudeFable5OpenRouter
-            | Model::ClaudeOpus48OpenRouter
-            | Model::ClaudeSonnet46OpenRouter
-            | Model::ClaudeHaiku45OpenRouter => false,
-        }
-    }
-
-    /// Context window for UX (`USER n/m`) and auto-compact heuristics.
-    pub fn context_window_tokens(self) -> u64 {
-        match self {
-            Model::ClaudeFable5 => 1_000_000,
-            Model::ClaudeOpus48 => 1_000_000,
-            Model::ClaudeSonnet5 => 1_000_000,
-            Model::ClaudeHaiku45 => 200_000,
-            Model::Grok45Build => 500_000,
-            // OpenRouter listings advertise ~1.05M for all of these; round down.
-            Model::KimiK3
-            | Model::DeepSeekV4Pro
-            | Model::DeepSeekV4Flash
-            | Model::Gemini35Flash
-            | Model::Gemini31ProPreview
-            | Model::Gpt56Sol
-            | Model::Gpt56Terra
-            | Model::Gpt56Luna
-            | Model::ClaudeFable5OpenRouter
-            | Model::ClaudeOpus48OpenRouter
-            | Model::ClaudeSonnet46OpenRouter => 1_000_000,
-            Model::ClaudeHaiku45OpenRouter => 200_000,
-        }
-    }
-}
-
-impl std::fmt::Display for Model {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.api_id())
-    }
-}
-
-impl std::str::FromStr for Model {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "claude-fable-5" => Ok(Model::ClaudeFable5),
-            "claude-opus-4-8" | "claude-opus-4.8" | "claude-opus-4.8[1m]" => {
-                Ok(Model::ClaudeOpus48)
-            }
-            "claude-sonnet-4-6" | "claude-sonnet-5" | "claude-sonnet-4.5" => {
-                Ok(Model::ClaudeSonnet5)
-            }
-            "claude-haiku-4-5" | "claude-haiku-4.5" => Ok(Model::ClaudeHaiku45),
-            "grok-4.5-build" | "grok-4.5" | "grok-4.5-build[1m]" => Ok(Model::Grok45Build),
-            "moonshotai/kimi-k3" | "kimi-k3" => Ok(Model::KimiK3),
-            "deepseek/deepseek-v4-pro" | "deepseek-v4-pro" => Ok(Model::DeepSeekV4Pro),
-            "deepseek/deepseek-v4-flash" | "deepseek-v4-flash" => Ok(Model::DeepSeekV4Flash),
-            "google/gemini-3.5-flash" | "gemini-3.5-flash" => Ok(Model::Gemini35Flash),
-            "google/gemini-3.1-pro-preview" | "gemini-3.1-pro-preview" | "gemini-3.1-pro" => {
-                Ok(Model::Gemini31ProPreview)
-            }
-            "openai/gpt-5.6-sol" | "gpt-5.6-sol" => Ok(Model::Gpt56Sol),
-            "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Ok(Model::Gpt56Terra),
-            "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Ok(Model::Gpt56Luna),
-            "anthropic/claude-fable-5" => Ok(Model::ClaudeFable5OpenRouter),
-            "anthropic/claude-opus-4.8" => Ok(Model::ClaudeOpus48OpenRouter),
-            "anthropic/claude-sonnet-4.6" => Ok(Model::ClaudeSonnet46OpenRouter),
-            "anthropic/claude-haiku-4.5" => Ok(Model::ClaudeHaiku45OpenRouter),
-            other => Err(format!("Unknown model: {other:?}")),
+            BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
+            BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
         }
     }
 }
 
 pub struct GenerativeModelConfig {
-    pub model: Model,
+    pub model: ModelSpec,
     pub tools: Vec<ToolSpec>,
     pub system_prompt: String,
-    /// When `None`, a default is selected from [`Model::backend_kind`].
-    pub backend_config: Option<BackendConfig>,
+    pub backend_config: BackendConfig,
 }
 
 pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, ModelCreationError> {
-    let backend = config
-        .backend_config
-        .clone()
-        .unwrap_or_else(|| BackendConfig::default_for_model(config.model));
-
-    match backend {
+    if config.backend_config.protocol() != config.model.protocol {
+        return Err(ModelCreationError::BadConfig(format!(
+            "model `{}` speaks {} but the backend config is for {}",
+            config.model,
+            config.model.protocol,
+            config.backend_config.protocol()
+        )));
+    }
+    match config.backend_config.clone() {
         BackendConfig::Anthropic(backend) => {
             let model = anthropic::AnthropicGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
@@ -832,224 +773,97 @@ mod tests {
         assert_eq!(answer_content(&output.content).len(), 1);
     }
 
-    #[test]
-    fn default_backend_matches_model_kind() {
-        assert_eq!(
-            BackendConfig::default_for_model(Model::ClaudeHaiku45).kind(),
-            BackendKind::AnthropicMessages
-        );
-        assert_eq!(
-            BackendConfig::default_for_model(Model::Grok45Build).kind(),
-            BackendKind::OpenAIResponses
-        );
-        assert_eq!(
-            BackendConfig::default_for_model(Model::KimiK3).kind(),
-            BackendKind::OpenAIResponses
-        );
-    }
-
-    const OPENROUTER_MODELS: [Model; 12] = [
-        Model::KimiK3,
-        Model::DeepSeekV4Pro,
-        Model::DeepSeekV4Flash,
-        Model::Gemini35Flash,
-        Model::Gemini31ProPreview,
-        Model::Gpt56Sol,
-        Model::Gpt56Terra,
-        Model::Gpt56Luna,
-        Model::ClaudeFable5OpenRouter,
-        Model::ClaudeOpus48OpenRouter,
-        Model::ClaudeSonnet46OpenRouter,
-        Model::ClaudeHaiku45OpenRouter,
-    ];
-
-    #[test]
-    fn openrouter_models_route_to_openai_responses_backend() {
-        for model in OPENROUTER_MODELS {
-            assert!(model.served_via_openrouter(), "{model}");
-            assert_eq!(
-                model.backend_kind(),
-                BackendKind::OpenAIResponses,
-                "{model}"
-            );
-            assert!(!model.uses_adaptive_thinking(), "{model}");
+    fn spec(key: &str, protocol: Protocol) -> ModelSpec {
+        ModelSpec {
+            key: key.into(),
+            api_id: key.into(),
+            protocol,
+            thinking: ThinkingMode::default_for(protocol),
+            context_window_tokens: 1_000_000,
         }
-        assert!(!Model::Grok45Build.served_via_openrouter());
-        assert!(!Model::ClaudeFable5.served_via_openrouter());
-        // Windows mirror the native listings (Haiku is the 200K outlier).
-        assert_eq!(Model::KimiK3.context_window_tokens(), 1_000_000);
+    }
+
+    #[test]
+    fn thinking_defaults_and_protocol_compatibility() {
         assert_eq!(
-            Model::ClaudeOpus48OpenRouter.context_window_tokens(),
-            1_000_000
+            ThinkingMode::default_for(Protocol::AnthropicMessages),
+            ThinkingMode::Adaptive
         );
         assert_eq!(
-            Model::ClaudeHaiku45OpenRouter.context_window_tokens(),
-            200_000
+            ThinkingMode::default_for(Protocol::OpenAIResponses),
+            ThinkingMode::Effort
+        );
+        assert!(ThinkingMode::Budget.compatible_with(Protocol::AnthropicMessages));
+        assert!(ThinkingMode::None.compatible_with(Protocol::AnthropicMessages));
+        assert!(!ThinkingMode::Effort.compatible_with(Protocol::AnthropicMessages));
+        assert!(ThinkingMode::None.compatible_with(Protocol::OpenAIResponses));
+        assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAIResponses));
+        assert!(!ThinkingMode::Budget.compatible_with(Protocol::OpenAIResponses));
+    }
+
+    #[test]
+    fn protocol_serde_uses_config_strings() {
+        assert_eq!(
+            serde_json::to_value(Protocol::AnthropicMessages).unwrap(),
+            serde_json::json!("anthropic-messages")
+        );
+        assert_eq!(
+            serde_json::from_value::<Protocol>(serde_json::json!("openai-responses")).unwrap(),
+            Protocol::OpenAIResponses
         );
     }
 
     #[test]
-    fn openrouter_ids_parse_display_and_serde_roundtrip() {
-        let cases = [
-            (Model::KimiK3, "moonshotai/kimi-k3", "kimi-k3"),
-            (
-                Model::DeepSeekV4Pro,
-                "deepseek/deepseek-v4-pro",
-                "deepseek-v4-pro",
-            ),
-            (
-                Model::DeepSeekV4Flash,
-                "deepseek/deepseek-v4-flash",
-                "deepseek-v4-flash",
-            ),
-            (
-                Model::Gemini35Flash,
-                "google/gemini-3.5-flash",
-                "gemini-3.5-flash",
-            ),
-            (
-                Model::Gemini31ProPreview,
-                "google/gemini-3.1-pro-preview",
-                "gemini-3.1-pro",
-            ),
-            (Model::Gpt56Sol, "openai/gpt-5.6-sol", "gpt-5.6-sol"),
-            (Model::Gpt56Terra, "openai/gpt-5.6-terra", "gpt-5.6-terra"),
-            (Model::Gpt56Luna, "openai/gpt-5.6-luna", "gpt-5.6-luna"),
-            // Anthropic slugs have no short alias: bare ids stay native.
-            (
-                Model::ClaudeFable5OpenRouter,
-                "anthropic/claude-fable-5",
-                "anthropic/claude-fable-5",
-            ),
-            (
-                Model::ClaudeOpus48OpenRouter,
-                "anthropic/claude-opus-4.8",
-                "anthropic/claude-opus-4.8",
-            ),
-            (
-                Model::ClaudeSonnet46OpenRouter,
-                "anthropic/claude-sonnet-4.6",
-                "anthropic/claude-sonnet-4.6",
-            ),
-            (
-                Model::ClaudeHaiku45OpenRouter,
-                "anthropic/claude-haiku-4.5",
-                "anthropic/claude-haiku-4.5",
-            ),
-        ];
-        for (model, canonical, short) in cases {
-            assert_eq!(canonical.parse::<Model>().unwrap(), model);
-            assert_eq!(short.parse::<Model>().unwrap(), model);
-            assert_eq!(model.to_string(), canonical);
-            assert_eq!(model.api_id(), canonical);
-            // Serde canonical string matches api_id; short alias deserializes.
-            assert_eq!(
-                serde_json::to_value(model).unwrap(),
-                serde_json::json!(canonical)
-            );
-            assert_eq!(
-                serde_json::from_value::<Model>(serde_json::json!(short)).unwrap(),
-                model
-            );
-        }
-        // Bare Claude ids must keep resolving to the native Anthropic backend,
-        // not the vendor-prefixed OpenRouter variants.
-        assert_eq!(
-            "claude-opus-4.8".parse::<Model>().unwrap(),
-            Model::ClaudeOpus48
-        );
-        assert_eq!(
-            "claude-fable-5".parse::<Model>().unwrap(),
-            Model::ClaudeFable5
-        );
-        assert_eq!(
-            "claude-haiku-4.5".parse::<Model>().unwrap(),
-            Model::ClaudeHaiku45
-        );
+    fn empty_catalog_get_says_no_models_configured() {
+        let catalog = ModelCatalog::default();
+        assert!(catalog.is_empty());
+        let err = catalog.get("kimi-k3").unwrap_err();
+        assert!(err.contains("no models configured"), "{err}");
+        assert!(err.contains("[models]"), "{err}");
     }
 
     #[test]
-    fn adaptive_thinking_model_matrix() {
-        assert!(Model::ClaudeFable5.uses_adaptive_thinking());
-        assert!(Model::ClaudeOpus48.uses_adaptive_thinking());
-        assert!(Model::ClaudeSonnet5.uses_adaptive_thinking());
-        assert!(!Model::ClaudeHaiku45.uses_adaptive_thinking());
-        assert!(!Model::Grok45Build.uses_adaptive_thinking());
-    }
-
-    #[test]
-    fn context_window_tokens_per_model() {
-        assert_eq!(Model::ClaudeFable5.context_window_tokens(), 1_000_000);
-        assert_eq!(Model::ClaudeOpus48.context_window_tokens(), 1_000_000);
-        assert_eq!(Model::ClaudeSonnet5.context_window_tokens(), 1_000_000);
-        assert_eq!(Model::ClaudeHaiku45.context_window_tokens(), 200_000);
-        assert_eq!(Model::Grok45Build.context_window_tokens(), 500_000);
-    }
-
-    #[test]
-    fn anthropic_backend_rejects_grok_model() {
-        let result = anthropic::AnthropicGenerativeModel::new(
-            GenerativeModelConfig {
-                model: Model::Grok45Build,
-                tools: vec![],
-                system_prompt: String::new(),
-                backend_config: None,
-            },
-            AnthropicBackendConfig {
-                anthropic_auth_token: "dummy".into(),
-                ..Default::default()
-            },
-        );
-        let err = match result {
-            Ok(_) => panic!("expected model/backend mismatch"),
-            Err(e) => e,
+    fn catalog_get_unknown_key_lists_configured_models() {
+        let entry = CatalogModel {
+            spec: spec("opus", Protocol::AnthropicMessages),
+            backend: BackendConfig::Anthropic(AnthropicBackendConfig::default()),
+            auth_error: None,
         };
-        assert!(
-            err.to_string().contains("not supported"),
-            "unexpected error: {err}"
-        );
+        let catalog = ModelCatalog::new([("opus".to_string(), entry)].into());
+        let err = catalog.get("opsu").unwrap_err();
+        assert!(err.contains("unknown model \"opsu\""), "{err}");
+        assert!(err.contains("[opus]"), "{err}");
+        assert!(catalog.get("opus").is_ok());
     }
 
     #[test]
-    fn openai_responses_backend_rejects_claude_model() {
-        let result = openai_responses::OpenAIResponsesGenerativeModel::new(
-            GenerativeModelConfig {
-                model: Model::ClaudeHaiku45,
-                tools: vec![],
-                system_prompt: String::new(),
-                backend_config: None,
-            },
-            OpenAIResponsesBackendConfig {
-                auth_token: "dummy".into(),
-                ..Default::default()
-            },
-        );
-        let err = match result {
-            Ok(_) => panic!("expected model/backend mismatch"),
-            Err(e) => e,
+    fn catalog_get_reports_deferred_auth_error() {
+        let entry = CatalogModel {
+            spec: spec("kimi", Protocol::OpenAIResponses),
+            backend: BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig::default()),
+            auth_error: Some("model `kimi`: auth env:OPENROUTER_API_KEY is unset".into()),
         };
-        assert!(
-            err.to_string().contains("not supported"),
-            "unexpected error: {err}"
-        );
+        let catalog = ModelCatalog::new([("kimi".to_string(), entry)].into());
+        let err = catalog.get("kimi").unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
     }
 
     #[test]
-    fn new_rejects_mismatched_explicit_backend() {
+    fn new_rejects_protocol_mismatch() {
         let result = new(GenerativeModelConfig {
-            model: Model::Grok45Build,
+            model: spec("grok", Protocol::OpenAIResponses),
             tools: vec![],
             system_prompt: String::new(),
-            backend_config: Some(BackendConfig::Anthropic(AnthropicBackendConfig {
+            backend_config: BackendConfig::Anthropic(AnthropicBackendConfig {
                 anthropic_auth_token: "dummy".into(),
                 ..Default::default()
-            })),
+            }),
         });
         let err = match result {
             Ok(_) => panic!("expected mismatch"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("not supported"), "{err}");
+        assert!(err.to_string().contains("speaks openai-responses"), "{err}");
     }
 
     #[test]
