@@ -131,6 +131,7 @@ impl HostWorker {
             Request::ToolCall {
                 id,
                 agent_id,
+                session_id,
                 tool_use,
             } => {
                 let result = self
@@ -138,6 +139,7 @@ impl HostWorker {
                         tool_use,
                         HostDispatchContext {
                             agent_id,
+                            session_id,
                             cancel: CancelToken::new(),
                             agent_root: None,
                         },

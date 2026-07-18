@@ -358,6 +358,7 @@ mod tests {
 
     fn ctx() -> HostDispatchContext {
         HostDispatchContext {
+            session_id: None,
             agent_id: uuid::Uuid::nil(),
             cancel: CancelToken::new(),
             agent_root: None,

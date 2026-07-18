@@ -170,10 +170,12 @@ impl HostController {
     pub async fn call(
         &self,
         agent_id: uuid::Uuid,
+        session_id: Option<String>,
         tool_use: ToolUse,
         cancel: CancelToken,
     ) -> ToolResult {
-        self.call_with_root(agent_id, tool_use, cancel, None).await
+        self.call_with_root(agent_id, session_id, tool_use, cancel, None)
+            .await
     }
 
     /// Like [`call`], optionally attaching agent-root handles for in-process tools
@@ -181,6 +183,7 @@ impl HostController {
     pub async fn call_with_root(
         &self,
         agent_id: uuid::Uuid,
+        session_id: Option<String>,
         tool_use: ToolUse,
         cancel: CancelToken,
         agent_root: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -194,6 +197,7 @@ impl HostController {
                         tool_use,
                         HostDispatchContext {
                             agent_id,
+                            session_id,
                             cancel,
                             agent_root,
                         },
@@ -201,13 +205,17 @@ impl HostController {
                     .await
                     .with_id(tool_id)
             }
-            Backend::Subprocess { .. } => self.call_subprocess(agent_id, tool_use, cancel).await,
+            Backend::Subprocess { .. } => {
+                self.call_subprocess(agent_id, session_id, tool_use, cancel)
+                    .await
+            }
         }
     }
 
     async fn call_subprocess(
         &self,
         agent_id: uuid::Uuid,
+        session_id: Option<String>,
         tool_use: ToolUse,
         cancel: CancelToken,
     ) -> ToolResult {
@@ -217,6 +225,7 @@ impl HostController {
         let request = Request::ToolCall {
             id: id.clone(),
             agent_id,
+            session_id,
             tool_use,
         };
 
@@ -673,6 +682,7 @@ mod tests {
         let result = ctl
             .call(
                 uuid::Uuid::nil(),
+                None,
                 ToolUse {
                     id: "t1".into(),
                     name: "bash".into(),
@@ -694,6 +704,7 @@ mod tests {
         let t0 = Instant::now();
         let a = ctl.call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "a".into(),
                 name: "bash".into(),
@@ -703,6 +714,7 @@ mod tests {
         );
         let b = ctl.call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "b".into(),
                 name: "bash".into(),
@@ -735,6 +747,7 @@ mod tests {
         // background spawn under heavy suite load / current_thread runtimes.
         let mut call = std::pin::pin!(ctl.call(
             uuid::Uuid::nil(),
+            None,
             ToolUse {
                 id: "slow".into(),
                 name: "bash".into(),
@@ -769,6 +782,7 @@ mod tests {
             Duration::from_secs(30),
             ctl.call(
                 uuid::Uuid::nil(),
+                None,
                 ToolUse {
                     id: "next".into(),
                     name: "bash".into(),
@@ -808,6 +822,7 @@ mod tests {
                 Duration::from_secs(5),
                 ctl.call(
                     uuid::Uuid::nil(),
+                    None,
                     ToolUse {
                         id: format!("t{attempt}"),
                         name: "bash".into(),
@@ -835,6 +850,7 @@ mod tests {
         let result = ctl
             .call(
                 uuid::Uuid::nil(),
+                None,
                 ToolUse {
                     id: "t1".into(),
                     name: "bash".into(),

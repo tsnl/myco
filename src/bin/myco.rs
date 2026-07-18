@@ -223,7 +223,15 @@ async fn run_interactive(args: Args) {
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new());
-    let mut agent = Agent::new(model, harness.clone(), sink);
+    let mut agent = Agent::with_context(
+        model,
+        harness.clone(),
+        sink,
+        TraceContext {
+            session_id: Some(active_session.id()),
+            ..TraceContext::root()
+        },
+    );
     agent.set_context_window_tokens(model_id.context_window_tokens());
     agent.set_history(active_session.snapshot().messages.clone());
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -572,6 +580,7 @@ async fn run_compact(
         sink,
         TraceContext {
             agent_id: worker_id,
+            session_id: Some(worker_hex.clone()),
             depth: 1,
             parent_tool_use_id: None,
         },
@@ -1365,6 +1374,21 @@ mod tests {
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
     use serde_json::json;
     use std::time::Duration;
+
+    /// Agent id and session id stay decoupled: a fresh runtime agent id per
+    /// process, with the durable session id carried alongside.
+    #[test]
+    fn root_context_carries_session_id_with_fresh_agent_id() {
+        let session_id = uuid_simple_hex(uuid::Uuid::new_v4());
+        let ctx = TraceContext {
+            session_id: Some(session_id.clone()),
+            ..TraceContext::root()
+        };
+        assert_eq!(ctx.session_id.as_deref(), Some(session_id.as_str()));
+        assert_ne!(uuid_simple_hex(ctx.agent_id), session_id);
+        assert!(!ctx.agent_id.is_nil());
+        assert_eq!(ctx.depth, 0);
+    }
 
     fn sample_messages() -> Vec<Message> {
         vec![

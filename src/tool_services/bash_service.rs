@@ -50,12 +50,16 @@ const MAX_SESSIONS: usize = 8;
 /// timeout, byte cap, or process exit.
 pub struct BashService {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Test override for the exec dump location. `None` ⇒ the conversation
+    /// session directory under this host's `~/.myco` (see [`Self::exec_dump`]).
+    dump_root: Option<std::path::PathBuf>,
 }
 
 impl Default for BashService {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            dump_root: None,
         }
     }
 }
@@ -74,10 +78,13 @@ impl ToolService for BashService {
                 Returns exit code, signal, stdout, stderr. Each stream is capped at \
                 `max_bytes` (default {DEFAULT_MAX_BYTES}): over the cap, the head and tail \
                 are kept and the middle is elided with a `[... N bytes omitted ...]` marker. \
-                Elided exec output is unrecoverable — pipe through grep/head/tail or \
-                redirect to a file when you expect a flood, or raise `max_bytes` when you \
-                truly need more. Prefer `exec` for finite commands (builds, tests, \
-                installs). Raise `timeout_ms` when the job may exceed {exec_default_s}s.\n\
+                Before eliding, the full stream is saved verbatim on the executing host \
+                in the session folder (`~/.myco/session/<shard>/<session>/`), and the \
+                marker names the file relative to it (`tool_output/<tool_use_id>.stdout`) \
+                — search it there (grep/head/tail) instead of re-running the command; \
+                don't cat a dump whole. Prefer `exec` for finite \
+                commands (builds, tests, installs). Raise `timeout_ms` when the job may \
+                exceed {exec_default_s}s.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
                 `session_id`. `command` is the program line (default: `bash -i`). Optional \
                 `stdin` is written after spawn. Returns a snapshot; the process keeps \
@@ -127,7 +134,7 @@ impl ToolService for BashService {
                 Err(e) => return generative_model::ToolResult::err(e),
             };
             // Owner is the agent that issued this tool call (root or subagent).
-            self.execute(action, ctx.agent_id, ctx.cancel).await
+            self.execute(action, &tool_use.id, ctx).await
         })
     }
 
@@ -141,12 +148,24 @@ impl BashService {
         Self::default()
     }
 
+    /// Test constructor: dump exec output under `root/{session_id}/tool_output`
+    /// instead of the real `~/.myco` session tree.
+    #[cfg(test)]
+    fn with_dump_root(root: std::path::PathBuf) -> Self {
+        Self {
+            dump_root: Some(root),
+            ..Self::default()
+        }
+    }
+
     async fn execute(
         &self,
         action: Action,
-        owner: Uuid,
-        cancel: crate::core::CancelToken,
+        tool_use_id: &str,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
+        let owner = ctx.agent_id;
+        let cancel = ctx.cancel;
         match action {
             Action::Exec {
                 command,
@@ -154,8 +173,16 @@ impl BashService {
                 timeout_ms,
                 max_bytes,
             } => {
-                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, max_bytes, cancel)
-                    .await
+                let dump = self.exec_dump(ctx.session_id.as_deref(), tool_use_id);
+                self.run_oneshot(
+                    &command,
+                    cwd.as_deref(),
+                    timeout_ms,
+                    max_bytes,
+                    dump,
+                    cancel,
+                )
+                .await
             }
             Action::Start {
                 session_id,
@@ -211,6 +238,25 @@ impl BashService {
         }
     }
 
+    /// Where one exec call's over-cap streams are dumped verbatim: the
+    /// conversation-session directory (layout mirrored on every host, keyed by
+    /// the session id sent with the call), one `<tool_use_id>.stdout` /
+    /// `.stderr` pair per tool use. `None` when the call has no backing
+    /// session or this host cannot resolve `~/.myco` — dumping is best-effort
+    /// and must never fail the tool call.
+    fn exec_dump(&self, session_id: Option<&str>, tool_use_id: &str) -> Option<ExecDump> {
+        // Session ids arrive over the wire; sanitize before touching the fs.
+        let session_id = sanitize_file_stem(session_id?);
+        let session_dir = match &self.dump_root {
+            Some(root) => root.join(&session_id),
+            None => crate::session::session_dir_path(&session_id).ok()?,
+        };
+        Some(ExecDump {
+            dir: session_dir.join("tool_output"),
+            stem: sanitize_file_stem(tool_use_id),
+        })
+    }
+
     /// Run `command` in a fresh bash process (`bash -c`).
     ///
     /// Unlike sessions, exec **waits for the process to exit**. Bounded by
@@ -219,14 +265,17 @@ impl BashService {
     /// returned. The final pipe drain is bounded too (`EXEC_DRAIN_GRACE`):
     /// a backgrounded grandchild that inherits the pipes must not hold the
     /// result hostage past the child's own exit. Every return path caps each
-    /// stream at `max_bytes` (see `truncate_middle_lossy`) so one flooding
-    /// command cannot saturate the model context.
+    /// stream at `max_bytes` (see `cap_exec_stream`) so one flooding command
+    /// cannot saturate the model context; over-cap streams are first dumped
+    /// verbatim to `dump` so nothing is lost.
+    #[allow(clippy::too_many_arguments)]
     async fn run_oneshot(
         &self,
         command: &str,
         cwd: Option<&str>,
         timeout_ms: u64,
         max_bytes: usize,
+        dump: Option<ExecDump>,
         cancel: crate::core::CancelToken,
     ) -> generative_model::ToolResult {
         let mut cmd = tokio::process::Command::new("bash");
@@ -290,8 +339,8 @@ impl BashService {
                     "exec cancelled\n\
                      stdout:\n{}\n\
                      stderr:\n{}",
-                    truncate_middle_lossy(&out, max_bytes),
-                    truncate_middle_lossy(&err, max_bytes),
+                    cap_exec_stream(&out, max_bytes, dump.as_ref(), "stdout").await,
+                    cap_exec_stream(&err, max_bytes, dump.as_ref(), "stderr").await,
                 ))
             }
             Outcome::TimedOut => {
@@ -309,8 +358,8 @@ impl BashService {
                      stdout:\n{}\n\
                      stderr:\n{}\n\
                      (exec timed out after {timeout_ms}ms; process group killed)\n",
-                    truncate_middle_lossy(&out, max_bytes),
-                    truncate_middle_lossy(&err, max_bytes),
+                    cap_exec_stream(&out, max_bytes, dump.as_ref(), "stdout").await,
+                    cap_exec_stream(&err, max_bytes, dump.as_ref(), "stderr").await,
                 ))
             }
             Outcome::Status(status) => {
@@ -325,8 +374,8 @@ impl BashService {
                          stderr:\n{}",
                         status.code(),
                         status.signal(),
-                        truncate_middle_lossy(&out, max_bytes),
-                        truncate_middle_lossy(&err, max_bytes),
+                        cap_exec_stream(&out, max_bytes, dump.as_ref(), "stdout").await,
+                        cap_exec_stream(&err, max_bytes, dump.as_ref(), "stderr").await,
                     )),
                     Err(error) => generative_model::ToolResult::err(format!(
                         "Error executing command: {error}"
@@ -931,28 +980,85 @@ where
     })
 }
 
+/// Verbatim on-disk destination for one exec call's over-cap streams:
+/// `<dir>/<stem>.stdout` / `<dir>/<stem>.stderr`.
+struct ExecDump {
+    dir: std::path::PathBuf,
+    stem: String,
+}
+
+/// Make a provider-issued tool-use id (`toolu_…`, `call_…`) safe as a file
+/// stem: keep `[A-Za-z0-9._-]`, replace the rest, bound the length.
+fn sanitize_file_stem(raw: &str) -> String {
+    let mut stem: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    if stem.is_empty() {
+        stem.push_str("tool_use");
+    }
+    stem
+}
+
 /// Cap one exec stream at `max_bytes`, keeping the head and tail halves and
 /// eliding the middle with a marker.
 ///
 /// Unlike session output (buffered; the agent can `read` the rest later),
-/// exec output is gone once the call returns, so the cut must keep the most
-/// informative parts — and those are the ends: build/test tools print the
-/// root-cause error first and the failure summary last. Cuts are byte-exact;
-/// a split UTF-8 char renders as U+FFFD at the seam.
-fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
+/// exec output is gone once the call returns, so before eliding, the full
+/// stream is written verbatim to `dump` and the marker names the file: the
+/// agent can search it post-hoc instead of re-running the command. The marker
+/// names it **relative to the session folder** (`tool_output/<id>.<ext>`),
+/// never absolutely, so a session folder stays portable — it can be copied or
+/// moved without invalidating references in the transcript. The write is
+/// best-effort — on failure the marker falls back to re-run advice. The kept
+/// ends carry the signal either way: build/test tools print the root-cause
+/// error first and the failure summary last. Cuts are byte-exact; a split
+/// UTF-8 char renders as U+FFFD at the seam.
+async fn cap_exec_stream(
+    bytes: &[u8],
+    max_bytes: usize,
+    dump: Option<&ExecDump>,
+    ext: &str,
+) -> String {
     if bytes.len() <= max_bytes {
         return String::from_utf8_lossy(bytes).into_owned();
     }
     let head_len = max_bytes.div_ceil(2);
     let tail_len = max_bytes / 2;
     let omitted = bytes.len() - head_len - tail_len;
+    let saved = match dump {
+        Some(d) => save_dump(d, ext, bytes).await,
+        None => None,
+    };
+    let hint = match &saved {
+        Some(name) => format!(
+            "full {ext} saved verbatim in this host's session folder as {name} — \
+             search it there (grep/head/tail), don't re-run the command"
+        ),
+        None => "filter with grep/head/tail, redirect to a file, or raise max_bytes".to_string(),
+    };
     format!(
-        "{}\n[... {omitted} bytes omitted ({} bytes total, max_bytes={max_bytes}); \
-         filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",
+        "{}\n[... {omitted} bytes omitted ({} bytes total, max_bytes={max_bytes}); {hint} ...]\n{}",
         String::from_utf8_lossy(&bytes[..head_len]),
         bytes.len(),
         String::from_utf8_lossy(&bytes[bytes.len() - tail_len..]),
     )
+}
+
+/// Best-effort verbatim write of one stream; returns the session-folder-
+/// relative name (`tool_output/<stem>.<ext>`) on success.
+async fn save_dump(dump: &ExecDump, ext: &str, bytes: &[u8]) -> Option<String> {
+    let name = format!("{}.{ext}", dump.stem);
+    tokio::fs::create_dir_all(&dump.dir).await.ok()?;
+    tokio::fs::write(dump.dir.join(&name), bytes).await.ok()?;
+    Some(format!("tool_output/{name}"))
 }
 
 /// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
@@ -1253,7 +1359,8 @@ pub struct Input {
     idle_ms: Option<u64>,
     /// Max bytes of output to return. Default 32768.
     /// - start/write/read: combined stdout+stderr drain cap; excess stays buffered — `read` again for more.
-    /// - exec: per-stream cap; head and tail are kept, the middle elided. Elided bytes are unrecoverable.
+    /// - exec: per-stream cap; head and tail are kept, the middle elided. The full
+    ///   stream is saved verbatim on the executing host (path in the marker).
     #[serde(default)]
     max_bytes: Option<usize>,
 }
@@ -1508,16 +1615,26 @@ mod tests {
             .join("\n")
     }
 
+    /// Worker with a temp dump root so flood tests never write under the
+    /// developer's real `~/.myco`.
     fn harness() -> Arc<HostWorker> {
         Arc::new(HostWorker::new(
             "test",
-            vec![Arc::new(BashService::new()) as Arc<dyn ToolService>],
+            vec![Arc::new(BashService::with_dump_root(unique_dump_root())) as Arc<dyn ToolService>],
         ))
     }
+
+    fn unique_dump_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("myco-dump-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Session id carried by test dispatches; exec dumps land under it.
+    const TEST_SESSION_ID: &str = "test-session";
 
     fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
         HostDispatchContext {
             agent_id,
+            session_id: Some(TEST_SESSION_ID.to_string()),
             cancel: crate::core::CancelToken::new(),
             agent_root: None,
         }
@@ -1775,15 +1892,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncate_middle_keeps_head_and_tail() {
+    /// No dump target: capping still keeps head + tail with an honest marker.
+    #[tokio::test]
+    async fn cap_keeps_head_and_tail_without_dump() {
         // At or under the cap: untouched, no marker.
-        assert_eq!(truncate_middle_lossy(b"hello", 5), "hello");
-        assert_eq!(truncate_middle_lossy(b"", 5), "");
+        assert_eq!(cap_exec_stream(b"hello", 5, None, "stdout").await, "hello");
+        assert_eq!(cap_exec_stream(b"", 5, None, "stdout").await, "");
 
         // Over the cap: head + marker + tail, omitted count exact.
         let bytes: Vec<u8> = (0..26).map(|i| b'a' + i).collect();
-        let text = truncate_middle_lossy(&bytes, 10);
+        let text = cap_exec_stream(&bytes, 10, None, "stdout").await;
         assert!(text.starts_with("abcde"), "{text}");
         assert!(text.ends_with("vwxyz"), "{text}");
         assert!(text.contains("16 bytes omitted"), "{text}");
@@ -1791,10 +1909,96 @@ mod tests {
         assert!(text.contains("max_bytes=10"), "{text}");
 
         // Odd cap: head gets the extra byte; total kept is still the cap.
-        let text = truncate_middle_lossy(&bytes, 5);
+        let text = cap_exec_stream(&bytes, 5, None, "stdout").await;
         assert!(text.starts_with("abc"), "{text}");
         assert!(text.ends_with("yz"), "{text}");
         assert!(text.contains("21 bytes omitted"), "{text}");
+    }
+
+    #[test]
+    fn sanitize_file_stem_keeps_safe_chars_only() {
+        assert_eq!(sanitize_file_stem("toolu_01AbC-x.y"), "toolu_01AbC-x.y");
+        assert_eq!(sanitize_file_stem("a/b\\c d"), "a_b_c_d");
+        assert_eq!(sanitize_file_stem(""), "tool_use");
+        assert!(sanitize_file_stem(&"x".repeat(300)).len() <= 128);
+    }
+
+    /// Over-cap exec streams are dumped verbatim to the session folder and the
+    /// marker names the file, so the agent can search it instead of re-running.
+    #[tokio::test]
+    async fn exec_truncation_dumps_full_stream_and_names_path() {
+        let root = unique_dump_root();
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![Arc::new(BashService::with_dump_root(root.clone())) as Arc<dyn ToolService>],
+        ));
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "seq 1 100000",
+                "max_bytes": 2000,
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+
+        // Dumped under <root>/<session-id>/tool_output/<tool_use_id>.stdout;
+        // dispatch_json carries TEST_SESSION_ID and tool_use id "test".
+        let dir = root.join(TEST_SESSION_ID).join("tool_output");
+        let stdout_path = dir.join("test.stdout");
+        let dumped = std::fs::read_to_string(&stdout_path).expect("dump file written");
+        let expected: String = (1..=100_000).map(|i| format!("{i}\n")).collect();
+        assert_eq!(dumped, expected, "dump must be verbatim");
+        // The marker names the file relative to the session folder only —
+        // never an absolute path — so the folder stays portable.
+        assert!(text.contains("tool_output/test.stdout"), "{text}");
+        assert!(
+            !text.contains(&root.display().to_string()),
+            "marker must not leak the absolute session location: {text}"
+        );
+        // stderr stayed under the cap: no file for it.
+        assert!(!dir.join("test.stderr").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A call with no backing session (bare context) truncates without
+    /// dumping: nothing on disk, marker falls back to re-run advice.
+    #[tokio::test]
+    async fn exec_without_session_truncates_without_dump() {
+        let root = unique_dump_root();
+        let service = Arc::new(BashService::with_dump_root(root.clone()));
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![service as Arc<dyn ToolService>],
+        ));
+        let result = harness
+            .dispatch_tool_use(
+                tool_use_json(json!({"command": "seq 1 100000", "max_bytes": 1000})),
+                HostDispatchContext::bare(uuid::Uuid::nil(), crate::core::CancelToken::new()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("bytes omitted"), "{text}");
+        assert!(!text.contains("tool_output/"), "{text}");
+        assert!(!root.exists(), "no dump without a session id: {root:?}");
+    }
+
+    /// Under the cap nothing is dumped — no per-call disk litter.
+    #[tokio::test]
+    async fn exec_under_cap_writes_no_dump() {
+        let root = unique_dump_root();
+        let harness = Arc::new(HostWorker::new(
+            "test",
+            vec![Arc::new(BashService::with_dump_root(root.clone())) as Arc<dyn ToolService>],
+        ));
+        let result = dispatch_json(harness, json!({"command": "echo small"})).await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        assert!(result_text(&result).contains("small"));
+        assert!(!root.exists(), "no dump dir should be created: {root:?}");
     }
 
     /// A flooding exec must come back capped — head and tail survive, the
@@ -2117,6 +2321,7 @@ mod tests {
                     "timeout_ms": 10_000,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: uuid::Uuid::nil(),
                     cancel,
                     agent_root: None,
@@ -2773,6 +2978,7 @@ mod tests {
                     "idle_ms": 100,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2796,6 +3002,7 @@ mod tests {
                     "stdin": "nope\n",
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_b,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2821,6 +3028,7 @@ mod tests {
                     "idle_ms": 200,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2842,6 +3050,7 @@ mod tests {
             .dispatch_tool_use(
                 tool_use_json(json!({"action": "close", "session_id": id})),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,
@@ -2872,6 +3081,7 @@ mod tests {
                     "idle_ms": 100,
                 })),
                 HostDispatchContext {
+                    session_id: None,
                     agent_id,
                     cancel: crate::core::CancelToken::new(),
                     agent_root: None,

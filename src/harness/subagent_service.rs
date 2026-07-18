@@ -127,8 +127,12 @@ impl SubagentService {
         let agent_id = uuid::Uuid::new_v4();
         let agent_id_hex = uuid_simple_hex(agent_id);
         let log_path = PathBuf::from(SUBAGENT_LOG_DIR).join(format!("{agent_id_hex}.log"));
-
-        let parent_session_id = uuid_simple_hex(root.context.agent_id);
+        // Bare contexts (tests) have no backing session; fall back to the runtime id.
+        let parent_session_id = root
+            .context
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid_simple_hex(root.context.agent_id));
         let mut worker_session = Session::new_hidden(
             input.model,
             agent_id_hex.clone(),
@@ -140,9 +144,10 @@ impl SubagentService {
             eprintln!("warning: failed to create hidden subagent session {agent_id_hex}: {e}");
         }
 
-        let child_context = root
+        let mut child_context = root
             .context
             .child_agent(agent_id, Some(parent_tool_use_id.clone()));
+        child_context.session_id = Some(agent_id_hex.clone());
 
         root.sink.emit(AgentEvent::AgentStarted {
             agent_id,
