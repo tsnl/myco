@@ -37,12 +37,15 @@ embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
 ## Use
 
 ```bash
-myco    # default model: grok-4.5-build; pass --model <id> for Claude models
+myco    # runs the default model from your config.toml; --model <key> to switch
 ```
 
-Set API credentials for your backend first (Anthropic Messages or xAI / OpenAI
-Responses; read from the process environment, and a `.env` in the cwd is also
-loaded). The exact variables are documented in the
+Configure your models first: myco ships none built in. `~/.myco/config.toml`
+holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
+Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
+pass to `--model`). The `auth` value is the token itself or a source such as
+`{ source = "env", var_name = "XAI_API_KEY" }` (`.env` in the cwd is loaded
+at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
 `myco --help overview` once installed. Set a default model with
 `model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript

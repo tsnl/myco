@@ -19,10 +19,10 @@ pub struct AnthropicBackendConfig {
     pub debug_dump_api_requests: bool,
     /// When set, enables Anthropic extended thinking at this effort level.
     ///
-    /// - Models with adaptive thinking (Opus 4.8, Fable 5, Sonnet 4.6, …): sent as
-    ///   `thinking.type: "adaptive"` plus `output_config.effort`.
-    /// - Older models (e.g. Haiku 4.5): sent as `thinking.type: "enabled"` with a
-    ///   mapped `budget_tokens` value.
+    /// The request shape follows the model's [`ThinkingMode`]: `adaptive` sends
+    /// `thinking.type: "adaptive"` plus `output_config.effort`; `budget` sends
+    /// `thinking.type: "enabled"` with a mapped `budget_tokens`; `none` sends
+    /// no thinking fields regardless of this value.
     ///
     /// Defaults to [`Effort::DEFAULT`] so thinking is always on for interactive use.
     pub effort: Option<Effort>,
@@ -31,7 +31,8 @@ pub struct AnthropicBackendConfig {
 impl Default for AnthropicBackendConfig {
     fn default() -> Self {
         Self {
-            anthropic_base_url: "https://api.anthropic.com".into(),
+            // No built-in gateway: the catalog (config.toml) supplies base_url.
+            anthropic_base_url: String::new(),
             anthropic_auth_token: String::new(),
             max_tokens_per_generate: 8192,
             enable_prompt_caching: true,
@@ -43,7 +44,7 @@ impl Default for AnthropicBackendConfig {
 
 /// Stateless Anthropic driver. Conversation history is owned by the caller.
 pub struct AnthropicGenerativeModel {
-    model: Model,
+    model: ModelSpec,
     system_prompt: String,
     tools: Vec<AnthropicTool>,
     backend: AnthropicBackendConfig,
@@ -55,53 +56,52 @@ impl AnthropicGenerativeModel {
         config: GenerativeModelConfig,
         backend: AnthropicBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.backend_kind() != BackendKind::AnthropicMessages {
+        if config.model.protocol != Protocol::AnthropicMessages {
             return Err(ModelCreationError::BadConfig(format!(
-                "Model `{}` is not supported by the Anthropic Messages backend \
-                 (expected models for {})",
+                "model `{}` speaks {}, not {}",
                 config.model,
-                BackendKind::AnthropicMessages
+                config.model.protocol,
+                Protocol::AnthropicMessages
             )));
         }
 
-        if backend.anthropic_auth_token.is_empty() {
-            return Err(ModelCreationError::BadConfig(
-                "Anthropic auth token is empty (set anthropic_auth_token or ANTHROPIC_AUTH_TOKEN)"
-                    .into(),
-            ));
-        }
-
+        let mut headers = reqwest::header::HeaderMap::from_iter([
+            (
+                reqwest::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            ),
+            (
+                "anthropic-version".parse().unwrap(),
+                "2023-06-01".parse().unwrap(),
+            ),
+        ]);
+        // Empty token = `auth = "none"` in the catalog (local proxies); send no
+        // auth header. Credential *presence* is the catalog's job
+        // (`ModelCatalog::get`), not the driver's.
+        //
         // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
         // `x-api-key` header and rejects them as `Authorization: Bearer`;
-        // Bearer is the convention for gateway/OAuth tokens
-        // (ANTHROPIC_AUTH_TOKEN). Pick by token shape so ANTHROPIC_API_KEY
-        // works against the default base URL.
+        // Bearer is the convention for gateway/OAuth tokens. Pick by token
+        // shape so both work against the default base URL.
         let token = &backend.anthropic_auth_token;
-        let (auth_header, auth_value) = if token.starts_with("sk-ant-") {
-            ("x-api-key", token.clone())
-        } else {
-            ("authorization", format!("Bearer {token}"))
-        };
+        if !token.is_empty() {
+            let (auth_header, auth_value) = if token.starts_with("sk-ant-") {
+                ("x-api-key", token.clone())
+            } else {
+                ("authorization", format!("Bearer {token}"))
+            };
+            headers.insert(
+                reqwest::header::HeaderName::from_static(auth_header),
+                // Never echo the token into the error: it ends up in logs.
+                auth_value.parse().map_err(|e| {
+                    ModelCreationError::BadConfig(format!(
+                        "auth token is not a valid HTTP header value: {e}"
+                    ))
+                })?,
+            );
+        }
         let client = reqwest::ClientBuilder::new()
-            .default_headers(reqwest::header::HeaderMap::from_iter([
-                (
-                    reqwest::header::CONTENT_TYPE,
-                    "application/json".parse().unwrap(),
-                ),
-                (
-                    auth_header.parse().unwrap(),
-                    // Never echo the token into the error: it ends up in logs.
-                    auth_value.parse().map_err(|e| {
-                        ModelCreationError::BadConfig(format!(
-                            "auth token is not a valid HTTP header value: {e}"
-                        ))
-                    })?,
-                ),
-                (
-                    "anthropic-version".parse().unwrap(),
-                    "2023-06-01".parse().unwrap(),
-                ),
-            ]))
+            .default_headers(headers)
             .build()
             .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
 
@@ -145,7 +145,8 @@ impl AnthropicGenerativeModel {
             }])
         };
 
-        let (thinking, output_config) = thinking_request_fields(self.model, self.backend.effort);
+        let (thinking, output_config) =
+            thinking_request_fields(self.model.thinking, self.backend.effort);
         // Anthropic requires max_tokens > thinking.budget_tokens for non-adaptive
         // extended thinking (e.g. Haiku). Adaptive thinking has no budget field.
         let mut max_tokens = self.backend.max_tokens_per_generate;
@@ -157,7 +158,7 @@ impl AnthropicGenerativeModel {
         }
         let request = AnthropicMessagesRequest {
             max_tokens,
-            model: self.model.api_id(),
+            model: &self.model.api_id,
             messages,
             system,
             tools: &self.tools,
@@ -196,7 +197,7 @@ impl AnthropicGenerativeModel {
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let messages = convert_messages(input);
-        let model = self.model;
+        let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
         let backend = self.backend.clone();
@@ -894,7 +895,7 @@ struct AnthropicOutputConfig {
 
 /// Build `thinking` / `output_config` for the given model when effort is set.
 fn thinking_request_fields(
-    model: Model,
+    mode: ThinkingMode,
     effort: Option<Effort>,
 ) -> (
     Option<AnthropicThinkingConfig>,
@@ -904,8 +905,8 @@ fn thinking_request_fields(
         return (None, None);
     };
 
-    if model.uses_adaptive_thinking() {
-        (
+    match mode {
+        ThinkingMode::Adaptive => (
             Some(AnthropicThinkingConfig::Adaptive {
                 // Agent UIs stream thinking; omit would yield empty thinking deltas.
                 display: Some("summarized"),
@@ -913,14 +914,15 @@ fn thinking_request_fields(
             Some(AnthropicOutputConfig {
                 effort: Some(effort.as_str()),
             }),
-        )
-    } else {
-        (
+        ),
+        ThinkingMode::Budget => (
             Some(AnthropicThinkingConfig::Enabled {
                 budget_tokens: effort.budget_tokens(),
             }),
             None,
-        )
+        ),
+        // `effort` is rejected for this protocol at catalog resolution.
+        ThinkingMode::Effort | ThinkingMode::None => (None, None),
     }
 }
 
@@ -1080,10 +1082,10 @@ mod tests {
     #[test]
     fn adaptive_thinking_uses_effort_not_budget() {
         let (thinking, output_config) =
-            thinking_request_fields(Model::ClaudeOpus48, Some(Effort::High));
+            thinking_request_fields(ThinkingMode::Adaptive, Some(Effort::High));
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
-            model: Model::ClaudeOpus48.api_id(),
+            model: "claude-opus-4-8",
             messages: &[],
             system: None,
             tools: &[],
@@ -1101,10 +1103,10 @@ mod tests {
     #[test]
     fn manual_thinking_uses_budget_tokens() {
         let (thinking, output_config) =
-            thinking_request_fields(Model::ClaudeHaiku45, Some(Effort::Medium));
+            thinking_request_fields(ThinkingMode::Budget, Some(Effort::Medium));
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
-            model: Model::ClaudeHaiku45.api_id(),
+            model: "claude-haiku-4-5",
             messages: &[],
             system: None,
             tools: &[],
@@ -1146,7 +1148,15 @@ mod tests {
 
     #[test]
     fn thinking_omitted_when_effort_unset() {
-        let (thinking, output_config) = thinking_request_fields(Model::ClaudeOpus48, None);
+        let (thinking, output_config) = thinking_request_fields(ThinkingMode::Adaptive, None);
+        assert!(thinking.is_none());
+        assert!(output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_mode_none_sends_no_thinking_fields() {
+        let (thinking, output_config) =
+            thinking_request_fields(ThinkingMode::None, Some(Effort::High));
         assert!(thinking.is_none());
         assert!(output_config.is_none());
     }

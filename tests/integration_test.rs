@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use myco::generative_model::{self, Content, GenerativeModelConfig, Model};
+use myco::generative_model::{self, Content, GenerativeModelConfig};
 use myco::harness::Harness;
 use myco::tool_services::ToolService;
 use myco::*;
@@ -18,12 +18,13 @@ async fn test_agent_tool_use() {
         Arc::new(test_tools::LetterCounterTool) as Arc<dyn ToolService>
     ]);
 
+    let (spec, backend) = test_utils::live_anthropic_haiku();
     let model = generative_model::new(GenerativeModelConfig {
-        model: Model::ClaudeHaiku45,
+        model: spec,
         tools: harness.tool_specs(),
         system_prompt: "You are a helpful assistant. Respond exclusively in decimal integers."
             .into(),
-        backend_config: None,
+        backend_config: backend,
     })
     .expect("create anthropic model");
 

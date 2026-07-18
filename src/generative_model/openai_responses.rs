@@ -1,8 +1,9 @@
-//! OpenAI Responses API backend (also used by xAI / Grok gateways).
+//! OpenAI Responses API backend (also used by xAI / Grok and OpenRouter gateways).
 //!
 //! Ref: https://platform.openai.com/docs/api-reference/responses
 //! Streaming: https://platform.openai.com/docs/guides/streaming-responses?api-mode=responses
 //! xAI: https://docs.x.ai/docs/guides/function-calling
+//! OpenRouter: https://openrouter.ai/docs/api/api-reference/responses/create-responses
 
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use super::*;
 /// OpenAI Responses API settings ([`BackendConfig::OpenAIResponses`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenAIResponsesBackendConfig {
-    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1`.
-    /// Requests go to `{base_url}/responses`.
+    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1` or
+    /// `https://openrouter.ai/api/v1`. Requests go to `{base_url}/responses`.
     pub base_url: String,
     pub auth_token: String,
     pub max_output_tokens: Option<usize>,
@@ -31,7 +32,8 @@ pub struct OpenAIResponsesBackendConfig {
 impl Default for OpenAIResponsesBackendConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://api.x.ai/v1".into(),
+            // No built-in gateway: the catalog (config.toml) supplies base_url.
+            base_url: String::new(),
             auth_token: String::new(),
             max_output_tokens: Some(8192),
             debug_dump_api_requests: false,
@@ -42,7 +44,7 @@ impl Default for OpenAIResponsesBackendConfig {
 
 /// Stateless OpenAI Responses driver. Conversation history is owned by the caller.
 pub struct OpenAIResponsesGenerativeModel {
-    model: Model,
+    model: ModelSpec,
     system_prompt: String,
     tools: Vec<ResponsesTool>,
     backend: OpenAIResponsesBackendConfig,
@@ -54,41 +56,37 @@ impl OpenAIResponsesGenerativeModel {
         config: GenerativeModelConfig,
         backend: OpenAIResponsesBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.backend_kind() != BackendKind::OpenAIResponses {
+        if config.model.protocol != Protocol::OpenAIResponses {
             return Err(ModelCreationError::BadConfig(format!(
-                "Model `{}` is not supported by the OpenAI Responses backend \
-                 (expected models for {})",
+                "model `{}` speaks {}, not {}",
                 config.model,
-                BackendKind::OpenAIResponses
+                config.model.protocol,
+                Protocol::OpenAIResponses
             )));
         }
 
-        if backend.auth_token.is_empty() {
-            return Err(ModelCreationError::BadConfig(
-                "OpenAI Responses auth token is empty (set auth_token, OPENAI_API_KEY, \
-                 XAI_API_KEY, or ANTHROPIC_AUTH_TOKEN)"
-                    .into(),
-            ));
+        let mut headers = reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        )]);
+        // Empty token = `auth = "none"` in the catalog (local servers); send no
+        // Authorization header. Credential *presence* is the catalog's job
+        // (`ModelCatalog::get`), not the driver's.
+        if !backend.auth_token.is_empty() {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                // Never echo the token into the error: it ends up in logs.
+                format!("Bearer {}", backend.auth_token)
+                    .parse()
+                    .map_err(|e| {
+                        ModelCreationError::BadConfig(format!(
+                            "auth token is not a valid HTTP header value: {e}"
+                        ))
+                    })?,
+            );
         }
-
         let client = reqwest::ClientBuilder::new()
-            .default_headers(reqwest::header::HeaderMap::from_iter([
-                (
-                    reqwest::header::CONTENT_TYPE,
-                    "application/json".parse().unwrap(),
-                ),
-                (
-                    reqwest::header::AUTHORIZATION,
-                    // Never echo the token into the error: it ends up in logs.
-                    format!("Bearer {}", backend.auth_token)
-                        .parse()
-                        .map_err(|e| {
-                            ModelCreationError::BadConfig(format!(
-                                "auth token is not a valid HTTP header value: {e}"
-                            ))
-                        })?,
-                ),
-            ]))
+            .default_headers(headers)
             .build()
             .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
 
@@ -120,14 +118,19 @@ impl OpenAIResponsesGenerativeModel {
         // Unknown fields are typically ignored by servers that don't support
         // them — but an unknown *value* is a 400: `max` is Anthropic-only
         // (Responses accepts minimal|low|medium|high), so clamp it.
-        let reasoning = self.backend.effort.map(|effort| ResponsesReasoningConfig {
-            effort: Some(match effort {
-                Effort::Max => Effort::High.as_str(),
-                other => other.as_str(),
-            }),
-        });
+        // `thinking = "none"` in the catalog suppresses the field entirely.
+        let reasoning = if self.model.thinking == ThinkingMode::Effort {
+            self.backend.effort.map(|effort| ResponsesReasoningConfig {
+                effort: Some(match effort {
+                    Effort::Max => Effort::High.as_str(),
+                    other => other.as_str(),
+                }),
+            })
+        } else {
+            None
+        };
         let request = ResponsesCreateRequest {
-            model: self.model.api_id(),
+            model: &self.model.api_id,
             input,
             instructions: if self.system_prompt.is_empty() {
                 None
@@ -178,7 +181,7 @@ impl OpenAIResponsesGenerativeModel {
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let input_items = convert_messages(input);
-        let model = self.model;
+        let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
         let backend = self.backend.clone();

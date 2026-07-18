@@ -334,7 +334,6 @@ enum LinkKind {
 mod tests {
     use super::*;
     use crate::CancelToken;
-    use crate::generative_model::Model;
     use crate::tool_services::{HostDispatchContext, ToolService};
     use std::sync::Arc;
 
@@ -355,7 +354,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let (tool, active) = tool_with_session(Session::new(Model::ClaudeHaiku45));
+        let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
         let result = tool
             .clone()
@@ -412,7 +411,7 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let (tool, _) = tool_with_session(Session::new(Model::ClaudeHaiku45));
+        let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
         let got = tool
             .dispatch_tool_use(

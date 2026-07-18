@@ -9,7 +9,7 @@ cluster/GUI work outrank CLI trust + long-session viability.
 
 ## Done / mostly done (do not re-open casually)
 
-- Dual backends: Anthropic Messages + OpenAI Responses (Grok path)
+- Dual protocol drivers: Anthropic Messages + OpenAI Responses. Models are a config.toml catalog (`[gateways]`/`[models]`; auth = literal token or env/file source) — no built-in model list; any gateway (Anthropic, xAI, OpenRouter, local) via config
 - Streaming generate + thinking; `EventSink` / `AgentEvent` (CLI consumer is thin)
 - Host pool: local + SSH `myco --mode host`, soft-fail non-default, `/hosts`
 - Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp), `subagent` (single-shot)

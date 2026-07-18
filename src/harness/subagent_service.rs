@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::Harness;
 use crate::core::Async;
-use crate::generative_model::{self, Content, GenerativeModelConfig, Message, Model};
+use crate::generative_model::{self, Content, GenerativeModelConfig, Message, ModelCatalog};
 use crate::prompts;
 use crate::session::{
     Agent, AgentEvent, EventSink, Session, SessionKind, TraceContext, uuid_simple_hex,
@@ -32,8 +32,6 @@ calls before replying.
 Creates a session under `~/.myco/session/` with `kind: subagent` (not visible in default listings)
 whose id equals the subagent UUID (same as runtime agent_id). Accessible via get-by-id or
 `session_meta list` with `include_hidden: true`.
-
-The `model` field must be one of the supported model ids (see the tool input schema enum).
 "#;
 
 const SUBAGENT_LOG_DIR: &str = ".myco/subagent-logs";
@@ -51,12 +49,18 @@ pub struct AgentRootHandles {
 /// [`AgentRootHandles`]). Persists a **hidden** [`Session`] under
 /// `~/.myco/session/` with `id == agent_id` (same hex as runtime correlation).
 /// Also writes a debug transcript to `.myco/subagent-logs/{agent_id}.log`.
+///
+/// Subagent models come from the same resolved [`ModelCatalog`] as the
+/// supervisor (config.toml `[models]`); the advertised tool description lists
+/// the configured keys.
 #[derive(Default)]
-pub struct SubagentService {}
+pub struct SubagentService {
+    models: ModelCatalog,
+}
 
 impl SubagentService {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(models: ModelCatalog) -> Self {
+        Self { models }
     }
 }
 
@@ -64,7 +68,10 @@ impl ToolService for SubagentService {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "subagent".to_string(),
-            description: TOOL_DESCRIPTION.to_string(),
+            description: format!(
+                "{TOOL_DESCRIPTION}\nConfigured models for the `model` field: [{}]",
+                self.models.keys().join(", ")
+            ),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
     }
@@ -106,15 +113,19 @@ impl SubagentService {
             );
         };
 
+        let catalog_model = match self.models.get(&input.model) {
+            Ok(m) => m,
+            Err(e) => return generative_model::ToolResult::err(e),
+        };
         let model = match generative_model::new(GenerativeModelConfig {
-            model: input.model,
+            model: catalog_model.spec.clone(),
             tools: root.harness.tool_specs(),
             system_prompt: [
                 SUBAGENT_SYSTEM_PROMPT_PROLOGUE,
                 prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
             ]
             .join("\n\n"),
-            backend_config: None,
+            backend_config: catalog_model.backend.clone(),
         }) {
             Ok(m) => m,
             Err(e) => {
@@ -130,7 +141,7 @@ impl SubagentService {
 
         let parent_session_id = uuid_simple_hex(root.context.agent_id);
         let mut worker_session = Session::new_hidden(
-            input.model,
+            input.model.as_str(),
             agent_id_hex.clone(),
             SessionKind::Subagent,
             Some(parent_session_id.clone()),
@@ -146,7 +157,7 @@ impl SubagentService {
 
         root.sink.emit(AgentEvent::AgentStarted {
             agent_id,
-            model: input.model.api_id().to_string(),
+            model: input.model.clone(),
             parent_agent_id: Some(root.context.agent_id),
             parent_tool_use_id: Some(parent_tool_use_id.clone()),
             depth: child_context.depth,
@@ -188,7 +199,7 @@ impl SubagentService {
         if let Err(e) = write_subagent_log(
             &log_path,
             agent_id,
-            input.model.api_id(),
+            &input.model,
             Some(&parent_tool_use_id),
             &input.prompt,
             subagent.history(),
@@ -264,6 +275,7 @@ fn write_subagent_log(
 struct Input {
     /// Instruction for the subagent (single user turn).
     prompt: String,
-    /// Model to run for the subagent (see schema enum for supported ids).
-    model: Model,
+    /// Model key for the subagent — one of the configured catalog keys
+    /// (listed in the tool description).
+    model: String,
 }

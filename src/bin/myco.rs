@@ -9,7 +9,9 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::generative_model::{self, BackendConfig, Content, Effort, GenerativeModelConfig, Model};
+use myco::generative_model::{
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
+};
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, Palette, RECENT_SESSION_LIMIT, SECTION_RULE, Session,
@@ -89,8 +91,8 @@ struct Args {
     #[arg(long, default_value = "local")]
     name: String,
 
-    /// Model id (e.g. claude-haiku-4-5, claude-opus-4-8, claude-sonnet-4-6, grok-4.5-build).
-    /// Default: `model` from config.toml, else grok-4.5-build.
+    /// Model key from the config.toml [models] catalog.
+    /// Default: `model` from config.toml, else the sole configured model.
     #[arg(long)]
     model: Option<String>,
 
@@ -172,9 +174,10 @@ async fn run_host(args: Args) {
 }
 
 async fn run_interactive(args: Args) {
-    // One explicit resolution step: backend credentials/base URLs, harness
-    // hosts and default model (--config → $MYCO_CONFIG → ~/.myco/config.toml),
-    // and the color decision. Everything downstream reads this, not the env.
+    // One explicit resolution step: model catalog (gateways/models + auth),
+    // harness hosts and default model key (--config → $MYCO_CONFIG →
+    // ~/.myco/config.toml), and the color decision. Everything downstream
+    // reads this, not the env or config files.
     let app_config = Config::resolve(ConfigUserSettings {
         harness_config_path: args.config.clone(),
         model: args.model.clone(),
@@ -185,7 +188,15 @@ async fn run_interactive(args: Args) {
         eprintln!("Failed to load config: {e}");
         std::process::exit(2);
     });
-    let model_id = app_config.model;
+    let catalog_model = match app_config.models.get(&app_config.model) {
+        Ok(m) => m.clone(),
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("config: {}", app_config.harness_config_path.display());
+            std::process::exit(2);
+        }
+    };
+    let model_key = catalog_model.spec.key.clone();
     let palette = Palette::colored(app_config.colors_enabled);
 
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
@@ -198,7 +209,7 @@ async fn run_interactive(args: Args) {
     let resuming = args.resume.is_some();
     let initial_session = match args.resume {
         Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
-        None => Session::new(model_id),
+        None => Session::new(model_key.clone()),
     };
     let active_session = ActiveSession::new(initial_session);
 
@@ -233,16 +244,10 @@ async fn run_interactive(args: Args) {
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
-    let model = build_model(
-        model_id,
-        &harness,
-        debug_dump_api_requests,
-        effort,
-        &app_config,
-    );
+    let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new(palette));
     let mut agent = Agent::new(model, harness.clone(), sink);
-    agent.set_context_window_tokens(model_id.context_window_tokens());
+    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_history(active_session.snapshot().messages.clone());
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
@@ -256,7 +261,7 @@ async fn run_interactive(args: Args) {
     // Extremely lean startup: one line. Hosts via /hosts, effort via /effort,
     // config path via attach-failure hints.
     println!(
-        "myco: model={model_id}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
+        "myco: model={model_key}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
     );
     // SSH preflight problems open a WARNING block after the banner, before the
     // first USER block; the happy path is silent.
@@ -270,11 +275,10 @@ async fn run_interactive(args: Args) {
         &active_session,
         &mut editor,
         harness.clone(),
-        model_id,
+        &catalog_model,
         &mut effort,
         debug_dump_api_requests,
         ctrl_l,
-        &app_config,
         palette,
     )
     .await;
@@ -292,13 +296,12 @@ async fn run_interactive(args: Args) {
 }
 
 fn build_model(
-    model_id: Model,
+    catalog_model: &CatalogModel,
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
-    app_config: &Config,
 ) -> Arc<dyn generative_model::GenerativeModel> {
-    let mut backend_config = app_config.backend_config(model_id);
+    let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
         BackendConfig::Anthropic(c) => {
             if debug_dump_api_requests {
@@ -316,14 +319,14 @@ fn build_model(
     }
 
     generative_model::new(GenerativeModelConfig {
-        model: model_id,
+        model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE,
             prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
         ]
         .join("\n"),
-        backend_config: Some(backend_config),
+        backend_config,
     })
     .unwrap_or_else(|e| {
         eprintln!("Failed to create model: {e}");
@@ -407,11 +410,10 @@ async fn run_repl(
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
-    model_id: Model,
+    catalog_model: &CatalogModel,
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
-    app_config: &Config,
     palette: Palette,
 ) {
     loop {
@@ -452,7 +454,15 @@ async fn run_repl(
         }
         if let Some(cmd) = parse_meta(&input) {
             if matches!(cmd, MetaCommand::Compact) {
-                run_compact(agent, session, editor, harness.clone(), model_id, palette).await;
+                run_compact(
+                    agent,
+                    session,
+                    editor,
+                    harness.clone(),
+                    catalog_model,
+                    palette,
+                )
+                .await;
                 continue;
             }
             handle_meta(
@@ -461,10 +471,9 @@ async fn run_repl(
                 session,
                 editor,
                 harness.as_ref(),
-                model_id,
+                catalog_model,
                 effort,
                 debug_dump_api_requests,
-                app_config,
                 palette,
             );
             continue;
@@ -542,7 +551,7 @@ async fn run_compact(
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
-    model_id: Model,
+    catalog_model: &CatalogModel,
     palette: Palette,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), true) {
@@ -560,7 +569,7 @@ async fn run_compact(
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
     let mut worker_session = Session::new_hidden(
-        model_id,
+        catalog_model.spec.key.clone(),
         worker_hex.clone(),
         SessionKind::Compact,
         Some(predecessor.id.clone()),
@@ -574,7 +583,7 @@ async fn run_compact(
     }
 
     let model = match generative_model::new(GenerativeModelConfig {
-        model: model_id,
+        model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
             "You are a myco compaction worker. Follow the user instruction exactly. \
@@ -582,7 +591,7 @@ async fn run_compact(
             prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
         ]
         .join("\n\n"),
-        backend_config: None,
+        backend_config: catalog_model.backend.clone(),
     }) {
         Ok(m) => m,
         Err(e) => {
@@ -602,7 +611,7 @@ async fn run_compact(
             parent_tool_use_id: None,
         },
     );
-    worker.set_context_window_tokens(model_id.context_window_tokens());
+    worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
 
     let prompt = compact_subagent_prompt(&predecessor.id);
     let cancel = myco::CancelToken::new();
@@ -641,14 +650,18 @@ async fn run_compact(
         }
     };
 
-    let (successor, outcome) =
-        match compact_session(&predecessor, &summary, model_id, &CompactOptions::default()) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("compact: failed to build successor: {e}");
-                return;
-            }
-        };
+    let (successor, outcome) = match compact_session(
+        &predecessor,
+        &summary,
+        &catalog_model.spec.key,
+        &CompactOptions::default(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("compact: failed to build successor: {e}");
+            return;
+        }
+    };
 
     let mut pred = predecessor;
     if let Err(e) = link_compact_pair(&mut pred, &successor) {
@@ -732,10 +745,9 @@ fn handle_meta(
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     harness: &Harness,
-    model_id: Model,
+    catalog_model: &CatalogModel,
     effort: &mut Effort,
     debug_dump_api_requests: bool,
-    app_config: &Config,
     palette: Palette,
 ) {
     match cmd {
@@ -751,7 +763,7 @@ fn handle_meta(
         MetaCommand::Hosts => print_host_status(harness),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
-            session.replace(Session::new(model_id));
+            session.replace(Session::new(catalog_model.spec.key.clone()));
             agent.set_history(Vec::new());
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
@@ -779,15 +791,10 @@ fn handle_meta(
                 Ok(next) if next == *effort => println!("effort={effort}  (unchanged)"),
                 Ok(next) => {
                     *effort = next;
-                    let model = build_model(
-                        model_id,
-                        harness,
-                        debug_dump_api_requests,
-                        *effort,
-                        app_config,
-                    );
+                    let model =
+                        build_model(catalog_model, harness, debug_dump_api_requests, *effort);
                     agent.set_model(model);
-                    agent.set_context_window_tokens(model_id.context_window_tokens());
+                    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
                     println!("effort={effort}");
                 }
                 Err(e) => eprintln!("{e}"),
@@ -904,7 +911,9 @@ Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
-  $MYCO_CONFIG) holds knobs only (enable_subagent, attach_timeout_secs).
+  $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
+  and knobs (enable_subagent, attach_timeout_secs). Auth per entry: a literal
+  token string or a source table (env var / file / none); see --help overview.
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host. Use /hosts to list hosts and attach status
   (startup no longer prints them).
@@ -1503,7 +1512,7 @@ mod tests {
 
     #[test]
     fn new_session_starts_empty() {
-        let session = Session::new(Model::Grok45Build);
+        let session = Session::new("grok-4.5-build");
         assert!(session.messages.is_empty());
     }
 }
