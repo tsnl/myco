@@ -1,8 +1,9 @@
 //! Conversation session persistence and metadata.
 //!
 //! Sessions live under `~/.myco/session/{shard}/{id}.json` (plus a sibling
-//! `.history` for readline). Schema is intentionally breaking vs earlier WIP
-//! files: only [`SESSION_FILE_VERSION`] is accepted.
+//! `.history` for readline and a sibling `{id}/` directory for per-session
+//! artifacts such as bash exec output dumps). Schema is intentionally breaking
+//! vs earlier WIP files: only [`SESSION_FILE_VERSION`] is accepted.
 
 mod agent;
 mod compact;
@@ -471,6 +472,19 @@ pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
         Ok(root) => root.join(shard).join(format!("{id}.{ext}")),
         Err(_) => PathBuf::from(format!(".myco/session/{shard}/{id}.{ext}")),
     }
+}
+
+/// Per-session artifact directory, a sibling of the session json:
+/// `session/{shard}/{id}/`.
+///
+/// Hosts mirror this layout under their own `~/.myco` (keyed by the agent id
+/// they receive with each tool call), so deleting the session json plus this
+/// directory on each host removes every trace of a session. Errors instead of
+/// falling back to a relative path: artifact writes from an arbitrary cwd are
+/// worse than skipping the write.
+pub fn session_dir_path(id: &str) -> Result<PathBuf, String> {
+    let shard = &id[..2.min(id.len())];
+    Ok(session_root()?.join(shard).join(id))
 }
 
 pub fn atomically_write(path: &Path, content: &[u8]) -> Result<(), String> {

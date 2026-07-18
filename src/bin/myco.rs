@@ -223,7 +223,12 @@ async fn run_interactive(args: Args) {
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(model_id, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new());
-    let mut agent = Agent::new(model, harness.clone(), sink);
+    let mut agent = Agent::with_context(
+        model,
+        harness.clone(),
+        sink,
+        root_trace_context(&active_session.id()),
+    );
     agent.set_context_window_tokens(model_id.context_window_tokens());
     agent.set_history(active_session.snapshot().messages.clone());
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -374,6 +379,21 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
             eprintln!("Failed to resume session: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Root agents adopt the session id as their runtime agent id — subagents and
+/// compact workers already do (`id == agent_id`). Hosts only ever see the
+/// agent id, so this keys host-side per-session artifacts (bash exec output
+/// dumps under `session/{shard}/{id}/`) and subagent parent links by the same
+/// id the user sees in `/sessions`.
+fn root_trace_context(session_id: &str) -> TraceContext {
+    // Session ids are `uuid_simple_hex`; fall back to a fresh id if not.
+    let agent_id = uuid::Uuid::parse_str(session_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+    TraceContext {
+        agent_id,
+        depth: 0,
+        parent_tool_use_id: None,
     }
 }
 
@@ -1365,6 +1385,21 @@ mod tests {
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
     use serde_json::json;
     use std::time::Duration;
+
+    /// Root agent id must equal the session id (as subagents/compact workers
+    /// already guarantee), so host-side artifacts key by the visible id.
+    #[test]
+    fn root_trace_context_adopts_session_id() {
+        let session_id = uuid_simple_hex(uuid::Uuid::new_v4());
+        let ctx = root_trace_context(&session_id);
+        assert_eq!(uuid_simple_hex(ctx.agent_id), session_id);
+        assert_eq!(ctx.depth, 0);
+        assert!(ctx.parent_tool_use_id.is_none());
+
+        // Non-uuid session id (defensive): still yields a usable non-nil id.
+        let ctx = root_trace_context("not-a-uuid");
+        assert!(!ctx.agent_id.is_nil());
+    }
 
     fn sample_messages() -> Vec<Message> {
         vec![
