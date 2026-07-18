@@ -11,8 +11,6 @@ use super::{HostDispatchContext, ToolService};
 const DEFAULT_MAX_CHARS: usize = 2_000;
 const HARD_MAX_CHARS: usize = 32_000;
 
-// Defaults/limits are embedded from the constants above so the model-facing
-// contract can never drift from the code.
 fn tool_description() -> String {
     format!(
         r#"

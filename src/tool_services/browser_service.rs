@@ -23,9 +23,6 @@ const DEFAULT_WIDTH: u32 = 100;
 const MAX_WIDTH: u32 = 400;
 const DEFAULT_MAX_BYTES: usize = 200_000;
 const HARD_MAX_BYTES: usize = 1_000_000;
-
-// Defaults/limits are embedded from the constants above so the model-facing
-// contract can never drift from the code.
 fn tool_description() -> String {
     format!(
         r#"

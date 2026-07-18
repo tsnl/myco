@@ -63,8 +63,6 @@ impl ToolService for BashService {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "bash".to_string(),
-            // Defaults/limits are embedded from the constants above so the
-            // model-facing contract can never drift from the code.
             description: format!(
                 "Executes bash commands and manages long-lived interactive sessions \
                 (shells, Python REPLs, SSH, etc.).\n\n\
