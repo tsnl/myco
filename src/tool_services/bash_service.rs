@@ -59,8 +59,9 @@ impl Default for BashService {
     }
 }
 
-impl ToolService for BashService {
-    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+impl BashService {
+    /// Tool schemas served by this service (static: no instance required).
+    pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "bash".to_string(),
             description: "Executes bash commands and manages long-lived interactive sessions \
@@ -92,6 +93,12 @@ impl ToolService for BashService {
                 .to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
+    }
+}
+
+impl ToolService for BashService {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+        Self::specs()
     }
 
     fn dispatch_tool_use(

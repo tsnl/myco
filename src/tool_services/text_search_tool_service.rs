@@ -79,28 +79,15 @@ impl TextSearchToolService {
         Self { engine }
     }
 
-    /// Service for tool-spec listing only: no engine threads, no auto-index.
-    pub fn spec_only() -> Self {
-        Self {
-            engine: TextSearchEngine::detached(),
-        }
-    }
-
     /// Owner opt-in: background-discover and index skills / AGENTS.md under
     /// `cwd` (see [`TextSearchEngine::auto_index_under`]).
     pub fn auto_index_under(&self, cwd: PathBuf) {
         self.engine.auto_index_under(cwd);
     }
-}
 
-impl Default for TextSearchToolService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ToolService for TextSearchToolService {
-    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+    /// Tool schemas served by this service (static: no instance or engine
+    /// required — catalog listing must never construct one).
+    pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![
             generative_model::ToolSpec {
                 name: "index_directory".to_string(),
@@ -123,6 +110,18 @@ impl ToolService for TextSearchToolService {
                 input_schema: schemars::schema_for!(DropInput).to_value(),
             },
         ]
+    }
+}
+
+impl Default for TextSearchToolService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolService for TextSearchToolService {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+        Self::specs()
     }
 
     fn dispatch_tool_use(

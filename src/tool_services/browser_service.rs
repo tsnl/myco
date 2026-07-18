@@ -62,15 +62,20 @@ impl BrowserService {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl ToolService for BrowserService {
-    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+    /// Tool schemas served by this service (static: no instance required).
+    pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "lynx_tui_browser".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: schemars::schema_for!(Input).to_value(),
         }]
+    }
+}
+
+impl ToolService for BrowserService {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+        Self::specs()
     }
 
     fn dispatch_tool_use(
