@@ -1,7 +1,7 @@
 {
-  "request_id": "v0.2.0-dry-run-2",
+  "request_id": "v0.2.0-publish-1",
   "branch": "main",
   "bump_type": "minor",
-  "dry_run": "true",
+  "dry_run": "false",
   "notes_path": ".github/release-notes-v0.2.0.md"
 }
