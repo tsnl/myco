@@ -173,7 +173,9 @@ When tools fail or the user asks why something is broken, investigate with tools
      platform** (release asset — weights already embedded), or **build on that host**
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
-   - If auth fails with BatchMode: check `ssh-add -l` and the startup ssh-agent preflight.
+   - If auth fails with BatchMode: check `ssh-add -l` and the startup ssh-agent
+     preflight (silent when clean; problems open a WARNING block before the first
+     USER block).
      Unlock with `ssh-add` / `ssh-add --apple-use-keychain <key>` (myco cannot prompt on the
      NDJSON pipe). Restart myco after loading keys.
    - Suggest user run `/hosts` after fixes (requires CLI restart to re-attach remotes).

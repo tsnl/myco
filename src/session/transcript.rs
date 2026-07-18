@@ -1,9 +1,10 @@
 //! Sectioned transcript layout for session restore and CLI display.
 //!
-//! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule), and
-//! ERROR (thin rule). Thinking summaries and tool invocations are paragraphs
-//! inside ASSISTANT. ERROR is used for live generate failures (not stored in
-//! session history).
+//! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule),
+//! ERROR (thin rule), and WARNING (thin rule). Thinking summaries and tool
+//! invocations are paragraphs inside ASSISTANT. ERROR is used for live
+//! generate failures, WARNING for startup preflight problems; both are
+//! live-only (not stored in session history).
 
 use std::io::Write;
 
@@ -13,7 +14,7 @@ use crate::generative_model::{Content, Message};
 pub const USER_RULE: &str =
     "════════════════════════════════════════════════════════════════════════";
 
-/// Thin 72-col rule before ASSISTANT / ERROR section headers (USER uses USER_RULE).
+/// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER uses USER_RULE).
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
@@ -105,6 +106,15 @@ pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> st
     Ok(())
 }
 
+/// Write a WARNING section open: blank line, thin rule, header, blank line, then body.
+pub fn write_warning_open(out: &mut (impl Write + ?Sized)) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "{SECTION_RULE}")?;
+    writeln!(out, "WARNING")?;
+    writeln!(out)?;
+    Ok(())
+}
+
 /// Write `text` with exactly one trailing newline.
 pub fn write_block(out: &mut impl Write, text: &str) -> std::io::Result<()> {
     out.write_all(text.as_bytes())?;
@@ -121,6 +131,12 @@ pub fn write_error_section(
     palette: Palette,
 ) -> std::io::Result<()> {
     write_error_open(out, palette)?;
+    write_block(out, text)
+}
+
+/// Write a full WARNING section with body text (trailing newline ensured).
+pub fn write_warning_section(out: &mut impl Write, text: &str) -> std::io::Result<()> {
+    write_warning_open(out)?;
     write_block(out, text)
 }
 
@@ -411,6 +427,18 @@ mod tests {
         let rendered = String::from_utf8(buf).unwrap();
         assert!(rendered.contains(&format!(
             "{SECTION_RULE}\nERROR\n\ncontext length exceeded\n"
+        )));
+        // Leading blank line before the section rule.
+        assert!(rendered.starts_with('\n'));
+    }
+
+    #[test]
+    fn write_warning_section_layout() {
+        let mut buf = Vec::new();
+        write_warning_section(&mut buf, "ssh-agent: not reachable").unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains(&format!(
+            "{SECTION_RULE}\nWARNING\n\nssh-agent: not reachable\n"
         )));
         // Leading blank line before the section rule.
         assert!(rendered.starts_with('\n'));

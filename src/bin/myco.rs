@@ -225,7 +225,6 @@ async fn run_interactive(args: Args) {
         eprintln!("config: {}", app_config.harness_config_path.display());
         std::process::exit(1);
     });
-    print_host_status(&harness);
     // Owner request: index skills / AGENTS.md under the launch directory.
     // Attach alone never indexes (tests rely on that).
     if let Ok(cwd) = std::env::current_dir() {
@@ -254,10 +253,11 @@ async fn run_interactive(args: Args) {
         Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
         _ => s.id.clone(),
     });
+    // Extremely lean startup: one line. Hosts via /hosts, effort via /effort,
+    // config path via attach-failure hints. SSH preflight problems (if any)
+    // already printed a WARNING block above; the happy path is silent.
     println!(
-        "myco: model={model_id}  effort={effort}  session={session_label}  config={}  hosts=[{}]  default=local  (/help for commands; newline: Alt-Enter or Ctrl-J)",
-        app_config.harness_config_path.display(),
-        harness.host_names().join(", "),
+        "myco: model={model_id}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
     );
     if resuming {
         print_session_history(agent.history(), palette);
@@ -904,9 +904,11 @@ Hosts:
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
   $MYCO_CONFIG) holds knobs only (enable_subagent, attach_timeout_secs).
   Host tools accept optional input field `host` (default: local).
-  Sessions (bash) are per-host.
+  Sessions (bash) are per-host. Use /hosts to list hosts and attach status
+  (startup no longer prints them).
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
-  passphrases on the NDJSON pipe). Missing keys: ssh-add, then restart.
+  passphrases on the NDJSON pipe). It is silent when clean; problems open a
+  WARNING block. Missing keys: ssh-add, then restart.
 
 Sessions are conversation memory only; shell/file state is not restored.
 Empty sessions (no messages) are not written to disk.
