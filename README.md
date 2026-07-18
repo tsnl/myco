@@ -43,8 +43,9 @@ myco    # runs the default model from your config.toml; --model <key> to switch
 Configure your models first: myco ships none built in. `~/.myco/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
 Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
-pass to `--model`). Credentials come from env vars (`auth = "env:VAR"`, with
-`.env` in the cwd loaded at startup) or a `tokens.toml` next to the config. The exact variables are documented in the
+pass to `--model`). The `auth` value is the token itself or a source such as
+`{ source = "env", var_name = "XAI_API_KEY" }` (`.env` in the cwd is loaded
+at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
 `myco --help overview` once installed. Set a default model with
 `model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript

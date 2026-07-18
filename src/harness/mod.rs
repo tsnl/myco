@@ -16,7 +16,7 @@ use crate::tool_services::ToolService;
 
 mod config;
 pub use config::{
-    FileConfig, GatewayEntry, ModelEntry, default_ssh_config_path, example_config_toml,
+    AuthEntry, FileConfig, GatewayEntry, ModelEntry, default_ssh_config_path, example_config_toml,
     load_file_config, load_ssh_host_aliases, parse_file_config_str, ssh_config_host_aliases,
     ssh_spawn_command,
 };

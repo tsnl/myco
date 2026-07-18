@@ -31,7 +31,6 @@ myco (interactive) / Agent
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/tokens.toml` | Optional flat `NAME = "secret"` table for `auth = "token:NAME"` entries (always next to config.toml). Keeps secrets out of a shareable config. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/memory/{uuid[..2]}/{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUID-keyed entry files; see below). |
@@ -49,7 +48,7 @@ attach_timeout_secs = 10
 [gateways.xai]
 protocol = "openai-responses"
 base_url = "https://api.x.ai/v1"
-auth = "env:XAI_API_KEY"
+auth = { source = "env", var_name = "XAI_API_KEY" }
 
 [models."grok-4.5-build"]
 gateway = "xai"
@@ -77,12 +76,12 @@ referenced gateway; a model may also inline all three and skip `gateway`.
 [gateways.anthropic]
 protocol = "anthropic-messages"        # or "openai-responses"
 base_url = "https://api.anthropic.com"
-auth = "env:ANTHROPIC_API_KEY"
+auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 
 [gateways.openrouter]
 protocol = "openai-responses"          # requests go to {base_url}/responses
 base_url = "https://openrouter.ai/api/v1"
-auth = "env:OPENROUTER_API_KEY"
+auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
 [models.claude-opus-4-8]
 gateway = "anthropic"
@@ -98,10 +97,9 @@ gateway = "openrouter"
 api_id = "moonshotai/kimi-k3"          # wire id; defaults to the key
 context_window = 1_000_000
 
-[models.local-qwen]                    # inline, no gateway ref
+[models.local-qwen]                    # inline, no gateway ref; no auth
 protocol = "openai-responses"
 base_url = "http://localhost:11434/v1"
-auth = "none"
 context_window = 32768
 ```
 
@@ -111,12 +109,15 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 `openai-responses`: `effort` (default) | `none`), `max_output_tokens`
 (default 8192).
 
-**Auth** is per gateway (or per model): `env:VAR` reads the process
-environment (`dotenvy` loads a `.env` from the cwd at startup), `token:NAME`
-reads `NAME` from `~/.myco/tokens.toml` (flat `NAME = "secret"`; sits next to
-config.toml so the config stays shareable), `none` sends no auth header
-(local servers). A missing credential does **not** fail startup resolution —
-the error (naming the env var / tokens key) surfaces when the model is used.
+**Auth** is per gateway, overridable per model. The `auth` value is either
+the credential itself (`auth = "sk-…"`) or a source table:
+`{ source = "env", var_name = "…" }` reads the process environment (`dotenvy`
+loads a `.env` from the cwd at startup); `{ source = "file", path = "…" }`
+reads the file's trimmed contents (`~/` expands; keeps secrets out of a
+shareable config); `{ source = "none" }` — or omitting `auth` — sends no auth
+header (local servers). A credential that fails to look up does **not** fail
+startup resolution — the error (naming the env var / file) surfaces when the
+model is used.
 
 Default model: `--model` → config.toml `model` → the sole `[models]` entry.
 Anything else is a startup error listing the configured keys. Rerouting a

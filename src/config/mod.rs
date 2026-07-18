@@ -17,14 +17,16 @@
 //! inlines `protocol` / `base_url` / `auth`) plus per-model metadata
 //! (`api_id`, required `context_window`, `thinking`, `max_output_tokens`).
 //!
-//! Auth mechanisms: `env:VAR` (process environment), `token:NAME` (looked up
-//! in a flat `tokens.toml` next to config.toml — keeps secrets out of a
-//! shareable config), or `none` (local servers; no auth header sent).
-//! A missing credential is **not** a resolve error: it is reported when the
-//! model is actually used ([`ModelCatalog::get`]).
+//! An entry's `auth` value is either the credential itself (a bare string) or
+//! a source table: `{ source = "env", var_name = "…" }` reads the process
+//! environment, `{ source = "file", path = "…" }` reads a file's trimmed
+//! contents (keeps secrets out of a shareable config), `{ source = "none" }`
+//! (or omitting `auth`) sends no auth header. A credential that fails to
+//! *look up* (unset variable, unreadable file) is **not** a resolve error: it
+//! is reported when the model is actually used ([`ModelCatalog::get`]).
 //!
 //! Out of scope, deliberately: `.env` loading (dotenvy runs in `main` before
-//! resolution so `env:VAR` sees its effect), `MYCO_HOME` (session storage
+//! resolution so env auth sources see its effect), `MYCO_HOME` (session storage
 //! root; read by session code that also runs in `--mode host` workers where
 //! no `Config` exists), and per-tool lookups like `MYCO_LYNX` (resolved at
 //! tool-call time on whichever host runs the tool).
@@ -37,63 +39,33 @@ use crate::generative_model::{
     AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
     OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
 };
-use crate::harness::{FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases};
+use crate::harness::{
+    AuthEntry, FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases,
+};
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 
 // ---------------------------------------------------------------------------
-// Auth mechanisms
+// Auth resolution
 // ---------------------------------------------------------------------------
 
-/// Parsed `auth` string from a gateway/model entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthRef {
-    /// `env:VAR` — read the process environment.
-    Env(String),
-    /// `token:NAME` — look up `NAME` in tokens.toml.
-    Token(String),
-    /// `none` — no credential; no auth header is sent.
-    None,
-}
-
-impl AuthRef {
-    fn parse(s: &str) -> Result<Self, String> {
-        if let Some(var) = s.strip_prefix("env:") {
-            if var.is_empty() {
-                return Err("auth \"env:\" is missing a variable name".into());
-            }
-            return Ok(AuthRef::Env(var.to_string()));
-        }
-        if let Some(name) = s.strip_prefix("token:") {
-            if name.is_empty() {
-                return Err("auth \"token:\" is missing a tokens.toml key".into());
-            }
-            return Ok(AuthRef::Token(name.to_string()));
-        }
-        if s == "none" {
-            return Ok(AuthRef::None);
-        }
-        Err(format!(
-            "invalid auth {s:?}: expected \"env:VAR\", \"token:NAME\" (tokens.toml), or \"none\""
-        ))
+/// Read an `auth = { source = "file", … }` credential: trimmed contents,
+/// leading `~/` expanded to the home directory.
+pub fn read_auth_file(path: &Path) -> Result<String, String> {
+    let expanded: PathBuf = match path.strip_prefix("~") {
+        Ok(rest) => dirs::home_dir()
+            .ok_or_else(|| "could not resolve home directory".to_string())?
+            .join(rest),
+        Err(_) => path.to_path_buf(),
+    };
+    let text =
+        std::fs::read_to_string(&expanded).map_err(|e| format!("{}: {e}", expanded.display()))?;
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(format!("{}: file is empty", expanded.display()));
     }
-}
-
-/// Load `tokens.toml` (flat `NAME = "secret"` table). Missing file → empty:
-/// it only becomes an error when a model references `token:NAME`.
-pub fn load_tokens_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read tokens {}: {e}", path.display()))?;
-    toml::from_str::<BTreeMap<String, String>>(&text).map_err(|e| {
-        format!(
-            "parse tokens {}: {e} (expected flat `NAME = \"secret\"` entries)",
-            path.display()
-        )
-    })
+    Ok(token.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +138,6 @@ pub struct Config {
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
-    /// Sibling `tokens.toml` holding literal credentials (`token:NAME`).
-    pub tokens_path: PathBuf,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
@@ -181,8 +151,8 @@ pub struct Config {
 
 impl Config {
     /// Resolve from the real process environment, stdout TTY state, the
-    /// config + tokens files, and `~/.ssh/config` host aliases. Errors carry
-    /// the offending path / entry name.
+    /// config file, auth files, and `~/.ssh/config` host aliases. Errors
+    /// carry the offending path / entry name.
     pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
         Self::resolve_with(
@@ -191,7 +161,7 @@ impl Config {
             stdout_is_tty,
             load_file_config,
             load_ssh_host_aliases,
-            load_tokens_file,
+            read_auth_file,
         )
     }
 
@@ -203,7 +173,7 @@ impl Config {
         stdout_is_tty: bool,
         load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
         ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
-        load_tokens: impl FnOnce(&Path) -> Result<BTreeMap<String, String>, String>,
+        read_auth_file: impl Fn(&Path) -> Result<String, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
@@ -215,14 +185,9 @@ impl Config {
 
         let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
         let harness_config_path = resolve_harness_config_path(harness_config_path, &env)?;
-        let tokens_path = harness_config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("tokens.toml");
         let file = load_file(&harness_config_path)?;
-        let tokens = load_tokens(&tokens_path)?;
 
-        let models = resolve_catalog(&file, &env, &tokens, &tokens_path)?;
+        let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
 
         let mut harness = file.into_harness_config(ssh_aliases()?);
@@ -233,7 +198,6 @@ impl Config {
             stdout_is_tty,
             colors_enabled,
             harness_config_path,
-            tokens_path,
             harness,
             models,
             model,
@@ -259,14 +223,13 @@ fn resolve_harness_config_path(
 /// Build the model catalog from `[gateways]` / `[models]`.
 ///
 /// Hard errors here are config-shape problems (unknown gateway, missing
-/// protocol/base_url/auth, invalid auth string, incompatible thinking mode).
-/// Missing *credentials* are soft: recorded per-entry and reported when the
-/// model is actually used.
+/// protocol/base_url, incompatible thinking mode). Credential *lookups* that
+/// fail (unset env var, unreadable file) are soft: recorded per-entry and
+/// reported when the model is actually used.
 fn resolve_catalog(
     file: &FileConfig,
     env: &impl Fn(&str) -> Option<String>,
-    tokens: &BTreeMap<String, String>,
-    tokens_path: &Path,
+    read_auth_file: &impl Fn(&Path) -> Result<String, String>,
 ) -> Result<ModelCatalog, String> {
     let mut entries = BTreeMap::new();
 
@@ -294,17 +257,12 @@ fn resolve_catalog(
             .ok_or_else(|| {
                 format!("model `{key}`: no base_url — set `base_url` or reference a `gateway`")
             })?;
-        let auth_str = entry
+        // Model-level auth overrides the gateway's; absent everywhere → no
+        // auth header (same as `{ source = "none" }`).
+        let auth = entry
             .auth
             .clone()
-            .or_else(|| gateway.map(|g| g.auth.clone()))
-            .ok_or_else(|| {
-                format!(
-                    "model `{key}`: no auth — set `auth = \"env:VAR\" | \"token:NAME\" | \
-                     \"none\"` on the model or its gateway"
-                )
-            })?;
-        let auth = AuthRef::parse(&auth_str).map_err(|e| format!("model `{key}`: {e}"))?;
+            .or_else(|| gateway.and_then(|g| g.auth.clone()));
 
         let thinking = entry
             .thinking
@@ -317,25 +275,20 @@ fn resolve_catalog(
         }
 
         let (token, auth_error) = match auth {
-            AuthRef::None => (String::new(), None),
-            AuthRef::Env(var) => match env(&var) {
+            None | Some(AuthEntry::None) => (String::new(), None),
+            Some(AuthEntry::Token(token)) => (token, None),
+            Some(AuthEntry::Env { var_name }) => match env(&var_name) {
                 Some(v) => (v, None),
                 None => (
                     String::new(),
                     Some(format!(
-                        "model `{key}`: auth env var `{var}` is unset or empty"
+                        "model `{key}`: auth env var `{var_name}` is unset or empty"
                     )),
                 ),
             },
-            AuthRef::Token(name) => match tokens.get(&name) {
-                Some(v) => (v.clone(), None),
-                None => (
-                    String::new(),
-                    Some(format!(
-                        "model `{key}`: token `{name}` not found in {}",
-                        tokens_path.display()
-                    )),
-                ),
+            Some(AuthEntry::File { path }) => match read_auth_file(Path::new(&path)) {
+                Ok(v) => (v, None),
+                Err(e) => (String::new(), Some(format!("model `{key}`: auth file {e}"))),
             },
         };
 
@@ -463,12 +416,12 @@ model = "kimi-k3"
 [gateways.openrouter]
 protocol = "openai-responses"
 base_url = "https://openrouter.ai/api/v1"
-auth = "env:OPENROUTER_API_KEY"
+auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
 [gateways.anthropic]
 protocol = "anthropic-messages"
 base_url = "https://api.anthropic.com"
-auth = "env:ANTHROPIC_API_KEY"
+auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 
 [models.kimi-k3]
 gateway = "openrouter"
@@ -483,7 +436,6 @@ context_window = 1_000_000
 [models.haiku-local]
 protocol = "anthropic-messages"
 base_url = "http://localhost:8080"
-auth = "none"
 thinking = "budget"
 api_id = "claude-haiku-4-5"
 context_window = 200_000
@@ -493,7 +445,17 @@ context_window = 200_000
         toml_text: &'static str,
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
-        tokens: BTreeMap<String, String>,
+    ) -> Result<Config, String> {
+        resolve_toml_with_files(toml_text, settings, env, |p| {
+            Err(format!("{}: no such file", p.display()))
+        })
+    }
+
+    fn resolve_toml_with_files(
+        toml_text: &'static str,
+        settings: ConfigUserSettings,
+        env: impl Fn(&str) -> Option<String>,
+        read_auth_file: impl Fn(&Path) -> Result<String, String>,
     ) -> Result<Config, String> {
         Config::resolve_with(
             settings,
@@ -501,18 +463,12 @@ context_window = 200_000
             false,
             move |_| parse_file_config_str(toml_text),
             || Ok(Vec::new()),
-            move |_| Ok(tokens),
+            read_auth_file,
         )
     }
 
     fn resolve_catalog_cfg(env_pairs: &[(&str, &str)]) -> Config {
-        resolve_toml(
-            CATALOG,
-            ConfigUserSettings::default(),
-            env_of(env_pairs),
-            BTreeMap::new(),
-        )
-        .unwrap()
+        resolve_toml(CATALOG, ConfigUserSettings::default(), env_of(env_pairs)).unwrap()
     }
 
     #[test]
@@ -562,36 +518,76 @@ context_window = 200_000
     }
 
     #[test]
-    fn token_auth_reads_tokens_toml_and_missing_key_defers() {
+    fn literal_auth_string_is_the_token() {
         let toml_text = r#"
 [models.proxy]
 protocol = "openai-responses"
 base_url = "https://proxy.corp/v1"
-auth = "token:corp"
+auth = "sk-inline-secret"
 context_window = 100_000
 "#;
-        let cfg = resolve_toml(
-            toml_text,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            [("corp".to_string(), "sekrit".to_string())].into(),
-        )
-        .unwrap();
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        match &cfg.models.get("proxy").unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sk-inline-secret"),
+            other => panic!("unexpected backend {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_auth_reads_trimmed_contents_and_read_failure_defers() {
+        let toml_text = r#"
+[models.proxy]
+protocol = "openai-responses"
+base_url = "https://proxy.corp/v1"
+auth = { source = "file", path = "~/.secrets/corp.token" }
+context_window = 100_000
+"#;
+        let cfg =
+            resolve_toml_with_files(toml_text, ConfigUserSettings::default(), env_of(&[]), |p| {
+                assert_eq!(p, Path::new("~/.secrets/corp.token"));
+                Ok("sekrit".into())
+            })
+            .unwrap();
         match &cfg.models.get("proxy").unwrap().backend {
             BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sekrit"),
             other => panic!("unexpected backend {other:?}"),
         }
 
-        let cfg = resolve_toml(
-            toml_text,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap();
+        // Unreadable file: resolve succeeds, use-time error names the path.
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
         let err = cfg.models.get("proxy").unwrap_err();
-        assert!(err.contains("token `corp` not found"), "{err}");
-        assert!(err.contains("tokens.toml"), "{err}");
+        assert!(err.contains("auth file"), "{err}");
+        assert!(err.contains("corp.token"), "{err}");
+    }
+
+    #[test]
+    fn absent_auth_and_source_none_send_no_credential() {
+        let toml_text = r#"
+model = "inherits"
+
+[gateways.g]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "sk-gateway-token"
+
+[models.inherits]
+gateway = "g"
+context_window = 1000
+
+[models.opts-out]
+gateway = "g"
+auth = { source = "none" }
+context_window = 1000
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        match &cfg.models.get("inherits").unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sk-gateway-token"),
+            other => panic!("unexpected backend {other:?}"),
+        }
+        match &cfg.models.get("opts-out").unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, ""),
+            other => panic!("unexpected backend {other:?}"),
+        }
     }
 
     #[test]
@@ -601,13 +597,8 @@ context_window = 100_000
 gateway = "nope"
 context_window = 1000
 "#;
-        let err = resolve_toml(
-            unknown_gateway,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
+        let err =
+            resolve_toml(unknown_gateway, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("model `x`"), "{err}");
         assert!(err.contains("unknown gateway `nope`"), "{err}");
 
@@ -617,31 +608,19 @@ base_url = "https://h"
 auth = "none"
 context_window = 1000
 "#;
-        let err = resolve_toml(
-            no_protocol,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
+        let err =
+            resolve_toml(no_protocol, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("no protocol"), "{err}");
 
         let bad_auth = r#"
 [models.x]
 protocol = "openai-responses"
 base_url = "https://h"
-auth = "keychain:oops"
+auth = { source = "keychain" }
 context_window = 1000
 "#;
-        let err = resolve_toml(
-            bad_auth,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-        assert!(err.contains("invalid auth"), "{err}");
-        assert!(err.contains("env:VAR"), "{err}");
+        let err = resolve_toml(bad_auth, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+        assert!(err.contains("unknown source \"keychain\""), "{err}");
     }
 
     #[test]
@@ -654,13 +633,7 @@ auth = "none"
 thinking = "effort"
 context_window = 1000
 "#;
-        let err = resolve_toml(
-            toml_text,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
+        let err = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("thinking `effort`"), "{err}");
         assert!(err.contains("anthropic-messages"), "{err}");
     }
@@ -675,7 +648,6 @@ context_window = 1000
                 ..Default::default()
             },
             env_of(&[]),
-            BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(cfg.model, "opus");
@@ -688,29 +660,16 @@ context_window = 1000
 [models.only]
 protocol = "openai-responses"
 base_url = "https://h"
-auth = "none"
 context_window = 1000
 "#;
-        let cfg = resolve_toml(
-            sole,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap();
+        let cfg = resolve_toml(sole, ConfigUserSettings::default(), env_of(&[])).unwrap();
         assert_eq!(cfg.model, "only");
     }
 
     #[test]
     fn missing_model_selection_errors_are_actionable() {
         // No models at all.
-        let err = resolve_toml(
-            "",
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
+        let err = resolve_toml("", ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("no models configured"), "{err}");
         assert!(err.contains("[models]"), "{err}");
 
@@ -719,22 +678,14 @@ context_window = 1000
 [models.a]
 protocol = "openai-responses"
 base_url = "https://h"
-auth = "none"
 context_window = 1000
 
 [models.b]
 protocol = "openai-responses"
 base_url = "https://h"
-auth = "none"
 context_window = 1000
 "#;
-        let err = resolve_toml(
-            two,
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap_err();
+        let err = resolve_toml(two, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("no model selected"), "{err}");
         assert!(err.contains("[a, b]"), "{err}");
 
@@ -746,27 +697,10 @@ context_window = 1000
                 ..Default::default()
             },
             env_of(&[]),
-            BTreeMap::new(),
         )
         .unwrap_err();
         assert!(err.contains("unknown model \"c\""), "{err}");
         assert!(err.contains("[a, b]"), "{err}");
-    }
-
-    #[test]
-    fn auth_ref_parse_forms() {
-        assert_eq!(
-            AuthRef::parse("env:XAI_API_KEY").unwrap(),
-            AuthRef::Env("XAI_API_KEY".into())
-        );
-        assert_eq!(
-            AuthRef::parse("token:corp").unwrap(),
-            AuthRef::Token("corp".into())
-        );
-        assert_eq!(AuthRef::parse("none").unwrap(), AuthRef::None);
-        assert!(AuthRef::parse("env:").is_err());
-        assert!(AuthRef::parse("token:").is_err());
-        assert!(AuthRef::parse("sk-raw-secret").is_err());
     }
 
     #[test]
@@ -777,7 +711,7 @@ context_window = 1000
             false,
             |_| parse_file_config_str(&crate::harness::example_config_toml()),
             || Ok(Vec::new()),
-            |_| Ok(BTreeMap::new()),
+            |_| Err("no files".into()),
         )
         .unwrap();
         assert_eq!(cfg.model, "grok-4.5-build");
@@ -785,21 +719,6 @@ context_window = 1000
         // Anthropic entries resolve but defer their missing credential.
         let err = cfg.models.get("claude-opus-4-8").unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
-    }
-
-    #[test]
-    fn tokens_path_sits_next_to_config() {
-        let cfg = resolve_toml(
-            CATALOG,
-            ConfigUserSettings {
-                harness_config_path: Some(PathBuf::from("/etc/myco/config.toml")),
-                ..Default::default()
-            },
-            env_of(&[]),
-            BTreeMap::new(),
-        )
-        .unwrap();
-        assert_eq!(cfg.tokens_path, PathBuf::from("/etc/myco/tokens.toml"));
     }
 
     #[test]
@@ -811,7 +730,6 @@ context_window = 1000
                 ..Default::default()
             },
             env_of(&[("NO_COLOR", "1")]),
-            BTreeMap::new(),
         )
         .unwrap();
         assert!(cfg.colors_enabled);
@@ -823,7 +741,6 @@ context_window = 1000
                 ..Default::default()
             },
             env_of(&[("CLICOLOR_FORCE", "1")]),
-            BTreeMap::new(),
         )
         .unwrap();
         assert!(!cfg.colors_enabled);
@@ -891,13 +808,13 @@ context_window = 1000
                 assert_eq!(p, Path::new("/tmp/h.toml"));
                 let mut file = parse_file_config_str(
                     "[models.m]\nprotocol = \"openai-responses\"\n\
-                     base_url = \"https://h\"\nauth = \"none\"\ncontext_window = 1000\n",
+                     base_url = \"https://h\"\ncontext_window = 1000\n",
                 )?;
                 file.attach_timeout_secs = 42;
                 Ok(file)
             },
             || Ok(vec!["devbox".into()]),
-            |_| Ok(BTreeMap::new()),
+            |_| Err("no files".into()),
         )
         .unwrap();
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
@@ -913,20 +830,9 @@ context_window = 1000
             false,
             |_| Err("invalid config TOML".into()),
             || Ok(Vec::new()),
-            |_| Ok(BTreeMap::new()),
+            |_| Err("no files".into()),
         )
         .unwrap_err();
         assert!(err.contains("invalid config TOML"));
-
-        let err = Config::resolve_with(
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            false,
-            |_| parse_file_config_str(""),
-            || Ok(Vec::new()),
-            |_| Err("bad tokens.toml".into()),
-        )
-        .unwrap_err();
-        assert!(err.contains("bad tokens.toml"));
     }
 }

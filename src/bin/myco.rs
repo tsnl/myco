@@ -912,8 +912,8 @@ Hosts:
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
   $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
-  and knobs (enable_subagent, attach_timeout_secs); credentials referenced as
-  env:VAR or token:NAME (tokens.toml next to config.toml).
+  and knobs (enable_subagent, attach_timeout_secs). Auth per entry: a literal
+  token string or a source table (env var / file / none); see --help overview.
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host. Use /hosts to list hosts and attach status
   (startup no longer prints them).

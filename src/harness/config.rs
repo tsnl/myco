@@ -25,7 +25,7 @@ use crate::generative_model::{Protocol, ThinkingMode};
 /// `~/.ssh/config`; models come from the `[gateways]` / `[models]` catalog
 /// here — myco ships no built-in models. Catalog *resolution* (auth, overlay,
 /// validation) lives in [`crate::config::Config`].
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct FileConfig {
     /// Default model **key** for the interactive CLI (`--model` overrides).
     /// Optional when exactly one `[models]` entry exists.
@@ -61,20 +61,21 @@ impl Default for FileConfig {
 }
 
 /// `[gateways.NAME]`: one place models are served from.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayEntry {
     /// Wire protocol: `"anthropic-messages"` or `"openai-responses"`.
     pub protocol: Protocol,
     /// Base URL including any path prefix, e.g. `https://openrouter.ai/api/v1`.
     pub base_url: String,
-    /// Auth mechanism: `"env:VAR"`, `"token:NAME"` (tokens.toml), or `"none"`.
-    pub auth: String,
+    /// Credential (see [`AuthEntry`]). Absent → no auth header.
+    #[serde(default)]
+    pub auth: Option<AuthEntry>,
 }
 
 /// `[models.KEY]`: one catalog entry. `gateway` pulls `protocol` / `base_url`
 /// / `auth` from a `[gateways.*]` entry; fields set here override it.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
     /// Name of a `[gateways.*]` entry supplying protocol / base_url / auth.
@@ -84,8 +85,9 @@ pub struct ModelEntry {
     pub protocol: Option<Protocol>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Credential override (see [`AuthEntry`]). Absent → the gateway's.
     #[serde(default)]
-    pub auth: Option<String>,
+    pub auth: Option<AuthEntry>,
     /// Wire id sent to the provider (request `model` field). Defaults to the
     /// catalog key, so it is only needed when they differ
     /// (e.g. key `kimi-k3` → `api_id = "moonshotai/kimi-k3"`).
@@ -101,6 +103,88 @@ pub struct ModelEntry {
     /// Per-generate output token cap (default 8192).
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+}
+
+/// The `auth` value on a gateway or model entry.
+///
+/// - a bare string is the credential itself: `auth = "sk-…"`
+/// - a table names a source:
+///   `auth = { source = "env", var_name = "OPENROUTER_API_KEY" }`,
+///   `auth = { source = "file", path = "~/.secrets/openrouter.token" }`
+///   (trimmed file contents), or `auth = { source = "none" }` (explicitly
+///   credential-less — useful to override a gateway's auth on one model).
+///
+/// Source *lookup* (env read, file read) happens at catalog resolution in
+/// [`crate::config::Config`]; failures there are deferred to model use.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "toml::Value")]
+pub enum AuthEntry {
+    /// The credential itself, inline.
+    Token(String),
+    /// Read the named environment variable.
+    Env { var_name: String },
+    /// Read (and trim) the file's contents; leading `~/` expands to home.
+    File { path: String },
+    /// Explicitly no credential (no auth header sent).
+    None,
+}
+
+impl TryFrom<toml::Value> for AuthEntry {
+    type Error = String;
+
+    // Hand-rolled rather than an untagged serde enum: untagged parse failures
+    // report "did not match any variant", which is useless in a config error.
+    fn try_from(v: toml::Value) -> Result<Self, String> {
+        const SHAPE: &str = "expected a string (the token itself) or a table like \
+                             { source = \"env\", var_name = \"NAME\" } / \
+                             { source = \"file\", path = \"…\" } / { source = \"none\" }";
+        let require_str = |t: &toml::Table, field: &str, source: &str| -> Result<String, String> {
+            t.get(field)
+                .and_then(|f| f.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("auth source \"{source}\" needs a string field `{field}`"))
+        };
+        let reject_extras = |t: &toml::Table, allowed: &[&str]| -> Result<(), String> {
+            for key in t.keys() {
+                if !allowed.contains(&key.as_str()) {
+                    return Err(format!("auth: unknown field `{key}`; {SHAPE}"));
+                }
+            }
+            Ok(())
+        };
+        match v {
+            toml::Value::String(s) => Ok(AuthEntry::Token(s)),
+            toml::Value::Table(t) => {
+                let source = t
+                    .get("source")
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| format!("auth table needs a string `source`; {SHAPE}"))?
+                    .to_string();
+                match source.as_str() {
+                    "env" => {
+                        reject_extras(&t, &["source", "var_name"])?;
+                        Ok(AuthEntry::Env {
+                            var_name: require_str(&t, "var_name", "env")?,
+                        })
+                    }
+                    "file" => {
+                        reject_extras(&t, &["source", "path"])?;
+                        Ok(AuthEntry::File {
+                            path: require_str(&t, "path", "file")?,
+                        })
+                    }
+                    "none" => {
+                        reject_extras(&t, &["source"])?;
+                        Ok(AuthEntry::None)
+                    }
+                    other => Err(format!(
+                        "auth: unknown source {other:?}; expected \"env\", \"file\", or \"none\""
+                    )),
+                }
+            }
+            other => Err(format!("auth: invalid type {}; {SHAPE}", other.type_str())),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -246,8 +330,10 @@ pub fn example_config_toml() -> String {
 #
 # Models are configured here — myco ships none built in. A [gateways.*] entry
 # holds protocol + base_url + auth; a [models.*] entry is a model key you pass
-# to --model. Auth: "env:VAR", "token:NAME" (NAME = key in a tokens.toml next
-# to this file), or "none".
+# to --model. The auth value is either the token itself ("sk-...") or a
+# source table: { source = "env", var_name = "NAME" },
+# { source = "file", path = "~/.secrets/x.token" }, { source = "none" }.
+# Omitting auth sends no auth header (fine for local servers).
 #
 # Top-level keys must come before the [gateways]/[models] tables (TOML).
 
@@ -262,17 +348,17 @@ attach_timeout_secs = 10
 [gateways.anthropic]
 protocol = "anthropic-messages"
 base_url = "https://api.anthropic.com"
-auth = "env:ANTHROPIC_API_KEY"
+auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 
 [gateways.xai]
 protocol = "openai-responses"
 base_url = "https://api.x.ai/v1"
-auth = "env:XAI_API_KEY"
+auth = { source = "env", var_name = "XAI_API_KEY" }
 
 [gateways.openrouter]
 protocol = "openai-responses"
 base_url = "https://openrouter.ai/api/v1"
-auth = "env:OPENROUTER_API_KEY"
+auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
 [models.claude-opus-4-8]
 gateway = "anthropic"
@@ -439,7 +525,7 @@ model = "kimi-k3"
 [gateways.openrouter]
 protocol = "openai-responses"
 base_url = "https://openrouter.ai/api/v1"
-auth = "env:OPENROUTER_API_KEY"
+auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
 [models.kimi-k3]
 gateway = "openrouter"
@@ -449,7 +535,6 @@ context_window = 1_000_000
 [models.local-qwen]
 protocol = "openai-responses"
 base_url = "http://localhost:11434/v1"
-auth = "none"
 thinking = "none"
 context_window = 32768
 "#;
@@ -457,7 +542,12 @@ context_window = 32768
         assert_eq!(file.model.as_deref(), Some("kimi-k3"));
         let gw = &file.gateways["openrouter"];
         assert_eq!(gw.protocol, Protocol::OpenAIResponses);
-        assert_eq!(gw.auth, "env:OPENROUTER_API_KEY");
+        assert_eq!(
+            gw.auth,
+            Some(AuthEntry::Env {
+                var_name: "OPENROUTER_API_KEY".into()
+            })
+        );
         let kimi = &file.models["kimi-k3"];
         assert_eq!(kimi.gateway.as_deref(), Some("openrouter"));
         assert_eq!(kimi.api_id.as_deref(), Some("moonshotai/kimi-k3"));
@@ -465,13 +555,72 @@ context_window = 32768
         assert_eq!(kimi.thinking, None);
         let local = &file.models["local-qwen"];
         assert_eq!(local.protocol, Some(Protocol::OpenAIResponses));
+        assert_eq!(local.auth, None);
         assert_eq!(local.thinking, Some(ThinkingMode::None));
+    }
+
+    #[test]
+    fn auth_entry_forms_parse() {
+        let text = r#"
+[models.a]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = "sk-literal-token"
+context_window = 1000
+
+[models.b]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = { source = "file", path = "~/.secrets/x.token" }
+context_window = 1000
+
+[models.c]
+protocol = "openai-responses"
+base_url = "https://h"
+auth = { source = "none" }
+context_window = 1000
+"#;
+        let file = parse_file_config_str(text).unwrap();
+        assert_eq!(
+            file.models["a"].auth,
+            Some(AuthEntry::Token("sk-literal-token".into()))
+        );
+        assert_eq!(
+            file.models["b"].auth,
+            Some(AuthEntry::File {
+                path: "~/.secrets/x.token".into()
+            })
+        );
+        assert_eq!(file.models["c"].auth, Some(AuthEntry::None));
+    }
+
+    #[test]
+    fn auth_entry_shape_errors_are_actionable() {
+        let bad_source = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                          auth = { source = \"keychain\" }\ncontext_window = 1000\n";
+        let err = parse_file_config_str(bad_source).unwrap_err();
+        assert!(err.contains("unknown source \"keychain\""), "{err}");
+
+        let missing_field = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                             auth = { source = \"env\" }\ncontext_window = 1000\n";
+        let err = parse_file_config_str(missing_field).unwrap_err();
+        assert!(err.contains("`var_name`"), "{err}");
+
+        let extra_field = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                           auth = { source = \"none\", token = \"x\" }\ncontext_window = 1000\n";
+        let err = parse_file_config_str(extra_field).unwrap_err();
+        assert!(err.contains("unknown field `token`"), "{err}");
+
+        let bad_type = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                        auth = 42\ncontext_window = 1000\n";
+        let err = parse_file_config_str(bad_type).unwrap_err();
+        assert!(err.contains("invalid type"), "{err}");
     }
 
     #[test]
     fn model_entry_requires_context_window() {
         let err = parse_file_config_str(
-            "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\nauth = \"none\"\n",
+            "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n",
         )
         .unwrap_err();
         assert!(err.contains("context_window"), "{err}");

@@ -143,8 +143,8 @@ impl std::fmt::Display for ModelSpec {
 pub struct CatalogModel {
     pub spec: ModelSpec,
     pub backend: BackendConfig,
-    /// Set when the auth mechanism did not resolve (env var unset, tokens.toml
-    /// key missing). Reported by [`ModelCatalog::get`] when the model is
+    /// Set when the auth source did not resolve (env var unset, auth file
+    /// unreadable). Reported by [`ModelCatalog::get`] when the model is
     /// actually used — configuring a model without its credential is fine
     /// until then.
     pub auth_error: Option<String>,
@@ -164,7 +164,7 @@ impl ModelCatalog {
 
     /// Look up a usable model. Errors are user-actionable: unknown keys list
     /// the configured catalog; entries with unresolved credentials report the
-    /// missing env var / tokens.toml key.
+    /// failing auth source (env var / file).
     pub fn get(&self, key: &str) -> Result<&CatalogModel, String> {
         let Some(entry) = self.entries.get(key) else {
             if self.entries.is_empty() {
