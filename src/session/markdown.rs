@@ -373,19 +373,17 @@ impl MarkdownRenderer {
     }
 
     /// A delimiter run ended; `next` is the char after it (`None` at stream
-    /// or line end). Emits the delimiters as content, then toggles styles —
-    /// so delimiters stay visible and a misread is purely cosmetic.
+    /// or line end). Delimiters stay visible and render inside the span they
+    /// delimit: an opening run styles before its delimiters, a closing run
+    /// after — so both ends of `**bold**` carry the same styling, and a
+    /// misread is purely cosmetic.
     fn resolve_run(&mut self, next: Option<char>) {
         let Some((rc, n)) = self.run.take() else {
             return;
         };
-        // Captured before the delimiters go out as content: the char in front
-        // of the run, for the flanking check below.
+        // The char in front of the run, for the flanking check below.
         let left_flank = self.prev_char.is_some_and(|c| !c.is_whitespace());
-        for _ in 0..n {
-            self.add_content_char(rc);
-        }
-        match rc {
+        let (bold, italic, code, opening) = match rc {
             '*' if n <= 3 => {
                 let (bold, italic) = match n {
                     1 => (false, true),
@@ -401,21 +399,39 @@ impl MarkdownRenderer {
                     left_flank
                 };
                 if allowed {
-                    if bold {
-                        self.bold = !self.bold;
-                    }
-                    if italic {
-                        self.italic = !self.italic;
-                    }
-                    self.emit_sgr();
+                    (bold, italic, false, opening)
+                } else {
+                    (false, false, false, false)
                 }
             }
-            '`' if n == 1 => {
-                self.code = !self.code;
-                self.emit_sgr();
-            }
-            _ => {}
+            '`' if n == 1 => (false, false, true, !self.code),
+            _ => (false, false, false, false),
+        };
+        if opening {
+            self.toggle_styles(bold, italic, code);
         }
+        for _ in 0..n {
+            self.add_content_char(rc);
+        }
+        if !opening {
+            self.toggle_styles(bold, italic, code);
+        }
+    }
+
+    fn toggle_styles(&mut self, bold: bool, italic: bool, code: bool) {
+        if !(bold || italic || code) {
+            return;
+        }
+        if bold {
+            self.bold = !self.bold;
+        }
+        if italic {
+            self.italic = !self.italic;
+        }
+        if code {
+            self.code = !self.code;
+        }
+        self.emit_sgr();
     }
 
     fn add_content_char(&mut self, c: char) {
@@ -669,12 +685,14 @@ mod tests {
 
     #[test]
     fn bold_and_italic_toggle_around_delimiters() {
-        assert_eq!(render("a **b** c", styled()), "a **\x1b[0;1mb**\x1b[0m c");
-        assert_eq!(render("x *it* y", styled()), "x *\x1b[0;3mit*\x1b[0m y");
+        // Delimiters render inside the span: styled the same at both ends.
+        assert_eq!(render("a **b** c", styled()), "a \x1b[0;1m**b**\x1b[0m c");
+        assert_eq!(render("x *it* y", styled()), "x \x1b[0;3m*it*\x1b[0m y");
         // *** toggles both on and both off.
-        let out = render("***both*** end", styled());
-        assert!(out.contains("\x1b[0;1;3m"), "{out:?}");
-        assert!(out.ends_with("\x1b[0m end"), "{out:?}");
+        assert_eq!(
+            render("***both*** end", styled()),
+            "\x1b[0;1;3m***both***\x1b[0m end"
+        );
     }
 
     #[test]
@@ -686,7 +704,7 @@ mod tests {
 
     #[test]
     fn inline_code_styles_and_shields_emphasis() {
-        assert_eq!(render("see `x`.", styled()), "see `\x1b[0;36mx`\x1b[0m.");
+        assert_eq!(render("see `x`.", styled()), "see \x1b[0;36m`x`\x1b[0m.");
         // Stars inside a code span are literal.
         let out = render("`a * b * c`", styled());
         assert!(!out.contains("[0;3m"), "{out:?}");
@@ -714,7 +732,7 @@ mod tests {
 
     #[test]
     fn finish_closes_open_styles() {
-        assert_eq!(render("**a", styled()), "**\x1b[0;1ma\x1b[0m");
+        assert_eq!(render("**a", styled()), "\x1b[0;1m**a\x1b[0m");
         // No markdown → no escapes at all.
         assert_eq!(render("hello", styled()), "hello");
     }
