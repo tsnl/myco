@@ -218,6 +218,10 @@ pub struct Config {
     /// `min(cap, terminal width)`, measured by the renderer per prompt so
     /// terminal resizes reflow.
     pub wrap_max: Option<usize>,
+    /// Automatic cursor repaints allowed (input re-echo, resize reflow):
+    /// stdout is a TTY and `TERM` is not `dumb`. Wrapping itself stays on for
+    /// dumb terminals — it only inserts newlines.
+    pub repaint_enabled: bool,
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
@@ -278,11 +282,13 @@ impl Config {
         harness.models = models.clone();
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
+        let repaint_enabled = stdout_is_tty && env("TERM").as_deref() != Some("dumb");
 
         Ok(Self {
             stdout_is_tty,
             colors_enabled,
             wrap_max,
+            repaint_enabled,
             harness_config_path,
             harness,
             models,
@@ -860,6 +866,27 @@ context_window = 1000
         // Wrap is TTY-only, like colors — a custom cap does not force it on pipes.
         assert_eq!(resolve_wrap(WrapMode::Columns(100), false), None);
         assert_eq!(resolve_wrap(WrapMode::Off, true), None);
+    }
+
+    #[test]
+    fn repaint_needs_a_tty_and_a_capable_term() {
+        let resolve = |tty: bool, env_pairs: &[(&str, &str)]| {
+            resolve_toml(
+                CATALOG,
+                ConfigUserSettings {
+                    stdout_is_tty: Some(tty),
+                    ..Default::default()
+                },
+                env_of(env_pairs),
+            )
+            .unwrap()
+            .repaint_enabled
+        };
+        assert!(resolve(true, &[("TERM", "xterm-256color")]));
+        assert!(resolve(true, &[]));
+        // Dumb terminals can't interpret cursor addressing; wrap itself stays.
+        assert!(!resolve(true, &[("TERM", "dumb")]));
+        assert!(!resolve(false, &[]));
     }
 
     #[test]

@@ -54,6 +54,10 @@ issues; hosts via `/hosts`.
 - On submit, the typed input echo is replaced with a word-wrapped copy
   (wrap-only, exactly as typed — the edit line is the one region the CLI
   repaints). Replay (`/resume`, Ctrl-L) wraps user turns the same way.
+- `TERM=dumb` disables the cursor repaints (input re-echo, resize reflow)
+  while plain wrapping stays on. Piped output gets neither: colors can be
+  forced into a pipe (`--color always` — escapes are strippable downstream),
+  wrap cannot (hard newlines would permanently alter the content).
 
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
 summary inside a unified ASSISTANT section; it is stored in session history for resume/Ctrl-L

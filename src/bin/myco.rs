@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{IsTerminal, Write},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -306,6 +306,7 @@ async fn run_interactive(args: Args) {
         ctrl_l,
         palette,
         app_config.wrap_max,
+        app_config.repaint_enabled,
         sink,
     )
     .await;
@@ -443,6 +444,7 @@ async fn run_repl(
     ctrl_l: Arc<AtomicBool>,
     mut palette: Palette,
     wrap_max: Option<usize>,
+    repaint: bool,
     sink: Arc<CliEventSink>,
 ) {
     let mut last_wrap = palette.wrap;
@@ -450,13 +452,14 @@ async fn run_repl(
         // Re-measure the terminal each prompt: after a resize, reflow the
         // whole dialog at the new width (same clear+reprint as Ctrl-L). This
         // is the safe point — never mid-stream, never while rustyline owns
-        // the terminal.
+        // the terminal. Dumb terminals skip the reprint (no cursor codes)
+        // but still pick up the new width for subsequent turns.
         let wrap = effective_wrap_width(wrap_max);
         if wrap != last_wrap {
             last_wrap = wrap;
             palette = palette.with_wrap(wrap);
             sink.set_wrap(wrap);
-            if !agent.history().is_empty() {
+            if repaint && !agent.history().is_empty() {
                 clear_and_reprint(agent, palette);
             }
         }
@@ -492,7 +495,7 @@ async fn run_repl(
         if input.is_empty() {
             continue;
         }
-        reprint_input_wrapped(&line, palette);
+        reprint_input_wrapped(&line, palette, repaint);
         if is_exit_command(&input) {
             break;
         }
@@ -551,11 +554,11 @@ fn input_echo_rows(line: &str, cols: usize) -> usize {
 /// The rustyline edit buffer is the one region the CLI repaints (the user can
 /// backspace while editing); this closes that exception at submit time —
 /// after this, output is append-only again. Wrap-only, no markdown styling:
-/// the user's words stay exactly as typed. Skipped when wrap is off, stdout
-/// is not a TTY, the echo may have scrolled off-screen, or wrapping would
-/// change nothing.
-fn reprint_input_wrapped(line: &str, palette: Palette) {
-    if palette.wrap.is_none() || !std::io::stdout().is_terminal() {
+/// the user's words stay exactly as typed. Skipped when wrap is off, repaint
+/// is unavailable (non-TTY stdout or `TERM=dumb`), the echo may have
+/// scrolled off-screen, or wrapping would change nothing.
+fn reprint_input_wrapped(line: &str, palette: Palette, repaint: bool) {
+    if palette.wrap.is_none() || !repaint {
         return;
     }
     let Some((cols, screen_rows)) = myco::config::detect_terminal_size() else {
