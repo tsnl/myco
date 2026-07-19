@@ -17,7 +17,7 @@ pub use compact::{
     CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
     select_tail,
 };
-pub use markdown::MarkdownRenderer;
+pub use markdown::{MarkdownRenderer, render_block};
 pub use transcript::{
     Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_assistant,
     format_tool_invocation, print_session_history, section_rule, truncate_display_string,

@@ -49,6 +49,9 @@ issues; hosts via `/hosts`.
   additive-only: delimiters stay visible, content bytes are never dropped.
   Fenced code blocks and 4-space-indented lines are never wrapped or styled.
   Piped output is never wrapped, so `myco | tee` stays byte-faithful.
+- On submit, the typed input echo is replaced with a word-wrapped copy
+  (wrap-only, exactly as typed — the edit line is the one region the CLI
+  repaints). Replay (`/resume`, Ctrl-L) wraps user turns the same way.
 
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
 summary inside a unified ASSISTANT section; it is stored in session history for resume/Ctrl-L
