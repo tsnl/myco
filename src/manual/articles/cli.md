@@ -41,6 +41,12 @@ print as a WARNING block after it; hosts via `/hosts`.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
+- Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
+  (`**bold**`, `*italic*`, `` `code` ``, `#` headers) when stdout is a TTY;
+  `--wrap auto|off|COLS` overrides (auto = min(80, terminal width)). Styling is
+  additive-only: delimiters stay visible, content bytes are never dropped.
+  Fenced code blocks and 4-space-indented lines are never wrapped or styled.
+  Piped output is never wrapped, so `myco | tee` stays byte-faithful.
 
 Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
 summary inside a unified ASSISTANT section; it is stored in session history for resume/Ctrl-L

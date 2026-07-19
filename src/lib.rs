@@ -9,7 +9,7 @@ pub mod session;
 pub mod text_search;
 pub mod tool_services;
 
-pub use config::{ColorMode, Config, ConfigUserSettings};
+pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode};
 pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, Harness, HarnessConfig, HostConfig, HostController, HostStatus,

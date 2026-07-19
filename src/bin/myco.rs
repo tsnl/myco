@@ -14,14 +14,14 @@ use myco::generative_model::{
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactOptions, Palette, RECENT_SESSION_LIMIT, SECTION_RULE, Session,
-    SessionListEntry, USER_RULE, compact_session, compact_subagent_prompt, format_session_detail,
+    ActiveSession, CompactOptions, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT, Session,
+    SessionListEntry, compact_session, compact_subagent_prompt, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
-    print_session_history, resolve_and_load_session, write_error_section,
+    print_session_history, resolve_and_load_session, section_rule, user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
-    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, TraceContext,
+    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, TraceContext, WrapMode,
     ensure_remote_ssh_identities, print_preflight_report, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
@@ -118,6 +118,11 @@ struct Args {
     /// and respects NO_COLOR / CLICOLOR_FORCE.
     #[arg(long, value_name = "WHEN", value_parser = parse_color_arg, default_value_t = ColorMode::Auto)]
     color: ColorMode,
+
+    /// Word-wrap prose (auto|off|COLS). Auto wraps at min(80, terminal width)
+    /// when stdout is a TTY; code blocks and piped output are never wrapped.
+    #[arg(long, value_name = "MODE", value_parser = parse_wrap_arg, default_value_t = WrapMode::Auto)]
+    wrap: WrapMode,
 }
 
 fn parse_effort_arg(s: &str) -> Result<Effort, String> {
@@ -125,6 +130,10 @@ fn parse_effort_arg(s: &str) -> Result<Effort, String> {
 }
 
 fn parse_color_arg(s: &str) -> Result<ColorMode, String> {
+    s.parse()
+}
+
+fn parse_wrap_arg(s: &str) -> Result<WrapMode, String> {
     s.parse()
 }
 
@@ -182,6 +191,7 @@ async fn run_interactive(args: Args) {
         harness_config_path: args.config.clone(),
         model: args.model.clone(),
         color: args.color,
+        wrap: args.wrap,
         ..Default::default()
     })
     .unwrap_or_else(|e| {
@@ -197,7 +207,7 @@ async fn run_interactive(args: Args) {
         }
     };
     let model_key = catalog_model.spec.key.clone();
-    let palette = Palette::colored(app_config.colors_enabled);
+    let palette = Palette::colored(app_config.colors_enabled).with_wrap(app_config.wrap_width);
 
     // Remote hosts use `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY). Unlock
     // passphrase-protected / security-key identities via the existing ssh-agent
@@ -417,7 +427,7 @@ async fn run_repl(
     palette: Palette,
 ) {
     loop {
-        println!("{}", palette.user(USER_RULE));
+        println!("{}", palette.user(&user_rule(palette.wrap)));
         let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
         println!("{}", palette.user(&format!("USER {used}/{max}")));
@@ -1215,9 +1225,12 @@ struct SinkState {
     need_blank: bool,
     /// True while streaming answer text (no blank lines between text deltas).
     in_text_stream: bool,
+    /// Streaming markdown/wrap renderer for the current answer-text paragraph.
+    text_md: Option<MarkdownRenderer>,
     /// Live thinking-summary line builder (UI only).
     thinking_line_open: bool,
     thinking_buf: String,
+    thinking_md: Option<MarkdownRenderer>,
 }
 
 impl CliEventSink {
@@ -1228,8 +1241,10 @@ impl CliEventSink {
                 assistant_open: false,
                 need_blank: false,
                 in_text_stream: false,
+                text_md: None,
                 thinking_line_open: false,
                 thinking_buf: String::new(),
+                thinking_md: None,
             }),
             palette,
         }
@@ -1260,7 +1275,10 @@ impl CliEventSink {
         self.finish_thinking_line();
         self.ensure_line_start();
         println!();
-        println!("{}", self.palette.assistant(SECTION_RULE));
+        println!(
+            "{}",
+            self.palette.assistant(&section_rule(self.palette.wrap))
+        );
         println!("{}", self.palette.assistant("ASSISTANT"));
         println!();
         self.with_state(|s| {
@@ -1287,21 +1305,48 @@ impl CliEventSink {
 
     /// Finish a live `Thinking: …` line with a trailing newline if one is open.
     fn finish_thinking_line(&self) {
-        let open = self.with_state(|s| s.thinking_line_open);
-        if !open {
-            return;
-        }
-        // Close the dim thinking style opened at line start.
-        println!("{}", self.palette.reset());
-        self.with_state(|s| {
+        let tail = self.with_state(|s| {
+            if !s.thinking_line_open {
+                return None;
+            }
             s.thinking_line_open = false;
             s.thinking_buf.clear();
             s.at_line_start = true;
             s.in_text_stream = false;
             // Thinking is a finished paragraph for spacing purposes.
             s.need_blank = true;
+            Some(
+                s.thinking_md
+                    .take()
+                    .map(|mut r| r.finish())
+                    .unwrap_or_default(),
+            )
         });
-        let _ = std::io::stdout().flush();
+        if let Some(tail) = tail {
+            // Flush the renderer and close the dim thinking style it opened.
+            println!("{tail}");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    /// Close the current answer-text stream: flush its renderer, mark the
+    /// paragraph finished.
+    fn end_text_stream(&self) {
+        let tail = self.with_state(|s| {
+            if !s.in_text_stream {
+                return None;
+            }
+            s.in_text_stream = false;
+            s.need_blank = true;
+            Some(s.text_md.take().map(|mut r| r.finish()).unwrap_or_default())
+        });
+        if let Some(tail) = tail
+            && !tail.is_empty()
+        {
+            print!("{tail}");
+            self.with_state(|s| s.at_line_start = tail.ends_with('\n'));
+            let _ = std::io::stdout().flush();
+        }
     }
 }
 
@@ -1320,27 +1365,38 @@ impl EventSink for CliEventSink {
                 let starting = self.with_state(|s| !s.thinking_line_open);
                 if starting {
                     // End answer-text stream so thinking is its own paragraph.
-                    self.with_state(|s| {
-                        if s.in_text_stream {
-                            s.in_text_stream = false;
-                            s.need_blank = true;
-                        }
-                    });
+                    self.end_text_stream();
                     self.separate_paragraph_if_needed();
                     self.ensure_line_start();
-                    self.with_state(|s| {
+                    let rendered = self.with_state(|s| {
                         s.thinking_line_open = true;
                         s.thinking_buf = text.clone();
-                        s.in_text_stream = false;
+                        // Dim base stays open across deltas; finish_thinking_line resets.
+                        let r = s
+                            .thinking_md
+                            .insert(MarkdownRenderer::with_base(self.palette, "2"));
+                        let mut out = r.feed("Thinking: ");
+                        out.push_str(&r.feed(&text));
+                        out
                     });
-                    // Dim stays open across deltas; finish_thinking_line resets.
-                    print!("{}Thinking: {text}", self.palette.thinking_on());
+                    print!("{rendered}");
                 } else {
-                    self.with_state(|s| s.thinking_buf.push_str(&text));
-                    print!("{text}");
+                    let rendered = self.with_state(|s| {
+                        s.thinking_buf.push_str(&text);
+                        s.thinking_md
+                            .as_mut()
+                            .map(|r| r.feed(&text))
+                            .unwrap_or_default()
+                    });
+                    print!("{rendered}");
                 }
                 let _ = std::io::stdout().flush();
-                self.with_state(|s| s.at_line_start = false);
+                self.with_state(|s| {
+                    s.at_line_start = s
+                        .thinking_md
+                        .as_ref()
+                        .is_some_and(|r| r.ends_at_line_start());
+                });
             }
             AgentEvent::TextDelta {
                 text,
@@ -1357,19 +1413,26 @@ impl EventSink for CliEventSink {
                 if start_new {
                     self.separate_paragraph_if_needed();
                 }
-                self.with_state(|s| {
+                let palette = self.palette;
+                let rendered = self.with_state(|s| {
                     s.in_text_stream = true;
                     s.need_blank = false;
+                    s.text_md
+                        .get_or_insert_with(|| MarkdownRenderer::new(palette))
+                        .feed(&text)
                 });
-                print!("{text}");
+                print!("{rendered}");
                 let _ = std::io::stdout().flush();
-                self.with_state(|s| s.at_line_start = text.ends_with('\n'));
+                self.with_state(|s| {
+                    s.at_line_start = s.text_md.as_ref().is_some_and(|r| r.ends_at_line_start());
+                });
             }
             AgentEvent::TurnFinished {
                 context: TraceContext { depth: 0, .. },
                 ..
             } => {
                 self.finish_thinking_line();
+                self.end_text_stream();
                 self.ensure_line_start();
                 // Close ASSISTANT for the next user turn (REPL prints USER next).
                 self.with_state(|s| {
@@ -1383,14 +1446,9 @@ impl EventSink for CliEventSink {
                 tool_use,
                 context: TraceContext { depth: 0, .. },
             } => {
-                // End any open text stream so the tool is its own paragraph.
+                // End any open text/thinking stream so the tool is its own paragraph.
                 self.finish_thinking_line();
-                self.with_state(|s| {
-                    if s.in_text_stream {
-                        s.in_text_stream = false;
-                        s.need_blank = true;
-                    }
-                });
+                self.end_text_stream();
                 self.ensure_assistant();
                 self.separate_paragraph_if_needed();
                 print!(
