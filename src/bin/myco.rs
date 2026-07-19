@@ -15,7 +15,7 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, compact_session, compact_subagent_prompt, format_session_detail,
+    SessionListEntry, banner_rule, compact_session, compact_subagent_prompt, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
     print_session_history, resolve_and_load_session, section_rule, user_rule, write_error_section,
 };
@@ -417,7 +417,7 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
     editor
 }
 
-/// Write the startup banner: thin rule, MYCO title, model/session lines, and
+/// Write the startup banner: heavy rule, MYCO title, model/session lines, and
 /// the two hints worth surfacing before the first prompt (/help, newline chord).
 fn write_startup_banner(
     out: &mut impl Write,
@@ -425,7 +425,7 @@ fn write_startup_banner(
     session_label: &str,
     palette: Palette,
 ) -> std::io::Result<()> {
-    writeln!(out, "{}", palette.banner(&section_rule(palette.wrap)))?;
+    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
     writeln!(out, "{}", palette.banner("MYCO"))?;
     writeln!(out)?;
     writeln!(out, "Model: {model_key}")?;
@@ -1560,7 +1560,7 @@ mod tests {
             "{rule}\nMYCO\n\nModel: hy3-free\n\
              Session: 993d14889c414aab81963843cccf8090 \"greeting\"\n\n\
              /help for commands\n\nAlt-Enter or Ctrl-J for newline\n",
-            rule = section_rule(None)
+            rule = banner_rule(None)
         );
         assert_eq!(text, expected);
     }

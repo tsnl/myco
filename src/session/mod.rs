@@ -19,10 +19,10 @@ pub use compact::{
 };
 pub use markdown::MarkdownRenderer;
 pub use transcript::{
-    Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, ensure_assistant,
-    format_tool_invocation, print_session_history, section_rule, truncate_display_string,
-    truncate_json_strings, user_rule, write_assistant_open, write_block, write_error_open,
-    write_error_section, write_session_history, write_warning_open,
+    BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, banner_rule,
+    ensure_assistant, format_tool_invocation, print_session_history, section_rule,
+    truncate_display_string, truncate_json_strings, user_rule, write_assistant_open, write_block,
+    write_error_open, write_error_section, write_session_history, write_warning_open,
 };
 
 use std::fs;

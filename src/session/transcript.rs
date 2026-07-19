@@ -11,6 +11,11 @@ use std::io::Write;
 use super::markdown::{render_block, render_block_with_base};
 use crate::generative_model::{Content, Message};
 
+/// Heavy 72-col rule above the startup banner — the heaviest rule in the UI
+/// (banner `━` > user `═` > section `─`), so launch stands out even uncolored.
+pub const BANNER_RULE: &str =
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+
 /// Double-line 72-col rule before each user turn (UTF-8 box drawing, no ANSI).
 pub const USER_RULE: &str =
     "════════════════════════════════════════════════════════════════════════";
@@ -21,6 +26,11 @@ pub const SECTION_RULE: &str =
 
 /// Rule width when wrap is off (matches [`USER_RULE`] / [`SECTION_RULE`]).
 pub const DEFAULT_RULE_WIDTH: usize = 72;
+
+/// Startup banner rule sized to the wrap width (default-width when wrap is off).
+pub fn banner_rule(wrap: Option<usize>) -> String {
+    "━".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
+}
 
 /// USER rule sized to the wrap width (default-width when wrap is off).
 pub fn user_rule(wrap: Option<usize>) -> String {
@@ -484,6 +494,7 @@ mod tests {
             "{rendered}"
         );
         // Rule fns match the legacy fixed rules when wrap is off.
+        assert_eq!(banner_rule(None), BANNER_RULE);
         assert_eq!(user_rule(None), USER_RULE);
         assert_eq!(section_rule(None), SECTION_RULE);
     }
