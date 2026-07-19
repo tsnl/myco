@@ -14,16 +14,16 @@ use myco::generative_model::{
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactOptions, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, banner_rule, compact_session, compact_subagent_prompt, format_session_detail,
-    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
-    print_session_history, render_block, resolve_and_load_session, section_rule, user_rule,
-    write_error_section,
+    ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
+    Session, SessionListEntry, banner_rule, compact_session, compact_subagent_prompt,
+    format_session_detail, format_session_list_line, format_tool_invocation, link_compact_pair,
+    list_sessions, print_session_history, render_block, resolve_and_load_session, section_rule,
+    user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
     NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, print_startup_preflight, prompts, uuid_simple_hex,
+    TraceContext, WrapMode, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -229,6 +229,15 @@ async fn run_interactive(args: Args) {
     };
     let active_session = ActiveSession::new(initial_session);
 
+    // Plain-text console mirror ({id}.console), TTY-gated like colors/wrap. It
+    // resolves the current session id per append, so /new, /compact, /resume
+    // redirect it automatically. The agent can read it to see exactly what the
+    // user saw, including live-only WARNING/ERROR sections.
+    let console = Arc::new(ConsoleLog::new(
+        active_session.clone(),
+        app_config.stdout_is_tty,
+    ));
+
     let session_tool =
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
@@ -270,7 +279,7 @@ async fn run_interactive(args: Args) {
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
-    let sink = Arc::new(CliEventSink::new(palette));
+    let sink = Arc::new(CliEventSink::new(palette, console.clone()));
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_history(active_session.snapshot().messages.clone());
@@ -285,18 +294,19 @@ async fn run_interactive(args: Args) {
     });
     // Startup chrome: headed banner block (rule, MYCO, model/session, key
     // hints). Hosts via /hosts, effort via /effort, config path via
-    // attach-failure hints.
-    {
-        let mut out = std::io::stdout();
-        let _ = write_startup_banner(&mut out, &model_key, &session_label, palette);
-        let _ = out.flush();
-    }
+    // attach-failure hints. Rendered to a buffer so the console mirror gets
+    // the same bytes (stripped) the terminal does.
+    let mut chrome = Vec::new();
+    let _ = write_startup_banner(&mut chrome, &model_key, &session_label, palette);
     // Preflight problems (missing executables, ssh-agent) open one WARNING
     // block after the banner, before the first USER block; happy path silent.
-    print_startup_preflight(&preflight, palette);
+    let _ = preflight.write_warning_section(&mut chrome, palette);
     // Blank line closes the startup chrome before the first USER rule
     // (or the resumed-history replay).
-    println!();
+    chrome.push(b'\n');
+    emit_mirrored(&console, &chrome);
+    // The resumed-history replay is not mirrored: {id}.console already holds it
+    // from the run(s) that produced it (the file is opened for append).
     if resuming {
         print_session_history(agent.history(), palette);
     }
@@ -314,6 +324,7 @@ async fn run_interactive(args: Args) {
         app_config.wrap_max,
         app_config.repaint_enabled,
         sink,
+        console,
     )
     .await;
 
@@ -472,6 +483,7 @@ async fn run_repl(
     wrap_max: Option<usize>,
     repaint: bool,
     sink: Arc<CliEventSink>,
+    console: Arc<ConsoleLog>,
 ) {
     let mut last_wrap = palette.wrap;
     loop {
@@ -479,7 +491,8 @@ async fn run_repl(
         // whole dialog at the new width (same clear+reprint as Ctrl-L). This
         // is the safe point — never mid-stream, never while rustyline owns
         // the terminal. Dumb terminals skip the reprint (no cursor codes)
-        // but still pick up the new width for subsequent turns.
+        // but still pick up the new width for subsequent turns. The reflow is
+        // a redraw, not new content, so it is not mirrored to the console.
         let wrap = effective_wrap_width(wrap_max);
         if wrap != last_wrap {
             last_wrap = wrap;
@@ -489,11 +502,13 @@ async fn run_repl(
                 clear_and_reprint(agent, palette);
             }
         }
-        println!("{}", palette.user(&user_rule(palette.wrap)));
         let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
-        println!("{}", palette.user(&format!("USER {used}/{max}")));
-        println!();
+        let mut header = Vec::new();
+        let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
+        let _ = writeln!(header, "{}", palette.user(&format!("USER {used}/{max}")));
+        let _ = writeln!(header);
+        emit_mirrored(&console, &header);
         // No "> " prefix; body is typed on the line after the USER header.
         // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
         // submits the whole buffer to the agent.
@@ -522,6 +537,14 @@ async fn run_repl(
             continue;
         }
         reprint_input_wrapped(&line, palette, repaint);
+        // Mirror the submitted line once (wrap-only, as shown). rustyline echoed
+        // it to the terminal but not to us; the re-echo above only moves the
+        // cursor, so the console needs the logical text here.
+        console.append(&render_block(
+            &line,
+            Palette::plain().with_wrap(palette.wrap),
+        ));
+        console.append("\n");
         if is_exit_command(&input) {
             break;
         }
@@ -552,8 +575,18 @@ async fn run_repl(
             continue;
         }
 
-        run_user_turn(agent, session, editor, input, palette).await;
+        run_user_turn(agent, session, editor, input, palette, &console).await;
     }
+}
+
+/// Write rendered bytes to stdout and to the console mirror (the mirror strips
+/// ANSI). Used for buffered blocks (banner, preflight, ERROR); the streaming
+/// sink and REPL headers mirror their own `print!`s directly.
+fn emit_mirrored(console: &ConsoleLog, rendered: &[u8]) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(rendered);
+    let _ = out.flush();
+    console.append(&String::from_utf8_lossy(rendered));
 }
 
 /// Effective wrap width right now: the configured cap bounded by the measured
@@ -609,6 +642,7 @@ async fn run_user_turn(
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     input: String,
     palette: Palette,
+    console: &ConsoleLog,
 ) {
     let _ = editor.add_history_entry(&input);
     if let Err(e) = save_readline_history(editor, session) {
@@ -636,18 +670,25 @@ async fn run_user_turn(
         .interact(vec![Content::Text { text: input }], cancel)
         .await
     {
-        Ok(_) => println!(),
+        Ok(_) => {
+            println!();
+            console.append("\n");
+        }
         Err(myco::AgentInteractionError::Cancelled) => {
             println!();
             println!("(cancelled)");
+            console.append("\n(cancelled)\n");
         }
         Err(e) => {
             // Close any open ASSISTANT stream state and show a headed ERROR section.
             // Generate failures (context overflow, provider errors) are live-only —
             // not stored in session history — so resume/Ctrl-L will not replay them.
-            let _ = write_error_section(&mut std::io::stdout(), &e.to_string(), palette);
-            let _ = std::io::stdout().flush();
+            // Buffered so the console mirror captures this live-only section too.
+            let mut block = Vec::new();
+            let _ = write_error_section(&mut block, &e.to_string(), palette);
+            emit_mirrored(console, &block);
             println!();
+            console.append("\n");
         }
     }
 
@@ -1327,6 +1368,9 @@ struct CliEventSink {
     /// Behind a lock so the REPL can update the wrap width after a terminal
     /// resize; renderers created afterwards pick it up.
     palette: Mutex<Palette>,
+    /// Plain-text mirror: every byte this sink prints is also appended here
+    /// (ANSI stripped) so the agent can read the exact ASSISTANT transcript.
+    console: Arc<ConsoleLog>,
 }
 
 struct SinkState {
@@ -1346,7 +1390,7 @@ struct SinkState {
 }
 
 impl CliEventSink {
-    fn new(palette: Palette) -> Self {
+    fn new(palette: Palette, console: Arc<ConsoleLog>) -> Self {
         Self {
             state: Mutex::new(SinkState {
                 at_line_start: true,
@@ -1359,11 +1403,31 @@ impl CliEventSink {
                 thinking_md: None,
             }),
             palette: Mutex::new(palette),
+            console,
         }
     }
 
     fn palette(&self) -> Palette {
         *self.palette.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `print!` to stdout and mirror the same bytes to the console log.
+    fn out(&self, s: &str) {
+        print!("{s}");
+        self.console.append(s);
+    }
+
+    /// `println!` to stdout and mirror the line (with its newline) to the log.
+    fn outln(&self, s: &str) {
+        println!("{s}");
+        self.console.append(s);
+        self.console.append("\n");
+    }
+
+    /// Bare `println!()` mirrored as a newline.
+    fn outln_blank(&self) {
+        println!();
+        self.console.append("\n");
     }
 
     /// Update the wrap width mid-session (terminal resize). An in-flight
@@ -1381,12 +1445,14 @@ impl CliEventSink {
     }
 
     fn ensure_line_start(&self) {
-        self.with_state(|s| {
-            if !s.at_line_start {
-                println!();
-                s.at_line_start = true;
-            }
+        let need_nl = self.with_state(|s| {
+            let need = !s.at_line_start;
+            s.at_line_start = true;
+            need
         });
+        if need_nl {
+            self.outln_blank();
+        }
     }
 
     /// Open ASSISTANT once per agent turn (multi-step tool loops stay in one section).
@@ -1397,11 +1463,11 @@ impl CliEventSink {
         }
         self.finish_thinking_line();
         self.ensure_line_start();
-        println!();
+        self.outln_blank();
         let palette = self.palette();
-        println!("{}", palette.assistant(&section_rule(palette.wrap)));
-        println!("{}", palette.assistant("ASSISTANT"));
-        println!();
+        self.outln(&palette.assistant(&section_rule(palette.wrap)));
+        self.outln(&palette.assistant("ASSISTANT"));
+        self.outln_blank();
         self.with_state(|s| {
             s.at_line_start = true;
             s.assistant_open = true;
@@ -1415,7 +1481,7 @@ impl CliEventSink {
         let need_blank = self.with_state(|s| s.need_blank);
         if need_blank {
             self.ensure_line_start();
-            println!();
+            self.outln_blank();
             self.with_state(|s| s.at_line_start = true);
         }
     }
@@ -1445,7 +1511,7 @@ impl CliEventSink {
         });
         if let Some(tail) = tail {
             // Flush the renderer and close the dim thinking style it opened.
-            println!("{tail}");
+            self.outln(&tail);
             let _ = std::io::stdout().flush();
         }
     }
@@ -1464,7 +1530,7 @@ impl CliEventSink {
         if let Some(tail) = tail
             && !tail.is_empty()
         {
-            print!("{tail}");
+            self.out(&tail);
             self.with_state(|s| s.at_line_start = tail.ends_with('\n'));
             let _ = std::io::stdout().flush();
         }
@@ -1501,7 +1567,7 @@ impl EventSink for CliEventSink {
                         out.push_str(&r.feed(&text));
                         out
                     });
-                    print!("{rendered}");
+                    self.out(&rendered);
                 } else {
                     let rendered = self.with_state(|s| {
                         s.thinking_buf.push_str(&text);
@@ -1510,7 +1576,7 @@ impl EventSink for CliEventSink {
                             .map(|r| r.feed(&text))
                             .unwrap_or_default()
                     });
-                    print!("{rendered}");
+                    self.out(&rendered);
                 }
                 let _ = std::io::stdout().flush();
                 self.with_state(|s| {
@@ -1543,7 +1609,7 @@ impl EventSink for CliEventSink {
                         .get_or_insert_with(|| MarkdownRenderer::new(palette))
                         .feed(&text)
                 });
-                print!("{rendered}");
+                self.out(&rendered);
                 let _ = std::io::stdout().flush();
                 self.with_state(|s| {
                     s.at_line_start = s.text_md.as_ref().is_some_and(|r| r.ends_at_line_start());
@@ -1573,10 +1639,11 @@ impl EventSink for CliEventSink {
                 self.end_text_stream();
                 self.ensure_assistant();
                 self.separate_paragraph_if_needed();
-                print!(
-                    "{}",
-                    format_tool_invocation(&tool_use.name, &tool_use.input, self.palette())
-                );
+                self.out(&format_tool_invocation(
+                    &tool_use.name,
+                    &tool_use.input,
+                    self.palette(),
+                ));
                 self.with_state(|s| {
                     s.at_line_start = true;
                     s.in_text_stream = false;

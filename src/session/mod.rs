@@ -6,6 +6,7 @@
 
 mod agent;
 mod compact;
+mod console_log;
 mod markdown;
 mod transcript;
 
@@ -17,6 +18,7 @@ pub use compact::{
     CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
     select_tail,
 };
+pub use console_log::ConsoleLog;
 pub use markdown::{MarkdownRenderer, render_block};
 pub use transcript::{
     BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, banner_rule,
@@ -314,6 +316,12 @@ impl Session {
 
     pub fn history_path(&self) -> PathBuf {
         session_file_path(&self.id, "history")
+    }
+
+    /// Sibling plain-text console mirror written live by the interactive CLI
+    /// ([`ConsoleLog`]): `{id}.console`.
+    pub fn console_path(&self) -> PathBuf {
+        session_file_path(&self.id, "console")
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -729,6 +737,10 @@ pub fn format_session_detail(session: &Session) -> String {
     let mut out = String::new();
     out.push_str(&format!("id:        {}\n", session.id));
     out.push_str(&format!("path:      {}\n", session.json_path().display()));
+    let console = session.console_path();
+    if console.exists() {
+        out.push_str(&format!("console:   {}\n", console.display()));
+    }
     out.push_str(&format!("created:   {}\n", session.created_at.to_rfc3339()));
     out.push_str(&format!("updated:   {}\n", session.updated_at.to_rfc3339()));
     out.push_str(&format!("model:     {}\n", session.model));
