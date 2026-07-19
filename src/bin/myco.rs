@@ -417,7 +417,7 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
     editor
 }
 
-/// Write the startup banner: heavy rule, MYCO title, model/session lines, and
+/// Write the startup banner: full-block rule, MYCO title, model/session lines, and
 /// the two hints worth surfacing before the first prompt (/help, newline chord).
 fn write_startup_banner(
     out: &mut impl Write,
