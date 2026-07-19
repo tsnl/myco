@@ -322,7 +322,11 @@ impl BashService {
                 ))
             }
             Outcome::Status(status) => {
-                drain_capture(stdout_task, stderr_task).await;
+                // `all_eof` is false when a reader had to be aborted at the
+                // grace: the leader exited but a descendant kept stdout/stderr
+                // open, so output it produced past the grace was dropped. The
+                // result would otherwise look complete — flag it honestly.
+                let all_eof = drain_capture(stdout_task, stderr_task).await;
                 let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
                 match status {
@@ -330,11 +334,12 @@ impl BashService {
                         "Exit code: {:?}\n\
                          Termination signal: {:?}\n\
                          stdout:\n{}\n\
-                         stderr:\n{}",
+                         stderr:\n{}{}",
                         status.code(),
                         status.signal(),
                         truncate_middle_lossy(&out, max_bytes),
                         truncate_middle_lossy(&err, max_bytes),
+                        incomplete_capture_note(all_eof),
                     )),
                     Err(error) => generative_model::ToolResult::err(format!(
                         "Error executing command: {error}"
@@ -966,18 +971,41 @@ fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
 /// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
 /// with the child already dead, so anything still holding the pipes open is a
 /// stray grandchild whose future output we deliberately give up on.
+///
+/// Returns `true` when both readers reached EOF within the grace (clean,
+/// complete capture) and `false` when either had to be aborted — i.e. a
+/// descendant still held the pipe and its later output was dropped. Callers use
+/// this to flag otherwise-complete-looking output as truncated.
 async fn drain_capture(
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
-) {
+) -> bool {
+    let mut all_eof = true;
     for mut task in [stdout_task, stderr_task] {
         if tokio::time::timeout(EXEC_DRAIN_GRACE, &mut task)
             .await
             .is_err()
         {
             task.abort();
+            all_eof = false;
         }
     }
+    all_eof
+}
+
+/// Trailing note when exec had to abandon a still-open pipe (`all_eof == false`).
+/// Empty when capture was clean, so it appends nothing to the common case.
+fn incomplete_capture_note(all_eof: bool) -> String {
+    if all_eof {
+        return String::new();
+    }
+    format!(
+        "\n(note: a child process kept stdout/stderr open after the command exited; \
+         any output it produced more than {grace_ms}ms later was not captured. For \
+         background work use action \"start\" (a live session), or redirect to a file \
+         and read it back.)\n",
+        grace_ms = EXEC_DRAIN_GRACE.as_millis(),
+    )
 }
 
 fn spawn_reader<R>(mut reader: R, kind: StreamKind, shared: Arc<SessionShared>)
@@ -1995,6 +2023,35 @@ mod tests {
         );
         assert!(text.contains("hi"), "partial output must survive: {text}");
         assert!(text.contains("Exit code: Some(0)"), "{text}");
+        // The descendant held the pipe past the drain grace, so capture is
+        // incomplete — say so instead of returning deceptively-complete output.
+        assert!(
+            text.contains("not captured") && text.contains("start"),
+            "expected an incomplete-capture note steering to `start`: {text}"
+        );
+    }
+
+    /// The incomplete-capture note fires only when a descendant actually held
+    /// the pipe open past exit: a plain foreground command that reaches EOF
+    /// cleanly must never be flagged (no false "output was dropped" scares).
+    #[tokio::test]
+    async fn exec_clean_capture_has_no_incomplete_note() {
+        let harness = harness();
+        let result = dispatch_json(
+            harness,
+            json!({
+                "action": "exec",
+                "command": "echo alpha; echo beta 1>&2",
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("alpha") && text.contains("beta"), "{text}");
+        assert!(
+            !text.contains("not captured"),
+            "clean foreground capture must not carry an incomplete-capture note: {text}"
+        );
     }
 
     /// Exec children get a null stdin. Inheriting ours is never right: in
