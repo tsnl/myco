@@ -173,6 +173,11 @@ When tools fail or the user asks why something is broken, investigate with tools
      platform** (release asset — weights already embedded), or **build on that host**
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
+   - Startup checks expected executables on the **agent** machine (`bash`,
+     `lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
+     reports missing ones in the startup WARNING block — the user must install
+     them and restart myco. Remote hosts report missing programs as tool
+     errors at call time.
    - If auth fails with BatchMode: check `ssh-add -l` and the startup ssh-agent
      preflight (silent when clean; problems open a WARNING block before the first
      USER block).

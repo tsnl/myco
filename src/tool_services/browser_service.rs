@@ -13,9 +13,10 @@ use tokio::process::Command;
 use url::Url;
 
 use crate::core::{Async, CancelToken};
+use crate::external_command::LYNX;
 use crate::generative_model::{self, ToolResult};
 
-use super::{HostDispatchContext, ToolService};
+use super::{HostDispatchContext, ToolService, kill_process_group};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -115,7 +116,7 @@ impl BrowserService {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        let lynx = resolve_lynx_bin().ok_or_else(|| {
+        let lynx = LYNX.resolve().ok_or_else(|| {
             "lynx not found on PATH. Install: `brew install lynx` (macOS) or \
              `apt install lynx` / `dnf install lynx` (Linux)."
                 .to_string()
@@ -141,7 +142,7 @@ impl BrowserService {
                 "lynx not found on PATH. Install: `brew install lynx` or `apt install lynx`."
                     .to_string()
             } else {
-                format!("failed to spawn lynx ({lynx}): {e}")
+                format!("failed to spawn lynx ({}): {e}", lynx.display())
             }
         })?;
 
@@ -227,7 +228,7 @@ impl BrowserService {
                         }
                     ));
                 }
-                let mut out = format!("url: {url}\nlynx: {lynx}\n");
+                let mut out = format!("url: {url}\nlynx: {}\n", lynx.display());
                 if !status.success() {
                     out.push_str(&format!(
                         "exit: {}\n",
@@ -265,36 +266,6 @@ fn parse_http_url(raw: &str) -> Result<Url, String> {
     }
 }
 
-fn resolve_lynx_bin() -> Option<String> {
-    if let Ok(p) = std::env::var("MYCO_LYNX")
-        && !p.is_empty()
-        && std::path::Path::new(&p).is_file()
-    {
-        return Some(p);
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = std::path::Path::new(dir).join("lynx");
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-    for p in [
-        "/opt/homebrew/bin/lynx",
-        "/usr/local/bin/lynx",
-        "/usr/bin/lynx",
-    ] {
-        if std::path::Path::new(p).is_file() {
-            return Some(p.to_string());
-        }
-    }
-    None
-}
-
 fn truncate_bytes(text: &str, max_bytes: usize) -> String {
     let b = text.as_bytes();
     if b.len() <= max_bytes {
@@ -310,17 +281,6 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> String {
         b.len()
     ));
     out
-}
-
-fn kill_process_group(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[derive(
@@ -440,7 +400,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "network + lynx"]
     async fn live_dump_example_com() {
-        if resolve_lynx_bin().is_none() {
+        if LYNX.resolve().is_none() {
             eprintln!("skip: lynx not installed");
             return;
         }

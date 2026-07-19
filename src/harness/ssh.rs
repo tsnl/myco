@@ -11,14 +11,16 @@
 //! - `ssh -G` IdentityFile discovery
 //! - existing-agent queries (`ssh-add -l`) and interactive unlock (`ssh-add`,
 //!   `--apple-load-keychain` / `--apple-use-keychain` on macOS)
-//! - CLI-facing preflight report + WARNING-block printing (silent when clean)
+//! - CLI-facing preflight report + WARNING-section body (silent when clean;
+//!   printed via the combined [`crate::harness::StartupPreflight`] block)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use super::HostConfig;
+use crate::external_command::{SSH, SSH_ADD, SSH_KEYGEN};
 use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
@@ -45,6 +47,12 @@ impl SshAgentPreflightReport {
         self.still_missing.is_empty()
     }
 
+    /// The report warrants a WARNING body: SSH hosts exist and the agent is
+    /// unreachable or keys are still missing.
+    pub fn has_problems(&self) -> bool {
+        self.had_ssh_hosts && !(self.agent_ok && self.is_clean())
+    }
+
     /// Write preflight problems as a WARNING section (thin rule + header +
     /// body) to `out` — stdout live, or any buffer in tests. Writes nothing on
     /// the happy path (no SSH hosts, or agent reachable with no keys missing).
@@ -54,10 +62,16 @@ impl SshAgentPreflightReport {
         out: &mut impl Write,
         palette: Palette,
     ) -> std::io::Result<()> {
-        if !self.had_ssh_hosts || (self.agent_ok && self.is_clean()) {
+        if !self.has_problems() {
             return Ok(());
         }
         write_warning_open(out, palette)?;
+        self.write_body(out)
+    }
+
+    /// Body lines only (no rule/header) — shared with the combined startup
+    /// preflight block ([`crate::harness::StartupPreflight`]).
+    pub(crate) fn write_body(&self, out: &mut impl Write) -> std::io::Result<()> {
         if !self.agent_ok {
             writeln!(out, "ssh-agent: {}", self.agent_status)?;
         }
@@ -263,22 +277,12 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
     report
 }
 
-/// Print preflight problems as a WARNING block on stdout, after the startup
-/// banner and before the first USER block. Happy path (agent reachable, no
-/// keys missing) prints nothing.
-/// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
-pub fn print_preflight_report(report: &SshAgentPreflightReport, palette: Palette) {
-    let mut out = std::io::stdout();
-    let _ = report.write_warning_section(&mut out, palette);
-    let _ = out.flush();
-}
-
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 
 /// `(configured_host_name, ssh_destination_alias)` for SSH-backed hosts.
-fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
+pub(crate) fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for h in hosts {
         if let Some(alias) = h
@@ -362,7 +366,8 @@ pub fn ssh_destination_from_command(command: &[String]) -> Option<String> {
 }
 
 fn identity_files_for_alias(alias: &str) -> Result<Vec<PathBuf>, String> {
-    let output = Command::new("ssh")
+    let output = SSH
+        .command()
         .args(["-G", alias])
         .output()
         .map_err(|e| format!("spawn ssh -G: {e}"))?;
@@ -431,7 +436,8 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Returns (human status line, set of SHA256 fingerprints without the `SHA256:` prefix normalization).
 fn agent_fingerprints() -> Result<(String, BTreeSet<String>), String> {
-    let output = Command::new("ssh-add")
+    let output = SSH_ADD
+        .command()
         .arg("-l")
         .output()
         .map_err(|e| format!("spawn ssh-add -l: {e}"))?;
@@ -480,7 +486,8 @@ fn identity_fingerprint(path: &Path) -> Result<String, String> {
 
     let mut last_err = String::new();
     for cand in candidates {
-        let output = Command::new("ssh-keygen")
+        let output = SSH_KEYGEN
+            .command()
             .args(["-lf", cand.to_str().unwrap_or_default()])
             .output()
             .map_err(|e| format!("spawn ssh-keygen: {e}"))?;
@@ -514,7 +521,8 @@ fn public_key_path(private: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn run_ssh_add_apple_load_keychain() -> Result<String, String> {
-    let output = Command::new("ssh-add")
+    let output = SSH_ADD
+        .command()
         .arg("--apple-load-keychain")
         .output()
         .map_err(|e| format!("spawn: {e}"))?;
@@ -534,7 +542,7 @@ fn interactive_ssh_add(path: &Path) -> Result<(), String> {
         return Err(format!("file does not exist: {}", path.display()));
     }
 
-    let mut cmd = Command::new("ssh-add");
+    let mut cmd = SSH_ADD.command();
     // Store passphrase in Keychain on macOS so later --apple-load-keychain works.
     if cfg!(target_os = "macos") {
         cmd.arg("--apple-use-keychain");
