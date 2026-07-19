@@ -167,9 +167,9 @@ fn resolve_wrap(
     }
 }
 
-/// Terminal column count of stdout, when stdout is a terminal.
+/// Terminal (columns, rows) of stdout, when stdout is a terminal.
 #[cfg(unix)]
-fn detect_terminal_cols() -> Option<usize> {
+pub fn detect_terminal_size() -> Option<(usize, usize)> {
     let mut ws = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -178,11 +178,11 @@ fn detect_terminal_cols() -> Option<usize> {
     };
     // SAFETY: TIOCGWINSZ only writes the winsize out-param on success.
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
-    (ok && ws.ws_col > 0).then_some(ws.ws_col as usize)
+    (ok && ws.ws_col > 0).then_some((ws.ws_col as usize, ws.ws_row as usize))
 }
 
 #[cfg(not(unix))]
-fn detect_terminal_cols() -> Option<usize> {
+pub fn detect_terminal_size() -> Option<(usize, usize)> {
     None
 }
 
@@ -240,7 +240,9 @@ impl Config {
     /// carry the offending path / entry name.
     pub fn resolve(mut settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
-        settings.terminal_cols = settings.terminal_cols.or_else(detect_terminal_cols);
+        settings.terminal_cols = settings
+            .terminal_cols
+            .or_else(|| detect_terminal_size().map(|(cols, _)| cols));
         Self::resolve_with(
             settings,
             |k| std::env::var(k).ok(),

@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{IsTerminal, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -17,7 +17,8 @@ use myco::session::{
     ActiveSession, CompactOptions, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT, Session,
     SessionListEntry, compact_session, compact_subagent_prompt, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
-    print_session_history, resolve_and_load_session, section_rule, user_rule, write_error_section,
+    print_session_history, render_block, resolve_and_load_session, section_rule, user_rule,
+    write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
@@ -34,6 +35,7 @@ use rustyline::{
     Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
     KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
+use unicode_width::UnicodeWidthStr;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -470,6 +472,7 @@ async fn run_repl(
         if input.is_empty() {
             continue;
         }
+        reprint_input_wrapped(&line, palette);
         if is_exit_command(&input) {
             break;
         }
@@ -502,6 +505,42 @@ async fn run_repl(
 
         run_user_turn(agent, session, editor, input, palette).await;
     }
+}
+
+/// Visual rows the just-submitted input echo occupies: terminal character
+/// wrap at `cols`, one row minimum per logical line.
+fn input_echo_rows(line: &str, cols: usize) -> usize {
+    line.split('\n')
+        .map(|l| l.width().div_ceil(cols).max(1))
+        .sum()
+}
+
+/// Replace the just-submitted input echo with a word-wrapped copy.
+///
+/// The rustyline edit buffer is the one region the CLI repaints (the user can
+/// backspace while editing); this closes that exception at submit time —
+/// after this, output is append-only again. Wrap-only, no markdown styling:
+/// the user's words stay exactly as typed. Skipped when wrap is off, stdout
+/// is not a TTY, the echo may have scrolled off-screen, or wrapping would
+/// change nothing.
+fn reprint_input_wrapped(line: &str, palette: Palette) {
+    if palette.wrap.is_none() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let Some((cols, screen_rows)) = myco::config::detect_terminal_size() else {
+        return;
+    };
+    let wrapped = render_block(line, Palette::plain().with_wrap(palette.wrap));
+    if wrapped == line {
+        return;
+    }
+    let rows = input_echo_rows(line, cols);
+    if rows >= screen_rows {
+        return;
+    }
+    print!("\x1b[{rows}A\x1b[J");
+    println!("{wrapped}");
+    let _ = std::io::stdout().flush();
 }
 
 async fn run_user_turn(
@@ -1583,5 +1622,17 @@ mod tests {
     fn new_session_starts_empty() {
         let session = Session::new("grok-4.5-build");
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn input_echo_rows_counts_terminal_character_wrap() {
+        assert_eq!(input_echo_rows("", 80), 1);
+        assert_eq!(input_echo_rows("short", 80), 1);
+        assert_eq!(input_echo_rows(&"x".repeat(80), 80), 1);
+        assert_eq!(input_echo_rows(&"x".repeat(81), 80), 2);
+        assert_eq!(input_echo_rows("a\nb", 80), 2);
+        assert_eq!(input_echo_rows("a\n\nb", 80), 3);
+        // CJK columns count double: 41 ideographs = 82 cols.
+        assert_eq!(input_echo_rows(&"宽".repeat(41), 80), 2);
     }
 }

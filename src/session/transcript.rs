@@ -214,7 +214,12 @@ pub fn write_session_history(
                 writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
                 writeln!(out, "{}", palette.user("USER"))?;
                 writeln!(out)?;
-                write_block(out, &text)?;
+                // Wrap-only (no markdown styling): the user's own words replay
+                // as typed, at the transcript width — same as the live echo.
+                write_block(
+                    out,
+                    &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
+                )?;
                 // Next assistant turn opens a fresh ASSISTANT section.
                 assistant_open = false;
                 need_blank = false;
@@ -458,7 +463,9 @@ mod tests {
         let palette = Palette::plain().with_wrap(Some(20));
         let messages = vec![
             Message::UserMessage {
-                content: vec![Content::Text { text: "q".into() }],
+                content: vec![Content::Text {
+                    text: "user words that go past twenty columns".into(),
+                }],
             },
             Message::AssistantMessage {
                 content: vec![Content::Text {
@@ -475,6 +482,11 @@ mod tests {
         assert!(!rendered.contains(&"═".repeat(21)), "{rendered}");
         assert!(
             rendered.contains("one two three four\nfive six seven\n"),
+            "{rendered}"
+        );
+        // User text is wrapped too (wrap-only, no styling).
+        assert!(
+            rendered.contains("user words that go\npast twenty columns\n"),
             "{rendered}"
         );
         // Rule fns match the legacy fixed rules when wrap is off.
