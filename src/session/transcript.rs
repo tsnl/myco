@@ -92,6 +92,12 @@ impl Palette {
         self.paint("1;31", text)
     }
 
+    /// Startup banner rule + MYCO title: bold, no color (distinct from the
+    /// USER/ASSISTANT section palette).
+    pub fn banner(&self, text: &str) -> String {
+        self.paint("1", text)
+    }
+
     /// WARNING rule + header: bold yellow.
     pub fn warning(&self, text: &str) -> String {
         self.paint("1;33", text)
