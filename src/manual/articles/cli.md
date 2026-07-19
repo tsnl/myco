@@ -44,9 +44,11 @@ issues; hosts via `/hosts`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
-  (`**bold**`, `*italic*`, `` `code` ``, `#` headers) when stdout is a TTY;
-  `--wrap auto|off|COLS` overrides (auto = min(80, terminal width)). Styling is
-  additive-only: delimiters stay visible, content bytes are never dropped.
+  (`**bold**`, `*italic*`, `` `code` ``, `#` headers) when stdout is a TTY.
+  `--wrap auto|off|COLS` sets a width *cap* (auto = 80); the effective width
+  is min(cap, terminal width), re-measured every prompt — after a resize the
+  dialog is cleared and reprinted at the new width (same as Ctrl-L). Styling
+  is additive-only: delimiters stay visible, content bytes are never dropped.
   Fenced code blocks and 4-space-indented lines are never wrapped or styled.
   Piped output is never wrapped, so `myco | tee` stays byte-faithful.
 - On submit, the typed input echo is replaced with a word-wrapped copy
