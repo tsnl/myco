@@ -1838,6 +1838,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hf-hub",
+ "libc",
  "notify",
  "reqwest",
  "rustyline",
@@ -1850,6 +1851,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "unicode-width",
  "url",
  "uuid",
 ]

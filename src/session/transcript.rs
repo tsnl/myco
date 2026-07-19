@@ -8,6 +8,7 @@
 
 use std::io::Write;
 
+use super::markdown::{render_block, render_block_with_base};
 use crate::generative_model::{Content, Message};
 
 /// Double-line 72-col rule before each user turn (UTF-8 box drawing, no ANSI).
@@ -18,25 +19,52 @@ pub const USER_RULE: &str =
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
+/// Rule width when wrap is off (matches [`USER_RULE`] / [`SECTION_RULE`]).
+pub const DEFAULT_RULE_WIDTH: usize = 72;
+
+/// USER rule sized to the wrap width (default-width when wrap is off).
+pub fn user_rule(wrap: Option<usize>) -> String {
+    "═".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
+}
+
+/// ASSISTANT / ERROR / WARNING rule sized to the wrap width.
+pub fn section_rule(wrap: Option<usize>) -> String {
+    "─".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
+}
+
 /// Max chars for string values inside pretty-printed tool inputs (display only).
 pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
 
-/// ANSI styling for transcript rendering. Disabled → byte-identical plain
-/// output, so files, logs, and piped stdout never carry escape codes. The CLI
-/// resolves the flag once at startup ([`crate::config::Config::colors_enabled`]).
+/// ANSI styling and wrap width for transcript rendering. Disabled styling +
+/// no wrap → byte-identical plain output, so files, logs, and piped stdout
+/// never carry escape codes. The CLI resolves both once at startup
+/// ([`crate::config::Config::colors_enabled`] /
+/// [`crate::config::Config::wrap_width`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Palette {
     pub enabled: bool,
+    /// Word-wrap prose (and size rules) to this column width; `None` = off.
+    pub wrap: Option<usize>,
 }
 
 impl Palette {
     /// No styling: session files, subagent logs, non-TTY output.
     pub const fn plain() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            wrap: None,
+        }
     }
 
     pub const fn colored(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            wrap: None,
+        }
+    }
+
+    pub const fn with_wrap(self, wrap: Option<usize>) -> Self {
+        Self { wrap, ..self }
     }
 
     /// Leading `0;` clears any style left open by an interrupted stream
@@ -96,7 +124,7 @@ pub fn write_assistant_open(
     palette: Palette,
 ) -> std::io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{}", palette.assistant(SECTION_RULE))?;
+    writeln!(out, "{}", palette.assistant(&section_rule(palette.wrap)))?;
     writeln!(out, "{}", palette.assistant("ASSISTANT"))?;
     writeln!(out)?;
     Ok(())
@@ -105,7 +133,7 @@ pub fn write_assistant_open(
 /// Write an ERROR section open: blank line, thin rule, header, blank line, then body.
 pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> std::io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{}", palette.error(SECTION_RULE))?;
+    writeln!(out, "{}", palette.error(&section_rule(palette.wrap)))?;
     writeln!(out, "{}", palette.error("ERROR"))?;
     writeln!(out)?;
     Ok(())
@@ -117,7 +145,7 @@ pub fn write_warning_open(
     palette: Palette,
 ) -> std::io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{}", palette.warning(SECTION_RULE))?;
+    writeln!(out, "{}", palette.warning(&section_rule(palette.wrap)))?;
     writeln!(out, "{}", palette.warning("WARNING"))?;
     writeln!(out)?;
     Ok(())
@@ -183,7 +211,7 @@ pub fn write_session_history(
                 if text.is_empty() {
                     continue;
                 }
-                writeln!(out, "{}", palette.user(USER_RULE))?;
+                writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
                 writeln!(out, "{}", palette.user("USER"))?;
                 writeln!(out)?;
                 write_block(out, &text)?;
@@ -201,7 +229,7 @@ pub fn write_session_history(
                             if need_blank {
                                 writeln!(out)?;
                             }
-                            write_block(out, text)?;
+                            write_block(out, &render_block(text, palette))?;
                             need_blank = true;
                         }
                         Content::Thinking { text, redacted, .. } => {
@@ -217,7 +245,10 @@ pub fn write_session_history(
                                 writeln!(out)?;
                             }
                             // Same shape as the live sink: one `Thinking: …` paragraph.
-                            write_block(out, &palette.thinking(&format!("Thinking: {body}")))?;
+                            write_block(
+                                out,
+                                &render_block_with_base(&format!("Thinking: {body}"), palette, "2"),
+                            )?;
                             need_blank = true;
                         }
                         _ => {}
@@ -420,6 +451,35 @@ mod tests {
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
+    }
+
+    #[test]
+    fn wrapped_palette_wraps_prose_and_sizes_rules() {
+        let palette = Palette::plain().with_wrap(Some(20));
+        let messages = vec![
+            Message::UserMessage {
+                content: vec![Content::Text { text: "q".into() }],
+            },
+            Message::AssistantMessage {
+                content: vec![Content::Text {
+                    text: "one two three four five six seven".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: Some(TurnEndReason::EndTurn),
+            },
+        ];
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &messages, palette).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains(&"═".repeat(20)), "{rendered}");
+        assert!(!rendered.contains(&"═".repeat(21)), "{rendered}");
+        assert!(
+            rendered.contains("one two three four\nfive six seven\n"),
+            "{rendered}"
+        );
+        // Rule fns match the legacy fixed rules when wrap is off.
+        assert_eq!(user_rule(None), USER_RULE);
+        assert_eq!(section_rule(None), SECTION_RULE);
     }
 
     #[test]
