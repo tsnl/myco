@@ -15,7 +15,7 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, compact_session, compact_subagent_prompt, format_session_detail,
+    SessionListEntry, banner_rule, compact_session, compact_subagent_prompt, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
     print_session_history, render_block, resolve_and_load_session, section_rule, user_rule,
     write_error_section,
@@ -283,14 +283,20 @@ async fn run_interactive(args: Args) {
         Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
         _ => s.id.clone(),
     });
-    // Extremely lean startup: one line. Hosts via /hosts, effort via /effort,
-    // config path via attach-failure hints.
-    println!(
-        "myco: model={model_key}  session={session_label}  (/help for commands; newline: Alt-Enter or Ctrl-J)"
-    );
+    // Startup chrome: headed banner block (rule, MYCO, model/session, key
+    // hints). Hosts via /hosts, effort via /effort, config path via
+    // attach-failure hints.
+    {
+        let mut out = std::io::stdout();
+        let _ = write_startup_banner(&mut out, &model_key, &session_label, palette);
+        let _ = out.flush();
+    }
     // Preflight problems (missing executables, ssh-agent) open one WARNING
     // block after the banner, before the first USER block; happy path silent.
     print_startup_preflight(&preflight, palette);
+    // Blank line closes the startup chrome before the first USER rule
+    // (or the resumed-history replay).
+    println!();
     if resuming {
         print_session_history(agent.history(), palette);
     }
@@ -416,6 +422,26 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
         EventHandler::Conditional(Box::new(CtrlLHandler { flag: ctrl_l })),
     );
     editor
+}
+
+/// Write the startup banner: full-block rule, MYCO title, model/session lines, and
+/// the two hints worth surfacing before the first prompt (/help, newline chord).
+fn write_startup_banner(
+    out: &mut impl Write,
+    model_key: &str,
+    session_label: &str,
+    palette: Palette,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
+    writeln!(out, "{}", palette.banner("MYCO"))?;
+    writeln!(out)?;
+    writeln!(out, "Model: {model_key}")?;
+    writeln!(out, "Session: {session_label}")?;
+    writeln!(out)?;
+    writeln!(out, "/help for commands")?;
+    writeln!(out)?;
+    writeln!(out, "Alt-Enter or Ctrl-J for newline")?;
+    Ok(())
 }
 
 fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
@@ -1602,6 +1628,26 @@ mod tests {
                 }],
             },
         ]
+    }
+
+    #[test]
+    fn startup_banner_layout() {
+        let mut buf = Vec::new();
+        write_startup_banner(
+            &mut buf,
+            "hy3-free",
+            "993d14889c414aab81963843cccf8090 \"greeting\"",
+            Palette::plain(),
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let expected = format!(
+            "{rule}\nMYCO\n\nModel: hy3-free\n\
+             Session: 993d14889c414aab81963843cccf8090 \"greeting\"\n\n\
+             /help for commands\n\nAlt-Enter or Ctrl-J for newline\n",
+            rule = banner_rule(None)
+        );
+        assert_eq!(text, expected);
     }
 
     #[test]

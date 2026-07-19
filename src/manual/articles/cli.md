@@ -24,7 +24,8 @@ plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
-Startup banner is one lean line: model and session. Startup preflight problems
+Startup banner is a small headed block (full-block rule, `MYCO`, model +
+session, `/help` and newline hints). Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,
 `lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and ssh-agent
 issues; hosts via `/hosts`.
