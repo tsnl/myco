@@ -111,17 +111,19 @@ impl std::str::FromStr for ColorMode {
 // Word wrap
 // ---------------------------------------------------------------------------
 
-/// Wrap width cap for `--wrap auto` (narrower terminals win).
+/// Wrap cap for `--wrap auto` (narrower terminals win).
 pub const DEFAULT_WRAP_WIDTH: usize = 80;
 
-/// Word-wrap choice for stdout rendering (CLI `--wrap`).
+/// Word-wrap choice for stdout rendering (CLI `--wrap`). Every mode is a
+/// *cap*: the effective width is `min(cap, measured terminal width)`,
+/// re-measured at render time so resizes reflow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WrapMode {
-    /// Wrap at `min(80, terminal width)` when stdout is a TTY; off otherwise.
+    /// Cap at [`DEFAULT_WRAP_WIDTH`].
     #[default]
     Auto,
     Off,
-    /// Wrap at a fixed column count, TTY or not.
+    /// Cap at a custom column count.
     Columns(usize),
 }
 
@@ -154,16 +156,13 @@ impl std::str::FromStr for WrapMode {
     }
 }
 
-fn resolve_wrap(
-    mode: WrapMode,
-    stdout_is_tty: bool,
-    terminal_cols: Option<usize>,
-) -> Option<usize> {
+/// The configured wrap cap. Wrap is TTY-only, like colors — piped output is
+/// never wrapped. Terminal-width measurement happens at render time, not here.
+fn resolve_wrap(mode: WrapMode, stdout_is_tty: bool) -> Option<usize> {
     match mode {
         WrapMode::Off => None,
-        WrapMode::Columns(n) => Some(n),
-        WrapMode::Auto => stdout_is_tty
-            .then(|| DEFAULT_WRAP_WIDTH.min(terminal_cols.unwrap_or(DEFAULT_WRAP_WIDTH))),
+        WrapMode::Columns(n) => stdout_is_tty.then_some(n),
+        WrapMode::Auto => stdout_is_tty.then_some(DEFAULT_WRAP_WIDTH),
     }
 }
 
@@ -198,8 +197,6 @@ pub struct ConfigUserSettings {
     pub wrap: WrapMode,
     /// Override TTY detection (tests / embedders). `None` → detect from stdout.
     pub stdout_is_tty: Option<bool>,
-    /// Override terminal width detection (tests / embedders).
-    pub terminal_cols: Option<usize>,
     /// Config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
     pub harness_config_path: Option<PathBuf>,
@@ -217,9 +214,14 @@ pub struct Config {
     pub stdout_is_tty: bool,
     /// Final color decision for stdout rendering ([`ColorMode`] + env overrides + TTY).
     pub colors_enabled: bool,
-    /// Final wrap decision: word-wrap prose at this column width, `None` = off
-    /// ([`WrapMode`] + TTY + terminal width).
-    pub wrap_width: Option<usize>,
+    /// Wrap cap ([`WrapMode`] + TTY), `None` = off. The effective width is
+    /// `min(cap, terminal width)`, measured by the renderer per prompt so
+    /// terminal resizes reflow.
+    pub wrap_max: Option<usize>,
+    /// Automatic cursor repaints allowed (input re-echo, resize reflow):
+    /// stdout is a TTY and `TERM` is not `dumb`. Wrapping itself stays on for
+    /// dumb terminals — it only inserts newlines.
+    pub repaint_enabled: bool,
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub harness_config_path: PathBuf,
@@ -238,11 +240,8 @@ impl Config {
     /// Resolve from the real process environment, stdout TTY state, the
     /// config file, auth files, and `~/.ssh/config` host aliases. Errors
     /// carry the offending path / entry name.
-    pub fn resolve(mut settings: ConfigUserSettings) -> Result<Self, String> {
+    pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
         let stdout_is_tty = std::io::stdout().is_terminal();
-        settings.terminal_cols = settings
-            .terminal_cols
-            .or_else(|| detect_terminal_size().map(|(cols, _)| cols));
         Self::resolve_with(
             settings,
             |k| std::env::var(k).ok(),
@@ -268,7 +267,6 @@ impl Config {
             color,
             wrap,
             stdout_is_tty: tty_override,
-            terminal_cols,
             harness_config_path,
             model: model_override,
         } = settings;
@@ -283,12 +281,14 @@ impl Config {
         let mut harness = file.into_harness_config(ssh_aliases()?);
         harness.models = models.clone();
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
-        let wrap_width = resolve_wrap(wrap, stdout_is_tty, terminal_cols);
+        let wrap_max = resolve_wrap(wrap, stdout_is_tty);
+        let repaint_enabled = stdout_is_tty && env("TERM").as_deref() != Some("dumb");
 
         Ok(Self {
             stdout_is_tty,
             colors_enabled,
-            wrap_width,
+            wrap_max,
+            repaint_enabled,
             harness_config_path,
             harness,
             models,
@@ -859,17 +859,34 @@ context_window = 1000
     }
 
     #[test]
-    fn wrap_auto_caps_at_terminal_width_and_needs_a_tty() {
-        assert_eq!(resolve_wrap(WrapMode::Auto, true, Some(120)), Some(80));
-        assert_eq!(resolve_wrap(WrapMode::Auto, true, Some(60)), Some(60));
-        assert_eq!(resolve_wrap(WrapMode::Auto, true, None), Some(80));
-        assert_eq!(resolve_wrap(WrapMode::Auto, false, Some(120)), None);
-        // An explicit column count applies even when piped; off is off on a TTY.
-        assert_eq!(
-            resolve_wrap(WrapMode::Columns(100), false, Some(60)),
-            Some(100)
-        );
-        assert_eq!(resolve_wrap(WrapMode::Off, true, Some(120)), None);
+    fn wrap_resolves_to_a_tty_only_cap() {
+        assert_eq!(resolve_wrap(WrapMode::Auto, true), Some(80));
+        assert_eq!(resolve_wrap(WrapMode::Auto, false), None);
+        assert_eq!(resolve_wrap(WrapMode::Columns(100), true), Some(100));
+        // Wrap is TTY-only, like colors — a custom cap does not force it on pipes.
+        assert_eq!(resolve_wrap(WrapMode::Columns(100), false), None);
+        assert_eq!(resolve_wrap(WrapMode::Off, true), None);
+    }
+
+    #[test]
+    fn repaint_needs_a_tty_and_a_capable_term() {
+        let resolve = |tty: bool, env_pairs: &[(&str, &str)]| {
+            resolve_toml(
+                CATALOG,
+                ConfigUserSettings {
+                    stdout_is_tty: Some(tty),
+                    ..Default::default()
+                },
+                env_of(env_pairs),
+            )
+            .unwrap()
+            .repaint_enabled
+        };
+        assert!(resolve(true, &[("TERM", "xterm-256color")]));
+        assert!(resolve(true, &[]));
+        // Dumb terminals can't interpret cursor addressing; wrap itself stays.
+        assert!(!resolve(true, &[("TERM", "dumb")]));
+        assert!(!resolve(false, &[]));
     }
 
     #[test]
@@ -878,15 +895,14 @@ context_window = 1000
             CATALOG,
             ConfigUserSettings {
                 stdout_is_tty: Some(true),
-                terminal_cols: Some(64),
                 ..Default::default()
             },
             env_of(&[]),
         )
         .unwrap();
-        assert_eq!(cfg.wrap_width, Some(64));
-        // Piped (the default `false` in resolve_toml): auto wrap stays off.
-        assert_eq!(resolve_catalog_cfg(&[]).wrap_width, None);
+        assert_eq!(cfg.wrap_max, Some(80));
+        // Piped (the default `false` in resolve_toml): wrap stays off.
+        assert_eq!(resolve_catalog_cfg(&[]).wrap_max, None);
     }
 
     #[test]

@@ -51,8 +51,9 @@ at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact var
 `model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript
 sections are colored when stdout is a TTY (`--color auto|always|never`;
 `NO_COLOR` / `CLICOLOR_FORCE` honored), and prose is word-wrapped with light
-markdown styling (`--wrap auto|off|COLS`; auto = min(80, terminal width),
-never inside code blocks, never when piped).
+markdown styling (`--wrap auto|off|COLS` caps the width at min(cap, terminal
+width), default 80; resizes reflow the transcript at the next prompt; never
+inside code blocks, never when piped).
 
 Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by

@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{IsTerminal, Write},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -121,8 +121,9 @@ struct Args {
     #[arg(long, value_name = "WHEN", value_parser = parse_color_arg, default_value_t = ColorMode::Auto)]
     color: ColorMode,
 
-    /// Word-wrap prose (auto|off|COLS). Auto wraps at min(80, terminal width)
-    /// when stdout is a TTY; code blocks and piped output are never wrapped.
+    /// Word-wrap prose (auto|off|COLS). The value caps the width: effective
+    /// wrap is min(cap, terminal width), re-measured every prompt so resizes
+    /// reflow (auto = 80). TTY only; code blocks and piped output never wrap.
     #[arg(long, value_name = "MODE", value_parser = parse_wrap_arg, default_value_t = WrapMode::Auto)]
     wrap: WrapMode,
 }
@@ -209,7 +210,8 @@ async fn run_interactive(args: Args) {
         }
     };
     let model_key = catalog_model.spec.key.clone();
-    let palette = Palette::colored(app_config.colors_enabled).with_wrap(app_config.wrap_width);
+    let palette = Palette::colored(app_config.colors_enabled)
+        .with_wrap(effective_wrap_width(app_config.wrap_max));
 
     // Startup preflight: verify expected executables resolve (bash, lynx;
     // OpenSSH tools when remotes are configured), then unlock SSH identities
@@ -269,7 +271,7 @@ async fn run_interactive(args: Args) {
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new(palette));
-    let mut agent = Agent::new(model, harness.clone(), sink);
+    let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_history(active_session.snapshot().messages.clone());
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -303,6 +305,9 @@ async fn run_interactive(args: Args) {
         debug_dump_api_requests,
         ctrl_l,
         palette,
+        app_config.wrap_max,
+        app_config.repaint_enabled,
+        sink,
     )
     .await;
 
@@ -437,9 +442,27 @@ async fn run_repl(
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
-    palette: Palette,
+    mut palette: Palette,
+    wrap_max: Option<usize>,
+    repaint: bool,
+    sink: Arc<CliEventSink>,
 ) {
+    let mut last_wrap = palette.wrap;
     loop {
+        // Re-measure the terminal each prompt: after a resize, reflow the
+        // whole dialog at the new width (same clear+reprint as Ctrl-L). This
+        // is the safe point — never mid-stream, never while rustyline owns
+        // the terminal. Dumb terminals skip the reprint (no cursor codes)
+        // but still pick up the new width for subsequent turns.
+        let wrap = effective_wrap_width(wrap_max);
+        if wrap != last_wrap {
+            last_wrap = wrap;
+            palette = palette.with_wrap(wrap);
+            sink.set_wrap(wrap);
+            if repaint && !agent.history().is_empty() {
+                clear_and_reprint(agent, palette);
+            }
+        }
         println!("{}", palette.user(&user_rule(palette.wrap)));
         let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
@@ -472,7 +495,7 @@ async fn run_repl(
         if input.is_empty() {
             continue;
         }
-        reprint_input_wrapped(&line, palette);
+        reprint_input_wrapped(&line, palette, repaint);
         if is_exit_command(&input) {
             break;
         }
@@ -507,6 +530,17 @@ async fn run_repl(
     }
 }
 
+/// Effective wrap width right now: the configured cap bounded by the measured
+/// terminal width. `None` = wrap off (includes non-TTY stdout, resolved at
+/// startup). Cheap (one ioctl) — called once per prompt.
+fn effective_wrap_width(wrap_max: Option<usize>) -> Option<usize> {
+    let cap = wrap_max?;
+    match myco::config::detect_terminal_size() {
+        Some((cols, _)) => Some(cap.min(cols)),
+        None => Some(cap),
+    }
+}
+
 /// Visual rows the just-submitted input echo occupies: terminal character
 /// wrap at `cols`, one row minimum per logical line.
 fn input_echo_rows(line: &str, cols: usize) -> usize {
@@ -520,11 +554,11 @@ fn input_echo_rows(line: &str, cols: usize) -> usize {
 /// The rustyline edit buffer is the one region the CLI repaints (the user can
 /// backspace while editing); this closes that exception at submit time —
 /// after this, output is append-only again. Wrap-only, no markdown styling:
-/// the user's words stay exactly as typed. Skipped when wrap is off, stdout
-/// is not a TTY, the echo may have scrolled off-screen, or wrapping would
-/// change nothing.
-fn reprint_input_wrapped(line: &str, palette: Palette) {
-    if palette.wrap.is_none() || !std::io::stdout().is_terminal() {
+/// the user's words stay exactly as typed. Skipped when wrap is off, repaint
+/// is unavailable (non-TTY stdout or `TERM=dumb`), the echo may have
+/// scrolled off-screen, or wrapping would change nothing.
+fn reprint_input_wrapped(line: &str, palette: Palette, repaint: bool) {
+    if palette.wrap.is_none() || !repaint {
         return;
     }
     let Some((cols, screen_rows)) = myco::config::detect_terminal_size() else {
@@ -1264,7 +1298,9 @@ fn session_id_completions(prefix: &str) -> Vec<String> {
 /// blank line + thin `SECTION_RULE` + `ASSISTANT` + blank line, then body.
 struct CliEventSink {
     state: Mutex<SinkState>,
-    palette: Palette,
+    /// Behind a lock so the REPL can update the wrap width after a terminal
+    /// resize; renderers created afterwards pick it up.
+    palette: Mutex<Palette>,
 }
 
 struct SinkState {
@@ -1296,8 +1332,19 @@ impl CliEventSink {
                 thinking_buf: String::new(),
                 thinking_md: None,
             }),
-            palette,
+            palette: Mutex::new(palette),
         }
+    }
+
+    fn palette(&self) -> Palette {
+        *self.palette.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Update the wrap width mid-session (terminal resize). An in-flight
+    /// paragraph keeps the width its renderer was created with.
+    fn set_wrap(&self, wrap: Option<usize>) {
+        let mut palette = self.palette.lock().unwrap_or_else(|e| e.into_inner());
+        *palette = palette.with_wrap(wrap);
     }
 }
 
@@ -1325,11 +1372,9 @@ impl CliEventSink {
         self.finish_thinking_line();
         self.ensure_line_start();
         println!();
-        println!(
-            "{}",
-            self.palette.assistant(&section_rule(self.palette.wrap))
-        );
-        println!("{}", self.palette.assistant("ASSISTANT"));
+        let palette = self.palette();
+        println!("{}", palette.assistant(&section_rule(palette.wrap)));
+        println!("{}", palette.assistant("ASSISTANT"));
         println!();
         self.with_state(|s| {
             s.at_line_start = true;
@@ -1418,13 +1463,14 @@ impl EventSink for CliEventSink {
                     self.end_text_stream();
                     self.separate_paragraph_if_needed();
                     self.ensure_line_start();
+                    let palette = self.palette();
                     let rendered = self.with_state(|s| {
                         s.thinking_line_open = true;
                         s.thinking_buf = text.clone();
                         // Dim base stays open across deltas; finish_thinking_line resets.
                         let r = s
                             .thinking_md
-                            .insert(MarkdownRenderer::with_base(self.palette, "2"));
+                            .insert(MarkdownRenderer::with_base(palette, "2"));
                         let mut out = r.feed("Thinking: ");
                         out.push_str(&r.feed(&text));
                         out
@@ -1463,7 +1509,7 @@ impl EventSink for CliEventSink {
                 if start_new {
                     self.separate_paragraph_if_needed();
                 }
-                let palette = self.palette;
+                let palette = self.palette();
                 let rendered = self.with_state(|s| {
                     s.in_text_stream = true;
                     s.need_blank = false;
@@ -1503,7 +1549,7 @@ impl EventSink for CliEventSink {
                 self.separate_paragraph_if_needed();
                 print!(
                     "{}",
-                    format_tool_invocation(&tool_use.name, &tool_use.input, self.palette)
+                    format_tool_invocation(&tool_use.name, &tool_use.input, self.palette())
                 );
                 self.with_state(|s| {
                     s.at_line_start = true;
