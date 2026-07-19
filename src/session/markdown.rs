@@ -201,15 +201,17 @@ impl MarkdownRenderer {
             return;
         }
         // ATX header: #{1,6} followed by a space.
-        if !stripped.is_empty() && stripped.len() <= 6 && stripped.chars().all(|h| h == '#') {
-            if c == ' ' {
-                self.line = Line::Body;
-                self.header = true;
-                self.emit_sgr();
-                self.replay_literal(&prefix);
-                self.inline_char(c);
-                return;
-            }
+        if !stripped.is_empty()
+            && stripped.len() <= 6
+            && stripped.chars().all(|h| h == '#')
+            && c == ' '
+        {
+            self.line = Line::Body;
+            self.header = true;
+            self.emit_sgr();
+            self.replay_literal(&prefix);
+            self.inline_char(c);
+            return;
         }
         // Bullets: `- ` / `+ ` / `* ` / `1. ` / `1) ` — hanging indent for
         // wrapped continuations. `> ` passes through with no special layout.
@@ -435,11 +437,11 @@ impl MarkdownRenderer {
         }
         self.word.push(c);
         self.word_width += w;
-        if let Some(width) = self.wrap {
-            if self.word_width >= width {
-                self.flush_word();
-                self.overflow = true;
-            }
+        if let Some(width) = self.wrap
+            && self.word_width >= width
+        {
+            self.flush_word();
+            self.overflow = true;
         }
     }
 
@@ -449,21 +451,20 @@ impl MarkdownRenderer {
         if self.word.is_empty() {
             return;
         }
-        if let Some(width) = self.wrap {
-            if self.col > 0
-                && self.spaces > 0
-                && self.word_width > 0
-                && self.col + self.spaces + self.word_width > width
-            {
-                // Break: the run of breakable spaces becomes the newline.
-                self.spaces = 0;
-                self.out_ch('\n');
-                let hang = self.hang.min(width.saturating_sub(1));
-                for _ in 0..hang {
-                    self.out_ch(' ');
-                }
-                self.col = hang;
+        if let Some(width) = self.wrap
+            && self.col > 0
+            && self.spaces > 0
+            && self.word_width > 0
+            && self.col + self.spaces + self.word_width > width
+        {
+            // Break: the run of breakable spaces becomes the newline.
+            self.spaces = 0;
+            self.out_ch('\n');
+            let hang = self.hang.min(width.saturating_sub(1));
+            for _ in 0..hang {
+                self.out_ch(' ');
             }
+            self.col = hang;
         }
         self.emit_spaces();
         let word = std::mem::take(&mut self.word);
