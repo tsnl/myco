@@ -59,6 +59,32 @@ Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by
 non-interactive SSH. Runtime details: `myco --help overview`.
 
+### Web GUI (`myco --mode server`)
+
+A browser frontend (`crates/myco-gui`, Yew/wasm) over the **same** harness,
+sessions, and hosts as the CLI. It renders the transcript like a slightly
+more polished CLI — full-width section rules, colored
+USER/ASSISTANT/ERROR sections, `Thinking:` and tool paragraphs — a second
+*presentation*, never a second *runtime*.
+
+```bash
+# Production: build the client, then serve API + GUI from one process:
+trunk build                       # emits crates/myco-gui/dist/
+myco --mode server --dist crates/myco-gui/dist
+# → http://127.0.0.1:8000  (API at /api, GUI at /)
+```
+
+```bash
+# Development (hot-reload): run the API server (no --dist) and Trunk together:
+myco --mode server                # API only, on :8000
+trunk serve                       # client on :8080, proxies /api → :8000
+# → http://127.0.0.1:8080  (edits to crates/myco-gui reload live)
+```
+
+`--bind`/`--port` override the address (default `127.0.0.1:8000`, matching
+`Trunk.toml`'s `/api` proxy). The server reuses `~/.myco/{config,session}` just
+like the CLI — sessions default to the configured `model` from the catalog.
+
 ## Develop
 
 ```bash

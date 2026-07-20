@@ -119,6 +119,20 @@ struct Args {
     /// reflow (auto = 80). TTY only; code blocks and piped output never wrap.
     #[arg(long, value_name = "MODE", value_parser = parse_wrap_arg, default_value_t = WrapMode::Auto)]
     wrap: WrapMode,
+
+    /// `--mode server`: address to bind the HTTP server. Default: 127.0.0.1.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
+    /// `--mode server`: HTTP port. Default: 8000 (matches Trunk.toml's /api proxy).
+    #[arg(long, default_value_t = 8000)]
+    port: u16,
+
+    /// `--mode server`: directory of built GUI assets to serve at `/`
+    /// (e.g. `dist` after `trunk build`). Omit for API-only dev mode: run
+    /// `trunk serve` for the client + hot-reload; it proxies `/api` to this server.
+    #[arg(long)]
+    dist: Option<PathBuf>,
 }
 
 fn parse_effort_arg(s: &str) -> Result<Effort, String> {
@@ -139,6 +153,8 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
+    /// HTTP server for the web GUI (`/api` + built client).
+    Server,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +172,7 @@ async fn main() {
     match args.mode {
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
+        Mode::Server => run_server(args).await,
     }
 }
 
@@ -174,6 +191,72 @@ async fn run_host(args: Args) {
         .await
     {
         eprintln!("myco host error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `--mode server`: HTTP frontend over the same harness/sessions/hosts as the
+/// CLI. Serves `/api` (REST + SSE) and, when `--dist` is given, the built GUI at
+/// `/`. In dev, run `trunk serve` for the client (hot-reload) and let it proxy
+/// `/api` to this server.
+///
+/// Uses [`Repl`] so config resolution, the system prompt, model construction,
+/// and `session_meta` / `session_history` / `memory` match the interactive CLI.
+async fn run_server(args: Args) {
+    // Same one-step resolution as the interactive CLI; the color decision only
+    // affects this process's own startup lines (the GUI styles itself).
+    let app_config = Config::resolve(ConfigUserSettings {
+        harness_config_path: args.config.clone(),
+        model: args.model.clone(),
+        color: args.color,
+        wrap: args.wrap,
+        ..Default::default()
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {e}");
+        std::process::exit(2);
+    });
+    let config_path = app_config.harness_config_path.clone();
+    let palette = Palette::colored(app_config.colors_enabled);
+
+    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
+    myco::print_startup_preflight(&preflight, palette);
+
+    let repl = Repl::attach(app_config, args.effort, args.debug_dump_api_requests)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to attach harness: {e}");
+            eprintln!("config: {}", config_path.display());
+            std::process::exit(1);
+        });
+    print_host_status(repl.harness());
+    // Owner request: index skills / AGENTS.md under the launch directory,
+    // matching the interactive CLI. Attach alone never indexes.
+    if let Ok(cwd) = std::env::current_dir() {
+        repl.harness().auto_index_local(cwd);
+    }
+
+    let dist_dir = args.dist.clone();
+    match &dist_dir {
+        Some(d) => println!(
+            "myco server: http://{}:{}  (serving GUI from {})",
+            args.bind,
+            args.port,
+            d.display()
+        ),
+        None => println!(
+            "myco server: http://{}:{}  (API only; run `trunk serve` for the GUI + hot-reload)",
+            args.bind, args.port
+        ),
+    }
+
+    let server_config = myco::ServerConfig {
+        bind: args.bind.clone(),
+        port: args.port,
+        dist_dir,
+    };
+    if let Err(e) = myco::serve_http(repl, server_config).await {
+        eprintln!("myco server error: {e}");
         std::process::exit(1);
     }
 }
