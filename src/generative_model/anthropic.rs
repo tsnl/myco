@@ -428,8 +428,12 @@ impl StreamAccumulator {
         let mut out = Vec::new();
 
         match event {
-            AnthropicStreamEvent::MessageStart { .. } => {
-                // Already emitted MessageStart at stream open.
+            AnthropicStreamEvent::MessageStart { message } => {
+                // Prompt-side counts (input + cache) arrive here; message_delta
+                // later carries only output_tokens. The accumulator merges both.
+                if let Some(u) = message.usage {
+                    out.push(MessagePart::Usage(u.into_token_usage()));
+                }
             }
             AnthropicStreamEvent::ContentBlockStart {
                 index,
@@ -633,8 +637,7 @@ enum AnthropicStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart {
         #[serde(default)]
-        #[allow(dead_code)]
-        message: serde_json::Value,
+        message: AnthropicStartMessage,
     },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
@@ -712,6 +715,13 @@ enum AnthropicDelta {
 #[derive(Debug, serde::Deserialize)]
 struct AnthropicMessageDelta {
     stop_reason: Option<AnthropicStopReason>,
+}
+
+/// `message_start` payload; only its prompt-side `usage` is read.
+#[derive(Debug, Default, serde::Deserialize)]
+struct AnthropicStartMessage {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1196,6 +1206,27 @@ mod tests {
             AnthropicContent::ToolResult { .. }
         ));
         assert!(matches!(msgs[0].content[1], AnthropicContent::Text { .. }));
+    }
+
+    #[test]
+    fn message_start_usage_is_captured() {
+        let mut acc = StreamAccumulator::default();
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"role":"assistant","usage":{"input_tokens":2095,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let usage = acc
+            .handle_event(event)
+            .unwrap()
+            .into_iter()
+            .find_map(|p| match p {
+                MessagePart::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("message_start should emit usage");
+        assert_eq!(usage.input_tokens, 2095);
+        assert_eq!(usage.cache_read_tokens, Some(100));
+        assert_eq!(usage.context_tokens(), 2195);
     }
 
     #[test]

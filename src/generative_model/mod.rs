@@ -446,6 +446,25 @@ impl TokenUsage {
             .saturating_add(self.cache_read_tokens.unwrap_or(0))
             .saturating_add(self.cache_creation_tokens.unwrap_or(0))
     }
+
+    /// Fold a later usage report into this one, keeping known fields when the
+    /// later report omits them (providers split usage across stream events).
+    pub fn merge(self, next: TokenUsage) -> TokenUsage {
+        TokenUsage {
+            input_tokens: if next.input_tokens != 0 {
+                next.input_tokens
+            } else {
+                self.input_tokens
+            },
+            output_tokens: if next.output_tokens != 0 {
+                next.output_tokens
+            } else {
+                self.output_tokens
+            },
+            cache_read_tokens: next.cache_read_tokens.or(self.cache_read_tokens),
+            cache_creation_tokens: next.cache_creation_tokens.or(self.cache_creation_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -539,7 +558,7 @@ impl GenerateOutput {
         let mut content: Vec<Option<Content>> = Vec::new();
         let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
         let mut turn_end_reason = None;
-        let mut usage = None;
+        let mut usage: Option<TokenUsage> = None;
 
         let mut stream = pin!(stream);
 
@@ -663,7 +682,10 @@ impl GenerateOutput {
                     turn_end_reason = Some(reason);
                 }
                 MessagePart::Usage(u) => {
-                    usage = Some(u);
+                    usage = Some(match usage {
+                        Some(prev) => prev.merge(u),
+                        None => u,
+                    });
                 }
             }
         }
@@ -771,6 +793,61 @@ mod tests {
             other => panic!("expected text, got {other:?}"),
         }
         assert_eq!(answer_content(&output.content).len(), 1);
+    }
+
+    #[test]
+    fn token_usage_merge_prefers_known_fields() {
+        let start = TokenUsage {
+            input_tokens: 2095,
+            output_tokens: 1,
+            cache_read_tokens: Some(100),
+            cache_creation_tokens: Some(0),
+        };
+        let delta = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 89,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        };
+        let merged = start.merge(delta);
+        assert_eq!(merged.input_tokens, 2095);
+        assert_eq!(merged.output_tokens, 89);
+        assert_eq!(merged.cache_read_tokens, Some(100));
+        assert_eq!(merged.context_tokens(), 2195);
+    }
+
+    #[tokio::test]
+    async fn accumulate_merges_split_usage() {
+        use futures::stream;
+
+        let parts = vec![
+            Ok(MessagePart::MessageStart),
+            Ok(MessagePart::Usage(TokenUsage {
+                input_tokens: 2095,
+                output_tokens: 1,
+                cache_read_tokens: Some(100),
+                cache_creation_tokens: Some(0),
+            })),
+            Ok(MessagePart::ContentStart(ContentStart::Text { index: 0 })),
+            Ok(MessagePart::ContentDelta(ContentDelta::Text {
+                index: 0,
+                delta: "hi".into(),
+            })),
+            Ok(MessagePart::Usage(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 89,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            })),
+            Ok(MessagePart::TurnEndReason(TurnEndReason::EndTurn)),
+        ];
+        let output = GenerateOutput::from_stream(stream::iter(parts))
+            .await
+            .expect("accumulate");
+        let usage = output.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 2095);
+        assert_eq!(usage.output_tokens, 89);
+        assert_eq!(usage.context_tokens(), 2195);
     }
 
     fn spec(key: &str, protocol: Protocol) -> ModelSpec {

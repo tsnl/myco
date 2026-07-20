@@ -850,10 +850,13 @@ struct ResponsesInputTokensDetails {
 
 impl ResponsesUsage {
     fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+        // OpenAI's `input_tokens` is the full prompt with `cached_tokens` a subset;
+        // split it out so `context_tokens()` (additive) doesn't double-count it.
+        let cached = self.input_tokens_details.and_then(|d| d.cached_tokens);
         crate::generative_model::TokenUsage {
-            input_tokens: self.input_tokens,
+            input_tokens: self.input_tokens.saturating_sub(cached.unwrap_or(0)),
             output_tokens: self.output_tokens,
-            cache_read_tokens: self.input_tokens_details.and_then(|d| d.cached_tokens),
+            cache_read_tokens: cached,
             cache_creation_tokens: None,
         }
     }
@@ -872,6 +875,21 @@ struct ResponsesIncompleteDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_splits_cached_out_of_input() {
+        let usage = ResponsesUsage {
+            input_tokens: 10_000,
+            output_tokens: 200,
+            input_tokens_details: Some(ResponsesInputTokensDetails {
+                cached_tokens: Some(8_000),
+            }),
+        }
+        .into_token_usage();
+        assert_eq!(usage.input_tokens, 2_000);
+        assert_eq!(usage.cache_read_tokens, Some(8_000));
+        assert_eq!(usage.context_tokens(), 10_000);
+    }
 
     #[test]
     fn convert_user_and_tool_results() {
