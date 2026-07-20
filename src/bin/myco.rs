@@ -9,9 +9,7 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
-};
+use myco::generative_model::{self, CatalogModel, Content, Effort, GenerativeModelConfig};
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
@@ -21,9 +19,8 @@ use myco::session::{
     user_rule, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
-    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, prompts, uuid_simple_hex,
+    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
+    Repl, SessionKind, StartupPreflight, TraceContext, WrapMode, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -40,10 +37,6 @@ use unicode_width::UnicodeWidthStr;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const SYSTEM_PROMPT_PROLOGUE: &str = r#"
-You are a helpful assistant running in an agentic harness with unfettered computer access.
-"#;
 
 const SLASH_COMMANDS: &[&str] = &[
     "/help",
@@ -238,51 +231,58 @@ async fn run_interactive(args: Args) {
         app_config.stdout_is_tty,
     ));
 
-    let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
-    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let memory_tool = Arc::new(MemoryService::new()) as Arc<dyn myco::ToolService>;
-    let harness = Harness::attach_with_root_services(
-        app_config.harness.clone(),
-        vec![session_tool, history_tool, memory_tool],
-    )
-    .await
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to attach harness: {e}");
-        eprintln!(
-            "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
-        );
-        if !preflight.executables.is_clean() {
-            let names: Vec<&str> = preflight
-                .executables
-                .missing
-                .iter()
-                .map(|m| m.name)
-                .collect();
-            eprintln!("hint: missing executables: {}", names.join(", "));
-        }
-        if preflight.ssh.has_problems() {
+    // Repl owns the harness, the resolved config, and the session registry
+    // backing the `session_meta` / `session_history` / `memory` root services.
+    // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
+    let mut effort = args.effort;
+    let debug_dump_api_requests = args.debug_dump_api_requests;
+    let repl = Repl::attach(app_config.clone(), effort, debug_dump_api_requests)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to attach harness: {e}");
             eprintln!(
-                "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
-                     try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
+                "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
             );
-        }
-        eprintln!("config: {}", app_config.harness_config_path.display());
-        std::process::exit(1);
-    });
+            if !preflight.executables.is_clean() {
+                let names: Vec<&str> = preflight
+                    .executables
+                    .missing
+                    .iter()
+                    .map(|m| m.name)
+                    .collect();
+                eprintln!("hint: missing executables: {}", names.join(", "));
+            }
+            if preflight.ssh.has_problems() {
+                eprintln!(
+                    "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
+                         try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
+                );
+            }
+            eprintln!("config: {}", app_config.harness_config_path.display());
+            std::process::exit(1);
+        });
+    let harness = repl.harness().clone();
     // Owner request: index skills / AGENTS.md under the launch directory.
     // Attach alone never indexes (tests rely on that).
     if let Ok(cwd) = std::env::current_dir() {
         harness.auto_index_local(cwd);
     }
-    // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
-    let mut effort = args.effort;
-    let debug_dump_api_requests = args.debug_dump_api_requests;
-    let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new(palette, console.clone()));
-    let mut agent = Agent::new(model, harness.clone(), sink.clone());
-    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-    agent.set_history(active_session.snapshot().messages.clone());
+    // CLI is single-session: register the pre-built ActiveSession (console
+    // mirror + readline already hold it) and keep the agent lock for the
+    // lifetime of the REPL.
+    let live = repl
+        .register_session(
+            active_session.clone(),
+            catalog_model.clone(),
+            effort,
+            sink.clone(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create session: {e}");
+            std::process::exit(1);
+        });
+    let mut agent = live.agent.lock().await;
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -312,6 +312,8 @@ async fn run_interactive(args: Args) {
     }
 
     run_repl(
+        &repl,
+        &live,
         &mut agent,
         &active_session,
         &mut editor,
@@ -346,34 +348,7 @@ fn build_model(
     debug_dump_api_requests: bool,
     effort: Effort,
 ) -> Arc<dyn generative_model::GenerativeModel> {
-    let mut backend_config = catalog_model.backend.clone();
-    match &mut backend_config {
-        BackendConfig::Anthropic(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            // Always enable thinking; effort controls how hard the model thinks.
-            c.effort = Some(effort);
-        }
-        BackendConfig::OpenAIResponses(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            c.effort = Some(effort);
-        }
-    }
-
-    generative_model::new(GenerativeModelConfig {
-        model: catalog_model.spec.clone(),
-        tools: harness.tool_specs(),
-        system_prompt: [
-            SYSTEM_PROMPT_PROLOGUE,
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
-        ]
-        .join("\n"),
-        backend_config,
-    })
-    .unwrap_or_else(|e| {
+    myco::build_model(catalog_model, harness, debug_dump_api_requests, effort).unwrap_or_else(|e| {
         eprintln!("Failed to create model: {e}");
         std::process::exit(1);
     })
@@ -471,6 +446,8 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_repl(
+    repl: &Repl,
+    live: &Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -551,6 +528,8 @@ async fn run_repl(
         if let Some(cmd) = parse_meta(&input) {
             if matches!(cmd, MetaCommand::Compact) {
                 run_compact(
+                    repl,
+                    live,
                     agent,
                     session,
                     editor,
@@ -563,6 +542,8 @@ async fn run_repl(
             }
             handle_meta(
                 cmd,
+                repl,
+                live,
                 agent,
                 session,
                 editor,
@@ -707,7 +688,10 @@ async fn run_user_turn(
 // Compaction
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact(
+    repl: &Repl,
+    live: &Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -834,8 +818,10 @@ async fn run_compact(
     if let Err(e) = save_readline_history(editor, session) {
         eprintln!("warning: could not save history: {e}");
     }
+    let old_id = session.id();
     session.replace(successor.clone());
     agent.set_history(successor.messages.clone());
+    repl.rekey_live_session(&old_id, live);
     reload_readline_history(editor, session);
     clear_and_reprint(agent, palette);
     println!(
@@ -902,6 +888,8 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
 #[allow(clippy::too_many_arguments)]
 fn handle_meta(
     cmd: MetaCommand<'_>,
+    repl: &Repl,
+    live: &Arc<myco::LiveSession>,
     agent: &mut Agent,
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -924,8 +912,10 @@ fn handle_meta(
         MetaCommand::Hosts => print_host_status(harness),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
+            let old_id = session.id();
             session.replace(Session::new(catalog_model.spec.key.clone()));
             agent.set_history(Vec::new());
+            repl.rekey_live_session(&old_id, live);
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
             clear_and_reprint(agent, palette);
@@ -935,7 +925,9 @@ fn handle_meta(
             save_before_switch(agent, session, editor);
             match resolve_resume_session(arg) {
                 Ok(loaded) => {
+                    let old_id = session.id();
                     install_session(agent, editor, session, &loaded);
+                    repl.rekey_live_session(&old_id, live);
                     println!(
                         "resumed session={}  messages={}",
                         session.id(),

@@ -1,7 +1,8 @@
 //! Root-only tool: session metadata + agent-process meta (executable path).
 //!
-//! Installed on the in-process local worker only (not remotes). Bound to the
-//! interactive process's [`ActiveSession`].
+//! Installed on the in-process local worker only (not remotes). Resolves the
+//! interactive [`ActiveSession`] via an [`ActiveSessionResolver`] (single
+//! session for the CLI; multi-session registry for the server).
 
 use std::sync::Arc;
 
@@ -13,7 +14,18 @@ use crate::session::{
     list_sessions_filtered, normalize_pr_url, parse_pr_fields,
 };
 
-use super::{HostDispatchContext, ToolService};
+use super::{ActiveSessionResolver, HostDispatchContext, ToolService};
+
+/// Always resolves to one fixed [`ActiveSession`] (CLI / unit tests).
+struct FixedSessionResolver {
+    active: ActiveSession,
+}
+
+impl ActiveSessionResolver for FixedSessionResolver {
+    fn resolve(&self, _agent_id: uuid::Uuid) -> Option<ActiveSession> {
+        Some(self.active.clone())
+    }
+}
 
 const TOOL_DESCRIPTION: &str = r#"
 Read and update Myco conversation session metadata, and inspect the running agent binary.
@@ -43,14 +55,28 @@ title; do not leave a stale first-line title for long work. When you create a wo
 open/receive a PR, add_link it (absolute path + host for worktrees).
 "#;
 
-/// Local tool bound to the interactive process's [`ActiveSession`].
+/// Local tool that resolves the caller's session via an [`ActiveSessionResolver`].
 pub struct SessionMetaTool {
-    active: ActiveSession,
+    resolver: Arc<dyn ActiveSessionResolver>,
 }
 
 impl SessionMetaTool {
+    /// Bind to a single active session (CLI / tests). Ignores `agent_id`.
     pub fn new(active: ActiveSession) -> Self {
-        Self { active }
+        Self {
+            resolver: Arc::new(FixedSessionResolver { active }),
+        }
+    }
+
+    /// Multi-session / registry-backed resolution by `agent_id`.
+    pub fn with_resolver(resolver: Arc<dyn ActiveSessionResolver>) -> Self {
+        Self { resolver }
+    }
+
+    fn resolve_active(&self, agent_id: uuid::Uuid) -> Result<ActiveSession, String> {
+        self.resolver
+            .resolve(agent_id)
+            .ok_or_else(|| format!("session_meta: no active session for agent_id={agent_id}"))
     }
 }
 
@@ -66,7 +92,7 @@ impl ToolService for SessionMetaTool {
     fn dispatch_tool_use(
         self: Arc<Self>,
         tool_use: generative_model::ToolUse,
-        _ctx: HostDispatchContext,
+        ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input.clone()) {
@@ -75,7 +101,7 @@ impl ToolService for SessionMetaTool {
                     return ToolResult::err(format!("invalid session_meta input: {e}"));
                 }
             };
-            match self.execute(input) {
+            match self.execute(input, ctx.agent_id) {
                 Ok(text) => ToolResult::text(text),
                 Err(e) => ToolResult::err(e),
             }
@@ -84,27 +110,27 @@ impl ToolService for SessionMetaTool {
 }
 
 impl SessionMetaTool {
-    fn execute(&self, input: Input) -> Result<String, String> {
+    fn execute(&self, input: Input, agent_id: uuid::Uuid) -> Result<String, String> {
         let action = input.action.clone().unwrap_or(ActionKind::Get);
         match action {
-            ActionKind::Get => self.action_get(input.session_id.as_deref()),
+            ActionKind::Get => self.action_get(agent_id, input.session_id.as_deref()),
             ActionKind::List => {
                 self.action_list(input.limit, input.include_hidden.unwrap_or(false))
             }
-            ActionKind::SetTitle => self.action_set_title(input.title),
+            ActionKind::SetTitle => self.action_set_title(agent_id, input.title),
             ActionKind::SetScratchpad => {
                 let text = input.scratchpad.unwrap_or_default();
-                self.action_set_scratchpad(text)
+                self.action_set_scratchpad(agent_id, text)
             }
-            ActionKind::AddLink => self.action_add_link(input),
-            ActionKind::RemoveLink => self.action_remove_link(input),
+            ActionKind::AddLink => self.action_add_link(agent_id, input),
+            ActionKind::RemoveLink => self.action_remove_link(agent_id, input),
             ActionKind::ExecutablePath => self.action_executable_path(),
         }
     }
 
-    fn action_get(&self, session_id: Option<&str>) -> Result<String, String> {
+    fn action_get(&self, agent_id: uuid::Uuid, session_id: Option<&str>) -> Result<String, String> {
         let session = match session_id {
-            None => self.active.snapshot(),
+            None => self.resolve_active(agent_id)?.snapshot(),
             Some(id) => Session::load_by_id_or_prefix(id)?,
         };
         // For current session, path/title reflect in-memory state (may be newer than disk).
@@ -139,8 +165,13 @@ impl SessionMetaTool {
         Ok(out)
     }
 
-    fn action_set_title(&self, title: Option<String>) -> Result<String, String> {
-        self.active.with_mut(|session| {
+    fn action_set_title(
+        &self,
+        agent_id: uuid::Uuid,
+        title: Option<String>,
+    ) -> Result<String, String> {
+        let active = self.resolve_active(agent_id)?;
+        active.with_mut(|session| {
             let cleared = title.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true);
             if cleared {
                 session.set_title(None)?;
@@ -161,8 +192,9 @@ impl SessionMetaTool {
         })
     }
 
-    fn action_set_scratchpad(&self, text: String) -> Result<String, String> {
-        self.active.with_mut(|session| {
+    fn action_set_scratchpad(&self, agent_id: uuid::Uuid, text: String) -> Result<String, String> {
+        let active = self.resolve_active(agent_id)?;
+        active.with_mut(|session| {
             session.set_scratchpad(text)?;
             session.touch();
             session.save()?;
@@ -174,7 +206,7 @@ impl SessionMetaTool {
         })
     }
 
-    fn action_add_link(&self, input: Input) -> Result<String, String> {
+    fn action_add_link(&self, agent_id: uuid::Uuid, input: Input) -> Result<String, String> {
         let kind = input
             .link_kind
             .ok_or_else(|| "add_link requires link_kind (github_pr | worktree)".to_string())?;
@@ -211,7 +243,8 @@ impl SessionMetaTool {
             }
         };
 
-        self.active.with_mut(|session| {
+        let active = self.resolve_active(agent_id)?;
+        active.with_mut(|session| {
             session.upsert_link(link.clone())?;
             session.touch();
             session.save()?;
@@ -224,8 +257,9 @@ impl SessionMetaTool {
         })
     }
 
-    fn action_remove_link(&self, input: Input) -> Result<String, String> {
-        self.active.with_mut(|session| {
+    fn action_remove_link(&self, agent_id: uuid::Uuid, input: Input) -> Result<String, String> {
+        let active = self.resolve_active(agent_id)?;
+        active.with_mut(|session| {
             let removed = if let Some(index) = input.index {
                 session.remove_link_at(index)?
             } else if input.url.is_some() || input.host.is_some() {

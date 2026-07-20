@@ -6,6 +6,7 @@ pub mod harness;
 pub mod host;
 pub mod manual;
 pub mod prompts;
+pub mod repl;
 pub mod session;
 pub mod text_search;
 pub mod tool_services;
@@ -22,6 +23,7 @@ pub use harness::{
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
+pub use repl::{LiveSession, Repl, SYSTEM_PROMPT_PROLOGUE, SessionRegistry, build_model};
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,
     ConsoleLog, EventSink, NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
@@ -30,6 +32,6 @@ pub use session::{
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ManualService, MemoryService, SessionHistoryTool,
-    SessionMetaTool, TextSearchToolService, ToolService,
+    ActiveSessionResolver, BrowserService, HostDispatchContext, ManualService, MemoryService,
+    SessionHistoryTool, SessionMetaTool, TextSearchToolService, ToolService,
 };
