@@ -5,6 +5,7 @@
 //! Sole test in its own binary so the process-global `MYCO_HOME` override does
 //! not race other tests.
 
+use myco::tui::{ConsoleTuiSink, Style, TuiEvent, TuiSink};
 use myco::{ActiveSession, ConsoleLog, Session};
 
 #[test]
@@ -51,6 +52,26 @@ fn mirror_strips_ansi_and_follows_session_swap() {
     let disabled = ConsoleLog::new(ActiveSession::new(third), /*enabled*/ false);
     disabled.append("should not appear\n");
     assert!(!third_console.exists());
+
+    // TuiEvent path (design sketch): a ConsoleTuiSink subscribed to the TUI
+    // stream lands plain text in the same {id}.console file — style events
+    // are simply never encoded, no stripping involved.
+    let fourth = Session::new("m");
+    let fourth_console = fourth.console_path();
+    let sink = ConsoleTuiSink::new(ConsoleLog::new(
+        ActiveSession::new(fourth),
+        /*enabled*/ true,
+    ));
+    sink.emit(&[
+        TuiEvent::Style(Style::USER),
+        TuiEvent::Text("USER 0/100\n".into()),
+        TuiEvent::Style(Style::RESET),
+        TuiEvent::Text("hi **there**\n".into()),
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(&fourth_console).unwrap(),
+        "USER 0/100\nhi **there**\n"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

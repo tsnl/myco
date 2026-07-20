@@ -9,6 +9,7 @@ pub mod prompts;
 pub mod session;
 pub mod text_search;
 pub mod tool_services;
+pub mod tui;
 
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode};
 pub use core::CancelToken;
