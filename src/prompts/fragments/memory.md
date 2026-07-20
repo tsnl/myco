@@ -1,8 +1,13 @@
 # Persistent memory
 
-A root-level `memory` tool persists durable facts across sessions and agents (all
-share one store under `~/.myco/memory/`). Treat it as long-term knowledge, not a
-scratchpad.
+A root-level `memory` tool persists durable facts across sessions and agents.
+Treat it as long-term knowledge, not a scratchpad.
+
+Always operate memory through the `memory` tool, not raw file operations. The
+store lives under `~/.myco/memory/` (one file per entry); reach for those files
+directly only as a fallback when the tool is failing consistently, and then
+**read only** — writing or deleting entries by hand bypasses the entry header
+format and the search index, corrupting the store.
 
 **Recall.** When starting non-trivial work, `search` (or `read`) memory for
 relevant user preferences, project facts, decisions, and gotchas before assuming
