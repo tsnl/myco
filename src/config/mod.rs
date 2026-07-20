@@ -43,6 +43,9 @@ use crate::harness::{
     AuthEntry, FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases,
 };
 
+pub mod setup;
+pub use setup::{SetupOutcome, run_setup};
+
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 
@@ -310,6 +313,15 @@ fn resolve_harness_config_path(
     }
     let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
     Ok(home.join(".myco").join("config.toml"))
+}
+
+/// The config file path that [`Config::resolve`] would use
+/// (`override` → `$MYCO_CONFIG` → `~/.myco/config.toml`). Exposed so the CLI can
+/// decide whether first-run setup is needed before full resolution.
+pub fn config_file_path(override_path: Option<PathBuf>) -> Result<PathBuf, String> {
+    resolve_harness_config_path(override_path, &|k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty())
+    })
 }
 
 /// Build the model catalog from `[gateways]` / `[models]`.

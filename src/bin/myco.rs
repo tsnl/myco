@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{IsTerminal, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -21,9 +21,10 @@ use myco::session::{
     user_rule, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
-    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, prompts, uuid_simple_hex,
+    Agent, AgentEvent, AskUserTool, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
+    MemoryService, NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, SetupOutcome,
+    StartupPreflight, TerminalPrompt, TraceContext, WrapMode, config_file_path, load_file_config,
+    prompts, run_setup, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -116,6 +117,11 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Run the guided setup wizard to (re)write the model catalog, then exit.
+    /// Runs automatically on first launch when no models are configured.
+    #[arg(long)]
+    setup: bool,
+
     /// Color output (auto|always|never). Auto colors only when stdout is a TTY
     /// and respects NO_COLOR / CLICOLOR_FORCE.
     #[arg(long, value_name = "WHEN", value_parser = parse_color_arg, default_value_t = ColorMode::Auto)]
@@ -185,7 +191,65 @@ async fn run_host(args: Args) {
     }
 }
 
+/// First-run / `--setup` handling. Returns `true` to continue into the REPL,
+/// `false` when the caller should stop (explicit `--setup` finished, or the user
+/// kept an existing config). Fatal errors exit the process directly.
+fn maybe_run_setup(args: &Args) -> bool {
+    let config_path = match config_file_path(args.config.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("config: {e}");
+            std::process::exit(2);
+        }
+    };
+    let configured_models = match load_file_config(&config_path) {
+        Ok(file) => file.models.len(),
+        // A malformed config is not "no models": don't auto-launch a wizard that
+        // would overwrite it. Let Config::resolve report the parse error. An
+        // explicit `--setup` still proceeds (the user asked to rewrite it).
+        Err(_) if !args.setup => return true,
+        Err(_) => 0,
+    };
+    if !args.setup && configured_models > 0 {
+        return true; // Catalog already present: straight to the REPL.
+    }
+
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !interactive {
+        if args.setup {
+            eprintln!("--setup needs an interactive terminal");
+            std::process::exit(2);
+        }
+        // No models and no terminal: let Config::resolve emit the actionable
+        // "no models configured" error below.
+        return true;
+    }
+
+    match run_setup(&TerminalPrompt::new(), &config_path) {
+        Ok(SetupOutcome::Written(path)) => {
+            println!("Wrote {}.", path.display());
+            if args.setup {
+                return false; // Explicit setup is a one-shot; re-run `myco` to use it.
+            }
+            println!();
+            true
+        }
+        // Only reached via `--setup` on an already-populated config.
+        Ok(SetupOutcome::Declined) => false,
+        Err(e) => {
+            eprintln!("setup: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 async fn run_interactive(args: Args) {
+    // First-run / `--setup`: myco ships no models, so an empty catalog has
+    // nothing to run. Walk the user through writing one before resolving.
+    if !maybe_run_setup(&args) {
+        return;
+    }
+
     // One explicit resolution step: model catalog (gateways/models + auth),
     // harness hosts and default model key (--config → $MYCO_CONFIG →
     // ~/.myco/config.toml), and the color decision. Everything downstream
@@ -242,9 +306,12 @@ async fn run_interactive(args: Args) {
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let memory_tool = Arc::new(MemoryService::new()) as Arc<dyn myco::ToolService>;
+    // Root-only: `ask_user` needs the interactive terminal, so it never installs on remotes.
+    let prompter: Arc<dyn myco::Prompt> = Arc::new(TerminalPrompt::new());
+    let ask_user_tool = Arc::new(AskUserTool::new(prompter)) as Arc<dyn myco::ToolService>;
     let harness = Harness::attach_with_root_services(
         app_config.harness.clone(),
-        vec![session_tool, history_tool, memory_tool],
+        vec![session_tool, history_tool, memory_tool, ask_user_tool],
     )
     .await
     .unwrap_or_else(|e| {

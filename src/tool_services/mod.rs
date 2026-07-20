@@ -25,6 +25,9 @@ pub use memory_service::MemoryService;
 pub mod meta_tool_service;
 pub use meta_tool_service::SessionMetaTool;
 
+pub mod ask_user_service;
+pub use ask_user_service::AskUserTool;
+
 pub mod session_history_service;
 pub use session_history_service::SessionHistoryTool;
 
