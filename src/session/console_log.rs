@@ -108,8 +108,10 @@ fn open_console_file(id: &str) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// Streaming stripper for ANSI escape sequences (`ESC [ … final`, plus lone
-/// two-byte `ESC x`). State carries across [`Self::strip_into`] calls so a
+/// Streaming stripper for ANSI escape sequences: CSI (`ESC [ … final`), OSC
+/// (`ESC ] … ST`, e.g. the OSC 8 hyperlinks the markdown renderer emits — the
+/// *visible* link text is outside the sequence and survives), plus lone
+/// two-byte `ESC x`. State carries across [`Self::strip_into`] calls so a
 /// sequence split across chunk boundaries is still removed. Operates on bytes:
 /// escape bytes are ASCII, so multibyte UTF-8 passes through untouched and the
 /// output stays valid UTF-8.
@@ -122,10 +124,14 @@ struct AnsiStripper {
 enum StripState {
     #[default]
     Normal,
-    /// Saw `ESC`; awaiting `[` (CSI) or a final byte (other escape).
+    /// Saw `ESC`; awaiting `[` (CSI), `]` (OSC), or a final byte (other escape).
     Esc,
     /// Inside a CSI sequence; consume until the final byte `0x40..=0x7E`.
     Csi,
+    /// Inside an OSC sequence; consume until BEL or the `ESC \` string terminator.
+    Osc,
+    /// Saw `ESC` inside an OSC; a `\` completes the `ST` terminator.
+    OscEsc,
 }
 
 impl AnsiStripper {
@@ -140,19 +146,30 @@ impl AnsiStripper {
                         StripState::Normal
                     }
                 }
-                StripState::Esc => {
-                    if b == b'[' {
-                        StripState::Csi
-                    } else {
-                        // Lone two-byte escape (e.g. `ESC c`): drop this byte too.
-                        StripState::Normal
-                    }
-                }
+                StripState::Esc => match b {
+                    b'[' => StripState::Csi,
+                    b']' => StripState::Osc,
+                    // Lone two-byte escape (e.g. `ESC c`): drop this byte too.
+                    _ => StripState::Normal,
+                },
                 StripState::Csi => {
                     if (0x40..=0x7e).contains(&b) {
                         StripState::Normal
                     } else {
                         StripState::Csi
+                    }
+                }
+                StripState::Osc => match b {
+                    0x07 => StripState::Normal, // BEL terminator
+                    0x1b => StripState::OscEsc, // maybe `ESC \` (ST)
+                    _ => StripState::Osc,
+                },
+                StripState::OscEsc => {
+                    if b == b'\\' {
+                        StripState::Normal
+                    } else {
+                        // Not the ST after all; stay inside the OSC.
+                        StripState::Osc
                     }
                 }
             };
@@ -179,6 +196,22 @@ mod tests {
         assert_eq!(strip(&["plain text\n"]), "plain text\n");
         // Cursor-movement CSI (would only appear defensively) is removed too.
         assert_eq!(strip(&["a\x1b[2Kb\x1b[3Jc"]), "abc");
+    }
+
+    #[test]
+    fn strips_osc8_hyperlink_keeping_visible_text() {
+        // OSC 8 open + close (ST = `ESC \`): the link text survives, escapes go.
+        assert_eq!(
+            strip(&["\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\"]),
+            "docs"
+        );
+        // Mixed with SGR and split across chunks mid-URL.
+        assert_eq!(
+            strip(&["a \x1b]8;;https://ex", ".com/p\x1b\\link\x1b]8;;\x1b\\ b"]),
+            "a link b"
+        );
+        // BEL-terminated OSC form is stripped too.
+        assert_eq!(strip(&["x\x1b]8;;u\x07t\x1b]8;;\x07y"]), "xty");
     }
 
     #[test]

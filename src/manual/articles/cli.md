@@ -45,13 +45,16 @@ issues; hosts via `/hosts`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
-  (`**bold**`, `*italic*`, `` `code` ``, `#` headers) when stdout is a TTY.
+  when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
+  delimiters *removed* (the styling conveys them), `#` headers keep their
+  markers, and `[text](url)` becomes a clickable OSC 8 hyperlink over `text`.
   `--wrap auto|off|COLS` sets a width *cap* (auto = 80); the effective width
   is min(cap, terminal width), re-measured every prompt — after a resize the
-  dialog is cleared and reprinted at the new width (same as Ctrl-L). Styling
-  is additive-only: delimiters stay visible, content bytes are never dropped.
-  Fenced code blocks and 4-space-indented lines are never wrapped or styled.
-  Piped output is never wrapped, so `myco | tee` stays byte-faithful.
+  dialog is cleared and reprinted at the new width (same as Ctrl-L). Fenced
+  code blocks and 4-space-indented lines are never wrapped or styled.
+  With styling off (`--color never`, `NO_COLOR`, non-TTY) rendering is exact
+  identity — delimiters and link syntax print verbatim — so `myco | tee` and
+  the console mirror stay byte-faithful.
 - On submit, the typed input echo is replaced with a word-wrapped copy
   (wrap-only, exactly as typed — the edit line is the one region the CLI
   repaints). Replay (`/resume`, Ctrl-L) wraps user turns the same way.

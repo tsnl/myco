@@ -165,11 +165,15 @@ pub enum Region {
 ///   decisions applied, **never** any escape byte;
 /// - `Style` carries semantics, not bytes — each sink chooses its encoding
 ///   (SGR, nothing, HTML classes, …);
+/// - `Link` opens (`Some(url)`) or closes (`None`) a hyperlink over the
+///   following `Text`; like `Style` it is presentation, not content (a
+///   terminal sink emits OSC 8, a plain sink emits nothing);
 /// - `Begin` is zero-width intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiEvent {
     Begin(Region),
     Style(Style),
+    Link(Option<String>),
     Text(String),
 }
 
@@ -184,8 +188,9 @@ pub trait TuiSink: Send + Sync {
     fn emit(&self, events: &[TuiEvent]);
 }
 
-/// Encode for a terminal: `Text` verbatim, `Style` as SGR when `styled`
-/// (the `--color` decision), `Begin` dropped.
+/// Encode for a terminal: `Text` verbatim, `Style` as SGR and `Link` as OSC 8
+/// when `styled` (the `--color` decision), `Begin` dropped. When not styled a
+/// link degrades to its plain visible text (the `Text` events pass through).
 pub fn encode_ansi(events: &[TuiEvent], styled: bool) -> String {
     let mut out = String::new();
     for event in events {
@@ -194,6 +199,17 @@ pub fn encode_ansi(events: &[TuiEvent], styled: bool) -> String {
             TuiEvent::Style(style) => {
                 if styled {
                     out.push_str(&style.sgr());
+                }
+            }
+            TuiEvent::Link(target) => {
+                if styled {
+                    // OSC 8 hyperlink: `ESC ] 8 ; ; <uri> ST`; close is the
+                    // same with an empty uri. ST is `ESC \`.
+                    out.push_str("\x1b]8;;");
+                    if let Some(url) = target {
+                        out.push_str(url);
+                    }
+                    out.push_str("\x1b\\");
                 }
             }
             TuiEvent::Begin(_) => {}
@@ -597,6 +613,24 @@ mod tests {
         };
         assert_eq!(bold_code.sgr(), "\x1b[0;1;36m");
         assert_eq!(Style::RESET.sgr(), "\x1b[0m");
+    }
+
+    #[test]
+    fn link_event_encodes_osc8_only_when_styled() {
+        let events = vec![
+            TuiEvent::Link(Some("https://ex.test/p".into())),
+            TuiEvent::Text("docs".into()),
+            TuiEvent::Link(None),
+        ];
+        // Styled: OSC 8 open (`ESC ] 8 ; ; uri ST`) around the text, then close.
+        assert_eq!(
+            encode_ansi(&events, true),
+            "\x1b]8;;https://ex.test/p\x1b\\docs\x1b]8;;\x1b\\"
+        );
+        // Not styled: link degrades to its plain visible text.
+        assert_eq!(encode_ansi(&events, false), "docs");
+        // Plain encoding never emits the escape either.
+        assert_eq!(encode_plain(&events), "docs");
     }
 
     #[test]
