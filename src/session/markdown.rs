@@ -1,4 +1,4 @@
-//! Streaming Markdown → ANSI renderer with fence-aware word wrap.
+//! Streaming Markdown renderer with fence-aware word wrap.
 //!
 //! Feed arbitrary UTF-8 chunks ([`MarkdownRenderer::feed`]); deltas may split
 //! anywhere, including inside a delimiter run. Two invariants:
@@ -10,6 +10,15 @@
 //! - **Disabled = identity**: styling off and wrap off ⇒ output is
 //!   byte-identical to input (the non-TTY / [`Palette::plain`] guarantee).
 //!
+//! Internally the renderer is event-first: it produces a [`TuiEvent`] stream
+//! in which content ([`TuiEvent::Text`], escape-free, wrap applied) and style
+//! state ([`TuiEvent::Style`], semantic) are separate variants
+//! ([`MarkdownRenderer::feed_events`] / [`MarkdownRenderer::finish_events`]).
+//! The String API ([`MarkdownRenderer::feed`] / [`MarkdownRenderer::finish`])
+//! is a facade that SGR-encodes that stream ([`crate::tui::encode_ansi`]),
+//! gated by the palette's `enabled` flag — bytes are unchanged from the
+//! pre-event renderer.
+//!
 //! Supported: `**` / `*` emphasis toggles (with a light flanking check),
 //! `` ` `` inline code, ATX headers, fenced code blocks (never styled, never
 //! wrapped), indented (4-space) lines verbatim, list hanging indent.
@@ -19,6 +28,7 @@
 use unicode_width::UnicodeWidthChar;
 
 use super::transcript::Palette;
+use crate::tui::{Color, Style, TuiEvent, encode_ansi};
 
 /// What the current physical line is, decided from its first characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,15 +43,17 @@ enum Line {
 
 #[derive(Debug)]
 pub struct MarkdownRenderer {
+    /// Whether the String facade ([`Self::feed`]) encodes `Style` events as
+    /// SGR. The event path always carries them; encoders decide.
     styled: bool,
     wrap: Option<usize>,
-    /// SGR attributes applied under all markdown styles (e.g. `"2"` keeps
-    /// thinking paragraphs dim). Empty for normal text.
-    base: &'static str,
+    /// Style applied under all markdown styles (e.g. dim keeps thinking
+    /// paragraphs dim). Default for normal text.
+    base: Style,
 
-    out: String,
-    /// Last SGR emitted, to skip redundant escapes. `None` → none yet.
-    last_sgr: Option<String>,
+    out: Vec<TuiEvent>,
+    /// Last style emitted, to skip redundant events. `None` → none yet.
+    last_style: Option<Style>,
     /// Last visible char pushed to `out` was a newline (or nothing yet).
     emitted_line_start: bool,
 
@@ -66,6 +78,10 @@ pub struct MarkdownRenderer {
 
     col: usize,
     word: String,
+    /// Style changes queued at byte offsets inside the pending `word`, so
+    /// style events ride the wrap decision with it and never dangle across a
+    /// break (the event-form of splicing SGR into the word buffer).
+    word_marks: Vec<(usize, Style)>,
     word_width: usize,
     spaces: usize,
     hang: usize,
@@ -79,14 +95,20 @@ impl MarkdownRenderer {
     }
 
     /// Renderer whose resets return to `base` SGR attributes instead of plain
-    /// (e.g. `"2"` for dim thinking paragraphs). The base is emitted up front.
+    /// (`"2"` for dim thinking paragraphs — the only non-empty base in use).
+    /// The base is emitted up front.
     pub fn with_base(palette: Palette, base: &'static str) -> Self {
+        debug_assert!(base.is_empty() || base == "2", "unsupported base {base:?}");
+        let base = Style {
+            dim: base == "2",
+            ..Style::RESET
+        };
         let mut r = Self {
             styled: palette.enabled,
             wrap: palette.wrap,
             base,
-            out: String::new(),
-            last_sgr: None,
+            out: Vec::new(),
+            last_style: None,
             emitted_line_start: true,
             bold: false,
             italic: false,
@@ -101,28 +123,43 @@ impl MarkdownRenderer {
             run: None,
             col: 0,
             word: String::new(),
+            word_marks: Vec::new(),
             word_width: 0,
             spaces: 0,
             hang: 0,
             overflow: false,
         };
-        if r.styled && !base.is_empty() {
-            let sgr = r.sgr_string();
-            r.out.push_str(&sgr);
-            r.last_sgr = Some(sgr);
+        if r.base != Style::RESET {
+            r.out.push(TuiEvent::Style(r.base));
+            r.last_style = Some(r.base);
         }
         r
     }
 
+    /// String facade: SGR-encode the event stream (escapes only when the
+    /// palette enabled styling).
     pub fn feed(&mut self, chunk: &str) -> String {
+        let events = self.feed_events(chunk);
+        encode_ansi(&events, self.styled)
+    }
+
+    /// Event path: content and style state as separate [`TuiEvent`] variants.
+    /// `Text` events never contain escape bytes.
+    pub fn feed_events(&mut self, chunk: &str) -> Vec<TuiEvent> {
         for c in chunk.chars() {
             self.push_char(c);
         }
         std::mem::take(&mut self.out)
     }
 
-    /// Flush pending word/run and close any open styling.
+    /// Flush pending word/run and close any open styling (String facade).
     pub fn finish(&mut self) -> String {
+        let events = self.finish_events();
+        encode_ansi(&events, self.styled)
+    }
+
+    /// Event-path [`Self::finish`].
+    pub fn finish_events(&mut self) -> Vec<TuiEvent> {
         match self.line {
             Line::Prefix if self.fence.is_none() => self.end_prefix(None),
             _ => {
@@ -134,8 +171,9 @@ impl MarkdownRenderer {
         self.resolve_run(None);
         self.flush_word();
         self.emit_spaces();
-        if self.styled && self.last_sgr.as_deref().is_some_and(|s| s != "\x1b[0m") {
-            self.out.push_str("\x1b[0m");
+        if self.last_style.is_some_and(|s| s != Style::RESET) {
+            self.out.push(TuiEvent::Style(Style::RESET));
+            self.last_style = Some(Style::RESET);
         }
         std::mem::take(&mut self.out)
     }
@@ -208,7 +246,7 @@ impl MarkdownRenderer {
         {
             self.line = Line::Body;
             self.header = true;
-            self.emit_sgr();
+            self.emit_style();
             self.replay_literal(&prefix);
             self.inline_char(c);
             return;
@@ -347,7 +385,7 @@ impl MarkdownRenderer {
         self.emit_spaces();
         if self.header {
             self.header = false;
-            self.emit_sgr();
+            self.emit_style();
         }
         if !self.line_has_content && (self.bold || self.italic || self.code) {
             // Blank line = paragraph boundary: drop unclosed inline styles so a
@@ -355,7 +393,7 @@ impl MarkdownRenderer {
             self.bold = false;
             self.italic = false;
             self.code = false;
-            self.emit_sgr();
+            self.emit_style();
         }
         self.flush_word(); // style codes queued above ride out before the break
         self.out_ch('\n');
@@ -431,7 +469,7 @@ impl MarkdownRenderer {
         if code {
             self.code = !self.code;
         }
-        self.emit_sgr();
+        self.emit_style();
     }
 
     fn add_content_char(&mut self, c: char) {
@@ -441,11 +479,8 @@ impl MarkdownRenderer {
         self.prev_char = Some(c);
         let w = UnicodeWidthChar::width(c).unwrap_or(0);
         if self.overflow {
-            if !self.word.is_empty() {
-                let word = std::mem::take(&mut self.word);
-                self.out_str(&word);
-                self.col += self.word_width;
-                self.word_width = 0;
+            if !self.word.is_empty() || !self.word_marks.is_empty() {
+                self.emit_word_raw();
             }
             self.out_ch(c);
             self.col += w;
@@ -464,7 +499,7 @@ impl MarkdownRenderer {
     // -- wrap machinery -----------------------------------------------------
 
     fn flush_word(&mut self) {
-        if self.word.is_empty() {
+        if self.word.is_empty() && self.word_marks.is_empty() {
             return;
         }
         if let Some(width) = self.wrap
@@ -483,8 +518,25 @@ impl MarkdownRenderer {
             self.col = hang;
         }
         self.emit_spaces();
+        self.emit_word_raw();
+    }
+
+    /// Emit the pending word, interleaving queued style marks at their byte
+    /// offsets (the wrap decision, if any, has already been made).
+    fn emit_word_raw(&mut self) {
         let word = std::mem::take(&mut self.word);
-        self.out_str(&word);
+        let marks = std::mem::take(&mut self.word_marks);
+        let mut pos = 0;
+        for (off, style) in marks {
+            if off > pos {
+                self.out_str(&word[pos..off]);
+                pos = off;
+            }
+            self.out.push(TuiEvent::Style(style));
+        }
+        if pos < word.len() {
+            self.out_str(&word[pos..]);
+        }
         self.col += self.word_width;
         self.word_width = 0;
     }
@@ -499,58 +551,58 @@ impl MarkdownRenderer {
 
     // -- styling ------------------------------------------------------------
 
-    fn sgr_string(&self) -> String {
-        let mut attrs: Vec<&str> = Vec::new();
-        if !self.base.is_empty() {
-            attrs.push(self.base);
-        }
-        if self.header || self.bold {
-            attrs.push("1");
-        }
-        if self.italic {
-            attrs.push("3");
-        }
-        if self.code {
-            attrs.push("36");
-        }
-        if attrs.is_empty() {
-            "\x1b[0m".to_string()
-        } else {
-            format!("\x1b[0;{}m", attrs.join(";"))
+    /// The semantic style for the current toggle state, merged over `base`.
+    /// SGR encoding ([`Style::sgr`]) reproduces the historical attribute
+    /// order: dim, bold (header or `**`), italic, color.
+    fn current_style(&self) -> Style {
+        Style {
+            dim: self.base.dim,
+            bold: self.base.bold || self.header || self.bold,
+            italic: self.base.italic || self.italic,
+            color: if self.code {
+                Some(Color::Cyan)
+            } else {
+                self.base.color
+            },
         }
     }
 
-    /// Queue the SGR for the current style state (zero display width). Rides
-    /// inside the pending word so escapes never dangle across a wrap break.
-    fn emit_sgr(&mut self) {
-        if !self.styled {
+    /// Queue a style event for the current state (zero display width). Rides
+    /// inside the pending word so styles never dangle across a wrap break.
+    fn emit_style(&mut self) {
+        let style = self.current_style();
+        if self.last_style == Some(style) {
             return;
         }
-        let sgr = self.sgr_string();
-        if self.last_sgr.as_deref() == Some(sgr.as_str()) {
-            return;
-        }
-        self.last_sgr = Some(sgr.clone());
+        self.last_style = Some(style);
         if self.overflow {
-            self.out.push_str(&sgr);
+            self.out.push(TuiEvent::Style(style));
         } else {
-            self.word.push_str(&sgr);
+            self.word_marks.push((self.word.len(), style));
         }
     }
 
     // -- output helpers (track visual line starts) --------------------------
 
     fn out_ch(&mut self, c: char) {
-        self.out.push(c);
         self.emitted_line_start = c == '\n';
+        if let Some(TuiEvent::Text(text)) = self.out.last_mut() {
+            text.push(c);
+        } else {
+            self.out.push(TuiEvent::Text(c.to_string()));
+        }
     }
 
     fn out_str(&mut self, s: &str) {
         if s.is_empty() {
             return;
         }
-        self.out.push_str(s);
         self.emitted_line_start = s.ends_with('\n');
+        if let Some(TuiEvent::Text(text)) = self.out.last_mut() {
+            text.push_str(s);
+        } else {
+            self.out.push(TuiEvent::Text(s.to_string()));
+        }
     }
 }
 
@@ -873,6 +925,65 @@ mod tests {
         assert!(r.ends_at_line_start());
         r.finish();
         assert!(!r.ends_at_line_start());
+    }
+
+    #[test]
+    fn event_stream_separates_style_from_content() {
+        let mut r = MarkdownRenderer::new(styled());
+        let mut events = r.feed_events("a **b** c");
+        events.extend(r.finish_events());
+        // Content never carries escape bytes; joined Text is the full input
+        // (additive-only: delimiters stay visible).
+        let mut content = String::new();
+        for e in &events {
+            if let TuiEvent::Text(text) = e {
+                assert!(!text.contains('\x1b'), "escape in Text: {text:?}");
+                content.push_str(text);
+            }
+        }
+        assert_eq!(content, "a **b** c");
+        // Style truth is semantic: bold on, then reset.
+        let styles: Vec<Style> = events
+            .iter()
+            .filter_map(|e| match e {
+                TuiEvent::Style(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            styles,
+            vec![
+                Style {
+                    bold: true,
+                    ..Style::RESET
+                },
+                Style::RESET
+            ]
+        );
+    }
+
+    #[test]
+    fn event_and_string_paths_agree_bytewise() {
+        let palette = Palette::colored(true).with_wrap(Some(14));
+        let inputs = [
+            "Some **bold words** wrap across a few lines here\n",
+            "# Header line that wraps\n\n- bullet with `code span` inside and more text\n",
+            "```\nfenced content stays put\n```\ntrailing prose after the fence block\n",
+        ];
+        for input in inputs {
+            // Char-chunked event stream, SGR-encoded, equals the String path.
+            let mut r = MarkdownRenderer::new(palette);
+            let mut events = Vec::new();
+            for c in input.chars() {
+                events.extend(r.feed_events(&c.to_string()));
+            }
+            events.extend(r.finish_events());
+            assert_eq!(
+                encode_ansi(&events, true),
+                render_block(input, palette),
+                "{input:?}"
+            );
+        }
     }
 
     fn strip_sgr(s: &str) -> String {
