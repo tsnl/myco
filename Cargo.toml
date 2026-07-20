@@ -22,7 +22,15 @@ dirs = "6"
 dotenvy = "0.15.7"
 futures = "0.3.32"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# rustls (webpki-roots) instead of the default native-tls backend so runtime
+# TLS is statically linked: platform-matched release binaries then carry no
+# dynamic dependency on the target host's system OpenSSL (see cargo-dist plan).
+# default-features=false drops `default-tls`; the other reqwest defaults
+# (charset, http2, system-proxy) are re-added so only the TLS backend changes.
+# `rustls-tls` bundles Mozilla's CA set in-binary (webpki-roots) — no system
+# trust store needed on minimal remotes. Swap to "rustls-tls-native-roots" if a
+# host must trust a custom/corporate CA from its OS trust store instead.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls"] }
 rustyline = "15"
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["serde_derive"] }
