@@ -196,7 +196,13 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(input);
+        let mut messages = convert_messages(input);
+        // Roll a cache breakpoint onto the last block so the growing conversation
+        // prefix is cached turn-over-turn (the system prompt carries the other
+        // breakpoint in `start_message_stream`). No-op when caching is disabled.
+        if self.backend.enable_prompt_caching {
+            apply_rolling_cache_breakpoint(&mut messages);
+        }
         let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
@@ -263,6 +269,7 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
                             .map(AnthropicContent::from)
                             .collect(),
                         is_error: result.is_error,
+                        cache_control: None,
                     })
                     .collect(),
             },
@@ -283,6 +290,7 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
                         id: tool_use.id.clone(),
                         name: tool_use.name.clone(),
                         input: tool_use.input.clone(),
+                        cache_control: None,
                     });
                 }
                 // A thinking-only turn (e.g. max_tokens hit mid-thinking)
@@ -775,22 +783,34 @@ struct AnthropicMessage {
 #[serde(tag = "type")]
 enum AnthropicContent {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
+    },
 
     #[serde(rename = "image")]
-    Image { source: AnthropicImageSource },
+    Image {
+        source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
+    },
 
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
     },
 
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {
         #[serde(default)]
         data: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
     },
 
     #[serde(rename = "tool_use")]
@@ -798,6 +818,8 @@ enum AnthropicContent {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
     },
 
     #[serde(rename = "tool_result")]
@@ -805,7 +827,42 @@ enum AnthropicContent {
         tool_use_id: String,
         content: Vec<AnthropicContent>,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+impl AnthropicContent {
+    /// Attach (or clear) an Anthropic cache breakpoint on this content block.
+    /// Anthropic caches the request prefix up to and including a block carrying
+    /// `cache_control`, so a breakpoint here marks everything before it as cacheable.
+    fn set_cache_control(&mut self, cc: Option<AnthropicCacheControl>) {
+        let slot = match self {
+            AnthropicContent::Text { cache_control, .. }
+            | AnthropicContent::Image { cache_control, .. }
+            | AnthropicContent::Thinking { cache_control, .. }
+            | AnthropicContent::RedactedThinking { cache_control, .. }
+            | AnthropicContent::ToolUse { cache_control, .. }
+            | AnthropicContent::ToolResult { cache_control, .. } => cache_control,
+        };
+        *slot = cc;
+    }
+}
+
+/// Put a rolling cache breakpoint on the final content block of the request.
+///
+/// Anthropic writes the prefix up to a `cache_control` block to its prompt cache
+/// and reads it back when a later request shares that prefix. Marking the last
+/// block each turn caches the entire conversation-so-far (system + tools + all
+/// prior turns, since those are covered by the earlier system breakpoint and this
+/// one); the next request reads it at ~0.1x input price and only the newest delta
+/// is billed in full. This is what makes multi-turn / tool-loop sessions cheap.
+fn apply_rolling_cache_breakpoint(messages: &mut [AnthropicMessage]) {
+    if let Some(last_msg) = messages.last_mut()
+        && let Some(last_block) = last_msg.content.last_mut()
+    {
+        last_block.set_cache_control(Some(AnthropicCacheControl::Ephemeral));
+    }
 }
 
 /// Wire form of Anthropic image `source`. Public `Content::Image.source` is an opaque
@@ -847,9 +904,13 @@ fn anthropic_image_source(source: String) -> AnthropicImageSource {
 impl From<Content> for AnthropicContent {
     fn from(content: Content) -> Self {
         match content {
-            Content::Text { text } => AnthropicContent::Text { text },
+            Content::Text { text } => AnthropicContent::Text {
+                text,
+                cache_control: None,
+            },
             Content::Image { source } => AnthropicContent::Image {
                 source: anthropic_image_source(source),
+                cache_control: None,
             },
             Content::Thinking {
                 text,
@@ -858,6 +919,7 @@ impl From<Content> for AnthropicContent {
             } => AnthropicContent::Thinking {
                 thinking: text,
                 signature,
+                cache_control: None,
             },
             Content::Thinking {
                 signature,
@@ -865,6 +927,7 @@ impl From<Content> for AnthropicContent {
                 ..
             } => AnthropicContent::RedactedThinking {
                 data: signature.unwrap_or_default(),
+                cache_control: None,
             },
         }
     }
@@ -952,7 +1015,7 @@ struct AnthropicSystemText<'a> {
     cache_control: Option<AnthropicCacheControl>,
 }
 
-#[derive(Debug, serde::Serialize, Clone, Copy)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 #[serde(tag = "type")]
 enum AnthropicCacheControl {
     #[serde(rename = "ephemeral")]
@@ -1022,9 +1085,82 @@ mod tests {
     fn test_content_serdes() {
         let content = AnthropicContent::Text {
             text: "Hello, world".to_string(),
+            cache_control: None,
         };
         let json = serde_json::to_string(&content).unwrap();
         assert_eq!(json, r#"{"type":"text","text":"Hello, world"}"#);
+    }
+
+    #[test]
+    fn rolling_cache_breakpoint_marks_only_last_block() {
+        let mut messages = vec![
+            AnthropicMessage {
+                role: AnthropicRole::User,
+                content: vec![AnthropicContent::Text {
+                    text: "hi".into(),
+                    cache_control: None,
+                }],
+            },
+            AnthropicMessage {
+                role: AnthropicRole::Assistant,
+                content: vec![AnthropicContent::Text {
+                    text: "yo".into(),
+                    cache_control: None,
+                }],
+            },
+            AnthropicMessage {
+                role: AnthropicRole::User,
+                content: vec![
+                    AnthropicContent::Text {
+                        text: "a".into(),
+                        cache_control: None,
+                    },
+                    AnthropicContent::Text {
+                        text: "b".into(),
+                        cache_control: None,
+                    },
+                ],
+            },
+        ];
+        apply_rolling_cache_breakpoint(&mut messages);
+        let json = serde_json::to_value(&messages).unwrap();
+        // Breakpoint lands on the very last block of the last message only.
+        assert_eq!(json[2]["content"][1]["cache_control"]["type"], "ephemeral");
+        assert!(json[2]["content"][0].get("cache_control").is_none());
+        assert!(json[0]["content"][0].get("cache_control").is_none());
+        assert!(json[1]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn rolling_cache_breakpoint_on_tool_result_leaves_nested_content_untouched() {
+        let mut messages = vec![AnthropicMessage {
+            role: AnthropicRole::User,
+            content: vec![AnthropicContent::ToolResult {
+                tool_use_id: "t1".into(),
+                content: vec![AnthropicContent::Text {
+                    text: "out".into(),
+                    cache_control: None,
+                }],
+                is_error: false,
+                cache_control: None,
+            }],
+        }];
+        apply_rolling_cache_breakpoint(&mut messages);
+        let json = serde_json::to_value(&messages).unwrap();
+        assert_eq!(json[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        // The nested tool-result body must not get its own breakpoint.
+        assert!(
+            json[0]["content"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rolling_cache_breakpoint_is_noop_on_empty_messages() {
+        let mut messages: Vec<AnthropicMessage> = Vec::new();
+        apply_rolling_cache_breakpoint(&mut messages);
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -1301,6 +1437,7 @@ mod tests {
             AnthropicContent::Thinking {
                 thinking,
                 signature,
+                ..
             } => {
                 assert_eq!(thinking, "secret plan");
                 assert_eq!(signature.as_deref(), Some("sig"));
@@ -1314,7 +1451,7 @@ mod tests {
             redacted: true,
         };
         match AnthropicContent::from(redacted) {
-            AnthropicContent::RedactedThinking { data } => assert_eq!(data, "opaque"),
+            AnthropicContent::RedactedThinking { data, .. } => assert_eq!(data, "opaque"),
             other => panic!("expected redacted_thinking, got {other:?}"),
         }
     }
