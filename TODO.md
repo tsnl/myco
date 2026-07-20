@@ -124,6 +124,11 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Invocation surface
 
+- [x] **Guided first-run setup** — auto on an empty catalog (and `myco --setup`): an
+      interactive wizard writes `~/.myco/config.toml` from a provider preset (provider +
+      API-key source + default model). Non-interactive with no models still prints the
+      actionable "no models configured" error rather than prompting. Wizard core is a pure
+      `render_config` validated against the real parser (`src/config/setup.rs`).
 - [ ] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
 - [ ] **User multimodal** — CLI path for images/files (`Content::Image` exists; CLI text-only;
       OpenAI image path thin).
@@ -134,6 +139,11 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 - [x] (REJECTED) **Todo / task-list tool** — durable checklist for long jobs (Claude TodoWrite-shaped).
   - Adds complexity. Can be achieved with a `TODO.md` file.
+- [x] **`ask_user` question tool** — root-only local tool (`src/tool_services/ask_user_service.rs`):
+  the agent asks the human a question (optional numbered options) and gets the typed answer back as
+  the tool result. Shares one terminal-prompt primitive (`src/interaction.rs`) with the setup
+  wizard; interactive terminal only (piped/headless → error result, so the agent falls back to
+  judgment). Prompt is TTY-gated and serialized; the blocking read is offloaded via `spawn_blocking`.
 - [ ] **Subagents: multi-turn + background**
   - Kick off N in background; optional multi-turn supervisor interaction
     (today: single-shot only; concurrent parent tools already work).

@@ -4,6 +4,7 @@ pub mod external_command;
 pub mod generative_model;
 pub mod harness;
 pub mod host;
+pub mod interaction;
 pub mod manual;
 pub mod prompts;
 pub mod session;
@@ -11,7 +12,9 @@ pub mod text_search;
 pub mod tool_services;
 pub mod tui;
 
-pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode};
+pub use config::{
+    ColorMode, Config, ConfigUserSettings, SetupOutcome, WrapMode, config_file_path, run_setup,
+};
 pub use core::CancelToken;
 pub use harness::{
     AgentRootHandles, ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController,
@@ -21,6 +24,7 @@ pub use harness::{
     ssh_config_host_aliases,
 };
 pub use host::HostWorker;
+pub use interaction::{Prompt, PromptError, Question, TerminalPrompt};
 pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,
@@ -30,6 +34,6 @@ pub use session::{
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ManualService, MemoryService, SessionHistoryTool,
-    SessionMetaTool, TextSearchToolService, ToolService,
+    AskUserTool, BrowserService, HostDispatchContext, ManualService, MemoryService,
+    SessionHistoryTool, SessionMetaTool, TextSearchToolService, ToolService,
 };

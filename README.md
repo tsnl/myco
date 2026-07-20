@@ -40,8 +40,12 @@ embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
 myco    # runs the default model from your config.toml; --model <key> to switch
 ```
 
-Configure your models first: myco ships none built in. `~/.myco/config.toml`
-holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
+The **first run** walks you through a guided setup — pick a provider, an
+API-key source, and a default model — and writes `~/.myco/config.toml` for you
+(re-run it anytime with `myco --setup`). myco ships no models built in;
+everything below is what that file holds and what you can edit by hand.
+
+`~/.myco/config.toml` holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
 Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
 pass to `--model`). The `auth` value is the token itself or a source such as
 `{ source = "env", var_name = "XAI_API_KEY" }` (`.env` in the cwd is loaded

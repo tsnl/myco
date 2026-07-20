@@ -35,6 +35,11 @@ issues; hosts via `/hosts`.
 - Models come from the `[gateways]` / `[models]` catalog in
   `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
   catalog key; default is config.toml `model`, or the sole configured entry.
+- **First run** (empty catalog) launches a guided setup wizard that writes
+  `~/.myco/config.toml` — pick a provider, an API-key source, and a default
+  model. Re-run it anytime with `myco --setup` (a one-shot: it writes, then
+  exits). A non-interactive run with no models prints the actionable
+  "no models configured" error instead of prompting.
 - A gateway holds `protocol` (`anthropic-messages` | `openai-responses`),
   `base_url`, and `auth` — the token itself as a string, or a source table:
   `{ source = "env", var_name = "…" }` / `{ source = "file", path = "…" }` /
