@@ -37,7 +37,7 @@ const STDIN_WRITE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_IDLE_MS: u64 = 300;
 /// Default max bytes returned per tool call: session drain cap and per-stream
 /// exec cap. Bounds how much one bash call can put into model context.
-const DEFAULT_MAX_BYTES: usize = 32_768;
+const DEFAULT_MAX_BYTES: usize = 4_096;
 /// Soft cap on concurrent sessions per harness.
 const MAX_SESSIONS: usize = 8;
 
@@ -1243,7 +1243,7 @@ pub struct Input {
     /// Idle gap in milliseconds with no new output before returning (start/write/read). Default 300.
     #[serde(default)]
     idle_ms: Option<u64>,
-    /// Max bytes of output to return. Default 32768.
+    /// Max bytes of output to return. Default 4096.
     /// - start/write/read: combined stdout+stderr drain cap; excess stays buffered — `read` again for more.
     /// - exec: per-stream cap; head and tail are kept, the middle elided. Elided bytes are unrecoverable.
     #[serde(default)]
@@ -1828,7 +1828,7 @@ mod tests {
             harness,
             json!({
                 "action": "exec",
-                // ~1.2 MB of stdout, far over the 32 KiB default.
+                // ~1.2 MB of stdout, far over the 4 KiB default.
                 "command": "seq 1 200000",
             }),
         )
