@@ -38,9 +38,10 @@
 //! (`| --- | :-: |`); a candidate that never confirms replays verbatim as
 //! prose. A table that fits the wrap width renders at its natural width; one
 //! too wide reflows — columns are sized by max-min fair share and cell contents
-//! wrap into taller rows so it stays inside the terminal. Because capture is
-//! gated on styling, **plain mode passes tables through byte-identically**,
-//! keeping the identity guarantee for files and pipes.
+//! wrap into taller rows so it stays inside the terminal (only an unbreakable
+//! over-long word can still overflow). Because capture is gated on styling,
+//! **plain mode passes tables through byte-identically**, keeping the identity
+//! guarantee for files and pipes.
 //!
 //! Out of scope — constructs that need non-linear layout or lookaside beyond
 //! the above: setext headers, reference/auto links, images.
@@ -50,10 +51,11 @@ use unicode_width::UnicodeWidthChar;
 use super::transcript::Palette;
 use crate::tui::{Color, Style, TuiEvent, encode_ansi};
 
-/// A rendered table cell: its presentation events and visible display width.
-type Cell = (Vec<TuiEvent>, usize);
-/// A cell wrapped into physical lines (one `Cell` per line).
-type CellLines = Vec<Cell>;
+/// One rendered physical line of a table cell: its presentation events and
+/// visible display width.
+type CellLine = (Vec<TuiEvent>, usize);
+/// A table cell rendered into physical lines (a single line when unwrapped).
+type CellLines = Vec<CellLine>;
 
 /// What the current physical line is, decided from its first characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +186,11 @@ pub struct MarkdownRenderer {
     hang: usize,
     /// Word already reached the wrap width; stream it raw until a break.
     overflow: bool,
+    /// Widest word emitted so far, hanging indent included — the narrowest
+    /// wrap width this content could rewrap to without a mid-word overflow.
+    /// Meaningful only when `wrap` is set (the no-wrap path flushes words in
+    /// fragments); read by table cell measurement ([`render_cell`]).
+    max_word_width: usize,
 }
 
 impl MarkdownRenderer {
@@ -227,6 +234,7 @@ impl MarkdownRenderer {
             word_marks: Vec::new(),
             word_width: 0,
             spaces: 0,
+            max_word_width: 0,
             hang: 0,
             overflow: false,
         };
@@ -567,13 +575,13 @@ impl MarkdownRenderer {
     /// fair-share allocator ([`allocate_widths`]): with no wrap width, or when
     /// the table already fits, every column gets its natural width and each row
     /// is one line; when the table is too wide for the wrap column, the wide
-    /// columns are squeezed and their cells wrap into taller rows so the table
-    /// stays inside the terminal. `lines` is header, delimiter, then rows.
+    /// columns are squeezed and their cells wrap into taller rows. Only an
+    /// unbreakable over-long word can still push the box past the wrap width.
+    /// `lines` is header, delimiter, then rows.
     fn render_table(&mut self, lines: &[String]) {
-        let cell_palette = Palette {
-            enabled: true,
-            wrap: None,
-        };
+        fn cell_text(raw: &[String], i: usize) -> &str {
+            raw.get(i).map_or("", String::as_str)
+        }
         let header = split_cells(&lines[0]);
         let ncols = header.len();
         let delim = split_cells(&lines[1]);
@@ -587,55 +595,71 @@ impl MarkdownRenderer {
             .collect();
         let body: Vec<Vec<String>> = lines[2..].iter().map(|l| split_cells(l)).collect();
 
-        // Measure each cell (unwrapped) for per-column `max` (widest cell) and
-        // `min` (widest unbreakable word — the floor a column can wrap to).
-        // `max` floored at 1 so a column is never empty.
-        let measure_row = |raw: &[String]| -> Vec<Cell> {
+        // Render every cell once at unbounded width: a single line whose width
+        // is the cell's natural width, plus the wrap machinery's own floor (the
+        // widest unbreakable word). The line is reused verbatim below for any
+        // cell that ends up not needing to wrap — the common case.
+        let measure_row = |raw: &[String]| -> Vec<(CellLines, usize)> {
             (0..ncols)
-                .map(|i| render_cell_events(raw.get(i).map_or("", String::as_str), cell_palette))
+                .map(|i| render_cell(cell_text(raw, i), usize::MAX))
                 .collect()
         };
-        let mut maxs = vec![1usize; ncols];
+        let measured_header = measure_row(&header);
+        let measured_body: Vec<_> = body.iter().map(|r| measure_row(r)).collect();
+        let mut maxs = vec![0usize; ncols];
         let mut mins = vec![0usize; ncols];
-        for raw in std::iter::once(&header).chain(body.iter()) {
-            for (i, (events, w)) in measure_row(raw).iter().enumerate() {
-                maxs[i] = maxs[i].max(*w);
-                mins[i] = mins[i].max(cell_min_width(events));
+        for row in std::iter::once(&measured_header).chain(measured_body.iter()) {
+            for (i, (lines, floor)) in row.iter().enumerate() {
+                maxs[i] = maxs[i].max(lines[0].1);
+                mins[i] = mins[i].max(*floor);
             }
         }
 
-        // Fair-share allocation to the available width. With no wrap the budget
-        // is unbounded, so the allocator returns the natural widths (no squeeze).
+        // Fair-share allocation to the available width, floored at 1 so a
+        // column is never empty. With no wrap the budget is unbounded, so the
+        // allocator returns the natural widths (no squeeze).
         let chrome = 3 * ncols + 1; // `ncols+1` verticals + one pad space each side
         let budget = self.wrap.map_or(usize::MAX, |w| w.saturating_sub(chrome));
-        let alloc = allocate_widths(&mins, &maxs, budget);
+        let widths: Vec<usize> = allocate_widths(&mins, &maxs, budget)
+            .into_iter()
+            .map(|w| w.max(1))
+            .collect();
 
-        // Wrap every cell to its column; rows may span several physical lines.
-        let wrap_row = |raw: &[String]| -> Vec<CellLines> {
-            (0..ncols)
-                .map(|i| render_cell_lines(raw.get(i).map_or("", String::as_str), alloc[i].max(1)))
+        // Re-render only the squeezed cells, wrapped to their columns; every
+        // other cell keeps its measured single line. The allocator never goes
+        // below a column's floor, and the floor comes from the wrap machinery
+        // itself, so no rendered line can exceed its column.
+        let wrap_row = |measured: Vec<(CellLines, usize)>, raw: &[String]| -> Vec<CellLines> {
+            measured
+                .into_iter()
+                .enumerate()
+                .map(|(i, (lines, _))| {
+                    let lines = if lines[0].1 <= widths[i] {
+                        lines
+                    } else {
+                        render_cell(cell_text(raw, i), widths[i]).0
+                    };
+                    debug_assert!(
+                        lines.iter().all(|(_, w)| *w <= widths[i]),
+                        "wrapped cell line exceeds its column"
+                    );
+                    lines
+                })
                 .collect()
         };
-        let header_lines = wrap_row(&header);
-        let body_lines: Vec<Vec<CellLines>> = body.iter().map(|r| wrap_row(r)).collect();
-
-        // Final widths from the wrapped lines (an unbreakable word can stick out
-        // past its allocation; the box grows so borders stay aligned). Floor 1.
-        let mut widths: Vec<usize> = alloc.iter().map(|w| (*w).max(1)).collect();
-        for cols in std::iter::once(&header_lines).chain(body_lines.iter()) {
-            for (i, col) in cols.iter().enumerate() {
-                for (_, lw) in col {
-                    widths[i] = widths[i].max(*lw);
-                }
-            }
-        }
+        let header_lines = wrap_row(measured_header, &header);
+        let body_lines: Vec<Vec<CellLines>> = measured_body
+            .into_iter()
+            .zip(body.iter())
+            .map(|(m, r)| wrap_row(m, r))
+            .collect();
 
         self.frame_open();
         self.table_border(&widths, '┌', '┬', '┐');
-        self.table_multiline_row(&header_lines, &widths, &aligns);
+        self.table_multiline_row(header_lines, &widths, &aligns);
         if !body_lines.is_empty() {
             self.table_border(&widths, '├', '┼', '┤');
-            for row in &body_lines {
+            for row in body_lines {
                 self.table_multiline_row(row, &widths, &aligns);
             }
         }
@@ -656,16 +680,24 @@ impl MarkdownRenderer {
         self.out_ch('\n');
     }
 
-    /// A logical row whose cells were wrapped into per-column lines. Its height
-    /// is the tallest cell; shorter cells pad with blank lines (top-aligned).
-    /// Each physical line is drawn like [`Self::table_row`].
-    fn table_multiline_row(&mut self, cols: &[CellLines], widths: &[usize], aligns: &[Align]) {
-        let height = cols.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    /// A logical row rendered as per-column lines: the row is as tall as its
+    /// tallest cell (shorter cells pad with blank lines, top-aligned), and each
+    /// physical line is `│`-separated cells padded to their column width per
+    /// the column's alignment.
+    fn table_multiline_row(
+        &mut self,
+        mut cols: Vec<CellLines>,
+        widths: &[usize],
+        aligns: &[Align],
+    ) {
+        let height = cols.iter().map(Vec::len).max().unwrap_or(1);
         for j in 0..height {
             self.out_ch('│');
-            for (i, col) in cols.iter().enumerate() {
-                let events: &[TuiEvent] = col.get(j).map_or(&[], |(e, _)| e.as_slice());
-                let w = col.get(j).map_or(0, |(_, w)| *w);
+            for (i, col) in cols.iter_mut().enumerate() {
+                let (mut events, w) = match col.get_mut(j) {
+                    Some(line) => std::mem::take(line),
+                    None => (Vec::new(), 0),
+                };
                 let pad = widths[i].saturating_sub(w);
                 let (left, right) = match aligns.get(i).copied().unwrap_or(Align::None) {
                     Align::Right => (pad, 0),
@@ -676,9 +708,7 @@ impl MarkdownRenderer {
                 for _ in 0..left {
                     self.out_ch(' ');
                 }
-                for e in events {
-                    self.out.push(e.clone());
-                }
+                self.out.append(&mut events);
                 for _ in 0..right {
                     self.out_ch(' ');
                 }
@@ -975,6 +1005,11 @@ impl MarkdownRenderer {
     /// Emit the pending word, interleaving queued presentation marks at their
     /// byte offsets (the wrap decision, if any, has already been made).
     fn emit_word_raw(&mut self) {
+        // The machinery's own record of its widest word: after a break this
+        // word would sit at `hang`, so `hang + width` is the narrowest line it
+        // can ever occupy. This is what makes table column floors agree with
+        // actual wrapping by construction.
+        self.max_word_width = self.max_word_width.max(self.hang + self.word_width);
         let word = std::mem::take(&mut self.word);
         let marks = std::mem::take(&mut self.word_marks);
         let mut pos = 0;
@@ -1206,54 +1241,25 @@ fn cell_alignment(cell: &str) -> Align {
     }
 }
 
-/// Render one cell's text through a fresh (styled, unwrapped) renderer so
-/// inline markdown works inside cells, returning the presentation events and
-/// the cell's visible display width (escapes excluded — they ride `Style` /
-/// `Link` events, never `Text`).
-fn render_cell_events(cell: &str, palette: Palette) -> Cell {
-    let mut r = MarkdownRenderer::new(palette);
+/// Render one cell through a fresh styled renderer wrapped to `width` (inline
+/// markdown works inside cells), returning its physical lines and the wrap
+/// machinery's own floor for the cell — its widest unbreakable word, hanging
+/// indent included. Measuring (`width = usize::MAX`, always one line) and
+/// wrapping share this single driver, so the floor can never disagree with how
+/// lines actually break.
+fn render_cell(cell: &str, width: usize) -> (CellLines, usize) {
+    let mut r = MarkdownRenderer::new(Palette::colored(true).with_wrap(Some(width)));
     let mut events = r.feed_events(cell);
     events.extend(r.finish_events());
-    let width = events
-        .iter()
-        .map(|e| match e {
-            TuiEvent::Text(t) => display_width(t),
-            _ => 0,
-        })
-        .sum();
-    (events, width)
+    let floor = r.max_word_width;
+    (split_cell_lines(events), floor)
 }
 
-/// The widest unbreakable unit in a rendered cell — the longest
-/// whitespace-delimited run of its visible text. This is the floor a column can
-/// wrap to: allocate any narrower and the word sticks out past the border.
-fn cell_min_width(events: &[TuiEvent]) -> usize {
-    let mut visible = String::new();
-    for e in events {
-        if let TuiEvent::Text(t) = e {
-            visible.push_str(t);
-        }
-    }
-    visible
-        .split_whitespace()
-        .map(display_width)
-        .max()
-        .unwrap_or(0)
-}
-
-/// Render a cell wrapped to `width`, split into physical lines as
+/// Split a rendered cell's event stream into physical lines as
 /// `(events, visible width)`. A style still open at a wrap break is re-asserted
 /// at the next line's start, so each line renders correctly in isolation
 /// between the table borders.
-fn render_cell_lines(cell: &str, width: usize) -> CellLines {
-    let palette = Palette {
-        enabled: true,
-        wrap: Some(width),
-    };
-    let mut r = MarkdownRenderer::new(palette);
-    let mut events = r.feed_events(cell);
-    events.extend(r.finish_events());
-
+fn split_cell_lines(events: Vec<TuiEvent>) -> CellLines {
     let mut lines: CellLines = Vec::new();
     let mut cur: Vec<TuiEvent> = Vec::new();
     let mut cur_w = 0;
@@ -1294,8 +1300,7 @@ fn render_cell_lines(cell: &str, width: usize) -> CellLines {
 
 /// Max-min fair-share (water-filling) column allocation for a `budget` of
 /// content columns (borders/padding already subtracted). Each column ends up
-/// `clamp(t, min_i, max_i)` for a common water level `t`, with any rounding
-/// remainder handed to the widest columns:
+/// `clamp(t, min_i, max_i)` for a common water level `t`:
 ///
 /// - `Σ max ≤ budget`: everything fits → natural widths, no wrapping.
 /// - `Σ min ≥ budget`: even minimums overflow → minimum widths (box overflows).
@@ -1323,11 +1328,9 @@ fn allocate_widths(mins: &[usize], maxs: &[usize], budget: usize) -> Vec<usize> 
     }
     let mut w: Vec<usize> = (0..n).map(|i| clamp(lo, i)).collect();
     let mut leftover = budget - w.iter().sum::<usize>();
-    // Remainder goes to columns sitting exactly at the water line (min ≤ t <
-    // max), widest natural width first; there are always enough for it.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| maxs[b].cmp(&maxs[a]).then(a.cmp(&b)));
-    for &i in &order {
+    // The rounding remainder tops up columns sitting at the water line
+    // (min ≤ t < max); there are always enough of them to absorb it.
+    for i in 0..n {
         if leftover == 0 {
             break;
         }
@@ -1819,10 +1822,10 @@ mod tests {
     }
 
     #[test]
-    fn table_ignores_wrap_width_like_code_blocks() {
-        // The box is 15 cols wide but wrap is 10; a table is never wrapped, so
-        // it still renders as a box at its natural width (terminal handles the
-        // overflow, exactly as it does for a fenced code block).
+    fn unbreakable_cells_overflow_at_natural_width() {
+        // Every cell is a single unbreakable word, so the column floors equal
+        // the natural widths and wrap 10 is infeasible: the allocator falls
+        // back to minimums and the box overflows at its natural 15 columns.
         let input = "| aaaa | bbbb |\n| - | - |\n| cccc | dddd |\n";
         let out = strip_sgr(&render(input, Palette::colored(true).with_wrap(Some(10))));
         assert_eq!(
@@ -1943,7 +1946,7 @@ mod tests {
             allocate_widths(&[1, 1, 1], &[10, 10, 10], 15),
             vec![5, 5, 5]
         );
-        // Odd remainder goes to the widest column first.
+        // The rounding remainder tops up the leading columns at the water line.
         assert_eq!(allocate_widths(&[1, 1], &[10, 10], 15), vec![8, 7]);
     }
 
