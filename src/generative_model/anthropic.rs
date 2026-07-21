@@ -1037,7 +1037,7 @@ struct AnthropicSystemText<'a> {
     cache_control: Option<AnthropicCacheControl>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
+#[derive(Debug, serde::Serialize, Clone, Copy)]
 #[serde(tag = "type")]
 enum AnthropicCacheControl {
     #[serde(rename = "ephemeral")]
