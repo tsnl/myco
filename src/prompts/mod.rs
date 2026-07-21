@@ -33,8 +33,6 @@ Quick map (details in `manual`):
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
-  `exec`/`start` run in a `bwrap` sandbox by default — writable only under the working dir, `/tmp`,
-  and toolchain caches; pass `sandbox: false` to write elsewhere (requires `bwrap`; the editor tool is not sandboxed).
 - Text search: host **persistently indexes** (watched) `.claude/skills`, `SKILL.md` folders, and
   `AGENTS.md`/`CLAUDE.md`. Use `indexed_exact_text_search` / `indexed_semantic_text_search` for
   skills & guidance; `index_directory` registers more small scopes (stays watched until drop).

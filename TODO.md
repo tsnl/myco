@@ -120,10 +120,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 - [x] (REJECTED) **Plan / ask mode** — reason + propose without edits; or diff-then-apply.
   - Not needed.
 - [ ] **Human approval hook** — block selected tools on `ToolStarted` until y/n.
-- [x] **OS-level / bubblewrap sandbox** (preferred over in-app permission modes; see REJECT above).
-  - `bash` `exec`/`start` run under `bwrap` by default: filesystem read-only except the working dir,
-    `/tmp`, and toolchain caches; network unchanged. Required executable, fail-closed; per-call
-    `sandbox: false` opts out. Contains `bash` children only (not the editor). Linux-only.
+- [ ] **OS-level / bubblewrap sandbox** (preferred over in-app permission modes; see REJECT above).
 
 ### Invocation surface
 
