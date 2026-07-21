@@ -197,11 +197,11 @@ impl AnthropicGenerativeModel {
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let mut messages = convert_messages(input);
-        // Roll a cache breakpoint onto the last block so the growing conversation
-        // prefix is cached turn-over-turn (the system prompt carries the other
+        // Roll cache breakpoints onto the final messages so the growing conversation
+        // prefix is cached turn-over-turn (the system prompt carries its own
         // breakpoint in `start_message_stream`). No-op when caching is disabled.
         if self.backend.enable_prompt_caching {
-            apply_rolling_cache_breakpoint(&mut messages);
+            apply_rolling_cache_breakpoints(&mut messages);
         }
         let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
@@ -849,19 +849,18 @@ impl AnthropicContent {
     }
 }
 
-/// Put a rolling cache breakpoint on the final content block of the request.
+/// Roll cache breakpoints onto the last block of each of the final two messages.
 ///
-/// Anthropic writes the prefix up to a `cache_control` block to its prompt cache
-/// and reads it back when a later request shares that prefix. Marking the last
-/// block each turn caches the entire conversation-so-far (system + tools + all
-/// prior turns, since those are covered by the earlier system breakpoint and this
-/// one); the next request reads it at ~0.1x input price and only the newest delta
-/// is billed in full. This is what makes multi-turn / tool-loop sessions cheap.
-fn apply_rolling_cache_breakpoint(messages: &mut [AnthropicMessage]) {
-    if let Some(last_msg) = messages.last_mut()
-        && let Some(last_block) = last_msg.content.last_mut()
-    {
-        last_block.set_cache_control(Some(AnthropicCacheControl::Ephemeral));
+/// Marking a block caches the whole prefix up to it (tools + system + all prior
+/// messages), read back at ~0.1x on the next request. Two breakpoints rather than
+/// one keep the previous turn's write inside Anthropic's 20-block cache lookback
+/// as the conversation grows — the recommended multi-turn pattern:
+/// <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
+fn apply_rolling_cache_breakpoints(messages: &mut [AnthropicMessage]) {
+    for msg in messages.iter_mut().rev().take(2) {
+        if let Some(last_block) = msg.content.last_mut() {
+            last_block.set_cache_control(Some(AnthropicCacheControl::Ephemeral));
+        }
     }
 }
 
@@ -1092,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_cache_breakpoint_marks_only_last_block() {
+    fn rolling_cache_breakpoints_mark_last_two_message_boundaries() {
         let mut messages = vec![
             AnthropicMessage {
                 role: AnthropicRole::User,
@@ -1122,13 +1121,15 @@ mod tests {
                 ],
             },
         ];
-        apply_rolling_cache_breakpoint(&mut messages);
+        apply_rolling_cache_breakpoints(&mut messages);
         let json = serde_json::to_value(&messages).unwrap();
-        // Breakpoint lands on the very last block of the last message only.
+        // Last block of each of the final two messages is marked.
         assert_eq!(json[2]["content"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(json[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        // A non-final block within a marked message is not.
         assert!(json[2]["content"][0].get("cache_control").is_none());
+        // Messages older than the last two are not marked.
         assert!(json[0]["content"][0].get("cache_control").is_none());
-        assert!(json[1]["content"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -1145,7 +1146,7 @@ mod tests {
                 cache_control: None,
             }],
         }];
-        apply_rolling_cache_breakpoint(&mut messages);
+        apply_rolling_cache_breakpoints(&mut messages);
         let json = serde_json::to_value(&messages).unwrap();
         assert_eq!(json[0]["content"][0]["cache_control"]["type"], "ephemeral");
         // The nested tool-result body must not get its own breakpoint.
@@ -1159,7 +1160,7 @@ mod tests {
     #[test]
     fn rolling_cache_breakpoint_is_noop_on_empty_messages() {
         let mut messages: Vec<AnthropicMessage> = Vec::new();
-        apply_rolling_cache_breakpoint(&mut messages);
+        apply_rolling_cache_breakpoints(&mut messages);
         assert!(messages.is_empty());
     }
 
