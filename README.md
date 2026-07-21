@@ -32,9 +32,7 @@ cargo install myco
 
 Needs stable Rust, network on the first build (`build.rs` bakes MiniLM
 embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
-`bash`, `bwrap` on `PATH` (`git`, `gh`, `curl` recommended). `bwrap`
-([bubblewrap](https://github.com/containers/bubblewrap), Linux) sandboxes the
-`bash` tool by default; run a command with `sandbox: false` to opt out.
+`bash` on `PATH` (`git`, `gh`, `curl` recommended).
 
 ## Use
 
