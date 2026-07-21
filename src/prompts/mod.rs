@@ -1,8 +1,9 @@
 //! Shared system-prompt fragments for root agents and subagents.
 //!
-//! Always-on agent policy (worktrees, computer-use, coding norms, user authority)
-//! lives here. Longer runtime docs live in [`crate::manual`] and are browsed via
-//! the `manual` host tool / `myco --help [id]`.
+//! Always-on agent policy (worktrees, computer-use, coding norms, user
+//! authority, the agent workspace) lives here. Longer runtime docs live in
+//! [`crate::manual`] and are browsed via the `manual` host tool /
+//! `myco --help [id]`.
 
 /// Epilogue appended to every agent system prompt (root + subagent).
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
@@ -65,20 +66,18 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     "\n---\n\n",
     include_str!("fragments/user-authority.md"),
     "\n---\n\n",
-    include_str!("fragments/memory.md"),
-    "\n---\n\n",
-    include_str!("fragments/soul.md"),
+    include_str!("fragments/workspace.md"),
     "\n",
 );
 
-/// The epilogue plus the current soul file (`~/.myco/SOUL.md`, respecting
-/// `MYCO_HOME`), when present. Read at model build time — session start, model
-/// switch, each subagent spawn — so a running agent's prompt never changes
-/// mid-conversation and the cached conversation prefix stays valid.
+/// The epilogue plus the current soul file (`~/.myco/workspace/SOUL.md`,
+/// respecting `MYCO_HOME`), when present. Read at model build time — session
+/// start, model switch, each subagent spawn — so a running agent's prompt never
+/// changes mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
     let soul = crate::session::myco_home()
         .ok()
-        .and_then(|home| std::fs::read_to_string(home.join("SOUL.md")).ok())
+        .and_then(|home| std::fs::read_to_string(home.join("workspace").join("SOUL.md")).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
     match soul {
@@ -98,22 +97,23 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Think Before Coding"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Persistent memory"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
-        // Soul file policy: memory holds details, SOUL.md holds one-line pointers.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Soul file"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/SOUL.md"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("single-line pointers"));
+        // Free-form workspace policy: soul file, consistency caution, dream pass.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul file"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("--mode dream"));
     }
 
     #[test]
     fn soul_file_contents_are_appended_when_present() {
         let _guard = crate::session::lock_myco_home_for_test();
         let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         // SAFETY: test-only env override; held under the myco-home lock.
         unsafe {
             std::env::set_var("MYCO_HOME", &dir);
@@ -121,15 +121,15 @@ mod tests {
 
         // Missing or whitespace-only file: the epilogue alone.
         assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
-        std::fs::write(dir.join("SOUL.md"), "  \n\n").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "  \n\n").unwrap();
         assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
         // Present: appended verbatim under the promised heading.
-        std::fs::write(dir.join("SOUL.md"), "- soul_token_alpha → memory 3f2a91\n").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul_token_alpha\n").unwrap();
         let prompt = agent_prompt_epilogue();
         assert!(prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE), "{prompt}");
         assert!(prompt.contains("# SOUL.md"), "{prompt}");
-        assert!(prompt.ends_with("- soul_token_alpha → memory 3f2a91\n"), "{prompt}");
+        assert!(prompt.ends_with("soul_token_alpha\n"), "{prompt}");
 
         // SAFETY: test-only env override; held under the myco-home lock.
         unsafe {

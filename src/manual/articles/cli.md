@@ -6,7 +6,7 @@ You cannot press these yourself — tell the user which command to run.
 |---------|---------|
 | `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
 | `/session` | Current session metadata (title, links, scratchpad, path) |
-| `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
+| `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact/dream) |
 | `/resume [id]` | Load conversation memory |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
@@ -42,6 +42,9 @@ issues; hosts via `/hosts`.
   `api_id` (wire id) and a required `context_window`.
 - Credentials that fail to look up error at model *use*, naming the source.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
+- `myco --mode dream` runs one non-interactive maintenance pass over the agent
+  workspace (`~/.myco/workspace`); users typically schedule it from cron. See
+  `overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled

@@ -19,9 +19,6 @@ pub use text_editor_service::TextEditorService;
 pub mod manual_service;
 pub use manual_service::ManualService;
 
-pub mod memory_service;
-pub use memory_service::MemoryService;
-
 pub mod meta_tool_service;
 pub use meta_tool_service::SessionMetaTool;
 

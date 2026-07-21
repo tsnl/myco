@@ -17,5 +17,3 @@ pub use discover::{AutoIndexTarget, discover_auto_index_targets};
 pub use engine::{
     DropReport, IndexReport, SearchHit, SearchOptions, SearchReport, TextSearchEngine,
 };
-// For the root-only memory tool's dedicated per-entry index.
-pub(crate) use index::{Hit, SearchIndex, embed_for_index};

@@ -20,7 +20,7 @@ myco (interactive) / Agent
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
   **local** host worker (standard tools plus root-only services such as `session_meta` /
-  `subagent` / `memory`).
+  `subagent`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
   text search) over NDJSON via SSH.
 - **Subagents** stay in the agent process and share this harness (same host pool).
@@ -33,8 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/memory/{uuid[..2]}/{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUID-keyed entry files; see below). |
-| `~/.myco/SOUL.md` | Model-authored soul file, appended verbatim to every agent system prompt when present. Kept short: single-line pointers to `memory` entries that carry the details. |
+| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/SOUL.md` is appended verbatim to every agent system prompt when present. Tidied by scheduled `myco --mode dream` runs (see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
@@ -151,21 +150,22 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
   `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
   code trees; only register small repeated scopes.
 
-## Cross-session memory
+## Agent workspace & dreams
 
-Root-only `memory` tool (agent process; shared by supervisor and subagents, across
-sessions). The document is a set of **atomic entries** — immutable, UUIDed,
-timestamped, titled — that are only ever created (`append` with title + body) or
-deleted (`delete` by id). Each entry is a write-once file keyed by its uuid under
-`~/.myco/memory/{uuid[..2]}/` (same fanout as the session store), carrying an
-RFC-822-style header block (`Id` / `Date` / `Date-Local` / `Agent` / `Title`, then a
-blank line and the markdown body) — nothing is rewritten in place and no locks are
-taken, so concurrent sessions cannot conflict even on weakly consistent network
-filesystems; readers order the document by the `Date` header. `list` gives a compact
-id/date/title index, `read` returns full entries (document view, or one by id), and
-`search` queries per-entry (mode `exact` = Tantivy, `semantic` = MiniLM) with
-entry-shaped hits. **Every entry stays indexed and readable until explicitly deleted**
-— there is no GC/pruning. Distinct from the per-session `session_meta` scratchpad.
+`~/.myco/workspace/` is the agents' own directory — free-form files maintained with
+the ordinary tools (no dedicated tool, no required format), persistent across
+sessions and shared by every agent on the machine. `workspace/SOUL.md` is the one
+special file: when present its contents are appended verbatim to every agent system
+prompt, read at model build time (session start, model switch, subagent spawn). The
+workspace may sit on a weakly consistent network filesystem shared with concurrent
+agents, so agents are told to write whole files in one shot, tolerate late-appearing
+writes, and take no locks. Distinct from the per-session `session_meta` scratchpad.
+
+`myco --mode dream` runs one non-interactive maintenance pass over the workspace:
+a hidden `dream` session cleans up, summarizes, and restructures the files
+(including rewriting SOUL.md) and prints a terse report to stdout. Schedule it,
+e.g. from cron: `0 4 * * * myco --mode dream`. `--model` / `--effort` / `--config`
+apply as usual.
 
 ## Product limits (V1)
 
