@@ -428,41 +428,38 @@ pub enum MessagePart {
     Usage(TokenUsage),
 }
 
-/// Token counts reported by a provider for one generate call.
+/// Token counts for one generate call. Cached counts are subsets of their
+/// totals; cached output is 0 for current providers (kept for symmetry).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_output_tokens: u64,
 }
 
 impl TokenUsage {
-    /// Best estimate of context occupied by the prompt (input + cache reads when present).
+    /// Context occupied by the prompt = total input tokens (cached input is a
+    /// subset, already included).
     pub fn context_tokens(self) -> u64 {
         self.input_tokens
-            .saturating_add(self.cache_read_tokens.unwrap_or(0))
-            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
     }
 
     /// Fold a later usage report into this one, keeping known fields when the
     /// later report omits them (providers split usage across stream events).
     pub fn merge(self, next: TokenUsage) -> TokenUsage {
+        fn pick(prev: u64, next: u64) -> u64 {
+            if next != 0 { next } else { prev }
+        }
         TokenUsage {
-            input_tokens: if next.input_tokens != 0 {
-                next.input_tokens
-            } else {
-                self.input_tokens
-            },
-            output_tokens: if next.output_tokens != 0 {
-                next.output_tokens
-            } else {
-                self.output_tokens
-            },
-            cache_read_tokens: next.cache_read_tokens.or(self.cache_read_tokens),
-            cache_creation_tokens: next.cache_creation_tokens.or(self.cache_creation_tokens),
+            input_tokens: pick(self.input_tokens, next.input_tokens),
+            output_tokens: pick(self.output_tokens, next.output_tokens),
+            cached_input_tokens: pick(self.cached_input_tokens, next.cached_input_tokens),
+            cached_output_tokens: pick(self.cached_output_tokens, next.cached_output_tokens),
         }
     }
 }
@@ -798,21 +795,21 @@ mod tests {
     #[test]
     fn token_usage_merge_prefers_known_fields() {
         let start = TokenUsage {
-            input_tokens: 2095,
+            input_tokens: 2195,
             output_tokens: 1,
-            cache_read_tokens: Some(100),
-            cache_creation_tokens: Some(0),
+            cached_input_tokens: 2000,
+            cached_output_tokens: 0,
         };
         let delta = TokenUsage {
             input_tokens: 0,
             output_tokens: 89,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
         };
         let merged = start.merge(delta);
-        assert_eq!(merged.input_tokens, 2095);
+        assert_eq!(merged.input_tokens, 2195);
         assert_eq!(merged.output_tokens, 89);
-        assert_eq!(merged.cache_read_tokens, Some(100));
+        assert_eq!(merged.cached_input_tokens, 2000);
         assert_eq!(merged.context_tokens(), 2195);
     }
 
@@ -823,10 +820,10 @@ mod tests {
         let parts = vec![
             Ok(MessagePart::MessageStart),
             Ok(MessagePart::Usage(TokenUsage {
-                input_tokens: 2095,
+                input_tokens: 2195,
                 output_tokens: 1,
-                cache_read_tokens: Some(100),
-                cache_creation_tokens: Some(0),
+                cached_input_tokens: 2000,
+                cached_output_tokens: 0,
             })),
             Ok(MessagePart::ContentStart(ContentStart::Text { index: 0 })),
             Ok(MessagePart::ContentDelta(ContentDelta::Text {
@@ -836,8 +833,8 @@ mod tests {
             Ok(MessagePart::Usage(TokenUsage {
                 input_tokens: 0,
                 output_tokens: 89,
-                cache_read_tokens: None,
-                cache_creation_tokens: None,
+                cached_input_tokens: 0,
+                cached_output_tokens: 0,
             })),
             Ok(MessagePart::TurnEndReason(TurnEndReason::EndTurn)),
         ];
@@ -845,8 +842,9 @@ mod tests {
             .await
             .expect("accumulate");
         let usage = output.usage.expect("usage present");
-        assert_eq!(usage.input_tokens, 2095);
+        assert_eq!(usage.input_tokens, 2195);
         assert_eq!(usage.output_tokens, 89);
+        assert_eq!(usage.cached_input_tokens, 2000);
         assert_eq!(usage.context_tokens(), 2195);
     }
 
