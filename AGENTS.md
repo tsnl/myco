@@ -158,7 +158,11 @@ cargo run --locked --bin myco
 - `bwrap` (bubblewrap) is a required executable: the `bash` tool sandboxes
   `exec`/`start` under it by default (fail-closed; per-call `sandbox: false`
   opts out). Install it (`apt install bubblewrap`) before running the bash
-  tests, which exercise the real sandbox.
+  tests, which exercise the real sandbox. `bwrap` also needs **unprivileged
+  user namespaces**; Ubuntu 23.10+/Debian restrict them by default, so enable
+  with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (CI does
+  this). Sandbox-behavior tests skip where userns is unavailable; the rest run
+  under the sandbox and need it working.
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.

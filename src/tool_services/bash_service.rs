@@ -1680,6 +1680,25 @@ mod tests {
         format!("{prefix}-{}", uuid::Uuid::new_v4().as_simple())
     }
 
+    /// bwrap is present **and can actually create a user namespace here**.
+    /// Installed ≠ functional: Ubuntu 23.10+/Debian restrict unprivileged
+    /// userns (AppArmor `kernel.apparmor_restrict_unprivileged_userns`), so a
+    /// non-setuid bwrap fails at runtime with "setting up uid map". Gate
+    /// sandbox-behavior tests on this so they skip (not fail) where the kernel
+    /// forbids the sandbox.
+    fn bwrap_works() -> bool {
+        BWRAP.is_installed()
+            && BWRAP
+                .command()
+                .args(["--ro-bind", "/", "/", "--dev", "/dev", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+    }
+
     #[test]
     fn input_roundtrip_exec() {
         let input = Input {
@@ -3168,7 +3187,7 @@ mod tests {
     /// real `bwrap` (skips where the sandbox binary is absent).
     #[tokio::test]
     async fn sandbox_blocks_writes_outside_writable_set() {
-        if !BWRAP.is_installed() {
+        if !bwrap_works() {
             return;
         }
         let home = match std::env::var("HOME") {
@@ -3211,7 +3230,7 @@ mod tests {
     /// The working dir and `/tmp` stay writable inside the sandbox.
     #[tokio::test]
     async fn sandbox_allows_writes_in_tmp() {
-        if !BWRAP.is_installed() {
+        if !bwrap_works() {
             return;
         }
         let result = dispatch_json(
