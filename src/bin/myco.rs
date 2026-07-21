@@ -18,7 +18,7 @@ use myco::session::{
     Session, SessionListEntry, banner_rule, compact_session, compact_subagent_prompt,
     format_session_detail, format_session_list_line, format_tool_invocation, link_compact_pair,
     list_sessions, print_session_history, render_block, resolve_and_load_session, section_rule,
-    user_rule, write_error_section,
+    usage_line, user_header_line, user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
@@ -589,24 +589,17 @@ async fn run_repl(
         }
         let max = agent.context_window_tokens();
         let usage = agent.last_usage();
-        // `?` = resumed before usage was tracked; `0` = genuinely empty session.
+        // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
         let used = match usage {
-            Some(u) => u.context_tokens().to_string(),
-            None if agent.history().is_empty() => "0".to_string(),
-            None => "?".to_string(),
+            Some(u) => Some(u.context_tokens()),
+            None if agent.history().is_empty() => Some(0),
+            None => None,
         };
         let mut header = Vec::new();
         let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
-        let _ = writeln!(header, "{}", palette.user(&format!("USER {used}/{max}")));
+        let _ = writeln!(header, "{}", palette.user(&user_header_line(used, max)));
         if let Some(u) = usage {
-            let _ = writeln!(
-                header,
-                "{}",
-                palette.user(&format!(
-                    "⚙ input {}  output {}  cached input {}  cached output {}",
-                    u.input_tokens, u.output_tokens, u.cached_input_tokens, u.cached_output_tokens
-                ))
-            );
+            let _ = writeln!(header, "{}", palette.user(&usage_line(u)));
         }
         for line in harness.running_tool_summaries(agent.context().agent_id) {
             let _ = writeln!(header, "{}", palette.user(&format!("● {line}")));
@@ -1189,9 +1182,10 @@ Thinking/reasoning is always requested (default effort=high). The UI shows a
 resume but stripped from provider requests. Change effort with `/effort`.
 Generate failures open a headed ERROR section (live only; not in history).
 
-Each USER header shows `USER <used>/<max>` context tokens when the provider
-reported usage on the previous generate (0/max until then). A `⚙`-prefixed
-line carries the token counts; below it, one `●`-prefixed line per
+Each USER header shows `USER <used>/<max> (<pct>%)` context tokens, compact
+(`63.8k/200k`; 0/max until the provider reports usage). A `⚙`-prefixed line
+carries the finished turn's token counts (input = final request's prompt,
+output summed across the turn); below it, one `●`-prefixed line per
 still-running tool (live bash session on the in-process local host) shows
 its command, uptime, and idle time.
 
