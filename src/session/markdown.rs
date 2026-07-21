@@ -563,12 +563,12 @@ impl MarkdownRenderer {
         self.replaying_table = false;
     }
 
-    /// Draw a confirmed table as a box. A table that fits the wrap width (or any
-    /// table when wrap is off) renders at its natural width, one line per row.
-    /// A table too wide for the wrap column reflows: columns are sized by
-    /// [`allocate_widths`] (max-min fair share) and cell contents wrap, so wide
-    /// tables stay inside the terminal as taller rows rather than overflowing.
-    /// `lines` is header, delimiter, then rows.
+    /// Draw a confirmed table as a box. Columns are always sized by the max-min
+    /// fair-share allocator ([`allocate_widths`]): with no wrap width, or when
+    /// the table already fits, every column gets its natural width and each row
+    /// is one line; when the table is too wide for the wrap column, the wide
+    /// columns are squeezed and their cells wrap into taller rows so the table
+    /// stays inside the terminal. `lines` is header, delimiter, then rows.
     fn render_table(&mut self, lines: &[String]) {
         let cell_palette = Palette {
             enabled: true,
@@ -587,45 +587,30 @@ impl MarkdownRenderer {
             .collect();
         let body: Vec<Vec<String>> = lines[2..].iter().map(|l| split_cells(l)).collect();
 
-        // Natural single-line render of every cell, plus per-column `max` (the
-        // widest cell) and `min` (the widest unbreakable word — the floor a
-        // column can wrap to). `max` floored at 1 so a column is never empty.
-        let render_row = |raw: &[String]| -> Vec<Cell> {
+        // Measure each cell (unwrapped) for per-column `max` (widest cell) and
+        // `min` (widest unbreakable word — the floor a column can wrap to).
+        // `max` floored at 1 so a column is never empty.
+        let measure_row = |raw: &[String]| -> Vec<Cell> {
             (0..ncols)
                 .map(|i| render_cell_events(raw.get(i).map_or("", String::as_str), cell_palette))
                 .collect()
         };
-        let header_cells = render_row(&header);
-        let body_cells: Vec<Vec<Cell>> = body.iter().map(|r| render_row(r)).collect();
         let mut maxs = vec![1usize; ncols];
         let mut mins = vec![0usize; ncols];
-        for cells in std::iter::once(&header_cells).chain(body_cells.iter()) {
-            for (i, (events, w)) in cells.iter().enumerate() {
+        for raw in std::iter::once(&header).chain(body.iter()) {
+            for (i, (events, w)) in measure_row(raw).iter().enumerate() {
                 maxs[i] = maxs[i].max(*w);
                 mins[i] = mins[i].max(cell_min_width(events));
             }
         }
 
-        // Chrome is `ncols+1` verticals plus one pad space each side per column.
-        let chrome = 3 * ncols + 1;
-        let natural = maxs.iter().sum::<usize>() + chrome;
-        let over_wide = self.wrap.filter(|&w| natural > w);
+        // Fair-share allocation to the available width. With no wrap the budget
+        // is unbounded, so the allocator returns the natural widths (no squeeze).
+        let chrome = 3 * ncols + 1; // `ncols+1` verticals + one pad space each side
+        let budget = self.wrap.map_or(usize::MAX, |w| w.saturating_sub(chrome));
+        let alloc = allocate_widths(&mins, &maxs, budget);
 
-        let Some(wrap) = over_wide else {
-            // Fits (or no wrap): natural width, one physical line per row.
-            self.draw_table(
-                &maxs,
-                &aligns,
-                &header_cells,
-                &body_cells,
-                |s, cells, w, a| s.table_row(cells, w, a),
-            );
-            return;
-        };
-
-        // Reflow: allocate column widths to the budget, then wrap each cell to
-        // its column and render rows that may span several physical lines.
-        let alloc = allocate_widths(&mins, &maxs, wrap.saturating_sub(chrome));
+        // Wrap every cell to its column; rows may span several physical lines.
         let wrap_row = |raw: &[String]| -> Vec<CellLines> {
             (0..ncols)
                 .map(|i| render_cell_lines(raw.get(i).map_or("", String::as_str), alloc[i].max(1)))
@@ -633,8 +618,9 @@ impl MarkdownRenderer {
         };
         let header_lines = wrap_row(&header);
         let body_lines: Vec<Vec<CellLines>> = body.iter().map(|r| wrap_row(r)).collect();
-        // Final widths from the wrapped lines (a word wider than its column can
-        // still stick out; the box grows so borders stay aligned). Floor at 1.
+
+        // Final widths from the wrapped lines (an unbreakable word can stick out
+        // past its allocation; the box grows so borders stay aligned). Floor 1.
         let mut widths: Vec<usize> = alloc.iter().map(|w| (*w).max(1)).collect();
         for cols in std::iter::once(&header_lines).chain(body_lines.iter()) {
             for (i, col) in cols.iter().enumerate() {
@@ -643,36 +629,17 @@ impl MarkdownRenderer {
                 }
             }
         }
-        self.draw_table(
-            &widths,
-            &aligns,
-            &header_lines,
-            &body_lines,
-            |s, cells, w, a| s.table_multiline_row(cells, w, a),
-        );
-    }
 
-    /// Shared box scaffold: top border, header, mid border, body rows, bottom
-    /// border, framed by base styling. `draw` renders one logical row of `T`
-    /// (single-line cells, or per-column wrapped lines).
-    fn draw_table<T>(
-        &mut self,
-        widths: &[usize],
-        aligns: &[Align],
-        header: &T,
-        body: &[T],
-        mut draw: impl FnMut(&mut Self, &T, &[usize], &[Align]),
-    ) {
         self.frame_open();
-        self.table_border(widths, '┌', '┬', '┐');
-        draw(self, header, widths, aligns);
-        if !body.is_empty() {
-            self.table_border(widths, '├', '┼', '┤');
-            for row in body {
-                draw(self, row, widths, aligns);
+        self.table_border(&widths, '┌', '┬', '┐');
+        self.table_multiline_row(&header_lines, &widths, &aligns);
+        if !body_lines.is_empty() {
+            self.table_border(&widths, '├', '┼', '┤');
+            for row in &body_lines {
+                self.table_multiline_row(row, &widths, &aligns);
             }
         }
-        self.table_border(widths, '└', '┴', '┘');
+        self.table_border(&widths, '└', '┴', '┘');
         self.frame_close();
     }
 
@@ -685,34 +652,6 @@ impl MarkdownRenderer {
                 self.out_ch('─');
             }
             self.out_ch(if i + 1 < widths.len() { mid } else { right });
-        }
-        self.out_ch('\n');
-    }
-
-    /// One content row: `│`-separated cells, each padded to its column width
-    /// per the column's alignment, with the cell's own style/link events spliced
-    /// in so inline markdown inside cells still renders.
-    fn table_row(&mut self, cells: &[Cell], widths: &[usize], aligns: &[Align]) {
-        self.out_ch('│');
-        for (i, (events, w)) in cells.iter().enumerate() {
-            let pad = widths[i].saturating_sub(*w);
-            let (left, right) = match aligns.get(i).copied().unwrap_or(Align::None) {
-                Align::Right => (pad, 0),
-                Align::Center => (pad / 2, pad - pad / 2),
-                Align::Left | Align::None => (0, pad),
-            };
-            self.out_ch(' ');
-            for _ in 0..left {
-                self.out_ch(' ');
-            }
-            for e in events {
-                self.out.push(e.clone());
-            }
-            for _ in 0..right {
-                self.out_ch(' ');
-            }
-            self.out_ch(' ');
-            self.out_ch('│');
         }
         self.out_ch('\n');
     }
