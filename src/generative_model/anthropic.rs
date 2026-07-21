@@ -196,7 +196,7 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(input);
+        let messages = convert_messages(input, self.backend.enable_prompt_caching);
         let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
@@ -237,22 +237,34 @@ impl GenerativeModel for AnthropicGenerativeModel {
 // Message conversion
 //
 
-fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
-    let mut out: Vec<AnthropicMessage> = Vec::new();
+/// One role-alternating turn of Anthropic content — the merged form of one or
+/// more consecutive same-role [`Message`]s. A user turn may combine tool-result
+/// and text blocks, which no single `Message` variant can hold, so the merge
+/// yields these runs rather than `Message`s.
+struct MessageRun {
+    role: AnthropicRole,
+    content: Vec<AnthropicContent>,
+}
+
+/// Merge consecutive same-role turns into role-alternating runs. Anthropic
+/// requires alternating user/assistant roles, and tool-result blocks must lead
+/// the user turn they answer.
+fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
+    let mut runs: Vec<MessageRun> = Vec::new();
 
     for message in input {
-        let anthropic = match message {
-            Message::UserMessage { content } => AnthropicMessage {
-                role: AnthropicRole::User,
-                content: content
+        let (role, content): (_, Vec<AnthropicContent>) = match message {
+            Message::UserMessage { content } => (
+                AnthropicRole::User,
+                content
                     .iter()
                     .cloned()
                     .map(AnthropicContent::from)
                     .collect(),
-            },
-            Message::ToolResults { tool_use_results } => AnthropicMessage {
-                role: AnthropicRole::User,
-                content: tool_use_results
+            ),
+            Message::ToolResults { tool_use_results } => (
+                AnthropicRole::User,
+                tool_use_results
                     .iter()
                     .map(|result| AnthropicContent::ToolResult {
                         tool_use_id: result.id.clone(),
@@ -265,7 +277,7 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
                         is_error: result.is_error,
                     })
                     .collect(),
-            },
+            ),
             Message::AssistantMessage {
                 content,
                 tool_uses,
@@ -291,40 +303,56 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
                 if blocks.is_empty() {
                     continue;
                 }
-                AnthropicMessage {
-                    role: AnthropicRole::Assistant,
-                    content: blocks,
-                }
+                (AnthropicRole::Assistant, blocks)
             }
         };
 
-        // Anthropic requires alternating roles; merge consecutive same-role turns.
-        // Tool-result blocks must appear before any other content in a user message.
-        if let Some(last) = out.last_mut()
-            && last.role == anthropic.role
+        // Tool-result blocks must appear before any other content in a user turn.
+        if let Some(last) = runs.last_mut()
+            && last.role == role
         {
-            if last.role == AnthropicRole::User {
-                let new_is_only_tool_results = !anthropic.content.is_empty()
-                    && anthropic
-                        .content
+            if role == AnthropicRole::User {
+                let new_is_only_tool_results = !content.is_empty()
+                    && content
                         .iter()
                         .all(|c| matches!(c, AnthropicContent::ToolResult { .. }));
                 if new_is_only_tool_results {
-                    let mut combined = anthropic.content;
+                    let mut combined = content;
                     combined.append(&mut last.content);
                     last.content = combined;
                 } else {
-                    last.content.extend(anthropic.content);
+                    last.content.extend(content);
                 }
             } else {
-                last.content.extend(anthropic.content);
+                last.content.extend(content);
             }
             continue;
         }
-        out.push(anthropic);
+        runs.push(MessageRun { role, content });
     }
 
-    out
+    runs.into_boxed_slice()
+}
+
+fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessage> {
+    // Merge into role-alternating runs, then emit one message per run — rolling
+    // cache breakpoints onto the last two. Marking a block caches the whole prefix
+    // up to it, and two breakpoints (rather than one) keep the previous turn's
+    // write inside Anthropic's 20-block lookback as the conversation grows — the
+    // recommended multi-turn pattern:
+    // <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
+    let runs = merge_same_role_turns(input);
+    let count = runs.len();
+    runs.into_vec()
+        .into_iter()
+        .enumerate()
+        .map(|(i, MessageRun { role, content })| AnthropicMessage {
+            role,
+            content,
+            cache_control: (enable_cache && i + 2 >= count)
+                .then_some(AnthropicCacheControl::Ephemeral),
+        })
+        .collect()
 }
 
 //
@@ -765,10 +793,67 @@ enum AnthropicRole {
     User,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, Clone)]
 struct AnthropicMessage {
     role: AnthropicRole,
     content: Vec<AnthropicContent>,
+    /// When set, a cache breakpoint is attached to the final content block at
+    /// serialization time — Anthropic only accepts `cache_control` on blocks, so
+    /// the message-level flag is lowered onto the last block on the wire.
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Serializes `{role, content}`, splicing `cache_control` onto the last content
+/// block when the message is a cache breakpoint. Anthropic then caches the whole
+/// prefix (tools + system + prior messages) up to and including that block.
+impl serde::Serialize for AnthropicMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut msg = serializer.serialize_struct("AnthropicMessage", 2)?;
+        msg.serialize_field("role", &self.role)?;
+        match self.cache_control {
+            Some(cache_control) => msg.serialize_field(
+                "content",
+                &TrailingCache {
+                    blocks: &self.content,
+                    cache_control,
+                },
+            )?,
+            None => msg.serialize_field("content", &self.content)?,
+        }
+        msg.end()
+    }
+}
+
+/// Serializes a block list, injecting `cache_control` into the final block only.
+struct TrailingCache<'a> {
+    blocks: &'a [AnthropicContent],
+    cache_control: AnthropicCacheControl,
+}
+
+impl serde::Serialize for TrailingCache<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        let last = self.blocks.len().saturating_sub(1);
+        let mut seq = serializer.serialize_seq(Some(self.blocks.len()))?;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i == last {
+                // `cache_control` isn't a field on the block enum; splice it into the
+                // serialized object so only this final block carries the breakpoint.
+                let mut value = serde_json::to_value(block).map_err(Error::custom)?;
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "cache_control".to_string(),
+                        serde_json::to_value(self.cache_control).map_err(Error::custom)?,
+                    );
+                }
+                seq.serialize_element(&value)?;
+            } else {
+                seq.serialize_element(block)?;
+            }
+        }
+        seq.end()
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -1028,6 +1113,84 @@ mod tests {
     }
 
     #[test]
+    fn cache_breakpoints_mark_last_two_messages() {
+        let input = [
+            Message::UserMessage {
+                content: vec![Content::Text { text: "one".into() }],
+            },
+            Message::AssistantMessage {
+                content: vec![Content::Text { text: "two".into() }],
+                tool_uses: vec![],
+                turn_end_reason: None,
+            },
+            Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "three".into(),
+                }],
+            },
+        ];
+        let json = serde_json::to_value(convert_messages(&input, true)).unwrap();
+        // The final two messages carry a breakpoint on their last block.
+        assert_eq!(json[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(json[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        // The oldest message does not.
+        assert!(json[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_breakpoint_marks_only_final_block_not_nested() {
+        let input = [
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "a".into(),
+                    name: "x".into(),
+                    input: serde_json::Value::Null,
+                }],
+                turn_end_reason: None,
+            },
+            Message::ToolResults {
+                tool_use_results: vec![
+                    ToolResult {
+                        id: "a".into(),
+                        content: vec![Content::Text { text: "ra".into() }],
+                        is_error: false,
+                    },
+                    ToolResult {
+                        id: "b".into(),
+                        content: vec![Content::Text { text: "rb".into() }],
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+        let json = serde_json::to_value(convert_messages(&input, true)).unwrap();
+        // Last message has two tool_result blocks; only the final one is marked.
+        assert_eq!(json[1]["content"][1]["cache_control"]["type"], "ephemeral");
+        assert!(json[1]["content"][0].get("cache_control").is_none());
+        // The breakpoint sits on the block, not spliced into its nested body.
+        assert!(
+            json[1]["content"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_absent_when_disabled() {
+        let input = [Message::UserMessage {
+            content: vec![Content::Text { text: "hi".into() }],
+        }];
+        let json = serde_json::to_value(convert_messages(&input, false)).unwrap();
+        assert!(json[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn convert_messages_empty_is_noop() {
+        assert!(convert_messages(&[], true).is_empty());
+    }
+
+    #[test]
     fn image_source_url_and_base64_wire_format() {
         let url = AnthropicContent::from(Content::Image {
             source: "https://example.com/a.png".into(),
@@ -1202,7 +1365,7 @@ mod tests {
                 }],
             },
         ];
-        let msgs = convert_messages(&input);
+        let msgs = convert_messages(&input, false);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, AnthropicRole::User));
         assert_eq!(msgs[0].content.len(), 2);
