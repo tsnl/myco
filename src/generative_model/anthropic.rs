@@ -237,11 +237,20 @@ impl GenerativeModel for AnthropicGenerativeModel {
 // Message conversion
 //
 
-fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessage> {
-    // Convert, merging consecutive same-role turns into role-alternating runs
-    // (Anthropic requires alternating roles). Cache breakpoints are assigned once
-    // per run below, so runs hold only role + blocks here.
-    let mut runs: Vec<(AnthropicRole, Vec<AnthropicContent>)> = Vec::new();
+/// One role-alternating turn of Anthropic content — the merged form of one or
+/// more consecutive same-role [`Message`]s. A user turn may combine tool-result
+/// and text blocks, which no single `Message` variant can hold, so the merge
+/// yields these runs rather than `Message`s.
+struct MessageRun {
+    role: AnthropicRole,
+    content: Vec<AnthropicContent>,
+}
+
+/// Merge consecutive same-role turns into role-alternating runs. Anthropic
+/// requires alternating user/assistant roles, and tool-result blocks must lead
+/// the user turn they answer.
+fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
+    let mut runs: Vec<MessageRun> = Vec::new();
 
     for message in input {
         let (role, content): (_, Vec<AnthropicContent>) = match message {
@@ -298,9 +307,9 @@ fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessa
             }
         };
 
-        // Tool-result blocks must appear before any other content in a user message.
-        if let Some((last_role, last_content)) = runs.last_mut()
-            && *last_role == role
+        // Tool-result blocks must appear before any other content in a user turn.
+        if let Some(last) = runs.last_mut()
+            && last.role == role
         {
             if role == AnthropicRole::User {
                 let new_is_only_tool_results = !content.is_empty()
@@ -309,28 +318,35 @@ fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessa
                         .all(|c| matches!(c, AnthropicContent::ToolResult { .. }));
                 if new_is_only_tool_results {
                     let mut combined = content;
-                    combined.append(last_content);
-                    *last_content = combined;
+                    combined.append(&mut last.content);
+                    last.content = combined;
                 } else {
-                    last_content.extend(content);
+                    last.content.extend(content);
                 }
             } else {
-                last_content.extend(content);
+                last.content.extend(content);
             }
             continue;
         }
-        runs.push((role, content));
+        runs.push(MessageRun { role, content });
     }
 
-    // Roll cache breakpoints onto the last two messages: marking a block caches the
-    // whole prefix up to it, and two breakpoints (rather than one) keep the previous
-    // turn's write inside Anthropic's 20-block lookback as the conversation grows —
-    // the recommended multi-turn pattern:
+    runs.into_boxed_slice()
+}
+
+fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessage> {
+    // Merge into role-alternating runs, then emit one message per run — rolling
+    // cache breakpoints onto the last two. Marking a block caches the whole prefix
+    // up to it, and two breakpoints (rather than one) keep the previous turn's
+    // write inside Anthropic's 20-block lookback as the conversation grows — the
+    // recommended multi-turn pattern:
     // <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
+    let runs = merge_same_role_turns(input);
     let count = runs.len();
-    runs.into_iter()
+    runs.into_vec()
+        .into_iter()
         .enumerate()
-        .map(|(i, (role, content))| AnthropicMessage {
+        .map(|(i, MessageRun { role, content })| AnthropicMessage {
             role,
             content,
             cache_control: (enable_cache && i + 2 >= count)
