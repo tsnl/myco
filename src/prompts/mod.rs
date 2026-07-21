@@ -101,11 +101,10 @@ mod tests {
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
-        // Free-form workspace policy: soul file, consistency caution, dream pass.
+        // Free-form workspace policy: soul file plus the consistency caution.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul file"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("--mode dream"));
     }
 
     #[test]

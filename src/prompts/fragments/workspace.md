@@ -18,8 +18,3 @@ shared with concurrently running agents. Write whole files in one shot (or
 create new uniquely named files) rather than editing shared files
 incrementally, expect other agents' writes to appear late, and do not build
 lock protocols on top of it.
-
-A scheduled **dream** pass (`myco --mode dream`, typically from cron)
-periodically cleans up, summarizes, and restructures the workspace, including
-rewriting SOUL.md — so treat SOUL.md as the stable entry point, not the exact
-file layout.

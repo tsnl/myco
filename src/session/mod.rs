@@ -55,9 +55,6 @@ pub enum SessionKind {
     Subagent,
     /// Compaction worker. Hidden by default in listings.
     Compact,
-    /// Scheduled workspace-maintenance run (`myco --mode dream`). Hidden by
-    /// default in listings.
-    Dream,
 }
 
 impl std::fmt::Display for SessionKind {
@@ -66,7 +63,6 @@ impl std::fmt::Display for SessionKind {
             SessionKind::User => write!(f, "user"),
             SessionKind::Subagent => write!(f, "subagent"),
             SessionKind::Compact => write!(f, "compact"),
-            SessionKind::Dream => write!(f, "dream"),
         }
     }
 }

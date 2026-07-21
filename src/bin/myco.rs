@@ -85,9 +85,7 @@ struct Args {
     help_topic: Option<String>,
 
     /// Run mode. `interactive` (default) starts the agent REPL; `host` runs the
-    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via
-    /// ssh); `dream` runs one non-interactive workspace-maintenance pass
-    /// (schedule it, e.g. from cron).
+    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via ssh).
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
 
@@ -148,8 +146,6 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
-    /// One scheduled maintenance pass over `~/.myco/workspace`.
-    Dream,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +163,6 @@ async fn main() {
     match args.mode {
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
-        Mode::Dream => run_dream(args).await,
     }
 }
 
@@ -188,132 +183,6 @@ async fn run_host(args: Args) {
         eprintln!("myco host error: {e}");
         std::process::exit(1);
     }
-}
-
-/// `--mode dream`: one non-interactive maintenance pass over the agent
-/// workspace (`~/.myco/workspace`), meant to be scheduled (e.g. from cron). A
-/// hidden [`SessionKind::Dream`] session cleans up, summarizes, and
-/// restructures the workspace — including SOUL.md — then the agent's final
-/// report is printed to stdout.
-async fn run_dream(args: Args) {
-    let app_config = Config::resolve(ConfigUserSettings {
-        harness_config_path: args.config.clone(),
-        model: args.model.clone(),
-        color: args.color,
-        wrap: args.wrap,
-        ..Default::default()
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to load config: {e}");
-        std::process::exit(2);
-    });
-    let catalog_model = match app_config.models.get(&app_config.model) {
-        Ok(m) => m.clone(),
-        Err(e) => {
-            eprintln!("{e}");
-            eprintln!("config: {}", app_config.harness_config_path.display());
-            std::process::exit(2);
-        }
-    };
-
-    let workspace = myco::session::myco_home()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to resolve workspace: {e}");
-            std::process::exit(2);
-        })
-        .join("workspace");
-    if let Err(e) = std::fs::create_dir_all(&workspace) {
-        eprintln!("Failed to create {}: {e}", workspace.display());
-        std::process::exit(1);
-    }
-
-    let mut session = Session::new_hidden(
-        catalog_model.spec.key.clone(),
-        uuid_simple_hex(uuid::Uuid::new_v4()),
-        SessionKind::Dream,
-        None,
-    );
-    session.title = Some("dream".into());
-    if let Err(e) = session.save() {
-        eprintln!("warning: could not save dream session: {e}");
-    }
-    let active_session = ActiveSession::new(session);
-
-    let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
-    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let harness = Harness::attach_with_root_services(
-        app_config.harness.clone(),
-        vec![session_tool, history_tool],
-    )
-    .await
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to attach harness: {e}");
-        std::process::exit(1);
-    });
-
-    let model = build_model(
-        &catalog_model,
-        &harness,
-        args.debug_dump_api_requests,
-        args.effort,
-    );
-    let mut agent = Agent::new(model, harness.clone(), Arc::new(NullEventSink));
-    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-
-    eprintln!(
-        "dreaming session={} workspace={}",
-        active_session.id(),
-        workspace.display()
-    );
-
-    let result = agent
-        .interact(
-            vec![Content::Text {
-                text: dream_prompt(&workspace),
-            }],
-            myco::CancelToken::new(),
-        )
-        .await;
-
-    if let Err(e) = active_session.persist_messages(agent.history(), agent.last_usage(), true) {
-        eprintln!("warning: could not save dream session: {e}");
-    }
-
-    match result {
-        Ok(content) => {
-            for c in &content {
-                if let Content::Text { text } = c {
-                    println!("{text}");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("dream failed: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn dream_prompt(workspace: &std::path::Path) -> String {
-    format!(
-        r#"It is dream time: you are running as a scheduled maintenance pass, with no user present.
-Tidy the shared agent workspace at `{ws}`.
-
-1. Read SOUL.md there (if present) and skim the rest of the workspace.
-2. Clean up: delete or merge stale scratch files, dead drafts, and duplicates. Prefer deleting
-   over hoarding — anything re-derivable can go.
-3. Summarize and restructure what remains into a few well-named files.
-4. Rewrite SOUL.md as a short note (about a screenful) to your future self: who the user is,
-   how you work together, what matters now, and where the details live.
-
-Other agents may be running concurrently and the workspace may sit on a weakly consistent
-network filesystem: write whole files in one shot, tolerate files appearing or changing under
-you, and take no locks.
-
-Finish with a terse report of what you changed and what you deleted."#,
-        ws = workspace.display()
-    )
 }
 
 async fn run_interactive(args: Args) {

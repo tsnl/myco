@@ -33,7 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/SOUL.md` is appended verbatim to every agent system prompt when present. Tidied by scheduled `myco --mode dream` runs (see below). |
+| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/SOUL.md` is appended verbatim to every agent system prompt when present (see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
@@ -150,7 +150,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
   `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
   code trees; only register small repeated scopes.
 
-## Agent workspace & dreams
+## Agent workspace
 
 `~/.myco/workspace/` is the agents' own directory — free-form files maintained with
 the ordinary tools (no dedicated tool, no required format), persistent across
@@ -160,12 +160,6 @@ prompt, read at model build time (session start, model switch, subagent spawn). 
 workspace may sit on a weakly consistent network filesystem shared with concurrent
 agents, so agents are told to write whole files in one shot, tolerate late-appearing
 writes, and take no locks. Distinct from the per-session `session_meta` scratchpad.
-
-`myco --mode dream` runs one non-interactive maintenance pass over the workspace:
-a hidden `dream` session cleans up, summarizes, and restructures the files
-(including rewriting SOUL.md) and prints a terse report to stdout. Schedule it,
-e.g. from cron: `0 4 * * * myco --mode dream`. `--model` / `--effort` / `--config`
-apply as usual.
 
 ## Product limits (V1)
 
