@@ -1,29 +1,35 @@
 //! Streaming Markdown renderer with fence-aware word wrap.
 //!
 //! Feed arbitrary UTF-8 chunks ([`MarkdownRenderer::feed`]); deltas may split
-//! anywhere, including inside a delimiter run. Two invariants:
+//! anywhere, including inside a delimiter run or a `[text](url)` link. Two
+//! invariants:
 //!
-//! - **Additive-only**: every content byte reaches the output in order.
-//!   Styling only injects SGR sequences; wrapping only exchanges a run of
-//!   breakable spaces for a newline (plus hanging indent). A stray delimiter
-//!   can mis-style the tail of one paragraph, never corrupt content.
-//! - **Disabled = identity**: styling off and wrap off ⇒ output is
-//!   byte-identical to input (the non-TTY / [`Palette::plain`] guarantee).
+//! - **Disabled = identity**: styling off ⇒ output is byte-identical to input
+//!   (the non-TTY / [`Palette::plain`] guarantee). No delimiter is dropped, so
+//!   piped stdout, session files, and the user's echoed input stay verbatim.
+//! - **Styled = presentation**: with styling on, the *formatting* delimiters
+//!   are consumed into presentation rather than printed — `*` / `` ` ``
+//!   emphasis runs turn into SGR, and a `[text](url)` link becomes an OSC 8
+//!   hyperlink over its visible text — while every *content* byte still reaches
+//!   the output in order. ATX headers are the exception: their `#` markers stay
+//!   visible (the line just styles bold). A stray delimiter can mis-style a
+//!   span, never corrupt content.
 //!
-//! Internally the renderer is event-first: it produces a [`TuiEvent`] stream
-//! in which content ([`TuiEvent::Text`], escape-free, wrap applied) and style
-//! state ([`TuiEvent::Style`], semantic) are separate variants
-//! ([`MarkdownRenderer::feed_events`] / [`MarkdownRenderer::finish_events`]).
-//! The String API ([`MarkdownRenderer::feed`] / [`MarkdownRenderer::finish`])
-//! is a facade that SGR-encodes that stream ([`crate::tui::encode_ansi`]),
-//! gated by the palette's `enabled` flag — bytes are unchanged from the
-//! pre-event renderer.
+//! Internally the renderer is event-first: it produces a [`TuiEvent`] stream in
+//! which content ([`TuiEvent::Text`], escape-free, wrap applied) and
+//! presentation state ([`TuiEvent::Style`] / [`TuiEvent::Link`], semantic) are
+//! separate variants ([`MarkdownRenderer::feed_events`] /
+//! [`MarkdownRenderer::finish_events`]). The String API
+//! ([`MarkdownRenderer::feed`] / [`MarkdownRenderer::finish`]) is a facade that
+//! encodes that stream ([`crate::tui::encode_ansi`]), gated by the palette's
+//! `enabled` flag.
 //!
 //! Supported: `**` / `*` emphasis toggles (with a light flanking check),
-//! `` ` `` inline code, ATX headers, fenced code blocks (never styled, never
-//! wrapped), indented (4-space) lines verbatim, list hanging indent.
-//! Out of scope — constructs that need non-linear layout: tables, setext
-//! headers, reference links.
+//! `` ` `` inline code, `[text](url)` links (OSC 8 when styled), ATX headers,
+//! fenced code blocks (never styled or wrapped), indented (4-space) lines
+//! verbatim, list hanging indent. Out of scope — constructs that need
+//! non-linear layout or lookaside: tables, setext headers, reference/auto
+//! links, images.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -39,6 +45,44 @@ enum Line {
     Body,
     /// Verbatim until end of line (indented code, tab-led lines).
     Raw,
+}
+
+/// A zero-width presentation mark queued inside the pending word so it rides
+/// the wrap decision (the event-form of splicing an escape into the buffer).
+#[derive(Debug)]
+enum Mark {
+    Style(Style),
+    /// OSC 8 hyperlink open (`Some(url)`) / close (`None`).
+    Link(Option<String>),
+}
+
+/// Buffering a possible `[text](url)` link (styling on only). Survives chunk
+/// boundaries; if the syntax doesn't complete it aborts back to literal text.
+#[derive(Debug)]
+struct LinkParse {
+    stage: LinkStage,
+    text: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkStage {
+    /// Between `[` and `]` — the visible text.
+    Text,
+    /// Saw `]`; a following `(` opens the URL, anything else is literal `[text]`.
+    CloseText,
+    /// Between `(` and `)` — the URL.
+    Url,
+}
+
+impl LinkParse {
+    fn new() -> Self {
+        Self {
+            stage: LinkStage::Text,
+            text: String::new(),
+            url: String::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -75,13 +119,15 @@ pub struct MarkdownRenderer {
 
     /// Pending delimiter run: (char, length). Survives chunk boundaries.
     run: Option<(char, usize)>,
+    /// Buffering a `[text](url)` link across chunk boundaries (styled only).
+    link: Option<LinkParse>,
 
     col: usize,
     word: String,
-    /// Style changes queued at byte offsets inside the pending `word`, so
-    /// style events ride the wrap decision with it and never dangle across a
-    /// break (the event-form of splicing SGR into the word buffer).
-    word_marks: Vec<(usize, Style)>,
+    /// Presentation changes (style toggles, link open/close) queued at byte
+    /// offsets inside the pending `word`, so they ride the wrap decision with
+    /// it and never dangle across a break.
+    word_marks: Vec<(usize, Mark)>,
     word_width: usize,
     spaces: usize,
     hang: usize,
@@ -121,6 +167,7 @@ impl MarkdownRenderer {
             line_has_content: false,
             prev_char: None,
             run: None,
+            link: None,
             col: 0,
             word: String::new(),
             word_marks: Vec::new(),
@@ -167,6 +214,9 @@ impl MarkdownRenderer {
                     self.out_str(&buf);
                 }
             }
+        }
+        if self.link.is_some() {
+            self.abort_link();
         }
         self.resolve_run(None);
         self.flush_word();
@@ -359,6 +409,10 @@ impl MarkdownRenderer {
     // -- inline text --------------------------------------------------------
 
     fn inline_char(&mut self, c: char) {
+        if self.link.is_some() {
+            self.link_char(c);
+            return;
+        }
         if let Some((rc, n)) = self.run {
             if c == rc {
                 self.run = Some((rc, n + 1));
@@ -376,7 +430,98 @@ impl MarkdownRenderer {
             }
             '*' if !self.code => self.run = Some(('*', 1)),
             '`' => self.run = Some(('`', 1)),
+            // A link's `[…](…)` syntax is presentation, folded into an OSC 8
+            // hyperlink; with styling off it stays literal text (identity).
+            '[' if self.styled && !self.code => self.link = Some(LinkParse::new()),
             _ => self.add_content_char(c),
+        }
+    }
+
+    // -- links --------------------------------------------------------------
+
+    /// Route a char into the in-progress `[text](url)` parse. Any syntax that
+    /// doesn't complete a link aborts back to literal text; a source newline
+    /// or a control char in the URL also aborts (links don't span lines).
+    fn link_char(&mut self, c: char) {
+        let stage = match &self.link {
+            Some(link) => link.stage,
+            None => return,
+        };
+        match stage {
+            LinkStage::Text => match c {
+                ']' => self.link.as_mut().unwrap().stage = LinkStage::CloseText,
+                '\n' => {
+                    self.abort_link();
+                    self.inline_char(c);
+                }
+                _ => self.link.as_mut().unwrap().text.push(c),
+            },
+            LinkStage::CloseText => {
+                if c == '(' {
+                    self.link.as_mut().unwrap().stage = LinkStage::Url;
+                } else {
+                    // `[text]` not followed by `(`: literal, then reprocess `c`
+                    // (it may open the next construct, e.g. another `[`).
+                    self.abort_link();
+                    self.inline_char(c);
+                }
+            }
+            LinkStage::Url => {
+                if c == ')' {
+                    let link = self.link.take().unwrap();
+                    self.finish_link(link.text, link.url);
+                } else if c.is_control() {
+                    // A newline or other control byte can't be part of a URL.
+                    self.abort_link();
+                    self.inline_char(c);
+                } else {
+                    self.link.as_mut().unwrap().url.push(c);
+                }
+            }
+        }
+    }
+
+    /// A complete `[text](url)`: bracket the visible text in link marks so the
+    /// text still wraps and the OSC 8 open/close ride the word buffer with it.
+    fn finish_link(&mut self, text: String, url: String) {
+        self.emit_link(Some(url));
+        for ch in text.chars() {
+            self.literal_char(ch);
+        }
+        self.emit_link(None);
+    }
+
+    /// The link syntax didn't complete — replay the bytes consumed so far as
+    /// literal text (spaces stay breakable), exactly as identity output would.
+    fn abort_link(&mut self) {
+        let Some(link) = self.link.take() else {
+            return;
+        };
+        self.literal_char('[');
+        for ch in link.text.chars() {
+            self.literal_char(ch);
+        }
+        if matches!(link.stage, LinkStage::CloseText | LinkStage::Url) {
+            self.literal_char(']');
+        }
+        if link.stage == LinkStage::Url {
+            self.literal_char('(');
+            for ch in link.url.chars() {
+                self.literal_char(ch);
+            }
+        }
+    }
+
+    /// Emit one char as plain inline content (no delimiter/link detection):
+    /// spaces stay breakable for wrap, everything else joins the word buffer.
+    fn literal_char(&mut self, c: char) {
+        if c == ' ' {
+            self.flush_word();
+            self.spaces += 1;
+            self.overflow = false;
+            self.prev_char = Some(' ');
+        } else {
+            self.add_content_char(c);
         }
     }
 
@@ -448,8 +593,14 @@ impl MarkdownRenderer {
         if opening {
             self.toggle_styles(bold, italic, code);
         }
-        for _ in 0..n {
-            self.add_content_char(rc);
+        // A recognized delimiter is consumed into the SGR span it toggles when
+        // styling is on; otherwise (and for a run that toggled nothing, e.g.
+        // `2 ** 3`) it stays literal so output is byte-identical to input.
+        let hide = self.styled && (bold || italic || code);
+        if !hide {
+            for _ in 0..n {
+                self.add_content_char(rc);
+            }
         }
         if !opening {
             self.toggle_styles(bold, italic, code);
@@ -521,18 +672,21 @@ impl MarkdownRenderer {
         self.emit_word_raw();
     }
 
-    /// Emit the pending word, interleaving queued style marks at their byte
-    /// offsets (the wrap decision, if any, has already been made).
+    /// Emit the pending word, interleaving queued presentation marks at their
+    /// byte offsets (the wrap decision, if any, has already been made).
     fn emit_word_raw(&mut self) {
         let word = std::mem::take(&mut self.word);
         let marks = std::mem::take(&mut self.word_marks);
         let mut pos = 0;
-        for (off, style) in marks {
+        for (off, mark) in marks {
             if off > pos {
                 self.out_str(&word[pos..off]);
                 pos = off;
             }
-            self.out.push(TuiEvent::Style(style));
+            self.out.push(match mark {
+                Mark::Style(style) => TuiEvent::Style(style),
+                Mark::Link(target) => TuiEvent::Link(target),
+            });
         }
         if pos < word.len() {
             self.out_str(&word[pos..]);
@@ -578,7 +732,17 @@ impl MarkdownRenderer {
         if self.overflow {
             self.out.push(TuiEvent::Style(style));
         } else {
-            self.word_marks.push((self.word.len(), style));
+            self.word_marks.push((self.word.len(), Mark::Style(style)));
+        }
+    }
+
+    /// Queue a hyperlink open (`Some(url)`) / close (`None`), riding the word
+    /// buffer like a style mark so it lands on the correct side of a wrap.
+    fn emit_link(&mut self, target: Option<String>) {
+        if self.overflow {
+            self.out.push(TuiEvent::Link(target));
+        } else {
+            self.word_marks.push((self.word.len(), Mark::Link(target)));
         }
     }
 
@@ -708,6 +872,12 @@ mod tests {
         out
     }
 
+    /// OSC 8 hyperlink open for `url`; [`OSC_CLOSE`] ends the run.
+    fn osc_open(url: &str) -> String {
+        format!("\x1b]8;;{url}\x1b\\")
+    }
+    const OSC_CLOSE: &str = "\x1b]8;;\x1b\\";
+
     #[test]
     fn disabled_renderer_is_byte_identical() {
         let inputs = [
@@ -724,6 +894,7 @@ mod tests {
             "~~~\ntilde fence\n~~~\n",
             "> quoted\n>> nested\n",
             "####### seven hashes\n#nospace\n",
+            "see [the docs](https://example.com/x) and [broken](\n",
         ];
         for input in inputs {
             assert_eq!(render(input, plain()), input, "single-feed: {input:?}");
@@ -736,14 +907,15 @@ mod tests {
     }
 
     #[test]
-    fn bold_and_italic_toggle_around_delimiters() {
-        // Delimiters render inside the span: styled the same at both ends.
-        assert_eq!(render("a **b** c", styled()), "a \x1b[0;1m**b**\x1b[0m c");
-        assert_eq!(render("x *it* y", styled()), "x \x1b[0;3m*it*\x1b[0m y");
+    fn styled_hides_emphasis_delimiters() {
+        // Styling on: the `*` delimiters are consumed into the SGR span; only
+        // the emphasized content prints.
+        assert_eq!(render("a **b** c", styled()), "a \x1b[0;1mb\x1b[0m c");
+        assert_eq!(render("x *it* y", styled()), "x \x1b[0;3mit\x1b[0m y");
         // *** toggles both on and both off.
         assert_eq!(
             render("***both*** end", styled()),
-            "\x1b[0;1;3m***both***\x1b[0m end"
+            "\x1b[0;1;3mboth\x1b[0m end"
         );
     }
 
@@ -756,10 +928,12 @@ mod tests {
 
     #[test]
     fn inline_code_styles_and_shields_emphasis() {
-        assert_eq!(render("see `x`.", styled()), "see \x1b[0;36m`x`\x1b[0m.");
-        // Stars inside a code span are literal.
+        // The backtick delimiters are consumed; the code content stays cyan.
+        assert_eq!(render("see `x`.", styled()), "see \x1b[0;36mx\x1b[0m.");
+        // Stars inside a code span are literal (never open emphasis).
         let out = render("`a * b * c`", styled());
         assert!(!out.contains("[0;3m"), "{out:?}");
+        assert!(out.contains("a * b * c"), "{out:?}");
     }
 
     #[test]
@@ -784,9 +958,56 @@ mod tests {
 
     #[test]
     fn finish_closes_open_styles() {
-        assert_eq!(render("**a", styled()), "\x1b[0;1m**a\x1b[0m");
+        // Unclosed `**`: the delimiter is still consumed, the tail styled, and
+        // finish emits the reset.
+        assert_eq!(render("**a", styled()), "\x1b[0;1ma\x1b[0m");
         // No markdown → no escapes at all.
         assert_eq!(render("hello", styled()), "hello");
+    }
+
+    #[test]
+    fn styled_link_becomes_osc8_hyperlink() {
+        let url = "https://example.com/x";
+        assert_eq!(
+            render("see [the docs](https://example.com/x) now", styled()),
+            format!("see {}the docs{OSC_CLOSE} now", osc_open(url))
+        );
+        // A link abutting preceding text keeps that text outside the link.
+        assert_eq!(
+            render("pre[t](u)", styled()),
+            format!("pre{}t{OSC_CLOSE}", osc_open("u"))
+        );
+    }
+
+    #[test]
+    fn plain_link_stays_literal() {
+        // Styling off ⇒ identity: the whole `[text](url)` prints verbatim.
+        let input = "see [the docs](https://example.com/x) now";
+        assert_eq!(render(input, plain()), input);
+        assert_eq!(render_char_chunks(input, plain()), input);
+    }
+
+    #[test]
+    fn incomplete_link_falls_back_to_literal() {
+        // `]` not followed by `(` → literal, trailing char reprocessed.
+        assert_eq!(render("[just text] here", styled()), "[just text] here");
+        // No closing paren before end of stream → literal.
+        assert_eq!(render("[a](http", styled()), "[a](http");
+        // Reference-style `[a][ref]` is not a URL link — passes through.
+        assert_eq!(render("[a][ref] x", styled()), "[a][ref] x");
+        // A newline inside the URL aborts the link.
+        assert_eq!(render("[a](url\nrest", styled()), "[a](url\nrest");
+    }
+
+    #[test]
+    fn link_split_across_chunks_matches_single_feed() {
+        let input = "go [here](https://h.test/p) ok";
+        assert_eq!(render(input, styled()), render_char_chunks(input, styled()));
+        // And the single-feed form is the OSC 8 hyperlink.
+        assert_eq!(
+            render(input, styled()),
+            format!("go {}here{OSC_CLOSE} ok", osc_open("https://h.test/p"))
+        );
     }
 
     #[test]
@@ -901,14 +1122,17 @@ mod tests {
     }
 
     #[test]
-    fn stripping_sgr_recovers_content() {
-        // Additive-only: dropping escapes and normalizing whitespace recovers
-        // the input exactly.
+    fn styled_output_strips_to_visible_text() {
+        // Styling on: emphasis/code delimiters are consumed (headers keep `#`),
+        // so stripping SGR + normalizing whitespace yields the visible text.
         let input = "# Hi\n\nSome **bold** and `code` in a paragraph that wraps around\n- item one two three\n";
+        let visible =
+            "# Hi\n\nSome bold and code in a paragraph that wraps around\n- item one two three\n";
         let palette = Palette::colored(true).with_wrap(Some(16));
-        let out = render_block(input, palette);
-        let stripped = strip_sgr(&out);
-        assert_eq!(normalize_ws(&stripped), normalize_ws(input));
+        let stripped = strip_sgr(&render_block(input, palette));
+        assert_eq!(normalize_ws(&stripped), normalize_ws(visible));
+        // Plain palette recovers the input byte-for-byte (no delimiter dropped).
+        assert_eq!(render_block(input, Palette::plain()), input);
     }
 
     #[test]
@@ -932,8 +1156,8 @@ mod tests {
         let mut r = MarkdownRenderer::new(styled());
         let mut events = r.feed_events("a **b** c");
         events.extend(r.finish_events());
-        // Content never carries escape bytes; joined Text is the full input
-        // (additive-only: delimiters stay visible).
+        // Content never carries escape bytes; the delimiters are folded into
+        // Style events, so joined Text is the visible span only.
         let mut content = String::new();
         for e in &events {
             if let TuiEvent::Text(text) = e {
@@ -941,7 +1165,7 @@ mod tests {
                 content.push_str(text);
             }
         }
-        assert_eq!(content, "a **b** c");
+        assert_eq!(content, "a b c");
         // Style truth is semantic: bold on, then reset.
         let styles: Vec<Style> = events
             .iter()
@@ -960,6 +1184,31 @@ mod tests {
                 Style::RESET
             ]
         );
+    }
+
+    #[test]
+    fn event_stream_carries_link_as_presentation() {
+        let mut r = MarkdownRenderer::new(styled());
+        let mut events = r.feed_events("go [here](https://h.test) ok");
+        events.extend(r.finish_events());
+        // Visible content is escape-free and free of the link syntax.
+        let mut content = String::new();
+        for e in &events {
+            if let TuiEvent::Text(text) = e {
+                assert!(!text.contains('\x1b'), "escape in Text: {text:?}");
+                content.push_str(text);
+            }
+        }
+        assert_eq!(content, "go here ok");
+        // The URL rides Link events, not Text: open then close.
+        let links: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                TuiEvent::Link(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec![Some("https://h.test".to_string()), None]);
     }
 
     #[test]
