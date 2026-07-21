@@ -1119,14 +1119,14 @@ mod tests {
         session.last_usage = Some(TokenUsage {
             input_tokens: 12_345,
             output_tokens: 678,
-            cache_read_tokens: Some(1_000),
-            cache_creation_tokens: None,
+            cached_input_tokens: 1_000,
+            cached_output_tokens: 0,
         });
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.last_usage, session.last_usage);
-        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 13_345);
+        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
 
         let old = dir.join("old.json");
         fs::write(
@@ -1154,8 +1154,8 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 5_000,
             output_tokens: 100,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
         };
         let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
         let id = active.id();
