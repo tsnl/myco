@@ -9,9 +9,10 @@
 //!   piped stdout, session files, and the user's echoed input stay verbatim.
 //! - **Styled = presentation**: with styling on, the *formatting* delimiters
 //!   are consumed into presentation rather than printed — `*` / `` ` ``
-//!   emphasis runs turn into SGR, and a `[text](url)` link becomes an OSC 8
-//!   hyperlink over its visible text — while every *content* byte still reaches
-//!   the output in order. ATX headers are the exception: their `#` markers stay
+//!   emphasis runs turn into SGR, a `[text](url)` link becomes an OSC 8
+//!   hyperlink over its visible text, and a bare `http(s)://…` URL becomes one
+//!   over itself — while every *content* byte still reaches the output in
+//!   order. ATX headers are the exception: their `#` markers stay
 //!   visible (the line just styles bold). A stray delimiter can mis-style a
 //!   span, never corrupt content.
 //!
@@ -25,9 +26,10 @@
 //! `enabled` flag.
 //!
 //! Supported: `**` / `*` emphasis toggles (with a light flanking check),
-//! `` ` `` inline code, `[text](url)` links (OSC 8 when styled), ATX headers,
-//! fenced code blocks (never styled or wrapped), indented (4-space) lines
-//! verbatim, list hanging indent, and — **styled only** — GFM pipe tables.
+//! `` ` `` inline code, `[text](url)` links and bare `http(s)://` URLs (both
+//! OSC 8 when styled), ATX headers, fenced code blocks (never styled or
+//! wrapped), indented (4-space) lines verbatim, list hanging indent, and —
+//! **styled only** — GFM pipe tables.
 //!
 //! Tables are the one construct that needs the whole block before *any* of it
 //! can be emitted (column widths depend on the widest cell), which append-only
@@ -44,7 +46,8 @@
 //! guarantee for files and pipes.
 //!
 //! Out of scope — constructs that need non-linear layout or lookaside beyond
-//! the above: setext headers, reference/auto links, images.
+//! the above: setext headers, reference links, `<…>` angle-bracket autolinks,
+//! images.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -191,6 +194,18 @@ pub struct MarkdownRenderer {
     /// Meaningful only when `wrap` is set (the no-wrap path flushes words in
     /// fragments); read by table cell measurement ([`render_cell`]).
     max_word_width: usize,
+    /// The pending word contains a bare URL scheme at a valid boundary.
+    /// Suppresses wrap overflow (and per-char flushing in no-wrap mode) so the
+    /// whole URL stays buffered — a word streamed raw can't be bracketed in the
+    /// link marks [`Self::autolink_word`] splices in.
+    word_is_url: bool,
+    /// The content char just before the pending `word` (`None` at a line
+    /// start): the left context for the scheme-boundary check, since in no-wrap
+    /// mode the char before a URL was already flushed out of `word`.
+    word_start_prev: Option<char>,
+    /// Suppress bare-URL detection while replaying a `[text](url)` link's
+    /// visible text, so a URL used *as* link text doesn't nest a second link.
+    suppress_autolink: bool,
 }
 
 impl MarkdownRenderer {
@@ -237,6 +252,9 @@ impl MarkdownRenderer {
             max_word_width: 0,
             hang: 0,
             overflow: false,
+            word_is_url: false,
+            word_start_prev: None,
+            suppress_autolink: false,
         };
         if r.base != Style::RESET {
             r.out.push(TuiEvent::Style(r.base));
@@ -318,8 +336,13 @@ impl MarkdownRenderer {
             }
         }
         // Without wrap there is no need to hold words back; only delimiter
-        // runs may buffer across chunks.
-        if self.wrap.is_none() && self.run.is_none() && self.line == Line::Body {
+        // runs — and a bare URL still forming, which must stay whole to be
+        // linked — may buffer across chunks.
+        if self.wrap.is_none()
+            && self.run.is_none()
+            && self.line == Line::Body
+            && !self.pending_url_word()
+        {
             self.flush_word();
             self.emit_spaces();
         }
@@ -815,9 +838,13 @@ impl MarkdownRenderer {
     /// text still wraps and the OSC 8 open/close ride the word buffer with it.
     fn finish_link(&mut self, text: String, url: String) {
         self.emit_link(Some(url));
+        // The visible text is already inside this link; don't let a URL within
+        // it open a second, nested one.
+        self.suppress_autolink = true;
         for ch in text.chars() {
             self.literal_char(ch);
         }
+        self.suppress_autolink = false;
         self.emit_link(None);
     }
 
@@ -883,6 +910,7 @@ impl MarkdownRenderer {
         self.col = 0;
         self.hang = 0;
         self.overflow = false;
+        self.word_is_url = false;
     }
 
     /// A delimiter run ended; `next` is the char after it (`None` at stream
@@ -954,6 +982,11 @@ impl MarkdownRenderer {
     }
 
     fn add_content_char(&mut self, c: char) {
+        if self.word.is_empty() {
+            // Left context for the scheme boundary check, captured before the
+            // char below overwrites `prev_char`.
+            self.word_start_prev = self.prev_char;
+        }
         if !c.is_whitespace() {
             self.line_has_content = true;
         }
@@ -969,8 +1002,23 @@ impl MarkdownRenderer {
         }
         self.word.push(c);
         self.word_width += w;
+        // Recognize a bare URL the moment its `://` lands (styling on, outside
+        // code and link-text replay). A recognized URL keeps buffering past the
+        // wrap width instead of overflowing into raw output — overflow streams
+        // chars straight out, where the link marks could no longer wrap them.
+        if self.styled
+            && !self.code
+            && !self.suppress_autolink
+            && !self.word_is_url
+            && c == '/'
+            && self.word.ends_with("://")
+            && self.word_starts_url()
+        {
+            self.word_is_url = true;
+        }
         if let Some(width) = self.wrap
             && self.word_width >= width
+            && !self.word_is_url
         {
             self.flush_word();
             self.overflow = true;
@@ -983,6 +1031,7 @@ impl MarkdownRenderer {
         if self.word.is_empty() && self.word_marks.is_empty() {
             return;
         }
+        self.autolink_word();
         if let Some(width) = self.wrap
             && self.col > 0
             && self.spaces > 0
@@ -1028,6 +1077,83 @@ impl MarkdownRenderer {
         }
         self.col += self.word_width;
         self.word_width = 0;
+        self.word_is_url = false;
+    }
+
+    /// Splice OSC 8 link marks around a bare `http(s)://…` URL in the completed
+    /// word so it hyperlinks like a `[text](url)` link would — the visible text
+    /// is untouched, only zero-width [`Mark::Link`] open/close ride in at the
+    /// URL's byte offsets. Styled-only: `word_is_url` is set solely when styling
+    /// is on, so plain output keeps its byte-for-byte identity.
+    fn autolink_word(&mut self) {
+        if !self.word_is_url {
+            return;
+        }
+        let Some((start, end)) = self.find_url() else {
+            return;
+        };
+        let url = self.word[start..end].to_string();
+        self.word_marks.push((start, Mark::Link(Some(url))));
+        self.word_marks.push((end, Mark::Link(None)));
+        // Keep marks in ascending byte order for the offset-splicing in
+        // `emit_word_raw`; the sort is stable, so a co-located style mark
+        // (emitted earlier) still precedes the link open.
+        self.word_marks.sort_by_key(|(off, _)| *off);
+    }
+
+    /// Whether `word` carries an `http(s)://` scheme at a valid boundary — the
+    /// word start (with a non-alphanumeric `word_start_prev`) or any position
+    /// after a non-alphanumeric char. Cheap-triggered only when a `://` lands,
+    /// so its per-char scan runs at most once per word.
+    fn word_starts_url(&self) -> bool {
+        let mut prev = self.word_start_prev;
+        for (i, c) in self.word.char_indices() {
+            if prev.is_none_or(|p| !p.is_alphanumeric()) && scheme_len_at(&self.word, i).is_some() {
+                return true;
+            }
+            prev = Some(c);
+        }
+        false
+    }
+
+    /// Byte range `[start, end)` of the bare URL in the completed word (scheme
+    /// at a boundary, host non-empty), or `None`. The left boundary uses
+    /// `word_start_prev` for a scheme at offset 0, so a URL glued to a preceding
+    /// letter (`foohttp://…`) is rejected the same in wrap and no-wrap modes.
+    fn find_url(&self) -> Option<(usize, usize)> {
+        let mut prev = self.word_start_prev;
+        for (i, c) in self.word.char_indices() {
+            if prev.is_none_or(|p| !p.is_alphanumeric())
+                && let Some(len) = scheme_len_at(&self.word, i)
+            {
+                let end = url_end(&self.word, i);
+                // Require at least one host char past the scheme.
+                if end > i + len {
+                    return Some((i, end));
+                }
+            }
+            prev = Some(c);
+        }
+        None
+    }
+
+    /// No-wrap mode flushes a word per char; a bare URL must instead stay
+    /// buffered until whole so [`Self::autolink_word`] can wrap it. True while
+    /// the pending word is a URL, or an `http(s)://` scheme still forming at a
+    /// valid boundary. Styled-only, and never during code spans or link-text
+    /// replay — those never autolink, so they keep their per-char flushing.
+    fn pending_url_word(&self) -> bool {
+        if !self.styled || self.code || self.suppress_autolink {
+            return false;
+        }
+        if self.word_is_url {
+            return true;
+        }
+        if self.word_start_prev.is_some_and(|p| p.is_alphanumeric()) {
+            return false;
+        }
+        let w: &str = &self.word;
+        !w.is_empty() && (HTTP.starts_with(w) || HTTPS.starts_with(w))
     }
 
     fn emit_spaces(&mut self) {
@@ -1170,6 +1296,51 @@ fn display_width(s: &str) -> usize {
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
+}
+
+// -- bare URL autolinking ---------------------------------------------------
+
+const HTTP: &str = "http://";
+const HTTPS: &str = "https://";
+
+/// Scheme length in bytes if `word[i..]` opens with `http://` / `https://`.
+fn scheme_len_at(word: &str, i: usize) -> Option<usize> {
+    let rest = &word[i..];
+    if rest.starts_with(HTTPS) {
+        Some(HTTPS.len())
+    } else if rest.starts_with(HTTP) {
+        Some(HTTP.len())
+    } else {
+        None
+    }
+}
+
+/// End byte offset of the URL that begins at `start`, trimming trailing
+/// punctuation more likely to be sentence punctuation than part of the link —
+/// `.,;:!?"'<>` unconditionally, and a closing bracket only when unbalanced
+/// within the URL (so the inner parens of `…/Foo_(bar)` stay, but a wrapping
+/// `(…)` does not).
+fn url_end(word: &str, start: usize) -> usize {
+    let mut end = word.len();
+    loop {
+        let seg = &word[start..end];
+        let Some(last) = seg.chars().next_back() else {
+            break;
+        };
+        let strip = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '<' | '>' => true,
+            ')' => seg.matches(')').count() > seg.matches('(').count(),
+            ']' => seg.matches(']').count() > seg.matches('[').count(),
+            '}' => seg.matches('}').count() > seg.matches('{').count(),
+            _ => false,
+        };
+        if strip {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 // -- table helpers ----------------------------------------------------------
@@ -1400,6 +1571,7 @@ mod tests {
             "> quoted\n>> nested\n",
             "####### seven hashes\n#nospace\n",
             "see [the docs](https://example.com/x) and [broken](\n",
+            "bare https://example.com/x url, then (http://a.b/c). end\n",
             "| A | B |\n| - | - |\n| 1 | 22 |\n",
             "| not a table\nplain line\n",
         ];
@@ -1514,6 +1686,181 @@ mod tests {
         assert_eq!(
             render(input, styled()),
             format!("go {}here{OSC_CLOSE} ok", osc_open("https://h.test/p"))
+        );
+    }
+
+    // -- bare URL autolinking -----------------------------------------------
+
+    #[test]
+    fn bare_url_becomes_osc8_hyperlink() {
+        // The visible text is the URL itself; the OSC 8 target is the same URL.
+        let url = "https://example.com/x";
+        assert_eq!(
+            render("see https://example.com/x now", styled()),
+            format!("see {}{url}{OSC_CLOSE} now", osc_open(url))
+        );
+        // `http://` is detected the same as `https://`.
+        let url = "http://a.test/p";
+        assert_eq!(
+            render("go http://a.test/p", styled()),
+            format!("go {}{url}{OSC_CLOSE}", osc_open(url))
+        );
+    }
+
+    #[test]
+    fn bare_url_trailing_punctuation_stays_outside_link() {
+        // Sentence punctuation after the URL is visible but not part of the link.
+        let url = "https://example.com";
+        assert_eq!(
+            render("Visit https://example.com.", styled()),
+            format!("Visit {}{url}{OSC_CLOSE}.", osc_open(url))
+        );
+        // A wrapping paren is excluded; balanced inner parens are kept.
+        assert_eq!(
+            render("(https://example.com)", styled()),
+            format!("({}{url}{OSC_CLOSE})", osc_open(url))
+        );
+        let wiki = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        assert_eq!(
+            render("see https://en.wikipedia.org/wiki/Foo_(bar).", styled()),
+            format!("see {}{wiki}{OSC_CLOSE}.", osc_open(wiki))
+        );
+    }
+
+    #[test]
+    fn bare_url_not_linked_without_a_real_scheme() {
+        // No scheme → literal; a scheme glued to a preceding word → literal.
+        assert_eq!(
+            render("visit example.com today", styled()),
+            "visit example.com today"
+        );
+        assert_eq!(
+            render("see www.example.com", styled()),
+            "see www.example.com"
+        );
+        assert_eq!(
+            render("nothttp://x.test here", styled()),
+            "nothttp://x.test here"
+        );
+        // Scheme with an empty host is not a link.
+        assert_eq!(
+            render("bare https:// slash", styled()),
+            "bare https:// slash"
+        );
+    }
+
+    #[test]
+    fn bare_url_in_code_span_is_not_linked() {
+        // Inside a code span the URL is literal, monospace content.
+        let out = render("run `curl https://example.com`", styled());
+        assert!(
+            !out.contains("\x1b]8;;"),
+            "no hyperlink in code span: {out:?}"
+        );
+        assert!(out.contains("https://example.com"), "{out:?}");
+    }
+
+    #[test]
+    fn plain_mode_bare_url_stays_literal() {
+        // Styling off ⇒ identity: the URL prints verbatim, no OSC 8.
+        let input = "see https://example.com/x, then done";
+        assert_eq!(render(input, plain()), input);
+        assert_eq!(render_char_chunks(input, plain()), input);
+    }
+
+    #[test]
+    fn bare_url_split_across_chunks_matches_single_feed() {
+        let input = "go https://h.test/a/b?c=d ok";
+        assert_eq!(render(input, styled()), render_char_chunks(input, styled()));
+        let url = "https://h.test/a/b?c=d";
+        assert_eq!(
+            render(input, styled()),
+            format!("go {}{url}{OSC_CLOSE} ok", osc_open(url))
+        );
+    }
+
+    #[test]
+    fn bare_url_event_stream_carries_link_as_presentation() {
+        // The live TUI path is the event path: the URL must ride Link events,
+        // its visible Text stay escape-free and equal to the source.
+        let mut r = MarkdownRenderer::new(styled());
+        let mut events = r.feed_events("open https://h.test/p now");
+        events.extend(r.finish_events());
+        let mut content = String::new();
+        for e in &events {
+            if let TuiEvent::Text(text) = e {
+                assert!(!text.contains('\x1b'), "escape in Text: {text:?}");
+                content.push_str(text);
+            }
+        }
+        assert_eq!(content, "open https://h.test/p now");
+        let links: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                TuiEvent::Link(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec![Some("https://h.test/p".to_string()), None]);
+    }
+
+    #[test]
+    fn url_as_markdown_link_text_is_not_double_linked() {
+        // `[url](url)` must yield a single link whose target is the paren URL,
+        // never a second link nested over the visible text.
+        let out = render("[https://vis.test](https://tgt.test)", styled());
+        assert_eq!(
+            out,
+            format!(
+                "{}https://vis.test{OSC_CLOSE}",
+                osc_open("https://tgt.test")
+            )
+        );
+    }
+
+    #[test]
+    fn long_bare_url_wraps_whole_and_links() {
+        // A URL longer than the wrap width breaks before it (no mid-URL split)
+        // and is still linked in full, rather than overflowing raw and unlinked.
+        let url = "https://example.com/very/long/path/segment";
+        let out = render(
+            &format!("see {url}"),
+            Palette::colored(true).with_wrap(Some(12)),
+        );
+        assert_eq!(out, format!("see\n{}{url}{OSC_CLOSE}", osc_open(url)));
+    }
+
+    #[test]
+    fn bare_url_in_table_cell_is_hyperlinked() {
+        // Cells render through the same inline machine, so a bare URL inside
+        // one hyperlinks like prose; the box pads by visible width.
+        let url = "https://h.test/x";
+        let input = "| link |\n| - |\n| https://h.test/x |\n";
+        let out = render(input, styled());
+        assert!(out.contains(&osc_open(url)), "cell URL linked: {out:?}");
+        assert_eq!(
+            strip_escapes(&out),
+            "┌──────────────────┐\n\
+             │ link             │\n\
+             ├──────────────────┤\n\
+             │ https://h.test/x │\n\
+             └──────────────────┘\n"
+        );
+    }
+
+    #[test]
+    fn squeezed_cell_keeps_url_whole_and_linked() {
+        // In a squeezed table the URL is the column's floor: it stays on one
+        // physical line (never split mid-URL) and stays hyperlinked, while the
+        // prose around it wraps into further lines.
+        let url = "https://h.test/long/path";
+        let input = format!("| k | v |\n| - | - |\n| a | see {url} today |\n");
+        let out = render(&input, styled_wrap(34));
+        assert!(out.contains(&osc_open(url)), "squeezed URL linked: {out:?}");
+        let plain = strip_escapes(&out);
+        assert!(
+            plain.contains(&format!("│ {url} ")),
+            "URL on one cell line: {plain:?}"
         );
     }
 
@@ -1636,7 +1983,7 @@ mod tests {
         let visible =
             "# Hi\n\nSome bold and code in a paragraph that wraps around\n- item one two three\n";
         let palette = Palette::colored(true).with_wrap(Some(16));
-        let stripped = strip_sgr(&render_block(input, palette));
+        let stripped = strip_escapes(&render_block(input, palette));
         assert_eq!(normalize_ws(&stripped), normalize_ws(visible));
         // Plain palette recovers the input byte-for-byte (no delimiter dropped).
         assert_eq!(render_block(input, Palette::plain()), input);
@@ -1747,7 +2094,7 @@ mod tests {
     #[test]
     fn styled_table_renders_aligned_box() {
         let input = "| A | B |\n| - | - |\n| 1 | 22 |\n";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(
             out,
             "┌───┬────┐\n\
@@ -1762,7 +2109,7 @@ mod tests {
     fn table_honors_column_alignment() {
         // `:--` left, `--:` right; column width comes from the widest cell.
         let input = "| L | R |\n| :-- | --: |\n| a | b |\n| ccc | ddd |\n";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(
             out,
             "┌─────┬─────┐\n\
@@ -1781,7 +2128,7 @@ mod tests {
         let input = "| **b** | `c` |\n| - | - |\n| x | y |\n";
         let out = render(input, styled());
         assert_eq!(
-            strip_sgr(&out),
+            strip_escapes(&out),
             "┌───┬───┐\n│ b │ c │\n├───┼───┤\n│ x │ y │\n└───┴───┘\n"
         );
         assert!(out.contains("\x1b[0;1mb\x1b[0m"), "bold cell: {out:?}");
@@ -1792,14 +2139,14 @@ mod tests {
     fn table_renders_without_trailing_newline() {
         // Confirmed table whose final row is unterminated at stream end.
         let input = "| H |\n| - |\n| x |";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(out, "┌───┐\n│ H │\n├───┤\n│ x │\n└───┘\n");
     }
 
     #[test]
     fn table_terminates_at_blank_line_then_prose_resumes() {
         let input = "| H |\n| - |\n| x |\n\nafter\n";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(out, "┌───┐\n│ H │\n├───┤\n│ x │\n└───┘\n\nafter\n");
     }
 
@@ -1807,7 +2154,7 @@ mod tests {
     fn header_only_table_omits_body_separator() {
         // A header + delimiter with no body rows draws top/header/bottom only.
         let input = "| H1 | H2 |\n| - | - |\n\ntail\n";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(out, "┌────┬────┐\n│ H1 │ H2 │\n└────┴────┘\n\ntail\n");
     }
 
@@ -1827,7 +2174,7 @@ mod tests {
         // the natural widths and wrap 10 is infeasible: the allocator falls
         // back to minimums and the box overflows at its natural 15 columns.
         let input = "| aaaa | bbbb |\n| - | - |\n| cccc | dddd |\n";
-        let out = strip_sgr(&render(input, Palette::colored(true).with_wrap(Some(10))));
+        let out = strip_escapes(&render(input, Palette::colored(true).with_wrap(Some(10))));
         assert_eq!(
             out,
             "┌──────┬──────┐\n\
@@ -1859,7 +2206,7 @@ mod tests {
     fn cjk_cells_pad_by_display_width() {
         // "你好" is width 4, so its column is 4 wide and ascii cells pad to match.
         let input = "| 你好 | b |\n| - | - |\n| a | y |\n";
-        let out = strip_sgr(&render(input, styled()));
+        let out = strip_escapes(&render(input, styled()));
         assert_eq!(
             out,
             "┌──────┬───┐\n│ 你好 │ b │\n├──────┼───┤\n│ a    │ y │\n└──────┴───┘\n"
@@ -1877,7 +2224,7 @@ mod tests {
         // Natural width (25) exceeds wrap 20, so the wide column wraps and the
         // row grows to two physical lines; the box fits within 20 columns.
         let input = "| id | note |\n| -- | ---- |\n| 1 | alpha beta gamma |\n";
-        let out = strip_sgr(&render(input, styled_wrap(20)));
+        let out = strip_escapes(&render(input, styled_wrap(20)));
         assert_eq!(
             out,
             "┌────┬─────────────┐\n\
@@ -1893,7 +2240,7 @@ mod tests {
     fn wrapped_cells_keep_column_alignment() {
         // Right-aligned column stays right-aligned on every wrapped line.
         let input = "| a | b |\n| :-- | --: |\n| x | one two three four |\n";
-        let out = strip_sgr(&render(input, styled_wrap(18)));
+        let out = strip_escapes(&render(input, styled_wrap(18)));
         assert_eq!(
             out,
             "┌───┬────────────┐\n\
@@ -1926,7 +2273,7 @@ mod tests {
         // overflows the wrap width (box wider than 30) and the word stays whole.
         let url = "https://example.com/really/long/unbreakable/path";
         let input = format!("| k | v |\n| - | - |\n| link | {url} |\n");
-        let out = strip_sgr(&render(&input, styled_wrap(30)));
+        let out = strip_escapes(&render(&input, styled_wrap(30)));
         assert!(out.contains(url), "token kept whole: {out:?}");
         // The narrow column still wrapped tight rather than padding to the box.
         assert!(out.contains("│ k    │"), "{out:?}");
@@ -1950,18 +2297,32 @@ mod tests {
         assert_eq!(allocate_widths(&[1, 1], &[10, 10], 15), vec![8, 7]);
     }
 
-    fn strip_sgr(s: &str) -> String {
+    /// Visible text only: drop SGR (`ESC [ … m`) and OSC 8 hyperlink
+    /// (`ESC ] … ST`) sequences.
+    fn strip_escapes(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for e in chars.by_ref() {
-                    if e == 'm' {
-                        break;
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('[') => {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
                     }
                 }
-            } else {
-                out.push(c);
+                Some(']') => {
+                    while let Some(e) = chars.next() {
+                        if e == '\x07' || (e == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         out
