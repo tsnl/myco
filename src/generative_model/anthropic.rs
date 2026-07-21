@@ -738,11 +738,17 @@ struct AnthropicUsage {
 
 impl AnthropicUsage {
     fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+        // Full prompt = input + cache read + cache write; cached_input = reads.
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
         crate::generative_model::TokenUsage {
-            input_tokens: self.input_tokens,
+            input_tokens: self
+                .input_tokens
+                .saturating_add(cache_read)
+                .saturating_add(cache_creation),
             output_tokens: self.output_tokens,
-            cache_read_tokens: self.cache_read_input_tokens,
-            cache_creation_tokens: self.cache_creation_input_tokens,
+            cached_input_tokens: cache_read,
+            cached_output_tokens: 0,
         }
     }
 }
@@ -1224,8 +1230,9 @@ mod tests {
                 _ => None,
             })
             .expect("message_start should emit usage");
-        assert_eq!(usage.input_tokens, 2095);
-        assert_eq!(usage.cache_read_tokens, Some(100));
+        assert_eq!(usage.input_tokens, 2195);
+        assert_eq!(usage.cached_input_tokens, 100);
+        assert_eq!(usage.cached_output_tokens, 0);
         assert_eq!(usage.context_tokens(), 2195);
     }
 
