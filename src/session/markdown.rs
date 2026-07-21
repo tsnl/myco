@@ -41,7 +41,10 @@
 //! prose. A table that fits the wrap width renders at its natural width; one
 //! too wide reflows — columns are sized by max-min fair share and cell contents
 //! wrap into taller rows so it stays inside the terminal (only an unbreakable
-//! over-long word can still overflow). Because capture is gated on styling,
+//! over-long word can still overflow). When any body row wraps, horizontal
+//! rules separate every body row so multiline rows don't blend together;
+//! all-single-line tables keep the compact borderless body. Because capture is
+//! gated on styling,
 //! **plain mode passes tables through byte-identically**, keeping the identity
 //! guarantee for files and pipes.
 //!
@@ -598,9 +601,10 @@ impl MarkdownRenderer {
     /// fair-share allocator ([`allocate_widths`]): with no wrap width, or when
     /// the table already fits, every column gets its natural width and each row
     /// is one line; when the table is too wide for the wrap column, the wide
-    /// columns are squeezed and their cells wrap into taller rows. Only an
-    /// unbreakable over-long word can still push the box past the wrap width.
-    /// `lines` is header, delimiter, then rows.
+    /// columns are squeezed and their cells wrap into taller rows, and body
+    /// rows are separated by horizontal rules so they stay distinguishable.
+    /// Only an unbreakable over-long word can still push the box past the wrap
+    /// width. `lines` is header, delimiter, then rows.
     fn render_table(&mut self, lines: &[String]) {
         fn cell_text(raw: &[String], i: usize) -> &str {
             raw.get(i).map_or("", String::as_str)
@@ -677,12 +681,24 @@ impl MarkdownRenderer {
             .map(|(m, r)| wrap_row(m, r))
             .collect();
 
+        // A wrapped cell makes its row several physical lines tall, and without
+        // a rule between rows adjacent multiline rows blend together. So once
+        // any body row is multiline, every pair of body rows gets a separator
+        // (all of them, so the table reads uniformly); an all-single-line table
+        // keeps the compact borderless body.
+        let separate_rows = body_lines
+            .iter()
+            .any(|row| row.iter().any(|cell| cell.len() > 1));
+
         self.frame_open();
         self.table_border(&widths, '┌', '┬', '┐');
         self.table_multiline_row(header_lines, &widths, &aligns);
         if !body_lines.is_empty() {
             self.table_border(&widths, '├', '┼', '┤');
-            for row in body_lines {
+            for (i, row) in body_lines.into_iter().enumerate() {
+                if separate_rows && i > 0 {
+                    self.table_border(&widths, '├', '┼', '┤');
+                }
                 self.table_multiline_row(row, &widths, &aligns);
             }
         }
@@ -2249,6 +2265,43 @@ mod tests {
              │ x │    one two │\n\
              │   │ three four │\n\
              └───┴────────────┘\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_table_separates_every_body_row() {
+        // One multiline row makes rows hard to tell apart, so the whole body
+        // gets per-row rules — including between the single-line rows.
+        let input = "| id | note |\n| -- | ---- |\n\
+                     | 1 | alpha beta gamma |\n| 2 | ok |\n";
+        let out = strip_escapes(&render(input, styled_wrap(20)));
+        assert_eq!(
+            out,
+            "┌────┬─────────────┐\n\
+             │ id │ note        │\n\
+             ├────┼─────────────┤\n\
+             │ 1  │ alpha beta  │\n\
+             │    │ gamma       │\n\
+             ├────┼─────────────┤\n\
+             │ 2  │ ok          │\n\
+             └────┴─────────────┘\n"
+        );
+    }
+
+    #[test]
+    fn single_line_rows_stay_compact_under_wrap() {
+        // A wrap width that the table already fits: no row wraps, so the body
+        // keeps its compact borderless form.
+        let input = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
+        let out = strip_escapes(&render(input, styled_wrap(40)));
+        assert_eq!(
+            out,
+            "┌───┬───┐\n\
+             │ a │ b │\n\
+             ├───┼───┤\n\
+             │ 1 │ 2 │\n\
+             │ 3 │ 4 │\n\
+             └───┴───┘\n"
         );
     }
 
