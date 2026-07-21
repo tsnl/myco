@@ -47,7 +47,8 @@ issues; hosts via `/hosts`.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
   when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
   delimiters *removed* (the styling conveys them), `#` headers keep their
-  markers, and `[text](url)` becomes a clickable OSC 8 hyperlink over `text`.
+  markers, and both `[text](url)` and a bare `http(s)://` URL become a
+  clickable OSC 8 hyperlink (over `text`, or over the URL itself).
   `--wrap auto|off|COLS` sets a width *cap* (auto = 80); the effective width
   is min(cap, terminal width), re-measured every prompt — after a resize the
   dialog is cleared and reprinted at the new width (same as Ctrl-L). Fenced
