@@ -7,7 +7,7 @@ You cannot press these yourself — tell the user which command to run.
 | `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
 | `/session` | Current session metadata (title, links, scratchpad, path) |
 | `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
-| `/resume [id]` | Load conversation memory |
+| `/resume [id]` | Load conversation memory (no id: session browser, see below) |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
 | `/compact` | Compact into successor session (summary + recent tail) |
@@ -23,6 +23,19 @@ Shift-Enter does **not** insert a newline in most terminals: they transmit it as
 plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
+
+### Session browser
+
+Bare `/resume` opens a session picker. Inside tmux (>= 3.2) it runs as a
+`tmux display-popup` executing `myco --mode session-browser`: fzf-powered
+fuzzy search over titles with a transcript preview (from the `{id}.console`
+mirror) when `fzf` is installed, else a paged list. Outside tmux the same
+paged list runs inline (`m` = next page, `q` = cancel). `tmux` and `fzf` are
+both optional — nothing warns when they are missing.
+
+`myco --mode session-browser` also runs standalone: it prints the picked
+session id to stdout (`--out FILE` writes it to a file instead; empty/absent
+file means cancelled), e.g. `myco --resume "$(myco --mode session-browser)"`.
 
 Startup banner is a small headed block (full-block rule, `MYCO`, model +
 session, `/help` and newline hints). Startup preflight problems

@@ -7,6 +7,7 @@ pub mod host;
 pub mod manual;
 pub mod prompts;
 pub mod session;
+pub mod session_browser;
 pub mod text_search;
 pub mod tool_services;
 pub mod tui;

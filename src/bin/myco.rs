@@ -85,9 +85,15 @@ struct Args {
     help_topic: Option<String>,
 
     /// Run mode. `interactive` (default) starts the agent REPL; `host` runs the
-    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via ssh).
+    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via
+    /// ssh); `session-browser` runs the standalone session picker.
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
+
+    /// Write the picked session id to FILE instead of stdout. Only with
+    /// `--mode session-browser`; used by the bare-/resume tmux popup handshake.
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
 
     /// Host name advertised in hello_ok / logs. Only used with `--mode host`.
     #[arg(long, default_value = "local")]
@@ -152,6 +158,9 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
+    /// Standalone session picker (fzf when installed, else a paged prompt);
+    /// prints the chosen id, or writes it to `--out`.
+    SessionBrowser,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +178,16 @@ async fn main() {
     match args.mode {
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
+        Mode::SessionBrowser => run_session_browser(args),
+    }
+}
+
+/// `--mode session-browser`: standalone picker, spawned by the bare-/resume
+/// tmux popup or run directly.
+fn run_session_browser(args: Args) {
+    if let Err(e) = myco::session_browser::run(args.out.as_deref()) {
+        eprintln!("session browser error: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -960,8 +979,17 @@ fn handle_meta(
             let _ = session.persist_messages(agent.history(), agent.last_usage(), false);
             print!("{}", format_session_detail(&session.snapshot()));
         }
-        MetaCommand::Sessions => match list_sessions(RECENT_SESSION_LIMIT) {
-            Ok(list) => print_session_list(&list),
+        MetaCommand::Sessions => match list_sessions(0) {
+            Ok(list) => {
+                let shown = RECENT_SESSION_LIMIT.min(list.len());
+                print_session_list(&list[..shown]);
+                if list.len() > shown {
+                    println!(
+                        "  … {} more — bare /resume opens the session browser",
+                        list.len() - shown
+                    );
+                }
+            }
             Err(e) => eprintln!("Failed to list sessions: {e}"),
         },
         MetaCommand::Hosts => print_host_status(harness),
@@ -992,6 +1020,7 @@ fn handle_meta(
                     );
                     print_session_history(agent.history(), palette);
                 }
+                Err(e) if e == RESUME_CANCELLED => println!("resume cancelled"),
                 Err(e) => eprintln!("resume failed: {e}"),
             }
         }
@@ -1091,7 +1120,8 @@ Commands:
   /session              Show session metadata (title, links, scratchpad, path)
   /sessions             List recent sessions (title + link counts)
   /hosts                List configured hosts and attach status
-  /resume [id|prefix]   Resume a session (prompts if omitted)
+  /resume [id|prefix]   Resume a session (no arg: browser -- tmux popup when
+                        inside tmux >= 3.2, else an inline paged list)
   /new                  Start a new session (saves current; clears display)
   /effort [level]       Show or set reasoning effort (low|medium|high|max)
   /title [text]         Show or set session title (empty text clears)
@@ -1237,42 +1267,35 @@ fn reload_readline_history(
 // Resume: resolve id → load Session → install into agent/editor
 // ---------------------------------------------------------------------------
 
+/// Sentinel from the pickers: the user backed out, not a failure.
+const RESUME_CANCELLED: &str = "cancelled";
+
 fn resolve_resume_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
     match id_or_prefix {
         Some(id) => Session::load_by_id_or_prefix(id),
-        None => pick_session_interactively(),
+        None => {
+            if myco::session_browser::tmux_popup_available() {
+                match myco::session_browser::pick_via_tmux_popup() {
+                    Ok(Some(choice)) => return Session::load_by_id_or_prefix(&choice),
+                    Ok(None) => return Err(RESUME_CANCELLED.into()),
+                    // tmux failed; the inline picker below still works.
+                    Err(_) => {}
+                }
+            }
+            pick_session_interactively()
+        }
     }
 }
 
 fn pick_session_interactively() -> Result<Session, String> {
-    let list = list_sessions(RECENT_SESSION_LIMIT)?;
+    let list = list_sessions(0)?;
     if list.is_empty() {
         return Err("no sessions found under ~/.myco/session".into());
     }
-    print_session_list(&list);
-    print!("Resume which? [id/prefix/number] (empty = most recent): ");
-    let _ = std::io::stdout().flush();
-
-    // Plain stdin read so the picker choice does not enter readline history.
-    let mut choice = String::new();
-    std::io::stdin()
-        .read_line(&mut choice)
-        .map_err(|e| e.to_string())?;
-    let choice = choice.trim();
-
-    if choice.is_empty() {
-        return Session::load(&list[0].path);
+    match myco::session_browser::pick_paged(&list)? {
+        Some(choice) => Session::load_by_id_or_prefix(&choice),
+        None => Err(RESUME_CANCELLED.into()),
     }
-    if let Ok(n) = choice.parse::<usize>() {
-        let idx = n
-            .checked_sub(1)
-            .ok_or_else(|| "invalid number".to_string())?;
-        let meta = list
-            .get(idx)
-            .ok_or_else(|| format!("no session numbered {n}"))?;
-        return Session::load(&meta.path);
-    }
-    Session::load_by_id_or_prefix(choice)
 }
 
 fn install_session(

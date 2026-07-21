@@ -711,18 +711,24 @@ pub fn first_user_text_from_messages(messages: &[Message]) -> Option<String> {
     None
 }
 
-pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> String {
+/// Human label for a list row: title when set, else the first-user-message
+/// snippet, else `(untitled)`.
+pub fn session_label(entry: &SessionListEntry) -> String {
     let label = entry
         .title
         .as_deref()
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .unwrap_or_else(|| truncate_snippet(&entry.snippet, SESSION_LIST_SNIPPET));
-    let label = if label.is_empty() {
+    if label.is_empty() {
         "(untitled)".to_string()
     } else {
         label
-    };
+    }
+}
+
+pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> String {
+    let label = session_label(entry);
     let links = if entry.link_counts.is_empty() {
         String::new()
     } else {
