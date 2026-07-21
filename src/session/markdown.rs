@@ -27,9 +27,21 @@
 //! Supported: `**` / `*` emphasis toggles (with a light flanking check),
 //! `` ` `` inline code, `[text](url)` links (OSC 8 when styled), ATX headers,
 //! fenced code blocks (never styled or wrapped), indented (4-space) lines
-//! verbatim, list hanging indent. Out of scope — constructs that need
-//! non-linear layout or lookaside: tables, setext headers, reference/auto
-//! links, images.
+//! verbatim, list hanging indent, and — **styled only** — GFM pipe tables.
+//!
+//! Tables are the one construct that needs the whole block before *any* of it
+//! can be emitted (column widths depend on the widest cell), which append-only
+//! output can't revise after the fact. So a leading-`|` line opens a capture
+//! that buffers rows until the block's terminator, then draws a box-drawing
+//! table with display-width-aligned columns. It stays a hold-back stream: the
+//! header row is buffered until the next line confirms a delimiter row
+//! (`| --- | :-: |`); a candidate that never confirms — or a confirmed table
+//! too wide for the wrap width — replays verbatim as prose. Because capture is
+//! gated on styling, **plain mode passes tables through byte-identically**,
+//! keeping the identity guarantee for files and pipes.
+//!
+//! Out of scope — constructs that need non-linear layout or lookaside beyond
+//! the above: setext headers, reference/auto links, images.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -45,6 +57,30 @@ enum Line {
     Body,
     /// Verbatim until end of line (indented code, tab-led lines).
     Raw,
+    /// A leading-`|` line being captured into a pending [`TableCapture`].
+    Table,
+}
+
+/// Column alignment from a GFM delimiter cell (`:--`, `--:`, `:-:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A leading-`|` block captured while it may still be a GFM pipe table. Holds
+/// the raw physical lines (no trailing newline); `confirmed` flips once line
+/// index 1 is a valid delimiter row, at which point the block will render as a
+/// box rather than replay as prose.
+#[derive(Debug)]
+struct TableCapture {
+    lines: Vec<String>,
+    confirmed: bool,
+    /// Whether the last captured line ended with a newline (false only for a
+    /// final partial line at stream end), so replay reproduces the input.
+    terminated: bool,
 }
 
 /// A zero-width presentation mark queued inside the pending word so it rides
@@ -108,6 +144,14 @@ pub struct MarkdownRenderer {
 
     line: Line,
     prefix: String,
+    /// A pending GFM pipe-table capture (styled only). `None` when not in or
+    /// awaiting a table block.
+    table: Option<TableCapture>,
+    /// The current physical line's raw bytes while in [`Line::Table`].
+    table_line: String,
+    /// True while replaying a rejected/oversized capture as prose, so those
+    /// leading-`|` lines don't re-trigger table detection.
+    replaying_table: bool,
     /// Inside a fenced block: (fence char, open-run length for close matching).
     fence: Option<(char, usize)>,
     /// Buffering a fence-block line start that may still be the closing fence.
@@ -162,6 +206,9 @@ impl MarkdownRenderer {
             header: false,
             line: Line::Prefix,
             prefix: String::new(),
+            table: None,
+            table_line: String::new(),
+            replaying_table: false,
             fence: None,
             fence_line: None,
             line_has_content: false,
@@ -207,6 +254,15 @@ impl MarkdownRenderer {
 
     /// Event-path [`Self::finish`].
     pub fn finish_events(&mut self) -> Vec<TuiEvent> {
+        // Complete an in-progress table line (unterminated at stream end), then
+        // resolve any pending capture (draw the box, or replay as prose).
+        if self.line == Line::Table {
+            let partial = std::mem::take(&mut self.table_line);
+            self.push_table_line(partial, false);
+            self.line = Line::Body;
+        }
+        self.flush_pending_table();
+
         match self.line {
             Line::Prefix if self.fence.is_none() => self.end_prefix(None),
             _ => {
@@ -243,6 +299,7 @@ impl MarkdownRenderer {
                 Line::Prefix => self.prefix_char(c),
                 Line::Body => self.inline_char(c),
                 Line::Raw => self.raw_char(c),
+                Line::Table => self.table_char(c),
             }
         }
         // Without wrap there is no need to hold words back; only delimiter
@@ -271,6 +328,20 @@ impl MarkdownRenderer {
     fn classify_prefix(&mut self, c: char) {
         let prefix = std::mem::take(&mut self.prefix);
         let (indent, stripped) = split_indent(&prefix);
+
+        // GFM pipe table (styled only): a line whose first non-space char is
+        // `|` opens or extends a capture. Suppressed during replay so a
+        // rejected candidate can't loop. Plain mode skips this entirely, so
+        // pipe rows stream as ordinary text (byte-identity preserved).
+        if self.styled && !self.replaying_table && c == '|' && stripped.is_empty() {
+            self.line = Line::Table;
+            self.table_line.clear();
+            self.table_line.push_str(&prefix);
+            self.table_line.push('|');
+            return;
+        }
+        // A non-pipe line ends any pending capture before it is classified.
+        self.flush_pending_table();
 
         // 4-space (or tab) indent: verbatim line, no styles, no wrap.
         if stripped.is_empty() && (c == '\t' || (indent >= 3 && c == ' ')) {
@@ -323,6 +394,8 @@ impl MarkdownRenderer {
 
     /// Line ended (or stream finished) while still classifying.
     fn end_prefix(&mut self, newline: Option<char>) {
+        // A blank / marker-only line terminates a pending table capture.
+        self.flush_pending_table();
         let prefix = std::mem::take(&mut self.prefix);
         let (_, stripped) = split_indent(&prefix);
         if let Some((fc, n)) = fence_run(stripped) {
@@ -404,6 +477,207 @@ impl MarkdownRenderer {
         if c == '\n' {
             self.reset_line();
         }
+    }
+
+    // -- tables -------------------------------------------------------------
+
+    /// Accumulate a table-row line; a newline closes it and hands it to the
+    /// block machine.
+    fn table_char(&mut self, c: char) {
+        if c == '\n' {
+            let line = std::mem::take(&mut self.table_line);
+            self.push_table_line(line, true);
+        } else {
+            self.table_line.push(c);
+        }
+    }
+
+    /// A complete physical line (or an unterminated final line at stream end)
+    /// joined the pending capture. The second line decides the block's fate:
+    /// a valid delimiter row confirms a table, anything else replays as prose.
+    fn push_table_line(&mut self, line: String, terminated: bool) {
+        let check = match &mut self.table {
+            None => {
+                self.table = Some(TableCapture {
+                    lines: vec![line],
+                    confirmed: false,
+                    terminated,
+                });
+                false
+            }
+            Some(t) => {
+                t.lines.push(line);
+                t.terminated = terminated;
+                !t.confirmed && t.lines.len() >= 2
+            }
+        };
+        if check {
+            let t = self.table.as_mut().unwrap();
+            let ncols = split_cells(&t.lines[0]).len();
+            if is_delimiter_row(&t.lines[1], ncols) {
+                t.confirmed = true;
+            } else {
+                // Not a table after all — replay the buffered lines verbatim.
+                self.flush_pending_table();
+                return;
+            }
+        }
+        if terminated {
+            self.reset_line();
+        }
+    }
+
+    /// Resolve the pending capture: render a confirmed, fitting table as a box;
+    /// otherwise replay the raw lines as prose. No-op when nothing is pending.
+    fn flush_pending_table(&mut self) {
+        let Some(t) = self.table.take() else {
+            return;
+        };
+        if t.confirmed {
+            self.render_or_replay_table(&t.lines, t.terminated);
+        } else {
+            self.replay_as_prose(&t.lines, t.terminated);
+        }
+    }
+
+    /// Feed the buffered lines back through the line machine as ordinary text
+    /// (table detection suppressed), reproducing the input newline for newline.
+    fn replay_as_prose(&mut self, lines: &[String], terminated: bool) {
+        self.replaying_table = true;
+        let n = lines.len();
+        for (i, line) in lines.iter().enumerate() {
+            for c in line.chars() {
+                self.push_char(c);
+            }
+            if i + 1 < n || terminated {
+                self.push_char('\n');
+            }
+        }
+        self.replaying_table = false;
+    }
+
+    /// Draw a confirmed table as a box, or fall back to prose if a full box
+    /// would exceed the wrap width. `lines` is header, delimiter, then rows.
+    fn render_or_replay_table(&mut self, lines: &[String], terminated: bool) {
+        let cell_palette = Palette {
+            enabled: true,
+            wrap: None,
+        };
+        let header = split_cells(&lines[0]);
+        let ncols = header.len();
+        let delim = split_cells(&lines[1]);
+        let aligns: Vec<Align> = (0..ncols)
+            .map(|i| {
+                delim
+                    .get(i)
+                    .map(|c| cell_alignment(c))
+                    .unwrap_or(Align::None)
+            })
+            .collect();
+
+        // Pre-render every cell to (events, visible width), padded to `ncols`.
+        let render_row = |raw: &[String]| -> Vec<(Vec<TuiEvent>, usize)> {
+            (0..ncols)
+                .map(|i| render_cell_events(raw.get(i).map_or("", String::as_str), cell_palette))
+                .collect()
+        };
+        let header_cells = render_row(&header);
+        let body_cells: Vec<Vec<(Vec<TuiEvent>, usize)>> = lines[2..]
+            .iter()
+            .map(|l| render_row(&split_cells(l)))
+            .collect();
+
+        // Column widths from visible content (min 1 so a column is never empty).
+        let mut widths = vec![1usize; ncols];
+        for (i, (_, w)) in header_cells.iter().enumerate() {
+            widths[i] = widths[i].max(*w);
+        }
+        for row in &body_cells {
+            for (i, (_, w)) in row.iter().enumerate() {
+                widths[i] = widths[i].max(*w);
+            }
+        }
+
+        // A full box is `sum(width+2)` cell columns plus `ncols+1` borders; if
+        // it can't fit the wrap width, degrade to the raw markdown rather than
+        // emit a box the terminal will hard-wrap into nonsense.
+        let total: usize = widths.iter().map(|w| w + 2).sum::<usize>() + ncols + 1;
+        if let Some(wrap) = self.wrap
+            && total > wrap
+        {
+            self.replay_as_prose(lines, terminated);
+            return;
+        }
+
+        self.frame_open();
+        self.table_border(&widths, '┌', '┬', '┐');
+        self.table_row(&header_cells, &widths, &aligns);
+        if !body_cells.is_empty() {
+            self.table_border(&widths, '├', '┼', '┤');
+            for row in &body_cells {
+                self.table_row(row, &widths, &aligns);
+            }
+        }
+        self.table_border(&widths, '└', '┴', '┘');
+        self.frame_close();
+    }
+
+    /// A horizontal border line: `left`/`mid`/`right` corner-or-junction runs
+    /// over each column (width + one pad space each side).
+    fn table_border(&mut self, widths: &[usize], left: char, mid: char, right: char) {
+        self.out_ch(left);
+        for (i, w) in widths.iter().enumerate() {
+            for _ in 0..(w + 2) {
+                self.out_ch('─');
+            }
+            self.out_ch(if i + 1 < widths.len() { mid } else { right });
+        }
+        self.out_ch('\n');
+    }
+
+    /// One content row: `│`-separated cells, each padded to its column width
+    /// per the column's alignment, with the cell's own style/link events spliced
+    /// in so inline markdown inside cells still renders.
+    fn table_row(&mut self, cells: &[(Vec<TuiEvent>, usize)], widths: &[usize], aligns: &[Align]) {
+        self.out_ch('│');
+        for (i, (events, w)) in cells.iter().enumerate() {
+            let pad = widths[i].saturating_sub(*w);
+            let (left, right) = match aligns.get(i).copied().unwrap_or(Align::None) {
+                Align::Right => (pad, 0),
+                Align::Center => (pad / 2, pad - pad / 2),
+                Align::Left | Align::None => (0, pad),
+            };
+            self.out_ch(' ');
+            for _ in 0..left {
+                self.out_ch(' ');
+            }
+            for e in events {
+                self.out.push(e.clone());
+            }
+            for _ in 0..right {
+                self.out_ch(' ');
+            }
+            self.out_ch(' ');
+            self.out_ch('│');
+        }
+        self.out_ch('\n');
+    }
+
+    /// Return the terminal to `base` before drawing borders, so a style left
+    /// open by preceding prose doesn't tint the box.
+    fn frame_open(&mut self) {
+        if self.last_style != Some(self.base) {
+            self.out.push(TuiEvent::Style(self.base));
+            self.last_style = Some(self.base);
+        }
+    }
+
+    /// After the box, re-assert `base`: spliced cell events changed the real
+    /// terminal state without updating `last_style`, so emit unconditionally to
+    /// resync (a following delta / the finish reset then behaves correctly).
+    fn frame_close(&mut self) {
+        self.out.push(TuiEvent::Style(self.base));
+        self.last_style = Some(self.base);
     }
 
     // -- inline text --------------------------------------------------------
@@ -837,6 +1111,93 @@ fn display_width(s: &str) -> usize {
         .sum()
 }
 
+// -- table helpers ----------------------------------------------------------
+
+/// Split a GFM table row into trimmed cell texts. Optional outer pipes are
+/// dropped and `\|` is an escaped literal pipe inside a cell.
+fn split_cells(row: &str) -> Vec<String> {
+    let mut s = row.trim();
+    s = s.strip_prefix('|').unwrap_or(s);
+    s = s.strip_suffix('|').unwrap_or(s);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cur.push('|');
+                chars.next();
+            }
+            '|' => {
+                cells.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// A GFM delimiter cell: optional leading/trailing `:` around one-or-more `-`.
+fn is_delimiter_cell(cell: &str) -> bool {
+    let b = cell.trim().as_bytes();
+    let mut i = 0;
+    if i < b.len() && b[i] == b':' {
+        i += 1;
+    }
+    let dash_start = i;
+    while i < b.len() && b[i] == b'-' {
+        i += 1;
+    }
+    if i == dash_start {
+        return false; // needs at least one dash
+    }
+    if i < b.len() && b[i] == b':' {
+        i += 1;
+    }
+    i == b.len()
+}
+
+/// Whether `row` is a delimiter row of exactly `ncols` delimiter cells — the
+/// line that turns a candidate header into a confirmed table.
+fn is_delimiter_row(row: &str, ncols: usize) -> bool {
+    if ncols == 0 {
+        return false;
+    }
+    let cells = split_cells(row);
+    cells.len() == ncols && cells.iter().all(|c| is_delimiter_cell(c))
+}
+
+/// Column alignment encoded by a delimiter cell's colons.
+fn cell_alignment(cell: &str) -> Align {
+    let c = cell.trim();
+    match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        (true, false) => Align::Left,
+        (false, false) => Align::None,
+    }
+}
+
+/// Render one cell's text through a fresh (styled, unwrapped) renderer so
+/// inline markdown works inside cells, returning the presentation events and
+/// the cell's visible display width (escapes excluded — they ride `Style` /
+/// `Link` events, never `Text`).
+fn render_cell_events(cell: &str, palette: Palette) -> (Vec<TuiEvent>, usize) {
+    let mut r = MarkdownRenderer::new(palette);
+    let mut events = r.feed_events(cell);
+    events.extend(r.finish_events());
+    let width = events
+        .iter()
+        .map(|e| match e {
+            TuiEvent::Text(t) => display_width(t),
+            _ => 0,
+        })
+        .sum();
+    (events, width)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -895,6 +1256,8 @@ mod tests {
             "> quoted\n>> nested\n",
             "####### seven hashes\n#nospace\n",
             "see [the docs](https://example.com/x) and [broken](\n",
+            "| A | B |\n| - | - |\n| 1 | 22 |\n",
+            "| not a table\nplain line\n",
         ];
         for input in inputs {
             assert_eq!(render(input, plain()), input, "single-feed: {input:?}");
@@ -1233,6 +1596,123 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    // -- tables -------------------------------------------------------------
+
+    #[test]
+    fn styled_table_renders_aligned_box() {
+        let input = "| A | B |\n| - | - |\n| 1 | 22 |\n";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(
+            out,
+            "┌───┬────┐\n\
+             │ A │ B  │\n\
+             ├───┼────┤\n\
+             │ 1 │ 22 │\n\
+             └───┴────┘\n"
+        );
+    }
+
+    #[test]
+    fn table_honors_column_alignment() {
+        // `:--` left, `--:` right; column width comes from the widest cell.
+        let input = "| L | R |\n| :-- | --: |\n| a | b |\n| ccc | ddd |\n";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(
+            out,
+            "┌─────┬─────┐\n\
+             │ L   │   R │\n\
+             ├─────┼─────┤\n\
+             │ a   │   b │\n\
+             │ ccc │ ddd │\n\
+             └─────┴─────┘\n"
+        );
+    }
+
+    #[test]
+    fn table_cells_render_inline_markdown_by_visible_width() {
+        // `**b**` / `` `c` `` style inside the cell and pad by visible width (1),
+        // not the raw delimiter length.
+        let input = "| **b** | `c` |\n| - | - |\n| x | y |\n";
+        let out = render(input, styled());
+        assert_eq!(
+            strip_sgr(&out),
+            "┌───┬───┐\n│ b │ c │\n├───┼───┤\n│ x │ y │\n└───┴───┘\n"
+        );
+        assert!(out.contains("\x1b[0;1mb\x1b[0m"), "bold cell: {out:?}");
+        assert!(out.contains("\x1b[0;36mc\x1b[0m"), "code cell: {out:?}");
+    }
+
+    #[test]
+    fn table_renders_without_trailing_newline() {
+        // Confirmed table whose final row is unterminated at stream end.
+        let input = "| H |\n| - |\n| x |";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(out, "┌───┐\n│ H │\n├───┤\n│ x │\n└───┘\n");
+    }
+
+    #[test]
+    fn table_terminates_at_blank_line_then_prose_resumes() {
+        let input = "| H |\n| - |\n| x |\n\nafter\n";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(out, "┌───┐\n│ H │\n├───┤\n│ x │\n└───┘\n\nafter\n");
+    }
+
+    #[test]
+    fn header_only_table_omits_body_separator() {
+        // A header + delimiter with no body rows draws top/header/bottom only.
+        let input = "| H1 | H2 |\n| - | - |\n\ntail\n";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(out, "┌────┬────┐\n│ H1 │ H2 │\n└────┴────┘\n\ntail\n");
+    }
+
+    #[test]
+    fn pipe_lines_without_a_delimiter_stay_prose() {
+        // Two pipe rows but no delimiter row → not a table; replays verbatim.
+        let input = "| a | b |\n| c | d |\n";
+        assert_eq!(render(input, styled()), input);
+        // A lone leading-pipe line followed by prose, likewise.
+        let input = "| just a note\nplain text\n";
+        assert_eq!(render(input, styled()), input);
+    }
+
+    #[test]
+    fn table_wider_than_wrap_falls_back_to_prose() {
+        // Box would be 15 cols wide; wrap is 10 → no box drawn.
+        let input = "| aaaa | bbbb |\n| - | - |\n| c | d |\n";
+        let out = render(input, Palette::colored(true).with_wrap(Some(10)));
+        assert!(!out.contains('┌'), "no box when it overflows wrap: {out:?}");
+        assert!(!out.contains('│'), "no box when it overflows wrap: {out:?}");
+        assert!(out.contains("aaaa") && out.contains("bbbb"), "{out:?}");
+    }
+
+    #[test]
+    fn table_chunked_matches_single_feed() {
+        // Detection buffers whole lines regardless of chunk boundaries.
+        let inputs = [
+            "| H | Val |\n| :- | --: |\n| a | 1 |\n| bb | 22 |\n",
+            "text before\n\n| x | y |\n| - | - |\n| 1 | 2 |\n\ntext after\n",
+            "| **bold** | plain |\n| - | - |\n| 你好 | z |\n",
+        ];
+        for input in inputs {
+            assert_eq!(
+                render(input, styled()),
+                render_char_chunks(input, styled()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_cells_pad_by_display_width() {
+        // "你好" is width 4, so its column is 4 wide and ascii cells pad to match.
+        let input = "| 你好 | b |\n| - | - |\n| a | y |\n";
+        let out = strip_sgr(&render(input, styled()));
+        assert_eq!(
+            out,
+            "┌──────┬───┐\n│ 你好 │ b │\n├──────┼───┤\n│ a    │ y │\n└──────┴───┘\n"
+        );
     }
 
     fn strip_sgr(s: &str) -> String {
