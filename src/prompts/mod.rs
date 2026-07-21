@@ -64,6 +64,8 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     include_str!("fragments/coding-norms.md"),
     "\n---\n\n",
     include_str!("fragments/user-authority.md"),
+    "\n---\n\n",
+    include_str!("fragments/memory.md"),
     "\n",
 );
 
@@ -78,6 +80,7 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Think Before Coding"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Persistent memory"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
