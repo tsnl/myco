@@ -15,6 +15,10 @@ agent laptop.
 - **`lynx`** — powers the `lynx_tui_browser` host tool (`lynx -dump` plaintext pages / search results).
 - **`uv`** — hermetic Python runs (agent computer-use norm: scripts and deps without polluting the system).
 - **`bash`** — host `bash` tool (one-shot `exec` and multi-turn shell sessions).
+- **`bwrap`** — sandboxes `bash` `exec`/`start` by default: whole filesystem read-only except the
+  working dir, `/tmp`, and toolchain caches (`~/.cargo`, `~/.rustup`, `~/.npm`, `~/.cache`); network
+  unchanged. Required — sandboxed calls fail closed when missing; pass `sandbox: false` to opt out per
+  call. Contains `bash` children only (the editor tool is not sandboxed).
 
 **Recommended**
 

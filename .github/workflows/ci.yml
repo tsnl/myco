@@ -47,6 +47,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install bubblewrap (bash tool sandbox)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Allow unprivileged user namespaces (bwrap needs them)
+        # ubuntu-latest (24.04) restricts unprivileged userns via AppArmor, so a
+        # non-setuid bwrap fails with "setting up uid map: Permission denied".
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Cache Hugging Face Hub (MiniLM)
         uses: ./.github/actions/cache-hf-hub
       - name: Seed MiniLM embed weights
