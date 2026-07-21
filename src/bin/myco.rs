@@ -282,7 +282,9 @@ async fn run_interactive(args: Args) {
     let sink = Arc::new(CliEventSink::new(palette, console.clone()));
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-    agent.set_history(active_session.snapshot().messages.clone());
+    let restored = active_session.snapshot();
+    agent.set_history(restored.messages.clone());
+    agent.set_last_usage(restored.last_usage);
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -502,8 +504,13 @@ async fn run_repl(
                 clear_and_reprint(agent, palette);
             }
         }
-        let used = agent.last_usage().map(|u| u.context_tokens()).unwrap_or(0);
         let max = agent.context_window_tokens();
+        // `?` = resumed before usage was tracked; `0` = genuinely empty session.
+        let used = match agent.last_usage() {
+            Some(u) => u.context_tokens().to_string(),
+            None if agent.history().is_empty() => "0".to_string(),
+            None => "?".to_string(),
+        };
         let mut header = Vec::new();
         let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
         let _ = writeln!(header, "{}", palette.user(&format!("USER {used}/{max}")));
@@ -715,7 +722,7 @@ async fn run_compact(
     catalog_model: &CatalogModel,
     palette: Palette,
 ) {
-    if let Err(e) = session.persist_messages(agent.history(), true) {
+    if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
         eprintln!("compact: failed to persist current session: {e}");
         return;
     }
@@ -836,6 +843,7 @@ async fn run_compact(
     }
     session.replace(successor.clone());
     agent.set_history(successor.messages.clone());
+    agent.set_last_usage(successor.last_usage);
     reload_readline_history(editor, session);
     clear_and_reprint(agent, palette);
     println!(
@@ -914,7 +922,7 @@ fn handle_meta(
     match cmd {
         MetaCommand::Help => print_help(),
         MetaCommand::Session => {
-            let _ = session.persist_messages(agent.history(), false);
+            let _ = session.persist_messages(agent.history(), agent.last_usage(), false);
             print!("{}", format_session_detail(&session.snapshot()));
         }
         MetaCommand::Sessions => match list_sessions(RECENT_SESSION_LIMIT) {
@@ -926,6 +934,7 @@ fn handle_meta(
             save_before_switch(agent, session, editor);
             session.replace(Session::new(catalog_model.spec.key.clone()));
             agent.set_history(Vec::new());
+            agent.set_last_usage(None);
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
             clear_and_reprint(agent, palette);
@@ -1147,7 +1156,7 @@ fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Resul
     if history.is_empty() && !session.snapshot().json_path().exists() {
         return Ok(());
     }
-    session.persist_messages(history, force)
+    session.persist_messages(history, agent.last_usage(), force)
 }
 
 fn save_readline_history(
@@ -1234,6 +1243,7 @@ fn install_session(
 ) {
     active.replace(session.clone());
     agent.set_history(session.messages.clone());
+    agent.set_last_usage(session.last_usage);
     reload_readline_history(editor, active);
 }
 
@@ -1740,6 +1750,7 @@ mod tests {
             kind: myco::SessionKind::User,
             predecessor_id: None,
             successor_id: None,
+            last_usage: None,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 

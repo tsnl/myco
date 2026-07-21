@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::generative_model::Message;
+use crate::generative_model::{Message, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
 pub const SESSION_FILE_VERSION: u32 = 2;
@@ -117,6 +117,10 @@ pub struct Session {
     /// Session created by compacting this one, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_id: Option<String>,
+    /// Last provider usage, persisted so a resumed session shows real context
+    /// (absent in sessions written before usage tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<TokenUsage>,
 }
 
 /// Structured association stored on a session.
@@ -217,11 +221,21 @@ impl ActiveSession {
         f(&mut self.lock())
     }
 
-    /// Update messages from the agent and persist when they changed (or `force`).
-    pub fn persist_messages(&self, messages: &[Message], force: bool) -> Result<(), String> {
+    /// Persist messages + last usage when either changed (or `force`). A `None`
+    /// usage keeps the stored value rather than clearing it.
+    pub fn persist_messages(
+        &self,
+        messages: &[Message],
+        last_usage: Option<TokenUsage>,
+        force: bool,
+    ) -> Result<(), String> {
         let mut session = self.lock();
-        if force || messages.len() != session.messages.len() {
+        let usage_changed = last_usage.is_some() && last_usage != session.last_usage;
+        if force || messages.len() != session.messages.len() || usage_changed {
             session.messages = messages.to_vec();
+            if last_usage.is_some() {
+                session.last_usage = last_usage;
+            }
             session.touch();
             session.save()?;
         }
@@ -272,6 +286,7 @@ impl Session {
             kind: SessionKind::User,
             predecessor_id: None,
             successor_id: None,
+            last_usage: None,
         }
     }
 
@@ -959,7 +974,7 @@ pub(crate) fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, Message};
+    use crate::generative_model::{Content, Message, TokenUsage};
     use std::time::Duration;
 
     fn myco_home_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1076,6 +1091,7 @@ mod tests {
             kind: SessionKind::User,
             predecessor_id: None,
             successor_id: None,
+            last_usage: None,
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 
@@ -1090,6 +1106,80 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_usage_persists_and_old_sessions_default_none() {
+        let dir = temp_session_root();
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("with_usage.json");
+        let mut session =
+            Session::new_with_id("claude-opus-4-8", "aa00bb11cc22dd33ee44ff5566778899");
+        session.last_usage = Some(TokenUsage {
+            input_tokens: 12_345,
+            output_tokens: 678,
+            cache_read_tokens: Some(1_000),
+            cache_creation_tokens: None,
+        });
+        let json = serde_json::to_vec_pretty(&session).unwrap();
+        fs::write(&path, &json).unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.last_usage, session.last_usage);
+        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 13_345);
+
+        let old = dir.join("old.json");
+        fs::write(
+            &old,
+            br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
+        )
+        .unwrap();
+        assert!(Session::load(&old).unwrap().last_usage.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_messages_records_usage_and_none_keeps_last() {
+        let _guard = myco_home_lock();
+        let dir = temp_session_root();
+        // SAFETY: test-only env override; held under myco_home_lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let msg = |t: &str| Message::UserMessage {
+            content: vec![Content::Text { text: t.into() }],
+        };
+        let usage = TokenUsage {
+            input_tokens: 5_000,
+            output_tokens: 100,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        };
+        let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
+        let id = active.id();
+
+        active
+            .persist_messages(&[msg("hi")], Some(usage), true)
+            .unwrap();
+        assert_eq!(
+            Session::load_by_id_or_prefix(&id).unwrap().last_usage,
+            Some(usage)
+        );
+
+        active
+            .persist_messages(&[msg("hi"), msg("more")], None, true)
+            .unwrap();
+        assert_eq!(
+            Session::load_by_id_or_prefix(&id).unwrap().last_usage,
+            Some(usage)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
     }
 
     #[test]

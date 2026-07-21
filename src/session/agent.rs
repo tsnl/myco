@@ -195,6 +195,11 @@ impl Agent {
         self.last_usage
     }
 
+    /// Seed last-usage when resuming a saved session (`None` if never tracked).
+    pub fn set_last_usage(&mut self, usage: Option<TokenUsage>) {
+        self.last_usage = usage;
+    }
+
     pub fn context(&self) -> &TraceContext {
         &self.context
     }
