@@ -35,10 +35,12 @@
 //! that buffers rows until the block's terminator, then draws a box-drawing
 //! table with display-width-aligned columns. It stays a hold-back stream: the
 //! header row is buffered until the next line confirms a delimiter row
-//! (`| --- | :-: |`); a candidate that never confirms — or a confirmed table
-//! too wide for the wrap width — replays verbatim as prose. Because capture is
-//! gated on styling, **plain mode passes tables through byte-identically**,
-//! keeping the identity guarantee for files and pipes.
+//! (`| --- | :-: |`); a candidate that never confirms replays verbatim as
+//! prose. Like a fenced code block, a confirmed table is never word-wrapped —
+//! it renders at its natural width and an over-wide box is left to the
+//! terminal. Because capture is gated on styling, **plain mode passes tables
+//! through byte-identically**, keeping the identity guarantee for files and
+//! pipes.
 //!
 //! Out of scope — constructs that need non-linear layout or lookaside beyond
 //! the above: setext headers, reference/auto links, images.
@@ -149,8 +151,8 @@ pub struct MarkdownRenderer {
     table: Option<TableCapture>,
     /// The current physical line's raw bytes while in [`Line::Table`].
     table_line: String,
-    /// True while replaying a rejected/oversized capture as prose, so those
-    /// leading-`|` lines don't re-trigger table detection.
+    /// True while replaying a rejected capture as prose, so those leading-`|`
+    /// lines don't re-trigger table detection.
     replaying_table: bool,
     /// Inside a fenced block: (fence char, open-run length for close matching).
     fence: Option<(char, usize)>,
@@ -527,14 +529,14 @@ impl MarkdownRenderer {
         }
     }
 
-    /// Resolve the pending capture: render a confirmed, fitting table as a box;
-    /// otherwise replay the raw lines as prose. No-op when nothing is pending.
+    /// Resolve the pending capture: draw a confirmed table as a box; otherwise
+    /// replay the raw lines as prose. No-op when nothing is pending.
     fn flush_pending_table(&mut self) {
         let Some(t) = self.table.take() else {
             return;
         };
         if t.confirmed {
-            self.render_or_replay_table(&t.lines, t.terminated);
+            self.render_table(&t.lines);
         } else {
             self.replay_as_prose(&t.lines, t.terminated);
         }
@@ -556,9 +558,11 @@ impl MarkdownRenderer {
         self.replaying_table = false;
     }
 
-    /// Draw a confirmed table as a box, or fall back to prose if a full box
-    /// would exceed the wrap width. `lines` is header, delimiter, then rows.
-    fn render_or_replay_table(&mut self, lines: &[String], terminated: bool) {
+    /// Draw a confirmed table as a box. Like a fenced code block, a table is
+    /// never word-wrapped: it renders at its natural width regardless of the
+    /// wrap column, and an over-wide box is left for the terminal to handle.
+    /// `lines` is header, delimiter, then rows.
+    fn render_table(&mut self, lines: &[String]) {
         let cell_palette = Palette {
             enabled: true,
             wrap: None,
@@ -596,17 +600,6 @@ impl MarkdownRenderer {
             for (i, (_, w)) in row.iter().enumerate() {
                 widths[i] = widths[i].max(*w);
             }
-        }
-
-        // A full box is `sum(width+2)` cell columns plus `ncols+1` borders; if
-        // it can't fit the wrap width, degrade to the raw markdown rather than
-        // emit a box the terminal will hard-wrap into nonsense.
-        let total: usize = widths.iter().map(|w| w + 2).sum::<usize>() + ncols + 1;
-        if let Some(wrap) = self.wrap
-            && total > wrap
-        {
-            self.replay_as_prose(lines, terminated);
-            return;
         }
 
         self.frame_open();
@@ -1678,13 +1671,20 @@ mod tests {
     }
 
     #[test]
-    fn table_wider_than_wrap_falls_back_to_prose() {
-        // Box would be 15 cols wide; wrap is 10 → no box drawn.
-        let input = "| aaaa | bbbb |\n| - | - |\n| c | d |\n";
-        let out = render(input, Palette::colored(true).with_wrap(Some(10)));
-        assert!(!out.contains('┌'), "no box when it overflows wrap: {out:?}");
-        assert!(!out.contains('│'), "no box when it overflows wrap: {out:?}");
-        assert!(out.contains("aaaa") && out.contains("bbbb"), "{out:?}");
+    fn table_ignores_wrap_width_like_code_blocks() {
+        // The box is 15 cols wide but wrap is 10; a table is never wrapped, so
+        // it still renders as a box at its natural width (terminal handles the
+        // overflow, exactly as it does for a fenced code block).
+        let input = "| aaaa | bbbb |\n| - | - |\n| cccc | dddd |\n";
+        let out = strip_sgr(&render(input, Palette::colored(true).with_wrap(Some(10))));
+        assert_eq!(
+            out,
+            "┌──────┬──────┐\n\
+             │ aaaa │ bbbb │\n\
+             ├──────┼──────┤\n\
+             │ cccc │ dddd │\n\
+             └──────┴──────┘\n"
+        );
     }
 
     #[test]
