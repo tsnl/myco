@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +12,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Notify;
 
 use super::*;
-use crate::external_command::BASH;
+use crate::external_command::{BASH, BWRAP};
 
 use uuid::Uuid;
 
@@ -100,7 +102,14 @@ impl BashService {
                 **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
                 process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
                 Tool uses whose `command` starts with `cd` are **rejected** — use `cwd` \
-                instead. (`write` stdin may still send interactive `cd` into a live shell.)",
+                instead. (`write` stdin may still send interactive `cd` into a live shell.)\n\n\
+                **Sandbox:** `exec` / `start` run inside a `bwrap` sandbox by default \
+                (`sandbox` true). The command sees the whole filesystem read-only, but may \
+                only **write** under the working directory, `/tmp`, and common toolchain \
+                caches (`~/.cargo`, `~/.rustup`, `~/.npm`, `~/.cache`); network is unchanged. \
+                Pass `\"sandbox\": false` to run unsandboxed when a command must write \
+                elsewhere. `bwrap` is required — if it is missing, sandboxed calls fail with \
+                an install hint (the editor tool is not sandboxed).",
                 exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
                 exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
                 session_default_s = DEFAULT_TIMEOUT_MS / 1000,
@@ -161,9 +170,17 @@ impl BashService {
                 cwd,
                 timeout_ms,
                 max_bytes,
+                sandbox,
             } => {
-                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, max_bytes, cancel)
-                    .await
+                self.run_oneshot(
+                    &command,
+                    cwd.as_deref(),
+                    timeout_ms,
+                    max_bytes,
+                    sandbox,
+                    cancel,
+                )
+                .await
             }
             Action::Start {
                 session_id,
@@ -173,6 +190,7 @@ impl BashService {
                 timeout_ms,
                 idle_ms,
                 max_bytes,
+                sandbox,
             } => {
                 self.session_start(
                     &session_id,
@@ -183,6 +201,7 @@ impl BashService {
                     timeout_ms,
                     idle_ms,
                     max_bytes,
+                    sandbox,
                     cancel,
                 )
                 .await
@@ -235,9 +254,13 @@ impl BashService {
         cwd: Option<&str>,
         timeout_ms: u64,
         max_bytes: usize,
+        sandbox: bool,
         cancel: crate::core::CancelToken,
     ) -> generative_model::ToolResult {
-        let mut cmd = BASH.tokio_command();
+        let mut cmd = match build_bash_command(cwd, sandbox) {
+            Ok(cmd) => cmd,
+            Err(e) => return generative_model::ToolResult::err(e),
+        };
         cmd.args(["-c", command])
             // Never inherit stdin: in `--mode host` it is the NDJSON protocol
             // pipe, and a child that reads it (python, xargs, `read`…) would
@@ -248,9 +271,6 @@ impl BashService {
             .kill_on_drop(true)
             // Own process group so timeout/cancel can kill grandchildren too.
             .process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(error) => {
@@ -355,6 +375,7 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
+        sandbox: bool,
         cancel: crate::core::CancelToken,
     ) -> generative_model::ToolResult {
         if session_id.is_empty() {
@@ -384,7 +405,10 @@ impl BashService {
         }
 
         let cmdline = command.unwrap_or("bash -i");
-        let mut cmd = BASH.tokio_command();
+        let mut cmd = match build_bash_command(cwd, sandbox) {
+            Ok(cmd) => cmd,
+            Err(e) => return generative_model::ToolResult::err(e),
+        };
         cmd.args(["-c", cmdline])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -393,9 +417,6 @@ impl BashService {
             .env("PYTHONUNBUFFERED", "1")
             // Own process group so close/reap can kill the whole tree.
             .process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1248,6 +1269,11 @@ pub struct Input {
     /// - exec: per-stream cap; head and tail are kept, the middle elided. Elided bytes are unrecoverable.
     #[serde(default)]
     max_bytes: Option<usize>,
+    /// Wrap the command in a `bwrap` sandbox (`exec` / `start` only). Default `true`:
+    /// filesystem is read-only except the working dir, `/tmp`, and toolchain caches;
+    /// network is unchanged. Set `false` to run unsandboxed.
+    #[serde(default)]
+    sandbox: Option<bool>,
 }
 
 #[derive(
@@ -1271,6 +1297,7 @@ enum Action {
         cwd: Option<String>,
         timeout_ms: u64,
         max_bytes: usize,
+        sandbox: bool,
     },
     Start {
         session_id: String,
@@ -1280,6 +1307,7 @@ enum Action {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
+        sandbox: bool,
     },
     Write {
         session_id: String,
@@ -1337,10 +1365,134 @@ fn normalize_cwd(cwd: Option<&String>) -> Result<Option<String>, String> {
     }
 }
 
+/// `cwd` and `sandbox` are only meaningful on `exec` / `start` (they configure a
+/// process spawn); reject them on session actions that address an existing child.
+fn reject_spawn_only_fields(cwd: &Option<String>, sandbox: Option<bool>) -> Result<(), String> {
+    if cwd.is_some() {
+        return Err("`cwd` is only valid on `exec` / `start`".into());
+    }
+    if sandbox.is_some() {
+        return Err("`sandbox` is only valid on `exec` / `start`".into());
+    }
+    Ok(())
+}
+
+/// Decide whether/where to sandbox: `Ok(None)` runs unsandboxed; `Ok(Some(path))`
+/// wraps in the resolved `bwrap`; `Err` when the sandbox is required but `bwrap`
+/// is unavailable (fail closed — the caller surfaces the install hint).
+fn sandbox_bwrap_path(sandbox: bool, resolved: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    if !sandbox {
+        return Ok(None);
+    }
+    resolved.map(Some).ok_or_else(|| {
+        "bash sandbox is enabled but `bwrap` was not found; install bubblewrap \
+         (apt install bubblewrap), set MYCO_BWRAP, or pass \"sandbox\": false to run \
+         unsandboxed"
+            .to_string()
+    })
+}
+
+/// Absolute working directory the sandbox makes writable and chdirs into: the
+/// explicit `cwd` (absolutized against the process cwd) or the process cwd.
+fn effective_workdir(cwd: Option<&str>) -> Result<PathBuf, String> {
+    let here = || std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"));
+    match cwd {
+        Some(dir) => {
+            let p = PathBuf::from(dir);
+            if p.is_absolute() {
+                Ok(p)
+            } else {
+                Ok(here()?.join(p))
+            }
+        }
+        None => here(),
+    }
+}
+
+/// Toolchain cache dirs under `$HOME` the sandbox keeps writable so builds and
+/// package installs still work. Bound with `--bind-try`, so absent ones are skipped.
+fn writable_cache_dirs() -> Vec<PathBuf> {
+    match std::env::var_os("HOME") {
+        Some(home) => {
+            let home = PathBuf::from(home);
+            [".cargo", ".rustup", ".npm", ".cache"]
+                .iter()
+                .map(|d| home.join(d))
+                .collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// bwrap arguments implementing the sandbox policy, ending with `-- <bash>`: the
+/// whole host filesystem read-only, with `workdir`, `/tmp`, and toolchain caches
+/// rebound read-write. Network is left untouched (no `--unshare-net`), and no PID
+/// namespace is created (no `--unshare-pid`) so the existing `kill(-pgid)` reap
+/// still tears down the whole tree.
+fn bwrap_policy_args(bash: &OsStr, workdir: &Path, caches: &[PathBuf]) -> Vec<OsString> {
+    let mut a: Vec<OsString> = Vec::new();
+    let bind = |a: &mut Vec<OsString>, flag: &str, src: &OsStr, dst: &OsStr| {
+        a.push(flag.into());
+        a.push(src.to_os_string());
+        a.push(dst.to_os_string());
+    };
+    // Read-only view of the entire host filesystem.
+    bind(&mut a, "--ro-bind", OsStr::new("/"), OsStr::new("/"));
+    // Fresh minimal /dev and /proc.
+    a.push("--dev".into());
+    a.push("/dev".into());
+    a.push("--proc".into());
+    a.push("/proc".into());
+    // Writable /tmp (shared with the host so multi-call workflows persist).
+    bind(&mut a, "--bind", OsStr::new("/tmp"), OsStr::new("/tmp"));
+    // Writable working dir.
+    bind(&mut a, "--bind", workdir.as_os_str(), workdir.as_os_str());
+    // Writable toolchain caches, skipped when absent.
+    for c in caches {
+        bind(&mut a, "--bind-try", c.as_os_str(), c.as_os_str());
+    }
+    // Start in the working dir; die if myco (the parent) dies.
+    a.push("--chdir".into());
+    a.push(workdir.as_os_str().to_os_string());
+    a.push("--die-with-parent".into());
+    a.push("--".into());
+    a.push(bash.to_os_string());
+    a
+}
+
+/// Build the `tokio` command for a bash invocation, sandboxed under `bwrap`
+/// unless `sandbox` is false. The caller appends `["-c", <command>]` and sets
+/// stdio / process group. Fails closed when the sandbox is required but `bwrap`
+/// is missing.
+fn build_bash_command(cwd: Option<&str>, sandbox: bool) -> Result<tokio::process::Command, String> {
+    match sandbox_bwrap_path(sandbox, BWRAP.resolve())? {
+        None => {
+            let mut cmd = BASH.tokio_command();
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            Ok(cmd)
+        }
+        Some(_) => {
+            let workdir = effective_workdir(cwd)?;
+            let bash = BASH.resolve().unwrap_or_else(|| PathBuf::from("bash"));
+            let mut cmd = BWRAP.tokio_command();
+            cmd.args(bwrap_policy_args(
+                bash.as_os_str(),
+                &workdir,
+                &writable_cache_dirs(),
+            ));
+            Ok(cmd)
+        }
+    }
+}
+
 fn resolve_action(input: &Input) -> Result<Action, String> {
     let idle_ms = input.idle_ms.unwrap_or(DEFAULT_IDLE_MS);
     let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let cwd = normalize_cwd(input.cwd.as_ref())?;
+    // Sandbox is on unless the caller explicitly opts out.
+    let sandbox = input.sandbox.unwrap_or(true);
 
     let kind = match &input.action {
         Some(k) => k.clone(),
@@ -1392,6 +1544,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 cwd,
                 timeout_ms: exec_timeout(input)?,
                 max_bytes,
+                sandbox,
             })
         }
         ActionKind::Start => {
@@ -1410,12 +1563,11 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 timeout_ms: session_timeout(input)?,
                 idle_ms,
                 max_bytes,
+                sandbox,
             })
         }
         ActionKind::Write => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
+            reject_spawn_only_fields(&cwd, input.sandbox)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -1433,9 +1585,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Read => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
+            reject_spawn_only_fields(&cwd, input.sandbox)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -1448,9 +1598,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Close => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
+            reject_spawn_only_fields(&cwd, input.sandbox)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -1458,9 +1606,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             Ok(Action::Close { session_id })
         }
         ActionKind::List => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
+            reject_spawn_only_fields(&cwd, input.sandbox)?;
             Ok(Action::List)
         }
     }
@@ -1545,6 +1691,7 @@ mod tests {
             timeout_ms: None,
             idle_ms: None,
             max_bytes: None,
+            sandbox: None,
         };
         let value = serde_json::to_value(&input).unwrap();
         assert_eq!(value["command"], "echo hi");
@@ -1564,11 +1711,13 @@ mod tests {
                 cwd,
                 timeout_ms,
                 max_bytes,
+                sandbox,
             } => {
                 assert_eq!(command, "echo hi");
                 assert_eq!(cwd, None);
                 assert_eq!(timeout_ms, DEFAULT_EXEC_TIMEOUT_MS);
                 assert_eq!(max_bytes, DEFAULT_MAX_BYTES);
+                assert!(sandbox, "bare command should default to sandboxed");
             }
             _ => panic!("expected Exec"),
         }
@@ -2144,6 +2293,7 @@ mod tests {
                 timeout_ms: None,
                 idle_ms: None,
                 max_bytes: None,
+                sandbox: None,
             },
         )
         .await;
@@ -2168,6 +2318,7 @@ mod tests {
                 timeout_ms: None,
                 idle_ms: None,
                 max_bytes: None,
+                sandbox: None,
             },
         )
         .await;
@@ -2190,6 +2341,7 @@ mod tests {
                 timeout_ms: None,
                 idle_ms: None,
                 max_bytes: None,
+                sandbox: None,
             },
         )
         .await;
@@ -2898,5 +3050,182 @@ mod tests {
                 "session should be reaped on agent finish"
             );
         }
+    }
+
+    // --- sandbox -------------------------------------------------------------
+
+    #[test]
+    fn sandbox_defaults_on_and_opt_out_parses() {
+        // Bare exec ⇒ sandboxed by default.
+        let input: Input = serde_json::from_value(json!({"command": "echo hi"})).unwrap();
+        match resolve_action(&input).unwrap() {
+            Action::Exec { sandbox, .. } => assert!(sandbox, "exec should default to sandboxed"),
+            _ => panic!("expected Exec"),
+        }
+        // Explicit opt-out.
+        let input: Input =
+            serde_json::from_value(json!({"command": "echo hi", "sandbox": false})).unwrap();
+        match resolve_action(&input).unwrap() {
+            Action::Exec { sandbox, .. } => assert!(!sandbox, "sandbox:false should disable"),
+            _ => panic!("expected Exec"),
+        }
+        // start defaults on too.
+        let input: Input =
+            serde_json::from_value(json!({"action": "start", "session_id": "s"})).unwrap();
+        match resolve_action(&input).unwrap() {
+            Action::Start { sandbox, .. } => assert!(sandbox, "start should default to sandboxed"),
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn sandbox_rejected_on_session_actions() {
+        for action in ["read", "write", "close", "list"] {
+            let mut v = json!({"action": action, "session_id": "s", "sandbox": false});
+            if action == "write" {
+                v["stdin"] = json!("x");
+            }
+            let input: Input = serde_json::from_value(v).unwrap();
+            let err = resolve_action(&input).unwrap_err();
+            assert!(
+                err.contains("`sandbox` is only valid"),
+                "action={action} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_bwrap_path_fails_closed_when_missing() {
+        use std::path::PathBuf;
+        assert_eq!(sandbox_bwrap_path(false, None).unwrap(), None);
+        assert_eq!(
+            sandbox_bwrap_path(false, Some(PathBuf::from("/usr/bin/bwrap"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            sandbox_bwrap_path(true, Some(PathBuf::from("/usr/bin/bwrap"))).unwrap(),
+            Some(PathBuf::from("/usr/bin/bwrap"))
+        );
+        let err = sandbox_bwrap_path(true, None).unwrap_err();
+        assert!(
+            err.contains("bwrap") && err.contains("sandbox") && err.contains("false"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bwrap_policy_is_ro_root_with_writable_workdir() {
+        use std::ffi::{OsStr, OsString};
+        use std::path::{Path, PathBuf};
+        let caches = vec![PathBuf::from("/home/u/.cargo")];
+        let args = bwrap_policy_args(OsStr::new("/bin/bash"), Path::new("/proj"), &caches);
+        let s: Vec<String> = args
+            .iter()
+            .map(|a: &OsString| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            s.windows(3).any(|w| w == ["--ro-bind", "/", "/"]),
+            "root must be read-only: {s:?}"
+        );
+        assert!(
+            s.windows(3).any(|w| w == ["--bind", "/proj", "/proj"]),
+            "workdir must be writable: {s:?}"
+        );
+        assert!(
+            s.windows(2).any(|w| w == ["--chdir", "/proj"]),
+            "must chdir into workdir: {s:?}"
+        );
+        assert!(
+            s.windows(3).any(|w| w == ["--bind", "/tmp", "/tmp"]),
+            "/tmp must be writable: {s:?}"
+        );
+        assert!(
+            s.windows(3)
+                .any(|w| w == ["--bind-try", "/home/u/.cargo", "/home/u/.cargo"]),
+            "caches bound best-effort: {s:?}"
+        );
+        // Network kept; no PID namespace (process-group reap depends on it).
+        assert!(!s.iter().any(|x| x == "--unshare-net"), "{s:?}");
+        assert!(!s.iter().any(|x| x == "--unshare-pid"), "{s:?}");
+        assert!(s.iter().any(|x| x == "--die-with-parent"), "{s:?}");
+        // bash is the program, immediately after the `--` separator.
+        assert_eq!(s.last().unwrap(), "/bin/bash");
+        let sep = s.iter().position(|x| x == "--").unwrap();
+        assert_eq!(sep, s.len() - 2, "bash must immediately follow `--`: {s:?}");
+    }
+
+    #[test]
+    fn tool_description_documents_sandbox() {
+        let d = &BashService::new().tool_specs()[0].description;
+        assert!(
+            d.contains("sandbox") && d.contains("bwrap"),
+            "description must document the sandbox: {d}"
+        );
+    }
+
+    /// bwrap actually contains writes: everything outside the working dir, `/tmp`,
+    /// and caches is read-only, while `sandbox:false` runs unconfined. Gated on a
+    /// real `bwrap` (skips where the sandbox binary is absent).
+    #[tokio::test]
+    async fn sandbox_blocks_writes_outside_writable_set() {
+        if !BWRAP.is_installed() {
+            return;
+        }
+        let home = match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() => h,
+            _ => return,
+        };
+        let probe = format!(
+            "{home}/.myco_sbx_probe_{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        let _ = std::fs::remove_file(&probe);
+
+        // Sandboxed (default): a write into $HOME (not a cache) must be refused.
+        let blocked = dispatch_json(
+            harness(),
+            json!({ "command": format!("echo hi > {probe}; echo rc=$?") }),
+        )
+        .await;
+        let bt = result_text(&blocked);
+        assert!(
+            bt.contains("Read-only file system") || bt.contains("rc=1"),
+            "sandboxed write to $HOME should fail: {bt}"
+        );
+        assert!(
+            !std::path::Path::new(&probe).exists(),
+            "probe must not exist after a blocked sandboxed write"
+        );
+
+        // sandbox:false: the same write succeeds.
+        let allowed = dispatch_json(
+            harness(),
+            json!({ "command": format!("echo hi > {probe}; cat {probe}"), "sandbox": false }),
+        )
+        .await;
+        let at = result_text(&allowed);
+        assert!(at.contains("hi"), "unsandboxed write should succeed: {at}");
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// The working dir and `/tmp` stay writable inside the sandbox.
+    #[tokio::test]
+    async fn sandbox_allows_writes_in_tmp() {
+        if !BWRAP.is_installed() {
+            return;
+        }
+        let result = dispatch_json(
+            harness(),
+            json!({
+                "command": "f=$(mktemp /tmp/.myco_sbx_XXXXXX); echo hi > \"$f\" && cat \"$f\" && rm -f \"$f\""
+            }),
+        )
+        .await;
+        let t = result_text(&result);
+        assert!(!result.is_error, "{t}");
+        assert!(
+            t.contains("hi"),
+            "/tmp write should succeed under sandbox: {t}"
+        );
     }
 }

@@ -146,13 +146,16 @@ mod tests {
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "lynx"]);
+        assert_eq!(names, ["bash", "bwrap", "lynx"]);
 
         let names: Vec<_> = missing_executables(true, |_| false)
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "lynx", "ssh", "ssh-add", "ssh-keygen"]);
+        assert_eq!(
+            names,
+            ["bash", "bwrap", "lynx", "ssh", "ssh-add", "ssh-keygen"]
+        );
     }
 
     #[test]

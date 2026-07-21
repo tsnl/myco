@@ -49,6 +49,15 @@ pub static BASH: ExternalCommand = ExternalCommand {
     fallback_dirs: &[],
 };
 
+pub static BWRAP: ExternalCommand = ExternalCommand {
+    name: "bwrap",
+    purpose: "the bash tool cannot sandbox commands (default; opt out per call with sandbox=false)",
+    install_hint: "apt install bubblewrap (Linux), or set MYCO_BWRAP",
+    startup_check: StartupCheck::Always,
+    env_override: Some("MYCO_BWRAP"),
+    fallback_dirs: &["/usr/bin", "/usr/local/bin"],
+};
+
 pub static LYNX: ExternalCommand = ExternalCommand {
     name: "lynx",
     purpose: "the lynx_tui_browser tool cannot fetch pages",
@@ -96,7 +105,7 @@ pub static PS: ExternalCommand = ExternalCommand {
 };
 
 /// Every registered program; the startup preflight iterates this.
-pub static ALL: &[&ExternalCommand] = &[&BASH, &LYNX, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
+pub static ALL: &[&ExternalCommand] = &[&BASH, &BWRAP, &LYNX, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(
