@@ -505,8 +505,9 @@ async fn run_repl(
             }
         }
         let max = agent.context_window_tokens();
+        let usage = agent.last_usage();
         // `?` = resumed before usage was tracked; `0` = genuinely empty session.
-        let used = match agent.last_usage() {
+        let used = match usage {
             Some(u) => u.context_tokens().to_string(),
             None if agent.history().is_empty() => "0".to_string(),
             None => "?".to_string(),
@@ -514,6 +515,16 @@ async fn run_repl(
         let mut header = Vec::new();
         let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
         let _ = writeln!(header, "{}", palette.user(&format!("USER {used}/{max}")));
+        if let Some(u) = usage {
+            let _ = writeln!(
+                header,
+                "{}",
+                palette.user(&format!(
+                    "input {}  output {}  cached input {}  cached output {}",
+                    u.input_tokens, u.output_tokens, u.cached_input_tokens, u.cached_output_tokens
+                ))
+            );
+        }
         let _ = writeln!(header);
         emit_mirrored(&console, &header);
         // No "> " prefix; body is typed on the line after the USER header.
