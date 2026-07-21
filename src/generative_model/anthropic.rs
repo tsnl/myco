@@ -196,13 +196,9 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let mut messages = convert_messages(input);
-        // Roll cache breakpoints onto the final messages so the growing conversation
-        // prefix is cached turn-over-turn (the system prompt carries its own
-        // breakpoint in `start_message_stream`). No-op when caching is disabled.
-        if self.backend.enable_prompt_caching {
-            apply_rolling_cache_breakpoints(&mut messages);
-        }
+        // convert_messages folds in the rolling cache breakpoints (the system prompt
+        // carries its own breakpoint in `start_message_stream`).
+        let messages = convert_messages(input, self.backend.enable_prompt_caching);
         let model = self.model.clone();
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
@@ -243,7 +239,7 @@ impl GenerativeModel for AnthropicGenerativeModel {
 // Message conversion
 //
 
-fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
+fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessage> {
     let mut out: Vec<AnthropicMessage> = Vec::new();
 
     for message in input {
@@ -332,6 +328,11 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
         out.push(anthropic);
     }
 
+    // Fold in the rolling cache breakpoints here so callers receive already-marked
+    // messages rather than mutating the vec after the fact. No-op when disabled.
+    if enable_cache {
+        apply_rolling_cache_breakpoints(&mut out);
+    }
     out
 }
 
@@ -1339,7 +1340,7 @@ mod tests {
                 }],
             },
         ];
-        let msgs = convert_messages(&input);
+        let msgs = convert_messages(&input, false);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, AnthropicRole::User));
         assert_eq!(msgs[0].content.len(), 2);
