@@ -369,8 +369,8 @@ fn build_model(
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
-            SYSTEM_PROMPT_PROLOGUE,
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+            SYSTEM_PROMPT_PROLOGUE.to_string(),
+            prompts::agent_prompt_epilogue(),
         ]
         .join("\n"),
         backend_config,
@@ -766,8 +766,9 @@ async fn run_compact(
         tools: harness.tool_specs(),
         system_prompt: [
             "You are a myco compaction worker. Follow the user instruction exactly. \
-             Prefer session_history over bash for reading sessions.",
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+             Prefer session_history over bash for reading sessions."
+                .to_string(),
+            prompts::agent_prompt_epilogue(),
         ]
         .join("\n\n"),
         backend_config: catalog_model.backend.clone(),

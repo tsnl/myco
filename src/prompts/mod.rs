@@ -66,8 +66,26 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     include_str!("fragments/user-authority.md"),
     "\n---\n\n",
     include_str!("fragments/memory.md"),
+    "\n---\n\n",
+    include_str!("fragments/soul.md"),
     "\n",
 );
+
+/// The epilogue plus the current soul file (`~/.myco/SOUL.md`, respecting
+/// `MYCO_HOME`), when present. Read at model build time — session start, model
+/// switch, each subagent spawn — so a running agent's prompt never changes
+/// mid-conversation and the cached conversation prefix stays valid.
+pub fn agent_prompt_epilogue() -> String {
+    let soul = crate::session::myco_home()
+        .ok()
+        .and_then(|home| std::fs::read_to_string(home.join("SOUL.md")).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    match soul {
+        Some(soul) => format!("{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# SOUL.md\n\n{soul}\n"),
+        None => DEFAULT_AGENT_PROMPT_EPILOGUE.to_string(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -85,5 +103,38 @@ mod tests {
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
+        // Soul file policy: memory holds details, SOUL.md holds one-line pointers.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Soul file"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/SOUL.md"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("single-line pointers"));
+    }
+
+    #[test]
+    fn soul_file_contents_are_appended_when_present() {
+        let _guard = crate::session::lock_myco_home_for_test();
+        let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only env override; held under the myco-home lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        // Missing or whitespace-only file: the epilogue alone.
+        assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+        std::fs::write(dir.join("SOUL.md"), "  \n\n").unwrap();
+        assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+
+        // Present: appended verbatim under the promised heading.
+        std::fs::write(dir.join("SOUL.md"), "- soul_token_alpha → memory 3f2a91\n").unwrap();
+        let prompt = agent_prompt_epilogue();
+        assert!(prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE), "{prompt}");
+        assert!(prompt.contains("# SOUL.md"), "{prompt}");
+        assert!(prompt.ends_with("- soul_token_alpha → memory 3f2a91\n"), "{prompt}");
+
+        // SAFETY: test-only env override; held under the myco-home lock.
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

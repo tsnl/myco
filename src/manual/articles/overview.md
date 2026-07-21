@@ -34,6 +34,7 @@ myco (interactive) / Agent
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/memory/{uuid[..2]}/{uuid}.md` | Shared cross-agent, cross-session memory (immutable UUID-keyed entry files; see below). |
+| `~/.myco/SOUL.md` | Model-authored soul file, appended verbatim to every agent system prompt when present. Kept short: single-line pointers to `memory` entries that carry the details. |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
