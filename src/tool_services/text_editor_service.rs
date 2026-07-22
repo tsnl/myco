@@ -29,7 +29,7 @@ impl TextEditorService {
             // Schema comes from [`Input`] (flat object). The tagged [`ParsedInput`] enum is used
             // at runtime after conversion — schemars would emit root `oneOf` for that enum,
             // which Anthropic rejects (missing `input_schema.type`).
-            input_schema: schemars::schema_for!(Input).to_value(),
+            input_schema: super::tool_input_schema::<Input>(),
         }]
     }
 }
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn schemars_schema_is_object_type() {
-        let schema = schemars::schema_for!(Input).to_value();
+        let schema = crate::tool_services::tool_input_schema::<Input>();
         assert_eq!(
             schema.get("type").and_then(|t| t.as_str()),
             Some("object"),

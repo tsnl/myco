@@ -72,7 +72,7 @@ impl ToolService for SubagentService {
                 "{TOOL_DESCRIPTION}\nConfigured models for the `model` field: [{}]",
                 self.models.keys().join(", ")
             ),
-            input_schema: schemars::schema_for!(Input).to_value(),
+            input_schema: crate::tool_services::tool_input_schema::<Input>(),
         }]
     }
 

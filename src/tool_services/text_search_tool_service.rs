@@ -92,22 +92,22 @@ impl TextSearchToolService {
             generative_model::ToolSpec {
                 name: "index_directory".to_string(),
                 description: INDEX_DIRECTORY_DESC.to_string(),
-                input_schema: schemars::schema_for!(IndexDirectoryInput).to_value(),
+                input_schema: super::tool_input_schema::<IndexDirectoryInput>(),
             },
             generative_model::ToolSpec {
                 name: "indexed_exact_text_search".to_string(),
                 description: EXACT_SEARCH_DESC.to_string(),
-                input_schema: schemars::schema_for!(SearchInput).to_value(),
+                input_schema: super::tool_input_schema::<SearchInput>(),
             },
             generative_model::ToolSpec {
                 name: "indexed_semantic_text_search".to_string(),
                 description: SEMANTIC_SEARCH_DESC.to_string(),
-                input_schema: schemars::schema_for!(SearchInput).to_value(),
+                input_schema: super::tool_input_schema::<SearchInput>(),
             },
             generative_model::ToolSpec {
                 name: "drop_directory_index".to_string(),
                 description: DROP_DESC.to_string(),
-                input_schema: schemars::schema_for!(DropInput).to_value(),
+                input_schema: super::tool_input_schema::<DropInput>(),
             },
         ]
     }
