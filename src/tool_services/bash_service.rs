@@ -106,7 +106,7 @@ impl BashService {
                 session_default_s = DEFAULT_TIMEOUT_MS / 1000,
                 session_max_min = MAX_TIMEOUT_MS / 60_000,
             ),
-            input_schema: schemars::schema_for!(Input).to_value(),
+            input_schema: super::tool_input_schema::<Input>(),
         }]
     }
 }

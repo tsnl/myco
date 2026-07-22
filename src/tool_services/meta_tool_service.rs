@@ -21,14 +21,16 @@ Read and update Myco conversation session metadata, and inspect the running agen
 Sessions store a title, structured links (GitHub PRs across repos, worktree paths on any
 host), and a markdown scratchpad. Files live at `~/.myco/session/{shard}/{id}.json`.
 
-Actions:
+Actions (`action` is required):
 - get: metadata for the current session (default) or another session via `session_id`
   (id or unique prefix). Always includes the on-disk file path and timestamps.
 - list: enumerate sessions (id, created, updated, title, link counts, path). Optional
   `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
   workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
-- set_title: set or clear (`title` null/empty clears) the **current** session title.
+- set_title: set the **current** session title. `title` is required: a non-empty string
+  sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
+  `scratchpad` is required; an empty string clears it.
 - add_link: attach a GitHub PR or worktree to the **current** session (deduped).
 - remove_link: drop a link from the **current** session by `index`, or by `url` /
   `host`+`path`.
@@ -59,7 +61,7 @@ impl ToolService for SessionMetaTool {
         vec![generative_model::ToolSpec {
             name: "session_meta".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
-            input_schema: schemars::schema_for!(Input).to_value(),
+            input_schema: super::tool_input_schema::<Input>(),
         }]
     }
 
@@ -85,17 +87,18 @@ impl ToolService for SessionMetaTool {
 
 impl SessionMetaTool {
     fn execute(&self, input: Input) -> Result<String, String> {
-        let action = input.action.clone().unwrap_or(ActionKind::Get);
-        match action {
+        match input.action.clone() {
             ActionKind::Get => self.action_get(input.session_id.as_deref()),
             ActionKind::List => {
                 self.action_list(input.limit, input.include_hidden.unwrap_or(false))
             }
             ActionKind::SetTitle => self.action_set_title(input.title),
-            ActionKind::SetScratchpad => {
-                let text = input.scratchpad.unwrap_or_default();
-                self.action_set_scratchpad(text)
-            }
+            ActionKind::SetScratchpad => match input.scratchpad {
+                Some(text) => self.action_set_scratchpad(text),
+                None => Err("set_scratchpad requires `scratchpad` (full markdown; \
+                     pass an empty string to clear)"
+                    .into()),
+            },
             ActionKind::AddLink => self.action_add_link(input),
             ActionKind::RemoveLink => self.action_remove_link(input),
             ActionKind::ExecutablePath => self.action_executable_path(),
@@ -140,12 +143,18 @@ impl SessionMetaTool {
     }
 
     fn action_set_title(&self, title: Option<String>) -> Result<String, String> {
+        // A missing/null `title` is an error, not a clear: models that fill
+        // every optional key with null must not silently wipe the title.
+        let Some(title) = title else {
+            return Err("set_title requires `title`: a non-empty string sets it, \
+                        an empty string clears it"
+                .into());
+        };
         self.active.with_mut(|session| {
-            let cleared = title.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true);
-            if cleared {
+            if title.trim().is_empty() {
                 session.set_title(None)?;
             } else {
-                session.set_title(title)?;
+                session.set_title(Some(title))?;
             }
             session.touch();
             session.save()?;
@@ -260,9 +269,8 @@ impl SessionMetaTool {
     Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
 )]
 struct Input {
-    /// Action to perform. Defaults to `get`.
-    #[serde(default)]
-    action: Option<ActionKind>,
+    /// Action to perform (required).
+    action: ActionKind,
     /// Target session id or unique prefix for `get`. Omit for the current session.
     #[serde(default)]
     session_id: Option<String>,
@@ -397,6 +405,152 @@ mod tests {
             })
             .collect::<String>();
         assert!(text.contains("My Feature"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
+    }
+
+    fn result_text(r: &generative_model::ToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| match c {
+                generative_model::Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The advertised schema must be safe for OpenAI-compatible gateways:
+    /// action enum inlined and required, no refs, closed object.
+    #[test]
+    fn input_schema_is_flat_required_and_closed() {
+        let (tool, _active) = tool_with_session(Session::new("claude-haiku-4-5"));
+        let spec = tool.tool_specs().remove(0);
+        let schema = spec.input_schema;
+        let text = schema.to_string();
+
+        assert!(!text.contains("$defs"), "{text}");
+        assert!(!text.contains("$ref"), "{text}");
+        assert!(!text.contains("anyOf"), "{text}");
+        assert!(!text.contains("\"default\":null"), "{text}");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!([
+                "get",
+                "list",
+                "set_title",
+                "set_scratchpad",
+                "add_link",
+                "remove_link",
+                "executable_path"
+            ]),
+            "{text}"
+        );
+        assert_eq!(schema["required"], serde_json::json!(["action"]), "{text}");
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "{text}"
+        );
+        // Optional enum stays visible inline (null arm merged, no ref).
+        assert_eq!(
+            schema["properties"]["link_kind"]["enum"],
+            serde_json::json!(["github_pr", "worktree", null]),
+            "{text}"
+        );
+    }
+
+    /// Null-filled mutations must error instead of silently clearing state,
+    /// and a missing `action` must be a hard error instead of a silent `get`.
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn null_and_missing_fields_error_instead_of_clearing() {
+        let _guard = crate::session::lock_myco_home_for_test();
+        let dir = std::env::temp_dir().join(format!(
+            "myco-meta-guards-{}",
+            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only env override; held under the myco-home lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
+        let tool = Arc::new(tool);
+        let ctx = || HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new());
+        let call = |input: serde_json::Value| generative_model::ToolUse {
+            id: "t".into(),
+            name: "session_meta".into(),
+            input,
+        };
+
+        // Seed a title, then try the all-keys-null fill some models emit.
+        let ok = tool
+            .clone()
+            .dispatch_tool_use(
+                call(serde_json::json!({"action": "set_title", "title": "Keep Me"})),
+                ctx(),
+            )
+            .await;
+        assert!(!ok.is_error, "{ok:?}");
+
+        let nulled = tool
+            .clone()
+            .dispatch_tool_use(
+                call(serde_json::json!({"action": "set_title", "title": null})),
+                ctx(),
+            )
+            .await;
+        assert!(nulled.is_error, "{nulled:?}");
+        assert!(
+            result_text(&nulled).contains("set_title requires"),
+            "{nulled:?}"
+        );
+        assert_eq!(active.snapshot().title.as_deref(), Some("Keep Me"));
+
+        // Explicit empty string is still the documented way to clear.
+        let cleared = tool
+            .clone()
+            .dispatch_tool_use(
+                call(serde_json::json!({"action": "set_title", "title": ""})),
+                ctx(),
+            )
+            .await;
+        assert!(!cleared.is_error, "{cleared:?}");
+        assert_eq!(active.snapshot().title, None);
+
+        // set_scratchpad without scratchpad must not wipe.
+        let sp = tool
+            .clone()
+            .dispatch_tool_use(
+                call(serde_json::json!({"action": "set_scratchpad", "scratchpad": "notes"})),
+                ctx(),
+            )
+            .await;
+        assert!(!sp.is_error, "{sp:?}");
+        let wiped = tool
+            .clone()
+            .dispatch_tool_use(call(serde_json::json!({"action": "set_scratchpad"})), ctx())
+            .await;
+        assert!(wiped.is_error, "{wiped:?}");
+        assert!(
+            result_text(&wiped).contains("set_scratchpad requires"),
+            "{wiped:?}"
+        );
+        assert_eq!(active.snapshot().scratchpad, "notes");
+
+        // A call with no action used to silently dispatch as `get`.
+        let missing = tool
+            .clone()
+            .dispatch_tool_use(call(serde_json::json!({"title": "X"})), ctx())
+            .await;
+        assert!(missing.is_error, "{missing:?}");
+        assert!(result_text(&missing).contains("action"), "{missing:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {

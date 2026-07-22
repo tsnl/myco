@@ -50,7 +50,7 @@ impl ToolService for SessionHistoryTool {
         vec![generative_model::ToolSpec {
             name: "session_history".to_string(),
             description: tool_description(),
-            input_schema: schemars::schema_for!(Input).to_value(),
+            input_schema: super::tool_input_schema::<Input>(),
         }]
     }
 
