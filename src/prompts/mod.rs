@@ -1,28 +1,28 @@
-//! Shared system-prompt fragments for root agents and subagents.
+//! Shared system-prompt fragments for myco agents.
 //!
 //! Always-on agent policy (worktrees, computer-use, coding norms, user
 //! authority, the agent workspace) lives here. Longer runtime docs live in
 //! [`crate::manual`] and are browsed via the `manual` host tool /
 //! `myco --help [id]`.
 
-/// Epilogue appended to every agent system prompt (root + subagent).
+/// Epilogue appended to every agent system prompt.
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
     r#"
 When generating a response, please follow these guidelines.
 
-Note that this section onward (the Myco Agent Prompt Epilogue) is made available to agents and
-subagents alike in the system prompt.
+Note that this section onward (the Myco Agent Prompt Epilogue) is made available to every myco
+agent in the system prompt, including nested ones.
 
 ---
 
 # Myco Runtime Manual
 
 You are running inside **myco**: a mycelial agent runtime. The same agent pattern repeats at every
-scale — supervisors orchestrate **subagents**, and tools run on **hosts** (hands) spanning local and
-remote machines. The **local** host is always enabled **in-process** (no subprocess). Remotes use
-`ssh … myco --mode host` over NDJSON. Local tools (`subagent`, `session_meta`) stay in the agent
-process; host tools (`bash`, editor, `manual`, text search, `lynx_tui_browser`) run on a host worker
-(local in-process or remote). Subagents share this harness and host pool.
+scale — supervisors drive **nested myco agents** as ordinary commands (see Nested Agents below),
+and tools run on **hosts** (hands) spanning local and remote machines. The **local** host is always
+enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. Local
+tools (`session_meta`) stay in the agent process; host tools (`bash`, editor, `manual`, text
+search, `lynx_tui_browser`) run on a host worker (local in-process or remote).
 
 **Browse runtime docs with the `manual` tool** (`list` / `get` by id) or `myco --help <id>`.
 Article ids: `overview`, `cli`, `harness-ops`.
@@ -30,7 +30,7 @@ Article ids: `overview`, `cli`, `harness-ops`.
 Quick map (details in `manual`):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
-  (`enable_subagent`, `attach_timeout_secs`).
+  (`attach_timeout_secs`).
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
@@ -50,11 +50,16 @@ Quick map (details in `manual`):
 
 ---
 
-# Subagent Use
+# Nested Agents
 
-Context is precious. Use sub-agents for ephemeral, task-specific context. For complex, multi-step
-tasks, delegate to a sub-agent. Subagents should return a terse summary of their work with details
-listed in `.myco/subagent-logs/{subagent-uuid}.log`.
+Context is precious. For ephemeral, task-specific context — and for complex, multi-step tasks —
+delegate to a nested agent: `myco` drives itself as an ordinary interactive command. Start one in a
+bash session (`bash` action=start, `command: "myco --model <key>"`; any host where myco is
+configured), then `write` one prompt per line — each line submits a turn — and `read` until the
+next `USER n/m` header, which marks the turn boundary (colors and wrapping switch off automatically
+when piped). Ask it to reply with a terse summary; `close` the session when done. A nested agent is
+a full myco process: its own session under `~/.myco/session/` (readable later via `session_meta`
+get-by-id), the same config and host pool.
 
 ---
 "#,
@@ -77,7 +82,7 @@ const MAX_SOUL_BYTES: usize = 64 * 1024;
 
 /// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
 /// `MYCO_HOME`), when present. Read at model build time — session start, model
-/// switch, each subagent spawn — so a running agent's prompt never changes
+/// switch, each worker spawn — so a running agent's prompt never changes
 /// mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
     epilogue_with_home(crate::session::myco_home().ok())

@@ -379,7 +379,7 @@ mod tests {
                         "title": "  My Feature  "
                     }),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!result.is_error, "{result:?}");
@@ -392,7 +392,7 @@ mod tests {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "get"}),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!got.is_error, "{got:?}");
@@ -482,7 +482,7 @@ mod tests {
 
         let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
-        let ctx = || HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new());
+        let ctx = || HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new());
         let call = |input: serde_json::Value| generative_model::ToolUse {
             id: "t".into(),
             name: "session_meta".into(),
@@ -583,7 +583,7 @@ mod tests {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "executable_path"}),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!got.is_error, "{got:?}");

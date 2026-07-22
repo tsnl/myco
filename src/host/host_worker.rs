@@ -146,7 +146,6 @@ impl HostWorker {
                         HostDispatchContext {
                             agent_id,
                             cancel: CancelToken::new(),
-                            agent_root: None,
                         },
                     )
                     .await;

@@ -10,8 +10,8 @@ optional **remote** hosts (`ssh … myco --mode host` over NDJSON).
 
 Primary goal: a **personal daily driver** that can replace Claude Code / Codex /
 OpenCode-class workflows — long sessions you trust, real computer use, and one
-conversation across machines. Multi-host execution and subagent orchestration are
-the product wedge; cluster/GUI work must not outrank CLI trust and long-session
+conversation across machines. Multi-host execution and nested-agent orchestration
+(myco driving myco over bash sessions) are the product wedge; cluster/GUI work must not outrank CLI trust and long-session
 viability (`TODO.md`).
 
 This is **not** an educational textbook repo (unlike resin/unit). Prefer clarity
@@ -74,13 +74,17 @@ myco (interactive) / Agent
               └── standard tools: bash, editor, manual, lynx browser, text search
 ```
 
+Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
+bash session (piped stdin/stdout; wrap/color auto-off) and reads turns off the
+`USER n/m` headers.
+
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), config file, color decision |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
-| `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), startup preflight (executables + ssh-agent), subagent service |
+| `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
@@ -96,7 +100,7 @@ myco (interactive) / Agent
   subprocess for the default host.
 - **Remotes are lazy** — connect on first tool use; soft-fail non-default hosts.
 - **Standard tool catalog is the same on every host**; root-only tools
-  (`session_meta`, `subagent`) are installed only on the in-process local worker.
+  (`session_meta`) are installed only on the in-process local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;

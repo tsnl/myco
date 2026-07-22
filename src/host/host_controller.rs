@@ -173,31 +173,12 @@ impl HostController {
         tool_use: ToolUse,
         cancel: CancelToken,
     ) -> ToolResult {
-        self.call_with_root(agent_id, tool_use, cancel, None).await
-    }
-
-    /// Like [`call`], optionally attaching agent-root handles for in-process tools
-    /// (e.g. `subagent`). Remote backends ignore `agent_root`.
-    pub async fn call_with_root(
-        &self,
-        agent_id: uuid::Uuid,
-        tool_use: ToolUse,
-        cancel: CancelToken,
-        agent_root: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    ) -> ToolResult {
         match &self.backend {
             Backend::InProcess { worker } => {
                 let tool_id = tool_use.id.clone();
                 let worker = Arc::clone(worker);
                 worker
-                    .dispatch_tool_use(
-                        tool_use,
-                        HostDispatchContext {
-                            agent_id,
-                            cancel,
-                            agent_root,
-                        },
-                    )
+                    .dispatch_tool_use(tool_use, HostDispatchContext { agent_id, cancel })
                     .await
                     .with_id(tool_id)
             }
