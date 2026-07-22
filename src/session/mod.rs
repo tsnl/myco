@@ -576,15 +576,35 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
 pub fn resolve_and_load_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
     match id_or_prefix {
         Some(id) => Session::load_by_id_or_prefix(id),
-        None => {
-            let list = list_sessions(1)?;
-            let meta = list
-                .into_iter()
-                .next()
-                .ok_or_else(|| "no sessions found under ~/.myco/session".to_string())?;
-            Session::load(&meta.path)
+        None => load_most_recent_session(),
+    }
+}
+
+/// Most recent visible session without parsing every file: every `touch()` is
+/// followed by an atomic `save()`, so file mtime tracks `updated_at`. Candidates
+/// are parsed newest-first until one is readable, current-version, and visible —
+/// hidden/corrupt/stale files cost a `stat` instead of a full-history parse.
+fn load_most_recent_session() -> Result<Session, String> {
+    let root = session_root()?;
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    if root.exists() {
+        for path in iter_session_json_files(&root)? {
+            let mtime = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            candidates.push((mtime, path));
         }
     }
+    // Path breaks mtime ties for determinism on coarse-mtime filesystems.
+    candidates.sort();
+    for (_, path) in candidates.iter().rev() {
+        if let Ok(session) = Session::load(path)
+            && session.is_visible()
+        {
+            return Ok(session);
+        }
+    }
+    Err("no sessions found under ~/.myco/session".to_string())
 }
 
 pub fn resolve_session_id(id_or_prefix: &str) -> Result<String, String> {
@@ -988,6 +1008,15 @@ mod tests {
         ))
     }
 
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
     #[test]
     fn normalize_pr_url_variants() {
         assert_eq!(
@@ -1283,6 +1312,42 @@ mod tests {
             loaded.parent_session_id.as_deref(),
             Some(visible.id.as_str())
         );
+
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
+    }
+
+    #[test]
+    fn bare_resume_picks_newest_mtime_and_skips_corrupt_files() {
+        let _guard = myco_home_lock();
+        let dir = temp_session_root();
+        // SAFETY: test-only env override; held under myco_home_lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let older = Session::new("claude-haiku-4-5");
+        older.save().unwrap();
+        let newer = Session::new("claude-haiku-4-5");
+        newer.save().unwrap();
+
+        // Force distinct mtimes regardless of filesystem timestamp granularity.
+        let base = std::time::SystemTime::now();
+        set_mtime(&older.json_path(), base - Duration::from_secs(60));
+        set_mtime(&newer.json_path(), base);
+
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, newer.id);
+
+        // A corrupt file with the newest mtime is skipped, not fatal.
+        let corrupt = session_file_path("ffeeddccbbaa00112233445566778899", "json");
+        fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        fs::write(&corrupt, b"{not json").unwrap();
+        set_mtime(&corrupt, base + Duration::from_secs(60));
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, newer.id);
 
         let _ = fs::remove_dir_all(&dir);
         unsafe {
