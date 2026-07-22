@@ -119,6 +119,15 @@ impl HostWorker {
         }
     }
 
+    /// One-line summaries of tool work still running for `agent_id` across
+    /// all services (e.g. live bash sessions).
+    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
+        self.services
+            .iter()
+            .flat_map(|service| service.running_tool_summaries(agent_id))
+            .collect()
+    }
+
     /// Handle one decoded request and write the reply through `writer`.
     async fn handle_request<W>(self: Arc<Self>, writer: Arc<Mutex<W>>, msg: Request)
     where

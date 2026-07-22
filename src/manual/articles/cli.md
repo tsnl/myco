@@ -92,7 +92,9 @@ but stripped from provider requests. Generate failures (e.g. context overflow) o
 ERROR section (live only; not stored in session history).
 
 Each live USER header is `USER <used>/<max>` (context tokens used / model window). `used` is 0
-until a provider usage report arrives.
+until a provider usage report arrives. Below the token counts, one line per still-running tool
+(live bash session on the in-process local host) shows its command, uptime, and idle time;
+remote hosts are not queried for this.
 
 ### Console mirror (`{id}.console`)
 

@@ -573,6 +573,9 @@ async fn run_repl(
                 ))
             );
         }
+        for line in harness.running_tool_summaries(agent.context().agent_id) {
+            let _ = writeln!(header, "{}", palette.user(&line));
+        }
         let _ = writeln!(header);
         emit_mirrored(&console, &header);
         // No "> " prefix; body is typed on the line after the USER header.
@@ -1151,7 +1154,9 @@ resume but stripped from provider requests. Change effort with `/effort`.
 Generate failures open a headed ERROR section (live only; not in history).
 
 Each USER header shows `USER <used>/<max>` context tokens when the provider
-reported usage on the previous generate (0/max until then).
+reported usage on the previous generate (0/max until then). Below the token
+counts, one line per still-running tool (live bash session on the in-process
+local host) shows its command, uptime, and idle time.
 
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from
