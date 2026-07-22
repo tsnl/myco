@@ -33,7 +33,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/SOUL.md` is appended verbatim to every agent system prompt when present (see below). |
+| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt (see below). |
 | `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
@@ -154,12 +154,16 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 `~/.myco/workspace/` is the agents' own directory — free-form files maintained with
 the ordinary tools (no dedicated tool, no required format), persistent across
-sessions and shared by every agent on the machine. `workspace/SOUL.md` is the one
-special file: when present its contents are appended verbatim to every agent system
-prompt, read at model build time (session start, model switch, subagent spawn). The
-workspace may sit on a weakly consistent network filesystem shared with concurrent
-agents, so agents are told to write whole files in one shot, tolerate late-appearing
-writes, and take no locks. Distinct from the per-session `session_meta` scratchpad.
+sessions and shared by every agent on the machine. `workspace/soul/` is the one
+special place: it holds the agent's soul as maildir-style complete snapshots (one
+write-once file per revision, never edited in place). The newest version — the
+lexicographically last non-hidden `*.md` filename — is appended verbatim to every
+agent system prompt, read at model build time (session start, model switch,
+subagent spawn). Revisions are whole new files renamed into place, so concurrent
+agents cannot clobber each other even on a weakly consistent network filesystem —
+both versions land, the later name wins, superseded versions are pruned after the
+fact. The same whole-file discipline is prompted for the rest of the workspace.
+Distinct from the per-session `session_meta` scratchpad.
 
 ## Product limits (V1)
 

@@ -70,37 +70,57 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     "\n",
 );
 
-/// Backstop so one runaway soul-file write cannot bloat every future prompt
+/// Backstop so one runaway soul revision cannot bloat every future prompt
 /// (the fragment asks for about a screenful; same cap as the session
-/// scratchpad). The truncation marker tells the agent to trim the file.
+/// scratchpad). The truncation marker tells the agent to write a shorter one.
 const MAX_SOUL_BYTES: usize = 64 * 1024;
 
-/// The epilogue plus the current soul file (`~/.myco/workspace/SOUL.md`,
-/// respecting `MYCO_HOME`), when present. Read at model build time — session
-/// start, model switch, each subagent spawn — so a running agent's prompt never
-/// changes mid-conversation and the cached conversation prefix stays valid.
+/// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
+/// `MYCO_HOME`), when present. Read at model build time — session start, model
+/// switch, each subagent spawn — so a running agent's prompt never changes
+/// mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
     epilogue_with_home(crate::session::myco_home().ok())
+}
+
+/// The current soul snapshot: filename and trimmed contents of the
+/// lexicographically last visible `*.md` in `workspace/soul/`. Versions are
+/// write-once maildir-style files, so "newest name wins" is the whole
+/// contract — a whitespace-only newest version reads as "no soul".
+fn latest_soul(dir: &std::path::Path) -> Option<(String, String)> {
+    let mut versions: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            (!name.starts_with('.') && name.ends_with(".md") && entry.path().is_file())
+                .then(|| (name, entry.path()))
+        })
+        .collect();
+    versions.sort();
+    let (name, path) = versions.pop()?;
+    let text = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (!text.is_empty()).then_some((name, text))
 }
 
 /// [`agent_prompt_epilogue`] against an explicit myco home, so tests need no
 /// process-global `MYCO_HOME` override.
 fn epilogue_with_home(home: Option<std::path::PathBuf>) -> String {
-    let soul = home
-        .and_then(|home| std::fs::read_to_string(home.join("workspace").join("SOUL.md")).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty());
+    let soul = home.and_then(|home| latest_soul(&home.join("workspace").join("soul")));
     match soul {
-        Some(mut soul) => {
+        Some((name, mut soul)) => {
             if soul.len() > MAX_SOUL_BYTES {
                 let mut end = MAX_SOUL_BYTES;
                 while !soul.is_char_boundary(end) {
                     end -= 1;
                 }
                 soul.truncate(end);
-                soul.push_str("\n\n[SOUL.md truncated at 64 KiB — keep it short]");
+                soul.push_str("\n\n[soul truncated at 64 KiB — write a shorter revision]");
             }
-            format!("{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# SOUL.md\n\n{soul}\n")
+            format!(
+                "{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# Soul\n\n\
+                 (current version: soul/{name})\n\n{soul}\n"
+            )
         }
         None => DEFAULT_AGENT_PROMPT_EPILOGUE.to_string(),
     }
@@ -121,41 +141,65 @@ mod tests {
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
-        // Free-form workspace policy: soul file, recall/record habit, and the
-        // consistency caution.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul file"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/"));
+        // Free-form workspace policy: maildir-style soul versions, the
+        // recall/record habit, and the consistency caution.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/soul/"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("write-once, never edited in place"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("consult and maintain them often"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
     }
 
     #[test]
-    fn soul_file_contents_are_appended_when_present() {
+    fn newest_soul_version_is_appended_to_the_epilogue() {
         let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
-        let workspace = dir.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
+        let soul_dir = dir.join("workspace").join("soul");
+        std::fs::create_dir_all(&soul_dir).unwrap();
         let epilogue = || epilogue_with_home(Some(dir.clone()));
 
-        // Missing or whitespace-only file: the epilogue alone.
-        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
-        std::fs::write(workspace.join("SOUL.md"), "  \n\n").unwrap();
+        // No versions: the epilogue alone.
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
-        // Present: appended verbatim under the promised heading.
-        std::fs::write(workspace.join("SOUL.md"), "soul_token_alpha\n").unwrap();
+        // One version: appended verbatim under the promised heading, with the
+        // live version named so agents know what to supersede.
+        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "soul_token_alpha\n").unwrap();
         let prompt = epilogue();
         assert!(
             prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE),
             "{prompt}"
         );
-        assert!(prompt.contains("# SOUL.md"), "{prompt}");
+        assert!(prompt.contains("# Soul"), "{prompt}");
+        assert!(
+            prompt.contains("(current version: soul/20260101T0000-aaaa.md)"),
+            "{prompt}"
+        );
         assert!(prompt.ends_with("soul_token_alpha\n"), "{prompt}");
 
-        // Oversized files are truncated with a visible marker, keeping the
-        // prompt bounded no matter what got written.
-        std::fs::write(workspace.join("SOUL.md"), "x".repeat(MAX_SOUL_BYTES * 2)).unwrap();
+        // The lexicographically last name wins; hidden temp files and non-md
+        // files are ignored (in-progress writes never leak into prompts).
+        std::fs::write(soul_dir.join("20270101T0000-bbbb.md"), "soul_token_beta\n").unwrap();
+        std::fs::write(soul_dir.join(".tmp-20280101T0000.md"), "tmp_token_gamma\n").unwrap();
+        std::fs::write(soul_dir.join("zz-notes.txt"), "txt_token_delta\n").unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("[SOUL.md truncated at 64 KiB"), "{prompt}");
+        assert!(prompt.contains("soul_token_beta"), "{prompt}");
+        assert!(!prompt.contains("soul_token_alpha"), "{prompt}");
+        assert!(!prompt.contains("tmp_token_gamma"), "{prompt}");
+        assert!(!prompt.contains("txt_token_delta"), "{prompt}");
+
+        // A whitespace-only newest version reads as a cleared soul — no
+        // fallback to older versions.
+        std::fs::write(soul_dir.join("20280101T0000-cccc.md"), "  \n\n").unwrap();
+        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+
+        // An oversized version is truncated with a visible marker, keeping
+        // the prompt bounded no matter what got written.
+        std::fs::write(
+            soul_dir.join("20290101T0000-dddd.md"),
+            "x".repeat(MAX_SOUL_BYTES * 2),
+        )
+        .unwrap();
+        let prompt = epilogue();
+        assert!(prompt.contains("[soul truncated at 64 KiB"), "{prompt}");
         assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_SOUL_BYTES + 200);
 
         let _ = std::fs::remove_dir_all(&dir);
