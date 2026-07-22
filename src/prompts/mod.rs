@@ -70,6 +70,11 @@ listed in `.myco/subagent-logs/{subagent-uuid}.log`.
     "\n",
 );
 
+/// Backstop so one runaway soul-file write cannot bloat every future prompt
+/// (the fragment asks for about a screenful; same cap as the session
+/// scratchpad). The truncation marker tells the agent to trim the file.
+const MAX_SOUL_BYTES: usize = 64 * 1024;
+
 /// The epilogue plus the current soul file (`~/.myco/workspace/SOUL.md`,
 /// respecting `MYCO_HOME`), when present. Read at model build time — session
 /// start, model switch, each subagent spawn — so a running agent's prompt never
@@ -81,7 +86,17 @@ pub fn agent_prompt_epilogue() -> String {
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
     match soul {
-        Some(soul) => format!("{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# SOUL.md\n\n{soul}\n"),
+        Some(mut soul) => {
+            if soul.len() > MAX_SOUL_BYTES {
+                let mut end = MAX_SOUL_BYTES;
+                while !soul.is_char_boundary(end) {
+                    end -= 1;
+                }
+                soul.truncate(end);
+                soul.push_str("\n\n[SOUL.md truncated at 64 KiB — keep it short]");
+            }
+            format!("{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# SOUL.md\n\n{soul}\n")
+        }
         None => DEFAULT_AGENT_PROMPT_EPILOGUE.to_string(),
     }
 }
@@ -101,9 +116,11 @@ mod tests {
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
-        // Free-form workspace policy: soul file plus the consistency caution.
+        // Free-form workspace policy: soul file, recall/record habit, and the
+        // consistency caution.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul file"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("consult and maintain them often"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
     }
 
@@ -126,9 +143,19 @@ mod tests {
         // Present: appended verbatim under the promised heading.
         std::fs::write(workspace.join("SOUL.md"), "soul_token_alpha\n").unwrap();
         let prompt = agent_prompt_epilogue();
-        assert!(prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE), "{prompt}");
+        assert!(
+            prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE),
+            "{prompt}"
+        );
         assert!(prompt.contains("# SOUL.md"), "{prompt}");
         assert!(prompt.ends_with("soul_token_alpha\n"), "{prompt}");
+
+        // Oversized files are truncated with a visible marker, keeping the
+        // prompt bounded no matter what got written.
+        std::fs::write(workspace.join("SOUL.md"), "x".repeat(MAX_SOUL_BYTES * 2)).unwrap();
+        let prompt = agent_prompt_epilogue();
+        assert!(prompt.contains("[SOUL.md truncated at 64 KiB"), "{prompt}");
+        assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_SOUL_BYTES + 200);
 
         // SAFETY: test-only env override; held under the myco-home lock.
         unsafe {
