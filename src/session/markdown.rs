@@ -41,7 +41,9 @@
 //! prose. A table that fits the wrap width renders at its natural width; one
 //! too wide reflows — columns are sized by max-min fair share and cell contents
 //! wrap into taller rows so it stays inside the terminal (only an unbreakable
-//! over-long word can still overflow). Because capture is gated on styling,
+//! over-long word can still overflow). Horizontal rules separate the body rows
+//! so rows stay distinguishable even when wrapped cells make them several
+//! physical lines tall. Because capture is gated on styling,
 //! **plain mode passes tables through byte-identically**, keeping the identity
 //! guarantee for files and pipes.
 //!
@@ -598,9 +600,10 @@ impl MarkdownRenderer {
     /// fair-share allocator ([`allocate_widths`]): with no wrap width, or when
     /// the table already fits, every column gets its natural width and each row
     /// is one line; when the table is too wide for the wrap column, the wide
-    /// columns are squeezed and their cells wrap into taller rows. Only an
-    /// unbreakable over-long word can still push the box past the wrap width.
-    /// `lines` is header, delimiter, then rows.
+    /// columns are squeezed and their cells wrap into taller rows. Body rows
+    /// are separated by horizontal rules, keeping multiline rows
+    /// distinguishable. Only an unbreakable over-long word can still push the
+    /// box past the wrap width. `lines` is header, delimiter, then rows.
     fn render_table(&mut self, lines: &[String]) {
         fn cell_text(raw: &[String], i: usize) -> &str {
             raw.get(i).map_or("", String::as_str)
@@ -682,7 +685,10 @@ impl MarkdownRenderer {
         self.table_multiline_row(header_lines, &widths, &aligns);
         if !body_lines.is_empty() {
             self.table_border(&widths, '├', '┼', '┤');
-            for row in body_lines {
+            for (i, row) in body_lines.into_iter().enumerate() {
+                if i > 0 {
+                    self.table_border(&widths, '├', '┼', '┤');
+                }
                 self.table_multiline_row(row, &widths, &aligns);
             }
         }
@@ -2116,6 +2122,7 @@ mod tests {
              │ L   │   R │\n\
              ├─────┼─────┤\n\
              │ a   │   b │\n\
+             ├─────┼─────┤\n\
              │ ccc │ ddd │\n\
              └─────┴─────┘\n"
         );
@@ -2249,6 +2256,26 @@ mod tests {
              │ x │    one two │\n\
              │   │ three four │\n\
              └───┴────────────┘\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_table_separates_every_body_row() {
+        // Per-row rules keep a multiline (wrapped) row from blending into the
+        // single-line row after it.
+        let input = "| id | note |\n| -- | ---- |\n\
+                     | 1 | alpha beta gamma |\n| 2 | ok |\n";
+        let out = strip_escapes(&render(input, styled_wrap(20)));
+        assert_eq!(
+            out,
+            "┌────┬─────────────┐\n\
+             │ id │ note        │\n\
+             ├────┼─────────────┤\n\
+             │ 1  │ alpha beta  │\n\
+             │    │ gamma       │\n\
+             ├────┼─────────────┤\n\
+             │ 2  │ ok          │\n\
+             └────┴─────────────┘\n"
         );
     }
 
