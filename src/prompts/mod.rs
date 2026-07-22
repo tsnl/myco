@@ -80,8 +80,13 @@ const MAX_SOUL_BYTES: usize = 64 * 1024;
 /// start, model switch, each subagent spawn — so a running agent's prompt never
 /// changes mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
-    let soul = crate::session::myco_home()
-        .ok()
+    epilogue_with_home(crate::session::myco_home().ok())
+}
+
+/// [`agent_prompt_epilogue`] against an explicit myco home, so tests need no
+/// process-global `MYCO_HOME` override.
+fn epilogue_with_home(home: Option<std::path::PathBuf>) -> String {
+    let soul = home
         .and_then(|home| std::fs::read_to_string(home.join("workspace").join("SOUL.md")).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
@@ -126,23 +131,19 @@ mod tests {
 
     #[test]
     fn soul_file_contents_are_appended_when_present() {
-        let _guard = crate::session::lock_myco_home_for_test();
         let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let epilogue = || epilogue_with_home(Some(dir.clone()));
 
         // Missing or whitespace-only file: the epilogue alone.
-        assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
         std::fs::write(workspace.join("SOUL.md"), "  \n\n").unwrap();
-        assert_eq!(agent_prompt_epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
         // Present: appended verbatim under the promised heading.
         std::fs::write(workspace.join("SOUL.md"), "soul_token_alpha\n").unwrap();
-        let prompt = agent_prompt_epilogue();
+        let prompt = epilogue();
         assert!(
             prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE),
             "{prompt}"
@@ -153,14 +154,10 @@ mod tests {
         // Oversized files are truncated with a visible marker, keeping the
         // prompt bounded no matter what got written.
         std::fs::write(workspace.join("SOUL.md"), "x".repeat(MAX_SOUL_BYTES * 2)).unwrap();
-        let prompt = agent_prompt_epilogue();
+        let prompt = epilogue();
         assert!(prompt.contains("[SOUL.md truncated at 64 KiB"), "{prompt}");
         assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_SOUL_BYTES + 200);
 
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
