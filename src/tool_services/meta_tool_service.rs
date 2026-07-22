@@ -342,6 +342,9 @@ mod tests {
         (SessionMetaTool::new(active.clone()), active)
     }
 
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn set_title_and_get() {
         let _guard = crate::session::lock_myco_home_for_test();
@@ -401,6 +404,9 @@ mod tests {
         }
     }
 
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn executable_path_returns_absolute_path() {
         let _guard = crate::session::lock_myco_home_for_test();

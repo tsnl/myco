@@ -606,6 +606,9 @@ mod tests {
         );
     }
 
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn root_only_tools_keep_host_field_and_run_local() {
         use crate::CancelToken;
