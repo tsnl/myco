@@ -130,8 +130,9 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 ### Invocation surface
 
 - [ ] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
-- [ ] **User multimodal** — CLI path for images/files (`Content::Image` exists; CLI text-only;
-      OpenAI image path thin).
+- [x] **User multimodal (images)** — `@path` mentions in the REPL attach
+      png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
+      Responses sends `input_image` parts. Non-image files: see **Rich attach**.
 - [ ] **`/model` mid-session** without restart. (`/effort` landed: always-on thinking, default high.)
 - [ ] **Rich attach** — files/dirs/URLs as first-class message parts (not only “cat in bash”).
 

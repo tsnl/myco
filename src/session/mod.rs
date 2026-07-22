@@ -5,6 +5,7 @@
 //! files: only [`SESSION_FILE_VERSION`] is accepted.
 
 mod agent;
+mod attach;
 mod compact;
 mod console_log;
 mod markdown;
@@ -15,6 +16,7 @@ pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, HistoryCheckpoint, NullEventSink,
     TraceContext, uuid_simple_hex,
 };
+pub use attach::{MAX_IMAGE_BYTES, UserInput, expand_image_attachments};
 pub use compact::{
     CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
     select_tail,

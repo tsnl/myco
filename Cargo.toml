@@ -13,6 +13,7 @@ license = "MIT"
 
 [dependencies]
 atomic-write-file = "0.3.0"
+base64 = "0.22"
 candle-core = "0.9.1"
 candle-nn = "0.9.1"
 candle-transformers = "0.9.1"

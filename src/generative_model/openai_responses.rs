@@ -229,7 +229,7 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
             Message::UserMessage { content } => {
                 out.push(ResponsesInputItem::Message {
                     role: "user".into(),
-                    content: content_to_input_text(content),
+                    content: user_content_to_input(content),
                 });
             }
             Message::ToolResults { tool_use_results } => {
@@ -253,7 +253,7 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                 if !text.is_empty() {
                     out.push(ResponsesInputItem::Message {
                         role: "assistant".into(),
-                        content: text,
+                        content: ResponsesMessageContent::Text(text),
                     });
                 }
                 for tool_use in tool_uses {
@@ -281,6 +281,41 @@ fn content_to_input_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// User message content: plain string when text-only, `input_text` /
+/// `input_image` parts when images are attached.
+fn user_content_to_input(content: &[Content]) -> ResponsesMessageContent {
+    if !content.iter().any(|c| matches!(c, Content::Image { .. })) {
+        return ResponsesMessageContent::Text(content_to_input_text(content));
+    }
+    ResponsesMessageContent::Parts(
+        content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => {
+                    Some(ResponsesContentPart::InputText { text: text.clone() })
+                }
+                Content::Image { source } => Some(ResponsesContentPart::InputImage {
+                    image_url: image_url(source),
+                }),
+                Content::Thinking { .. } => None,
+            })
+            .collect(),
+    )
+}
+
+/// `input_image.image_url` accepts http(s) and `data:` URLs. Same source
+/// policy as the Anthropic driver: pass URLs through, treat anything else as
+/// raw base64 PNG.
+fn image_url(source: &str) -> String {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("data:")
+    {
+        return source.to_string();
+    }
+    format!("data:image/png;base64,{source}")
 }
 
 fn tool_result_to_string(result: &ToolResult) -> String {
@@ -691,7 +726,7 @@ struct ResponsesTool {
 enum ResponsesInputItem {
     Message {
         role: String,
-        content: String,
+        content: ResponsesMessageContent,
     },
     FunctionCall {
         #[serde(rename = "type")]
@@ -706,6 +741,24 @@ enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+}
+
+/// Message `content`: the plain-string form for text-only messages, or the
+/// part-list form when a user message carries images.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ResponsesMessageContent {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+enum ResponsesContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image_url: String },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -923,7 +976,8 @@ mod tests {
         assert!(matches!(
             &items[0],
             ResponsesInputItem::Message { role, content }
-                if role == "user" && content == "hi"
+                if role == "user"
+                    && *content == ResponsesMessageContent::Text("hi".into())
         ));
         assert!(matches!(
             &items[1],
@@ -941,6 +995,49 @@ mod tests {
                 ..
             } if call_id == "call_1" && output == "hi\n"
         ));
+    }
+
+    #[test]
+    fn user_image_becomes_input_image_part() {
+        let input = [Message::UserMessage {
+            content: vec![
+                Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                },
+                Content::Text {
+                    text: "what is this? @shot.png".into(),
+                },
+            ],
+        }];
+        let items = convert_messages(&input);
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(json[0]["role"], "user");
+        assert_eq!(json[0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            json[0]["content"][0]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert_eq!(json[0]["content"][1]["type"], "input_text");
+        assert_eq!(json[0]["content"][1]["text"], "what is this? @shot.png");
+    }
+
+    #[test]
+    fn text_only_user_message_stays_plain_string() {
+        let input = [Message::UserMessage {
+            content: vec![Content::Text { text: "hi".into() }],
+        }];
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        assert_eq!(json[0]["content"], "hi");
+    }
+
+    #[test]
+    fn image_url_passes_urls_and_wraps_raw_base64() {
+        assert_eq!(image_url("https://x.test/a.png"), "https://x.test/a.png");
+        assert_eq!(
+            image_url("data:image/jpeg;base64,AA"),
+            "data:image/jpeg;base64,AA"
+        );
+        assert_eq!(image_url("iVBOR"), "data:image/png;base64,iVBOR");
     }
 
     #[test]

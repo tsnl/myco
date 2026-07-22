@@ -282,7 +282,11 @@ pub fn write_session_history(
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                if text.is_empty() {
+                let images = content
+                    .iter()
+                    .filter(|c| matches!(c, Content::Image { .. }))
+                    .count();
+                if text.is_empty() && images == 0 {
                     continue;
                 }
                 writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
@@ -290,10 +294,19 @@ pub fn write_session_history(
                 writeln!(out)?;
                 // Wrap-only (no markdown styling): the user's own words replay
                 // as typed, at the transcript width — same as the live echo.
-                write_block(
-                    out,
-                    &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
-                )?;
+                if !text.is_empty() {
+                    write_block(
+                        out,
+                        &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
+                    )?;
+                }
+                // Attached image data is not replayable in a terminal; a count
+                // placeholder keeps the replay honest (the `@path` mentions in
+                // the text say which files they were).
+                if images > 0 {
+                    let plural = if images == 1 { "" } else { "s" };
+                    writeln!(out, "[{images} image{plural} attached]")?;
+                }
                 // Next assistant turn opens a fresh ASSISTANT section.
                 assistant_open = false;
                 need_blank = false;
@@ -573,6 +586,26 @@ mod tests {
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
+    }
+
+    #[test]
+    fn user_images_replay_as_count_placeholder() {
+        let messages = vec![Message::UserMessage {
+            content: vec![
+                Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                },
+                Content::Text {
+                    text: "look at @shot.png".into(),
+                },
+            ],
+        }];
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("look at @shot.png\n[1 image attached]\n"));
+        // The base64 payload never hits the terminal.
+        assert!(!rendered.contains("AAAA"));
     }
 
     #[test]
