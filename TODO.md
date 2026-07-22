@@ -12,7 +12,7 @@ cluster/GUI work outrank CLI trust + long-session viability.
 - Dual protocol drivers: Anthropic Messages + OpenAI Responses. Models are a config.toml catalog (`[gateways]`/`[models]`; auth = literal token or env/file source) — no built-in model list; any gateway (Anthropic, xAI, OpenRouter, local) via config
 - Streaming generate + thinking; `EventSink` / `AgentEvent` (CLI consumer is thin)
 - Host pool: local + SSH `myco --mode host`, soft-fail non-default, `/hosts`
-- Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp), `subagent` (single-shot)
+- Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp), `subagent` (one-shot + live multi-turn)
 - Concurrent tool uses per turn (`join_all`), including concurrent host-routed tools (pipelined NDJSON + concurrent host dispatch)
 - Session message resume (`~/.myco/session/…`); readline history
 - Session metadata v2: title, PR/worktree links, scratchpad; `session_meta` local tool;
@@ -133,9 +133,11 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 - [x] (REJECTED) **Todo / task-list tool** — durable checklist for long jobs (Claude TodoWrite-shaped).
   - Adds complexity. Can be achieved with a `TODO.md` file.
-- [ ] **Subagents: multi-turn + background**
-  - Kick off N in background; optional multi-turn supervisor interaction
-    (today: single-shot only; concurrent parent tools already work).
+- [x] **Subagents: multi-turn** — live subagents via `start`/`send`/`close`/`list`
+      (id = hidden session id); one in-flight turn each; turns run detached so
+      supervisor cancel cannot corrupt them; session re-saved every turn.
+- [ ] **Subagents: background** — kick off N without blocking the supervisor's
+      turn (today `start`/`send` block until the reply); notify on done.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
 - [x] **`lynx_tui_browser`** — host tool via `lynx -dump` (search + simple browsing; link IDs).
   - Point at DDG Lite/HTML or Bing search URLs; follow numbered References.
