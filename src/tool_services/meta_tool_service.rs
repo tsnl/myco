@@ -342,14 +342,18 @@ mod tests {
         (SessionMetaTool::new(active.clone()), active)
     }
 
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn set_title_and_get() {
+        let _guard = crate::session::lock_myco_home_for_test();
         let dir = std::env::temp_dir().join(format!(
             "myco-meta-tool-{}",
             crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-only env override.
+        // SAFETY: test-only env override; held under the myco-home lock.
         unsafe {
             std::env::set_var("MYCO_HOME", &dir);
         }
@@ -400,13 +404,18 @@ mod tests {
         }
     }
 
+    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn executable_path_returns_absolute_path() {
+        let _guard = crate::session::lock_myco_home_for_test();
         let dir = std::env::temp_dir().join(format!(
             "myco-meta-exe-{}",
             crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only env override; held under the myco-home lock.
         unsafe {
             std::env::set_var("MYCO_HOME", &dir);
         }

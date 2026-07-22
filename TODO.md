@@ -97,13 +97,12 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [ ] **Skills / skill packs**
   - Directory convention (user + project); load as prompt/procedures or slash-skills.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
-- [x] **Optional cross-session memory** — root-only `memory` tool: immutable UUIDed,
-      timestamped, titled entries as write-once uuid-keyed files under
-      `~/.myco/memory/{uuid[..2]}/` with RFC-822-style headers (create/delete only;
-      lock-free, safe on weakly consistent filesystems); list/read plus exact +
-      semantic entry search over the whole store. Entries persist until explicitly
-      deleted — no GC/pruning by design (revisit if the store or index ever gets
-      big enough to hurt).
+- [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
+      ordinary tools; `workspace/soul/` holds maildir-style write-once soul
+      snapshots, and the newest is appended verbatim to every agent system
+      prompt at model build time. Replaced the earlier root-only `memory`
+      tool (structured UUID-keyed entries + dedicated search) — (REJECT) that
+      abstraction: plain files the agent organizes itself cover the same need.
 
 ---
 

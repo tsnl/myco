@@ -121,8 +121,8 @@ impl SubagentService {
             model: catalog_model.spec.clone(),
             tools: root.harness.tool_specs(),
             system_prompt: [
-                SUBAGENT_SYSTEM_PROMPT_PROLOGUE,
-                prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+                SUBAGENT_SYSTEM_PROMPT_PROLOGUE.to_string(),
+                prompts::agent_prompt_epilogue(),
             ]
             .join("\n\n"),
             backend_config: catalog_model.backend.clone(),

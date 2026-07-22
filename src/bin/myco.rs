@@ -21,9 +21,9 @@ use myco::session::{
     user_rule, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, MemoryService,
-    NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, prompts, uuid_simple_hex,
+    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
+    SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight, TraceContext, WrapMode,
+    prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -241,10 +241,9 @@ async fn run_interactive(args: Args) {
     let session_tool =
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let memory_tool = Arc::new(MemoryService::new()) as Arc<dyn myco::ToolService>;
     let harness = Harness::attach_with_root_services(
         app_config.harness.clone(),
-        vec![session_tool, history_tool, memory_tool],
+        vec![session_tool, history_tool],
     )
     .await
     .unwrap_or_else(|e| {
@@ -369,8 +368,8 @@ fn build_model(
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
-            SYSTEM_PROMPT_PROLOGUE,
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+            SYSTEM_PROMPT_PROLOGUE.to_string(),
+            prompts::agent_prompt_epilogue(),
         ]
         .join("\n"),
         backend_config,
@@ -766,8 +765,9 @@ async fn run_compact(
         tools: harness.tool_specs(),
         system_prompt: [
             "You are a myco compaction worker. Follow the user instruction exactly. \
-             Prefer session_history over bash for reading sessions.",
-            prompts::DEFAULT_AGENT_PROMPT_EPILOGUE,
+             Prefer session_history over bash for reading sessions."
+                .to_string(),
+            prompts::agent_prompt_epilogue(),
         ]
         .join("\n\n"),
         backend_config: catalog_model.backend.clone(),
