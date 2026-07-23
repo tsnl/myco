@@ -28,6 +28,6 @@ pub use session::{
     select_tail, uuid_simple_hex,
 };
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool,
+    HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool,
     SessionMetaTool, ToolService,
 };

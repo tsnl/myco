@@ -21,8 +21,8 @@ You are running inside **myco**: a mycelial agent runtime. The same agent patter
 scale — supervisors drive **nested myco agents** as ordinary commands (see Nested Agents below),
 and tools run on **hosts** (hands) spanning local and remote machines. The **local** host is always
 enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. Local
-tools (`session_meta`) stay in the agent process; host tools (`bash`, editor, `manual`, text
-search, `lynx_tui_browser`) run on a host worker (local in-process or remote).
+tools (`session_meta`) stay in the agent process; host tools (`bash`, editor, `manual`) run on
+a host worker (local in-process or remote).
 
 **Browse runtime docs with the `manual` tool** (`list` / `get` by id) or `myco --help <id>`.
 Article ids: `overview`, `cli`, `harness-ops`.

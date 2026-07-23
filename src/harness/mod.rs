@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_catalog_excludes_web_tools() {
+    fn standard_catalog_is_bash_editor_manual_only() {
         let names: Vec<_> = crate::host::HostWorker::standard_tool_specs()
             .into_iter()
             .map(|s| s.name)
@@ -535,27 +535,8 @@ mod tests {
         );
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"manual".to_string()));
-        assert!(names.contains(&"lynx_tui_browser".to_string()));
-    }
-
-    #[test]
-    fn lynx_tui_browser_is_standard_host_tool_with_routing_host() {
-        let harness = Harness::local_with_services(Vec::new());
-        let browser = harness
-            .tool_specs()
-            .into_iter()
-            .find(|s| s.name == "lynx_tui_browser")
-            .expect("lynx_tui_browser in standard catalog");
-        let host = &browser.input_schema["properties"]["host"];
-        assert!(
-            host.is_object(),
-            "lynx_tui_browser should get injected routing host: {host:?}"
-        );
-        let desc = host["description"].as_str().unwrap_or("");
-        assert!(
-            desc.contains("defaults to \"local\""),
-            "expected routing host description, got {desc:?}"
-        );
+        assert!(names.contains(&"str_replace_based_edit_tool".to_string()));
+        assert_eq!(names.len(), 3, "catalog grew unexpectedly: {names:?}");
     }
 
     // Deliberate guard-across-await: it serializes MYCO_HOME for the whole

@@ -25,8 +25,6 @@ pub use meta_tool_service::SessionMetaTool;
 pub mod session_history_service;
 pub use session_history_service::SessionHistoryTool;
 
-pub mod browser_service;
-pub use browser_service::BrowserService;
 
 
 pub mod list_recent_service;

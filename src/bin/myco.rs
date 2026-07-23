@@ -495,7 +495,7 @@ async fn run_interactive(args: Args) {
     let palette = Palette::colored(app_config.colors_enabled)
         .with_wrap(effective_wrap_width(app_config.wrap_max));
 
-    // Startup preflight: verify expected executables resolve (bash, lynx;
+    // Startup preflight: verify expected executables resolve (bash, tmux, fzf;
     // OpenSSH tools when remotes are configured), then unlock SSH identities
     // via the existing ssh-agent before attach — remote hosts use
     // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never

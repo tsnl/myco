@@ -55,7 +55,7 @@ so the agent can find past sessions by content.
 Startup banner is a small headed block (full-block rule, `MYCO`, model +
 session, `/help` and newline hints). Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,
-`lynx`, `tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
+`tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
 configured) and ssh-agent issues; hosts via `/hosts`.
 
 ### Print mode (`myco -p`)

@@ -146,7 +146,7 @@ mod tests {
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "lynx", "tmux", "fzf"]);
+        assert_eq!(names, ["bash", "tmux", "fzf"]);
 
         let names: Vec<_> = missing_executables(true, |_| false)
             .iter()
@@ -154,15 +154,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [
-                "bash",
-                "lynx",
-                "tmux",
-                "fzf",
-                "ssh",
-                "ssh-add",
-                "ssh-keygen"
-            ]
+            ["bash", "tmux", "fzf", "ssh", "ssh-add", "ssh-keygen"]
         );
     }
 
@@ -179,20 +171,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_lynx_opens_warning_with_install_hint() {
+    fn missing_tmux_opens_warning_with_install_hint() {
         let pf = StartupPreflight {
             executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "lynx"),
+                missing: missing_executables(false, |e| e.name != "tmux"),
             },
             ssh: SshAgentPreflightReport::default(),
         };
         let out = warning_output(&pf);
         assert!(out.contains(&format!("{}\nWARNING\n\n", crate::session::SECTION_RULE)));
         assert!(
-            out.contains("missing executable lynx: the lynx_tui_browser tool cannot fetch pages"),
+            out.contains("missing executable tmux: bare /resume cannot open the session browser"),
             "{out}"
         );
-        assert!(out.contains("MYCO_LYNX"), "{out}");
         assert!(
             out.contains("hint: install the missing executables"),
             "{out}"
@@ -225,7 +216,7 @@ mod tests {
         // leak into a WARNING block opened for missing executables.
         let pf = StartupPreflight {
             executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "lynx"),
+                missing: missing_executables(false, |e| e.name != "tmux"),
             },
             ssh: SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
@@ -233,16 +224,16 @@ mod tests {
             },
         };
         let out = warning_output(&pf);
-        assert!(out.contains("missing executable lynx"), "{out}");
+        assert!(out.contains("missing executable tmux"), "{out}");
         assert!(!out.contains("note:"), "{out}");
     }
 
     #[test]
     fn ssh_tools_missing_matches_only_openssh_tools() {
-        let only_lynx = ExecutableCheckReport {
-            missing: missing_executables(true, |e| e.name != "lynx"),
+        let only_tmux = ExecutableCheckReport {
+            missing: missing_executables(true, |e| e.name != "tmux"),
         };
-        assert!(!only_lynx.ssh_tools_missing());
+        assert!(!only_tmux.ssh_tools_missing());
         let no_ssh_add = ExecutableCheckReport {
             missing: missing_executables(true, |e| e.name != "ssh-add"),
         };
