@@ -26,9 +26,9 @@ pub use markdown::{MarkdownRenderer, render_block};
 pub use search::{SessionSearchReport, search_sessions};
 pub use transcript::{
     BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, attachment_note,
-    banner_rule, ensure_assistant, format_tokens, format_tool_invocation, print_session_history,
-    section_rule, truncate_display_string, truncate_json_strings, usage_line, user_header_line,
-    user_rule, write_assistant_open, write_block, write_error_open, write_error_section,
+    banner_rule, format_tokens, format_tool_invocation, history_events, section_rule,
+    truncate_display_string, truncate_json_strings, usage_line, user_header_line, user_rule,
+    write_error_section,
     write_session_history, write_warning_open,
 };
 

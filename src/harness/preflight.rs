@@ -97,8 +97,20 @@ impl StartupPreflight {
         !self.executables.is_clean() || self.ssh.has_problems()
     }
 
-    /// Write all preflight problems as one WARNING section (executables first,
-    /// then ssh-agent). Writes nothing on the happy path.
+    /// Plain body lines of the WARNING section (executables first, then
+    /// ssh-agent; no rule/header). Empty on the happy path. The interactive
+    /// CLI feeds this to its Ui's WARNING section.
+    pub fn warning_body(&self) -> String {
+        let mut out = Vec::new();
+        let _ = self.executables.write_body(&mut out);
+        if self.ssh.has_problems() {
+            let _ = self.ssh.write_body(&mut out);
+        }
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// Write all preflight problems as one WARNING section. Writes nothing on
+    /// the happy path.
     pub fn write_warning_section(
         &self,
         out: &mut impl Write,
@@ -108,11 +120,7 @@ impl StartupPreflight {
             return Ok(());
         }
         write_warning_open(out, palette)?;
-        self.executables.write_body(out)?;
-        if self.ssh.has_problems() {
-            self.ssh.write_body(out)?;
-        }
-        Ok(())
+        out.write_all(self.warning_body().as_bytes())
     }
 }
 
