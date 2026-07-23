@@ -1,8 +1,8 @@
 //! One-shot content search over saved sessions.
 //!
-//! Backs `myco --mode session-browser --search`, the paged picker's
-//! `s <text>` command, and `session_meta list` with `query`. Builds a
-//! dedicated in-RAM [`SearchIndex`] (same pattern as the memory tool's
+//! Backs `myco --mode session-browser --search` and `session_meta list`
+//! with `query`. Builds a dedicated in-RAM [`SearchIndex`] (same pattern
+//! as the memory tool's
 //! per-entry index) with one document per session: label, first-user-message
 //! snippet, scratchpad, and the tail of the `{id}.console` mirror — so recall
 //! works on what was *discussed*, not just the title. Nothing persists; the
