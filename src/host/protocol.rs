@@ -21,7 +21,11 @@ pub enum Request {
         tool_use: ToolUse,
     },
     /// Reap agent-owned host state (bash sessions, …).
-    AgentFinished { agent_id: uuid::Uuid },
+    AgentFinished {
+        /// Correlation id echoed in [`Response::AgentFinishedOk`].
+        id: String,
+        agent_id: uuid::Uuid,
+    },
 }
 
 impl Request {
@@ -52,6 +56,7 @@ pub enum Response {
         result: ToolResult,
     },
     AgentFinishedOk {
+        id: String,
         agent_id: uuid::Uuid,
     },
     Error {

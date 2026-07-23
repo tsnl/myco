@@ -272,11 +272,13 @@ impl HostController {
             }
             Backend::Subprocess { .. } => {
                 let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-                let key = format!("agent_finished:{id}");
-                let request = Request::AgentFinished { agent_id };
+                let request = Request::AgentFinished {
+                    id: id.clone(),
+                    agent_id,
+                };
 
                 let rx = match self
-                    .submit(&key, &request, /*connect_if_needed*/ false)
+                    .submit(&id, &request, /*connect_if_needed*/ false)
                     .await
                 {
                     Ok(rx) => rx,
@@ -438,16 +440,15 @@ async fn connect_with_timeout(
 ) -> Result<Conn, String> {
     let fut = connect(config);
     match connect_timeout_secs {
-        0 => fut.await.map(|(c, _, _)| c),
+        0 => fut.await,
         secs => match tokio::time::timeout(Duration::from_secs(secs), fut).await {
-            Ok(Ok((c, _, _))) => Ok(c),
-            Ok(Err(e)) => Err(e),
+            Ok(r) => r,
             Err(_) => Err(format!("connect timed out after {secs}s")),
         },
     }
 }
 
-async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), String> {
+async fn connect(config: &HostConfig) -> Result<Conn, String> {
     if config.command.is_empty() {
         return Err(format!("host {:?}: empty command", config.name));
     }
@@ -479,8 +480,8 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
     let line = read_line(&mut stdout).await?;
     let reply = Response::decode(&line)?;
 
-    let (name, tools) = match reply {
-        Response::HelloOk { name, tools, .. } => (name, tools),
+    let version = match reply {
+        Response::HelloOk { version, .. } => version,
         Response::Error { message, .. } => {
             let _ = child.start_kill();
             return Err(format!("hello error: {message}"));
@@ -490,6 +491,19 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
             return Err(format!("unexpected hello reply: {other:?}"));
         }
     };
+
+    // Same-version lockstep: the assumed tool catalog and the NDJSON protocol
+    // are only sound when both ends run the same build, so skew is a connect
+    // error — not a latent tool failure hours later.
+    let local_version = env!("CARGO_PKG_VERSION");
+    if version != local_version {
+        let _ = child.start_kill();
+        return Err(format!(
+            "remote myco {version} does not match local {local_version}; \
+             rebuild myco on host {:?} (see `manual` harness-ops)",
+            config.name
+        ));
+    }
 
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -515,7 +529,7 @@ async fn connect(config: &HostConfig) -> Result<(Conn, String, Vec<ToolSpec>), S
         reader_abort: reader.abort_handle(),
         writer_abort: writer.abort_handle(),
     };
-    Ok((conn, name, tools))
+    Ok(conn)
 }
 
 async fn write_all(w: &mut ChildStdin, bytes: &[u8]) -> Result<(), String> {
@@ -605,15 +619,9 @@ async fn run_reader(
                     let _ = tx.send(msg);
                 }
             }
-            Response::AgentFinishedOk { .. } => {
+            Response::AgentFinishedOk { id, .. } => {
                 let mut pending = pending.lock().await;
-                let key = pending
-                    .keys()
-                    .find(|k| k.starts_with("agent_finished:"))
-                    .cloned();
-                if let Some(k) = key
-                    && let Some(tx) = pending.remove(&k)
-                {
+                if let Some(tx) = pending.remove(id) {
                     let _ = tx.send(msg);
                 }
             }
@@ -783,9 +791,48 @@ mod tests {
     /// A host that dies after hello must *fail* calls, never hang them: the
     /// reader's exit poisons the connection, and the next call drops the dead
     /// conn and respawns instead of registering a waiter nobody will answer.
+    /// A remote answering hello with a different package version must fail
+    /// the connect with an actionable error, not limp along on an assumed
+    /// tool catalog that may no longer match.
+    #[tokio::test]
+    async fn version_skew_fails_connect_with_actionable_error() {
+        let hello = "{\"type\":\"hello_ok\",\"name\":\"old\",\"version\":\"0.0.1\",\"tools\":[]}";
+        let ctl = HostController::new(HostConfig {
+            name: "skewed".into(),
+            command: vec![
+                "bash".into(),
+                "-c".into(),
+                format!("read -r _line; printf '%s\\n' '{hello}'; sleep 5"),
+            ],
+            ssh_destination: None,
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            ctl.call(
+                uuid::Uuid::nil(),
+                ToolUse {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "true"}),
+                },
+                CancelToken::new(),
+            ),
+        )
+        .await
+        .expect("skewed connect must fail fast");
+        assert!(result.is_error, "{result:?}");
+        let text = tool_text(&result);
+        assert!(text.contains("0.0.1"), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains("rebuild"), "{text}");
+    }
+
     #[tokio::test]
     async fn dead_host_fails_calls_and_respawns_instead_of_hanging() {
-        let hello = "{\"type\":\"hello_ok\",\"name\":\"fake\",\"version\":\"0\",\"tools\":[]}";
+        let hello = format!(
+            "{{\"type\":\"hello_ok\",\"name\":\"fake\",\"version\":\"{}\",\"tools\":[]}}",
+            env!("CARGO_PKG_VERSION")
+        );
         let ctl = HostController::new(HostConfig {
             name: "dies".into(),
             // Answers the hello handshake, then exits immediately.
