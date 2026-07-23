@@ -143,13 +143,11 @@ cargo install --git https://github.com/tsnl/myco --tag <tag> --locked
 ## What the workflow does (do not reimplement)
 
 1. Checkout `branch` with `PAT_TOKEN`
-2. Seed MiniLM weights (HF cache + `scripts/seed-minilm-weights.sh`) so the
-   publish crate builds
-3. Wait for check-runs named `Check Formatting`, `Lint`, `Test` (see
+2. Wait for check-runs named `Check Formatting`, `Lint`, `Test` (see
    `wait_for_checks` in the workflow; not the `CI / …` protection strings)
-4. Bump version in `Cargo.toml` / lockfile, commit, tag
-5. `cargo publish` when not dry-run and on main
-6. Create GitHub Release notes (when published)
+3. Bump version in `Cargo.toml` / lockfile, commit, tag
+4. `cargo publish` when not dry-run and on main
+5. Create GitHub Release notes (when published)
 
 Source of truth: `.github/workflows/publish.yml`.
 

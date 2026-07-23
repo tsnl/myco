@@ -12,7 +12,6 @@ agent laptop.
 **Required**
 
 - **`ssh`** — attaches remotes (`ssh … myco --mode host` over NDJSON) and is used for install/diagnose over SSH.
-- **`lynx`** — powers the `lynx_tui_browser` host tool (`lynx -dump` plaintext pages / search results).
 - **`uv`** — hermetic Python runs (agent computer-use norm: scripts and deps without polluting the system).
 - **`bash`** — host `bash` tool (one-shot `exec` and multi-turn shell sessions).
 
@@ -20,10 +19,9 @@ agent laptop.
 
 - **`git`** — worktrees/branches, repo inspection, and `git archive` when shipping local source to remotes.
 - **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
-- **`curl`** — `build.rs` MiniLM asset fetch at compile time, and downloading release source tarballs.
+- **`curl`** — downloading release source tarballs.
 
-Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above). Optional
-`trunk` + `wasm32-unknown-unknown` only for **`crates/myco-gui`**.
+Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above).
 
 ## Finding configured hosts
 
@@ -56,8 +54,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 For **remotes**, prefer a **same-platform binary** (release asset or build on the target)
 when you are not actively developing myco; only **build from a local git tree** when you are
 working on the myco codebase itself (unreleased commits, dirty worktree, or a feature branch
-that must ship). Embedding weights are **compiled into** `myco`, so a correct binary is enough to
-run — you do **not** deploy model files next to it. Do **not** scp/rsync a prebuilt binary
+that must ship). Do **not** scp/rsync a prebuilt binary
 across **mismatched** OS, CPU arch, or glibc (e.g. newer glibc → older cluster fails with
 `GLIBC_X.Y not found`); for those targets, compile on the machine or use a matching release.
 
@@ -112,25 +109,9 @@ git archive --format=tar.gz -o /tmp/myco-src.tgz "${REF:-HEAD}"
 first if the install must include uncommitted edits. Untracked files are never in the archive;
 add/commit them if they are required to build.
 
-### Embedding weights (MiniLM / Candle) — fully embedded in the binary
-
-Semantic search bakes all-MiniLM-L6-v2 (Candle) into `myco` at **compile time**
-(`build.rs` stages under `OUT_DIR` + `include_bytes!`). Runtime never reads weight
-files and never downloads from Hugging Face.
-
-| Stage | What you need |
-|-------|----------------|
-| **Running / shipping** | The **`myco` binary only** for that OS/CPU/libc. No model pack, no `embed_weights/` on the target. |
-| **Compiling from source** | Network so `build.rs` (`hf-hub`) can populate the shared Hub cache and stage into `OUT_DIR` (or seed via warm `HF_HOME` / `MYCO_EMBED_CACHE` / `src/text_search/embed_weights/`). |
-
-Source tarballs / crates.io packages / `git archive` do not ship the ~87 MiB weight
-files (gitignored; not part of the package). That only matters when **building**; a
-finished binary already contains the weights. Details:
-`src/text_search/embed_weights/README.md`.
-
-Because weights are embedded, a **release only needs platform-matched binaries**. Do not scp
-binaries across mismatched OS/arch/glibc; for those hosts, build there or use a matching
-release asset.
+A **release only needs platform-matched binaries**. Do not scp binaries across
+mismatched OS/arch/glibc; for those hosts, build there or use a matching
+release asset. Builds are fully offline beyond the crates.io dependency fetch.
 
 ### Install on each remote host (build from source)
 
@@ -153,15 +134,14 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || { echo "cargo/rustc required on host"; exit 1; }
-  # build.rs uses hf-hub (shared HF cache) then stages MiniLM assets into OUT_DIR.
   cargo install --path ~/src/myco-src --force --locked --root "$HOME/.local"
   # ~/.local/bin is the usual remote install path in multi-host setups
   ~/.local/bin/myco --version
 '
 ```
 
-- Require **Rust/cargo** (and network once for `hf-hub` MiniLM assets, or a warm Hub cache) when building from source. Prefer a
-  prebuilt **same-platform** binary when available (weights already inside).
+- Require **Rust/cargo** when building from source. Prefer a prebuilt
+  **same-platform** binary when available.
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
   `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`.
@@ -184,7 +164,7 @@ When tools fail or the user asks why something is broken, investigate with tools
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
    - Startup checks expected executables on the **agent** machine (`bash`,
-     `lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
+     `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
      reports missing ones in the startup WARNING block — the user must install
      them and restart myco. Remote hosts report missing programs as tool
      errors at call time.

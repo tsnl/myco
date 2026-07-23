@@ -49,15 +49,6 @@ pub static BASH: ExternalCommand = ExternalCommand {
     fallback_dirs: &[],
 };
 
-pub static LYNX: ExternalCommand = ExternalCommand {
-    name: "lynx",
-    purpose: "the lynx_tui_browser tool cannot fetch pages",
-    install_hint: "brew install lynx / apt install lynx, or set MYCO_LYNX",
-    startup_check: StartupCheck::Always,
-    env_override: Some("MYCO_LYNX"),
-    fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
-};
-
 pub static SSH: ExternalCommand = ExternalCommand {
     name: "ssh",
     purpose: "remote hosts cannot connect",
@@ -118,7 +109,7 @@ pub static FZF: ExternalCommand = ExternalCommand {
 
 /// Every registered program; the startup preflight iterates this.
 pub static ALL: &[&ExternalCommand] =
-    &[&BASH, &LYNX, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
+    &[&BASH, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(
@@ -133,8 +124,7 @@ pub fn expected_at_startup(
 
 impl ExternalCommand {
     /// Resolve the program: env override → PATH → fallback dirs. `None` means
-    /// not installed. Existence check is `is_file` (no executable-bit probe),
-    /// matching how myco has always resolved lynx.
+    /// not installed. Existence check is `is_file` (no executable-bit probe).
     pub fn resolve(&self) -> Option<PathBuf> {
         if let Some(var) = self.env_override
             && let Ok(p) = std::env::var(var)

@@ -105,8 +105,8 @@ struct Args {
     out: Option<PathBuf>,
 
     /// With `--mode session-browser`: rank sessions matching QUERY (keyword
-    /// search over title/first message/scratchpad/console tail, semantic
-    /// fallback) instead of listing by recency.
+    /// search over title/first message/scratchpad/console tail) instead of
+    /// listing by recency.
     #[arg(long, value_name = "QUERY")]
     search: Option<String>,
 
@@ -221,16 +221,7 @@ fn run_session_browser(args: Args) {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    // Owner request: index skills / AGENTS.md under the worker's cwd.
-    // Construction alone never indexes (tests rely on that).
-    let search = myco::TextSearchToolService::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        search.auto_index_under(cwd);
-    }
-    if let Err(e) = HostWorker::standard_with_search(args.name, search)
-        .serve_stdio()
-        .await
-    {
+    if let Err(e) = HostWorker::standard(args.name).serve_stdio().await {
         eprintln!("myco host error: {e}");
         std::process::exit(1);
     }
@@ -285,10 +276,6 @@ async fn run_print(args: Args) {
         vec![session_tool, history_tool, list_recent_tool],
     )
     .await;
-    // Owner request: index skills / AGENTS.md under the launch directory.
-    if let Ok(cwd) = std::env::current_dir() {
-        harness.auto_index_local(cwd);
-    }
 
     let model = build_model(
         &catalog_model,
@@ -508,7 +495,7 @@ async fn run_interactive(args: Args) {
     let palette = Palette::colored(app_config.colors_enabled)
         .with_wrap(effective_wrap_width(app_config.wrap_max));
 
-    // Startup preflight: verify expected executables resolve (bash, lynx;
+    // Startup preflight: verify expected executables resolve (bash, tmux, fzf;
     // OpenSSH tools when remotes are configured), then unlock SSH identities
     // via the existing ssh-agent before attach — remote hosts use
     // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never
@@ -539,12 +526,7 @@ async fn run_interactive(args: Args) {
         &preflight,
         vec![session_tool, history_tool, list_recent_tool],
     )
-    .await;
-    // Owner request: index skills / AGENTS.md under the launch directory.
-    // Attach alone never indexes (tests rely on that).
-    if let Ok(cwd) = std::env::current_dir() {
-        harness.auto_index_local(cwd);
-    }
+.await;
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;

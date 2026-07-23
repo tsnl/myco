@@ -143,20 +143,16 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Host routing
 
-- Host tools (`bash`, `str_replace_based_edit_tool`, `manual`, text search, …) accept optional input field **`host`**.
+- Host tools (`bash`, `str_replace_based_edit_tool`, `manual`, …) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
 - Bash `session_id`s are **per host** (and per agent id). Do not assume a session on `local`
   exists on `devbox`.
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
   idle, or DOWN after a failed remote connect.
-- **Text search** (per host): persistent watched roots via `index_directory` /
-  `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
-  file bodies **and** path/filename tokens) /
-  `indexed_semantic_text_search` (Candle **MiniLM**, weights baked in at compile
-  time). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
-  `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
-  code trees; only register small repeated scopes.
+- **Text search**: `bash` + `rg`/`grep` on the target host. myco ships no
+  search tools of its own; project guidance (`AGENTS.md`/`CLAUDE.md`, skill
+  packs) is read with the editor or `rg` like any other file.
 
 ## Agent workspace
 

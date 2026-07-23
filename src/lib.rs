@@ -8,7 +8,6 @@ pub mod manual;
 pub mod prompts;
 pub mod session;
 pub mod session_browser;
-pub mod text_search;
 pub mod tool_services;
 pub mod tui;
 
@@ -28,8 +27,7 @@ pub use session::{
     SessionListEntry, TraceContext, compact_session, compact_subagent_prompt, link_compact_pair,
     select_tail, uuid_simple_hex,
 };
-pub use text_search::TextSearchEngine;
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool,
-    SessionMetaTool, TextSearchToolService, ToolService,
+    HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool,
+    SessionMetaTool, ToolService,
 };

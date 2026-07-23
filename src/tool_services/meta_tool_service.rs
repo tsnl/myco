@@ -28,8 +28,7 @@ Actions (`action` is required):
   `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
   workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
   Optional `query` ranks sessions by content instead of recency — keyword search over
-  title, first user message, scratchpad, and the console-transcript tail, with a semantic
-  fallback when keywords find nothing (`semantic` true forces semantic ranking). Use it to
+  title, first user message, scratchpad, and the console-transcript tail. Use it to
   find past sessions by what was discussed, not just what the title says.
 - set_title: set the **current** session title. `title` is required: a non-empty string
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
@@ -85,9 +84,8 @@ impl ToolService for SessionMetaTool {
                     return ToolResult::err(format!("invalid session_meta input: {e}"));
                 }
             };
-            // Off the executor: `list` with `query` may embed via candle
-            // (candle never runs on an executor thread), and every action
-            // does file IO.
+            // Off the executor: every action does file IO (session files,
+            // console tails).
             match tokio::task::spawn_blocking(move || self.execute(input)).await {
                 Ok(Ok(text)) => ToolResult::text(text),
                 Ok(Err(e)) => ToolResult::err(e),
@@ -105,7 +103,6 @@ impl SessionMetaTool {
                 input.limit,
                 input.include_hidden.unwrap_or(false),
                 input.query.as_deref(),
-                input.semantic.unwrap_or(false),
             ),
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => match input.scratchpad {
@@ -135,7 +132,6 @@ impl SessionMetaTool {
         limit: Option<usize>,
         include_hidden: bool,
         query: Option<&str>,
-        force_semantic: bool,
     ) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
         let mut list = if include_hidden {
@@ -152,7 +148,7 @@ impl SessionMetaTool {
             }
             Some(q) => {
                 let cap = if limit == 0 { 50 } else { limit };
-                let report = search_sessions(&list, q, cap, force_semantic)?;
+                let report = search_sessions(&list, q, cap)?;
                 header = format!("  query={q:?}  mode={}", report.mode);
                 list = report.entries;
             }
@@ -312,13 +308,10 @@ struct Input {
     /// When true, `list` includes hidden sessions (subagents, compact workers).
     #[serde(default)]
     include_hidden: Option<bool>,
-    /// For `list`: rank sessions matching this text (keyword, semantic fallback)
-    /// instead of listing by recency.
+    /// For `list`: rank sessions matching this text (keyword) instead of
+    /// listing by recency.
     #[serde(default)]
     query: Option<String>,
-    /// For `list` with `query`: force semantic ranking (skip keyword search).
-    #[serde(default)]
-    semantic: Option<bool>,
     /// New title for `set_title`. Empty/null clears.
     #[serde(default)]
     title: Option<String>,
