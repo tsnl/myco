@@ -35,6 +35,16 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
   `attach_timeout_secs`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
+- **Connection sharing:** every myco process (the supervisor and each nested agent)
+  opens its own `ssh <alias> myco --mode host` per remote it touches. OpenSSH
+  multiplexes them over one authenticated connection per host with:
+
+  ```
+  Host *
+      ControlMaster auto
+      ControlPath ~/.ssh/cm-%r@%h:%p
+      ControlPersist 10m
+  ```
 - Tell the user to run **`/hosts`** for live attach status (local ok/in-process; remotes idle / ok / DOWN); you cannot run slash-commands.
 - Host tool field `host` must match a configured name (`local` or a remote `name`). Omitted → `local`.
 

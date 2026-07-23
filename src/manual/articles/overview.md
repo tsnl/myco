@@ -23,9 +23,11 @@ myco (interactive) / Agent
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
   text search) over NDJSON via SSH.
 - **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
-  session (on any configured host), writes one prompt per line, and reads until the next
-  `USER n/m` header (the turn boundary; colors/wrapping auto-off when piped). Each nested agent
-  is a full myco process with its own session file.
+  session **on the local host**, passing `--parent-session <its own session id>`, writes one
+  prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
+  auto-off when piped). Nesting locally shares config, keys, network, and the session store by
+  construction; the child reaches remotes through its own host pool, its session is hidden
+  (`kind: subagent`) and parented to the supervisor's. Remotes stay config/key-free hands.
 
 ## Config & paths
 

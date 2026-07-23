@@ -74,3 +74,75 @@ context_window = 100000
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--parent-session` is the nested-agent lineage contract: the child's fresh
+/// session lands in the shared store hidden (`kind: subagent`) and parented to
+/// the supervisor, so default listings stay clean and the supervisor can read
+/// it back by id.
+#[tokio::test]
+async fn parent_session_flag_creates_hidden_linked_session() {
+    let dir = std::env::temp_dir().join(format!(
+        "myco-parent-session-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model = "pipetest"
+
+[models.pipetest]
+protocol = "openai-responses"
+base_url = "http://127.0.0.1:1/v1"
+auth = { source = "none" }
+context_window = 100000
+"#,
+    )
+    .unwrap();
+
+    let parent_id = "cafef00dcafef00dcafef00dcafef00d";
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+        .args(["--parent-session", parent_id])
+        .env("MYCO_HOME", &dir)
+        .env("MYCO_CONFIG", &config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn myco");
+
+    // Sessions persist after the first turn (a zero-turn /quit writes nothing),
+    // so run one — the unreachable gateway makes it fail fast, which still
+    // records the user message and force-saves on turn end.
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"hello\n/quit\n").await.unwrap();
+    drop(stdin);
+
+    let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+        .await
+        .expect("piped REPL must not hang")
+        .expect("wait myco");
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Exactly one session was written; it is hidden and parented.
+    let session_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("session"))
+        .expect("session store exists")
+        .flatten()
+        .filter(|shard| shard.path().is_dir())
+        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+        .map(|f| f.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(session_files.len(), 1, "{session_files:?}");
+    let session: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session_files[0]).unwrap()).unwrap();
+    assert_eq!(session["kind"], "subagent", "{session}");
+    assert_eq!(session["parent_session_id"], parent_id, "{session}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

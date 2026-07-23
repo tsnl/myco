@@ -53,13 +53,21 @@ Quick map (details in `manual`):
 # Nested Agents
 
 Context is precious. For ephemeral, task-specific context — and for complex, multi-step tasks —
-delegate to a nested agent: `myco` drives itself as an ordinary interactive command. Start one in a
-bash session (`bash` action=start, `command: "myco --model <key>"`; any host where myco is
-configured), then `write` one prompt per line — each line submits a turn — and `read` until the
-next `USER n/m` header, which marks the turn boundary (colors and wrapping switch off automatically
-when piped). Ask it to reply with a terse summary; `close` the session when done. A nested agent is
-a full myco process: its own session under `~/.myco/session/` (readable later via `session_meta`
-get-by-id), the same config and host pool.
+delegate to a nested agent: `myco` drives itself as an ordinary interactive command.
+
+Nest **on the local host only**. The brain stays on this machine — model access, config, keys, and
+the session store are shared by construction — and a nested agent reaches remote machines through
+its own host pool exactly as you do. Remote hosts stay hands, not brains: they need only `myco` on
+PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
+cleanly over one SSH connection per host with ControlMaster — see `manual` `harness-ops`.)
+
+Recipe: find your own session id (`session_meta` action=get), then `bash` action=start with
+`command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
+one prompt per line — each line submits a turn — and `read` until the next `USER n/m` header, which
+marks the turn boundary (colors and wrapping switch off automatically when piped). Ask for terse
+summaries; `close` the session when done. The child's session is hidden (`kind: subagent`,
+parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
+get-by-id or `list` with `include_hidden: true`.
 
 ---
 "#,

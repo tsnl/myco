@@ -138,7 +138,15 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
       session (piped stdin/stdout; wrap/color auto-off; one prompt per line;
       the `USER n/m` header marks each turn boundary). Bash sessions already
       run in the background and support multi-turn `write`/`read`, so both
-      halves come free; each nested agent persists its own session file.
+      halves come free. Nesting is **local-only by doctrine** (brains — config,
+      keys, gateway network, session store — stay on the user's machine;
+      remotes stay hands); children pass `--parent-session <id>` so their
+      sessions are hidden and linked in the shared store.
+- [ ] **Remote nesting / gateway proxy** — running a whole agent *on* a remote
+      (vs local brain + remote hands) would need config, keys, and gateway
+      network there. If it is ever really needed, the principled fix is
+      proxying model traffic through the supervisor's machine (myco as a local
+      gateway for children). Not planned; nested agents run locally.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
 - [x] **`lynx_tui_browser`** — host tool via `lynx -dump` (search + simple browsing; link IDs).
   - Point at DDG Lite/HTML or Bing search URLs; follow numbered References.

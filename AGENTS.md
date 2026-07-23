@@ -75,8 +75,11 @@ myco (interactive) / Agent
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
-bash session (piped stdin/stdout; wrap/color auto-off) and reads turns off the
-`USER n/m` headers.
+bash session on the **local** host (piped stdin/stdout; wrap/color auto-off),
+passing `--parent-session <supervisor session id>` so the child's session is
+hidden and linked, and reads turns off the `USER n/m` headers. Nesting is
+local-only by doctrine: brains (config, keys, gateway access, session store)
+stay on the user's machine; remotes stay hands.
 
 | Area | Role |
 |------|------|
