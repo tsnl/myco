@@ -32,7 +32,7 @@ cargo install myco
 
 Needs stable Rust, network on the first build (`build.rs` bakes MiniLM
 embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
-`bash` on `PATH` (`git`, `gh`, `curl` recommended).
+`bash`, `tmux`, `fzf` on `PATH` (`git`, `gh`, `curl` recommended).
 
 ## Use
 

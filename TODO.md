@@ -17,6 +17,12 @@ cluster/GUI work outrank CLI trust + long-session viability.
 - Session message resume (`~/.myco/session/…`); readline history
 - Session metadata v2: title, PR/worktree links, scratchpad; `session_meta` local tool;
   `/title`; list/get any session (breaking vs old v1 files — WIP, no migration)
+- Session browser: bare `/resume` → fzf over sessions (console-mirror preview), as a tmux
+  `display-popup` running `--mode session-browser` inside tmux, inline otherwise. `tmux` +
+  `fzf` are expected on PATH (preflight warns). Deliberately composes with tmux/fzf
+  instead of an in-house TUI. Content search: `--search` / `session_meta list query` rank
+  sessions via a one-shot RAM `SearchIndex` (Tantivy keyword, MiniLM semantic fallback)
+  over title + first message + scratchpad + console tail.
 - Anthropic system-block prompt caching (`cache_control` on system text)
 - Local turn cancel (Ctrl-C); synthetic cancelled tool results when tools already started
 - `dyn GenerativeModel`; harness routing with injected `host` field
