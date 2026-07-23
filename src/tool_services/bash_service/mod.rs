@@ -88,7 +88,10 @@ impl BashService {
                 alive).\n\
                 - read: collect more output without writing (process stays alive).\n\
                 - close: kill and reap a session.\n\
-                - list: list live sessions.\n\n\
+                - list: list live sessions. Note the session cap ({MAX_SESSIONS}) is shared \
+                by every agent on the host while `list` shows only yours — if `start` \
+                reports too many sessions and your list looks short, other agents own the \
+                rest; close your own idle sessions and retry.\n\n\
                 For start/write/read, the child runs in the background. Each call waits until \
                 an idle gap (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
                 (`timeout_ms`, default {DEFAULT_TIMEOUT_MS} ms / {session_default_s}s; max \

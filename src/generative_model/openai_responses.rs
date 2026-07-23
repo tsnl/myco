@@ -202,10 +202,12 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
     out
 }
 
-/// Images are not converted to `input_image` parts yet. An explicit
-/// placeholder is the honest degradation: the transcript says an image was
+/// Placeholder for images on paths without `input_image` support (tool
+/// results are plain `function_call_output` strings; assistant text never
+/// carries images). The honest degradation: the transcript says an image was
 /// there, and raw base64 must never be inlined as prompt text (context
-/// blowout + model confusion).
+/// blowout + model confusion). User-message images take the real
+/// `input_image` path in [`user_content_to_input`].
 const IMAGE_OMITTED: &str = "[image omitted: not supported on this gateway]";
 
 fn content_to_input_text(content: &[Content]) -> String {

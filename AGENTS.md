@@ -92,11 +92,10 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
-| `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
-| `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |
-| `crates/myco-gui/` | Optional Yew UI — not on the critical CLI path |
-| `tests/` | Integration tests (bash sessions, concurrent host tools, …) |
+| `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + soul / project-guidance injection |
+| `src/tui/` | The rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks; replay shares its layout helpers |
+| `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
 
 **Invariants worth protecting**
 
@@ -109,9 +108,12 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
-- **Embedding weights** are compile-time (`build.rs` stages under `OUT_DIR` →
-  `include_bytes!`). Ship platform-matched binaries; do not scp across
+- **Builds are offline** beyond the crates.io fetch — no build script, no
+  network at compile time. Ship platform-matched binaries; do not scp across
   glibc/arch boundaries.
+- **Local and remote myco run the same version** — connect fails loud on
+  package-version skew, which is what keeps the assumed tool catalog and the
+  NDJSON protocol sound.
 
 ## Code style
 
@@ -160,9 +162,6 @@ cargo test --locked --test integration_test   # and other tests/ binaries as nee
 cargo run --locked --bin myco
 ```
 
-- First build may download MiniLM assets via `build.rs` (`hf-hub` → shared
-  Hugging Face cache → `OUT_DIR`) unless `MYCO_EMBED_OFFLINE=1` with a warm
-  hub cache / `MYCO_EMBED_CACHE` / pre-seeded `src/text_search/embed_weights/`.
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.
@@ -175,9 +174,6 @@ cargo run --locked --bin myco
 - Don’t scp prebuilt `myco` binaries across mismatched OS/arch/libc; build on
   the target or use a matching asset (`harness-ops`).
 - Don’t treat `/resume` as full workspace restore.
-- Don’t expand `crates/myco-gui` scope at the expense of CLI trust work.
-- Don’t commit large embed weight blobs; they stay gitignored and baked into
-  the binary at compile time.
 - Don’t edit `~/.myco/session/*.json` by hand from the agent — use
   `session_meta`.
 - Don’t force-merge PRs, bypass branch protection/required checks, or use

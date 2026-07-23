@@ -531,7 +531,7 @@ async fn run_interactive(args: Args) {
         &preflight,
         vec![session_tool, history_tool, list_recent_tool],
     )
-.await;
+    .await;
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
