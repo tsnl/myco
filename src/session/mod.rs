@@ -1175,7 +1175,6 @@ mod tests {
             input_tokens: 100,
             output_tokens: 10,
             cached_input_tokens: 50,
-            cached_output_tokens: 0,
         });
 
         let child = parent.fork_child("othermodel");
@@ -1207,7 +1206,6 @@ mod tests {
             input_tokens: 12_345,
             output_tokens: 678,
             cached_input_tokens: 1_000,
-            cached_output_tokens: 0,
         });
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
@@ -1242,7 +1240,6 @@ mod tests {
             input_tokens: 5_000,
             output_tokens: 100,
             cached_input_tokens: 0,
-            cached_output_tokens: 0,
         };
         let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
         let id = active.id();

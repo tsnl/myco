@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::core::*;
 
+use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::*;
 
 /// OpenAI Responses API settings ([`BackendConfig::OpenAIResponses`]).
@@ -65,30 +66,9 @@ impl OpenAIResponsesGenerativeModel {
             )));
         }
 
-        let mut headers = reqwest::header::HeaderMap::from_iter([(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        )]);
-        // Empty token = `auth = "none"` in the catalog (local servers); send no
-        // Authorization header. Credential *presence* is the catalog's job
-        // (`ModelCatalog::get`), not the driver's.
-        if !backend.auth_token.is_empty() {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                // Never echo the token into the error: it ends up in logs.
-                format!("Bearer {}", backend.auth_token)
-                    .parse()
-                    .map_err(|e| {
-                        ModelCreationError::BadConfig(format!(
-                            "auth token is not a valid HTTP header value: {e}"
-                        ))
-                    })?,
-            );
-        }
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
+        let auth = (!backend.auth_token.is_empty())
+            .then(|| ("authorization", format!("Bearer {}", backend.auth_token)));
+        let client = driver_core::build_client(auth, &[])?;
 
         let tools = config
             .tools
@@ -110,10 +90,8 @@ impl OpenAIResponsesGenerativeModel {
         }))
     }
 
-    async fn start_response_stream(
-        &self,
-        input: &[ResponsesInputItem],
-    ) -> Result<reqwest::Response, GenerateError> {
+    /// Build (without sending) the streaming Responses request.
+    fn response_request(&self, input: &[ResponsesInputItem]) -> reqwest::RequestBuilder {
         // Best-effort enablement across OpenAI-compatible gateways.
         // Unknown fields are typically ignored by servers that don't support
         // them — but an unknown *value* is a 400: `max` is Anthropic-only
@@ -155,65 +133,18 @@ impl OpenAIResponsesGenerativeModel {
         }
 
         let base = self.backend.base_url.trim_end_matches('/');
-        let raw_response = self
-            .client
-            .post(format!("{base}/responses"))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-
-        if !raw_response.status().is_success() {
-            let status = raw_response.status();
-            let body = raw_response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-            return Err(GenerateError::ExecutionError(format!(
-                "OpenAI Responses API returned HTTP {status}: {body}"
-            )));
-        }
-
-        Ok(raw_response)
+        self.client.post(format!("{base}/responses")).json(&request)
     }
 }
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let input_items = convert_messages(input);
-        let model = self.model.clone();
-        let system_prompt = self.system_prompt.clone();
-        let tools = self.tools.clone();
-        let backend = self.backend.clone();
-        let client = self.client.clone();
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
-
-        tokio::spawn(async move {
-            let driver = OpenAIResponsesGenerativeModel {
-                model,
-                system_prompt,
-                tools,
-                backend,
-                client,
-            };
-
-            let response = match driver.start_response_stream(&input_items).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            if let Err(e) = drive_responses_sse_stream(response, tx.clone()).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        driver_core::spawn_generate(
+            self.response_request(&input_items),
+            StreamAccumulator::default(),
+            "OpenAI Responses",
+        )
     }
 }
 
@@ -346,102 +277,64 @@ fn tool_result_to_string(result: &ToolResult) -> String {
 }
 
 //
-// SSE streaming
+// Stream accumulation (the SSE drive loop is shared, in driver_core)
 //
-
-async fn drive_responses_sse_stream(
-    response: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
-) -> Result<(), GenerateError> {
-    if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped (turn cancelled): stop reading so the response
-        // body drops and the provider stops generating/billing.
-        return Ok(());
-    }
-
-    let mut byte_stream = response.bytes_stream();
-    let mut sse = SseParser::default();
-    let mut acc = StreamAccumulator::default();
-
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!(
-                "Error reading OpenAI Responses stream body: {e:?}"
-            ))
-        })?;
-
-        for data in sse.push(&chunk) {
-            let event: ResponsesStreamEvent = serde_json::from_str(&data).map_err(|e| {
-                GenerateError::MalformedResponseError(format!(
-                    "Failed to parse OpenAI Responses SSE event JSON: {e}; data={data}"
-                ))
-            })?;
-
-            for item in acc.handle_event(event)? {
-                if tx.send(Ok(item)).await.is_err() {
-                    // Consumer dropped (turn cancelled): stop reading so the
-                    // response body drops and the provider stops generating.
-                    return Ok(());
-                }
-            }
-
-            if acc.finished {
-                break;
-            }
-        }
-
-        if acc.finished {
-            break;
-        }
-    }
-
-    acc.finish()?;
-    Ok(())
-}
 
 /// Maps Responses `output_index` slots onto separate content / tool-use index spaces.
 #[derive(Default)]
 struct StreamAccumulator {
-    output_kinds: Vec<Option<OutputKind>>,
+    slots: SlotMap,
+    /// Streamed function-call arguments per `output_index`, so a
+    /// `function_call_arguments.done` with final arguments can be preferred
+    /// when no deltas were streamed.
     tool_input_json: Vec<Option<String>>,
     saw_tool_call: bool,
     stop_reason: Option<TurnEndReason>,
     finished: bool,
 }
 
-#[derive(Clone, Copy)]
-enum OutputKind {
-    Content { index: usize },
-    Thinking { index: usize },
-    ToolUse { index: usize },
-    Ignored,
+impl SseAccumulator for StreamAccumulator {
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+        let event: ResponsesStreamEvent = serde_json::from_str(data).map_err(|e| {
+            GenerateError::MalformedResponseError(format!(
+                "Failed to parse OpenAI Responses SSE event JSON: {e}; data={data}"
+            ))
+        })?;
+        self.handle_event(event)
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    fn finish(self) -> Result<(), GenerateError> {
+        if self.stop_reason.is_none() {
+            return Err(GenerateError::MalformedResponseError(
+                "OpenAI Responses stream ended without response.completed".into(),
+            ));
+        }
+
+        for (i, json) in self.tool_input_json.into_iter().enumerate() {
+            if let Some(json) = json {
+                let json = if json.is_empty() { "{}" } else { json.as_str() };
+                if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
+                    return Err(GenerateError::MalformedResponseError(format!(
+                        "Malformed stream: function call arguments at output {i} invalid: {e}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl StreamAccumulator {
-    fn ensure_slot(&mut self, output_index: usize) {
-        while self.output_kinds.len() <= output_index {
-            self.output_kinds.push(None);
+    fn set_tool_json(&mut self, output_index: usize, json: String) {
+        while self.tool_input_json.len() <= output_index {
             self.tool_input_json.push(None);
         }
-    }
-
-    fn content_count(&self) -> usize {
-        self.output_kinds
-            .iter()
-            .filter(|k| {
-                matches!(
-                    k,
-                    Some(OutputKind::Content { .. } | OutputKind::Thinking { .. })
-                )
-            })
-            .count()
-    }
-
-    fn tool_use_count(&self) -> usize {
-        self.output_kinds
-            .iter()
-            .filter(|k| matches!(k, Some(OutputKind::ToolUse { .. })))
-            .count()
+        self.tool_input_json[output_index] = Some(json);
     }
 
     fn handle_event(
@@ -453,77 +346,62 @@ impl StreamAccumulator {
         match event {
             ResponsesStreamEvent::ResponseCreated { .. }
             | ResponsesStreamEvent::ResponseInProgress { .. } => {}
-            ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => {
-                self.ensure_slot(output_index);
-                match item {
-                    ResponsesOutputItem::Message { .. } => {
-                        let content_index = self.content_count();
-                        self.output_kinds[output_index] = Some(OutputKind::Content {
-                            index: content_index,
-                        });
-                        out.push(MessagePart::ContentStart(ContentStart::Text {
-                            index: content_index,
-                        }));
-                    }
-                    ResponsesOutputItem::Reasoning { .. } => {
-                        let content_index = self.content_count();
-                        self.output_kinds[output_index] = Some(OutputKind::Thinking {
-                            index: content_index,
-                        });
-                        out.push(MessagePart::ContentStart(ContentStart::Thinking {
-                            index: content_index,
-                            signature: None,
-                            redacted: false,
-                        }));
-                    }
-                    ResponsesOutputItem::FunctionCall {
-                        call_id,
-                        name,
-                        arguments,
-                        ..
-                    } => {
-                        // An id-less or nameless call is poison: it would flow into
-                        // persisted history and 400 on every later request (resume
-                        // included). Fail loud like the arguments-without-item path.
-                        let (Some(call_id), Some(name)) = (call_id, name) else {
-                            return Err(GenerateError::MalformedResponseError(format!(
-                                "OpenAI Responses: function_call output_item.added for \
-                                 output_index={output_index} is missing call_id or name"
-                            )));
-                        };
-                        let tool_index = self.tool_use_count();
-                        self.output_kinds[output_index] =
-                            Some(OutputKind::ToolUse { index: tool_index });
-                        self.tool_input_json[output_index] = Some(arguments.unwrap_or_default());
-                        self.saw_tool_call = true;
-                        out.push(MessagePart::ToolUseStart(ToolUseStart {
-                            index: tool_index,
-                            id: call_id,
-                            name,
-                        }));
-                    }
-                    ResponsesOutputItem::Other => {
-                        self.output_kinds[output_index] = Some(OutputKind::Ignored);
-                    }
+            ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => match item {
+                ResponsesOutputItem::Message { .. } => {
+                    let content_index = self.slots.open_content(output_index);
+                    out.push(MessagePart::ContentStart(ContentStart::Text {
+                        index: content_index,
+                    }));
                 }
-            }
+                ResponsesOutputItem::Reasoning { .. } => {
+                    let content_index = self.slots.open_thinking(output_index);
+                    out.push(MessagePart::ContentStart(ContentStart::Thinking {
+                        index: content_index,
+                        signature: None,
+                        redacted: false,
+                    }));
+                }
+                ResponsesOutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    // An id-less or nameless call is poison: it would flow into
+                    // persisted history and 400 on every later request (resume
+                    // included). Fail loud like the arguments-without-item path.
+                    let (Some(call_id), Some(name)) = (call_id, name) else {
+                        return Err(GenerateError::MalformedResponseError(format!(
+                            "OpenAI Responses: function_call output_item.added for \
+                             output_index={output_index} is missing call_id or name"
+                        )));
+                    };
+                    let tool_index = self.slots.open_tool_use(output_index);
+                    self.set_tool_json(output_index, arguments.unwrap_or_default());
+                    self.saw_tool_call = true;
+                    out.push(MessagePart::ToolUseStart(ToolUseStart {
+                        index: tool_index,
+                        id: call_id,
+                        name,
+                    }));
+                }
+                ResponsesOutputItem::Other => {
+                    self.slots.ignore(output_index);
+                }
+            },
             ResponsesStreamEvent::ResponseOutputTextDelta {
                 output_index,
                 delta,
                 ..
             } => {
-                self.ensure_slot(output_index);
                 // Lazy-open a content slot if the gateway skips output_item.added for text.
-                if self.output_kinds[output_index].is_none() {
-                    let content_index = self.content_count();
-                    self.output_kinds[output_index] = Some(OutputKind::Content {
-                        index: content_index,
-                    });
+                if self.slots.get(output_index).is_none() {
+                    let content_index = self.slots.open_content(output_index);
                     out.push(MessagePart::ContentStart(ContentStart::Text {
                         index: content_index,
                     }));
                 }
-                if let Some(OutputKind::Content { index }) = self.output_kinds[output_index] {
+                if let Some(Slot::Content { index }) = self.slots.get(output_index) {
                     out.push(MessagePart::ContentDelta(ContentDelta::Text {
                         index,
                         delta,
@@ -536,23 +414,17 @@ impl StreamAccumulator {
                 output_index,
                 delta,
             } => {
-                self.ensure_slot(output_index);
                 // Lazy-open a thinking slot if the gateway streams deltas without item.added.
-                if self.output_kinds[output_index].is_none()
-                    || matches!(self.output_kinds[output_index], Some(OutputKind::Ignored))
-                {
-                    let content_index = self.content_count();
-                    self.output_kinds[output_index] = Some(OutputKind::Thinking {
-                        index: content_index,
-                    });
+                if matches!(self.slots.get(output_index), None | Some(Slot::Ignored)) {
+                    let content_index = self.slots.open_thinking(output_index);
                     out.push(MessagePart::ContentStart(ContentStart::Thinking {
                         index: content_index,
                         signature: None,
                         redacted: false,
                     }));
                 }
-                match self.output_kinds[output_index] {
-                    Some(OutputKind::Thinking { index }) if !delta.is_empty() => {
+                match self.slots.get(output_index) {
+                    Some(Slot::Thinking { index }) if !delta.is_empty() => {
                         out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
                             index,
                             delta,
@@ -569,9 +441,8 @@ impl StreamAccumulator {
                 delta,
                 ..
             } => {
-                self.ensure_slot(output_index);
-                match self.output_kinds.get(output_index).and_then(|k| *k) {
-                    Some(OutputKind::ToolUse { index }) => {
+                match self.slots.get(output_index) {
+                    Some(Slot::ToolUse { index }) => {
                         if let Some(Some(acc)) = self.tool_input_json.get_mut(output_index) {
                             acc.push_str(&delta);
                         }
@@ -597,12 +468,9 @@ impl StreamAccumulator {
                 arguments,
                 ..
             } => {
-                self.ensure_slot(output_index);
                 if let Some(arguments) = arguments {
                     // Prefer the final assembled arguments when the gateway provides them.
-                    if let Some(OutputKind::ToolUse { index }) =
-                        self.output_kinds.get(output_index).and_then(|k| *k)
-                    {
+                    if let Some(Slot::ToolUse { index }) = self.slots.get(output_index) {
                         // Emit a full replace only if we never streamed deltas.
                         let prior = self
                             .tool_input_json
@@ -617,7 +485,7 @@ impl StreamAccumulator {
                             }));
                         }
                     }
-                    self.tool_input_json[output_index] = Some(arguments);
+                    self.set_tool_json(output_index, arguments);
                 }
             }
             ResponsesStreamEvent::ResponseCompleted { response } => {
@@ -677,27 +545,6 @@ impl StreamAccumulator {
         }
 
         Ok(out)
-    }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        if self.stop_reason.is_none() {
-            return Err(GenerateError::MalformedResponseError(
-                "OpenAI Responses stream ended without response.completed".into(),
-            ));
-        }
-
-        for (i, json) in self.tool_input_json.into_iter().enumerate() {
-            if let Some(json) = json {
-                let json = if json.is_empty() { "{}" } else { json.as_str() };
-                if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
-                    return Err(GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: function call arguments at output {i} invalid: {e}"
-                    )));
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -927,7 +774,6 @@ impl ResponsesUsage {
                 .input_tokens_details
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0),
-            cached_output_tokens: 0,
         }
     }
 }
@@ -958,7 +804,6 @@ mod tests {
         .into_token_usage();
         assert_eq!(usage.input_tokens, 10_000);
         assert_eq!(usage.cached_input_tokens, 8_000);
-        assert_eq!(usage.cached_output_tokens, 0);
         assert_eq!(usage.context_tokens(), 10_000);
     }
 

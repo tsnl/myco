@@ -91,12 +91,6 @@ pub fn usage_line(u: TokenUsage) -> String {
         ));
     }
     line.push_str(&format!(" · output {}", format_tokens(u.output_tokens)));
-    if u.cached_output_tokens > 0 {
-        line.push_str(&format!(
-            " ({} cached)",
-            format_tokens(u.cached_output_tokens)
-        ));
-    }
     line
 }
 
@@ -465,7 +459,6 @@ mod tests {
             input_tokens: 63_841,
             output_tokens: 1_400,
             cached_input_tokens: 58_000,
-            cached_output_tokens: 0,
         };
         assert_eq!(
             usage_line(full),
@@ -475,7 +468,6 @@ mod tests {
             input_tokens: 500,
             output_tokens: 42,
             cached_input_tokens: 0,
-            cached_output_tokens: 0,
         };
         assert_eq!(usage_line(uncached), "⚙ last turn: input 500 · output 42");
     }
