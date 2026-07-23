@@ -18,8 +18,8 @@ pub use agent::{
 };
 pub use attach::{MAX_IMAGE_BYTES, expand_image_attachments};
 pub use compact::{
-    CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
-    select_tail,
+    CompactOptions, CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
+    link_compact_pair, run_compact_worker, select_tail,
 };
 pub use console_log::ConsoleLog;
 pub use markdown::{MarkdownRenderer, render_block};
