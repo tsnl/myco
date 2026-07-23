@@ -8,6 +8,7 @@ mod agent;
 mod compact;
 mod console_log;
 mod markdown;
+mod search;
 mod transcript;
 
 pub use agent::{
@@ -20,6 +21,7 @@ pub use compact::{
 };
 pub use console_log::ConsoleLog;
 pub use markdown::{MarkdownRenderer, render_block};
+pub use search::{SessionSearchReport, search_sessions};
 pub use transcript::{
     BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, banner_rule,
     ensure_assistant, format_tool_invocation, print_session_history, section_rule,

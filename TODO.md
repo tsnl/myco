@@ -20,6 +20,9 @@ cluster/GUI work outrank CLI trust + long-session viability.
 - Session browser: bare `/resume` → tmux `display-popup` running `--mode session-browser`
   (fzf + console-mirror preview when installed; paged prompt fallback); inline paged
   picker outside tmux. Deliberately composes with tmux/fzf instead of an in-house TUI.
+  Content search on top: `--search` / picker `s <text>` / `session_meta list query` rank
+  sessions via a one-shot RAM `SearchIndex` (Tantivy keyword, MiniLM semantic fallback)
+  over title + first message + scratchpad + console tail.
 - Anthropic system-block prompt caching (`cache_control` on system text)
 - Local turn cancel (Ctrl-C); synthetic cancelled tool results when tools already started
 - `dyn GenerativeModel`; harness routing with injected `host` field

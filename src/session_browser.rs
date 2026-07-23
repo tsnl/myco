@@ -19,9 +19,15 @@ use std::process::Stdio;
 
 use crate::external_command;
 use crate::session::{
-    RECENT_SESSION_LIMIT, SessionListEntry, format_session_list_line, list_sessions, session_label,
-    uuid_simple_hex,
+    RECENT_SESSION_LIMIT, SessionListEntry, format_session_list_line, list_sessions,
+    search_sessions, session_label, uuid_simple_hex,
 };
+
+/// Result cap for content search (`--search`, the picker's `s <text>`).
+pub const SESSION_SEARCH_LIMIT: usize = 50;
+
+/// Content-search hook for the paged picker: query → ranked entries.
+pub type SessionSearchFn<'a> = &'a dyn Fn(&str) -> Result<Vec<SessionListEntry>, String>;
 
 // ---------------------------------------------------------------------------
 // Browser mode (`myco --mode session-browser`)
@@ -30,15 +36,28 @@ use crate::session::{
 /// Entry point for `--mode session-browser`. Picks a visible session and
 /// reports the choice: written to `out` when given (the popup handshake),
 /// printed to stdout otherwise. Cancelling reports nothing and exits 0.
-pub fn run(out: Option<&Path>) -> Result<(), String> {
-    let entries = list_sessions(0)?;
-    if entries.is_empty() {
+/// With `search`, the list is ranked by content match instead of recency.
+pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
+    let all = list_sessions(0)?;
+    if all.is_empty() {
         return Err("no sessions found under ~/.myco/session".into());
     }
+    let entries = match search {
+        Some(query) => {
+            let report = search_sessions(&all, query, SESSION_SEARCH_LIMIT, false)?;
+            if report.entries.is_empty() {
+                return Err(format!("no sessions matched {query:?}"));
+            }
+            report.entries
+        }
+        None => all.clone(),
+    };
+    let search_fn =
+        |query: &str| search_sessions(&all, query, SESSION_SEARCH_LIMIT, false).map(|r| r.entries);
     let choice = if external_command::FZF.is_installed() {
         pick_with_fzf(&entries)?
     } else {
-        pick_paged(&entries)?
+        pick_paged(&entries, Some(&search_fn))?
     };
     match (choice, out) {
         (Some(id), Some(path)) => std::fs::write(path, id).map_err(|e| e.to_string()),
@@ -154,14 +173,19 @@ fn sanitize_field(s: &str) -> String {
 /// installed, and the REPL's inline picker outside tmux. Reads plain stdin
 /// (not readline), so choices never enter readline history.
 ///
-/// Returns the chosen session id — or the raw id/prefix the user typed — and
-/// `None` on quit or EOF.
-pub fn pick_paged(entries: &[SessionListEntry]) -> Result<Option<String>, String> {
+/// `search` powers the `s <text>` command: it swaps the working list for the
+/// ranked results (bare `s` restores the original list). Returns the chosen
+/// session id — or the raw id/prefix the user typed — and `None` on quit/EOF.
+pub fn pick_paged(
+    entries: &[SessionListEntry],
+    search: Option<SessionSearchFn>,
+) -> Result<Option<String>, String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     pick_paged_io(
         entries,
         RECENT_SESSION_LIMIT,
+        search,
         &mut stdin.lock(),
         &mut stdout.lock(),
     )
@@ -170,6 +194,7 @@ pub fn pick_paged(entries: &[SessionListEntry]) -> Result<Option<String>, String
 fn pick_paged_io(
     entries: &[SessionListEntry],
     page_size: usize,
+    search: Option<SessionSearchFn>,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<Option<String>, String> {
@@ -177,18 +202,24 @@ fn pick_paged_io(
         return Ok(None);
     }
     let err = |e: std::io::Error| e.to_string();
+    let mut current: Vec<SessionListEntry> = entries.to_vec();
     let mut shown = 0;
-    print_next_page(entries, page_size, &mut shown, output)?;
+    print_next_page(&current, page_size, &mut shown, output)?;
     loop {
-        let remaining = entries.len() - shown;
+        let remaining = current.len() - shown;
         let more = if remaining > 0 {
             format!(", m = {remaining} more")
         } else {
             String::new()
         };
+        let search_hint = if search.is_some() {
+            ", s <text> = search"
+        } else {
+            ""
+        };
         write!(
             output,
-            "Resume which? [number/id/prefix{more}, q = quit] (empty = most recent): "
+            "Resume which? [number/id/prefix{search_hint}{more}, q = quit] (empty = first listed): "
         )
         .map_err(err)?;
         output.flush().map_err(err)?;
@@ -199,19 +230,41 @@ fn pick_paged_io(
         }
         let choice = line.trim();
         match choice {
-            "" => return Ok(Some(entries[0].id.clone())),
+            "" => return Ok(Some(current[0].id.clone())),
             "q" | "quit" => return Ok(None),
             "m" | "more" => {
                 if remaining == 0 {
                     writeln!(output, "(no more sessions)").map_err(err)?;
                 } else {
-                    print_next_page(entries, page_size, &mut shown, output)?;
+                    print_next_page(&current, page_size, &mut shown, output)?;
                 }
             }
+            "s" => {
+                current = entries.to_vec();
+                shown = 0;
+                writeln!(output, "(recent sessions)").map_err(err)?;
+                print_next_page(&current, page_size, &mut shown, output)?;
+            }
+            _ if choice.starts_with("s ") => match search {
+                None => writeln!(output, "(search not available here)").map_err(err)?,
+                Some(f) => match f(choice.strip_prefix("s ").unwrap_or_default().trim()) {
+                    Ok(results) if results.is_empty() => {
+                        writeln!(output, "(no matches)").map_err(err)?;
+                    }
+                    Ok(results) => {
+                        current = results;
+                        shown = 0;
+                        writeln!(output, "matches: {}  (s = back to recent)", current.len())
+                            .map_err(err)?;
+                        print_next_page(&current, page_size, &mut shown, output)?;
+                    }
+                    Err(e) => writeln!(output, "search failed: {e}").map_err(err)?,
+                },
+            },
             _ => {
                 if let Ok(n) = choice.parse::<usize>() {
                     // Numbers address listed rows only — what's on screen.
-                    match n.checked_sub(1).and_then(|i| entries[..shown].get(i)) {
+                    match n.checked_sub(1).and_then(|i| current[..shown].get(i)) {
                         Some(entry) => return Ok(Some(entry.id.clone())),
                         None => writeln!(output, "no listed session numbered {n}").map_err(err)?,
                     }
@@ -356,9 +409,19 @@ mod tests {
     }
 
     fn pick(entries: &[SessionListEntry], page_size: usize, input: &str) -> Option<String> {
+        pick_with_search(entries, page_size, input, None).0
+    }
+
+    fn pick_with_search(
+        entries: &[SessionListEntry],
+        page_size: usize,
+        input: &str,
+        search: Option<SessionSearchFn>,
+    ) -> (Option<String>, String) {
         let mut reader = Cursor::new(input.as_bytes().to_vec());
         let mut out = Vec::new();
-        pick_paged_io(entries, page_size, &mut reader, &mut out).unwrap()
+        let got = pick_paged_io(entries, page_size, search, &mut reader, &mut out).unwrap();
+        (got, String::from_utf8_lossy(&out).into_owned())
     }
 
     #[test]
@@ -421,5 +484,34 @@ mod tests {
     fn paged_non_number_is_returned_as_prefix() {
         let entries = vec![entry("aaa", None)];
         assert_eq!(pick(&entries, 10, "deadbeef\n"), Some("deadbeef".into()));
+    }
+
+    type SearchResult = Result<Vec<SessionListEntry>, String>;
+
+    #[test]
+    fn paged_search_swaps_ranking_and_empty_picks_top_match() {
+        let entries = vec![entry("aaa", None), entry("bbb", None)];
+        let ranked = vec![entry("ccc", None)];
+        let search = |_q: &str| -> SearchResult { Ok(ranked.clone()) };
+        let (got, _) = pick_with_search(&entries, 10, "s foo\n\n", Some(&search));
+        assert_eq!(got, Some("ccc".into()));
+    }
+
+    #[test]
+    fn paged_search_no_matches_keeps_current_list() {
+        let entries = vec![entry("aaa", None)];
+        let search = |_q: &str| -> SearchResult { Ok(Vec::new()) };
+        let (got, out) = pick_with_search(&entries, 10, "s foo\n\n", Some(&search));
+        assert_eq!(got, Some("aaa".into()));
+        assert!(out.contains("(no matches)"), "{out}");
+    }
+
+    #[test]
+    fn paged_bare_s_restores_recency_list() {
+        let entries = vec![entry("aaa", None), entry("bbb", None)];
+        let ranked = vec![entry("ccc", None)];
+        let search = |_q: &str| -> SearchResult { Ok(ranked.clone()) };
+        let (got, _) = pick_with_search(&entries, 10, "s foo\ns\n\n", Some(&search));
+        assert_eq!(got, Some("aaa".into()));
     }
 }

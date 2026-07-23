@@ -37,6 +37,16 @@ both optional — nothing warns when they are missing.
 session id to stdout (`--out FILE` writes it to a file instead; empty/absent
 file means cancelled), e.g. `myco --resume "$(myco --mode session-browser)"`.
 
+Content search: `--search QUERY` ranks sessions by match instead of recency;
+in the paged picker `s <text>` does the same and bare `s` restores the recency
+list. The corpus per session is title, first user message, scratchpad, and the
+console-transcript tail — keyword (Tantivy) first, MiniLM semantic fallback
+when keywords find nothing, over a one-shot in-RAM index (nothing persists;
+the semantic pass pays a model load + corpus embed per call). fzf's own typing
+filters display labels only. The `session_meta` tool's `list` action takes the
+same `query` (plus `semantic` to force semantic ranking), so the agent can find
+past sessions by content.
+
 Startup banner is a small headed block (full-block rule, `MYCO`, model +
 session, `/help` and newline hints). Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,

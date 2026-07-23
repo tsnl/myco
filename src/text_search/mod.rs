@@ -17,3 +17,5 @@ pub use discover::{AutoIndexTarget, discover_auto_index_targets};
 pub use engine::{
     DropReport, IndexReport, SearchHit, SearchOptions, SearchReport, TextSearchEngine,
 };
+// For session search's dedicated one-document-per-session index.
+pub(crate) use index::{Hit, SearchIndex, embed_for_index};

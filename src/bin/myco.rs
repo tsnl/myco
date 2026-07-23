@@ -95,6 +95,12 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
 
+    /// With `--mode session-browser`: rank sessions matching QUERY (keyword
+    /// search over title/first message/scratchpad/console tail, semantic
+    /// fallback) instead of listing by recency.
+    #[arg(long, value_name = "QUERY")]
+    search: Option<String>,
+
     /// Host name advertised in hello_ok / logs. Only used with `--mode host`.
     #[arg(long, default_value = "local")]
     name: String,
@@ -185,7 +191,7 @@ async fn main() {
 /// `--mode session-browser`: standalone picker, spawned by the bare-/resume
 /// tmux popup or run directly.
 fn run_session_browser(args: Args) {
-    if let Err(e) = myco::session_browser::run(args.out.as_deref()) {
+    if let Err(e) = myco::session_browser::run(args.out.as_deref(), args.search.as_deref()) {
         eprintln!("session browser error: {e}");
         std::process::exit(1);
     }
@@ -1292,7 +1298,16 @@ fn pick_session_interactively() -> Result<Session, String> {
     if list.is_empty() {
         return Err("no sessions found under ~/.myco/session".into());
     }
-    match myco::session_browser::pick_paged(&list)? {
+    let search = |query: &str| {
+        myco::session::search_sessions(
+            &list,
+            query,
+            myco::session_browser::SESSION_SEARCH_LIMIT,
+            /*force_semantic*/ false,
+        )
+        .map(|r| r.entries)
+    };
+    match myco::session_browser::pick_paged(&list, Some(&search))? {
         Some(choice) => Session::load_by_id_or_prefix(&choice),
         None => Err(RESUME_CANCELLED.into()),
     }
