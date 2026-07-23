@@ -14,16 +14,16 @@ use myco::generative_model::{
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactOptions, ConsoleLog, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, attachment_note, compact_session, compact_subagent_prompt,
-    expand_image_attachments, format_session_detail, format_session_list_line,
-    link_compact_pair, list_sessions, render_block, resolve_and_load_session,
+    ActiveSession, CompactWorkerError, ConsoleLog, Palette, RECENT_SESSION_LIMIT, Session,
+    SessionListEntry, attachment_note, expand_image_attachments, format_session_detail,
+    format_session_list_line, list_sessions, render_block, resolve_and_load_session,
+    run_compact_worker,
 };
 use myco::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer};
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
-    ListRecentService, NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool,
-    StartupPreflight, TraceContext, WrapMode, prompts, uuid_simple_hex,
+    ListRecentService, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
+    TraceContext, WrapMode, prompts,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -531,9 +531,9 @@ async fn run_interactive(args: Args) {
         &preflight,
         vec![session_tool, history_tool, list_recent_tool],
     )
-.await;
+    .await;
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
-    let mut effort = args.effort;
+    let effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
     let mut agent = Agent::new(model, harness.clone(), ui.clone());
@@ -569,31 +569,32 @@ async fn run_interactive(args: Args) {
         ui.replay_history(agent.history());
     }
 
-    run_repl(
-        &mut agent,
-        &active_session,
-        &mut editor,
-        harness.clone(),
-        &catalog_model,
-        &mut effort,
+    let mut repl = ReplSession {
+        agent,
+        session: active_session,
+        editor,
+        harness,
+        catalog_model,
+        effort,
         debug_dump_api_requests,
         ctrl_l,
         wrap,
-        app_config.wrap_max,
-        app_config.repaint_enabled,
-        ui.clone(),
-    )
-    .await;
+        wrap_max: app_config.wrap_max,
+        repaint: app_config.repaint_enabled,
+        ui: ui.clone(),
+        turn_cancel: TurnCancel::default(),
+    };
+    repl.run_repl().await;
 
-    if let Err(e) = persist_session(&agent, &active_session, /*force*/ true) {
+    if let Err(e) = persist_session(&repl.agent, &repl.session, /*force*/ true) {
         eprintln!("warning: could not save session on exit: {e}");
     }
-    if let Err(e) = save_readline_history(&mut editor, &active_session) {
+    if let Err(e) = save_readline_history(&mut repl.editor, &repl.session) {
         eprintln!("warning: could not save history on exit: {e}");
     }
     // Only announce a session id if we actually wrote one (non-empty history).
-    if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
-        ui.line(&format!("session={}", active_session.id()));
+    if !repl.agent.history().is_empty() || repl.session.snapshot().json_path().exists() {
+        ui.line(&format!("session={}", repl.session.id()));
     }
 }
 
@@ -707,115 +708,105 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 // REPL
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn run_repl(
-    agent: &mut Agent,
-    session: &ActiveSession,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
+/// Everything the interactive REPL threads through its turn / meta / compact
+/// helpers: the agent with its live session and line editor, the resolved
+/// model and UI handles, and the REPL-scoped knobs.
+struct ReplSession {
+    agent: Agent,
+    session: ActiveSession,
+    editor: Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
-    catalog_model: &CatalogModel,
-    effort: &mut Effort,
+    catalog_model: CatalogModel,
+    effort: Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
+    /// Wrap width resolved at startup; re-measured every prompt.
     wrap: Option<usize>,
     wrap_max: Option<usize>,
     repaint: bool,
     ui: Arc<TuiProducer>,
-) {
-    let turn_cancel = TurnCancel::default();
-    let sigint_listener = turn_cancel.install();
-    let mut last_wrap = wrap;
-    loop {
-        // Re-measure the terminal each prompt: after a resize, reflow the
-        // whole dialog at the new width (same clear+reprint as Ctrl-L). This
-        // is the safe point — never mid-stream, never while rustyline owns
-        // the terminal. Dumb terminals skip the reprint (no cursor codes)
-        // but still pick up the new width for subsequent turns. The reflow is
-        // a redraw, not new content, so it is not mirrored to the console.
-        let wrap = effective_wrap_width(wrap_max);
-        if wrap != last_wrap {
-            last_wrap = wrap;
-            ui.set_wrap(wrap);
-            if repaint && !agent.history().is_empty() {
-                clear_and_reprint(agent, &ui);
+    turn_cancel: TurnCancel,
+}
+
+impl ReplSession {
+    async fn run_repl(&mut self) {
+        let sigint_listener = self.turn_cancel.install();
+        let mut last_wrap = self.wrap;
+        loop {
+            // Re-measure the terminal each prompt: after a resize, reflow the
+            // whole dialog at the new width (same clear+reprint as Ctrl-L). This
+            // is the safe point — never mid-stream, never while rustyline owns
+            // the terminal. Dumb terminals skip the reprint (no cursor codes)
+            // but still pick up the new width for subsequent turns. The reflow is
+            // a redraw, not new content, so it is not mirrored to the console.
+            let wrap = effective_wrap_width(self.wrap_max);
+            if wrap != last_wrap {
+                last_wrap = wrap;
+                self.ui.set_wrap(wrap);
+                if self.repaint && !self.agent.history().is_empty() {
+                    clear_and_reprint(&self.agent, &self.ui);
+                }
             }
-        }
-        let max = agent.context_window_tokens();
-        let usage = agent.last_usage();
-        // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
-        let used = match usage {
-            Some(u) => Some(u.context_tokens()),
-            None if agent.history().is_empty() => Some(0),
-            None => None,
-        };
-        let running = harness.running_tool_summaries(agent.context().agent_id);
-        ui.user_header(used, max, usage, &running);
-        // No "> " prefix; body is typed on the line after the USER header.
-        // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
-        // submits the whole buffer to the agent.
-        let line = match editor.readline("") {
-            Ok(l) => l,
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-C cancels the current (multi-)line, keeps the session open.
+            let max = self.agent.context_window_tokens();
+            let usage = self.agent.last_usage();
+            // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
+            let used = match usage {
+                Some(u) => Some(u.context_tokens()),
+                None if self.agent.history().is_empty() => Some(0),
+                None => None,
+            };
+            let running = self
+                .harness
+                .running_tool_summaries(self.agent.context().agent_id);
+            self.ui.user_header(used, max, usage, &running);
+            // No "> " prefix; body is typed on the line after the USER header.
+            // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
+            // submits the whole buffer to the agent.
+            let line = match self.editor.readline("") {
+                Ok(l) => l,
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl-C cancels the current (multi-)line, keeps the session open.
+                    continue;
+                }
+                Err(ReadlineError::Eof) => break, // Ctrl-D
+                Err(e) => {
+                    eprintln!("Readline error: {e}");
+                    break;
+                }
+            };
+
+            // Ctrl-L on an empty buffer submits an empty line + sets this flag:
+            // clear scrollback and reprint the conversation.
+            if self.ctrl_l.swap(false, Ordering::SeqCst) {
+                clear_and_reprint(&self.agent, &self.ui);
                 continue;
             }
-            Err(ReadlineError::Eof) => break, // Ctrl-D
-            Err(e) => {
-                eprintln!("Readline error: {e}");
+
+            let input = line.trim().to_string();
+            if input.is_empty() {
+                continue;
+            }
+            reprint_input_wrapped(&line, last_wrap, self.repaint);
+            // Mirror the submitted line once (wrap-only, as shown). rustyline echoed
+            // it to the terminal but not to us; the re-echo above only moves the
+            // cursor, so the console needs the logical text here.
+            self.ui.submitted_input(&line);
+            if is_exit_command(&input) {
                 break;
             }
-        };
-
-        // Ctrl-L on an empty buffer submits an empty line + sets this flag:
-        // clear scrollback and reprint the conversation.
-        if ctrl_l.swap(false, Ordering::SeqCst) {
-            clear_and_reprint(agent, &ui);
-            continue;
-        }
-
-        let input = line.trim().to_string();
-        if input.is_empty() {
-            continue;
-        }
-        reprint_input_wrapped(&line, last_wrap, repaint);
-        // Mirror the submitted line once (wrap-only, as shown). rustyline echoed
-        // it to the terminal but not to us; the re-echo above only moves the
-        // cursor, so the console needs the logical text here.
-        ui.submitted_input(&line);
-        if is_exit_command(&input) {
-            break;
-        }
-        if let Some(cmd) = parse_meta(&input) {
-            if matches!(cmd, MetaCommand::Compact) {
-                run_compact(
-                    agent,
-                    session,
-                    editor,
-                    harness.clone(),
-                    catalog_model,
-                    &ui,
-                    &turn_cancel,
-                )
-                .await;
+            if let Some(cmd) = parse_meta(&input) {
+                if matches!(cmd, MetaCommand::Compact) {
+                    self.run_compact().await;
+                    continue;
+                }
+                self.handle_meta(cmd);
                 continue;
             }
-            handle_meta(
-                cmd,
-                agent,
-                session,
-                editor,
-                harness.as_ref(),
-                catalog_model,
-                effort,
-                debug_dump_api_requests,
-                &ui,
-            );
-            continue;
-        }
 
-        run_user_turn(agent, session, editor, input, &ui, &turn_cancel).await;
+            self.run_user_turn(input).await;
+        }
+        sigint_listener.abort();
     }
-    sigint_listener.abort();
 }
 
 /// Effective wrap width right now: the configured cap bounded by the measured
@@ -907,61 +898,56 @@ impl TurnCancel {
     }
 }
 
-async fn run_user_turn(
-    agent: &mut Agent,
-    session: &ActiveSession,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-    input: String,
-    ui: &TuiProducer,
-    turn_cancel: &TurnCancel,
-) {
-    let _ = editor.add_history_entry(&input);
-    if let Err(e) = save_readline_history(editor, session) {
-        eprintln!("warning: could not save history: {e}");
-    }
-    // `@path.png` mentions attach images. A bad path aborts the turn before the
-    // model is called (headed ERROR section, like generate failures) so the
-    // user can fix the path and resubmit — nothing is silently dropped.
-    let content = match expand_image_attachments(&input) {
-        Ok(c) => c,
-        Err(e) => {
-            ui.error_section(&e);
-            ui.blank_line();
-            return;
+impl ReplSession {
+    async fn run_user_turn(&mut self, input: String) {
+        let _ = self.editor.add_history_entry(&input);
+        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
+            eprintln!("warning: could not save history: {e}");
         }
-    };
-    // Same note, same position as replay: directly under the wrapped input.
-    if let Some(note) = attachment_note(&content) {
-        ui.line(&note);
-    }
-    if let Err(e) = session.maybe_auto_title_from_user_text(&input) {
-        eprintln!("warning: could not auto-title session: {e}");
-    }
-
-    let cancel = turn_cancel.arm();
-
-    // First assistant section opens with its own blank line + thin rule + header.
-    match agent.interact(content, cancel).await {
-        Ok(_) => ui.blank_line(),
-        Err(myco::AgentInteractionError::Cancelled) => ui.cancelled(),
-        Err(e) => {
-            // Headed ERROR section (the agent already closed the ASSISTANT
-            // stream via TurnFinished). Generate failures (context overflow,
-            // provider errors) are live-only — not stored in session history —
-            // so resume/Ctrl-L will not replay them.
-            ui.error_section(&e.to_string());
-            ui.blank_line();
+        // `@path.png` mentions attach images. A bad path aborts the turn before
+        // the model is called (headed ERROR section, like generate failures) so
+        // the user can fix the path and resubmit — nothing is silently dropped.
+        let content = match expand_image_attachments(&input) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ui.error_section(&e);
+                self.ui.blank_line();
+                return;
+            }
+        };
+        // Same note, same position as replay: directly under the wrapped input.
+        if let Some(note) = attachment_note(&content) {
+            self.ui.line(&note);
         }
-    }
+        if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
+            eprintln!("warning: could not auto-title session: {e}");
+        }
 
-    turn_cancel.disarm();
+        let cancel = self.turn_cancel.arm();
 
-    // Persist whatever history the agent has, including failed/cancelled turns.
-    if let Err(e) = persist_session(agent, session, /*force*/ true) {
-        eprintln!("warning: could not save session: {e}");
-    }
-    if let Err(e) = save_readline_history(editor, session) {
-        eprintln!("warning: could not save history: {e}");
+        // First assistant section opens with its own blank line + thin rule + header.
+        match self.agent.interact(content, cancel).await {
+            Ok(_) => self.ui.blank_line(),
+            Err(myco::AgentInteractionError::Cancelled) => self.ui.cancelled(),
+            Err(e) => {
+                // Headed ERROR section (the agent already closed the ASSISTANT
+                // stream via TurnFinished). Generate failures (context overflow,
+                // provider errors) are live-only — not stored in session history —
+                // so resume/Ctrl-L will not replay them.
+                self.ui.error_section(&e.to_string());
+                self.ui.blank_line();
+            }
+        }
+
+        self.turn_cancel.disarm();
+
+        // Persist whatever history the agent has, including failed/cancelled turns.
+        if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ true) {
+            eprintln!("warning: could not save session: {e}");
+        }
+        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
+            eprintln!("warning: could not save history: {e}");
+        }
     }
 }
 
@@ -969,155 +955,67 @@ async fn run_user_turn(
 // Compaction
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn run_compact(
-    agent: &mut Agent,
-    session: &ActiveSession,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-    harness: Arc<Harness>,
-    catalog_model: &CatalogModel,
-    ui: &TuiProducer,
-    turn_cancel: &TurnCancel,
-) {
-    if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
-        eprintln!("compact: failed to persist current session: {e}");
-        return;
-    }
-    let predecessor = session.snapshot();
-    if predecessor.messages.is_empty() {
-        eprintln!("compact: session is empty");
-        return;
-    }
-
-    ui.line(&format!("compacting session={} …", predecessor.id));
-
-    let worker_id = uuid::Uuid::new_v4();
-    let worker_hex = uuid_simple_hex(worker_id);
-    let mut worker_session = Session::new_hidden(
-        catalog_model.spec.key.clone(),
-        worker_hex.clone(),
-        SessionKind::Compact,
-        Some(predecessor.id.clone()),
-    );
-    worker_session.title = Some(format!(
-        "compact {}",
-        &predecessor.id[..8.min(predecessor.id.len())]
-    ));
-    if let Err(e) = worker_session.save() {
-        eprintln!("warning: could not save compact worker session: {e}");
-    }
-
-    let model = match generative_model::new(GenerativeModelConfig {
-        model: catalog_model.spec.clone(),
-        tools: harness.tool_specs(),
-        system_prompt: [
-            "You are a myco compaction worker. Follow the user instruction exactly. \
-             Prefer session_history over bash for reading sessions."
-                .to_string(),
-            prompts::agent_prompt_epilogue(),
-            prompts::model_stamp(&catalog_model.spec.key),
-        ]
-        .join("\n\n"),
-        backend_config: catalog_model.backend.clone(),
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("compact: failed to create model: {e:?}");
+impl ReplSession {
+    /// `/compact`: run the worker lifecycle (see
+    /// [`myco::session::run_compact_worker`]) and switch the live REPL to the
+    /// successor it built.
+    async fn run_compact(&mut self) {
+        if let Err(e) =
+            self.session
+                .persist_messages(self.agent.history(), self.agent.last_usage(), true)
+        {
+            eprintln!("compact: failed to persist current session: {e}");
             return;
         }
-    };
+        let predecessor = self.session.snapshot();
+        if predecessor.messages.is_empty() {
+            eprintln!("compact: session is empty");
+            return;
+        }
 
-    let sink = Arc::new(NullEventSink);
-    let mut worker = Agent::with_context(
-        model,
-        harness.clone(),
-        sink,
-        TraceContext {
-            agent_id: worker_id,
-            depth: 1,
-            parent_tool_use_id: None,
-        },
-    );
-    worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+        self.ui
+            .line(&format!("compacting session={} …", predecessor.id));
 
-    let prompt = compact_subagent_prompt(&predecessor.id);
-    // Ctrl-C during compaction cancels the worker turn like any user turn.
-    let cancel = turn_cancel.arm();
-    let result = worker
-        .interact(vec![Content::Text { text: prompt }], cancel)
+        // Ctrl-C during compaction cancels the worker turn like any user turn.
+        let cancel = self.turn_cancel.arm();
+        let result = run_compact_worker(
+            &predecessor,
+            &self.catalog_model,
+            self.harness.clone(),
+            cancel,
+        )
         .await;
-    turn_cancel.disarm();
+        self.turn_cancel.disarm();
 
-    worker_session.messages = worker.history().to_vec();
-    worker_session.touch();
-    let _ = worker_session.save();
+        let (successor, outcome) = match result {
+            Ok(v) => v,
+            Err(CompactWorkerError::Cancelled) => {
+                self.ui.line("compact: cancelled (session unchanged)");
+                return;
+            }
+            Err(CompactWorkerError::Failed(reason)) => {
+                eprintln!("compact: {reason}");
+                return;
+            }
+        };
 
-    match result {
-        Ok(_) => {}
-        Err(myco::AgentInteractionError::Cancelled) => {
-            ui.line("compact: cancelled (session unchanged)");
-            return;
+        // Switch live REPL to successor.
+        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
+            eprintln!("warning: could not save history: {e}");
         }
-        Err(e) => {
-            eprintln!("compact: worker failed: {e}");
-            return;
-        }
+        self.session.replace(successor.clone());
+        self.agent.set_history(successor.messages.clone());
+        self.agent.set_last_usage(successor.last_usage);
+        reload_readline_history(&mut self.editor, &self.session);
+        clear_and_reprint(&self.agent, &self.ui);
+        self.ui.line(&format!(
+            "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
+            outcome.successor_id,
+            outcome.predecessor_id,
+            outcome.tail_messages,
+            outcome.summary_path.display()
+        ));
     }
-
-    let summary_path = predecessor.summary_path();
-    let summary = match std::fs::read_to_string(&summary_path) {
-        Ok(s) if !s.trim().is_empty() => s,
-        Ok(_) => {
-            eprintln!(
-                "compact: worker finished but summary file is empty ({})",
-                summary_path.display()
-            );
-            return;
-        }
-        Err(e) => {
-            eprintln!(
-                "compact: worker finished but summary missing at {}: {e}",
-                summary_path.display()
-            );
-            return;
-        }
-    };
-
-    let (successor, outcome) = match compact_session(
-        &predecessor,
-        &summary,
-        &catalog_model.spec.key,
-        &CompactOptions::default(),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("compact: failed to build successor: {e}");
-            return;
-        }
-    };
-
-    let mut pred = predecessor;
-    if let Err(e) = link_compact_pair(&mut pred, &successor) {
-        eprintln!("compact: failed to link sessions: {e}");
-        return;
-    }
-
-    // Switch live REPL to successor.
-    if let Err(e) = save_readline_history(editor, session) {
-        eprintln!("warning: could not save history: {e}");
-    }
-    session.replace(successor.clone());
-    agent.set_history(successor.messages.clone());
-    agent.set_last_usage(successor.last_usage);
-    reload_readline_history(editor, session);
-    clear_and_reprint(agent, ui);
-    ui.line(&format!(
-        "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
-        outcome.successor_id,
-        outcome.predecessor_id,
-        outcome.tail_messages,
-        outcome.summary_path.display()
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,131 +1070,142 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_meta(
-    cmd: MetaCommand<'_>,
-    agent: &mut Agent,
-    session: &ActiveSession,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-    harness: &Harness,
-    catalog_model: &CatalogModel,
-    effort: &mut Effort,
-    debug_dump_api_requests: bool,
-    ui: &TuiProducer,
-) {
-    match cmd {
-        MetaCommand::Help => print_help(ui),
-        MetaCommand::Session => {
-            let _ = session.persist_messages(agent.history(), agent.last_usage(), false);
-            ui.text(&format_session_detail(&session.snapshot()));
-        }
-        MetaCommand::Sessions => match list_sessions(0) {
-            Ok(list) => {
-                let shown = RECENT_SESSION_LIMIT.min(list.len());
-                print_session_list(&list[..shown], ui);
-                if list.len() > shown {
-                    ui.line(&format!(
-                        "  … {} more — bare /resume opens the session browser",
-                        list.len() - shown
-                    ));
-                }
+impl ReplSession {
+    fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
+        match cmd {
+            MetaCommand::Help => print_help(&self.ui),
+            MetaCommand::Session => {
+                let _ = self.session.persist_messages(
+                    self.agent.history(),
+                    self.agent.last_usage(),
+                    false,
+                );
+                self.ui
+                    .text(&format_session_detail(&self.session.snapshot()));
             }
-            Err(e) => eprintln!("Failed to list sessions: {e}"),
-        },
-        MetaCommand::Hosts => print_host_status(harness, ui),
-        MetaCommand::New => {
-            save_before_switch(agent, session, editor);
-            // A nested run stays nested across /new: carry kind + parent lineage.
-            let snapshot = session.snapshot();
-            let mut fresh = Session::new(catalog_model.spec.key.clone());
-            fresh.kind = snapshot.kind;
-            fresh.parent_session_id = snapshot.parent_session_id.clone();
-            session.replace(fresh);
-            agent.set_history(Vec::new());
-            agent.set_last_usage(None);
-            reload_readline_history(editor, session);
-            // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
-            clear_and_reprint(agent, ui);
-            ui.line(&format!("new session={}", session.id()));
-        }
-        MetaCommand::Resume(arg) => {
-            save_before_switch(agent, session, editor);
-            match resolve_resume_session(arg) {
-                Ok(loaded) => {
-                    install_session(agent, editor, session, &loaded);
-                    ui.line(&format!(
-                        "resumed session={}  messages={}",
-                        session.id(),
-                        agent.history().len()
-                    ));
-                    ui.replay_history(agent.history());
+            MetaCommand::Sessions => match list_sessions(0) {
+                Ok(list) => {
+                    let shown = RECENT_SESSION_LIMIT.min(list.len());
+                    print_session_list(&list[..shown], &self.ui);
+                    if list.len() > shown {
+                        self.ui.line(&format!(
+                            "  … {} more — bare /resume opens the session browser",
+                            list.len() - shown
+                        ));
+                    }
                 }
-                Err(e) if e == RESUME_CANCELLED => ui.line("resume cancelled"),
-                Err(e) => eprintln!("resume failed: {e}"),
-            }
-        }
-        MetaCommand::Effort(arg) => match arg {
-            None => ui.line(&format!("effort={effort}  (low|medium|high|max)")),
-            Some(s) => match s.parse::<Effort>() {
-                Ok(next) if next == *effort => ui.line(&format!("effort={effort}  (unchanged)")),
-                Ok(next) => {
-                    *effort = next;
-                    let model =
-                        build_model(catalog_model, harness, debug_dump_api_requests, *effort);
-                    agent.set_model(model);
-                    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-                    ui.line(&format!("effort={effort}"));
-                }
-                Err(e) => eprintln!("{e}"),
+                Err(e) => eprintln!("Failed to list sessions: {e}"),
             },
-        },
-        MetaCommand::Title(arg) => match arg {
-            None => {
-                let snap = session.snapshot();
-                match snap.title.as_deref() {
-                    Some(t) if !t.is_empty() => ui.line(&format!("title={t:?}")),
-                    _ => ui.line("title=(none)"),
+            MetaCommand::Hosts => print_host_status(&self.harness, &self.ui),
+            MetaCommand::New => {
+                self.save_before_switch();
+                // A nested run stays nested across /new: carry kind + parent lineage.
+                let snapshot = self.session.snapshot();
+                let mut fresh = Session::new(self.catalog_model.spec.key.clone());
+                fresh.kind = snapshot.kind;
+                fresh.parent_session_id = snapshot.parent_session_id.clone();
+                self.session.replace(fresh);
+                self.agent.set_history(Vec::new());
+                self.agent.set_last_usage(None);
+                reload_readline_history(&mut self.editor, &self.session);
+                // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
+                clear_and_reprint(&self.agent, &self.ui);
+                self.ui.line(&format!("new session={}", self.session.id()));
+            }
+            MetaCommand::Resume(arg) => {
+                self.save_before_switch();
+                match resolve_resume_session(arg) {
+                    Ok(loaded) => {
+                        self.install_session(&loaded);
+                        self.ui.line(&format!(
+                            "resumed session={}  messages={}",
+                            self.session.id(),
+                            self.agent.history().len()
+                        ));
+                        self.ui.replay_history(self.agent.history());
+                    }
+                    Err(e) if e == RESUME_CANCELLED => self.ui.line("resume cancelled"),
+                    Err(e) => eprintln!("resume failed: {e}"),
                 }
             }
-            Some(t) if t.trim().is_empty() => {
-                if let Err(e) = session.with_mut(|s| {
-                    s.set_title(None)?;
-                    s.touch();
-                    s.save()
-                }) {
-                    eprintln!("failed to clear title: {e}");
-                } else {
-                    ui.line("title=(none)");
+            MetaCommand::Effort(arg) => match arg {
+                None => self
+                    .ui
+                    .line(&format!("effort={}  (low|medium|high|max)", self.effort)),
+                Some(s) => match s.parse::<Effort>() {
+                    Ok(next) if next == self.effort => self
+                        .ui
+                        .line(&format!("effort={}  (unchanged)", self.effort)),
+                    Ok(next) => {
+                        self.effort = next;
+                        let model = build_model(
+                            &self.catalog_model,
+                            &self.harness,
+                            self.debug_dump_api_requests,
+                            self.effort,
+                        );
+                        self.agent.set_model(model);
+                        self.agent.set_context_window_tokens(
+                            self.catalog_model.spec.context_window_tokens,
+                        );
+                        self.ui.line(&format!("effort={}", self.effort));
+                    }
+                    Err(e) => eprintln!("{e}"),
+                },
+            },
+            MetaCommand::Title(arg) => match arg {
+                None => {
+                    let snap = self.session.snapshot();
+                    match snap.title.as_deref() {
+                        Some(t) if !t.is_empty() => self.ui.line(&format!("title={t:?}")),
+                        _ => self.ui.line("title=(none)"),
+                    }
                 }
-            }
-            Some(t) => {
-                if let Err(e) = session.with_mut(|s| {
-                    s.set_title(Some(t.to_string()))?;
-                    s.touch();
-                    s.save()
-                }) {
-                    eprintln!("failed to set title: {e}");
-                } else if let Some(title) = session.snapshot().title {
-                    ui.line(&format!("title={title:?}"));
+                Some(t) if t.trim().is_empty() => {
+                    if let Err(e) = self.session.with_mut(|s| {
+                        s.set_title(None)?;
+                        s.touch();
+                        s.save()
+                    }) {
+                        eprintln!("failed to clear title: {e}");
+                    } else {
+                        self.ui.line("title=(none)");
+                    }
                 }
+                Some(t) => {
+                    if let Err(e) = self.session.with_mut(|s| {
+                        s.set_title(Some(t.to_string()))?;
+                        s.touch();
+                        s.save()
+                    }) {
+                        eprintln!("failed to set title: {e}");
+                    } else if let Some(title) = self.session.snapshot().title {
+                        self.ui.line(&format!("title={title:?}"));
+                    }
+                }
+            },
+            MetaCommand::Compact => {
+                // Handled asynchronously in run_repl.
             }
-        },
-        MetaCommand::Compact => {
-            // Handled asynchronously in run_repl.
         }
     }
-}
 
-fn save_before_switch(
-    agent: &Agent,
-    session: &ActiveSession,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-) {
-    if let Err(e) = persist_session(agent, session, /*force*/ false) {
-        eprintln!("warning: could not save current session: {e}");
+    fn save_before_switch(&mut self) {
+        if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ false) {
+            eprintln!("warning: could not save current session: {e}");
+        }
+        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
+            eprintln!("warning: could not save history: {e}");
+        }
     }
-    if let Err(e) = save_readline_history(editor, session) {
-        eprintln!("warning: could not save history: {e}");
+
+    /// Make `loaded` the live session: swap it into the shared handle, reset
+    /// agent history/usage, and reload readline history.
+    fn install_session(&mut self, loaded: &Session) {
+        self.session.replace(loaded.clone());
+        self.agent.set_history(loaded.messages.clone());
+        self.agent.set_last_usage(loaded.last_usage);
+        reload_readline_history(&mut self.editor, &self.session);
     }
 }
 
@@ -1441,12 +1350,6 @@ fn print_host_status(harness: &Harness, ui: &TuiProducer) {
 fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
     let history = agent.history();
     // Never create a file for a session that has never had a turn.
-    if history.is_empty()
-        && session.snapshot().messages.is_empty()
-        && !session.snapshot().json_path().exists()
-    {
-        return Ok(());
-    }
     if history.is_empty() && !session.snapshot().json_path().exists() {
         return Ok(());
     }
@@ -1513,18 +1416,6 @@ fn resolve_resume_session(id_or_prefix: Option<&str>) -> Result<Session, String>
             }
         }
     }
-}
-
-fn install_session(
-    agent: &mut Agent,
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-    active: &ActiveSession,
-    session: &Session,
-) {
-    active.replace(session.clone());
-    agent.set_history(session.messages.clone());
-    agent.set_last_usage(session.last_usage);
-    reload_readline_history(editor, active);
 }
 
 fn print_session_list(list: &[SessionListEntry], ui: &TuiProducer) {
@@ -1686,6 +1577,7 @@ impl EventSink for PrintEventSink {
 mod tests {
     use super::*;
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
+    use myco::uuid_simple_hex;
     use serde_json::json;
     use std::time::Duration;
 

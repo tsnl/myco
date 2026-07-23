@@ -18,8 +18,8 @@ pub use agent::{
 };
 pub use attach::{MAX_IMAGE_BYTES, expand_image_attachments};
 pub use compact::{
-    CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
-    select_tail,
+    CompactOptions, CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
+    link_compact_pair, run_compact_worker, select_tail,
 };
 pub use console_log::ConsoleLog;
 pub use markdown::{MarkdownRenderer, render_block};
@@ -28,8 +28,7 @@ pub use transcript::{
     BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, attachment_note,
     banner_rule, format_tokens, format_tool_invocation, history_events, section_rule,
     truncate_display_string, truncate_json_strings, usage_line, user_header_line, user_rule,
-    write_error_section,
-    write_session_history, write_warning_open,
+    write_error_section, write_session_history, write_warning_open,
 };
 
 use std::fs;

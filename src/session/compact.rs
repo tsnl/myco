@@ -1,7 +1,15 @@
 //! Session compaction: archive predecessor, seed successor with summary + tail.
 
-use crate::generative_model::{Content, Message};
-use crate::session::Session;
+use std::sync::Arc;
+
+use crate::core::CancelToken;
+use crate::generative_model::{self, CatalogModel, Content, GenerativeModelConfig, Message};
+use crate::harness::Harness;
+use crate::prompts;
+use crate::session::{
+    Agent, AgentInteractionError, NullEventSink, Session, SessionKind, TraceContext,
+    uuid_simple_hex,
+};
 
 /// Options for [`compact_session`].
 #[derive(Debug, Clone)]
@@ -99,6 +107,123 @@ pub fn link_compact_pair(predecessor: &mut Session, successor: &Session) -> Resu
     predecessor.save()?;
     successor.save()?;
     Ok(())
+}
+
+/// How [`run_compact_worker`] ended without producing a successor.
+#[derive(Debug)]
+pub enum CompactWorkerError {
+    /// The worker turn was cancelled (Ctrl-C); the predecessor is unchanged.
+    Cancelled,
+    /// Any other failure, as a printable reason.
+    Failed(String),
+}
+
+/// The whole compact worker lifecycle against a saved `predecessor`: create
+/// the hidden worker session, run the worker agent (which writes the summary
+/// via `session_history`), read the summary back, then build and link the
+/// successor. Pure orchestration — the caller owns all UI (progress, error
+/// display) and installing the successor into the live REPL.
+pub async fn run_compact_worker(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    harness: Arc<Harness>,
+    cancel: CancelToken,
+) -> Result<(Session, CompactOutcome), CompactWorkerError> {
+    let worker_id = uuid::Uuid::new_v4();
+    let worker_hex = uuid_simple_hex(worker_id);
+    let mut worker_session = Session::new_hidden(
+        catalog_model.spec.key.clone(),
+        worker_hex.clone(),
+        SessionKind::Compact,
+        Some(predecessor.id.clone()),
+    );
+    worker_session.title = Some(format!(
+        "compact {}",
+        &predecessor.id[..8.min(predecessor.id.len())]
+    ));
+    if let Err(e) = worker_session.save() {
+        eprintln!("warning: could not save compact worker session: {e}");
+    }
+
+    let model = match generative_model::new(GenerativeModelConfig {
+        model: catalog_model.spec.clone(),
+        tools: harness.tool_specs(),
+        system_prompt: [
+            "You are a myco compaction worker. Follow the user instruction exactly. \
+             Prefer session_history over bash for reading sessions."
+                .to_string(),
+            prompts::agent_prompt_epilogue(),
+            prompts::model_stamp(&catalog_model.spec.key),
+        ]
+        .join("\n\n"),
+        backend_config: catalog_model.backend.clone(),
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(CompactWorkerError::Failed(format!(
+                "failed to create model: {e:?}"
+            )));
+        }
+    };
+
+    let sink = Arc::new(NullEventSink);
+    let mut worker = Agent::with_context(
+        model,
+        harness.clone(),
+        sink,
+        TraceContext {
+            agent_id: worker_id,
+            depth: 1,
+            parent_tool_use_id: None,
+        },
+    );
+    worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+
+    let prompt = compact_subagent_prompt(&predecessor.id);
+    let result = worker
+        .interact(vec![Content::Text { text: prompt }], cancel)
+        .await;
+
+    worker_session.messages = worker.history().to_vec();
+    worker_session.touch();
+    let _ = worker_session.save();
+
+    match result {
+        Ok(_) => {}
+        Err(AgentInteractionError::Cancelled) => return Err(CompactWorkerError::Cancelled),
+        Err(e) => return Err(CompactWorkerError::Failed(format!("worker failed: {e}"))),
+    }
+
+    let summary_path = predecessor.summary_path();
+    let summary = match std::fs::read_to_string(&summary_path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            return Err(CompactWorkerError::Failed(format!(
+                "worker finished but summary file is empty ({})",
+                summary_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(CompactWorkerError::Failed(format!(
+                "worker finished but summary missing at {}: {e}",
+                summary_path.display()
+            )));
+        }
+    };
+
+    let (successor, outcome) = compact_session(
+        predecessor,
+        &summary,
+        &catalog_model.spec.key,
+        &CompactOptions::default(),
+    )
+    .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor: {e}")))?;
+
+    let mut pred = predecessor.clone();
+    link_compact_pair(&mut pred, &successor)
+        .map_err(|e| CompactWorkerError::Failed(format!("failed to link sessions: {e}")))?;
+
+    Ok((successor, outcome))
 }
 
 /// Select the last `user_turns` well-formed user turns (user → … → assistant end).

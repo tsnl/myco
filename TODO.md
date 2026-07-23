@@ -10,7 +10,7 @@ cluster/GUI work outrank CLI trust + long-session viability.
 ## Done / mostly done (do not re-open casually)
 
 - Dual protocol drivers: Anthropic Messages + OpenAI Responses. Models are a config.toml catalog (`[gateways]`/`[models]`; auth = literal token or env/file source) — no built-in model list; any gateway (Anthropic, xAI, OpenRouter, local) via config
-- Streaming generate + thinking; `EventSink` / `AgentEvent` (CLI consumer is thin)
+- Streaming generate + thinking; `EventSink` / `AgentEvent`; one rendering pipeline (`TuiProducer` drives terminal + console mirror; replay shares its layout helpers)
 - Host pool: local + SSH `myco --mode host`, soft-fail non-default, `/hosts`
 - Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp)
 - Concurrent tool uses per turn (`join_all`), including concurrent host-routed tools (pipelined NDJSON + concurrent host dispatch)
@@ -21,8 +21,8 @@ cluster/GUI work outrank CLI trust + long-session viability.
   `display-popup` running `--mode session-browser` inside tmux, inline otherwise. `tmux` +
   `fzf` are expected on PATH (preflight warns). Deliberately composes with tmux/fzf
   instead of an in-house TUI. Content search: `--search` / `session_meta list query` rank
-  sessions via a one-shot RAM `SearchIndex` (Tantivy keyword, MiniLM semantic fallback)
-  over title + first message + scratchpad + console tail.
+  sessions by plain keyword matching over title + first message + scratchpad + console
+  tail (nothing indexed, nothing persisted).
 - Anthropic system-block prompt caching (`cache_control` on system text)
 - Local turn cancel (Ctrl-C); synthetic cancelled tool results when tools already started
 - `dyn GenerativeModel`; harness routing with injected `host` field
@@ -50,13 +50,12 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
       bracketed-paste handling. Terminal paste that injects bare newlines can still
       AcceptLine early (rustyline 15 default). Confirm on real paste; enable bracketed
       paste / filter if so.
-- [ ] **Host-side cancel** — confirmed gap, not just “agent turn only”:
-  - `Harness::dispatch_tool_use`: `let _ = cancel; // V1: host calls are not mid-flight cancelled`
-  - `host::serve_stdio` invents `CancelToken::new()` per `ToolCall` (never cancelled from agent)
-  - Protocol has no Cancel message (`ClientMessage`: Hello / ToolCall / AgentFinished only)
-  - In-process bash _can_ kill on cancel (unit test `exec_cancel_kills_runaway`); that path
-    is unused for real host-routed tools today.
-  - Need: cancel (or kill) over the host pipe + process-group kill for in-flight tools.
+- [ ] **Remote host-side cancel** — the local half is fixed: cancel gives the dispatch a
+      grace window, so in-process tools run their process-group kill and return partial
+      output (`cancel_during_local_exec_leaves_no_process_group_survivors`). Remaining gap
+      is the protocol: no Cancel message (`Request`: Hello / ToolCall / AgentFinished), and
+      the worker invents a fresh `CancelToken` per ToolCall — a cancelled remote tool runs
+      to completion on the host. Need: Cancel over the pipe, wired to the worker-side token.
 - [ ] **Host liveness / reconnect** — V1 is attach-time + next tool error. Soft reconnect,
       clearer mid-session DOWN UX (beyond `/hosts` at startup).
 - [x] (REJECT) **Cold resume honesty** — sessions restore messages only (no bash sessions, no editor
@@ -66,7 +65,9 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
 ### Tests that encode trust
 
 - [x] History: generate-error-after-tools; resume-after-tools mid-turn (agent unit tests).
-- [ ] Cancel already has agent-level unit coverage; add **host-routed** cancel once protocol exists.
+- [x] Composed local cancel (Agent → Harness → worker → bash) has an orphan-scan
+      integration test. Add **remote host-routed** cancel coverage once the protocol
+      Cancel message exists.
 - [ ] Tool integration tests (bash sessions, editor read-stamp races) — still thin beyond
       existing bash/editor unit tests.
 
@@ -78,9 +79,10 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 
 ### Context lifecycle
 
-- [ ] **Compaction**
-  - Manual `/compact` (and/or tool).
-  - Auto-compact when approaching context limit (threshold config).
+- [x] **Compaction (manual)** — `/compact` runs a hidden compact-worker agent over the
+      session (`session_history` tool), writes `{id}.summary.md`, and seeds a linked
+      successor session with the summary + a well-formed recent tail. Ctrl-C cancels it.
+- [ ] **Auto-compact** when approaching the context limit (threshold config).
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [ ] **Token + cost tracking**
@@ -96,8 +98,10 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 
 ### Project brain
 
-- [ ] **`AGENTS.md` support** (also accept `CLAUDE.md` / common aliases as input).
-  - Inject at session start; ideally re-read on cwd / project change.
+- [x] **`AGENTS.md` support** — `AGENTS.md` (or `CLAUDE.md`) from the launch directory
+      is appended to the system prompt at model build time, same lifecycle and cap as
+      the soul. Re-read on cwd / project change remains open (prompt stability vs
+      freshness trade-off).
 - [ ] **Layered config** — `~/.myco` + repo `.myco/` / instruction files:
       model defaults, permissions, hooks paths, ignore globs — not only host pool.
 - [ ] **Skills / skill packs**
@@ -175,16 +179,12 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
       proxying model traffic through the supervisor's machine (myco as a local
       gateway for children). Not planned; nested agents run locally.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
-- [x] **`lynx_tui_browser`** — host tool via `lynx -dump` (search + simple browsing; link IDs).
-  - Point at DDG Lite/HTML or Bing search URLs; follow numbered References.
-  - Requires `lynx` on host PATH. No separate web_fetch/web_search tools.
-- [ ] **Servo / AccessKit browser backend** (replace or complement Lynx)
-  - Embed or sidecar Servo; dump **AccessKit** tree (roles/names/links) as primary
-    agent text; optional screenshot (`Content::Image`).
-  - Feature-gate / optional host capability (heavy; not every remote).
-  - Spike candidates: official `servo` embedder API, or `servo-fetch` (JS + a11y +
-    markdown + PNG). Prefer a11y linearization over Lynx `-dump` long-term.
-  - Keep Lynx as the light default until Servo packaging is solid on macOS + Linux.
+- [x] (REMOVED) **`lynx_tui_browser`** — the dedicated browser tool is gone; web
+      browsing composes from bash (`lynx -dump`, `curl`, …) where installed, with
+      per-system guidance in the workspace/soul. No separate web_fetch/web_search tools.
+- [x] (REJECTED) **Servo / AccessKit browser backend** — superseded by the same
+      doctrine: browsing is not a myco tool; anything heavier than bash-composed
+      browsing belongs in a dedicated external program.
 - [x] (REJECTED) **Apply-patch / diff review UX** — unified diff + accept/reject (esp. with plan mode).
   - Adds complexity. No real benefit.
 - [x] (REJECTED) **Rewind / branch conversation** — undo last turn or fork session after a bad path.
@@ -210,12 +210,10 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Features
 
-- [x] Powerful text search and indexing (v1)
-  - Host tools: `index_directory`, `indexed_exact_text_search`,
-    `indexed_semantic_text_search` (Candle MiniLM), `drop_directory_index`
-  - Exact: Tantivy (in-RAM); semantic: Candle MiniLM + cosine
-    (weights: build.rs downloads safetensors → embed_weights/ gitignored + include_bytes; no ORT)
-  - Auto-index: `.claude/skills`, `.myco/skills`, `SKILL.md` dirs, `AGENTS.md`/`CLAUDE.md`
-  - Persistent watched roots + `notify` incremental updates; parent expand in place
-  - [ ] tree-sitter structure index (next)
-  - [ ] Persist / build-time skills embedding snapshot
+- [x] (REMOVED) **Indexed text search** — the in-binary search subsystem (Tantivy exact,
+      Candle MiniLM semantic, notify watchers, compile-time weights via build.rs) is cut:
+      it dominated dependency count, binary size, and build networking to serve a
+      low-ranked need. Agents search with bash + `rg`; project guidance is injected at
+      session start instead of indexed. Semantic search, if wanted, becomes a dedicated
+      external CLI (long-running index daemon + query interface) — a separate project,
+      not a myco subsystem.
