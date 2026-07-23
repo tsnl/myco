@@ -34,19 +34,14 @@ Quick map (details in `manual`):
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
-- Text search: host **persistently indexes** (watched) `.claude/skills`, `SKILL.md` folders, and
-  `AGENTS.md`/`CLAUDE.md`. Use `indexed_exact_text_search` / `indexed_semantic_text_search` for
-  skills & guidance; `index_directory` registers more small scopes (stays watched until drop).
-  **Prefer `bash` + `rg`/`grep` for large code trees** — do not index monorepos or `node_modules`.
+- Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
+  guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs (`.claude/skills`, `SKILL.md`
+  folders) — read them with the editor or `rg` when the task touches how this project works.
 - You cannot run slash-commands (`/hosts`, `/session`, …); tell the user which to run.
 - Updating `myco` on **remote** hosts: compile **on the target** (see `manual` `harness-ops`).
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
-  `myco --version`). **Separately** ensure MiniLM embed weights are available for the
-  build (`build.rs` uses `hf-hub` into the shared Hugging Face cache, then
-  stages into `OUT_DIR` — weights are **not** in git archive / crates.io /
-  GitHub source tarballs). Never scp prebuilt
-  binaries across machines (glibc/arch mismatch).
+  `myco --version`). Never scp prebuilt binaries across machines (glibc/arch mismatch).
 
 ---
 
@@ -123,11 +118,15 @@ pub fn model_stamp(model_key: &str) -> String {
 const MAX_SOUL_BYTES: usize = 64 * 1024;
 
 /// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
-/// `MYCO_HOME`), when present. Read at model build time — session start, model
-/// switch, each worker spawn — so a running agent's prompt never changes
-/// mid-conversation and the cached conversation prefix stays valid.
+/// `MYCO_HOME`) and the launch directory's project guidance (`AGENTS.md` /
+/// `CLAUDE.md`), when present. Read at model build time — session start,
+/// model switch, each worker spawn — so a running agent's prompt never
+/// changes mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
-    epilogue_with_home(crate::session::myco_home().ok())
+    epilogue_with(
+        crate::session::myco_home().ok(),
+        std::env::current_dir().ok(),
+    )
 }
 
 /// The current soul snapshot: filename and trimmed contents of the
@@ -150,27 +149,63 @@ fn latest_soul(dir: &std::path::Path) -> Option<(String, String)> {
     (!text.is_empty()).then_some((name, text))
 }
 
-/// [`agent_prompt_epilogue`] against an explicit myco home, so tests need no
-/// process-global `MYCO_HOME` override.
-fn epilogue_with_home(home: Option<std::path::PathBuf>) -> String {
-    let soul = home.and_then(|home| latest_soul(&home.join("workspace").join("soul")));
-    match soul {
-        Some((name, mut soul)) => {
-            if soul.len() > MAX_SOUL_BYTES {
-                let mut end = MAX_SOUL_BYTES;
-                while !soul.is_char_boundary(end) {
-                    end -= 1;
-                }
-                soul.truncate(end);
-                soul.push_str("\n\n[soul truncated at 64 KiB — write a shorter revision]");
+/// Project guidance for the launch directory: `AGENTS.md` (preferred) or
+/// `CLAUDE.md`, when present and non-empty. Injected at session start so the
+/// agent knows how this project works without any indexing machinery.
+fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                return Some((name.to_string(), text));
             }
-            format!(
-                "{DEFAULT_AGENT_PROMPT_EPILOGUE}\n---\n\n# Soul\n\n\
-                 (current version: soul/{name})\n\n{soul}\n"
-            )
         }
-        None => DEFAULT_AGENT_PROMPT_EPILOGUE.to_string(),
     }
+    None
+}
+
+/// Truncate to `max` bytes on a char boundary, appending `marker` when cut.
+fn cap_bytes(text: &mut String, max: usize, marker: &str) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(marker);
+}
+
+/// [`agent_prompt_epilogue`] against explicit dirs, so tests need no
+/// process-global `MYCO_HOME` / cwd override.
+fn epilogue_with(
+    home: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+) -> String {
+    let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
+    let soul = home.and_then(|home| latest_soul(&home.join("workspace").join("soul")));
+    if let Some((name, mut soul)) = soul {
+        cap_bytes(
+            &mut soul,
+            MAX_SOUL_BYTES,
+            "\n\n[soul truncated at 64 KiB — write a shorter revision]",
+        );
+        prompt.push_str(&format!(
+            "\n---\n\n# Soul\n\n(current version: soul/{name})\n\n{soul}\n"
+        ));
+    }
+    if let Some((name, mut guidance)) = cwd.as_deref().and_then(project_guidance) {
+        cap_bytes(
+            &mut guidance,
+            MAX_SOUL_BYTES,
+            "\n\n[project guidance truncated at 64 KiB]",
+        );
+        prompt.push_str(&format!(
+            "\n---\n\n# Project guidance ({name})\n\n{guidance}\n"
+        ));
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -187,7 +222,9 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
+        // Search guidance is bash-first; myco ships no search tools of its own.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`rg`"));
+        assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
         // Free-form workspace policy: maildir-style soul versions, the
         // recall/record habit, and the consistency caution.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul"));
@@ -195,6 +232,31 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("write-once, never edited in place"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("consult and maintain them often"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
+    }
+
+    /// Project guidance from the launch directory is appended at model build
+    /// time — AGENTS.md preferred, CLAUDE.md fallback, absent = no section.
+    #[test]
+    fn project_guidance_is_appended_from_cwd() {
+        let dir = std::env::temp_dir().join(format!("myco-guidance-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let epilogue = || epilogue_with(None, Some(dir.clone()));
+
+        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+
+        std::fs::write(dir.join("CLAUDE.md"), "claude_guidance_token\n").unwrap();
+        let prompt = epilogue();
+        assert!(prompt.contains("# Project guidance (CLAUDE.md)"), "{prompt}");
+        assert!(prompt.contains("claude_guidance_token"), "{prompt}");
+
+        // AGENTS.md wins over CLAUDE.md when both exist.
+        std::fs::write(dir.join("AGENTS.md"), "agents_guidance_token\n").unwrap();
+        let prompt = epilogue();
+        assert!(prompt.contains("# Project guidance (AGENTS.md)"), "{prompt}");
+        assert!(prompt.contains("agents_guidance_token"), "{prompt}");
+        assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -214,7 +276,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
         let soul_dir = dir.join("workspace").join("soul");
         std::fs::create_dir_all(&soul_dir).unwrap();
-        let epilogue = || epilogue_with_home(Some(dir.clone()));
+        let epilogue = || epilogue_with(Some(dir.clone()), None);
 
         // No versions: the epilogue alone.
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);

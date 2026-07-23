@@ -14,9 +14,6 @@ license = "MIT"
 [dependencies]
 atomic-write-file = "0.3.0"
 base64 = "0.22"
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
-candle-transformers = "0.9.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive"] }
 dirs = "6"
@@ -37,20 +34,13 @@ schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["serde_derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 toml = "0.8"
 tokio = { version = "1.52.3", features = ["full"] }
 url = "2"
 uuid = { version = "1.23.2", features = ["v4", "serde"] }
-notify = "8.2.0"
-tantivy = "0.22"
 ssh2-config = "0.7.1"
 unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # Terminal width detection (TIOCGWINSZ) for `--wrap auto`.
 libc = "0.2"
-
-[build-dependencies]
-# Sync Hub client (ureq + native-tls); shares ~/.cache/huggingface with Python huggingface_hub.
-hf-hub = { version = "0.4", default-features = false, features = ["native-tls", "ureq"] }

@@ -7,9 +7,3 @@ __pycache__
 .myco
 .myco/worktrees/
 
-# Embed assets (fetched by build.rs; only README + MODEL.manifest tracked)
-src/text_search/embed_weights/*
-!src/text_search/embed_weights/README.md
-!src/text_search/embed_weights/MODEL.manifest
-*.onnx
-*.safetensors

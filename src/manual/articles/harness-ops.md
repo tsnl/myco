@@ -20,7 +20,7 @@ agent laptop.
 
 - **`git`** — worktrees/branches, repo inspection, and `git archive` when shipping local source to remotes.
 - **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
-- **`curl`** — `build.rs` MiniLM asset fetch at compile time, and downloading release source tarballs.
+- **`curl`** — downloading release source tarballs.
 
 Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above). Optional
 `trunk` + `wasm32-unknown-unknown` only for **`crates/myco-gui`**.
@@ -112,25 +112,9 @@ git archive --format=tar.gz -o /tmp/myco-src.tgz "${REF:-HEAD}"
 first if the install must include uncommitted edits. Untracked files are never in the archive;
 add/commit them if they are required to build.
 
-### Embedding weights (MiniLM / Candle) — fully embedded in the binary
-
-Semantic search bakes all-MiniLM-L6-v2 (Candle) into `myco` at **compile time**
-(`build.rs` stages under `OUT_DIR` + `include_bytes!`). Runtime never reads weight
-files and never downloads from Hugging Face.
-
-| Stage | What you need |
-|-------|----------------|
-| **Running / shipping** | The **`myco` binary only** for that OS/CPU/libc. No model pack, no `embed_weights/` on the target. |
-| **Compiling from source** | Network so `build.rs` (`hf-hub`) can populate the shared Hub cache and stage into `OUT_DIR` (or seed via warm `HF_HOME` / `MYCO_EMBED_CACHE` / `src/text_search/embed_weights/`). |
-
-Source tarballs / crates.io packages / `git archive` do not ship the ~87 MiB weight
-files (gitignored; not part of the package). That only matters when **building**; a
-finished binary already contains the weights. Details:
-`src/text_search/embed_weights/README.md`.
-
-Because weights are embedded, a **release only needs platform-matched binaries**. Do not scp
-binaries across mismatched OS/arch/glibc; for those hosts, build there or use a matching
-release asset.
+A **release only needs platform-matched binaries**. Do not scp binaries across
+mismatched OS/arch/glibc; for those hosts, build there or use a matching
+release asset. Builds are fully offline beyond the crates.io dependency fetch.
 
 ### Install on each remote host (build from source)
 
@@ -153,15 +137,14 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || { echo "cargo/rustc required on host"; exit 1; }
-  # build.rs uses hf-hub (shared HF cache) then stages MiniLM assets into OUT_DIR.
   cargo install --path ~/src/myco-src --force --locked --root "$HOME/.local"
   # ~/.local/bin is the usual remote install path in multi-host setups
   ~/.local/bin/myco --version
 '
 ```
 
-- Require **Rust/cargo** (and network once for `hf-hub` MiniLM assets, or a warm Hub cache) when building from source. Prefer a
-  prebuilt **same-platform** binary when available (weights already inside).
+- Require **Rust/cargo** when building from source. Prefer a prebuilt
+  **same-platform** binary when available.
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
   `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`.

@@ -15,7 +15,7 @@ use crate::generative_model::{self, ToolUse};
 use crate::host::protocol::{Request, Response};
 use crate::tool_services::{
     BashService, BrowserService, HostDispatchContext, ManualService, TextEditorService,
-    TextSearchToolService, ToolService,
+    ToolService,
 };
 
 /// Worker process: tool registry + NDJSON serve loop.
@@ -42,19 +42,15 @@ impl HostWorker {
         Self::new(name, Self::standard_services())
     }
 
-    /// Standard worker whose owner supplies the text-search service — use
-    /// when the owner keeps a handle to request auto-indexing
-    /// ([`TextSearchToolService::auto_index_under`]). Construction itself
-    /// never indexes.
-    pub fn standard_with_search(name: impl Into<String>, search: TextSearchToolService) -> Self {
-        Self::new(name, Self::services_with_search(search))
-    }
-
     /// Standard service list for building an extended local worker: the
-    /// dispatchers behind [`Self::standard_tool_specs`]. No indexing happens
-    /// at construction (see [`Self::standard_with_search`]).
+    /// dispatchers behind [`Self::standard_tool_specs`].
     pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
-        Self::services_with_search(TextSearchToolService::new())
+        vec![
+            Arc::new(BashService::new()) as Arc<dyn ToolService>,
+            Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
+            Arc::new(ManualService::new()) as Arc<dyn ToolService>,
+            Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
+        ]
     }
 
     /// Tool catalog advertised by [`Self::standard`] — pure static data, no
@@ -71,21 +67,10 @@ impl HostWorker {
             TextEditorService::specs(),
             ManualService::specs(),
             BrowserService::specs(),
-            TextSearchToolService::specs(),
         ]
         .into_iter()
         .flatten()
         .collect()
-    }
-
-    pub(crate) fn services_with_search(search: TextSearchToolService) -> Vec<Arc<dyn ToolService>> {
-        vec![
-            Arc::new(BashService::new()) as Arc<dyn ToolService>,
-            Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
-            Arc::new(ManualService::new()) as Arc<dyn ToolService>,
-            Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
-            Arc::new(search) as Arc<dyn ToolService>,
-        ]
     }
 
     pub fn name(&self) -> &str {
