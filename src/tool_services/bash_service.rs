@@ -144,9 +144,7 @@ impl ToolService for BashService {
     }
 
     fn running_tool_summaries(&self, agent_id: Uuid) -> Vec<String> {
-        let Ok(sessions) = self.sessions.lock() else {
-            return Vec::new();
-        };
+        let sessions = self.sessions();
         let mut lines: Vec<String> = sessions
             .iter()
             .filter(|(_, s)| {
@@ -188,9 +186,19 @@ fn brief_age(d: Duration) -> String {
     }
 }
 
+/// Lock, recovering the data from a poisoned mutex: a panicked holder leaves
+/// the state intact, and refusing every later bash call would be worse.
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl BashService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
+        lock_unpoisoned(&self.sessions)
     }
 
     async fn execute(
@@ -401,14 +409,7 @@ impl BashService {
 
         // Reject duplicates and enforce session cap before spawning.
         {
-            let sessions = match self.sessions.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!(
-                        "sessions lock poisoned: {e}"
-                    ));
-                }
-            };
+            let sessions = self.sessions();
             if sessions.contains_key(session_id) {
                 return generative_model::ToolResult::err(format!(
                     "session {session_id:?} already exists; close it first"
@@ -490,14 +491,7 @@ impl BashService {
         };
 
         {
-            let mut sessions = match self.sessions.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!(
-                        "sessions lock poisoned: {e}"
-                    ));
-                }
-            };
+            let mut sessions = self.sessions();
             // Re-check under lock in case of concurrent start with same id.
             // The child is already running (readers + waiter own it), so a
             // losing start must kill it here or it leaks unkillable: its pid
@@ -584,14 +578,7 @@ impl BashService {
 
     async fn session_close(&self, session_id: &str, owner: Uuid) -> generative_model::ToolResult {
         let session = {
-            let mut sessions = match self.sessions.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!(
-                        "sessions lock poisoned: {e}"
-                    ));
-                }
-            };
+            let mut sessions = self.sessions();
             match sessions.get(session_id) {
                 Some(s) if s.owner != owner => {
                     return generative_model::ToolResult::err(format!(
@@ -611,15 +598,7 @@ impl BashService {
         };
 
         // Drop stdin (EOF). The waiter task owns the Child with kill_on_drop.
-        {
-            let mut guard = match session.stdin.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!("stdin lock poisoned: {e}"));
-                }
-            };
-            *guard = None;
-        }
+        *lock_unpoisoned(&session.stdin) = None;
 
         // Drain any final buffered output (short wait).
         let snapshot = collect_output(
@@ -642,12 +621,7 @@ impl BashService {
     }
 
     fn session_list(&self, owner: Uuid) -> generative_model::ToolResult {
-        let sessions = match self.sessions.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                return generative_model::ToolResult::err(format!("sessions lock poisoned: {e}"));
-            }
-        };
+        let sessions = self.sessions();
         let mine: Vec<_> = sessions.iter().filter(|(_, s)| s.owner == owner).collect();
         if mine.is_empty() {
             return generative_model::ToolResult::text("(no live sessions)\n");
@@ -685,10 +659,7 @@ impl BashService {
     }
 
     fn ensure_owner(&self, session_id: &str, owner: Uuid) -> Result<(), String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|e| format!("sessions lock poisoned: {e}"))?;
+        let sessions = self.sessions();
         let session = sessions
             .get(session_id)
             .ok_or_else(|| format!("unknown session {session_id:?}"))?;
@@ -702,9 +673,7 @@ impl BashService {
     /// Called from `on_agent_finished` / `Agent::drop` — must not await.
     fn reap_owner(&self, owner: Uuid) {
         let victims: Vec<Session> = {
-            let Ok(mut sessions) = self.sessions.lock() else {
-                return;
-            };
+            let mut sessions = self.sessions();
             let keys: Vec<String> = sessions
                 .iter()
                 .filter(|(_, s)| s.owner == owner)
@@ -716,9 +685,7 @@ impl BashService {
         };
         for session in victims {
             // Drop stdin (EOF) then best-effort SIGKILL.
-            if let Ok(mut guard) = session.stdin.lock() {
-                *guard = None;
-            }
+            *lock_unpoisoned(&session.stdin) = None;
             kill_session_process(&session);
         }
     }
@@ -727,20 +694,13 @@ impl BashService {
         // Bump generation so an in-flight collect doesn't treat pre-write idle as done.
         // Take stdin out briefly to write without holding the sessions map lock across await.
         let (stdin_slot, shared) = {
-            let sessions = self
-                .sessions
-                .lock()
-                .map_err(|e| format!("sessions lock poisoned: {e}"))?;
+            let sessions = self.sessions();
             let session = sessions
                 .get(session_id)
                 .ok_or_else(|| format!("unknown session {session_id:?}"))?;
             session.shared.generation.fetch_add(1, Ordering::SeqCst);
             let shared = Arc::clone(&session.shared);
-            let stdin = session
-                .stdin
-                .lock()
-                .map_err(|e| format!("stdin lock poisoned: {e}"))?
-                .take();
+            let stdin = lock_unpoisoned(&session.stdin).take();
             (stdin, shared)
         };
 
@@ -778,26 +738,24 @@ impl BashService {
         }
 
         self.return_stdin(session_id, stdin);
-        if let Ok(sessions) = self.sessions.lock()
-            && let Some(session) = sessions.get(session_id)
-            && let Ok(mut t) = session.last_used.lock()
         {
-            *t = Instant::now();
+            let sessions = self.sessions();
+            if let Some(session) = sessions.get(session_id)
+                && let Ok(mut t) = session.last_used.lock()
+            {
+                *t = Instant::now();
+            }
         }
         shared.notify.notify_waiters();
         Ok(())
     }
 
     fn return_stdin(&self, session_id: &str, stdin: ChildStdin) {
-        let Ok(sessions) = self.sessions.lock() else {
-            return;
-        };
+        let sessions = self.sessions();
         let Some(session) = sessions.get(session_id) else {
             return;
         };
-        if let Ok(mut slot) = session.stdin.lock() {
-            *slot = Some(stdin);
-        }
+        *lock_unpoisoned(&session.stdin) = Some(stdin);
     }
 
     async fn collect_from_session(
@@ -809,10 +767,7 @@ impl BashService {
         cancel: crate::core::CancelToken,
     ) -> Result<SessionSnapshot, String> {
         let (shared, owner, cmdline) = {
-            let sessions = self
-                .sessions
-                .lock()
-                .map_err(|e| format!("sessions lock poisoned: {e}"))?;
+            let sessions = self.sessions();
             let session = sessions
                 .get(session_id)
                 .ok_or_else(|| format!("unknown session {session_id:?}"))?;

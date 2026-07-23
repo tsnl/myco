@@ -649,7 +649,6 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 3,
                 cached_input_tokens: 8,
-                cached_output_tokens: 0,
             }),
         );
         let events = capture.events();
