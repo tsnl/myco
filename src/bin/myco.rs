@@ -568,13 +568,13 @@ async fn run_repl(
                 header,
                 "{}",
                 palette.user(&format!(
-                    "input {}  output {}  cached input {}  cached output {}",
+                    "⚙ input {}  output {}  cached input {}  cached output {}",
                     u.input_tokens, u.output_tokens, u.cached_input_tokens, u.cached_output_tokens
                 ))
             );
         }
         for line in harness.running_tool_summaries(agent.context().agent_id) {
-            let _ = writeln!(header, "{}", palette.user(&format!("↻ {line}")));
+            let _ = writeln!(header, "{}", palette.user(&format!("● {line}")));
         }
         let _ = writeln!(header);
         emit_mirrored(&console, &header);
@@ -1154,9 +1154,10 @@ resume but stripped from provider requests. Change effort with `/effort`.
 Generate failures open a headed ERROR section (live only; not in history).
 
 Each USER header shows `USER <used>/<max>` context tokens when the provider
-reported usage on the previous generate (0/max until then). Below the token
-counts, one `↻`-prefixed line per still-running tool (live bash session on
-the in-process local host) shows its command, uptime, and idle time.
+reported usage on the previous generate (0/max until then). A `⚙`-prefixed
+line carries the token counts; below it, one `●`-prefixed line per
+still-running tool (live bash session on the in-process local host) shows
+its command, uptime, and idle time.
 
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from

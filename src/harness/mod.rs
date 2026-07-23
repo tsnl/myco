@@ -941,7 +941,6 @@ mod tests {
                         "idle_ms": 100,
                     }),
                 },
-                Arc::new(crate::NullEventSink),
                 context.clone(),
                 CancelToken::new(),
             )
@@ -966,7 +965,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"action": "close", "session_id": "summary-probe"}),
                 },
-                Arc::new(crate::NullEventSink),
                 context,
                 CancelToken::new(),
             )
