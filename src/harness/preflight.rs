@@ -106,12 +106,25 @@ impl StartupPreflight {
         self.soul.is_some() || !self.executables.is_clean() || self.ssh.has_problems()
     }
 
-    /// Write all preflight problems as one WARNING section. Writes nothing on
-    /// the happy path.
+    /// Plain body lines of the WARNING section (soul first, then executables,
+    /// then ssh-agent; no rule/header). Empty on the happy path. The
+    /// interactive CLI feeds this to its Ui's WARNING section.
     ///
     /// The soul goes first: a cut soul is invisible everywhere else (the agent
     /// simply runs with less of itself), while missing executables and ssh
     /// keys announce themselves again at the tool call that needs them.
+    pub fn warning_body(&self) -> String {
+        let mut out = Vec::new();
+        let _ = write_soul_body(self.soul.as_ref(), &mut out);
+        let _ = self.executables.write_body(&mut out);
+        if self.ssh.has_problems() {
+            let _ = self.ssh.write_body(&mut out);
+        }
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// Write all preflight problems as one WARNING section. Writes nothing on
+    /// the happy path.
     pub fn write_warning_section(
         &self,
         out: &mut impl Write,
@@ -121,12 +134,7 @@ impl StartupPreflight {
             return Ok(());
         }
         write_warning_open(out, palette)?;
-        write_soul_body(self.soul.as_ref(), out)?;
-        self.executables.write_body(out)?;
-        if self.ssh.has_problems() {
-            self.ssh.write_body(out)?;
-        }
-        Ok(())
+        out.write_all(self.warning_body().as_bytes())
     }
 }
 
