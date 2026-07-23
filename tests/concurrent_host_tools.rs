@@ -114,12 +114,9 @@ fn bash_tool(id: &str, command: &str) -> ToolUse {
 
 #[tokio::test]
 async fn agent_concurrent_host_bash_tools_complete() {
-    let harness = Harness::attach(HarnessConfig {
-        enable_subagent: false,
-        ..HarnessConfig::default()
-    })
-    .await
-    .expect("attach local host");
+    let harness = Harness::attach(HarnessConfig::default())
+        .await
+        .expect("attach local host");
 
     let model = ScriptedModel::new(vec![
         GenerateOutput {
@@ -197,12 +194,9 @@ async fn agent_concurrent_host_bash_tools_complete() {
 
 #[tokio::test]
 async fn agent_concurrent_bash_and_editor_complete() {
-    let harness = Harness::attach(HarnessConfig {
-        enable_subagent: false,
-        ..HarnessConfig::default()
-    })
-    .await
-    .expect("attach local host");
+    let harness = Harness::attach(HarnessConfig::default())
+        .await
+        .expect("attach local host");
 
     let tmp = std::env::temp_dir().join(format!("myco-concurrent-edit-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&tmp);

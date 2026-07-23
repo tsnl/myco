@@ -64,12 +64,9 @@ async fn scripted_multi_turn_bash_session_transcript() {
     let session_id = format!("itest-{}", uuid::Uuid::new_v4().as_simple());
 
     // Real bash via always-on in-process local host.
-    let harness = Harness::attach(HarnessConfig {
-        enable_subagent: false,
-        ..HarnessConfig::default()
-    })
-    .await
-    .expect("attach local myco host (build with cargo test --bins)");
+    let harness = Harness::attach(HarnessConfig::default())
+        .await
+        .expect("attach local myco host (build with cargo test --bins)");
 
     // One generate() per agent loop iteration. The agent keeps calling generate
     // until it sees EndTurn, so we script every tool-use step plus a finale.

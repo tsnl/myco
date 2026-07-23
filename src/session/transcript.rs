@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use super::markdown::{render_block, render_block_with_base};
-use crate::generative_model::{Content, Message};
+use crate::generative_model::{Content, Message, TokenUsage};
 
 /// Full-block 72-col rule above the startup banner — the heaviest rule in the
 /// UI (banner `█` > user `═` > section `─`), so launch stands out even
@@ -44,6 +44,62 @@ pub fn section_rule(wrap: Option<usize>) -> String {
     "─".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
 }
 
+/// Compact token count for header chrome: `812`, `63.8k`, `200k`, `1.2M`.
+pub fn format_tokens(n: u64) -> String {
+    fn scale(n: u64, div: f64, suffix: &str) -> String {
+        let v = n as f64 / div;
+        let s = if v >= 100.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        };
+        format!("{}{suffix}", s.strip_suffix(".0").unwrap_or(&s))
+    }
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        scale(n, 1_000.0, "k")
+    } else {
+        scale(n, 1_000_000.0, "M")
+    }
+}
+
+/// `USER <used>/<max> (<pct>%)` header line. `used = None` (resumed session
+/// predating usage tracking) renders `?` and omits the percentage.
+pub fn user_header_line(used: Option<u64>, max: u64) -> String {
+    match used {
+        Some(used) => format!(
+            "USER {}/{} ({}%)",
+            format_tokens(used),
+            format_tokens(max),
+            used * 100 / max.max(1),
+        ),
+        None => format!("USER ?/{}", format_tokens(max)),
+    }
+}
+
+/// `⚙`-prefixed usage line under the USER header, describing the turn that
+/// just finished: input is the prompt of that turn's final request (≈ live
+/// context), output is summed across the turn's requests. Zero cached counts
+/// are elided. Pairs with the `●` running-tool lines printed below it.
+pub fn usage_line(u: TokenUsage) -> String {
+    let mut line = format!("⚙ last turn: input {}", format_tokens(u.input_tokens));
+    if u.cached_input_tokens > 0 {
+        line.push_str(&format!(
+            " ({} cached)",
+            format_tokens(u.cached_input_tokens)
+        ));
+    }
+    line.push_str(&format!(" · output {}", format_tokens(u.output_tokens)));
+    if u.cached_output_tokens > 0 {
+        line.push_str(&format!(
+            " ({} cached)",
+            format_tokens(u.cached_output_tokens)
+        ));
+    }
+    line
+}
+
 /// Max chars for string values inside pretty-printed tool inputs (display only).
 pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
 
@@ -60,7 +116,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// No styling: session files, subagent logs, non-TTY output.
+    /// No styling: session files, non-TTY output.
     pub const fn plain() -> Self {
         Self {
             enabled: false,
@@ -357,6 +413,49 @@ mod tests {
     use super::*;
     use crate::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
     use serde_json::json;
+
+    #[test]
+    fn format_tokens_scales_and_drops_trailing_zero() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(8_192), "8.2k");
+        assert_eq!(format_tokens(63_841), "63.8k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_234_567), "1.2M");
+    }
+
+    #[test]
+    fn user_header_line_shows_percent_only_when_usage_known() {
+        assert_eq!(
+            user_header_line(Some(63_841), 200_000),
+            "USER 63.8k/200k (31%)"
+        );
+        assert_eq!(user_header_line(Some(0), 200_000), "USER 0/200k (0%)");
+        assert_eq!(user_header_line(None, 200_000), "USER ?/200k");
+    }
+
+    #[test]
+    fn usage_line_elides_zero_cached_counts() {
+        let full = TokenUsage {
+            input_tokens: 63_841,
+            output_tokens: 1_400,
+            cached_input_tokens: 58_000,
+            cached_output_tokens: 0,
+        };
+        assert_eq!(
+            usage_line(full),
+            "⚙ last turn: input 63.8k (58k cached) · output 1.4k"
+        );
+        let uncached = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 42,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+        };
+        assert_eq!(usage_line(uncached), "⚙ last turn: input 500 · output 42");
+    }
 
     fn sample_messages() -> Vec<Message> {
         vec![

@@ -8,8 +8,8 @@
 //! reads them natively — myco only adds `BatchMode=yes`.
 //!
 //! `~/.myco/config.toml` holds the model catalog (`[gateways]` / `[models]`,
-//! default `model`) and the myco knobs (`enable_subagent`,
-//! `attach_timeout_secs`). The **local** host is always available in-process
+//! default `model`) and the myco knobs (`attach_timeout_secs`). The
+//! **local** host is always available in-process
 //! and is never configured. Path defaulting, loading, and catalog resolution
 //! happen in [`crate::config::Config`].
 
@@ -39,9 +39,6 @@ pub struct FileConfig {
     /// what sessions record.
     #[serde(default)]
     pub models: BTreeMap<String, ModelEntry>,
-    /// When false, do not register the in-process `subagent` tool.
-    #[serde(default = "default_true")]
-    pub enable_subagent: bool,
     /// Per-remote-host connect timeout in seconds on first tool use (lazy spawn + hello).
     /// `0` disables the timeout. (Config key kept as `attach_timeout_secs`.)
     #[serde(default = "default_attach_timeout_secs")]
@@ -54,7 +51,6 @@ impl Default for FileConfig {
             model: None,
             gateways: BTreeMap::new(),
             models: BTreeMap::new(),
-            enable_subagent: default_true(),
             attach_timeout_secs: default_attach_timeout_secs(),
         }
     }
@@ -187,10 +183,6 @@ impl TryFrom<toml::Value> for AuthEntry {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_attach_timeout_secs() -> u64 {
     10
 }
@@ -211,11 +203,7 @@ impl FileConfig {
             .collect();
         HarnessConfig {
             remote_hosts,
-            enable_subagent: self.enable_subagent,
             attach_timeout_secs: self.attach_timeout_secs,
-            // The resolved catalog is filled in by `crate::config::Config`
-            // (catalog resolution needs env/tokens, which live there).
-            models: Default::default(),
         }
     }
 }
@@ -340,7 +328,6 @@ pub fn example_config_toml() -> String {
 # Default model key when more than one model is configured (--model overrides).
 model = "grok-4.5-build"
 
-enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 # Remotes connect lazily; startup does not wait for them.
 attach_timeout_secs = 10
@@ -400,7 +387,6 @@ mod tests {
     fn empty_config_and_no_ssh_hosts_is_local_only() {
         let cfg = harness_from("", "");
         assert!(cfg.remote_hosts.is_empty());
-        assert!(cfg.enable_subagent);
         assert_eq!(cfg.attach_timeout_secs, 10);
     }
 
@@ -415,8 +401,8 @@ Host devbox
 Host gpu bastion
     IdentityFile ~/.ssh/id_ed25519
 "#;
-        let cfg = harness_from("enable_subagent = false", ssh_config);
-        assert!(!cfg.enable_subagent);
+        let cfg = harness_from("attach_timeout_secs = 5", ssh_config);
+        assert_eq!(cfg.attach_timeout_secs, 5);
         let names: Vec<_> = cfg.remote_hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["devbox", "gpu", "bastion"]);
         let h = &cfg.remote_hosts[0];

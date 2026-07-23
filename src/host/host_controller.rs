@@ -145,6 +145,19 @@ impl HostController {
         }
     }
 
+    /// One-line summaries of tool work still running for `agent_id` on this
+    /// host (e.g. live bash sessions).
+    ///
+    /// In-process hosts only: the NDJSON protocol has no query message, and
+    /// prompt-time display must never block on a lazy/dead remote connection,
+    /// so subprocess hosts report none.
+    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
+        match &self.backend {
+            Backend::InProcess { worker } => worker.running_tool_summaries(agent_id),
+            Backend::Subprocess { .. } => Vec::new(),
+        }
+    }
+
     /// Last connect failure, if any (cleared after a successful connect).
     /// Always `None` for in-process hosts.
     pub fn last_error(&self) -> Option<String> {
@@ -173,31 +186,12 @@ impl HostController {
         tool_use: ToolUse,
         cancel: CancelToken,
     ) -> ToolResult {
-        self.call_with_root(agent_id, tool_use, cancel, None).await
-    }
-
-    /// Like [`call`], optionally attaching agent-root handles for in-process tools
-    /// (e.g. `subagent`). Remote backends ignore `agent_root`.
-    pub async fn call_with_root(
-        &self,
-        agent_id: uuid::Uuid,
-        tool_use: ToolUse,
-        cancel: CancelToken,
-        agent_root: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    ) -> ToolResult {
         match &self.backend {
             Backend::InProcess { worker } => {
                 let tool_id = tool_use.id.clone();
                 let worker = Arc::clone(worker);
                 worker
-                    .dispatch_tool_use(
-                        tool_use,
-                        HostDispatchContext {
-                            agent_id,
-                            cancel,
-                            agent_root,
-                        },
-                    )
+                    .dispatch_tool_use(tool_use, HostDispatchContext { agent_id, cancel })
                     .await
                     .with_id(tool_id)
             }

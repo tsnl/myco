@@ -278,8 +278,7 @@ impl Config {
         let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
 
-        let mut harness = file.into_harness_config(ssh_aliases()?);
-        harness.models = models.clone();
+        let harness = file.into_harness_config(ssh_aliases()?);
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
         let repaint_enabled = stdout_is_tty && env("TERM").as_deref() != Some("dumb");

@@ -10,7 +10,7 @@ use crate::generative_model::{self, ToolResult};
 use crate::session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
     format_session_list_line, list_all_sessions, list_all_sessions_including_hidden,
-    list_sessions_filtered, normalize_pr_url, parse_pr_fields,
+    normalize_pr_url, parse_pr_fields, search_sessions,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -27,6 +27,10 @@ Actions (`action` is required):
 - list: enumerate sessions (id, created, updated, title, link counts, path). Optional
   `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
   workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
+  Optional `query` ranks sessions by content instead of recency — keyword search over
+  title, first user message, scratchpad, and the console-transcript tail, with a semantic
+  fallback when keywords find nothing (`semantic` true forces semantic ranking). Use it to
+  find past sessions by what was discussed, not just what the title says.
 - set_title: set the **current** session title. `title` is required: a non-empty string
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
@@ -81,9 +85,13 @@ impl ToolService for SessionMetaTool {
                     return ToolResult::err(format!("invalid session_meta input: {e}"));
                 }
             };
-            match self.execute(input) {
-                Ok(text) => ToolResult::text(text),
-                Err(e) => ToolResult::err(e),
+            // Off the executor: `list` with `query` may embed via candle
+            // (candle never runs on an executor thread), and every action
+            // does file IO.
+            match tokio::task::spawn_blocking(move || self.execute(input)).await {
+                Ok(Ok(text)) => ToolResult::text(text),
+                Ok(Err(e)) => ToolResult::err(e),
+                Err(e) => ToolResult::err(format!("session_meta join: {e}")),
             }
         })
     }
@@ -93,9 +101,12 @@ impl SessionMetaTool {
     fn execute(&self, input: Input) -> Result<String, String> {
         match input.action.clone() {
             ActionKind::Get => self.action_get(input.session_id.as_deref()),
-            ActionKind::List => {
-                self.action_list(input.limit, input.include_hidden.unwrap_or(false))
-            }
+            ActionKind::List => self.action_list(
+                input.limit,
+                input.include_hidden.unwrap_or(false),
+                input.query.as_deref(),
+                input.semantic.unwrap_or(false),
+            ),
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => match input.scratchpad {
                 Some(text) => self.action_set_scratchpad(text),
@@ -119,21 +130,37 @@ impl SessionMetaTool {
         Ok(format_session_detail(&session))
     }
 
-    fn action_list(&self, limit: Option<usize>, include_hidden: bool) -> Result<String, String> {
+    fn action_list(
+        &self,
+        limit: Option<usize>,
+        include_hidden: bool,
+        query: Option<&str>,
+        force_semantic: bool,
+    ) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
-        let list = if limit == 0 {
-            if include_hidden {
-                list_all_sessions_including_hidden()?
-            } else {
-                list_all_sessions()?
-            }
+        let mut list = if include_hidden {
+            list_all_sessions_including_hidden()?
         } else {
-            list_sessions_filtered(limit, include_hidden)?
+            list_all_sessions()?
         };
+        let mut header = String::new();
+        match query {
+            None => {
+                if limit > 0 {
+                    list.truncate(limit);
+                }
+            }
+            Some(q) => {
+                let cap = if limit == 0 { 50 } else { limit };
+                let report = search_sessions(&list, q, cap, force_semantic)?;
+                header = format!("  query={q:?}  mode={}", report.mode);
+                list = report.entries;
+            }
+        }
         if list.is_empty() {
             return Ok("(no sessions)\n".into());
         }
-        let mut out = format!("sessions: {}\n", list.len());
+        let mut out = format!("sessions: {}{header}\n", list.len());
         for (i, entry) in list.iter().enumerate() {
             out.push_str(&format_session_list_line(i + 1, entry));
             out.push('\n');
@@ -285,6 +312,13 @@ struct Input {
     /// When true, `list` includes hidden sessions (subagents, compact workers).
     #[serde(default)]
     include_hidden: Option<bool>,
+    /// For `list`: rank sessions matching this text (keyword, semantic fallback)
+    /// instead of listing by recency.
+    #[serde(default)]
+    query: Option<String>,
+    /// For `list` with `query`: force semantic ranking (skip keyword search).
+    #[serde(default)]
+    semantic: Option<bool>,
     /// New title for `set_title`. Empty/null clears.
     #[serde(default)]
     title: Option<String>,
@@ -385,7 +419,7 @@ mod tests {
                         "title": "  My Feature  "
                     }),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!result.is_error, "{result:?}");
@@ -398,7 +432,7 @@ mod tests {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "get"}),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!got.is_error, "{got:?}");
@@ -489,7 +523,7 @@ mod tests {
 
         let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
-        let ctx = || HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new());
+        let ctx = || HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new());
         let call = |input: serde_json::Value| generative_model::ToolUse {
             id: "t".into(),
             name: "session_meta".into(),
@@ -590,7 +624,7 @@ mod tests {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "executable_path"}),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!got.is_error, "{got:?}");
