@@ -56,6 +56,9 @@ pub fn compact_session(
     successor.title = predecessor.title.clone();
     successor.links = predecessor.links.clone();
     successor.scratchpad = predecessor.scratchpad.clone();
+    // Cost continuity: the successor continues the same conversation, so
+    // "session cost so far" keeps counting across compaction.
+    successor.usage_totals = predecessor.usage_totals.clone();
     successor.predecessor_id = Some(predecessor.id.clone());
     successor.kind = SessionKind::User;
 
@@ -275,6 +278,16 @@ mod tests {
         let mut pred = Session::new("claude-haiku-4-5");
         pred.messages = vec![user("hello"), assistant_end("world")];
         pred.title = Some("t".into());
+        pred.usage_totals.insert(
+            "claude-haiku-4-5".into(),
+            crate::session::UsageTotals {
+                calls: 2,
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+                cached_output_tokens: 0,
+            },
+        );
         pred.save().unwrap();
 
         let (succ, out) = compact_session(
@@ -286,6 +299,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.predecessor_id, pred.id);
         assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
+        assert_eq!(succ.usage_totals, pred.usage_totals);
         assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
         assert!(
             std::fs::read_to_string(pred.summary_path())

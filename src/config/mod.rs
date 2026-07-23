@@ -414,6 +414,7 @@ fn resolve_catalog(
             CatalogModel {
                 spec,
                 backend,
+                pricing: entry.pricing,
                 auth_error,
             },
         );
@@ -531,6 +532,11 @@ base_url = "http://localhost:8080"
 thinking = "budget"
 api_id = "claude-haiku-4-5"
 context_window = 200_000
+
+[models.haiku-local.pricing]
+input = 1.0
+cached_input = 0.1
+output = 5.0
 "#;
 
     fn resolve_toml(
@@ -588,6 +594,11 @@ context_window = 200_000
         let local = cfg.models.get("haiku-local").unwrap();
         assert_eq!(local.spec.protocol, Protocol::AnthropicMessages);
         assert_eq!(local.spec.thinking, ThinkingMode::Budget);
+        // Pricing resolves per key and never depends on credentials.
+        let pricing = cfg.models.pricing();
+        assert_eq!(pricing["haiku-local"].input, 1.0);
+        assert_eq!(pricing["haiku-local"].cached_input, Some(0.1));
+        assert!(!pricing.contains_key("kimi-k3"));
         match &local.backend {
             BackendConfig::Anthropic(b) => {
                 assert_eq!(b.anthropic_base_url, "http://localhost:8080");

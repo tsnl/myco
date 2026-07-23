@@ -137,12 +137,46 @@ impl std::fmt::Display for ModelSpec {
     }
 }
 
+/// Optional USD pricing for a catalog model (`[models.KEY.pricing]` in
+/// config.toml), in dollars per **million** tokens. Enables session cost
+/// estimates (`session_meta` action `cost`); models without pricing report
+/// token counts only.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricing {
+    /// USD per million uncached input tokens.
+    pub input: f64,
+    /// USD per million cache-read input tokens. Default: the `input` rate.
+    #[serde(default)]
+    pub cached_input: Option<f64>,
+    /// USD per million output tokens.
+    pub output: f64,
+}
+
+impl ModelPricing {
+    /// Estimated USD for the given token counts. `cached_input_tokens` is a
+    /// subset of `input_tokens` ([`TokenUsage`] convention); cache **writes**
+    /// are not tracked separately and are billed at the plain input rate, so
+    /// this slightly underestimates on providers with a cache-write surcharge.
+    pub fn cost_usd(&self, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> f64 {
+        let cached = cached_input_tokens.min(input_tokens);
+        let uncached = input_tokens - cached;
+        let cached_rate = self.cached_input.unwrap_or(self.input);
+        (uncached as f64 * self.input
+            + cached as f64 * cached_rate
+            + output_tokens as f64 * self.output)
+            / 1_000_000.0
+    }
+}
+
 /// One usable catalog entry: spec plus the backend (gateway + credentials)
 /// that serves it.
 #[derive(Debug, Clone)]
 pub struct CatalogModel {
     pub spec: ModelSpec,
     pub backend: BackendConfig,
+    /// USD-per-MTok pricing when configured (`[models.KEY.pricing]`).
+    pub pricing: Option<ModelPricing>,
     /// Set when the auth source did not resolve (env var unset, auth file
     /// unreadable). Reported by [`ModelCatalog::get`] when the model is
     /// actually used — configuring a model without its credential is fine
@@ -191,6 +225,15 @@ impl ModelCatalog {
 
     pub fn keys(&self) -> Vec<&str> {
         self.entries.keys().map(String::as_str).collect()
+    }
+
+    /// Pricing for every model that configures it. Independent of credential
+    /// resolution (cost reporting must not fail on a missing API key).
+    pub fn pricing(&self) -> std::collections::BTreeMap<String, ModelPricing> {
+        self.entries
+            .iter()
+            .filter_map(|(key, entry)| entry.pricing.map(|p| (key.clone(), p)))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -902,6 +945,7 @@ mod tests {
         let entry = CatalogModel {
             spec: spec("opus", Protocol::AnthropicMessages),
             backend: BackendConfig::Anthropic(AnthropicBackendConfig::default()),
+            pricing: None,
             auth_error: None,
         };
         let catalog = ModelCatalog::new([("opus".to_string(), entry)].into());
@@ -912,10 +956,37 @@ mod tests {
     }
 
     #[test]
+    fn pricing_cost_splits_cached_input_and_defaults_cached_rate() {
+        let pricing = ModelPricing {
+            input: 3.0,
+            cached_input: Some(0.3),
+            output: 15.0,
+        };
+        // 1M input of which 400k cached, 100k output:
+        // 600k*3 + 400k*0.3 + 100k*15 = 1.8 + 0.12 + 1.5
+        let cost = pricing.cost_usd(1_000_000, 400_000, 100_000);
+        assert!((cost - 3.42).abs() < 1e-9, "{cost}");
+
+        // No cached rate → cached tokens bill at the input rate.
+        let flat = ModelPricing {
+            input: 3.0,
+            cached_input: None,
+            output: 15.0,
+        };
+        let cost = flat.cost_usd(1_000_000, 400_000, 0);
+        assert!((cost - 3.0).abs() < 1e-9, "{cost}");
+
+        // Malformed counts (cached > input) must not underflow.
+        let cost = flat.cost_usd(100, 200, 0);
+        assert!(cost > 0.0 && cost.is_finite(), "{cost}");
+    }
+
+    #[test]
     fn catalog_get_reports_deferred_auth_error() {
         let entry = CatalogModel {
             spec: spec("kimi", Protocol::OpenAIResponses),
             backend: BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig::default()),
+            pricing: None,
             auth_error: Some("model `kimi`: auth env:OPENROUTER_API_KEY is unset".into()),
         };
         let catalog = ModelCatalog::new([("kimi".to_string(), entry)].into());

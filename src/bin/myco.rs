@@ -22,8 +22,8 @@ use myco::session::{
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
-    SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight, TraceContext, WrapMode,
-    prompts, uuid_simple_hex,
+    SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight, TraceContext,
+    UsageRecordingSink, WrapMode, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -238,8 +238,9 @@ async fn run_interactive(args: Args) {
         app_config.stdout_is_tty,
     ));
 
-    let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
+    let session_tool = Arc::new(
+        SessionMetaTool::new(active_session.clone()).with_pricing(app_config.models.pricing()),
+    ) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let harness = Harness::attach_with_root_services(
         app_config.harness.clone(),
@@ -279,7 +280,14 @@ async fn run_interactive(args: Args) {
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
     let sink = Arc::new(CliEventSink::new(palette, console.clone()));
-    let mut agent = Agent::new(model, harness.clone(), sink.clone());
+    // Usage from every agent sharing this sink (root, subagents) accumulates
+    // into the live session's per-model cost totals (`session_meta` cost).
+    let agent_sink = Arc::new(UsageRecordingSink::new(
+        sink.clone(),
+        active_session.clone(),
+        model_key.clone(),
+    ));
+    let mut agent = Agent::new(model, harness.clone(), agent_sink);
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
@@ -779,7 +787,13 @@ async fn run_compact(
         }
     };
 
-    let sink = Arc::new(NullEventSink);
+    // Silent rendering, but the worker's spend still lands in the live
+    // session's cost totals.
+    let sink = Arc::new(UsageRecordingSink::new(
+        Arc::new(NullEventSink),
+        session.clone(),
+        catalog_model.spec.key.clone(),
+    ));
     let mut worker = Agent::with_context(
         model,
         harness.clone(),
@@ -829,6 +843,9 @@ async fn run_compact(
         }
     };
 
+    // Re-snapshot so the compact worker's just-recorded usage carries into
+    // the successor's totals.
+    let predecessor = session.snapshot();
     let (successor, outcome) = match compact_session(
         &predecessor,
         &summary,
@@ -1762,6 +1779,7 @@ mod tests {
             predecessor_id: None,
             successor_id: None,
             last_usage: None,
+            usage_totals: Default::default(),
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 

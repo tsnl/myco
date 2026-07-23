@@ -25,8 +25,8 @@ pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,
     ConsoleLog, EventSink, NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
-    SessionListEntry, TraceContext, compact_session, compact_subagent_prompt, link_compact_pair,
-    select_tail, uuid_simple_hex,
+    SessionListEntry, TraceContext, UsageRecordingSink, UsageTotals, compact_session,
+    compact_subagent_prompt, link_compact_pair, select_tail, uuid_simple_hex,
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{

@@ -3,10 +3,11 @@
 //! Installed on the in-process local worker only (not remotes). Bound to the
 //! interactive process's [`ActiveSession`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::core::Async;
-use crate::generative_model::{self, ToolResult};
+use crate::generative_model::{self, ModelPricing, ToolResult};
 use crate::session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
     format_session_list_line, list_all_sessions, list_all_sessions_including_hidden,
@@ -27,6 +28,12 @@ Actions (`action` is required):
 - list: enumerate sessions (id, created, updated, title, link counts, path). Optional
   `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
   workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
+- cost: token totals and estimated USD spend so far for the current session (default)
+  or another via `session_id`. Reports per-model cumulative generate calls and
+  input / cached-input / output tokens — covering the root agent plus subagents and
+  compact workers, persisted across resume and compaction. USD estimates require
+  `[models.KEY.pricing]` in config.toml (USD per million tokens); models without
+  pricing report token counts only.
 - set_title: set the **current** session title. `title` is required: a non-empty string
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
@@ -48,11 +55,21 @@ open/receive a PR, add_link it (absolute path + host for worktrees).
 /// Local tool bound to the interactive process's [`ActiveSession`].
 pub struct SessionMetaTool {
     active: ActiveSession,
+    /// Per-model USD pricing from the resolved catalog (`cost` estimates).
+    pricing: BTreeMap<String, ModelPricing>,
 }
 
 impl SessionMetaTool {
     pub fn new(active: ActiveSession) -> Self {
-        Self { active }
+        Self {
+            active,
+            pricing: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_pricing(mut self, pricing: BTreeMap<String, ModelPricing>) -> Self {
+        self.pricing = pricing;
+        self
     }
 }
 
@@ -92,6 +109,7 @@ impl SessionMetaTool {
             ActionKind::List => {
                 self.action_list(input.limit, input.include_hidden.unwrap_or(false))
             }
+            ActionKind::Cost => self.action_cost(input.session_id.as_deref()),
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => match input.scratchpad {
                 Some(text) => self.action_set_scratchpad(text),
@@ -139,6 +157,60 @@ impl SessionMetaTool {
                 entry.updated_at.to_rfc3339()
             ));
         }
+        Ok(out)
+    }
+
+    fn action_cost(&self, session_id: Option<&str>) -> Result<String, String> {
+        let session = match session_id {
+            None => self.active.snapshot(),
+            Some(id) => Session::load_by_id_or_prefix(id)?,
+        };
+        let mut out = format!("session={}  cost so far\n", session.id);
+        if session.usage_totals.is_empty() {
+            out.push_str("no usage recorded yet (no generate calls, or a session file written before usage tracking)\n");
+            return Ok(out);
+        }
+
+        let mut total_usd = 0.0_f64;
+        let mut priced = 0_usize;
+        let mut unpriced: Vec<&str> = Vec::new();
+        for (model, t) in &session.usage_totals {
+            out.push_str(&format!(
+                "  model={model}  calls={}  input={} (cached {})  output={}",
+                t.calls, t.input_tokens, t.cached_input_tokens, t.output_tokens
+            ));
+            match self.pricing.get(model) {
+                Some(p) => {
+                    let usd = p.cost_usd(t.input_tokens, t.cached_input_tokens, t.output_tokens);
+                    total_usd += usd;
+                    priced += 1;
+                    out.push_str(&format!("  est=${usd:.4}\n"));
+                }
+                None => {
+                    unpriced.push(model.as_str());
+                    out.push_str("  est=? (no pricing configured)\n");
+                }
+            }
+        }
+
+        if priced == 0 {
+            out.push_str(
+                "total: unknown — no pricing configured; set [models.KEY.pricing] in \
+                 config.toml (USD per million tokens: input / cached_input / output)\n",
+            );
+        } else if unpriced.is_empty() {
+            out.push_str(&format!("total: est=${total_usd:.4}\n"));
+        } else {
+            out.push_str(&format!(
+                "total: est=${total_usd:.4} — excludes unpriced models: [{}]\n",
+                unpriced.join(", ")
+            ));
+        }
+        out.push_str(
+            "note: totals cover every generate call attributed to this session (root \
+             agent, subagents, compact workers) and persist across resume and \
+             compaction; cache writes bill at the plain input rate.\n",
+        );
         Ok(out)
     }
 
@@ -271,7 +343,7 @@ impl SessionMetaTool {
 struct Input {
     /// Action to perform (required).
     action: ActionKind,
-    /// Target session id or unique prefix for `get`. Omit for the current session.
+    /// Target session id or unique prefix for `get` / `cost`. Omit for the current session.
     #[serde(default)]
     session_id: Option<String>,
     /// Max sessions for `list` (default 20; 0 = all).
@@ -322,6 +394,7 @@ struct Input {
 enum ActionKind {
     Get,
     List,
+    Cost,
     SetTitle,
     SetScratchpad,
     AddLink,
@@ -440,6 +513,7 @@ mod tests {
             serde_json::json!([
                 "get",
                 "list",
+                "cost",
                 "set_title",
                 "set_scratchpad",
                 "add_link",
@@ -556,6 +630,109 @@ mod tests {
         unsafe {
             std::env::remove_var("MYCO_HOME");
         }
+    }
+
+    /// Cost reports per-model totals, prices models with configured pricing,
+    /// and names unpriced models instead of silently dropping their tokens.
+    #[tokio::test]
+    async fn cost_reports_per_model_totals_and_estimates() {
+        use crate::session::UsageTotals;
+
+        let mut session = Session::new("opus");
+        session.usage_totals.insert(
+            "opus".into(),
+            UsageTotals {
+                calls: 2,
+                input_tokens: 1_000_000,
+                output_tokens: 100_000,
+                cached_input_tokens: 400_000,
+                cached_output_tokens: 0,
+            },
+        );
+        session.usage_totals.insert(
+            "mystery".into(),
+            UsageTotals {
+                calls: 1,
+                input_tokens: 10,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cached_output_tokens: 0,
+            },
+        );
+        let tool = Arc::new(
+            SessionMetaTool::new(ActiveSession::new(session)).with_pricing(
+                [(
+                    "opus".to_string(),
+                    ModelPricing {
+                        input: 3.0,
+                        cached_input: Some(0.3),
+                        output: 15.0,
+                    },
+                )]
+                .into(),
+            ),
+        );
+
+        let got = tool
+            .dispatch_tool_use(
+                generative_model::ToolUse {
+                    id: "t1".into(),
+                    name: "session_meta".into(),
+                    input: serde_json::json!({"action": "cost"}),
+                },
+                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+            )
+            .await;
+        assert!(!got.is_error, "{got:?}");
+        let text = result_text(&got);
+        // 600k uncached * $3 + 400k cached * $0.3 + 100k out * $15 = $3.42
+        assert!(text.contains("model=opus  calls=2"), "{text}");
+        assert!(text.contains("input=1000000 (cached 400000)"), "{text}");
+        assert!(text.contains("est=$3.4200"), "{text}");
+        assert!(text.contains("model=mystery"), "{text}");
+        assert!(text.contains("no pricing configured"), "{text}");
+        assert!(
+            text.contains("total: est=$3.4200 — excludes unpriced models: [mystery]"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_without_totals_or_pricing_stays_actionable() {
+        let call = |tool: &Arc<SessionMetaTool>| {
+            let tool = tool.clone();
+            async move {
+                tool.dispatch_tool_use(
+                    generative_model::ToolUse {
+                        id: "t".into(),
+                        name: "session_meta".into(),
+                        input: serde_json::json!({"action": "cost"}),
+                    },
+                    HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                )
+                .await
+            }
+        };
+
+        // No usage recorded at all.
+        let (tool, _active) = tool_with_session(Session::new("opus"));
+        let got = call(&Arc::new(tool)).await;
+        assert!(!got.is_error, "{got:?}");
+        assert!(
+            result_text(&got).contains("no usage recorded yet"),
+            "{got:?}"
+        );
+
+        // Usage but no pricing anywhere: point at the config key to set.
+        let mut session = Session::new("opus");
+        session
+            .usage_totals
+            .insert("opus".into(), crate::session::UsageTotals::default());
+        let tool = Arc::new(SessionMetaTool::new(ActiveSession::new(session)));
+        let got = call(&tool).await;
+        assert!(!got.is_error, "{got:?}");
+        let text = result_text(&got);
+        assert!(text.contains("[models.KEY.pricing]"), "{text}");
     }
 
     // Deliberate guard-across-await: it serializes MYCO_HOME for the whole

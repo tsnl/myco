@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use ssh2_config::{ParseRule, SshConfig};
 
 use super::{HarnessConfig, HostConfig};
-use crate::generative_model::{Protocol, ThinkingMode};
+use crate::generative_model::{ModelPricing, Protocol, ThinkingMode};
 
 /// On-disk config file shape (`~/.myco/config.toml`). Hosts come from
 /// `~/.ssh/config`; models come from the `[gateways]` / `[models]` catalog
@@ -103,6 +103,11 @@ pub struct ModelEntry {
     /// Per-generate output token cap (default 8192).
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+    /// `[models.KEY.pricing]`: USD per million tokens (`input`,
+    /// optional `cached_input`, `output`). Enables session cost estimates;
+    /// absent → token counts only.
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
 }
 
 /// The `auth` value on a gateway or model entry.
@@ -369,6 +374,13 @@ gateway = "anthropic"
 thinking = "budget"          # older models reject adaptive thinking
 context_window = 200_000
 
+# Optional per-model pricing (USD per million tokens) enables session cost
+# estimates (session_meta action "cost"). cached_input defaults to input.
+[models.claude-haiku-4-5.pricing]
+input = 1.00
+cached_input = 0.10
+output = 5.00
+
 # Keys with dots need quoting (TOML): [models."grok-4.5-build"]
 [models."grok-4.5-build"]
 gateway = "xai"
@@ -624,6 +636,42 @@ context_window = 1000
         )
         .unwrap_err();
         assert!(err.contains("context_window"), "{err}");
+    }
+
+    #[test]
+    fn model_pricing_parses_and_rejects_unknown_fields() {
+        let text = r#"
+[models.a]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+
+[models.a.pricing]
+input = 3.0
+cached_input = 0.3
+output = 15.0
+
+[models.b]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+
+[models.b.pricing]
+input = 1.0
+output = 5.0
+"#;
+        let file = parse_file_config_str(text).unwrap();
+        let a = file.models["a"].pricing.unwrap();
+        assert_eq!(a.input, 3.0);
+        assert_eq!(a.cached_input, Some(0.3));
+        assert_eq!(a.output, 15.0);
+        assert_eq!(file.models["b"].pricing.unwrap().cached_input, None);
+
+        let bad = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                   context_window = 1000\n[models.x.pricing]\ninput = 1.0\noutput = 2.0\n\
+                   typo_rate = 3.0\n";
+        let err = parse_file_config_str(bad).unwrap_err();
+        assert!(err.contains("typo_rate"), "{err}");
     }
 
     #[test]

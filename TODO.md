@@ -78,9 +78,11 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [ ] **Token + cost tracking**
-  - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
-    and session totals.
-  - Turn footer / `/session` (or similar): tokens this turn, session cumulative, rough cost.
+  - Done: provider `usage` flows into per-model session totals (root agent +
+    subagents + compact workers; persists across resume/compact); `session_meta`
+    action `cost` reports cumulative tokens + USD estimate from optional
+    `[models.KEY.pricing]`; `/session` shows aggregate token totals.
+  - Remaining: turn footer (tokens this turn, rough cost at a glance).
 - [x] (REJECT) **Caching strategy beyond system block**
   - History breakpoints / strategic `cache_control` so the growing prefix is not fully uncached.
   - Surface cache hit metrics so prompts can be tuned.

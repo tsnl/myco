@@ -39,7 +39,9 @@ issues; hosts via `/hosts`.
   `base_url`, and `auth` — the token itself as a string, or a source table:
   `{ source = "env", var_name = "…" }` / `{ source = "file", path = "…" }` /
   `{ source = "none" }` (omit for no auth). A model names its gateway plus
-  `api_id` (wire id) and a required `context_window`.
+  `api_id` (wire id) and a required `context_window`. Optional
+  `[models.KEY.pricing]` (USD per million tokens) enables session cost
+  estimates via `session_meta` action `cost`.
 - Credentials that fail to look up error at model *use*, naming the source.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;

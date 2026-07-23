@@ -107,7 +107,12 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 `context_window` (drives `USER n/m` + auto-compact), `thinking`
 (`anthropic-messages`: `adaptive` (default) | `budget` | `none`;
 `openai-responses`: `effort` (default) | `none`), `max_output_tokens`
-(default 8192).
+(default 8192), and an optional `[models.KEY.pricing]` table — USD per
+million tokens (`input`, `cached_input` (default: `input`), `output`) —
+which enables per-session USD estimates via `session_meta` action `cost`.
+Sessions accumulate per-model token totals across every generate call
+attributed to them (root agent, subagents, compact workers), persisted
+across resume and compaction.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

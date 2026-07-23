@@ -27,6 +27,7 @@ pub use transcript::{
     write_error_open, write_error_section, write_session_history, write_warning_open,
 };
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,54 @@ pub struct Session {
     /// (absent in sessions written before usage tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<TokenUsage>,
+    /// Cumulative token usage per model key across every generate call
+    /// attributed to this session (root agent, subagents, compact workers).
+    /// Persisted so resumed sessions keep counting; empty in older files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_totals: BTreeMap<String, UsageTotals>,
+}
+
+/// Cumulative token counts for one model within a session
+/// (see [`Session::usage_totals`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageTotals {
+    /// Generate calls folded in so far.
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_output_tokens: u64,
+}
+
+impl UsageTotals {
+    /// Fold one generate call's usage into the totals.
+    pub fn add_call(&mut self, usage: TokenUsage) {
+        self.merge(UsageTotals {
+            calls: 1,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cached_output_tokens: usage.cached_output_tokens,
+        });
+    }
+
+    /// Fold another bucket into this one (cross-model rollups).
+    pub fn merge(&mut self, other: UsageTotals) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cached_output_tokens = self
+            .cached_output_tokens
+            .saturating_add(other.cached_output_tokens);
+    }
 }
 
 /// Structured association stored on a session.
@@ -242,6 +291,17 @@ impl ActiveSession {
         Ok(())
     }
 
+    /// Fold one generate call's usage into the per-model session totals.
+    /// In-memory only — totals reach disk with the session's next save
+    /// (turn-end [`Self::persist_messages`]), same durability as messages.
+    pub fn record_usage(&self, model_key: &str, usage: TokenUsage) {
+        self.lock()
+            .usage_totals
+            .entry(model_key.to_string())
+            .or_default()
+            .add_call(usage);
+    }
+
     /// Set title if currently unset, from the first user line. Returns true if set.
     pub fn maybe_auto_title_from_user_text(&self, text: &str) -> Result<bool, String> {
         let mut session = self.lock();
@@ -259,6 +319,62 @@ impl ActiveSession {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Session> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// [`EventSink`] wrapper that folds every [`AgentEvent::Usage`] into the
+/// active session's per-model totals, then forwards the event unchanged.
+///
+/// One recorder sees the whole process: nested agents (subagents, compact
+/// workers) share the root agent's sink, so their spend lands in the
+/// interactive session's totals. A nested agent is attributed to the model
+/// its [`AgentEvent::AgentStarted`] announced; agents never announced (the
+/// root) fall back to `default_model`.
+pub struct UsageRecordingSink {
+    inner: Arc<dyn EventSink>,
+    session: ActiveSession,
+    default_model: String,
+    agent_models: Mutex<HashMap<Uuid, String>>,
+}
+
+impl UsageRecordingSink {
+    pub fn new(
+        inner: Arc<dyn EventSink>,
+        session: ActiveSession,
+        default_model: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            session,
+            default_model: default_model.into(),
+            agent_models: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn agent_models(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, String>> {
+        self.agent_models.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl EventSink for UsageRecordingSink {
+    fn emit(&self, event: AgentEvent) {
+        match &event {
+            AgentEvent::AgentStarted {
+                agent_id, model, ..
+            } if !model.is_empty() => {
+                self.agent_models().insert(*agent_id, model.clone());
+            }
+            AgentEvent::Usage { usage, context } => {
+                let model = self
+                    .agent_models()
+                    .get(&context.agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.default_model.clone());
+                self.session.record_usage(&model, *usage);
+            }
+            _ => {}
+        }
+        self.inner.emit(event);
     }
 }
 
@@ -287,6 +403,7 @@ impl Session {
             predecessor_id: None,
             successor_id: None,
             last_usage: None,
+            usage_totals: BTreeMap::new(),
         }
     }
 
@@ -760,6 +877,16 @@ pub fn format_session_detail(session: &Session) -> String {
     out.push_str(&format!("updated:   {}\n", session.updated_at.to_rfc3339()));
     out.push_str(&format!("model:     {}\n", session.model));
     out.push_str(&format!("messages:  {}\n", session.messages.len()));
+    if !session.usage_totals.is_empty() {
+        let mut total = UsageTotals::default();
+        for bucket in session.usage_totals.values() {
+            total.merge(*bucket);
+        }
+        out.push_str(&format!(
+            "usage:     calls={}  input={} (cached {})  output={} tokens\n",
+            total.calls, total.input_tokens, total.cached_input_tokens, total.output_tokens
+        ));
+    }
     out.push_str(&format!("kind:      {}\n", session.kind));
     out.push_str(&format!(
         "hidden:    {}\n",
@@ -1092,6 +1219,7 @@ mod tests {
             predecessor_id: None,
             successor_id: None,
             last_usage: None,
+            usage_totals: BTreeMap::new(),
         };
         session.updated_at = session.created_at + Duration::from_secs(1);
 
@@ -1122,11 +1250,22 @@ mod tests {
             cached_input_tokens: 1_000,
             cached_output_tokens: 0,
         });
+        session.usage_totals.insert(
+            "claude-opus-4-8".into(),
+            UsageTotals {
+                calls: 3,
+                input_tokens: 30_000,
+                output_tokens: 900,
+                cached_input_tokens: 25_000,
+                cached_output_tokens: 0,
+            },
+        );
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.last_usage, session.last_usage);
         assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
+        assert_eq!(loaded.usage_totals, session.usage_totals);
 
         let old = dir.join("old.json");
         fs::write(
@@ -1134,9 +1273,68 @@ mod tests {
             br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
         )
         .unwrap();
-        assert!(Session::load(&old).unwrap().last_usage.is_none());
+        let old_loaded = Session::load(&old).unwrap();
+        assert!(old_loaded.last_usage.is_none());
+        assert!(old_loaded.usage_totals.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_recording_sink_attributes_usage_by_agent_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(AtomicUsize);
+        impl EventSink for Counter {
+            fn emit(&self, _event: AgentEvent) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = ActiveSession::new(Session::new("root-model"));
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let sink = UsageRecordingSink::new(counter.clone(), active.clone(), "root-model");
+
+        let usage = |input: u64, output: u64| TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+        };
+        let root = TraceContext::root();
+
+        // Root agent has no AgentStarted announcement → default model.
+        sink.emit(AgentEvent::Usage {
+            usage: usage(100, 10),
+            context: root.clone(),
+        });
+        sink.emit(AgentEvent::Usage {
+            usage: usage(50, 5),
+            context: root.clone(),
+        });
+
+        // Subagent usage is attributed to its announced model.
+        let sub_id = Uuid::new_v4();
+        sink.emit(AgentEvent::AgentStarted {
+            agent_id: sub_id,
+            model: "haiku".into(),
+            parent_agent_id: Some(root.agent_id),
+            parent_tool_use_id: None,
+            depth: 1,
+        });
+        sink.emit(AgentEvent::Usage {
+            usage: usage(30, 3),
+            context: root.child_agent(sub_id, None),
+        });
+
+        let totals = active.snapshot().usage_totals;
+        assert_eq!(totals["root-model"].calls, 2);
+        assert_eq!(totals["root-model"].input_tokens, 150);
+        assert_eq!(totals["root-model"].output_tokens, 15);
+        assert_eq!(totals["haiku"].calls, 1);
+        assert_eq!(totals["haiku"].input_tokens, 30);
+        // Every event is forwarded to the inner sink unchanged in count.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 4);
     }
 
     #[test]
