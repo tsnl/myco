@@ -20,6 +20,8 @@ agent laptop.
 - **`git`** — worktrees/branches, repo inspection, and `git archive` when shipping local source to remotes.
 - **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
 - **`curl`** — downloading release source tarballs.
+- **`ck`** — semantic / hybrid code search (`cargo install ck-search`); agents use it via
+  bash where installed, alongside `rg`.
 
 Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above).
 
