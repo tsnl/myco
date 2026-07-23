@@ -250,7 +250,6 @@ impl Agent {
         // tool round-trip); each new report's input side already covers the
         // whole prompt, so it replaces rather than adds.
         let mut turn_output: u64 = 0;
-        let mut turn_cached_output: u64 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -270,10 +269,8 @@ impl Agent {
 
             if let Some(usage) = output.usage {
                 turn_output += usage.output_tokens;
-                turn_cached_output += usage.cached_output_tokens;
                 let usage = TokenUsage {
                     output_tokens: turn_output,
-                    cached_output_tokens: turn_cached_output,
                     ..usage
                 };
                 self.last_usage = Some(usage);
@@ -808,7 +805,6 @@ mod tests {
                     input_tokens: 1_000,
                     output_tokens: 500,
                     cached_input_tokens: 800,
-                    cached_output_tokens: 0,
                 }),
             },
             GenerateOutput {
@@ -821,7 +817,6 @@ mod tests {
                     input_tokens: 1_600,
                     output_tokens: 20,
                     cached_input_tokens: 900,
-                    cached_output_tokens: 0,
                 }),
             },
         ]);

@@ -2,11 +2,15 @@
 //!
 //! Ref: https://platform.claude.com/docs/en/api/messages/create
 //! Streaming: https://platform.claude.com/docs/en/build-with-claude/streaming
+//!
+//! Invariant: history thinking is never re-sent to the API; whether budget-mode
+//! thinking + tool use requires re-sending is an open question.
 
 use std::sync::Arc;
 
 use crate::core::*;
 
+use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::*;
 
 /// Anthropic Messages API settings ([`BackendConfig::Anthropic`]).
@@ -65,45 +69,19 @@ impl AnthropicGenerativeModel {
             )));
         }
 
-        let mut headers = reqwest::header::HeaderMap::from_iter([
-            (
-                reqwest::header::CONTENT_TYPE,
-                "application/json".parse().unwrap(),
-            ),
-            (
-                "anthropic-version".parse().unwrap(),
-                "2023-06-01".parse().unwrap(),
-            ),
-        ]);
-        // Empty token = `auth = "none"` in the catalog (local proxies); send no
-        // auth header. Credential *presence* is the catalog's job
-        // (`ModelCatalog::get`), not the driver's.
-        //
         // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
         // `x-api-key` header and rejects them as `Authorization: Bearer`;
         // Bearer is the convention for gateway/OAuth tokens. Pick by token
         // shape so both work against the default base URL.
         let token = &backend.anthropic_auth_token;
-        if !token.is_empty() {
-            let (auth_header, auth_value) = if token.starts_with("sk-ant-") {
-                ("x-api-key", token.clone())
-            } else {
-                ("authorization", format!("Bearer {token}"))
-            };
-            headers.insert(
-                reqwest::header::HeaderName::from_static(auth_header),
-                // Never echo the token into the error: it ends up in logs.
-                auth_value.parse().map_err(|e| {
-                    ModelCreationError::BadConfig(format!(
-                        "auth token is not a valid HTTP header value: {e}"
-                    ))
-                })?,
-            );
-        }
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
+        let auth = if token.is_empty() {
+            None
+        } else if token.starts_with("sk-ant-") {
+            Some(("x-api-key", token.clone()))
+        } else {
+            Some(("authorization", format!("Bearer {token}")))
+        };
+        let client = driver_core::build_client(auth, &[("anthropic-version", "2023-06-01")])?;
 
         let tools = config
             .tools
@@ -124,10 +102,8 @@ impl AnthropicGenerativeModel {
         }))
     }
 
-    async fn start_message_stream(
-        &self,
-        messages: &[AnthropicMessage],
-    ) -> Result<reqwest::Response, GenerateError> {
+    /// Build (without sending) the streaming Messages request.
+    fn message_request(&self, messages: &[AnthropicMessage]) -> reqwest::RequestBuilder {
         // Anthropic only honors `cache_control` on content blocks (system / messages /
         // tools), never as a top-level request field. Put the breakpoint on the system
         // prompt text block so the stable prefix can be cached across turns.
@@ -171,65 +147,20 @@ impl AnthropicGenerativeModel {
             eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
         }
 
-        let raw_response = self
-            .client
+        self.client
             .post(format!("{}/v1/messages", self.backend.anthropic_base_url))
             .json(&request)
-            .send()
-            .await
-            .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-
-        if !raw_response.status().is_success() {
-            let status = raw_response.status();
-            let body = raw_response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-            return Err(GenerateError::ExecutionError(format!(
-                "Anthropic API returned HTTP {status}: {body}"
-            )));
-        }
-
-        Ok(raw_response)
     }
 }
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
         let messages = convert_messages(input, self.backend.enable_prompt_caching);
-        let model = self.model.clone();
-        let system_prompt = self.system_prompt.clone();
-        let tools = self.tools.clone();
-        let backend = self.backend.clone();
-        let client = self.client.clone();
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
-
-        tokio::spawn(async move {
-            let driver = AnthropicGenerativeModel {
-                model,
-                system_prompt,
-                tools,
-                backend,
-                client,
-            };
-
-            let response = match driver.start_message_stream(&messages).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            if let Err(e) = drive_anthropic_sse_stream(response, tx.clone()).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        driver_core::spawn_generate(
+            self.message_request(&messages),
+            StreamAccumulator::default(),
+            "Anthropic",
+        )
     }
 }
 
@@ -256,11 +187,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
         let (role, content): (_, Vec<AnthropicContent>) = match message {
             Message::UserMessage { content } => (
                 AnthropicRole::User,
-                content
-                    .iter()
-                    .cloned()
-                    .map(AnthropicContent::from)
-                    .collect(),
+                content.iter().cloned().filter_map(answer_block).collect(),
             ),
             Message::ToolResults { tool_use_results } => (
                 AnthropicRole::User,
@@ -272,7 +199,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                             .content
                             .iter()
                             .cloned()
-                            .map(AnthropicContent::from)
+                            .filter_map(answer_block)
                             .collect(),
                         is_error: result.is_error,
                     })
@@ -284,12 +211,8 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                 turn_end_reason: _,
             } => {
                 // Thinking may be stored in history for resume/UI; never echo it back to the API.
-                let mut blocks: Vec<AnthropicContent> = content
-                    .iter()
-                    .filter(|c| !matches!(c, Content::Thinking { .. }))
-                    .cloned()
-                    .map(AnthropicContent::from)
-                    .collect();
+                let mut blocks: Vec<AnthropicContent> =
+                    content.iter().cloned().filter_map(answer_block).collect();
                 for tool_use in tool_uses {
                     blocks.push(AnthropicContent::ToolUse {
                         id: tool_use.id.clone(),
@@ -356,99 +279,42 @@ fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessa
 }
 
 //
-// SSE streaming
-//
-
-async fn drive_anthropic_sse_stream(
-    response: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
-) -> Result<(), GenerateError> {
-    if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped (turn cancelled): stop reading so the response
-        // body drops and the provider stops generating/billing.
-        return Ok(());
-    }
-
-    let mut byte_stream = response.bytes_stream();
-    let mut sse = SseParser::default();
-    let mut acc = StreamAccumulator::default();
-
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!("Error reading Anthropic stream body: {e:?}"))
-        })?;
-
-        for data in sse.push(&chunk) {
-            let event: AnthropicStreamEvent = serde_json::from_str(&data).map_err(|e| {
-                GenerateError::MalformedResponseError(format!(
-                    "Failed to parse Anthropic SSE event JSON: {e}; data={data}"
-                ))
-            })?;
-
-            for item in acc.handle_event(event)? {
-                if tx.send(Ok(item)).await.is_err() {
-                    return Ok(());
-                }
-            }
-
-            if acc.finished {
-                break;
-            }
-        }
-
-        if acc.finished {
-            break;
-        }
-    }
-
-    // Validate stream completed with a stop reason and parseable tool inputs.
-    acc.finish()?;
-    Ok(())
-}
-
-//
-// Stream accumulation (`SseParser` is shared, in mod.rs)
+// Stream accumulation (the SSE drive loop is shared, in driver_core)
 //
 
 /// Maps Anthropic's unified content-block indices onto separate content/tool-use index spaces.
 #[derive(Default)]
 struct StreamAccumulator {
-    block_kinds: Vec<Option<BlockKind>>,
-    /// Parallel builders used only to validate tool input JSON at the end.
-    tool_input_json: Vec<Option<String>>,
+    slots: SlotMap,
     stop_reason: Option<AnthropicStopReason>,
     finished: bool,
 }
 
-#[derive(Clone, Copy)]
-enum BlockKind {
-    Content { index: usize },
-    ToolUse { index: usize },
-    Ignored,
+impl SseAccumulator for StreamAccumulator {
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+        let event: AnthropicStreamEvent = serde_json::from_str(data).map_err(|e| {
+            GenerateError::MalformedResponseError(format!(
+                "Failed to parse Anthropic SSE event JSON: {e}; data={data}"
+            ))
+        })?;
+        self.handle_event(event)
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    fn finish(self) -> Result<(), GenerateError> {
+        if self.stop_reason.is_none() {
+            return Err(GenerateError::MalformedResponseError(
+                "Anthropic stream ended without a stop_reason".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl StreamAccumulator {
-    fn ensure_slot(&mut self, anthropic_index: usize) {
-        while self.block_kinds.len() <= anthropic_index {
-            self.block_kinds.push(None);
-            self.tool_input_json.push(None);
-        }
-    }
-
-    fn content_count(&self) -> usize {
-        self.block_kinds
-            .iter()
-            .filter(|k| matches!(k, Some(BlockKind::Content { .. })))
-            .count()
-    }
-
-    fn tool_use_count(&self) -> usize {
-        self.block_kinds
-            .iter()
-            .filter(|k| matches!(k, Some(BlockKind::ToolUse { .. })))
-            .count()
-    }
-
     fn handle_event(
         &mut self,
         event: AnthropicStreamEvent,
@@ -466,89 +332,72 @@ impl StreamAccumulator {
             AnthropicStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => {
-                self.ensure_slot(index);
-                match content_block {
-                    AnthropicStreamContentBlock::Text { text } => {
-                        let content_index = self.content_count();
-                        self.block_kinds[index] = Some(BlockKind::Content {
+            } => match content_block {
+                AnthropicStreamContentBlock::Text { text } => {
+                    let content_index = self.slots.open_content(index);
+                    out.push(MessagePart::ContentStart(ContentStart::Text {
+                        index: content_index,
+                    }));
+                    if !text.is_empty() {
+                        out.push(MessagePart::ContentDelta(ContentDelta::Text {
                             index: content_index,
-                        });
-                        out.push(MessagePart::ContentStart(ContentStart::Text {
-                            index: content_index,
+                            delta: text,
                         }));
-                        if !text.is_empty() {
-                            out.push(MessagePart::ContentDelta(ContentDelta::Text {
-                                index: content_index,
-                                delta: text,
-                            }));
-                        }
-                    }
-                    AnthropicStreamContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        let content_index = self.content_count();
-                        self.block_kinds[index] = Some(BlockKind::Content {
-                            index: content_index,
-                        });
-                        out.push(MessagePart::ContentStart(ContentStart::Thinking {
-                            index: content_index,
-                            signature,
-                            redacted: false,
-                        }));
-                        if !thinking.is_empty() {
-                            out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                                index: content_index,
-                                delta: thinking,
-                            }));
-                        }
-                    }
-                    AnthropicStreamContentBlock::RedactedThinking { data } => {
-                        let content_index = self.content_count();
-                        self.block_kinds[index] = Some(BlockKind::Content {
-                            index: content_index,
-                        });
-                        // Preserve opaque payload in signature; no plaintext deltas.
-                        out.push(MessagePart::ContentStart(ContentStart::Thinking {
-                            index: content_index,
-                            signature: if data.is_empty() { None } else { Some(data) },
-                            redacted: true,
-                        }));
-                    }
-                    AnthropicStreamContentBlock::ToolUse { id, name, input } => {
-                        let tool_index = self.tool_use_count();
-                        self.block_kinds[index] = Some(BlockKind::ToolUse { index: tool_index });
-                        // Input arrives via input_json_delta; starter object is usually empty.
-                        let _ = input;
-                        self.tool_input_json[index] = Some(String::new());
-                        out.push(MessagePart::ToolUseStart(ToolUseStart {
-                            index: tool_index,
-                            id,
-                            name,
-                        }));
-                    }
-                    AnthropicStreamContentBlock::Other => {
-                        self.block_kinds[index] = Some(BlockKind::Ignored);
-                        self.tool_input_json[index] = None;
                     }
                 }
-            }
+                AnthropicStreamContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    let content_index = self.slots.open_thinking(index);
+                    out.push(MessagePart::ContentStart(ContentStart::Thinking {
+                        index: content_index,
+                        signature,
+                        redacted: false,
+                    }));
+                    if !thinking.is_empty() {
+                        out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
+                            index: content_index,
+                            delta: thinking,
+                        }));
+                    }
+                }
+                AnthropicStreamContentBlock::RedactedThinking { data } => {
+                    let content_index = self.slots.open_thinking(index);
+                    // Preserve opaque payload in signature; no plaintext deltas.
+                    out.push(MessagePart::ContentStart(ContentStart::Thinking {
+                        index: content_index,
+                        signature: if data.is_empty() { None } else { Some(data) },
+                        redacted: true,
+                    }));
+                }
+                AnthropicStreamContentBlock::ToolUse { id, name, input } => {
+                    // Input arrives via input_json_delta; starter object is usually empty.
+                    let _ = input;
+                    let tool_index = self.slots.open_tool_use(index);
+                    out.push(MessagePart::ToolUseStart(ToolUseStart {
+                        index: tool_index,
+                        id,
+                        name,
+                    }));
+                }
+                AnthropicStreamContentBlock::Other => {
+                    self.slots.ignore(index);
+                }
+            },
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
-                self.ensure_slot(index);
-                let kind = self
-                    .block_kinds
-                    .get(index)
-                    .and_then(|k| *k)
-                    .ok_or_else(|| {
-                        GenerateError::MalformedResponseError(format!(
-                            "content_block_delta for unknown index {index}"
-                        ))
-                    })?;
+                let slot = self.slots.get(index).ok_or_else(|| {
+                    GenerateError::MalformedResponseError(format!(
+                        "content_block_delta for unknown index {index}"
+                    ))
+                })?;
 
-                match (kind, delta) {
+                match (slot, delta) {
                     (
-                        BlockKind::Content {
+                        Slot::Content {
+                            index: content_index,
+                        }
+                        | Slot::Thinking {
                             index: content_index,
                         },
                         AnthropicDelta::TextDelta { text },
@@ -559,7 +408,10 @@ impl StreamAccumulator {
                         }));
                     }
                     (
-                        BlockKind::Content {
+                        Slot::Content {
+                            index: content_index,
+                        }
+                        | Slot::Thinking {
                             index: content_index,
                         },
                         AnthropicDelta::ThinkingDelta { thinking },
@@ -570,7 +422,10 @@ impl StreamAccumulator {
                         }));
                     }
                     (
-                        BlockKind::Content {
+                        Slot::Content {
+                            index: content_index,
+                        }
+                        | Slot::Thinking {
                             index: content_index,
                         },
                         AnthropicDelta::InputJsonDelta { .. },
@@ -580,26 +435,23 @@ impl StreamAccumulator {
                         )));
                     }
                     (
-                        BlockKind::ToolUse { index: tool_index },
+                        Slot::ToolUse { index: tool_index },
                         AnthropicDelta::InputJsonDelta { partial_json },
                     ) => {
-                        if let Some(Some(acc)) = self.tool_input_json.get_mut(index) {
-                            acc.push_str(&partial_json);
-                        }
                         out.push(MessagePart::ToolUseDelta(ToolUseDelta {
                             index: tool_index,
                             input_json_delta: partial_json,
                         }));
                     }
                     (
-                        BlockKind::ToolUse { .. },
+                        Slot::ToolUse { .. },
                         AnthropicDelta::TextDelta { .. } | AnthropicDelta::ThinkingDelta { .. },
                     ) => {
                         return Err(GenerateError::MalformedResponseError(
                             "text/thinking delta on tool_use block".into(),
                         ));
                     }
-                    (BlockKind::Ignored, _) | (_, AnthropicDelta::Other) => {}
+                    (Slot::Ignored, _) | (_, AnthropicDelta::Other) => {}
                 }
             }
             AnthropicStreamEvent::ContentBlockStop { .. } => {}
@@ -630,28 +482,6 @@ impl StreamAccumulator {
         }
 
         Ok(out)
-    }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        if self.stop_reason.is_none() {
-            return Err(GenerateError::MalformedResponseError(
-                "Anthropic stream ended without a stop_reason".into(),
-            ));
-        }
-
-        for (i, json) in self.tool_input_json.into_iter().enumerate() {
-            if let Some(json) = json {
-                // No deltas means empty object input.
-                let json = if json.is_empty() { "{}" } else { json.as_str() };
-                if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
-                    return Err(GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: tool use input JSON at block {i} is invalid: {e}"
-                    )));
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -776,7 +606,6 @@ impl AnthropicUsage {
                 .saturating_add(cache_creation),
             output_tokens: self.output_tokens,
             cached_input_tokens: cache_read,
-            cached_output_tokens: 0,
         }
     }
 }
@@ -865,19 +694,6 @@ enum AnthropicContent {
     #[serde(rename = "image")]
     Image { source: AnthropicImageSource },
 
-    #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-    },
-
-    #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        #[serde(default)]
-        data: String,
-    },
-
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -929,29 +745,15 @@ fn anthropic_image_source(source: String) -> AnthropicImageSource {
     }
 }
 
-impl From<Content> for AnthropicContent {
-    fn from(content: Content) -> Self {
-        match content {
-            Content::Text { text } => AnthropicContent::Text { text },
-            Content::Image { source } => AnthropicContent::Image {
-                source: anthropic_image_source(source),
-            },
-            Content::Thinking {
-                text,
-                signature,
-                redacted: false,
-            } => AnthropicContent::Thinking {
-                thinking: text,
-                signature,
-            },
-            Content::Thinking {
-                signature,
-                redacted: true,
-                ..
-            } => AnthropicContent::RedactedThinking {
-                data: signature.unwrap_or_default(),
-            },
-        }
+/// Wire block for one history content item. History thinking is never re-sent
+/// (module invariant), so `Content::Thinking` yields `None`.
+fn answer_block(content: Content) -> Option<AnthropicContent> {
+    match content {
+        Content::Text { text } => Some(AnthropicContent::Text { text }),
+        Content::Image { source } => Some(AnthropicContent::Image {
+            source: anthropic_image_source(source),
+        }),
+        Content::Thinking { .. } => None,
     }
 }
 
@@ -1192,25 +994,28 @@ mod tests {
 
     #[test]
     fn image_source_url_and_base64_wire_format() {
-        let url = AnthropicContent::from(Content::Image {
+        let url = answer_block(Content::Image {
             source: "https://example.com/a.png".into(),
-        });
+        })
+        .unwrap();
         let url_json = serde_json::to_value(&url).unwrap();
         assert_eq!(url_json["type"], "image");
         assert_eq!(url_json["source"]["type"], "url");
         assert_eq!(url_json["source"]["url"], "https://example.com/a.png");
 
-        let b64 = AnthropicContent::from(Content::Image {
+        let b64 = answer_block(Content::Image {
             source: "iVBORw0KGgo=".into(),
-        });
+        })
+        .unwrap();
         let b64_json = serde_json::to_value(&b64).unwrap();
         assert_eq!(b64_json["source"]["type"], "base64");
         assert_eq!(b64_json["source"]["media_type"], "image/png");
         assert_eq!(b64_json["source"]["data"], "iVBORw0KGgo=");
 
-        let data_url = AnthropicContent::from(Content::Image {
+        let data_url = answer_block(Content::Image {
             source: "data:image/jpeg;base64,/9j/4AAQ".into(),
-        });
+        })
+        .unwrap();
         let data_json = serde_json::to_value(&data_url).unwrap();
         assert_eq!(data_json["source"]["type"], "base64");
         assert_eq!(data_json["source"]["media_type"], "image/jpeg");
@@ -1395,7 +1200,6 @@ mod tests {
             .expect("message_start should emit usage");
         assert_eq!(usage.input_tokens, 2195);
         assert_eq!(usage.cached_input_tokens, 100);
-        assert_eq!(usage.cached_output_tokens, 0);
         assert_eq!(usage.context_tokens(), 2195);
     }
 
@@ -1451,35 +1255,6 @@ mod tests {
             &parts[1],
             MessagePart::ContentDelta(ContentDelta::Text { index: 1, delta }) if delta == "hi"
         ));
-    }
-
-    #[test]
-    fn thinking_content_round_trips_signature() {
-        let c = Content::Thinking {
-            text: "secret plan".into(),
-            signature: Some("sig".into()),
-            redacted: false,
-        };
-        match AnthropicContent::from(c) {
-            AnthropicContent::Thinking {
-                thinking,
-                signature,
-            } => {
-                assert_eq!(thinking, "secret plan");
-                assert_eq!(signature.as_deref(), Some("sig"));
-            }
-            other => panic!("expected thinking wire block, got {other:?}"),
-        }
-
-        let redacted = Content::Thinking {
-            text: String::new(),
-            signature: Some("opaque".into()),
-            redacted: true,
-        };
-        match AnthropicContent::from(redacted) {
-            AnthropicContent::RedactedThinking { data } => assert_eq!(data, "opaque"),
-            other => panic!("expected redacted_thinking, got {other:?}"),
-        }
     }
 
     #[test]

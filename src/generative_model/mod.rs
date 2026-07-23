@@ -7,6 +7,8 @@ use crate::core::*;
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
 
+mod driver_core;
+
 mod openai_responses;
 pub use openai_responses::OpenAIResponsesBackendConfig;
 
@@ -428,8 +430,8 @@ pub enum MessagePart {
     Usage(TokenUsage),
 }
 
-/// Token counts for one generate call. Cached counts are subsets of their
-/// totals; cached output is 0 for current providers (kept for symmetry).
+/// Token counts for one generate call. `cached_input_tokens` is a subset of
+/// `input_tokens`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     #[serde(default)]
@@ -438,8 +440,6 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_input_tokens: u64,
-    #[serde(default)]
-    pub cached_output_tokens: u64,
 }
 
 impl TokenUsage {
@@ -459,7 +459,6 @@ impl TokenUsage {
             input_tokens: pick(self.input_tokens, next.input_tokens),
             output_tokens: pick(self.output_tokens, next.output_tokens),
             cached_input_tokens: pick(self.cached_input_tokens, next.cached_input_tokens),
-            cached_output_tokens: pick(self.cached_output_tokens, next.cached_output_tokens),
         }
     }
 }
@@ -798,13 +797,11 @@ mod tests {
             input_tokens: 2195,
             output_tokens: 1,
             cached_input_tokens: 2000,
-            cached_output_tokens: 0,
         };
         let delta = TokenUsage {
             input_tokens: 0,
             output_tokens: 89,
             cached_input_tokens: 0,
-            cached_output_tokens: 0,
         };
         let merged = start.merge(delta);
         assert_eq!(merged.input_tokens, 2195);
@@ -823,7 +820,6 @@ mod tests {
                 input_tokens: 2195,
                 output_tokens: 1,
                 cached_input_tokens: 2000,
-                cached_output_tokens: 0,
             })),
             Ok(MessagePart::ContentStart(ContentStart::Text { index: 0 })),
             Ok(MessagePart::ContentDelta(ContentDelta::Text {
@@ -834,7 +830,6 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 89,
                 cached_input_tokens: 0,
-                cached_output_tokens: 0,
             })),
             Ok(MessagePart::TurnEndReason(TurnEndReason::EndTurn)),
         ];
