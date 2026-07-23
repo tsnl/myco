@@ -1,4 +1,4 @@
-//! Root-only tool: session metadata + agent-process meta (executable path).
+//! Root-only tool: session metadata + agent-process meta (executable path, pid).
 //!
 //! Installed on the in-process local worker only (not remotes). Bound to the
 //! interactive process's [`ActiveSession`].
@@ -37,6 +37,10 @@ Actions (`action` is required):
 - executable_path: absolute path of the running `myco` agent binary
   (`std::env::current_exe`). Use with bash (`$path --version`) to read the package
   version when deciding how to update remotes (see manual `harness-ops`).
+- pid: OS process id of the running `myco` agent process (`std::process::id`).
+  All agents in this process (root and subagents) share it. Use with bash to
+  inspect the live process (`ps -p $pid`, `/proc/$pid`) — e.g. memory use or
+  open files — without guessing which `myco` is you.
 
 Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
 the real task is clear (usually first turn), set_title a short scannable label — replace a
@@ -102,6 +106,7 @@ impl SessionMetaTool {
             ActionKind::AddLink => self.action_add_link(input),
             ActionKind::RemoveLink => self.action_remove_link(input),
             ActionKind::ExecutablePath => self.action_executable_path(),
+            ActionKind::Pid => Ok(format!("{}\n", std::process::id())),
         }
     }
 
@@ -327,6 +332,7 @@ enum ActionKind {
     AddLink,
     RemoveLink,
     ExecutablePath,
+    Pid,
 }
 
 #[derive(
@@ -444,7 +450,8 @@ mod tests {
                 "set_scratchpad",
                 "add_link",
                 "remove_link",
-                "executable_path"
+                "executable_path",
+                "pid"
             ]),
             "{text}"
         );
@@ -606,5 +613,26 @@ mod tests {
         unsafe {
             std::env::remove_var("MYCO_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn pid_matches_current_process_id() {
+        let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
+        let got = Arc::new(tool)
+            .dispatch_tool_use(
+                generative_model::ToolUse {
+                    id: "t1".into(),
+                    name: "session_meta".into(),
+                    input: serde_json::json!({"action": "pid"}),
+                },
+                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+            )
+            .await;
+        assert!(!got.is_error, "{got:?}");
+        assert_eq!(
+            result_text(&got).trim().parse::<u32>().ok(),
+            Some(std::process::id()),
+            "{got:?}"
+        );
     }
 }
