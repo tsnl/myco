@@ -1,42 +1,36 @@
-//! Root-only tool: rank recent sessions by activity and search across them.
+//! Root-only tool: recent sessions ranked by activity.
 //!
-//! Complements `session_meta` (list/links for one store) and `session_history`
-//! (drill into one transcript): this is the cross-session review surface —
-//! "what was I working on, and where did topic X come up?"
+//! Complements `session_meta` (enumeration, content search via `query`,
+//! links) and `session_history` (drill into one transcript): this view
+//! answers "what was I actually working on?" — a deep active session
+//! outranks a just-touched stub.
 
 use std::sync::Arc;
 
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult, ToolUse};
-use crate::session::{Session, SessionListEntry, format_session_list_line, list_sessions_filtered};
+use crate::session::{SessionListEntry, format_session_list_line, list_sessions_filtered};
 
-use super::session_history_service::{HARD_MAX_CHARS, preview_message};
 use super::{HostDispatchContext, ToolService};
 
 const DEFAULT_LIMIT: usize = 10;
 
 const TOOL_DESCRIPTION: &str = r#"
-Review recent sessions across the whole session store (root machine only).
-
-Actions:
-- list (default): recent sessions ranked by **activity** — a blend of update
-  recency and message count, so a deep active session outranks a just-touched
-  stub. Each line shows id, updated time, model, message count, PR/worktree
-  link counts, and a one-liner (title or first user text).
-- search: case-insensitive keyword over session titles plus message text and
-  tool names, across sessions; returns matching sessions with hit counts,
-  most hits first.
+Recent sessions ranked by **activity** — a blend of update recency and message
+count, so a deep active session outranks a just-touched stub. Each line shows
+id, updated time, model, message count, PR/worktree link counts, and a
+one-liner (title or first user text).
 
 Options: `limit` (default 10, 0 = all), `include_hidden` (subagent/compact
-sessions; default false), `query` (required for search).
+sessions; default false).
 
-To drill into one session's transcript use `session_history`; to read or edit
-links (PRs, worktrees) use `session_meta`.
+For content search across sessions use `session_meta` list with `query`; to
+drill into one session's transcript use `session_history`.
 "#;
 
-/// Cross-session activity ranking + keyword search. Root-only [`ToolService`]:
-/// installed beside `session_meta` / `session_history` on the in-process local
-/// worker, never on remotes (sessions live on the interactive machine).
+/// Activity-ranked session listing. Root-only [`ToolService`]: installed
+/// beside `session_meta` / `session_history` on the in-process local worker,
+/// never on remotes (sessions live on the interactive machine).
 #[derive(Default)]
 pub struct ListRecentService;
 
@@ -48,18 +42,30 @@ impl ListRecentService {
     fn execute(&self, input: Input) -> Result<String, String> {
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
         let include_hidden = input.include_hidden.unwrap_or(false);
-        match input.action.unwrap_or(ActionKind::List) {
-            ActionKind::List => list_ranked(limit, include_hidden),
-            ActionKind::Search => {
-                let query = input
-                    .query
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|q| !q.is_empty())
-                    .ok_or_else(|| "search requires a non-empty query".to_string())?;
-                search_sessions(query, limit, include_hidden)
-            }
+
+        // Rank over the full store, then truncate — otherwise a deep-but-older
+        // session could be cut before ranking ever sees it.
+        let entries = list_sessions_filtered(0, include_hidden)?;
+        if entries.is_empty() {
+            return Ok("no sessions found".to_string());
         }
+        let order = activity_order(&entries);
+        let shown = if limit > 0 {
+            order.len().min(limit)
+        } else {
+            order.len()
+        };
+
+        let mut out = format!(
+            "sessions: {} (showing {}, ranked by activity = recency + depth)\n",
+            entries.len(),
+            shown
+        );
+        for (row, &i) in order.iter().take(shown).enumerate() {
+            out.push_str(&format_session_list_line(row + 1, &entries[i]));
+            out.push('\n');
+        }
+        Ok(out)
     }
 }
 
@@ -90,32 +96,6 @@ impl ToolService for ListRecentService {
     }
 }
 
-fn list_ranked(limit: usize, include_hidden: bool) -> Result<String, String> {
-    // Rank over the full store, then truncate — otherwise a deep-but-older
-    // session could be cut before ranking ever sees it.
-    let entries = list_sessions_filtered(0, include_hidden)?;
-    if entries.is_empty() {
-        return Ok("no sessions found".to_string());
-    }
-    let order = activity_order(&entries);
-    let shown = if limit > 0 {
-        order.len().min(limit)
-    } else {
-        order.len()
-    };
-
-    let mut out = format!(
-        "sessions: {} (showing {}, ranked by activity = recency + depth)\n",
-        entries.len(),
-        shown
-    );
-    for (row, &i) in order.iter().take(shown).enumerate() {
-        out.push_str(&format_session_list_line(row + 1, &entries[i]));
-        out.push('\n');
-    }
-    Ok(out)
-}
-
 /// Blend recency and depth without magic constants: each session's score is
 /// its rank by `updated_at` plus its rank by `message_count` (lower = more
 /// active). Ties break toward the more recently updated session. Returns
@@ -140,79 +120,14 @@ fn activity_order(entries: &[SessionListEntry]) -> Vec<usize> {
     order
 }
 
-fn search_sessions(query: &str, limit: usize, include_hidden: bool) -> Result<String, String> {
-    let q = query.to_ascii_lowercase();
-    let entries = list_sessions_filtered(0, include_hidden)?;
-
-    let mut matches: Vec<(usize, SessionListEntry)> = Vec::new();
-    for entry in entries.iter() {
-        // Same haystack as `session_history` search (text + tool names), so
-        // a cross-session hit here is findable there too.
-        let session = match Session::load(&entry.path) {
-            Ok(s) => s,
-            Err(_) => continue, // racing writer / corrupt file: skip, like listing does
-        };
-        let mut hits = session
-            .title
-            .as_deref()
-            .map(|t| t.to_ascii_lowercase().matches(&q).count())
-            .unwrap_or(0);
-        for msg in &session.messages {
-            hits += preview_message(msg, HARD_MAX_CHARS)
-                .to_ascii_lowercase()
-                .matches(&q)
-                .count();
-        }
-        if hits > 0 {
-            matches.push((hits, entry.clone()));
-        }
-    }
-
-    matches.sort_by_key(|(hits, entry)| {
-        (
-            std::cmp::Reverse(*hits),
-            std::cmp::Reverse(entry.updated_at),
-        )
-    });
-    let shown = if limit > 0 {
-        matches.len().min(limit)
-    } else {
-        matches.len()
-    };
-
-    let mut out = format!(
-        "matches: {} of {} sessions (query={query:?}, showing {shown}, most hits first)\n",
-        matches.len(),
-        entries.len(),
-    );
-    for (row, (hits, entry)) in matches.iter().take(shown).enumerate() {
-        out.push_str(&format_session_list_line(row + 1, entry));
-        out.push_str(&format!("  hits={hits}\n"));
-    }
-    Ok(out)
-}
-
 #[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 struct Input {
-    /// Action to perform. Defaults to `list`.
-    #[serde(default)]
-    action: Option<ActionKind>,
     /// Max sessions to return (default 10; 0 = all).
     #[serde(default)]
     limit: Option<usize>,
     /// Include hidden sessions (subagents, compact workers). Default false.
     #[serde(default)]
     include_hidden: Option<bool>,
-    /// Keyword for `search` (case-insensitive substring).
-    #[serde(default)]
-    query: Option<String>,
-}
-
-#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ActionKind {
-    List,
-    Search,
 }
 
 #[cfg(test)]
@@ -220,7 +135,9 @@ mod tests {
     use super::*;
     use crate::CancelToken;
     use crate::generative_model::{Content, Message};
-    use crate::session::{LinkCounts, SessionKind, lock_myco_home_for_test, uuid_simple_hex};
+    use crate::session::{
+        LinkCounts, Session, SessionKind, lock_myco_home_for_test, uuid_simple_hex,
+    };
     use chrono::{Duration, Utc};
     use serde_json::json;
 
@@ -271,10 +188,6 @@ mod tests {
             .collect()
     }
 
-    fn ctx() -> HostDispatchContext {
-        HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new())
-    }
-
     fn saved_session(model: &str, title: &str, user_text: &str) -> Session {
         let mut s = Session::new(model);
         s.title = Some(title.to_string());
@@ -288,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_and_search_over_real_store() {
+    async fn lists_ranked_sessions_from_real_store() {
         let _guard = lock_myco_home_for_test();
         let dir = std::env::temp_dir().join(format!(
             "myco-list-recent-{}",
@@ -300,42 +213,25 @@ mod tests {
             std::env::set_var("MYCO_HOME", &dir);
         }
 
-        let cancel_fix = saved_session("m1", "host cancel work", "fix host-side cancel");
-        let unrelated = saved_session("m2", "docs pass", "tidy the readme");
+        let first = saved_session("m1", "host cancel work", "fix host-side cancel");
+        let second = saved_session("m2", "docs pass", "tidy the readme");
 
         let tool = Arc::new(ListRecentService::new());
         let list = tool
-            .clone()
             .dispatch_tool_use(
                 ToolUse {
                     id: "t1".into(),
                     name: "list_recent".into(),
                     input: json!({}),
                 },
-                ctx(),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!list.is_error, "{list:?}");
         let text = tool_text(&list);
-        assert!(text.contains(&cancel_fix.id), "{text}");
-        assert!(text.contains(&unrelated.id), "{text}");
-
-        let search = tool
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t2".into(),
-                    name: "list_recent".into(),
-                    input: json!({"action": "search", "query": "CANCEL"}),
-                },
-                ctx(),
-            )
-            .await;
-        assert!(!search.is_error, "{search:?}");
-        let text = tool_text(&search);
-        // Title + message hit, case-insensitive; unrelated session absent.
-        assert!(text.contains(&cancel_fix.id), "{text}");
-        assert!(text.contains("hits=2"), "{text}");
-        assert!(!text.contains(&unrelated.id), "{text}");
+        assert!(text.contains(&first.id), "{text}");
+        assert!(text.contains(&second.id), "{text}");
+        assert!(text.contains("ranked by activity"), "{text}");
 
         // SAFETY: test-only env cleanup; still under the myco-home lock.
         unsafe {
