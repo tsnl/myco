@@ -256,6 +256,23 @@ pub fn ensure_assistant(
     Ok(())
 }
 
+/// `[N image(s) attached]` note for a user message carrying images; `None`
+/// when it has none. Image bytes are never printed. The live echo and replay
+/// both print this line directly under the wrapped user text, so the two
+/// paths stay byte-identical (the `@path` mentions in the text carry the
+/// filenames).
+pub fn attachment_note(content: &[Content]) -> Option<String> {
+    let images = content
+        .iter()
+        .filter(|c| matches!(c, Content::Image { .. }))
+        .count();
+    match images {
+        0 => None,
+        1 => Some("[1 image attached]".into()),
+        n => Some(format!("[{n} images attached]")),
+    }
+}
+
 /// Replay saved messages with the same section layout as the live REPL.
 ///
 /// Only USER / ASSISTANT headers. Thinking summaries and tools are paragraphs
@@ -282,7 +299,8 @@ pub fn write_session_history(
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                if text.is_empty() {
+                let note = attachment_note(content);
+                if text.is_empty() && note.is_none() {
                     continue;
                 }
                 writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
@@ -290,10 +308,15 @@ pub fn write_session_history(
                 writeln!(out)?;
                 // Wrap-only (no markdown styling): the user's own words replay
                 // as typed, at the transcript width — same as the live echo.
-                write_block(
-                    out,
-                    &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
-                )?;
+                if !text.is_empty() {
+                    write_block(
+                        out,
+                        &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
+                    )?;
+                }
+                if let Some(note) = note {
+                    writeln!(out, "{note}")?;
+                }
                 // Next assistant turn opens a fresh ASSISTANT section.
                 assistant_open = false;
                 need_blank = false;
@@ -573,6 +596,43 @@ mod tests {
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
+    }
+
+    #[test]
+    fn attachment_note_counts_and_pluralizes() {
+        let text = Content::Text { text: "hi".into() };
+        let image = Content::Image {
+            source: "data:image/png;base64,AA".into(),
+        };
+        assert_eq!(attachment_note(std::slice::from_ref(&text)), None);
+        assert_eq!(
+            attachment_note(&[image.clone(), text.clone()]).as_deref(),
+            Some("[1 image attached]")
+        );
+        assert_eq!(
+            attachment_note(&[image.clone(), image, text]).as_deref(),
+            Some("[2 images attached]")
+        );
+    }
+
+    #[test]
+    fn user_images_replay_as_count_placeholder() {
+        let messages = vec![Message::UserMessage {
+            content: vec![
+                Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                },
+                Content::Text {
+                    text: "look at @shot.png".into(),
+                },
+            ],
+        }];
+        let mut buf = Vec::new();
+        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("look at @shot.png\n[1 image attached]\n"));
+        // The base64 payload never hits the terminal.
+        assert!(!rendered.contains("AAAA"));
     }
 
     #[test]

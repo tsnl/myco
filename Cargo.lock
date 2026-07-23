@@ -1861,6 +1861,7 @@ name = "myco"
 version = "0.3.0"
 dependencies = [
  "atomic-write-file",
+ "base64 0.22.1",
  "candle-core",
  "candle-nn",
  "candle-transformers",

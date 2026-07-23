@@ -24,6 +24,14 @@ plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
+Mentioning `@<path>` in a message attaches that file as image input (extensions
+png/jpg/jpeg/gif/webp, up to 5 MiB each; whitespace-delimited, so paths with
+spaces are unsupported; `~/` expands). The text is sent exactly as typed — the
+`@` mentions stay in it — and a `[N image(s) attached]` note prints directly
+under the wrapped input, identical live and in replay (`/resume`, Ctrl-L); the
+image bytes are never printed. A bad path opens an ERROR section before the
+model is called; nothing is silently dropped.
+
 ### Session browser
 
 Bare `/resume` opens an fzf picker over visible sessions (fuzzy search on

@@ -15,10 +15,11 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
-    Session, SessionListEntry, banner_rule, compact_session, compact_subagent_prompt,
-    format_session_detail, format_session_list_line, format_tool_invocation, link_compact_pair,
-    list_sessions, print_session_history, render_block, resolve_and_load_session, section_rule,
-    usage_line, user_header_line, user_rule, write_error_section,
+    Session, SessionListEntry, attachment_note, banner_rule, compact_session,
+    compact_subagent_prompt, expand_image_attachments, format_session_detail,
+    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
+    print_session_history, render_block, resolve_and_load_session, section_rule, usage_line,
+    user_header_line, user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
@@ -746,6 +747,26 @@ async fn run_user_turn(
     if let Err(e) = save_readline_history(editor, session) {
         eprintln!("warning: could not save history: {e}");
     }
+    // `@path.png` mentions attach images. A bad path aborts the turn before the
+    // model is called (headed ERROR section, like generate failures) so the
+    // user can fix the path and resubmit — nothing is silently dropped.
+    let content = match expand_image_attachments(&input) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut block = Vec::new();
+            let _ = write_error_section(&mut block, &e, palette);
+            emit_mirrored(console, &block);
+            println!();
+            console.append("\n");
+            return;
+        }
+    };
+    // Same note, same position as replay: directly under the wrapped input.
+    if let Some(note) = attachment_note(&content) {
+        println!("{note}");
+        console.append(&note);
+        console.append("\n");
+    }
     if let Err(e) = session.maybe_auto_title_from_user_text(&input) {
         eprintln!("warning: could not auto-title session: {e}");
     }
@@ -764,10 +785,7 @@ async fn run_user_turn(
     });
 
     // First assistant section opens with its own blank line + thin rule + header.
-    match agent
-        .interact(vec![Content::Text { text: input }], cancel)
-        .await
-    {
+    match agent.interact(content, cancel).await {
         Ok(_) => {
             println!();
             console.append("\n");
@@ -1177,6 +1195,12 @@ Shortcuts:
   Ctrl-C                Cancel current line at prompt; cancel in-flight turn while running
   Ctrl-L                Clear scrollback and reprint the conversation (empty prompt only)
   Ctrl-D                Save and quit
+
+Images:
+  Mention @path in a message to attach that image file as model input, e.g.
+  `what is wrong here? @ui/shot.png`. Extensions png/jpg/jpeg/gif/webp, up to
+  5 MiB each, `~/` expands, paths with spaces unsupported. The text is sent as
+  typed; a bad path errors before the model is called.
 
 Thinking/reasoning is always requested (default effort=high). The UI shows a
 `Thinking: …` summary inside ASSISTANT; it is stored in session history for
