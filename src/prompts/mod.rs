@@ -63,8 +63,9 @@ cleanly over one SSH connection per host with ControlMaster — see `manual` `ha
 
 Recipe: find your own session id (`session_meta` action=get), then `bash` action=start with
 `command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
-one prompt per line — each line submits a turn — and `read` until the next `USER n/m` header, which
-marks the turn boundary (colors and wrapping switch off automatically when piped). Ask for terse
+one prompt per line — each line is a self-contained turn (the newline submits it), so keep every
+prompt to a single line — and `read` until the next `USER n/m` header, which marks the turn
+boundary (colors and wrapping switch off automatically when piped). Ask for terse
 summaries; `close` the session when done. The child's session is hidden (`kind: subagent`,
 parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
 get-by-id or `list` with `include_hidden: true`.
@@ -185,6 +186,8 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
+        // Nested-agent recipe: prompts are single-line, self-contained turns.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("self-contained turn"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
