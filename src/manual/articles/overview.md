@@ -25,7 +25,9 @@ myco (interactive) / Agent
 - **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
   session **on the local host**, passing `--parent-session <its own session id>`, writes one
   prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
-  auto-off when piped). Nesting locally shares config, keys, network, and the session store by
+  auto-off when piped). For a single self-contained task, print mode is the one-shot form:
+  `myco -p "<task>" --parent-session <id>` runs one turn, streams the answer to stdout, and
+  exits (`session=<id>` on stderr). Nesting locally shares config, keys, network, and the session store by
   construction; the child reaches remotes through its own host pool, its session is hidden
   (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
   supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
