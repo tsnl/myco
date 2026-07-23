@@ -14,8 +14,8 @@ use crate::core::CancelToken;
 use crate::generative_model::{self, ToolUse};
 use crate::host::protocol::{Request, Response};
 use crate::tool_services::{
-    BashService, BrowserService, HostDispatchContext, ManualService, TextEditorService,
-    TextSearchToolService, ToolService,
+    BashService, BrowserService, HostDispatchContext, ListRecentService, ManualService,
+    TextEditorService, TextSearchToolService, ToolService,
 };
 
 /// Worker process: tool registry + NDJSON serve loop.
@@ -71,6 +71,7 @@ impl HostWorker {
             TextEditorService::specs(),
             ManualService::specs(),
             BrowserService::specs(),
+            ListRecentService::specs(),
             TextSearchToolService::specs(),
         ]
         .into_iter()
@@ -84,6 +85,7 @@ impl HostWorker {
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ManualService::new()) as Arc<dyn ToolService>,
             Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
+            Arc::new(ListRecentService::new()) as Arc<dyn ToolService>,
             Arc::new(search) as Arc<dyn ToolService>,
         ]
     }

@@ -31,6 +31,9 @@ pub use browser_service::BrowserService;
 pub mod text_search_tool_service;
 pub use text_search_tool_service::TextSearchToolService;
 
+pub mod list_recent_service;
+pub use list_recent_service::ListRecentService;
+
 /// Model-facing JSON Schema for a tool input type.
 ///
 /// `schemars`' default output is hostile to OpenAI-compatible gateways and
