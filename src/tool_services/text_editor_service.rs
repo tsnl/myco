@@ -2,21 +2,25 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use super::*;
+
+/// Byte cap for an unranged `view` — every sibling tool bounds its output;
+/// whole-file view of a huge log would otherwise become a giant history entry
+/// resent to the model every turn.
+const MAX_VIEW_BYTES: u64 = 256 * 1024;
 
 /// Gives agents tools to view, create, and edit files, and handle its view, str_replace, create,
 /// and insert commands.
 ///
-/// Tracks last-modified times of files the agent has read so mutations fail if the file changed on
-/// disk outside the tool (or was never read).
+/// Tracks content fingerprints of files the agent has read so mutations fail if the file changed
+/// on disk outside the tool (or was never read).
 ///
 /// Cf https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool
 #[derive(Default)]
 pub struct TextEditorService {
-    /// Paths the agent has successfully viewed/mutated → last-modified time at that moment.
-    read_files: Mutex<HashMap<PathBuf, SystemTime>>,
+    /// Paths the agent has successfully viewed/mutated → content fingerprint at that moment.
+    read_files: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl TextEditorService {
@@ -70,8 +74,15 @@ impl TextEditorService {
     }
 
     fn execute(&self, input: ParsedInput) -> generative_model::ToolResult {
+        // One guard across check + mutate + record: concurrent same-turn edits
+        // of one file serialize here, so the stamp that authorized a write can
+        // never go stale between its check and the write it authorized, and
+        // the recorded fingerprint always describes the bytes this command
+        // left behind.
+        let mut read_files = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+
         for path in input.mutated_files() {
-            if let Err(e) = self.ensure_mutated_file_already_read(&path) {
+            if let Err(e) = ensure_mutated_file_already_read(&read_files, &path) {
                 return generative_model::ToolResult::err(e);
             }
         }
@@ -91,47 +102,14 @@ impl TextEditorService {
             } => self.cmd_insert(path, *insert_line, insert_text),
         };
 
-        // On success, record LMT so subsequent tool-driven edits don't require a re-view, while
-        // external on-disk changes still fail the guard.
+        // On success, record the fingerprint so subsequent tool-driven edits
+        // don't require a re-view, while external on-disk changes still fail
+        // the guard.
         if !result.is_error {
-            self.record_read_files(input.read_files());
+            record_read_files(&mut read_files, input.read_files());
         }
 
         result
-    }
-
-    fn ensure_mutated_file_already_read(&self, path: &Path) -> Result<(), String> {
-        let read_files = self
-            .read_files
-            .lock()
-            .map_err(|e| format!("read_files lock poisoned: {e}"))?;
-        let Some(last_read_lmt) = read_files.get(path) else {
-            return Err(format!(
-                "File {path:?} was not read before being mutated. Read the file first."
-            ));
-        };
-        let current_lmt = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| {
-                format!("Error getting metadata for file {path:?} to check if it was modified: {e}")
-            })?;
-        if current_lmt > *last_read_lmt {
-            return Err(format!(
-                "File {path:?} was modified on disk after being read. Read the file again before mutating."
-            ));
-        }
-        Ok(())
-    }
-
-    fn record_read_files(&self, paths: Vec<PathBuf>) {
-        let Ok(mut read_files) = self.read_files.lock() else {
-            return;
-        };
-        for path in paths {
-            if let Ok(modified_time) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-                read_files.insert(path, modified_time);
-            }
-        }
     }
 
     fn cmd_view(&self, path: &str, view_range: Option<[i64; 2]>) -> generative_model::ToolResult {
@@ -198,6 +176,43 @@ impl TextEditorService {
 // File operations
 //
 
+/// Content fingerprint for the read-stamp guard. Hashes the file bytes:
+/// mtime comparison misses external writes within the same filesystem clock
+/// granule, and byte identity is the property the guard actually promises.
+fn file_fingerprint(path: &Path) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Error reading file {path:?} to check if it was modified: {e}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn ensure_mutated_file_already_read(
+    read_files: &HashMap<PathBuf, u64>,
+    path: &Path,
+) -> Result<(), String> {
+    let Some(read_fingerprint) = read_files.get(path) else {
+        return Err(format!(
+            "File {path:?} was not read before being mutated. Read the file first."
+        ));
+    };
+    if file_fingerprint(path)? != *read_fingerprint {
+        return Err(format!(
+            "File {path:?} was modified on disk after being read. Read the file again before mutating."
+        ));
+    }
+    Ok(())
+}
+
+fn record_read_files(read_files: &mut HashMap<PathBuf, u64>, paths: Vec<PathBuf>) {
+    for path in paths {
+        if let Ok(fingerprint) = file_fingerprint(&path) {
+            read_files.insert(path, fingerprint);
+        }
+    }
+}
+
 fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String> {
     let path_buf = PathBuf::from(path);
     let metadata = std::fs::metadata(&path_buf)
@@ -251,6 +266,14 @@ fn view_file(
     let mut reader = BufReader::new(file);
 
     let Some([start, end]) = view_range else {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if len > MAX_VIEW_BYTES {
+            return Err(format!(
+                "File '{path_display}' is {len} bytes — over the {MAX_VIEW_BYTES}-byte cap for \
+                 an unranged view. Pass view_range to read a slice (e.g. [1, 400]), or search \
+                 it with bash + rg."
+            ));
+        }
         let mut data = String::new();
         reader
             .read_to_string(&mut data)
@@ -1071,12 +1094,9 @@ mod tests {
         );
         assert!(!view.is_error);
 
-        // Ensure mtime advances past the recorded read time.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Immediate external write — the guard fingerprints content, so no
+        // sleep or mtime bump is needed even on coarse filesystem clocks.
         std::fs::write(&path, "hello externally\n").unwrap();
-        // Bump mtime explicitly in case the sleep was not enough on coarse FS clocks.
-        let now = SystemTime::now() + std::time::Duration::from_secs(2);
-        filetime_set_mtime(&path, now);
 
         let edit = dispatch(
             &harness,
@@ -1149,9 +1169,33 @@ mod tests {
         assert!(result_text(&result).contains("already exists"));
     }
 
-    /// Set mtime without depending on the `filetime` crate.
-    fn filetime_set_mtime(path: &Path, time: SystemTime) {
-        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        file.set_modified(time).unwrap();
+    /// Unranged view of an over-cap file must refuse with a pointer at
+    /// view_range instead of dumping the whole file into context.
+    #[test]
+    fn unranged_view_of_huge_file_is_capped() {
+        let tmp = temp_dir();
+        let big = "x".repeat((MAX_VIEW_BYTES + 1) as usize);
+        let path = write_file(&tmp.0, "huge.log", &big);
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: path.to_string_lossy().into(),
+                view_range: None,
+            },
+        );
+        assert!(view.is_error, "{}", result_text(&view));
+        assert!(result_text(&view).contains("view_range"), "{}", result_text(&view));
+
+        // A ranged view of the same file still works.
+        let ranged = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: path.to_string_lossy().into(),
+                view_range: Some([1, 1]),
+            },
+        );
+        assert!(!ranged.is_error, "{}", result_text(&ranged));
     }
 }
