@@ -138,6 +138,11 @@ impl EventSink for NullEventSink {
 /// it must never be the snapshot a context fork inherits.
 pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
 
+/// How long a cancelled tool dispatch may keep running to do its own
+/// cleanup (process-group kill, buffer drain) before the agent abandons it
+/// and records a synthetic cancelled result.
+const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct Agent {
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
@@ -385,18 +390,26 @@ impl Agent {
             cancel.clone(),
         );
 
-        // Race cancel vs tool. Dropping a host call mid-flight is safe: Host
-        // pipelines on one host worker process and demuxes by correlation id, so
-        // cancel/drop only abandons this waiter (orphan replies discarded)
-        // without desyncing the pipe or killing sibling in-flight tools.
-        // Local tools that observe the cancel token return promptly; others
-        // are aborted by drop.
+        // Race cancel vs tool — but on cancel, give the dispatch a short grace
+        // window instead of dropping it immediately. Cancel-aware tools use it
+        // to run their own cleanup and return an honest partial result: bash
+        // kills the exec's whole process group (kill_on_drop alone SIGKILLs
+        // only the leader, orphaning grandchildren), drains its capture tasks,
+        // and a mid-write bash session gets its taken ChildStdin back instead
+        // of having it dropped (which would close the session's stdin for
+        // good). Tools that ignore cancel are abandoned when the grace
+        // expires; for subprocess hosts that only abandons this waiter —
+        // the pipe demuxes by correlation id, so siblings are unaffected.
+        let mut work = std::pin::pin!(work);
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                ToolResult::err("cancelled").with_id(tool_use.id.clone())
+                match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
+                    Ok(result) => result,
+                    Err(_) => ToolResult::err("cancelled").with_id(tool_use.id.clone()),
+                }
             }
-            result = work => result,
+            result = &mut work => result,
         };
 
         self.sink.emit(AgentEvent::ToolFinished {
@@ -955,9 +968,11 @@ mod tests {
             .expect_err("should cancel");
         let elapsed = t0.elapsed();
         assert!(matches!(err, AgentInteractionError::Cancelled));
+        // A cancel-ignoring tool is abandoned after CANCEL_TOOL_GRACE — the
+        // turn must end well before the tool's own 5s delay.
         assert!(
-            elapsed < Duration::from_secs(2),
-            "should not wait full tool delay, took {elapsed:?}"
+            elapsed < Duration::from_secs(4),
+            "should wait only the cancel grace, not the full tool delay, took {elapsed:?}"
         );
 
         // user + assistant(tool_use) + tool_results (cancelled)
