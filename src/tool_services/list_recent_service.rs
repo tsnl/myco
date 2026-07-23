@@ -1,39 +1,42 @@
-//! Host tool service: list and rank recent sessions by activity.
+//! Root-only tool: rank recent sessions by activity and search across them.
+//!
+//! Complements `session_meta` (list/links for one store) and `session_history`
+//! (drill into one transcript): this is the cross-session review surface —
+//! "what was I working on, and where did topic X come up?"
 
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
-
-use chrono::{DateTime, Utc};
-use serde_json::json;
 
 use crate::core::Async;
-use crate::generative_model::{self, ToolResult};
-use crate::session::{self, Session, SessionKind};
+use crate::generative_model::{self, ToolResult, ToolUse};
+use crate::session::{Session, SessionListEntry, format_session_list_line, list_sessions_filtered};
 
+use super::session_history_service::{HARD_MAX_CHARS, preview_message};
 use super::{HostDispatchContext, ToolService};
 
+const DEFAULT_LIMIT: usize = 10;
+
 const TOOL_DESCRIPTION: &str = r#"
-List and rank recent sessions by activity (modification time + message count).
-Extract statistics, search by keywords, and cross-reference with work items.
+Review recent sessions across the whole session store (root machine only).
 
 Actions:
-- list (default): rank recent sessions by activity score (mtime + message count).
-  Returns id, title, message count, model, and time span for each session.
-- search: filter sessions by keyword in title or recent messages (case-insensitive).
-- stats: detailed statistics for a single session (message types, tool uses, models).
+- list (default): recent sessions ranked by **activity** — a blend of update
+  recency and message count, so a deep active session outranks a just-touched
+  stub. Each line shows id, updated time, model, message count, PR/worktree
+  link counts, and a one-liner (title or first user text).
+- search: case-insensitive keyword over session titles plus message text and
+  tool names, across sessions; returns matching sessions with hit counts,
+  most hits first.
 
-Typical workflow:
-1. Use `list` to see recent sessions ranked by activity.
-2. Use `search` with a keyword to find related work.
-3. Use `stats` on a specific session to audit execution and resource usage.
+Options: `limit` (default 10, 0 = all), `include_hidden` (subagent/compact
+sessions; default false), `query` (required for search).
 
-Session ranking combines recency (mtime) and conversation depth (message count)
-into an activity score — active, deep sessions bubble to the top.
+To drill into one session's transcript use `session_history`; to read or edit
+links (PRs, worktrees) use `session_meta`.
 "#;
 
-/// List and rank sessions by activity. Implements [`ToolService`].
+/// Cross-session activity ranking + keyword search. Root-only [`ToolService`]:
+/// installed beside `session_meta` / `session_history` on the in-process local
+/// worker, never on remotes (sessions live on the interactive machine).
 #[derive(Default)]
 pub struct ListRecentService;
 
@@ -42,287 +45,42 @@ impl ListRecentService {
         Self
     }
 
-    fn session_dir() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        home.join(".myco/session")
-    }
-
-    fn read_sessions() -> Result<Vec<(PathBuf, Session)>, String> {
-        let dir = Self::session_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = Vec::new();
-
-        for entry in fs::read_dir(&dir).map_err(|e| format!("failed to read session dir: {e}"))? {
-            let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
-            let path = entry.path();
-
-            if !path.is_dir() {
-                continue;
-            }
-
-            for sub_entry in fs::read_dir(&path)
-                .map_err(|e| format!("failed to read shard dir: {e}"))? {
-                let sub_entry =
-                    sub_entry.map_err(|e| format!("read_dir sub-entry: {e}"))?;
-                let file_path = sub_entry.path();
-
-                if file_path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-
-                match fs::read_to_string(&file_path) {
-                    Ok(content) => {
-                        match serde_json::from_str::<Session>(&content) {
-                            Ok(session) => {
-                                sessions.push((file_path, session));
-                            }
-                            Err(_) => {
-                                // Skip malformed session files
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Skip unreadable files
-                    }
-                }
-            }
-        }
-
-        Ok(sessions)
-    }
-
-    fn mtime_for_path(path: &Path) -> Option<u64> {
-        fs::metadata(path)
-            .ok()?
-            .modified()
-            .ok()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-    }
-
-    fn activity_score(mtime_secs: u64, message_count: usize) -> f64 {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let age_hours = (now.saturating_sub(mtime_secs)) as f64 / 3600.0;
-        let recency_score = (-(age_hours / 24.0)).exp(); // decays over days
-
-        let depth_score = (message_count as f64).ln() + 1.0; // log of message count
-
-        recency_score * 0.7 + (depth_score / 10.0) * 0.3
-    }
-
-    fn format_duration(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-        let duration = end
-            .signed_duration_since(start)
-            .to_std()
-            .unwrap_or_default();
-        let hours = duration.as_secs() / 3600;
-        let minutes = (duration.as_secs() % 3600) / 60;
-
-        if hours > 0 {
-            format!("{}h {}m", hours, minutes)
-        } else if minutes > 0 {
-            format!("{}m", minutes)
-        } else {
-            "< 1m".to_string()
-        }
-    }
-
     fn execute(&self, input: Input) -> Result<String, String> {
-        let action = input.action.unwrap_or(ActionKind::List);
-        match action {
-            ActionKind::List => self.execute_list(input.limit),
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+        let include_hidden = input.include_hidden.unwrap_or(false);
+        match input.action.unwrap_or(ActionKind::List) {
+            ActionKind::List => list_ranked(limit, include_hidden),
             ActionKind::Search => {
-                let keyword = input
-                    .keyword
-                    .ok_or_else(|| "search requires keyword parameter".to_string())?;
-                self.execute_search(&keyword)
-            }
-            ActionKind::Stats => {
-                let id = input
-                    .id
-                    .ok_or_else(|| "stats requires id parameter".to_string())?;
-                self.execute_stats(&id)
+                let query = input
+                    .query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                    .ok_or_else(|| "search requires a non-empty query".to_string())?;
+                search_sessions(query, limit, include_hidden)
             }
         }
-    }
-
-    fn execute_list(&self, limit: Option<usize>) -> Result<String, String> {
-        let limit = limit.unwrap_or(10);
-        let mut sessions = Self::read_sessions()?;
-
-        // Sort by activity score (descending)
-        sessions.sort_by(|(path_a, session_a), (path_b, session_b)| {
-            let mtime_a = Self::mtime_for_path(path_a).unwrap_or(0);
-            let mtime_b = Self::mtime_for_path(path_b).unwrap_or(0);
-            let score_a = Self::activity_score(mtime_a, session_a.messages.len());
-            let score_b = Self::activity_score(mtime_b, session_b.messages.len());
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut output = String::from("# Recent Sessions\n\n");
-        output.push_str("| ID | Title | Msgs | Model | Duration | Kind |\n");
-        output.push_str("|---|---|---|---|---|---|\n");
-
-        for (_, session) in sessions.iter().take(limit) {
-            let id = session.id.chars().take(8).collect::<String>();
-            let title = session
-                .title
-                .as_deref()
-                .unwrap_or("(untitled)")
-                .chars()
-                .take(40)
-                .collect::<String>();
-            let msg_count = session.messages.len();
-            let duration = Self::format_duration(session.created_at, session.updated_at);
-            let kind = if session.kind.is_user() {
-                ""
-            } else {
-                &format!(" ({})", session.kind)
-            };
-
-            output.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} |{}|\n",
-                id, title, msg_count, session.model, duration, kind
-            ));
-        }
-
-        Ok(output)
-    }
-
-    fn execute_search(&self, keyword: &str) -> Result<String, String> {
-        let sessions = Self::read_sessions()?;
-        let keyword_lower = keyword.to_lowercase();
-
-        let mut matches = Vec::new();
-
-        for (_, session) in sessions {
-            let title_match = session
-                .title
-                .as_ref()
-                .map(|t| t.to_lowercase().contains(&keyword_lower))
-                .unwrap_or(false);
-
-            let recent_text = session
-                .messages
-                .iter()
-                .rev()
-                .take(5)
-                .map(|m| m.to_string())
-                .collect::<String>()
-                .to_lowercase();
-            let text_match = recent_text.contains(&keyword_lower);
-
-            if title_match || text_match {
-                matches.push(session);
-            }
-        }
-
-        if matches.is_empty() {
-            return Ok(format!("No sessions found matching '{}'", keyword));
-        }
-
-        let mut output = format!("# Sessions matching '{}'\n\n", keyword);
-        output.push_str("| ID | Title | Msgs |\n");
-        output.push_str("|---|---|---|\n");
-
-        for session in matches {
-            let id = session.id.chars().take(8).collect::<String>();
-            let title = session
-                .title
-                .as_deref()
-                .unwrap_or("(untitled)")
-                .chars()
-                .take(40)
-                .collect::<String>();
-            let msg_count = session.messages.len();
-
-            output.push_str(&format!("| `{}` | {} | {} |\n", id, title, msg_count));
-        }
-
-        Ok(output)
-    }
-
-    fn execute_stats(&self, id: &str) -> Result<String, String> {
-        let sessions = Self::read_sessions()?;
-
-        let (_, session) = sessions
-            .into_iter()
-            .find(|(_, s)| s.id.starts_with(id))
-            .ok_or_else(|| format!("session '{}' not found", id))?;
-
-        let mut output = String::new();
-        output.push_str(&format!("# Session: {}\n\n", session.id.chars().take(8).collect::<String>()));
-
-        if let Some(title) = &session.title {
-            output.push_str(&format!("**Title:** {}\n\n", title));
-        }
-
-        output.push_str(&format!("**Model:** {}\n", session.model));
-        output.push_str(&format!("**Created:** {}\n", session.created_at));
-        output.push_str(&format!("**Updated:** {}\n", session.updated_at));
-        output.push_str(&format!("**Duration:** {}\n\n", Self::format_duration(session.created_at, session.updated_at)));
-
-        // Message breakdown
-        let user_msgs = session.messages.iter().filter(|m| m.role == "user").count();
-        let assistant_msgs = session.messages.iter().filter(|m| m.role == "assistant").count();
-        let tool_results = session.messages.iter().filter(|m| m.role == "tool").count();
-
-        output.push_str(&format!(
-            "**Messages:** {} total (user: {}, assistant: {}, tool: {})\n\n",
-            session.messages.len(),
-            user_msgs,
-            assistant_msgs,
-            tool_results
-        ));
-
-        // Tool usage count
-        let tool_uses = session.messages
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .filter(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-            .count();
-
-        output.push_str(&format!("**Tool uses:** {}\n", tool_uses));
-
-        Ok(output)
     }
 }
 
-impl ListRecentService {
-    /// Tool schemas served by this service (static: no instance required).
-    pub fn specs() -> Vec<generative_model::ToolSpec> {
+impl ToolService for ListRecentService {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "list_recent".to_string(),
             description: TOOL_DESCRIPTION.to_string(),
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
-}
-
-impl ToolService for ListRecentService {
-    fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
-        Self::specs()
-    }
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: generative_model::ToolUse,
+        tool_use: ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<generative_model::ToolResult> {
+    ) -> Async<ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input.clone()) {
                 Ok(v) => v,
-                Err(e) => {
-                    return ToolResult::err(format!("invalid list_recent input: {e}"));
-                }
+                Err(e) => return ToolResult::err(format!("invalid list_recent input: {e}")),
             };
             match self.execute(input) {
                 Ok(text) => ToolResult::text(text),
@@ -332,71 +90,256 @@ impl ToolService for ListRecentService {
     }
 }
 
+fn list_ranked(limit: usize, include_hidden: bool) -> Result<String, String> {
+    // Rank over the full store, then truncate — otherwise a deep-but-older
+    // session could be cut before ranking ever sees it.
+    let entries = list_sessions_filtered(0, include_hidden)?;
+    if entries.is_empty() {
+        return Ok("no sessions found".to_string());
+    }
+    let order = activity_order(&entries);
+    let shown = if limit > 0 {
+        order.len().min(limit)
+    } else {
+        order.len()
+    };
+
+    let mut out = format!(
+        "sessions: {} (showing {}, ranked by activity = recency + depth)\n",
+        entries.len(),
+        shown
+    );
+    for (row, &i) in order.iter().take(shown).enumerate() {
+        out.push_str(&format_session_list_line(row + 1, &entries[i]));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Blend recency and depth without magic constants: each session's score is
+/// its rank by `updated_at` plus its rank by `message_count` (lower = more
+/// active). Ties break toward the more recently updated session. Returns
+/// indices into `entries` in display order.
+fn activity_order(entries: &[SessionListEntry]) -> Vec<usize> {
+    let mut score = vec![0usize; entries.len()];
+
+    let mut by_recency: Vec<usize> = (0..entries.len()).collect();
+    by_recency.sort_by_key(|&i| std::cmp::Reverse(entries[i].updated_at));
+    for (rank, &i) in by_recency.iter().enumerate() {
+        score[i] += rank;
+    }
+
+    let mut by_depth: Vec<usize> = (0..entries.len()).collect();
+    by_depth.sort_by_key(|&i| std::cmp::Reverse(entries[i].message_count));
+    for (rank, &i) in by_depth.iter().enumerate() {
+        score[i] += rank;
+    }
+
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (score[i], std::cmp::Reverse(entries[i].updated_at)));
+    order
+}
+
+fn search_sessions(query: &str, limit: usize, include_hidden: bool) -> Result<String, String> {
+    let q = query.to_ascii_lowercase();
+    let entries = list_sessions_filtered(0, include_hidden)?;
+
+    let mut matches: Vec<(usize, SessionListEntry)> = Vec::new();
+    for entry in entries.iter() {
+        // Same haystack as `session_history` search (text + tool names), so
+        // a cross-session hit here is findable there too.
+        let session = match Session::load(&entry.path) {
+            Ok(s) => s,
+            Err(_) => continue, // racing writer / corrupt file: skip, like listing does
+        };
+        let mut hits = session
+            .title
+            .as_deref()
+            .map(|t| t.to_ascii_lowercase().matches(&q).count())
+            .unwrap_or(0);
+        for msg in &session.messages {
+            hits += preview_message(msg, HARD_MAX_CHARS)
+                .to_ascii_lowercase()
+                .matches(&q)
+                .count();
+        }
+        if hits > 0 {
+            matches.push((hits, entry.clone()));
+        }
+    }
+
+    matches.sort_by_key(|(hits, entry)| {
+        (
+            std::cmp::Reverse(*hits),
+            std::cmp::Reverse(entry.updated_at),
+        )
+    });
+    let shown = if limit > 0 {
+        matches.len().min(limit)
+    } else {
+        matches.len()
+    };
+
+    let mut out = format!(
+        "matches: {} of {} sessions (query={query:?}, showing {shown}, most hits first)\n",
+        matches.len(),
+        entries.len(),
+    );
+    for (row, (hits, entry)) in matches.iter().take(shown).enumerate() {
+        out.push_str(&format_session_list_line(row + 1, entry));
+        out.push_str(&format!("  hits={hits}\n"));
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 struct Input {
     /// Action to perform. Defaults to `list`.
     #[serde(default)]
     action: Option<ActionKind>,
-    /// Maximum sessions to return for `list`. Defaults to 10.
+    /// Max sessions to return (default 10; 0 = all).
     #[serde(default)]
     limit: Option<usize>,
-    /// Keyword to search for in `search` action.
+    /// Include hidden sessions (subagents, compact workers). Default false.
     #[serde(default)]
-    keyword: Option<String>,
-    /// Session id (or prefix) for `stats` action.
+    include_hidden: Option<bool>,
+    /// Keyword for `search` (case-insensitive substring).
     #[serde(default)]
-    id: Option<String>,
+    query: Option<String>,
 }
 
-#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ActionKind {
     List,
     Search,
-    Stats,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CancelToken;
-    use crate::generative_model::ToolUse;
+    use crate::generative_model::{Content, Message};
+    use crate::session::{LinkCounts, SessionKind, lock_myco_home_for_test, uuid_simple_hex};
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
-    fn tool_text(r: &generative_model::ToolResult) -> String {
+    fn entry(id: &str, updated_minutes_ago: i64, message_count: usize) -> SessionListEntry {
+        let updated_at = Utc::now() - Duration::minutes(updated_minutes_ago);
+        SessionListEntry {
+            id: id.to_string(),
+            path: std::path::PathBuf::from(format!("/dev/null/{id}")),
+            created_at: updated_at,
+            updated_at,
+            model: "m".into(),
+            message_count,
+            title: None,
+            snippet: String::new(),
+            link_counts: LinkCounts::default(),
+            kind: SessionKind::User,
+            parent_session_id: None,
+        }
+    }
+
+    #[test]
+    fn activity_blend_prefers_deep_recent_over_fresh_stub() {
+        // A: brand-new 1-message stub; B: slightly older but deep; C: old + shallow.
+        let entries = vec![
+            entry("aaaa", 0, 1),
+            entry("bbbb", 10, 100),
+            entry("cccc", 60, 50),
+        ];
+        let order = activity_order(&entries);
+        let ids: Vec<&str> = order.iter().map(|&i| entries[i].id.as_str()).collect();
+        assert_eq!(ids, ["bbbb", "aaaa", "cccc"], "{ids:?}");
+    }
+
+    #[test]
+    fn activity_blend_breaks_ties_by_recency() {
+        let entries = vec![entry("older", 30, 5), entry("newer", 5, 5)];
+        let order = activity_order(&entries);
+        assert_eq!(entries[order[0]].id, "newer");
+    }
+
+    fn tool_text(r: &ToolResult) -> String {
         r.content
             .iter()
             .filter_map(|c| match c {
-                crate::generative_model::Content::Text { text } => Some(text.as_str()),
+                Content::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
     }
 
     fn ctx() -> HostDispatchContext {
-        HostDispatchContext {
-            agent_id: uuid::Uuid::nil(),
-            cancel: CancelToken::new(),
-            agent_root: None,
-        }
+        HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new())
+    }
+
+    fn saved_session(model: &str, title: &str, user_text: &str) -> Session {
+        let mut s = Session::new(model);
+        s.title = Some(title.to_string());
+        s.messages.push(Message::UserMessage {
+            content: vec![Content::Text {
+                text: user_text.to_string(),
+            }],
+        });
+        s.save().unwrap();
+        s
     }
 
     #[tokio::test]
-    async fn list_recent_tool() {
+    async fn list_and_search_over_real_store() {
+        let _guard = lock_myco_home_for_test();
+        let dir = std::env::temp_dir().join(format!(
+            "myco-list-recent-{}",
+            uuid_simple_hex(uuid::Uuid::new_v4())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only env override; held under the myco-home lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let cancel_fix = saved_session("m1", "host cancel work", "fix host-side cancel");
+        let unrelated = saved_session("m2", "docs pass", "tidy the readme");
+
         let tool = Arc::new(ListRecentService::new());
-        let res = tool
+        let list = tool
             .clone()
             .dispatch_tool_use(
                 ToolUse {
                     id: "t1".into(),
                     name: "list_recent".into(),
-                    input: json!({"action": "list", "limit": 5}),
+                    input: json!({}),
                 },
                 ctx(),
             )
             .await;
-        assert!(!res.is_error, "{res:?}");
-        let text = tool_text(&res);
-        assert!(text.contains("Recent Sessions") || text.is_empty(), "{text}");
+        assert!(!list.is_error, "{list:?}");
+        let text = tool_text(&list);
+        assert!(text.contains(&cancel_fix.id), "{text}");
+        assert!(text.contains(&unrelated.id), "{text}");
+
+        let search = tool
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t2".into(),
+                    name: "list_recent".into(),
+                    input: json!({"action": "search", "query": "CANCEL"}),
+                },
+                ctx(),
+            )
+            .await;
+        assert!(!search.is_error, "{search:?}");
+        let text = tool_text(&search);
+        // Title + message hit, case-insensitive; unrelated session absent.
+        assert!(text.contains(&cancel_fix.id), "{text}");
+        assert!(text.contains("hits=2"), "{text}");
+        assert!(!text.contains(&unrelated.id), "{text}");
+
+        // SAFETY: test-only env cleanup; still under the myco-home lock.
+        unsafe {
+            std::env::remove_var("MYCO_HOME");
+        }
     }
 }

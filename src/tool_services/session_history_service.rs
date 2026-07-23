@@ -9,7 +9,7 @@ use crate::session::Session;
 use super::{HostDispatchContext, ToolService};
 
 const DEFAULT_MAX_CHARS: usize = 2_000;
-const HARD_MAX_CHARS: usize = 32_000;
+pub(crate) const HARD_MAX_CHARS: usize = 32_000;
 
 fn tool_description() -> String {
     format!(
@@ -285,7 +285,9 @@ fn message_kind(msg: &Message) -> &'static str {
     }
 }
 
-fn preview_message(msg: &Message, max_chars: usize) -> String {
+/// Searchable/preview text for one message (also `list_recent`'s search
+/// haystack, so cross-session hits match within-session `search` here).
+pub(crate) fn preview_message(msg: &Message, max_chars: usize) -> String {
     match msg {
         Message::UserMessage { content } => truncate(&content_text(content), max_chars),
         Message::AssistantMessage {

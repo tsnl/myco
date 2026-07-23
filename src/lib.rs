@@ -30,6 +30,6 @@ pub use session::{
 };
 pub use text_search::TextSearchEngine;
 pub use tool_services::{
-    BrowserService, HostDispatchContext, ManualService, SessionHistoryTool, SessionMetaTool,
-    TextSearchToolService, ToolService,
+    BrowserService, HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool,
+    SessionMetaTool, TextSearchToolService, ToolService,
 };

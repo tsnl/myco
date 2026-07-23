@@ -21,9 +21,9 @@ use myco::session::{
     user_rule, write_error_section,
 };
 use myco::{
-    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
-    SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight, TraceContext, WrapMode,
-    prompts, uuid_simple_hex,
+    Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
+    ListRecentService, NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool,
+    StartupPreflight, TraceContext, WrapMode, prompts, uuid_simple_hex,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -241,9 +241,10 @@ async fn run_interactive(args: Args) {
     let session_tool =
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
+    let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
     let harness = Harness::attach_with_root_services(
         app_config.harness.clone(),
-        vec![session_tool, history_tool],
+        vec![session_tool, history_tool, list_recent_tool],
     )
     .await
     .unwrap_or_else(|e| {
