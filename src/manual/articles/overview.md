@@ -39,7 +39,7 @@ myco (interactive) / Agent
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
+| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt (see below). |
 

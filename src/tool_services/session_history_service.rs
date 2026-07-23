@@ -27,6 +27,7 @@ Actions:
   Used by compaction workers; prefer this over free-form filesystem writes.
 
 Do not dump entire long sessions into context — use stats/search/range, expand only what you need.
+Raw session files are minified single-line JSON — prefer this tool (or `jq`) over `cat`/`grep`.
 "#
     )
 }
