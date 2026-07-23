@@ -12,7 +12,6 @@ agent laptop.
 **Required**
 
 - **`ssh`** — attaches remotes (`ssh … myco --mode host` over NDJSON) and is used for install/diagnose over SSH.
-- **`lynx`** — powers the `lynx_tui_browser` host tool (`lynx -dump` plaintext pages / search results).
 - **`uv`** — hermetic Python runs (agent computer-use norm: scripts and deps without polluting the system).
 - **`bash`** — host `bash` tool (one-shot `exec` and multi-turn shell sessions).
 
@@ -22,8 +21,7 @@ agent laptop.
 - **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
 - **`curl`** — downloading release source tarballs.
 
-Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above). Optional
-`trunk` + `wasm32-unknown-unknown` only for **`crates/myco-gui`**.
+Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above).
 
 ## Finding configured hosts
 
@@ -56,8 +54,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 For **remotes**, prefer a **same-platform binary** (release asset or build on the target)
 when you are not actively developing myco; only **build from a local git tree** when you are
 working on the myco codebase itself (unreleased commits, dirty worktree, or a feature branch
-that must ship). Embedding weights are **compiled into** `myco`, so a correct binary is enough to
-run — you do **not** deploy model files next to it. Do **not** scp/rsync a prebuilt binary
+that must ship). Do **not** scp/rsync a prebuilt binary
 across **mismatched** OS, CPU arch, or glibc (e.g. newer glibc → older cluster fails with
 `GLIBC_X.Y not found`); for those targets, compile on the machine or use a matching release.
 
@@ -167,7 +164,7 @@ When tools fail or the user asks why something is broken, investigate with tools
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
    - Startup checks expected executables on the **agent** machine (`bash`,
-     `lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
+     `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and
      reports missing ones in the startup WARNING block — the user must install
      them and restart myco. Remote hosts report missing programs as tool
      errors at call time.
