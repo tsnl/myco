@@ -18,7 +18,7 @@ use myco::session::{
     Session, SessionListEntry, banner_rule, compact_session, compact_subagent_prompt,
     format_session_detail, format_session_list_line, format_tool_invocation, link_compact_pair,
     list_sessions, print_session_history, render_block, resolve_and_load_session, section_rule,
-    user_rule, write_error_section,
+    usage_line, user_header_line, user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
@@ -85,9 +85,21 @@ struct Args {
     help_topic: Option<String>,
 
     /// Run mode. `interactive` (default) starts the agent REPL; `host` runs the
-    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via ssh).
+    /// tool runtime, speaking NDJSON over stdin/stdout (spawned locally or via
+    /// ssh); `session-browser` runs the standalone session picker.
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
+
+    /// Write the picked session id to FILE instead of stdout. Only with
+    /// `--mode session-browser`; used by the bare-/resume tmux popup handshake.
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+
+    /// With `--mode session-browser`: rank sessions matching QUERY (keyword
+    /// search over title/first message/scratchpad/console tail, semantic
+    /// fallback) instead of listing by recency.
+    #[arg(long, value_name = "QUERY")]
+    search: Option<String>,
 
     /// Host name advertised in hello_ok / logs. Only used with `--mode host`.
     #[arg(long, default_value = "local")]
@@ -105,6 +117,18 @@ struct Args {
     /// Resume a saved session (id or unique prefix). Bare `--resume` reopens the most recent.
     #[arg(long)]
     resume: Option<Option<String>>,
+
+    /// Run as a nested agent of the given supervisor session: the fresh session
+    /// is created hidden (`kind: subagent`) with this parent recorded. Used when
+    /// one myco drives another over a bash session (see `--help overview`).
+    #[arg(long, value_name = "SESSION_ID")]
+    parent_session: Option<String>,
+
+    /// With --parent-session: context fork — seed the fresh child session with
+    /// the parent's saved conversation instead of a blank context. Same
+    /// `--model` as the parent keeps the fork on the parent's prompt cache.
+    #[arg(long, requires = "parent_session")]
+    fork: bool,
 
     /// Reasoning / extended-thinking effort (low|medium|high|max). Default: high.
     /// Change mid-session with `/effort`.
@@ -146,6 +170,9 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
+    /// Standalone fzf session picker; prints the chosen id, or writes it
+    /// to `--out`.
+    SessionBrowser,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +190,16 @@ async fn main() {
     match args.mode {
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
+        Mode::SessionBrowser => run_session_browser(args),
+    }
+}
+
+/// `--mode session-browser`: standalone picker, spawned by the bare-/resume
+/// tmux popup or run directly.
+fn run_session_browser(args: Args) {
+    if let Err(e) = myco::session_browser::run(args.out.as_deref(), args.search.as_deref()) {
+        eprintln!("session browser error: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -223,9 +260,43 @@ async fn run_interactive(args: Args) {
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
+    if resuming && args.parent_session.is_some() {
+        // A resumed session already carries its kind/parent; rewriting them
+        // here would silently change a stored session's identity.
+        eprintln!("--parent-session applies only to a fresh session; drop it when resuming");
+        std::process::exit(2);
+    }
     let initial_session = match args.resume {
         Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
-        None => Session::new(model_key.clone()),
+        None => {
+            let mut fresh = Session::new(model_key.clone());
+            if let Some(parent) = args.parent_session.as_deref() {
+                let parent = parent.trim();
+                if parent.is_empty() {
+                    eprintln!("--parent-session needs a non-empty session id");
+                    std::process::exit(2);
+                }
+                if args.fork {
+                    // Context fork: seed the child with the parent's saved
+                    // conversation. Loading validates the parent (unlike the
+                    // record-only path below) and normalizes a prefix to the
+                    // full id.
+                    match Session::load_by_id_or_prefix(parent) {
+                        Ok(parent_session) => {
+                            fresh = parent_session.fork_child(model_key.clone());
+                        }
+                        Err(e) => {
+                            eprintln!("--fork: cannot load parent session {parent:?}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    fresh.kind = SessionKind::Subagent;
+                    fresh.parent_session_id = Some(parent.to_string());
+                }
+            }
+            fresh
+        }
     };
     let active_session = ActiveSession::new(initial_session);
 
@@ -285,6 +356,18 @@ async fn run_interactive(args: Args) {
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
+    // Mid-turn checkpoints: persist at well-formed boundaries (after the user
+    // message, after each completed tool round) so context forks and crash
+    // recovery see the freshest replayable snapshot, not just the last turn
+    // end. The end-of-turn force-save in run_user_turn stays the backstop.
+    {
+        let checkpoint_session = active_session.clone();
+        agent.set_checkpoint(Box::new(move |messages, last_usage| {
+            if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
+                eprintln!("warning: mid-turn session save failed: {e}");
+            }
+        }));
+    }
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -371,6 +454,7 @@ fn build_model(
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
             prompts::agent_prompt_epilogue(),
+            prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
         backend_config,
@@ -506,24 +590,20 @@ async fn run_repl(
         }
         let max = agent.context_window_tokens();
         let usage = agent.last_usage();
-        // `?` = resumed before usage was tracked; `0` = genuinely empty session.
+        // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
         let used = match usage {
-            Some(u) => u.context_tokens().to_string(),
-            None if agent.history().is_empty() => "0".to_string(),
-            None => "?".to_string(),
+            Some(u) => Some(u.context_tokens()),
+            None if agent.history().is_empty() => Some(0),
+            None => None,
         };
         let mut header = Vec::new();
         let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
-        let _ = writeln!(header, "{}", palette.user(&format!("USER {used}/{max}")));
+        let _ = writeln!(header, "{}", palette.user(&user_header_line(used, max)));
         if let Some(u) = usage {
-            let _ = writeln!(
-                header,
-                "{}",
-                palette.user(&format!(
-                    "input {}  output {}  cached input {}  cached output {}",
-                    u.input_tokens, u.output_tokens, u.cached_input_tokens, u.cached_output_tokens
-                ))
-            );
+            let _ = writeln!(header, "{}", palette.user(&usage_line(u)));
+        }
+        for line in harness.running_tool_summaries(agent.context().agent_id) {
+            let _ = writeln!(header, "{}", palette.user(&format!("● {line}")));
         }
         let _ = writeln!(header);
         emit_mirrored(&console, &header);
@@ -769,6 +849,7 @@ async fn run_compact(
              Prefer session_history over bash for reading sessions."
                 .to_string(),
             prompts::agent_prompt_epilogue(),
+            prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n\n"),
         backend_config: catalog_model.backend.clone(),
@@ -937,14 +1018,28 @@ fn handle_meta(
             let _ = session.persist_messages(agent.history(), agent.last_usage(), false);
             print!("{}", format_session_detail(&session.snapshot()));
         }
-        MetaCommand::Sessions => match list_sessions(RECENT_SESSION_LIMIT) {
-            Ok(list) => print_session_list(&list),
+        MetaCommand::Sessions => match list_sessions(0) {
+            Ok(list) => {
+                let shown = RECENT_SESSION_LIMIT.min(list.len());
+                print_session_list(&list[..shown]);
+                if list.len() > shown {
+                    println!(
+                        "  … {} more — bare /resume opens the session browser",
+                        list.len() - shown
+                    );
+                }
+            }
             Err(e) => eprintln!("Failed to list sessions: {e}"),
         },
         MetaCommand::Hosts => print_host_status(harness),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
-            session.replace(Session::new(catalog_model.spec.key.clone()));
+            // A nested run stays nested across /new: carry kind + parent lineage.
+            let snapshot = session.snapshot();
+            let mut fresh = Session::new(catalog_model.spec.key.clone());
+            fresh.kind = snapshot.kind;
+            fresh.parent_session_id = snapshot.parent_session_id.clone();
+            session.replace(fresh);
             agent.set_history(Vec::new());
             agent.set_last_usage(None);
             reload_readline_history(editor, session);
@@ -964,6 +1059,7 @@ fn handle_meta(
                     );
                     print_session_history(agent.history(), palette);
                 }
+                Err(e) if e == RESUME_CANCELLED => println!("resume cancelled"),
                 Err(e) => eprintln!("resume failed: {e}"),
             }
         }
@@ -1063,7 +1159,8 @@ Commands:
   /session              Show session metadata (title, links, scratchpad, path)
   /sessions             List recent sessions (title + link counts)
   /hosts                List configured hosts and attach status
-  /resume [id|prefix]   Resume a session (prompts if omitted)
+  /resume [id|prefix]   Resume a session (no arg: fzf browser, as a tmux
+                        popup when inside tmux)
   /new                  Start a new session (saves current; clears display)
   /effort [level]       Show or set reasoning effort (low|medium|high|max)
   /title [text]         Show or set session title (empty text clears)
@@ -1086,15 +1183,19 @@ Thinking/reasoning is always requested (default effort=high). The UI shows a
 resume but stripped from provider requests. Change effort with `/effort`.
 Generate failures open a headed ERROR section (live only; not in history).
 
-Each USER header shows `USER <used>/<max>` context tokens when the provider
-reported usage on the previous generate (0/max until then).
+Each USER header shows `USER <used>/<max> (<pct>%)` context tokens, compact
+(`63.8k/200k`; 0/max until the provider reports usage). A `⚙`-prefixed line
+carries the finished turn's token counts (input = final request's prompt,
+output summed across the turn); below it, one `●`-prefixed line per
+still-running tool (live bash session on the in-process local host) shows
+its command, uptime, and idle time.
 
 Hosts:
   Local is always enabled in-process (no subprocess). Remotes come from
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
   $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
-  and knobs (enable_subagent, attach_timeout_secs). Auth per entry: a literal
+  and knobs (attach_timeout_secs). Auth per entry: a literal
   token string or a source table (env var / file / none); see --help overview.
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host. Use /hosts to list hosts and attach status
@@ -1209,42 +1310,28 @@ fn reload_readline_history(
 // Resume: resolve id → load Session → install into agent/editor
 // ---------------------------------------------------------------------------
 
+/// Sentinel from the pickers: the user backed out, not a failure.
+const RESUME_CANCELLED: &str = "cancelled";
+
 fn resolve_resume_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
     match id_or_prefix {
         Some(id) => Session::load_by_id_or_prefix(id),
-        None => pick_session_interactively(),
+        None => {
+            let choice = if myco::session_browser::inside_tmux() {
+                match myco::session_browser::pick_via_tmux_popup() {
+                    Ok(choice) => choice,
+                    // Popup failed (e.g. tmux < 3.2); fzf still works inline.
+                    Err(_) => myco::session_browser::pick(None)?,
+                }
+            } else {
+                myco::session_browser::pick(None)?
+            };
+            match choice {
+                Some(id) => Session::load_by_id_or_prefix(&id),
+                None => Err(RESUME_CANCELLED.into()),
+            }
+        }
     }
-}
-
-fn pick_session_interactively() -> Result<Session, String> {
-    let list = list_sessions(RECENT_SESSION_LIMIT)?;
-    if list.is_empty() {
-        return Err("no sessions found under ~/.myco/session".into());
-    }
-    print_session_list(&list);
-    print!("Resume which? [id/prefix/number] (empty = most recent): ");
-    let _ = std::io::stdout().flush();
-
-    // Plain stdin read so the picker choice does not enter readline history.
-    let mut choice = String::new();
-    std::io::stdin()
-        .read_line(&mut choice)
-        .map_err(|e| e.to_string())?;
-    let choice = choice.trim();
-
-    if choice.is_empty() {
-        return Session::load(&list[0].path);
-    }
-    if let Ok(n) = choice.parse::<usize>() {
-        let idx = n
-            .checked_sub(1)
-            .ok_or_else(|| "invalid number".to_string())?;
-        let meta = list
-            .get(idx)
-            .ok_or_else(|| format!("no session numbered {n}"))?;
-        return Session::load(&meta.path);
-    }
-    Session::load_by_id_or_prefix(choice)
 }
 
 fn install_session(
@@ -1651,7 +1738,7 @@ impl EventSink for CliEventSink {
                     s.in_text_stream = false;
                 });
             }
-            // Root agent only — hide nested subagent tool spam (and other depth>0 noise).
+            // Root agent only — hide nested worker noise (depth>0, e.g. compact).
             AgentEvent::ToolStarted {
                 tool_use,
                 context: TraceContext { depth: 0, .. },

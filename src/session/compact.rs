@@ -1,7 +1,7 @@
 //! Session compaction: archive predecessor, seed successor with summary + tail.
 
 use crate::generative_model::{Content, Message};
-use crate::session::{Session, SessionKind};
+use crate::session::Session;
 
 /// Options for [`compact_session`].
 #[derive(Debug, Clone)]
@@ -57,7 +57,9 @@ pub fn compact_session(
     successor.links = predecessor.links.clone();
     successor.scratchpad = predecessor.scratchpad.clone();
     successor.predecessor_id = Some(predecessor.id.clone());
-    successor.kind = SessionKind::User;
+    // Nested (hidden) sessions stay nested across compaction; user sessions stay user.
+    successor.kind = predecessor.kind;
+    successor.parent_session_id = predecessor.parent_session_id.clone();
 
     let mut resume = String::from("# Compaction resume\n\n");
     resume.push_str(summary_markdown.trim());

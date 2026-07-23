@@ -2,7 +2,7 @@
 //!
 //! - **local**: tools run in-process via [`HostController::in_process`] (no subprocess).
 //! - **remotes**: lazy `ssh … myco --mode host` over NDJSON.
-//! - **Root-only services**: extra [`ToolService`]s (e.g. `session_meta`, `subagent`)
+//! - **Root-only services**: extra [`ToolService`]s (e.g. `session_meta`)
 //!   are installed only on the local worker at attach time — still host tools,
 //!   configured on root.
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::core::{Async, CancelToken};
 use crate::generative_model;
-use crate::session::{EventSink, TraceContext};
+use crate::session::TraceContext;
 use crate::tool_services::ToolService;
 
 mod config;
@@ -23,9 +23,6 @@ pub use config::{
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
 pub use crate::host::{HostConfig, HostController};
-
-mod subagent_service;
-pub use subagent_service::{AgentRootHandles, SubagentService};
 
 mod preflight;
 pub use preflight::{
@@ -80,22 +77,15 @@ pub struct Harness {
 pub struct HarnessConfig {
     /// Remote hosts only. Local is always added in-process by [`Harness::attach`].
     pub remote_hosts: Vec<HostConfig>,
-    /// When true (default), register [`SubagentService`] as a local tool.
-    pub enable_subagent: bool,
     /// Per-remote connect timeout in seconds on first tool use (`0` disables it).
     pub attach_timeout_secs: u64,
-    /// Resolved model catalog for subagents (`crate::config`). Empty (default)
-    /// means the `subagent` tool rejects every model key.
-    pub models: crate::generative_model::ModelCatalog,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             remote_hosts: Vec::new(),
-            enable_subagent: true,
             attach_timeout_secs: 10,
-            models: crate::generative_model::ModelCatalog::default(),
         }
     }
 }
@@ -158,10 +148,8 @@ impl Harness {
     ///
     /// Remotes start with `conn = None` and connect on first tool call (bounded by
     /// `attach_timeout_secs`). Local is ready immediately — no subprocess.
-    /// Register the always-on in-process local host and optional remotes.
     ///
-    /// When `enable_subagent` is true, installs [`SubagentService`] on the **local**
-    /// worker only. Use [`Self::attach_with_root_services`] to add more root-only services
+    /// Use [`Self::attach_with_root_services`] to add root-only services
     /// (e.g. `session_meta`).
     pub async fn attach(config: HarnessConfig) -> Result<Arc<Self>, String> {
         Self::attach_with_root_services(config, Vec::new()).await
@@ -199,15 +187,8 @@ impl Harness {
             }
         }
 
-        // Root-only extras (subagent, session_meta, …) — local only; keep their schemas.
-        let mut root_extras: Vec<Arc<dyn ToolService>> = Vec::new();
-        if config.enable_subagent {
-            root_extras
-                .push(Arc::new(SubagentService::new(config.models.clone())) as Arc<dyn ToolService>);
-        }
-        root_extras.extend(root_services);
-
-        for service in &root_extras {
+        // Root-only extras (session_meta, …) — local only; keep their schemas.
+        for service in &root_services {
             for spec in service.tool_specs() {
                 host_tool_names.insert(spec.name.clone());
                 root_only_tool_names.insert(spec.name.clone());
@@ -225,7 +206,7 @@ impl Harness {
             crate::host::HostWorker::services_with_search(
                 crate::tool_services::TextSearchToolService::with_engine(local_search.clone()),
             );
-        local_services.extend(root_extras);
+        local_services.extend(root_services);
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
         let local = HostController::in_process("local", local_worker);
@@ -262,13 +243,9 @@ impl Harness {
         self.local_search.auto_index_under(cwd);
     }
 
-    /// Test helper: attach only the in-process local host, no subagent.
+    /// Test helper: attach only the in-process local host.
     pub async fn attach_local_for_tests() -> Result<Arc<Self>, String> {
-        Self::attach(HarnessConfig {
-            enable_subagent: false,
-            ..HarnessConfig::default()
-        })
-        .await
+        Self::attach(HarnessConfig::default()).await
     }
 
     /// In-process harness for unit tests: local host only, with the given services
@@ -360,7 +337,6 @@ impl Harness {
     pub fn dispatch_tool_use(
         self: Arc<Self>,
         mut tool_use: generative_model::ToolUse,
-        sink: Arc<dyn EventSink>,
         context: TraceContext,
         cancel: CancelToken,
     ) -> Async<generative_model::ToolResult> {
@@ -399,22 +375,20 @@ impl Harness {
                 .with_id(id);
             };
 
-            // Root handles for in-process local (subagent etc.); remotes ignore.
-            let agent_root: Option<Arc<dyn std::any::Any + Send + Sync>> = if client.is_in_process()
-            {
-                Some(Arc::new(crate::harness::AgentRootHandles {
-                    harness: self.clone(),
-                    sink,
-                    context: context.clone(),
-                }) as Arc<dyn std::any::Any + Send + Sync>)
-            } else {
-                None
-            };
-
-            client
-                .call_with_root(context.agent_id, tool_use, cancel, agent_root)
-                .await
+            client.call(context.agent_id, tool_use, cancel).await
         })
+    }
+
+    /// One-line summaries of tool work still running for `agent_id` (e.g.
+    /// live bash sessions), for prompt-time display between turns. Local
+    /// (in-process) hosts only — remotes are never queried here (see
+    /// [`HostController::running_tool_summaries`]).
+    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
+        self.host_names()
+            .into_iter()
+            .filter_map(|name| self.hosts.get(&name))
+            .flat_map(|client| client.running_tool_summaries(agent_id))
+            .collect()
     }
 
     /// Notify all hosts that `agent_id`'s session ended.
@@ -664,7 +638,6 @@ mod tests {
                         "branch": "feat/x"
                     }),
                 },
-                Arc::new(crate::session::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -691,12 +664,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_is_always_present_and_connected() {
-        let harness = Harness::attach(HarnessConfig {
-            enable_subagent: false,
-            ..HarnessConfig::default()
-        })
-        .await
-        .expect("attach");
+        let harness = Harness::attach(HarnessConfig::default())
+            .await
+            .expect("attach");
         assert_eq!(harness.default_host(), "local");
         let status = harness.host_status();
         assert_eq!(status.len(), 1);
@@ -713,7 +683,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "printf 'on-local\\n'"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -727,12 +696,9 @@ mod tests {
     /// explicit owner request, so tests never pay discovery/embedding work.
     #[tokio::test]
     async fn attach_does_not_auto_index() {
-        let harness = Harness::attach(HarnessConfig {
-            enable_subagent: false,
-            ..HarnessConfig::default()
-        })
-        .await
-        .expect("attach");
+        let harness = Harness::attach(HarnessConfig::default())
+            .await
+            .expect("attach");
 
         // Give any (buggy) background indexing a chance to register roots.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -745,7 +711,6 @@ mod tests {
                     name: "indexed_exact_text_search".into(),
                     input: json!({"query": "anything"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -770,12 +735,9 @@ mod tests {
         )
         .unwrap();
 
-        let harness = Harness::attach(HarnessConfig {
-            enable_subagent: false,
-            ..HarnessConfig::default()
-        })
-        .await
-        .expect("attach");
+        let harness = Harness::attach(HarnessConfig::default())
+            .await
+            .expect("attach");
         harness.auto_index_local(dir.clone());
 
         // The crawl is a background task; poll until the root is searchable.
@@ -789,7 +751,6 @@ mod tests {
                         name: "indexed_exact_text_search".into(),
                         input: json!({"query": "unique_owner_optin_token"}),
                     },
-                    Arc::new(crate::NullEventSink),
                     TraceContext::default(),
                     CancelToken::new(),
                 )
@@ -821,7 +782,6 @@ mod tests {
             return;
         }
         let cfg = HarnessConfig {
-            enable_subagent: false,
             // Host hello can be slow under parallel suite load (MiniLM seed).
             attach_timeout_secs: 60,
             remote_hosts: vec![
@@ -848,7 +808,6 @@ mod tests {
                     ssh_destination: None,
                 },
             ],
-            ..Default::default()
         };
         let harness = Harness::attach(cfg).await.expect("attach");
         assert_eq!(harness.default_host(), "local");
@@ -872,7 +831,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "printf 'on-local\\n'"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -889,7 +847,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "printf 'on-b\\n'", "host": "b"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -905,7 +862,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "true", "host": "nope"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -917,14 +873,12 @@ mod tests {
     #[tokio::test]
     async fn lazy_connect_failure_on_first_use() {
         let cfg = HarnessConfig {
-            enable_subagent: false,
             attach_timeout_secs: 10,
             remote_hosts: vec![HostConfig {
                 name: "ghost".into(),
                 command: vec!["/nonexistent/myco-please-fail".into()],
                 ssh_destination: None,
             }],
-            ..Default::default()
         };
         let harness = Harness::attach(cfg)
             .await
@@ -942,7 +896,6 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "true", "host": "ghost"}),
                 },
-                Arc::new(crate::NullEventSink),
                 TraceContext::default(),
                 CancelToken::new(),
             )
@@ -960,6 +913,64 @@ mod tests {
         // Local still fine.
         let local = status.iter().find(|s| s.name == "local").unwrap();
         assert!(local.connected && local.in_process);
+    }
+
+    /// Prompt-time running-tool summaries surface the caller's in-process
+    /// bash sessions and disappear once the session is closed.
+    #[tokio::test]
+    async fn running_tool_summaries_surface_local_bash_sessions() {
+        let harness = Harness::attach_local_for_tests().await.expect("attach");
+        let agent_id = uuid::Uuid::new_v4();
+        let context = TraceContext {
+            agent_id,
+            ..TraceContext::default()
+        };
+        assert!(harness.running_tool_summaries(agent_id).is_empty());
+
+        let r = harness
+            .clone()
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: json!({
+                        "action": "start",
+                        "session_id": "summary-probe",
+                        "command": "bash -c 'sleep 30'",
+                        "timeout_ms": 500,
+                        "idle_ms": 100,
+                    }),
+                },
+                context.clone(),
+                CancelToken::new(),
+            )
+            .await;
+        assert!(!r.is_error, "{r:?}");
+
+        let lines = harness.running_tool_summaries(agent_id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("summary-probe"), "{lines:?}");
+        assert!(
+            harness
+                .running_tool_summaries(uuid::Uuid::new_v4())
+                .is_empty(),
+            "other agents must not see this session"
+        );
+
+        let r = harness
+            .clone()
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t2".into(),
+                    name: "bash".into(),
+                    input: json!({"action": "close", "session_id": "summary-probe"}),
+                },
+                context,
+                CancelToken::new(),
+            )
+            .await;
+        assert!(!r.is_error, "{r:?}");
+        assert!(harness.running_tool_summaries(agent_id).is_empty());
     }
 
     fn tool_text(r: &generative_model::ToolResult) -> String {

@@ -1,14 +1,14 @@
 # Myco overview
 
 **myco** is a coding agent CLI: one conversation can drive tools on your laptop and on remote
-machines over SSH. Supervisors can spawn subagents; tools run on **hosts** (local or remote).
+machines over SSH. Tools run on **hosts** (local or remote); for nested agents, myco drives
+itself as an ordinary command (see below).
 
 ## Architecture (one sentence)
 
 **Agents orchestrate; hosts run tools on machines.** The **local** host is always enabled
 **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
 `myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
-Subagents share the supervisor harness and host pool.
 
 ```
 myco (interactive) / Agent
@@ -19,29 +19,35 @@ myco (interactive) / Agent
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
-  **local** host worker (standard tools plus root-only services such as `session_meta` /
-  `subagent`).
+  **local** host worker (standard tools plus root-only services such as `session_meta`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
   text search) over NDJSON via SSH.
-- **Subagents** stay in the agent process and share this harness (same host pool).
+- **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
+  session **on the local host**, passing `--parent-session <its own session id>`, writes one
+  prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
+  auto-off when piped). Nesting locally shares config, keys, network, and the session store by
+  construction; the child reaches remotes through its own host pool, its session is hidden
+  (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
+  supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
+  supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
+  completed tool round) so forks start from the freshest replayable snapshot — never between a
+  tool call and its result. Remotes stay config/key-free hands.
 
 ## Config & paths
 
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`enable_subagent`, `attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Subagent runs use the same store with `kind: subagent` (hidden in default listings) and `id == agent_id`. |
+| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad). Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt (see below). |
-| `.myco/subagent-logs/{agent_id}.log` | Durable subagent transcripts (cwd-relative). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
 top-level keys must come before the tables, per TOML):
 
 ```toml
 model = "grok-4.5-build"      # default model key (--model overrides)
-enable_subagent = true
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
 
@@ -159,7 +165,7 @@ special place: it holds the agent's soul as maildir-style complete snapshots (on
 write-once file per revision, never edited in place). The newest version — the
 lexicographically last non-hidden `*.md` filename — is appended verbatim to every
 agent system prompt, read at model build time (session start, model switch,
-subagent spawn). Revisions are whole new files renamed into place, so concurrent
+worker spawn). Revisions are whole new files renamed into place, so concurrent
 agents cannot clobber each other even on a weakly consistent network filesystem —
 both versions land, the later name wins, superseded versions are pruned after the
 fact. The same whole-file discipline is prompted for the rest of the workspace.

@@ -74,7 +74,7 @@ pub enum AgentEvent {
     /// A new agent session began. Emitted once when the agent id is assigned.
     AgentStarted {
         agent_id: Uuid,
-        /// Model id when known (e.g. subagent tool input); empty for unspecified.
+        /// Model id when known; empty for unspecified.
         model: String,
         parent_agent_id: Option<Uuid>,
         /// Provider tool-use id that spawned this agent, if any.
@@ -99,7 +99,9 @@ pub enum AgentEvent {
         reason: TurnEndReason,
         context: TraceContext,
     },
-    /// Provider usage for the most recent generate call (may fire multiple times per user turn).
+    /// Turn-accumulated usage, fired after each generate call: input side is
+    /// the latest request's prompt (≈ live context), output side sums across
+    /// the turn's generate calls so far (one per tool round-trip).
     Usage {
         usage: TokenUsage,
         context: TraceContext,
@@ -129,16 +131,25 @@ impl EventSink for NullEventSink {
 // Agent
 //
 
+/// Callback invoked at well-formed mid-turn history boundaries (after the user
+/// message is pushed and after each ToolResults push) so callers can persist
+/// the conversation before the turn completes. Not called between an assistant
+/// tool_use message and its results — that prefix is rejected by providers, so
+/// it must never be the snapshot a context fork inherits.
+pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
+
 pub struct Agent {
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
-    /// Last provider usage observed (input-side context estimate for the next USER header).
+    /// Last turn's usage: input = final request's prompt (context estimate for
+    /// the next USER header), output = summed across that turn's generate calls.
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
+    checkpoint: Option<HistoryCheckpoint>,
 }
 
 impl Agent {
@@ -164,6 +175,18 @@ impl Agent {
             history: Vec::new(),
             last_usage: None,
             context_window_tokens: 200_000,
+            checkpoint: None,
+        }
+    }
+
+    /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
+    pub fn set_checkpoint(&mut self, checkpoint: HistoryCheckpoint) {
+        self.checkpoint = Some(checkpoint);
+    }
+
+    fn emit_checkpoint(&self) {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(&self.history, self.last_usage);
         }
     }
 
@@ -216,6 +239,13 @@ impl Agent {
         self.history.push(Message::UserMessage {
             content: user_input,
         });
+        self.emit_checkpoint();
+
+        // Output tokens accumulate across this turn's generate calls (one per
+        // tool round-trip); each new report's input side already covers the
+        // whole prompt, so it replaces rather than adds.
+        let mut turn_output: u64 = 0;
+        let mut turn_cached_output: u64 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -234,6 +264,13 @@ impl Agent {
             };
 
             if let Some(usage) = output.usage {
+                turn_output += usage.output_tokens;
+                turn_cached_output += usage.cached_output_tokens;
+                let usage = TokenUsage {
+                    output_tokens: turn_output,
+                    cached_output_tokens: turn_cached_output,
+                    ..usage
+                };
                 self.last_usage = Some(usage);
                 self.sink.emit(AgentEvent::Usage {
                     usage,
@@ -280,6 +317,7 @@ impl Agent {
                     self.history.push(Message::ToolResults {
                         tool_use_results: tool_results,
                     });
+                    self.emit_checkpoint();
 
                     // If cancel fired during tools, do not start another generate — the
                     // transcript already has matching tool results for every tool_use.
@@ -343,7 +381,6 @@ impl Agent {
 
         let work = self.harness.clone().dispatch_tool_use(
             tool_use.clone(),
-            self.sink.clone(),
             dispatch_context,
             cancel.clone(),
         );
@@ -520,6 +557,9 @@ mod tests {
                     input_json_delta: tu.input.to_string(),
                 }));
             }
+            if let Some(usage) = output.usage {
+                parts.push(MessagePart::Usage(usage));
+            }
             parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
 
             Box::pin(stream::iter(parts.into_iter().map(Ok)))
@@ -674,6 +714,120 @@ mod tests {
             wall < delay * 6 + Duration::from_secs(1),
             "expected concurrent wall time ~1 delay, got {wall:?} (delay={delay:?})"
         );
+    }
+
+    /// Checkpoints fire after the user push and after ToolResults — never
+    /// between an assistant tool_use and its results, a prefix providers
+    /// reject and a context fork must never inherit.
+    #[tokio::test]
+    async fn checkpoint_fires_only_at_well_formed_boundaries() {
+        let slow = Arc::new(SlowService {
+            name: "slow_a".into(),
+            delay: Duration::from_millis(1),
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "slow_a".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let snapshots: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = snapshots.clone();
+        agent.set_checkpoint(Box::new(move |history, _usage| {
+            record.lock().unwrap().push(history.to_vec());
+        }));
+
+        agent
+            .interact(
+                vec![Content::Text { text: "run".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+        assert_eq!(snapshots[0].len(), 1);
+        assert!(matches!(snapshots[0][0], Message::UserMessage { .. }));
+        assert_eq!(snapshots[1].len(), 3);
+        assert!(matches!(snapshots[1][1], Message::AssistantMessage { .. }));
+        assert!(matches!(snapshots[1][2], Message::ToolResults { .. }));
+    }
+
+    #[tokio::test]
+    async fn last_usage_sums_output_across_tool_round_trips() {
+        let tool = Arc::new(SlowService {
+            name: "fast".into(),
+            delay: Duration::ZERO,
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![tool as Arc<dyn ToolService>]);
+
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "fast".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: Some(TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 500,
+                    cached_input_tokens: 800,
+                    cached_output_tokens: 0,
+                }),
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: Some(TokenUsage {
+                    input_tokens: 1_600,
+                    output_tokens: 20,
+                    cached_input_tokens: 900,
+                    cached_output_tokens: 0,
+                }),
+            },
+        ]);
+
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
+            .interact(
+                vec![Content::Text { text: "go".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        // Input side tracks the latest request (the live context); output sums the turn.
+        let usage = agent.last_usage().expect("usage recorded");
+        assert_eq!(usage.input_tokens, 1_600);
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.output_tokens, 520);
+        assert_eq!(usage.context_tokens(), 1_600);
     }
 
     /// Slow generate stream: cancel mid-stream must return Cancelled quickly.

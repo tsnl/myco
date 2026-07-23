@@ -8,9 +8,9 @@ shared by every agent on this machine.
 Your **soul** lives in `~/.myco/workspace/soul/` as complete snapshots, maildir
 style: one file per revision, write-once, never edited in place. The newest
 version — the lexicographically last non-hidden `*.md` filename — is appended
-verbatim to every agent system prompt (root, subagents, workers) under a final
+verbatim to every agent system prompt (root, nested agents, workers) under a final
 `# Soul` heading, which also names the live version. It is read when an agent's
-model is built (session start, model switch, every subagent spawn), so edits
+model is built (session start, model switch, every worker spawn), so edits
 apply from the next agent, not mid-conversation.
 
 To revise your soul: compose the complete new document — about a screenful;
