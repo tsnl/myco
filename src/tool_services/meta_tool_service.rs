@@ -42,9 +42,9 @@ Actions (`action` is required):
   (`std::env::current_exe`). Use with bash (`$path --version`) to read the package
   version when deciding how to update remotes (see manual `harness-ops`).
 - pid: OS process id of the running `myco` agent process (`std::process::id`).
-  All agents in this process (root and subagents) share it. Use with bash to
-  inspect the live process (`ps -p $pid`, `/proc/$pid`) — e.g. memory use or
-  open files — without guessing which `myco` is you.
+  Use with bash to inspect the live process (`ps -p $pid`, `/proc/$pid`) — e.g.
+  memory use or open files — without guessing which `myco` is you (nested agents
+  are separate `myco` processes with their own pids).
 
 Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
 the real task is clear (usually first turn), set_title a short scannable label — replace a
@@ -659,7 +659,7 @@ mod tests {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "pid"}),
                 },
-                HostDispatchContext::bare(uuid::Uuid::nil(), CancelToken::new()),
+                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
             .await;
         assert!(!got.is_error, "{got:?}");
