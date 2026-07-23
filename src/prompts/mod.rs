@@ -69,6 +69,17 @@ summaries; `close` the session when done. The child's session is hidden (`kind: 
 parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
 get-by-id or `list` with `include_hidden: true`.
 
+Context forking: add `--fork` to seed the child with your session's saved conversation instead of
+a blank context. Fork when the task needs what you already know (decisions so far, investigation,
+the user's intent); start blank when the task is self-contained — a fork begins at your context
+size and has less headroom. Launch forks on your own model (`--model` with the catalog key stamped
+at the end of this prompt): a same-model fork's first request re-reads your cached prompt prefix at
+a fraction of full input cost, while a different model is legal but starts cold (pass `--effort`
+too if yours was changed from the default). Your session file is checkpointed mid-turn after each
+user message and completed tool round, so a fork sees the current user request and finished tool
+rounds — never tool calls still in flight, its own launch included; put anything newer in the first
+prompt line you write to it.
+
 ---
 "#,
     include_str!("fragments/worktrees.md"),
@@ -82,6 +93,20 @@ get-by-id or `list` with `include_hidden: true`.
     include_str!("fragments/workspace.md"),
     "\n",
 );
+
+/// Stamp appended after the epilogue (and soul) naming the running model's
+/// catalog key, so agents can spawn nested/forked children on the same model.
+///
+/// Keep this identity-free: the model key is shared by a supervisor and its
+/// cache-aligned forks, but any per-process value (session id, agent id) or
+/// mid-session-mutable value (effort) here would change the system-prompt
+/// bytes per agent and break fork prompt-cache reuse from the first byte.
+pub fn model_stamp(model_key: &str) -> String {
+    format!(
+        "---\n\n# Current Model\n\nCatalog key: `{model_key}` — pass `--model {model_key}` when \
+         spawning nested or forked myco agents to keep them on this model.\n"
+    )
+}
 
 /// Backstop so one runaway soul revision cannot bloat every future prompt
 /// (the fragment asks for about a screenful; same cap as the session
@@ -161,6 +186,18 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("write-once, never edited in place"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("consult and maintain them often"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
+    }
+
+    #[test]
+    fn fork_recipe_and_model_stamp_are_documented() {
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Context forking"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("--fork"));
+        // The epilogue points at the stamp; the stamp names the key and flag.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("at the end of this prompt"));
+        let stamp = model_stamp("grok-4");
+        assert!(stamp.contains("# Current Model"), "{stamp}");
+        assert!(stamp.contains("`grok-4`"), "{stamp}");
+        assert!(stamp.contains("--model grok-4"), "{stamp}");
     }
 
     #[test]

@@ -124,6 +124,12 @@ struct Args {
     #[arg(long, value_name = "SESSION_ID")]
     parent_session: Option<String>,
 
+    /// With --parent-session: context fork — seed the fresh child session with
+    /// the parent's saved conversation instead of a blank context. Same
+    /// `--model` as the parent keeps the fork on the parent's prompt cache.
+    #[arg(long, requires = "parent_session")]
+    fork: bool,
+
     /// Reasoning / extended-thinking effort (low|medium|high|max). Default: high.
     /// Change mid-session with `/effort`.
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
@@ -270,8 +276,24 @@ async fn run_interactive(args: Args) {
                     eprintln!("--parent-session needs a non-empty session id");
                     std::process::exit(2);
                 }
-                fresh.kind = SessionKind::Subagent;
-                fresh.parent_session_id = Some(parent.to_string());
+                if args.fork {
+                    // Context fork: seed the child with the parent's saved
+                    // conversation. Loading validates the parent (unlike the
+                    // record-only path below) and normalizes a prefix to the
+                    // full id.
+                    match Session::load_by_id_or_prefix(parent) {
+                        Ok(parent_session) => {
+                            fresh = parent_session.fork_child(model_key.clone());
+                        }
+                        Err(e) => {
+                            eprintln!("--fork: cannot load parent session {parent:?}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    fresh.kind = SessionKind::Subagent;
+                    fresh.parent_session_id = Some(parent.to_string());
+                }
             }
             fresh
         }
@@ -333,6 +355,18 @@ async fn run_interactive(args: Args) {
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
+    // Mid-turn checkpoints: persist at well-formed boundaries (after the user
+    // message, after each completed tool round) so context forks and crash
+    // recovery see the freshest replayable snapshot, not just the last turn
+    // end. The end-of-turn force-save in run_user_turn stays the backstop.
+    {
+        let checkpoint_session = active_session.clone();
+        agent.set_checkpoint(Box::new(move |messages, last_usage| {
+            if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
+                eprintln!("warning: mid-turn session save failed: {e}");
+            }
+        }));
+    }
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -419,6 +453,7 @@ fn build_model(
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
             prompts::agent_prompt_epilogue(),
+            prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
         backend_config,
@@ -820,6 +855,7 @@ async fn run_compact(
              Prefer session_history over bash for reading sessions."
                 .to_string(),
             prompts::agent_prompt_epilogue(),
+            prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n\n"),
         backend_config: catalog_model.backend.clone(),

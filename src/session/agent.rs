@@ -129,6 +129,13 @@ impl EventSink for NullEventSink {
 // Agent
 //
 
+/// Callback invoked at well-formed mid-turn history boundaries (after the user
+/// message is pushed and after each ToolResults push) so callers can persist
+/// the conversation before the turn completes. Not called between an assistant
+/// tool_use message and its results — that prefix is rejected by providers, so
+/// it must never be the snapshot a context fork inherits.
+pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
+
 pub struct Agent {
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
@@ -139,6 +146,7 @@ pub struct Agent {
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
+    checkpoint: Option<HistoryCheckpoint>,
 }
 
 impl Agent {
@@ -164,6 +172,18 @@ impl Agent {
             history: Vec::new(),
             last_usage: None,
             context_window_tokens: 200_000,
+            checkpoint: None,
+        }
+    }
+
+    /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
+    pub fn set_checkpoint(&mut self, checkpoint: HistoryCheckpoint) {
+        self.checkpoint = Some(checkpoint);
+    }
+
+    fn emit_checkpoint(&self) {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(&self.history, self.last_usage);
         }
     }
 
@@ -216,6 +236,7 @@ impl Agent {
         self.history.push(Message::UserMessage {
             content: user_input,
         });
+        self.emit_checkpoint();
 
         loop {
             if cancel.is_cancelled() {
@@ -280,6 +301,7 @@ impl Agent {
                     self.history.push(Message::ToolResults {
                         tool_use_results: tool_results,
                     });
+                    self.emit_checkpoint();
 
                     // If cancel fired during tools, do not start another generate — the
                     // transcript already has matching tool results for every tool_use.
@@ -673,6 +695,62 @@ mod tests {
             wall < delay * 6 + Duration::from_secs(1),
             "expected concurrent wall time ~1 delay, got {wall:?} (delay={delay:?})"
         );
+    }
+
+    /// Checkpoints fire after the user push and after ToolResults — never
+    /// between an assistant tool_use and its results, a prefix providers
+    /// reject and a context fork must never inherit.
+    #[tokio::test]
+    async fn checkpoint_fires_only_at_well_formed_boundaries() {
+        let slow = Arc::new(SlowService {
+            name: "slow_a".into(),
+            delay: Duration::from_millis(1),
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "slow_a".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let snapshots: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = snapshots.clone();
+        agent.set_checkpoint(Box::new(move |history, _usage| {
+            record.lock().unwrap().push(history.to_vec());
+        }));
+
+        agent
+            .interact(
+                vec![Content::Text { text: "run".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+        assert_eq!(snapshots[0].len(), 1);
+        assert!(matches!(snapshots[0][0], Message::UserMessage { .. }));
+        assert_eq!(snapshots[1].len(), 3);
+        assert!(matches!(snapshots[1][1], Message::AssistantMessage { .. }));
+        assert!(matches!(snapshots[1][2], Message::ToolResults { .. }));
     }
 
     /// Slow generate stream: cancel mid-stream must return Cancelled quickly.

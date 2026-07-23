@@ -27,7 +27,11 @@ myco (interactive) / Agent
   prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
   auto-off when piped). Nesting locally shares config, keys, network, and the session store by
   construction; the child reaches remotes through its own host pool, its session is hidden
-  (`kind: subagent`) and parented to the supervisor's. Remotes stay config/key-free hands.
+  (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
+  supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
+  supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
+  completed tool round) so forks start from the freshest replayable snapshot — never between a
+  tool call and its result. Remotes stay config/key-free hands.
 
 ## Config & paths
 

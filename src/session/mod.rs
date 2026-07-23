@@ -12,8 +12,8 @@ mod search;
 mod transcript;
 
 pub use agent::{
-    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext,
-    uuid_simple_hex,
+    Agent, AgentEvent, AgentInteractionError, EventSink, HistoryCheckpoint, NullEventSink,
+    TraceContext, uuid_simple_hex,
 };
 pub use compact::{
     CompactOptions, CompactOutcome, compact_session, compact_subagent_prompt, link_compact_pair,
@@ -322,6 +322,19 @@ impl Session {
         s.kind = kind;
         s.parent_session_id = parent_session_id;
         s
+    }
+
+    /// Context fork: a fresh hidden child session seeded with this session's
+    /// conversation and usage. New id, `kind: subagent`, parented here; the
+    /// parent's own metadata (title, links, scratchpad) stays with the parent.
+    /// `model` records the child's catalog key.
+    pub fn fork_child(&self, model: impl Into<String>) -> Self {
+        let mut child = Self::new(model);
+        child.kind = SessionKind::Subagent;
+        child.parent_session_id = Some(self.id.clone());
+        child.messages = self.messages.clone();
+        child.last_usage = self.last_usage;
+        child
     }
 
     pub fn touch(&mut self) {
@@ -1115,6 +1128,38 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_child_copies_conversation_not_identity() {
+        let mut parent = Session::new_with_id("modelkey", "aa00bb11cc22dd33ee44ff5566778899");
+        parent.title = Some("parent title".into());
+        parent.scratchpad = "parent notes".into();
+        parent.messages = vec![Message::UserMessage {
+            content: vec![Content::Text { text: "hi".into() }],
+        }];
+        parent.last_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_input_tokens: 50,
+            cached_output_tokens: 0,
+        });
+
+        let child = parent.fork_child("othermodel");
+        // Conversation + usage are inherited so the fork resumes the parent's
+        // context (and its USER n/m headroom header) exactly.
+        assert_eq!(child.messages.len(), 1);
+        assert_eq!(child.last_usage, parent.last_usage);
+        // Identity is fresh: new id, hidden subagent kind, parented; the
+        // parent's metadata does not leak.
+        assert_ne!(child.id, parent.id);
+        assert_eq!(child.kind, SessionKind::Subagent);
+        assert!(child.is_hidden());
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.model, "othermodel");
+        assert!(child.title.is_none());
+        assert!(child.scratchpad.is_empty());
+        assert!(child.links.is_empty());
     }
 
     #[test]
