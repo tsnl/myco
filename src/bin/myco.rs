@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -90,6 +90,14 @@ struct Args {
     /// ssh); `session-browser` runs the standalone session picker.
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
+
+    /// Print mode (non-interactive): run one agent turn, stream the answer to
+    /// stdout, and exit. Bare `-p` takes the prompt from piped stdin; with
+    /// PROMPT given, piped stdin (if any) is prepended as context. Combines
+    /// with `--resume` (continue a saved session) and `--parent-session` /
+    /// `--fork` (one-shot nested agent).
+    #[arg(short = 'p', long = "print", value_name = "PROMPT")]
+    print: Option<Option<String>>,
 
     /// Write the picked session id to FILE instead of stdout. Only with
     /// `--mode session-browser`; used by the bare-/resume tmux popup handshake.
@@ -188,7 +196,12 @@ async fn main() {
         print_cli_help(topic);
         return;
     }
+    if args.print.is_some() && args.mode != Mode::Interactive {
+        eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
+        std::process::exit(2);
+    }
     match args.mode {
+        Mode::Interactive if args.print.is_some() => run_print(args).await,
         Mode::Interactive => run_interactive(args).await,
         Mode::Host => run_host(args).await,
         Mode::SessionBrowser => run_session_browser(args),
@@ -223,11 +236,162 @@ async fn run_host(args: Args) {
     }
 }
 
-async fn run_interactive(args: Args) {
-    // One explicit resolution step: model catalog (gateways/models + auth),
-    // harness hosts and default model key (--config → $MYCO_CONFIG →
-    // ~/.myco/config.toml), and the color decision. Everything downstream
-    // reads this, not the env or config files.
+/// `-p/--print`: one non-interactive agent turn. Answer text streams to stdout
+/// raw (no sections, colors, or wrap); everything else — preflight WARNING,
+/// `session=<id>`, errors — goes to stderr so stdout stays pipeable. The
+/// session persists like an interactive run (`--resume` picks it up), and
+/// `--parent-session` / `--fork` make it a one-shot nested agent.
+async fn run_print(args: Args) {
+    let arg = args.print.clone().flatten();
+    let prompt = match assemble_print_prompt(arg.clone(), read_piped_stdin()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("myco: {e}");
+            std::process::exit(2);
+        }
+    };
+    // `@path.png` mentions attach images, same contract as the REPL; a bad
+    // path is a usage error before any config/model work.
+    let content = match print_turn_content(arg.as_deref(), prompt.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("myco: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(note) = attachment_note(&content) {
+        eprintln!("{note}");
+    }
+
+    let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
+    let model_key = catalog_model.spec.key.clone();
+
+    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
+    let mut warn = Vec::new();
+    let _ = preflight.write_warning_section(&mut warn, Palette::plain());
+    if !warn.is_empty() {
+        let _ = std::io::stderr().write_all(&warn);
+    }
+
+    let active_session = ActiveSession::new(initial_session_or_exit(&args, &model_key));
+
+    let session_tool =
+        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
+    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
+    let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
+    let harness = attach_harness_or_exit(
+        &app_config,
+        &preflight,
+        vec![session_tool, history_tool, list_recent_tool],
+    )
+    .await;
+    // Owner request: index skills / AGENTS.md under the launch directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        harness.auto_index_local(cwd);
+    }
+
+    let model = build_model(
+        &catalog_model,
+        &harness,
+        args.debug_dump_api_requests,
+        args.effort,
+    );
+    let sink = Arc::new(PrintEventSink::default());
+    let mut agent = Agent::new(model, harness, sink.clone());
+    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+    let restored = active_session.snapshot();
+    agent.set_history(restored.messages.clone());
+    agent.set_last_usage(restored.last_usage);
+    // Mid-turn checkpoints, same as interactive: children forked off this run
+    // see finished tool rounds, and a crash loses at most the in-flight round.
+    wire_checkpoint(&mut agent, &active_session);
+
+    if let Err(e) = active_session.maybe_auto_title_from_user_text(&prompt) {
+        eprintln!("warning: could not auto-title session: {e}");
+    }
+
+    // Ctrl-C cancels the in-flight turn; history stays well-formed.
+    let cancel = myco::CancelToken::new();
+    let cancel_on_sigint = cancel.clone();
+    let sigint_task = tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            cancel_on_sigint.cancel();
+        }
+    });
+
+    let result = agent.interact(content, cancel).await;
+    sigint_task.abort();
+    sink.finish();
+
+    // Persist whatever history the agent has, including failed/cancelled turns.
+    if let Err(e) = persist_session(&agent, &active_session, /*force*/ true) {
+        eprintln!("warning: could not save session: {e}");
+    }
+    if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
+        eprintln!("session={}", active_session.id());
+    }
+
+    match result {
+        Ok(_) => {}
+        Err(myco::AgentInteractionError::Cancelled) => {
+            eprintln!("(cancelled)");
+            std::process::exit(130);
+        }
+        Err(e) => {
+            eprintln!("myco: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Combine the `-p` argument and piped stdin into the user prompt. With both,
+/// stdin is context and the argument is the instruction, so
+/// `git diff | myco -p "review this"` reads in that order.
+fn assemble_print_prompt(arg: Option<String>, piped: Option<String>) -> Result<String, String> {
+    let arg = arg.filter(|s| !s.trim().is_empty());
+    let piped = piped.filter(|s| !s.trim().is_empty());
+    match (piped, arg) {
+        (Some(stdin), Some(arg)) => Ok(format!("{}\n\n{arg}", stdin.trim_end())),
+        (None, Some(arg)) => Ok(arg),
+        (Some(stdin), None) => Ok(stdin),
+        (None, None) => Err("print mode needs a prompt: `myco -p \"…\"` or pipe stdin".into()),
+    }
+}
+
+/// Content blocks for the print-mode turn: images from `@path` mentions in
+/// the `-p` argument (matching the REPL's typed-input contract), then the
+/// full prompt text. Piped stdin is data — it is never parsed for
+/// attachments, so `git diff | myco -p "review"` cannot fail on a `@x.png`
+/// that happens to appear in the diff.
+fn print_turn_content(arg: Option<&str>, prompt: String) -> Result<Vec<Content>, String> {
+    let mut content: Vec<Content> = expand_image_attachments(arg.unwrap_or(""))?
+        .into_iter()
+        .filter(|c| matches!(c, Content::Image { .. }))
+        .collect();
+    content.push(Content::Text { text: prompt });
+    Ok(content)
+}
+
+/// Read piped stdin fully; `None` when stdin is a TTY or effectively empty.
+fn read_piped_stdin() -> Option<String> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    stdin.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// One explicit resolution step: model catalog (gateways/models + auth),
+/// harness hosts and default model key (--config → $MYCO_CONFIG →
+/// ~/.myco/config.toml), and the color decision. Everything downstream
+/// reads this, not the env or config files.
+fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
     let app_config = Config::resolve(ConfigUserSettings {
         harness_config_path: args.config.clone(),
         model: args.model.clone(),
@@ -247,6 +411,99 @@ async fn run_interactive(args: Args) {
             std::process::exit(2);
         }
     };
+    (app_config, catalog_model)
+}
+
+/// Starting session for an agent run (interactive or print): `--resume` loads
+/// a saved session; otherwise a fresh one, hidden and parented under
+/// `--parent-session`, context-forked with `--fork`.
+fn initial_session_or_exit(args: &Args, model_key: &str) -> Session {
+    if args.resume.is_some() && args.parent_session.is_some() {
+        // A resumed session already carries its kind/parent; rewriting them
+        // here would silently change a stored session's identity.
+        eprintln!("--parent-session applies only to a fresh session; drop it when resuming");
+        std::process::exit(2);
+    }
+    match &args.resume {
+        Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
+        None => {
+            let mut fresh = Session::new(model_key.to_string());
+            if let Some(parent) = args.parent_session.as_deref() {
+                let parent = parent.trim();
+                if parent.is_empty() {
+                    eprintln!("--parent-session needs a non-empty session id");
+                    std::process::exit(2);
+                }
+                if args.fork {
+                    // Context fork: seed the child with the parent's saved
+                    // conversation. Loading validates the parent (unlike the
+                    // record-only path below) and normalizes a prefix to the
+                    // full id.
+                    match Session::load_by_id_or_prefix(parent) {
+                        Ok(parent_session) => {
+                            fresh = parent_session.fork_child(model_key.to_string());
+                        }
+                        Err(e) => {
+                            eprintln!("--fork: cannot load parent session {parent:?}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    fresh.kind = SessionKind::Subagent;
+                    fresh.parent_session_id = Some(parent.to_string());
+                }
+            }
+            fresh
+        }
+    }
+}
+
+async fn attach_harness_or_exit(
+    app_config: &Config,
+    preflight: &StartupPreflight,
+    root_services: Vec<Arc<dyn myco::ToolService>>,
+) -> Arc<Harness> {
+    Harness::attach_with_root_services(app_config.harness.clone(), root_services)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to attach harness: {e}");
+            eprintln!(
+                "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
+            );
+            if !preflight.executables.is_clean() {
+                let names: Vec<&str> = preflight
+                    .executables
+                    .missing
+                    .iter()
+                    .map(|m| m.name)
+                    .collect();
+                eprintln!("hint: missing executables: {}", names.join(", "));
+            }
+            if preflight.ssh.has_problems() {
+                eprintln!(
+                    "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
+                     try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
+                );
+            }
+            eprintln!("config: {}", app_config.harness_config_path.display());
+            std::process::exit(1);
+        })
+}
+
+/// Persist agent history at replayable mid-turn boundaries (after the user
+/// message, after each completed tool round) so context forks and crash
+/// recovery see the freshest well-formed snapshot.
+fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
+    let checkpoint_session = active_session.clone();
+    agent.set_checkpoint(Box::new(move |messages, last_usage| {
+        if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
+            eprintln!("warning: mid-turn session save failed: {e}");
+        }
+    }));
+}
+
+async fn run_interactive(args: Args) {
+    let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
     let model_key = catalog_model.spec.key.clone();
     let palette = Palette::colored(app_config.colors_enabled)
         .with_wrap(effective_wrap_width(app_config.wrap_max));
@@ -261,44 +518,7 @@ async fn run_interactive(args: Args) {
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
-    if resuming && args.parent_session.is_some() {
-        // A resumed session already carries its kind/parent; rewriting them
-        // here would silently change a stored session's identity.
-        eprintln!("--parent-session applies only to a fresh session; drop it when resuming");
-        std::process::exit(2);
-    }
-    let initial_session = match args.resume {
-        Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
-        None => {
-            let mut fresh = Session::new(model_key.clone());
-            if let Some(parent) = args.parent_session.as_deref() {
-                let parent = parent.trim();
-                if parent.is_empty() {
-                    eprintln!("--parent-session needs a non-empty session id");
-                    std::process::exit(2);
-                }
-                if args.fork {
-                    // Context fork: seed the child with the parent's saved
-                    // conversation. Loading validates the parent (unlike the
-                    // record-only path below) and normalizes a prefix to the
-                    // full id.
-                    match Session::load_by_id_or_prefix(parent) {
-                        Ok(parent_session) => {
-                            fresh = parent_session.fork_child(model_key.clone());
-                        }
-                        Err(e) => {
-                            eprintln!("--fork: cannot load parent session {parent:?}: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    fresh.kind = SessionKind::Subagent;
-                    fresh.parent_session_id = Some(parent.to_string());
-                }
-            }
-            fresh
-        }
-    };
+    let initial_session = initial_session_or_exit(&args, &model_key);
     let active_session = ActiveSession::new(initial_session);
 
     // Plain-text console mirror ({id}.console), TTY-gated like colors/wrap. It
@@ -314,34 +534,12 @@ async fn run_interactive(args: Args) {
         Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
-    let harness = Harness::attach_with_root_services(
-        app_config.harness.clone(),
+    let harness = attach_harness_or_exit(
+        &app_config,
+        &preflight,
         vec![session_tool, history_tool, list_recent_tool],
     )
-    .await
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to attach harness: {e}");
-        eprintln!(
-            "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
-        );
-        if !preflight.executables.is_clean() {
-            let names: Vec<&str> = preflight
-                .executables
-                .missing
-                .iter()
-                .map(|m| m.name)
-                .collect();
-            eprintln!("hint: missing executables: {}", names.join(", "));
-        }
-        if preflight.ssh.has_problems() {
-            eprintln!(
-                "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
-                     try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
-            );
-        }
-        eprintln!("config: {}", app_config.harness_config_path.display());
-        std::process::exit(1);
-    });
+    .await;
     // Owner request: index skills / AGENTS.md under the launch directory.
     // Attach alone never indexes (tests rely on that).
     if let Ok(cwd) = std::env::current_dir() {
@@ -357,18 +555,9 @@ async fn run_interactive(args: Args) {
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
-    // Mid-turn checkpoints: persist at well-formed boundaries (after the user
-    // message, after each completed tool round) so context forks and crash
-    // recovery see the freshest replayable snapshot, not just the last turn
-    // end. The end-of-turn force-save in run_user_turn stays the backstop.
-    {
-        let checkpoint_session = active_session.clone();
-        agent.set_checkpoint(Box::new(move |messages, last_usage| {
-            if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
-                eprintln!("warning: mid-turn session save failed: {e}");
-            }
-        }));
-    }
+    // Mid-turn checkpoints; the end-of-turn force-save in run_user_turn stays
+    // the backstop.
+    wire_checkpoint(&mut agent, &active_session);
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -1789,6 +1978,43 @@ impl EventSink for CliEventSink {
     }
 }
 
+/// Sink for `-p/--print`: root-agent answer text streams to stdout verbatim
+/// (no sections, colors, or wrapping — the output is meant for pipes).
+/// Thinking and tool activity are not rendered.
+#[derive(Default)]
+struct PrintEventSink {
+    /// (wrote anything, ended with newline) — drives the closing newline.
+    tail: Mutex<(bool, bool)>,
+}
+
+impl PrintEventSink {
+    /// Terminate the answer with a newline when the model's text didn't.
+    fn finish(&self) {
+        let (wrote, newline) = *self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        if wrote && !newline {
+            println!();
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
+impl EventSink for PrintEventSink {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::TextDelta {
+            text,
+            context: TraceContext { depth: 0, .. },
+        } = event
+        {
+            if text.is_empty() {
+                return;
+            }
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            *self.tail.lock().unwrap_or_else(|e| e.into_inner()) = (true, text.ends_with('\n'));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1909,6 +2135,88 @@ mod tests {
         assert_eq!("h".parse::<Effort>().unwrap(), Effort::High);
         assert_eq!("max".parse::<Effort>().unwrap(), Effort::Max);
         assert!("nope".parse::<Effort>().is_err());
+    }
+
+    #[test]
+    fn print_flag_parses_bare_and_with_prompt() {
+        assert_eq!(Args::parse_from(["myco"]).print, None);
+        assert_eq!(Args::parse_from(["myco", "-p"]).print, Some(None));
+        assert_eq!(
+            Args::parse_from(["myco", "-p", "hello"]).print,
+            Some(Some("hello".into()))
+        );
+        let args = Args::parse_from(["myco", "--print", "hello", "--model", "k"]);
+        assert_eq!(args.print, Some(Some("hello".into())));
+        assert_eq!(args.model.as_deref(), Some("k"));
+        // A following flag is not swallowed as the prompt.
+        let args = Args::parse_from(["myco", "-p", "--model", "k"]);
+        assert_eq!(args.print, Some(None));
+        assert_eq!(args.model.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn print_prompt_stdin_is_context_arg_is_instruction() {
+        assert_eq!(
+            assemble_print_prompt(
+                Some("what does this do?".into()),
+                Some("fn main() {}\n".into())
+            )
+            .unwrap(),
+            "fn main() {}\n\nwhat does this do?"
+        );
+        assert_eq!(
+            assemble_print_prompt(Some("hi".into()), None).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            assemble_print_prompt(None, Some("just stdin\n".into())).unwrap(),
+            "just stdin\n"
+        );
+    }
+
+    #[test]
+    fn print_prompt_requires_some_input() {
+        assert!(assemble_print_prompt(None, None).is_err());
+        assert!(assemble_print_prompt(Some("  ".into()), Some(" \n".into())).is_err());
+    }
+
+    #[test]
+    fn print_mentions_parsed_from_arg_only() {
+        // A (missing) image path in the piped-stdin portion of the prompt must
+        // not attach or error; the same path in the -p argument must error.
+        let prompt = "diff mentions @no-such-file.png\n\nreview this".to_string();
+        let content = print_turn_content(Some("review this"), prompt.clone()).unwrap();
+        assert_eq!(content.len(), 1);
+        assert!(matches!(&content[0], Content::Text { text } if *text == prompt));
+        assert!(print_turn_content(Some("look at @no-such-file.png"), prompt).is_err());
+    }
+
+    #[test]
+    fn print_arg_mention_attaches_image_before_text() {
+        let dir = std::env::temp_dir().join(format!(
+            "myco-print-attach-{}",
+            uuid_simple_hex(uuid::Uuid::new_v4())
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("shot.png");
+        fs::write(&img, b"not-really-a-png").unwrap();
+
+        let arg = format!("what is this? @{}", img.display());
+        let content = print_turn_content(Some(&arg), arg.clone()).unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(matches!(&content[0], Content::Image { .. }));
+        assert!(matches!(&content[1], Content::Text { text } if *text == arg));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_session_marks_fresh_session_hidden() {
+        let args = Args::parse_from(["myco", "-p", "task", "--parent-session", "abc123"]);
+        let session = initial_session_or_exit(&args, "some-model");
+        assert!(matches!(session.kind, SessionKind::Subagent));
+        assert_eq!(session.parent_session_id.as_deref(), Some("abc123"));
+        assert!(session.messages.is_empty());
     }
 
     #[test]

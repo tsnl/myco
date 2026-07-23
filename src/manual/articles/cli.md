@@ -60,6 +60,22 @@ print as one WARNING block after it — missing expected executables (`bash`,
 `lynx`, `tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
 configured) and ssh-agent issues; hosts via `/hosts`.
 
+### Print mode (`myco -p`)
+
+`myco -p "PROMPT"` runs one non-interactive turn and exits: answer text
+streams to stdout verbatim (no sections, colors, or wrap — thinking and tool
+activity are not rendered); everything else — preflight WARNING,
+`session=<id>`, errors — goes to stderr, so stdout is pipe-clean. Bare `-p`
+takes the prompt from piped stdin; with both, stdin is prepended as context
+(`git diff | myco -p "review this"`). The session persists like an
+interactive run — continue with `--resume <id>` interactively, or
+`-p … --resume <id>` for one more non-interactive turn. `--parent-session` /
+`--fork` compose with `-p` for one-shot nested agents (the session is created
+hidden and parented, exactly as in the live-session recipe). `@path` image
+mentions in the PROMPT argument attach images exactly as in the REPL
+(attachment note on stderr); piped stdin is data and is never parsed for
+attachments. No console mirror is written in print mode.
+
 ### Models & config (quick)
 
 - Models come from the `[gateways]` / `[models]` catalog in

@@ -38,7 +38,14 @@ embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
 
 ```bash
 myco    # runs the default model from your config.toml; --model <key> to switch
+myco -p "explain build.rs"        # print mode: one turn, answer on stdout, exit
+git diff | myco -p "review this"  # piped stdin becomes context for the prompt
 ```
+
+`-p/--print` runs one non-interactive turn: the answer streams to stdout
+(raw, pipe-friendly), everything else prints to stderr, and the session is
+saved like any other (`session=<id>` on stderr) — continue it with
+`--resume <id>`. Bare `-p` takes the prompt from piped stdin.
 
 Configure your models first: myco ships none built in. `~/.myco/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.

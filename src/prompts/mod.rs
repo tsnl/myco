@@ -69,6 +69,15 @@ summaries; `close` the session when done. The child's session is hidden (`kind: 
 parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
 get-by-id or `list` with `include_hidden: true`.
 
+One-shot delegation: for a single self-contained task, skip the live session — a plain one-shot
+`bash` run of `myco -p "<task>" --parent-session <your-session-id>` does one turn and exits.
+Stdout is the answer text alone (no headers to parse; process exit is the turn boundary) and
+stderr ends with `session=<id>` for later reads. `-p` composes with `--fork` and `--model`.
+Prefer a live session for real back-and-forth: `myco -p "…" --resume <child-id>` can append
+follow-up turns, but each pays full process startup. Inside a **live** bash session, append
+`</dev/null` — with a prompt argument `-p` still drains piped stdin as context, and a live
+session's open stdin never EOFs (one-shot `bash` runs are safe; their stdin is null).
+
 Context forking: add `--fork` to seed the child with your session's saved conversation instead of
 a blank context. Fork when the task needs what you already know (decisions so far, investigation,
 the user's intent); start blank when the task is self-contained — a fork begins at your context
