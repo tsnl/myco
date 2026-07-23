@@ -271,13 +271,20 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
     out
 }
 
+/// Images are not converted to `input_image` parts yet. An explicit
+/// placeholder is the honest degradation: the transcript says an image was
+/// there, and raw base64 must never be inlined as prompt text (context
+/// blowout + model confusion).
+const IMAGE_OMITTED: &str = "[image omitted: not supported on this gateway]";
+
 fn content_to_input_text(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
             Content::Text { text } => Some(text.as_str()),
+            Content::Image { .. } => Some(IMAGE_OMITTED),
             // Thinking is not sent as ordinary assistant text on OpenAI Responses.
-            Content::Image { .. } | Content::Thinking { .. } => None,
+            Content::Thinking { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -324,7 +331,7 @@ fn tool_result_to_string(result: &ToolResult) -> String {
         .iter()
         .filter_map(|c| match c {
             Content::Text { text } => Some(text.as_str()),
-            Content::Image { source } => Some(source.as_str()),
+            Content::Image { .. } => Some(IMAGE_OMITTED),
             Content::Thinking { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -475,6 +482,15 @@ impl StreamAccumulator {
                         arguments,
                         ..
                     } => {
+                        // An id-less or nameless call is poison: it would flow into
+                        // persisted history and 400 on every later request (resume
+                        // included). Fail loud like the arguments-without-item path.
+                        let (Some(call_id), Some(name)) = (call_id, name) else {
+                            return Err(GenerateError::MalformedResponseError(format!(
+                                "OpenAI Responses: function_call output_item.added for \
+                                 output_index={output_index} is missing call_id or name"
+                            )));
+                        };
                         let tool_index = self.tool_use_count();
                         self.output_kinds[output_index] =
                             Some(OutputKind::ToolUse { index: tool_index });
@@ -482,8 +498,8 @@ impl StreamAccumulator {
                         self.saw_tool_call = true;
                         out.push(MessagePart::ToolUseStart(ToolUseStart {
                             index: tool_index,
-                            id: call_id.unwrap_or_default(),
-                            name: name.unwrap_or_default(),
+                            id: call_id,
+                            name,
                         }));
                     }
                     ResponsesOutputItem::Other => {
@@ -995,6 +1011,54 @@ mod tests {
                 ..
             } if call_id == "call_1" && output == "hi\n"
         ));
+    }
+
+    /// Images never reach the wire as base64 text or silent drops: both the
+    /// user-message and tool-result conversions substitute an explicit
+    /// placeholder until real `input_image` support exists.
+    #[test]
+    fn images_become_placeholders_never_base64_or_silence() {
+        let user_text = content_to_input_text(&[
+            Content::Text { text: "see:".into() },
+            Content::Image {
+                source: "aGVsbG8=".into(),
+            },
+        ]);
+        assert!(user_text.contains("see:"), "{user_text}");
+        assert!(user_text.contains(IMAGE_OMITTED), "{user_text}");
+        assert!(!user_text.contains("aGVsbG8="), "{user_text}");
+
+        let tool_text = tool_result_to_string(&ToolResult {
+            id: "call_1".into(),
+            content: vec![Content::Image {
+                source: "c2NyZWVuc2hvdA==".into(),
+            }],
+            is_error: false,
+        });
+        assert_eq!(tool_text, IMAGE_OMITTED);
+    }
+
+    /// A function_call item without call_id/name must fail the stream, not
+    /// flow an empty id into persisted history (which would 400 every later
+    /// request, resume included).
+    #[test]
+    fn function_call_without_call_id_fails_loud() {
+        let mut acc = StreamAccumulator::default();
+        let err = acc
+            .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
+                output_index: 0,
+                item: ResponsesOutputItem::FunctionCall {
+                    id: None,
+                    call_id: None,
+                    name: Some("bash".into()),
+                    arguments: None,
+                },
+            })
+            .expect_err("missing call_id must be malformed");
+        assert!(
+            matches!(err, GenerateError::MalformedResponseError(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
