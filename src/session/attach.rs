@@ -17,23 +17,15 @@ use crate::generative_model::Content;
 /// clear local error beats a confusing provider 400).
 pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
-/// A parsed user message: content blocks for `Agent::interact`, plus the
-/// attachment paths (as typed) for UI feedback.
-#[derive(Debug)]
-pub struct UserInput {
-    /// Attached images first (providers prefer image-before-text), then the
-    /// input text exactly as typed.
-    pub content: Vec<Content>,
-    pub attached: Vec<String>,
-}
-
-/// Expand `@<path>` image mentions in `input` into attached [`Content::Image`]
-/// blocks. Repeated mentions of one path attach it once. Any unreadable or
-/// oversized image fails the whole message so the user can fix the path and
-/// resubmit — nothing is silently dropped.
-pub fn expand_image_attachments(input: &str) -> Result<UserInput, String> {
+/// Expand `@<path>` image mentions in `input` into content blocks for
+/// `Agent::interact`: attached images first (providers prefer
+/// image-before-text), then the input text exactly as typed. Repeated
+/// mentions of one path attach it once. Any unreadable or oversized image
+/// fails the whole message so the user can fix the path and resubmit —
+/// nothing is silently dropped.
+pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
     let mut content = Vec::new();
-    let mut attached: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
 
     for token in input.split_whitespace() {
         // Sentence position: "see @shot.png." / "(@shot.png)" — trailing
@@ -46,7 +38,7 @@ pub fn expand_image_attachments(input: &str) -> Result<UserInput, String> {
         let Some(media_type) = image_media_type(path) else {
             continue;
         };
-        if attached.iter().any(|p| p == path) {
+        if seen.contains(&path) {
             continue;
         }
 
@@ -66,13 +58,13 @@ pub fn expand_image_attachments(input: &str) -> Result<UserInput, String> {
         content.push(Content::Image {
             source: format!("data:{media_type};base64,{data}"),
         });
-        attached.push(path.to_string());
+        seen.push(path);
     }
 
     content.push(Content::Text {
         text: input.to_string(),
     });
-    Ok(UserInput { content, attached })
+    Ok(content)
 }
 
 fn image_media_type(path: &str) -> Option<&'static str> {
@@ -115,10 +107,9 @@ mod tests {
     #[test]
     fn plain_text_passes_through() {
         let parsed = expand_image_attachments("just words, no files").unwrap();
-        assert!(parsed.attached.is_empty());
-        assert_eq!(parsed.content.len(), 1);
+        assert_eq!(parsed.len(), 1);
         assert!(matches!(
-            &parsed.content[0],
+            &parsed[0],
             Content::Text { text } if text == "just words, no files"
         ));
     }
@@ -131,9 +122,8 @@ mod tests {
         let input = format!("what is wrong in @{}?", path.display());
 
         let parsed = expand_image_attachments(&input).unwrap();
-        assert_eq!(parsed.attached, vec![path.display().to_string()]);
-        assert_eq!(parsed.content.len(), 2);
-        match &parsed.content[0] {
+        assert_eq!(parsed.len(), 2);
+        match &parsed[0] {
             Content::Image { source } => {
                 let data = source.strip_prefix("data:image/png;base64,").unwrap();
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -145,7 +135,7 @@ mod tests {
         }
         // Text is unchanged: the `@` mention stays for the model to reference.
         assert!(matches!(
-            &parsed.content[1],
+            &parsed[1],
             Content::Text { text } if *text == input
         ));
 
@@ -159,7 +149,8 @@ mod tests {
         fs::write(&path, [1, 2, 3]).unwrap();
 
         let parsed = expand_image_attachments(&format!("look at @{}.", path.display())).unwrap();
-        assert_eq!(parsed.attached, vec![path.display().to_string()]);
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(&parsed[0], Content::Image { .. }));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -171,7 +162,7 @@ mod tests {
         fs::write(&path, [1]).unwrap();
 
         let parsed = expand_image_attachments(&format!("@{}", path.display())).unwrap();
-        match &parsed.content[0] {
+        match &parsed[0] {
             Content::Image { source } => {
                 assert!(source.starts_with("data:image/jpeg;base64,"), "{source}");
             }
@@ -184,8 +175,7 @@ mod tests {
     #[test]
     fn non_image_at_tokens_are_ordinary_text() {
         let parsed = expand_image_attachments("ping @alice about @notes.txt").unwrap();
-        assert!(parsed.attached.is_empty());
-        assert_eq!(parsed.content.len(), 1);
+        assert_eq!(parsed.len(), 1);
     }
 
     #[test]
@@ -214,8 +204,7 @@ mod tests {
         let p = path.display();
 
         let parsed = expand_image_attachments(&format!("@{p} and again @{p}")).unwrap();
-        assert_eq!(parsed.attached.len(), 1);
-        assert_eq!(parsed.content.len(), 2); // one image + the text
+        assert_eq!(parsed.len(), 2); // one image + the text
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -256,6 +256,23 @@ pub fn ensure_assistant(
     Ok(())
 }
 
+/// `[N image(s) attached]` note for a user message carrying images; `None`
+/// when it has none. Image bytes are never printed. The live echo and replay
+/// both print this line directly under the wrapped user text, so the two
+/// paths stay byte-identical (the `@path` mentions in the text carry the
+/// filenames).
+pub fn attachment_note(content: &[Content]) -> Option<String> {
+    let images = content
+        .iter()
+        .filter(|c| matches!(c, Content::Image { .. }))
+        .count();
+    match images {
+        0 => None,
+        1 => Some("[1 image attached]".into()),
+        n => Some(format!("[{n} images attached]")),
+    }
+}
+
 /// Replay saved messages with the same section layout as the live REPL.
 ///
 /// Only USER / ASSISTANT headers. Thinking summaries and tools are paragraphs
@@ -282,11 +299,8 @@ pub fn write_session_history(
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                let images = content
-                    .iter()
-                    .filter(|c| matches!(c, Content::Image { .. }))
-                    .count();
-                if text.is_empty() && images == 0 {
+                let note = attachment_note(content);
+                if text.is_empty() && note.is_none() {
                     continue;
                 }
                 writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
@@ -300,12 +314,8 @@ pub fn write_session_history(
                         &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
                     )?;
                 }
-                // Attached image data is not replayable in a terminal; a count
-                // placeholder keeps the replay honest (the `@path` mentions in
-                // the text say which files they were).
-                if images > 0 {
-                    let plural = if images == 1 { "" } else { "s" };
-                    writeln!(out, "[{images} image{plural} attached]")?;
+                if let Some(note) = note {
+                    writeln!(out, "{note}")?;
                 }
                 // Next assistant turn opens a fresh ASSISTANT section.
                 assistant_open = false;
@@ -586,6 +596,23 @@ mod tests {
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
+    }
+
+    #[test]
+    fn attachment_note_counts_and_pluralizes() {
+        let text = Content::Text { text: "hi".into() };
+        let image = Content::Image {
+            source: "data:image/png;base64,AA".into(),
+        };
+        assert_eq!(attachment_note(std::slice::from_ref(&text)), None);
+        assert_eq!(
+            attachment_note(&[image.clone(), text.clone()]).as_deref(),
+            Some("[1 image attached]")
+        );
+        assert_eq!(
+            attachment_note(&[image.clone(), image, text]).as_deref(),
+            Some("[2 images attached]")
+        );
     }
 
     #[test]

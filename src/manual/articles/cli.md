@@ -27,10 +27,10 @@ which reports key modifiers.)
 Mentioning `@<path>` in a message attaches that file as image input (extensions
 png/jpg/jpeg/gif/webp, up to 5 MiB each; whitespace-delimited, so paths with
 spaces are unsupported; `~/` expands). The text is sent exactly as typed — the
-`@` mentions stay in it — and the CLI prints `(attached: …)` under the input
-echo. A bad path opens an ERROR section before the model is called; nothing is
-silently dropped. Replay (`/resume`, Ctrl-L) shows a `[N image(s) attached]`
-placeholder instead of the image bytes.
+`@` mentions stay in it — and a `[N image(s) attached]` note prints directly
+under the wrapped input, identical live and in replay (`/resume`, Ctrl-L); the
+image bytes are never printed. A bad path opens an ERROR section before the
+model is called; nothing is silently dropped.
 
 ### Session browser
 

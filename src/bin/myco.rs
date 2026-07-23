@@ -15,11 +15,11 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
-    Session, SessionListEntry, banner_rule, compact_session, compact_subagent_prompt,
-    expand_image_attachments, format_session_detail, format_session_list_line,
-    format_tool_invocation, link_compact_pair, list_sessions, print_session_history, render_block,
-    resolve_and_load_session, section_rule, usage_line, user_header_line, user_rule,
-    write_error_section,
+    Session, SessionListEntry, attachment_note, banner_rule, compact_session,
+    compact_subagent_prompt, expand_image_attachments, format_session_detail,
+    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
+    print_session_history, render_block, resolve_and_load_session, section_rule, usage_line,
+    user_header_line, user_rule, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness, NullEventSink,
@@ -749,8 +749,8 @@ async fn run_user_turn(
     // `@path.png` mentions attach images. A bad path aborts the turn before the
     // model is called (headed ERROR section, like generate failures) so the
     // user can fix the path and resubmit — nothing is silently dropped.
-    let parsed = match expand_image_attachments(&input) {
-        Ok(p) => p,
+    let content = match expand_image_attachments(&input) {
+        Ok(c) => c,
         Err(e) => {
             let mut block = Vec::new();
             let _ = write_error_section(&mut block, &e, palette);
@@ -760,8 +760,8 @@ async fn run_user_turn(
             return;
         }
     };
-    if !parsed.attached.is_empty() {
-        let note = format!("(attached: {})", parsed.attached.join(", "));
+    // Same note, same position as replay: directly under the wrapped input.
+    if let Some(note) = attachment_note(&content) {
         println!("{note}");
         console.append(&note);
         console.append("\n");
@@ -784,7 +784,7 @@ async fn run_user_turn(
     });
 
     // First assistant section opens with its own blank line + thin rule + header.
-    match agent.interact(parsed.content, cancel).await {
+    match agent.interact(content, cancel).await {
         Ok(_) => {
             println!();
             console.append("\n");
