@@ -40,9 +40,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::generative_model::TokenUsage;
 use crate::session::{
     AgentEvent, ConsoleLog, EventSink, MarkdownRenderer, Palette, TOOL_DISPLAY_STRING_MAX,
-    render_block, section_rule, truncate_json_strings, user_rule,
+    render_block, section_rule, truncate_json_strings, usage_line, user_header_line, user_rule,
 };
 
 // ---------------------------------------------------------------------------
@@ -328,13 +329,17 @@ impl TuiProducer {
 
     // -- chrome (called by the REPL loop, not derived from AgentEvents) -----
 
-    /// USER rule + `USER <used>/<max>` header + blank line, byte-compatible
-    /// with the current `run_repl` chrome. Resets per-turn stream state.
-    pub fn user_header(&self, used: u64, max: u64) {
+    /// USER rule + `USER <used>/<max> (<pct>%)` header + optional usage line +
+    /// blank line, byte-compatible with the current `run_repl` chrome. Resets
+    /// per-turn stream state.
+    pub fn user_header(&self, used: Option<u64>, max: u64, usage: Option<TokenUsage>) {
         let events = self.with_state(|st| {
             let mut events = vec![TuiEvent::Begin(Region::UserTurn)];
             styled_line(&mut events, Style::USER, &user_rule(st.wrap));
-            styled_line(&mut events, Style::USER, &format!("USER {used}/{max}"));
+            styled_line(&mut events, Style::USER, &user_header_line(used, max));
+            if let Some(u) = usage {
+                styled_line(&mut events, Style::USER, &usage_line(u));
+            }
             events.push(TuiEvent::Text("\n".into()));
             st.assistant_open = false;
             st.need_blank = false;
@@ -637,14 +642,24 @@ mod tests {
     fn user_header_matches_current_cli_bytes() {
         let capture = Arc::new(Capture::default());
         let producer = TuiProducer::new(vec![capture.clone()], Some(24));
-        producer.user_header(10, 200);
+        producer.user_header(
+            Some(10),
+            200,
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 3,
+                cached_input_tokens: 8,
+                cached_output_tokens: 0,
+            }),
+        );
         let events = capture.events();
 
         let palette = Palette::colored(true).with_wrap(Some(24));
         let expected = format!(
-            "{}\n{}\n\n",
+            "{}\n{}\n{}\n\n",
             palette.user(&user_rule(palette.wrap)),
-            palette.user("USER 10/200")
+            palette.user("USER 10/200 (5%)"),
+            palette.user("⚙ last turn: input 10 (8 cached) · output 3")
         );
         assert_eq!(encode_ansi(&events, true), expected);
         // Colors off: same content, no escapes — the piped/`--color never` path.
@@ -655,7 +670,7 @@ mod tests {
     fn plain_encoding_is_structurally_stripped_ansi() {
         let capture = Arc::new(Capture::default());
         let producer = TuiProducer::new(vec![capture.clone()], Some(30));
-        producer.user_header(0, 100);
+        producer.user_header(Some(0), 100, None);
         producer.submitted_input("please make it **bold** somewhere");
         producer.emit(AgentEvent::TextDelta {
             text: "Some **bold** and `code` in a paragraph that wraps.".into(),
@@ -694,7 +709,7 @@ mod tests {
         let a = Arc::new(Capture::default());
         let b = Arc::new(Capture::default());
         let producer = TuiProducer::new(vec![a.clone(), b.clone()], None);
-        producer.user_header(1, 2);
+        producer.user_header(Some(1), 2, None);
         producer.emit(AgentEvent::TextDelta {
             text: "hello".into(),
             context: TraceContext::root(),
@@ -708,7 +723,7 @@ mod tests {
     fn assistant_section_opens_once_per_turn() {
         let capture = Arc::new(Capture::default());
         let producer = TuiProducer::new(vec![capture.clone()], None);
-        producer.user_header(0, 1);
+        producer.user_header(Some(0), 1, None);
         producer.emit(AgentEvent::TextDelta {
             text: "one".into(),
             context: TraceContext::root(),
@@ -722,7 +737,7 @@ mod tests {
         assert_eq!(plain.matches("ASSISTANT\n").count(), 1);
         assert!(plain.contains("one two\n"));
         // Next user turn reopens the section.
-        producer.user_header(0, 1);
+        producer.user_header(Some(0), 1, None);
         producer.emit(AgentEvent::TextDelta {
             text: "three".into(),
             context: TraceContext::root(),

@@ -99,7 +99,9 @@ pub enum AgentEvent {
         reason: TurnEndReason,
         context: TraceContext,
     },
-    /// Provider usage for the most recent generate call (may fire multiple times per user turn).
+    /// Turn-accumulated usage, fired after each generate call: input side is
+    /// the latest request's prompt (≈ live context), output side sums across
+    /// the turn's generate calls so far (one per tool round-trip).
     Usage {
         usage: TokenUsage,
         context: TraceContext,
@@ -142,7 +144,8 @@ pub struct Agent {
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
-    /// Last provider usage observed (input-side context estimate for the next USER header).
+    /// Last turn's usage: input = final request's prompt (context estimate for
+    /// the next USER header), output = summed across that turn's generate calls.
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
@@ -238,6 +241,12 @@ impl Agent {
         });
         self.emit_checkpoint();
 
+        // Output tokens accumulate across this turn's generate calls (one per
+        // tool round-trip); each new report's input side already covers the
+        // whole prompt, so it replaces rather than adds.
+        let mut turn_output: u64 = 0;
+        let mut turn_cached_output: u64 = 0;
+
         loop {
             if cancel.is_cancelled() {
                 return self.finish_cancelled();
@@ -255,6 +264,13 @@ impl Agent {
             };
 
             if let Some(usage) = output.usage {
+                turn_output += usage.output_tokens;
+                turn_cached_output += usage.cached_output_tokens;
+                let usage = TokenUsage {
+                    output_tokens: turn_output,
+                    cached_output_tokens: turn_cached_output,
+                    ..usage
+                };
                 self.last_usage = Some(usage);
                 self.sink.emit(AgentEvent::Usage {
                     usage,
@@ -541,6 +557,9 @@ mod tests {
                     input_json_delta: tu.input.to_string(),
                 }));
             }
+            if let Some(usage) = output.usage {
+                parts.push(MessagePart::Usage(usage));
+            }
             parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
 
             Box::pin(stream::iter(parts.into_iter().map(Ok)))
@@ -751,6 +770,64 @@ mod tests {
         assert_eq!(snapshots[1].len(), 3);
         assert!(matches!(snapshots[1][1], Message::AssistantMessage { .. }));
         assert!(matches!(snapshots[1][2], Message::ToolResults { .. }));
+    }
+
+    #[tokio::test]
+    async fn last_usage_sums_output_across_tool_round_trips() {
+        let tool = Arc::new(SlowService {
+            name: "fast".into(),
+            delay: Duration::ZERO,
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![tool as Arc<dyn ToolService>]);
+
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "fast".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: Some(TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 500,
+                    cached_input_tokens: 800,
+                    cached_output_tokens: 0,
+                }),
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: Some(TokenUsage {
+                    input_tokens: 1_600,
+                    output_tokens: 20,
+                    cached_input_tokens: 900,
+                    cached_output_tokens: 0,
+                }),
+            },
+        ]);
+
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
+            .interact(
+                vec![Content::Text { text: "go".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        // Input side tracks the latest request (the live context); output sums the turn.
+        let usage = agent.last_usage().expect("usage recorded");
+        assert_eq!(usage.input_tokens, 1_600);
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.output_tokens, 520);
+        assert_eq!(usage.context_tokens(), 1_600);
     }
 
     /// Slow generate stream: cancel mid-stream must return Cancelled quickly.
