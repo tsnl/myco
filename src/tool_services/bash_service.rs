@@ -310,8 +310,8 @@ impl BashService {
         let stderr = child.stderr.take().expect("stderr piped");
         // Shared buffers, appended to as data arrives, so the bounded drain
         // below can report partial output even when a reader never hits EOF.
-        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_buf = Arc::new(Mutex::new(CappedCapture::default()));
+        let stderr_buf = Arc::new(Mutex::new(CappedCapture::default()));
         let stdout_task = spawn_capture(stdout, Arc::clone(&stdout_buf));
         let stderr_task = spawn_capture(stderr, Arc::clone(&stderr_buf));
 
@@ -336,14 +336,12 @@ impl BashService {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 drain_capture(stdout_task, stderr_task).await;
-                let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
-                let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                let out = render_locked_capture(&stdout_buf, max_bytes);
+                let err = render_locked_capture(&stderr_buf, max_bytes);
                 generative_model::ToolResult::err(format!(
                     "exec cancelled\n\
-                     stdout:\n{}\n\
-                     stderr:\n{}",
-                    truncate_middle_lossy(&out, max_bytes),
-                    truncate_middle_lossy(&err, max_bytes),
+                     stdout:\n{out}\n\
+                     stderr:\n{err}"
                 ))
             }
             Outcome::TimedOut => {
@@ -351,34 +349,30 @@ impl BashService {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 drain_capture(stdout_task, stderr_task).await;
-                let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
-                let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                let out = render_locked_capture(&stdout_buf, max_bytes);
+                let err = render_locked_capture(&stderr_buf, max_bytes);
                 generative_model::ToolResult::text(format!(
                     "Exit code: None\n\
                      Termination signal: None\n\
                      status: timed_out\n\
                      timeout_ms: {timeout_ms}\n\
-                     stdout:\n{}\n\
-                     stderr:\n{}\n\
-                     (exec timed out after {timeout_ms}ms; process group killed)\n",
-                    truncate_middle_lossy(&out, max_bytes),
-                    truncate_middle_lossy(&err, max_bytes),
+                     stdout:\n{out}\n\
+                     stderr:\n{err}\n\
+                     (exec timed out after {timeout_ms}ms; process group killed)\n"
                 ))
             }
             Outcome::Status(status) => {
                 drain_capture(stdout_task, stderr_task).await;
-                let out = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
-                let err = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                let out = render_locked_capture(&stdout_buf, max_bytes);
+                let err = render_locked_capture(&stderr_buf, max_bytes);
                 match status {
                     Ok(status) => generative_model::ToolResult::text(format!(
                         "Exit code: {:?}\n\
                          Termination signal: {:?}\n\
-                         stdout:\n{}\n\
-                         stderr:\n{}",
+                         stdout:\n{out}\n\
+                         stderr:\n{err}",
                         status.code(),
                         status.signal(),
-                        truncate_middle_lossy(&out, max_bytes),
-                        truncate_middle_lossy(&err, max_bytes),
                     )),
                     Err(error) => generative_model::ToolResult::err(format!(
                         "Error executing command: {error}"
@@ -866,6 +860,9 @@ struct SessionShared {
 struct OutputBuffer {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Oldest bytes dropped since the last read because a stream exceeded
+    /// [`SESSION_STREAM_CAP`] (surfaced in the next snapshot, then reset).
+    dropped_bytes: usize,
     /// Total bytes ever observed (for activity detection).
     total_bytes: usize,
     exited: bool,
@@ -892,6 +889,9 @@ struct SessionSnapshot {
     stdout: String,
     stderr: String,
     bytes_returned: usize,
+    /// Oldest buffered bytes dropped (stream over the in-memory cap) since
+    /// the previous read.
+    bytes_dropped: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -926,6 +926,12 @@ impl SessionSnapshot {
         out.push_str(&format!("exit_code: {:?}\n", self.exit_code));
         out.push_str(&format!("exit_signal: {:?}\n", self.exit_signal));
         out.push_str(&format!("bytes_returned: {}\n", self.bytes_returned));
+        if self.bytes_dropped > 0 {
+            out.push_str(&format!(
+                "(oldest {} buffered bytes dropped: output exceeded the in-memory session cap; read more often or filter at the source)\n",
+                self.bytes_dropped
+            ));
+        }
         out.push_str("stdout:\n");
         out.push_str(&self.stdout);
         if !self.stdout.ends_with('\n') && !self.stdout.is_empty() {
@@ -962,9 +968,49 @@ impl SessionSnapshot {
 /// its whole lifetime — or forever, for a daemon.
 const EXEC_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// In-memory accumulation cap per exec stream. `max_bytes` caps what a call
+/// *returns*; without this a flooding child (`yes`, a verbose build) grows
+/// the capture buffer without bound for the exec's whole lifetime. Head and
+/// rolling tail are kept so the final middle-elision still sees both ends.
+const EXEC_CAPTURE_CAP: usize = 512 * 1024;
+
+/// One exec stream captured under the accumulation cap: the first
+/// `EXEC_CAPTURE_CAP / 2` bytes, a rolling tail of the same size, and a count
+/// of bytes dropped at the seam between them.
+#[derive(Default)]
+struct CappedCapture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    omitted: usize,
+}
+
+impl CappedCapture {
+    fn push(&mut self, chunk: &[u8]) {
+        let head_cap = EXEC_CAPTURE_CAP / 2;
+        let tail_cap = EXEC_CAPTURE_CAP - head_cap;
+        let mut rest = chunk;
+        if self.head.len() < head_cap {
+            let take = (head_cap - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() {
+            return;
+        }
+        self.tail.extend_from_slice(rest);
+        // Drop-oldest in blocks (not per chunk) so a flood costs a few
+        // memmoves, not one per 4 KiB read.
+        if self.tail.len() > tail_cap + 64 * 1024 {
+            let excess = self.tail.len() - tail_cap;
+            self.tail.drain(..excess);
+            self.omitted += excess;
+        }
+    }
+}
+
 /// Read `reader` to EOF, appending to `buf` as data arrives (not just at EOF),
 /// so a bounded drain still observes everything read so far.
-fn spawn_capture<R>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+fn spawn_capture<R>(mut reader: R, buf: Arc<Mutex<CappedCapture>>) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -975,7 +1021,7 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if let Ok(mut g) = buf.lock() {
-                        g.extend_from_slice(&chunk[..n]);
+                        g.push(&chunk[..n]);
                     }
                 }
             }
@@ -983,14 +1029,54 @@ where
     })
 }
 
-/// Cap one exec stream at `max_bytes`, keeping the head and tail halves and
-/// eliding the middle with a marker.
+/// Render a shared capture buffer under the return cap (empty on a poisoned
+/// lock — the capture task panicked, so there is nothing better to report).
+fn render_locked_capture(buf: &Arc<Mutex<CappedCapture>>, max_bytes: usize) -> String {
+    buf.lock()
+        .map(|g| render_capture(&g, max_bytes))
+        .unwrap_or_default()
+}
+
+/// The shared middle-elision shape: verbatim head, one honest marker, tail.
+fn middle_elision(head: &[u8], tail: &[u8], omitted: usize, total: usize, max_bytes: usize) -> String {
+    format!(
+        "{}\n[... {omitted} bytes omitted ({total} bytes total, max_bytes={max_bytes}); \
+         filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",
+        String::from_utf8_lossy(head),
+        String::from_utf8_lossy(tail),
+    )
+}
+
+/// Render a captured exec stream under the *return* cap `max_bytes`, folding
+/// any capture-time loss into the same middle-elision marker.
 ///
 /// Unlike session output (buffered; the agent can `read` the rest later),
 /// exec output is gone once the call returns, so the cut must keep the most
 /// informative parts — and those are the ends: build/test tools print the
 /// root-cause error first and the failure summary last. Cuts are byte-exact;
 /// a split UTF-8 char renders as U+FFFD at the seam.
+fn render_capture(capture: &CappedCapture, max_bytes: usize) -> String {
+    if capture.omitted == 0 {
+        let mut all = Vec::with_capacity(capture.head.len() + capture.tail.len());
+        all.extend_from_slice(&capture.head);
+        all.extend_from_slice(&capture.tail);
+        return truncate_middle_lossy(&all, max_bytes);
+    }
+    let total = capture.head.len() + capture.omitted + capture.tail.len();
+    let head_keep = max_bytes.div_ceil(2).min(capture.head.len());
+    let tail_keep = (max_bytes / 2).min(capture.tail.len());
+    let omitted = total - head_keep - tail_keep;
+    middle_elision(
+        &capture.head[..head_keep],
+        &capture.tail[capture.tail.len() - tail_keep..],
+        omitted,
+        total,
+        max_bytes,
+    )
+}
+
+/// Cap contiguous bytes at `max_bytes`, keeping the head and tail halves and
+/// eliding the middle with a marker (see [`render_capture`]).
 fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
     if bytes.len() <= max_bytes {
         return String::from_utf8_lossy(bytes).into_owned();
@@ -998,12 +1084,12 @@ fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
     let head_len = max_bytes.div_ceil(2);
     let tail_len = max_bytes / 2;
     let omitted = bytes.len() - head_len - tail_len;
-    format!(
-        "{}\n[... {omitted} bytes omitted ({} bytes total, max_bytes={max_bytes}); \
-         filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",
-        String::from_utf8_lossy(&bytes[..head_len]),
+    middle_elision(
+        &bytes[..head_len],
+        &bytes[bytes.len() - tail_len..],
+        omitted,
         bytes.len(),
-        String::from_utf8_lossy(&bytes[bytes.len() - tail_len..]),
+        max_bytes,
     )
 }
 
@@ -1024,6 +1110,23 @@ async fn drain_capture(
     }
 }
 
+/// Per-stream in-memory cap for session output. A long-lived session nobody
+/// `read`s (a dev server left running for hours) must not grow resident
+/// memory without bound; the newest output is what a late reader wants, so
+/// the oldest is dropped — in blocks, so a flood costs a few memmoves.
+const SESSION_STREAM_CAP: usize = 2 * 1024 * 1024;
+
+/// Enforce [`SESSION_STREAM_CAP`] on one stream; returns bytes dropped.
+fn cap_session_stream(stream: &mut Vec<u8>) -> usize {
+    if stream.len() <= SESSION_STREAM_CAP {
+        return 0;
+    }
+    // Drop down to 3/4 of the cap so the next overflows are amortized.
+    let excess = stream.len() - (SESSION_STREAM_CAP - SESSION_STREAM_CAP / 4);
+    stream.drain(..excess);
+    excess
+}
+
 fn spawn_reader<R>(mut reader: R, kind: StreamKind, shared: Arc<SessionShared>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1035,10 +1138,17 @@ where
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut b) = shared.buffer.lock() {
-                        match kind {
-                            StreamKind::Stdout => b.stdout.extend_from_slice(&buf[..n]),
-                            StreamKind::Stderr => b.stderr.extend_from_slice(&buf[..n]),
-                        }
+                        let dropped = match kind {
+                            StreamKind::Stdout => {
+                                b.stdout.extend_from_slice(&buf[..n]);
+                                cap_session_stream(&mut b.stdout)
+                            }
+                            StreamKind::Stderr => {
+                                b.stderr.extend_from_slice(&buf[..n]);
+                                cap_session_stream(&mut b.stderr)
+                            }
+                        };
+                        b.dropped_bytes = b.dropped_bytes.saturating_add(dropped);
                         b.total_bytes = b.total_bytes.saturating_add(n);
                     }
                     shared.notify.notify_waiters();
@@ -1190,7 +1300,7 @@ async fn collect_output(
     }
 
     // Drain up to max_bytes from the buffer (stdout first, then stderr).
-    let (stdout, stderr, exit_code, exit_signal, exited) = {
+    let (stdout, stderr, exit_code, exit_signal, exited, bytes_dropped) = {
         let mut b = match shared.buffer.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -1204,6 +1314,7 @@ async fn collect_output(
                     stdout: String::new(),
                     stderr: String::new(),
                     bytes_returned: 0,
+                    bytes_dropped: 0,
                 };
             }
         };
@@ -1233,6 +1344,7 @@ async fn collect_output(
             b.exit_code,
             b.exit_signal,
             b.exited,
+            std::mem::take(&mut b.dropped_bytes),
         )
     };
 
@@ -1251,6 +1363,7 @@ async fn collect_output(
         stdout,
         stderr,
         bytes_returned,
+        bytes_dropped,
     }
 }
 
@@ -1830,6 +1943,49 @@ mod tests {
         assert!(text.starts_with("abc"), "{text}");
         assert!(text.ends_with("yz"), "{text}");
         assert!(text.contains("21 bytes omitted"), "{text}");
+    }
+
+    /// The capture buffer itself is capped: a stream bigger than
+    /// EXEC_CAPTURE_CAP keeps only head + rolling tail in memory, and the
+    /// rendered result folds capture loss and the return cap into one
+    /// accurate marker.
+    #[test]
+    fn capped_capture_bounds_memory_and_reports_total() {
+        let mut cap = CappedCapture::default();
+        let total: usize = EXEC_CAPTURE_CAP * 3;
+        let chunk = vec![b'x'; 4096];
+        let mut written = 0usize;
+        while written < total {
+            cap.push(&chunk);
+            written += chunk.len();
+        }
+        assert!(cap.omitted > 0);
+        assert!(
+            cap.head.len() + cap.tail.len() <= EXEC_CAPTURE_CAP + 64 * 1024,
+            "in-memory bytes must stay near the cap: {}",
+            cap.head.len() + cap.tail.len()
+        );
+        assert_eq!(cap.head.len() + cap.omitted + cap.tail.len(), written);
+
+        let text = render_capture(&cap, 1000);
+        assert!(text.contains(&format!("{written} bytes total")), "{text}");
+        assert!(text.contains("bytes omitted"), "{text}");
+        // Rendered size respects the return cap (plus the marker line).
+        assert!(text.len() < 1000 + 300, "rendered too big: {}", text.len());
+    }
+
+    /// A session stream over the in-memory cap drops oldest bytes in blocks
+    /// and stays bounded.
+    #[test]
+    fn session_stream_cap_drops_oldest() {
+        let mut v = vec![0u8; SESSION_STREAM_CAP + 100];
+        let dropped = cap_session_stream(&mut v);
+        assert!(dropped >= 100, "{dropped}");
+        assert!(v.len() <= SESSION_STREAM_CAP);
+        // Under the cap: untouched.
+        let mut small = vec![0u8; 1024];
+        assert_eq!(cap_session_stream(&mut small), 0);
+        assert_eq!(small.len(), 1024);
     }
 
     /// A flooding exec must come back capped — head and tail survive, the
