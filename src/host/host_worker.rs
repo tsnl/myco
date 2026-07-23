@@ -145,9 +145,9 @@ impl HostWorker {
                     eprintln!("host worker: write tool result failed: {e}");
                 }
             }
-            Request::AgentFinished { agent_id } => {
+            Request::AgentFinished { id, agent_id } => {
                 self.notify_agent_finished(agent_id);
-                let response = Response::AgentFinishedOk { agent_id };
+                let response = Response::AgentFinishedOk { id, agent_id };
                 if let Err(e) = write_locked(&writer, &response).await {
                     eprintln!("host worker: write agent_finished failed: {e}");
                 }
