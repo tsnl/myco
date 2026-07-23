@@ -133,6 +133,19 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 - [x] **User multimodal (images)** — `@path` mentions in the REPL attach
       png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
       Responses sends `input_image` parts. Non-image files: see **Rich attach**.
+- [ ] **Provider file upload for images** — inline data-URL images are re-sent on
+      *every* generate call (every tool-loop step), so one attached image adds its
+      base64 to the wire for the rest of the session. When that hurts, fix inside
+      the protocol drivers, not the abstraction: at request composition, hash the
+      image, check an in-memory upload cache (hash → provider file id), upload on
+      miss (Anthropic Files API, beta `files-api-2025-04-14`, file source block;
+      OpenAI `/v1/files` purpose=vision, `input_image.file_id`), substitute the id
+      in the outgoing request, fall back to inline base64 on failure. History and
+      session files keep the data URL, so `/resume` across models keeps working.
+      Per-gateway opt-in (`files_api = true`) — most OpenAI-compatible gateways
+      (OpenRouter, local servers) and Anthropic-protocol proxies lack the
+      endpoint. Known costs: uploaded files persist server-side until deleted
+      (org storage cap), and upload paths need HTTP-mock tests.
 - [ ] **`/model` mid-session** without restart. (`/effort` landed: always-on thinking, default high.)
 - [ ] **Rich attach** — files/dirs/URLs as first-class message parts (not only “cat in bash”).
 
