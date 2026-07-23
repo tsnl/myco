@@ -1019,7 +1019,9 @@ mod tests {
     #[test]
     fn images_become_placeholders_never_base64_or_silence() {
         let user_text = content_to_input_text(&[
-            Content::Text { text: "see:".into() },
+            Content::Text {
+                text: "see:".into(),
+            },
             Content::Image {
                 source: "aGVsbG8=".into(),
             },

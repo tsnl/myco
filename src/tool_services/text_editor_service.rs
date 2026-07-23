@@ -1186,7 +1186,11 @@ mod tests {
             },
         );
         assert!(view.is_error, "{}", result_text(&view));
-        assert!(result_text(&view).contains("view_range"), "{}", result_text(&view));
+        assert!(
+            result_text(&view).contains("view_range"),
+            "{}",
+            result_text(&view)
+        );
 
         // A ranged view of the same file still works.
         let ranged = dispatch(
