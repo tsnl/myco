@@ -34,9 +34,12 @@ Quick map (details in `manual`):
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
-- Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
-  guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs (`.claude/skills`, `SKILL.md`
-  folders) — read them with the editor or `rg` when the task touches how this project works.
+- Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). For
+  search **by meaning**, use `ck` where installed (`ck --sem "query" dir/`; hybrid BM25 +
+  semantic, persistent per-folder index, `cargo install ck-search`) — probe with
+  `command -v ck`. Project guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs
+  (`.claude/skills`, `SKILL.md` folders) — read them with the editor or `rg` when the task
+  touches how this project works.
 - You cannot run slash-commands (`/hosts`, `/session`, …); tell the user which to run.
 - Updating `myco` on **remote** hosts: compile **on the target** (see `manual` `harness-ops`).
   If developing myco, archive the local git tree; else download a source snapshot from
@@ -220,7 +223,9 @@ mod tests {
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         // Search guidance is bash-first; myco ships no search tools of its own.
+        // Semantic search is the external `ck` companion, probed per host.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`rg`"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`ck`"));
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
         // Free-form workspace policy: maildir-style soul versions, the
         // recall/record habit, and the consistency caution.

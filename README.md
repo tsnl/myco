@@ -16,7 +16,7 @@ the local machine **and** on every concrete `Host` alias in your
   demand; you stay in a single conversation.
 - **Real computer use.** Bash (including multi-turn sessions) and a surgical
   file editor on each host; search and browsing compose from the tools already
-  on your machines (`rg`, `curl`, `lynx`, …) via bash.
+  on your machines (`rg`, `curl`, `lynx`, `ck` for semantic search, …) via bash.
 - **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
   conversation history live under `~/.myco/` — pick up later with `/resume`.
 - **Nested agents for long work.** myco drives itself: start `myco` in a bash
@@ -32,7 +32,8 @@ cargo install myco
 ```
 
 Needs stable Rust and `ssh`, `uv`, `bash`, `tmux`, `fzf` on `PATH`
-(`git`, `gh`, `curl` recommended).
+(`git`, `gh`, `curl` recommended; `ck` — `cargo install ck-search` — for
+semantic code search).
 
 ## Use
 
