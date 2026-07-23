@@ -200,6 +200,9 @@ mod tests {
         s
     }
 
+    // Holding the std MutexGuard across await is intended: it serializes the
+    // test, and #[tokio::test] runs on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn lists_ranked_sessions_from_real_store() {
         let _guard = lock_myco_home_for_test();
