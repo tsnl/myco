@@ -142,6 +142,50 @@ impl ToolService for BashService {
     fn on_agent_finished(&self, agent_id: Uuid) {
         self.reap_owner(agent_id);
     }
+
+    fn running_tool_summaries(&self, agent_id: Uuid) -> Vec<String> {
+        let Ok(sessions) = self.sessions.lock() else {
+            return Vec::new();
+        };
+        let mut lines: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| {
+                // Exited-but-unclosed sessions are not running; skip them.
+                s.owner == agent_id && !s.shared.buffer.lock().map(|b| b.exited).unwrap_or(true)
+            })
+            .map(|(id, s)| {
+                let idle = s.last_used.lock().map(|t| t.elapsed()).unwrap_or_default();
+                format!(
+                    "bash session {id}: {} (up {}, idle {})",
+                    summary_cmdline(&s.cmdline),
+                    brief_age(s.created_at.elapsed()),
+                    brief_age(idle),
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+}
+
+/// Cmdline for a one-line session summary: first line only, capped.
+fn summary_cmdline(cmdline: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let first_line = cmdline.lines().next().unwrap_or_default();
+    match first_line.char_indices().nth(MAX_CHARS) {
+        Some((byte, _)) => format!("{}…", &first_line[..byte]),
+        None => first_line.to_string(),
+    }
+}
+
+/// Compact human age for one-line summaries: `42s`, `7m`, `2h05m`.
+fn brief_age(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
 }
 
 impl BashService {
@@ -1939,6 +1983,96 @@ mod tests {
         );
 
         let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    }
+
+    /// Prompt-time summaries list only the caller's live sessions, one line
+    /// each; exited-but-unclosed and foreign-owned sessions are excluded.
+    #[tokio::test]
+    async fn running_tool_summaries_list_live_sessions_for_owner_only() {
+        let service = Arc::new(BashService::new());
+        let owner = uuid::Uuid::new_v4();
+        let id = unique_id("summary");
+
+        let start = service
+            .clone()
+            .dispatch_tool_use(
+                tool_use_json(json!({
+                    "action": "start",
+                    "session_id": id,
+                    "command": "bash -c 'sleep 30'",
+                    "timeout_ms": 500,
+                    "idle_ms": 100,
+                })),
+                dispatch_ctx(owner),
+            )
+            .await;
+        assert!(!start.is_error, "start: {}", result_text(&start));
+
+        let lines = service.running_tool_summaries(owner);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(&id), "{lines:?}");
+        assert!(lines[0].contains("sleep 30"), "{lines:?}");
+        assert!(!lines[0].contains('\n'), "must be one line: {lines:?}");
+        assert!(
+            service
+                .running_tool_summaries(uuid::Uuid::new_v4())
+                .is_empty(),
+            "other agents must not see this session"
+        );
+
+        let close = service
+            .clone()
+            .dispatch_tool_use(
+                tool_use_json(json!({"action": "close", "session_id": id})),
+                dispatch_ctx(owner),
+            )
+            .await;
+        assert!(!close.is_error, "close: {}", result_text(&close));
+        assert!(
+            service.running_tool_summaries(owner).is_empty(),
+            "closed sessions must not be listed"
+        );
+
+        // An exited-but-unclosed session is not running. Exit is observed by
+        // an async waiter, so poll briefly instead of asserting immediately.
+        let id2 = unique_id("exited");
+        let start = service
+            .clone()
+            .dispatch_tool_use(
+                tool_use_json(json!({
+                    "action": "start",
+                    "session_id": id2,
+                    "command": "true",
+                })),
+                dispatch_ctx(owner),
+            )
+            .await;
+        assert!(!start.is_error, "start: {}", result_text(&start));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !service.running_tool_summaries(owner).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "exited session still listed: {:?}",
+                service.running_tool_summaries(owner)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Summary lines stay compact: cmdlines are first-line-only and capped,
+    /// ages render as s/m/h.
+    #[test]
+    fn summary_cmdline_and_age_stay_compact() {
+        assert_eq!(summary_cmdline("npm run dev"), "npm run dev");
+        assert_eq!(summary_cmdline("line one\nline two"), "line one");
+        let long = "x".repeat(100);
+        let capped = summary_cmdline(&long);
+        assert!(capped.chars().count() <= 61, "{capped}");
+        assert!(capped.ends_with('…'), "{capped}");
+
+        assert_eq!(brief_age(Duration::from_secs(42)), "42s");
+        assert_eq!(brief_age(Duration::from_secs(420)), "7m");
+        assert_eq!(brief_age(Duration::from_secs(2 * 3600 + 5 * 60)), "2h05m");
     }
 
     /// One-shot exec waits for exit but must not hang forever on a long sleep.

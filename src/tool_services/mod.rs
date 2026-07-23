@@ -155,6 +155,13 @@ pub trait ToolService: Send + Sync + 'static {
     /// Called when an agent session ends so services can drop agent-scoped state
     /// (e.g. bash sessions owned by that agent). Default: no-op.
     fn on_agent_finished(&self, _agent_id: uuid::Uuid) {}
+
+    /// One-line summaries of work this service still has running for
+    /// `agent_id` (e.g. live bash sessions), for prompt-time display between
+    /// turns. Must not block. Default: none.
+    fn running_tool_summaries(&self, _agent_id: uuid::Uuid) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
