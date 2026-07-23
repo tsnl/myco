@@ -5,11 +5,20 @@
 //! invocations are paragraphs inside ASSISTANT. ERROR is used for live
 //! generate failures, WARNING for startup preflight problems; both are
 //! live-only (not stored in session history).
+//!
+//! Layout is built as [`TuiEvent`]s on the same section/paragraph helpers the
+//! live producer uses ([`crate::tui::TuiProducer`]), so replay and live output
+//! share one policy; the `Write`-based functions here are encoding facades
+//! ([`crate::tui::encode_ansi`]) for buffered callers and tests.
 
 use std::io::Write;
 
-use super::markdown::{render_block, render_block_with_base};
+use super::markdown::{MarkdownRenderer, render_block};
 use crate::generative_model::{Content, Message, TokenUsage};
+use crate::tui::{
+    SectionState, Style, TuiEvent, encode_ansi, encoded_ends_with_newline, section_open_events,
+    styled_line, tool_invocation_events,
+};
 
 /// Full-block 72-col rule above the startup banner — the heaviest rule in the
 /// UI (banner `█` > user `═` > section `─`), so launch stands out even
@@ -128,104 +137,17 @@ impl Palette {
     pub const fn with_wrap(self, wrap: Option<usize>) -> Self {
         Self { wrap, ..self }
     }
-
-    /// Leading `0;` clears any style left open by an interrupted stream
-    /// before applying `sgr`, so headers stay legible after a cancel.
-    fn paint(&self, sgr: &str, text: &str) -> String {
-        if self.enabled {
-            format!("\x1b[0;{sgr}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
-    }
-
-    /// USER rule + header: bold cyan.
-    pub fn user(&self, text: &str) -> String {
-        self.paint("1;36", text)
-    }
-
-    /// ASSISTANT rule + header: bold green.
-    pub fn assistant(&self, text: &str) -> String {
-        self.paint("1;32", text)
-    }
-
-    /// ERROR rule + header: bold red.
-    pub fn error(&self, text: &str) -> String {
-        self.paint("1;31", text)
-    }
-
-    /// Startup banner rule + MYCO title: bold, no color (distinct from the
-    /// USER/ASSISTANT section palette).
-    pub fn banner(&self, text: &str) -> String {
-        self.paint("1", text)
-    }
-
-    /// WARNING rule + header: bold yellow.
-    pub fn warning(&self, text: &str) -> String {
-        self.paint("1;33", text)
-    }
-
-    /// Thinking paragraphs: dim.
-    pub fn thinking(&self, text: &str) -> String {
-        self.paint("2", text)
-    }
-
-    /// Tool name in tool-invocation paragraphs: bold yellow.
-    pub fn tool_name(&self, text: &str) -> String {
-        self.paint("1;33", text)
-    }
-
-    /// Open the thinking style for a streamed line (deltas print in between;
-    /// close with [`Palette::reset`]).
-    pub fn thinking_on(&self) -> &'static str {
-        if self.enabled { "\x1b[0;2m" } else { "" }
-    }
-
-    pub fn reset(&self) -> &'static str {
-        if self.enabled { "\x1b[0m" } else { "" }
-    }
 }
 
-/// Write an ASSISTANT section open: blank line, thin rule, header, blank line, then body.
-pub fn write_assistant_open(
-    out: &mut (impl Write + ?Sized),
-    palette: Palette,
-) -> std::io::Result<()> {
-    writeln!(out)?;
-    writeln!(out, "{}", palette.assistant(&section_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.assistant("ASSISTANT"))?;
-    writeln!(out)?;
-    Ok(())
-}
-
-/// Write an ERROR section open: blank line, thin rule, header, blank line, then body.
-pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> std::io::Result<()> {
-    writeln!(out)?;
-    writeln!(out, "{}", palette.error(&section_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.error("ERROR"))?;
-    writeln!(out)?;
-    Ok(())
-}
-
-/// Write a WARNING section open: blank line, thin rule, header, blank line, then body.
+/// Write a WARNING section open: blank line, thin rule, header, blank line,
+/// then body (written by the caller — preflight problem lines).
 pub fn write_warning_open(
     out: &mut (impl Write + ?Sized),
     palette: Palette,
 ) -> std::io::Result<()> {
-    writeln!(out)?;
-    writeln!(out, "{}", palette.warning(&section_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.warning("WARNING"))?;
-    writeln!(out)?;
-    Ok(())
-}
-
-/// Write `text` with exactly one trailing newline.
-pub fn write_block(out: &mut impl Write, text: &str) -> std::io::Result<()> {
-    out.write_all(text.as_bytes())?;
-    if !text.ends_with('\n') {
-        out.write_all(b"\n")?;
-    }
-    Ok(())
+    let mut events = Vec::new();
+    section_open_events(&mut events, Style::WARNING, "WARNING", palette.wrap);
+    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
 }
 
 /// Write a full ERROR section with body text (trailing newline ensured).
@@ -234,20 +156,15 @@ pub fn write_error_section(
     text: &str,
     palette: Palette,
 ) -> std::io::Result<()> {
-    write_error_open(out, palette)?;
-    write_block(out, text)
-}
-
-pub fn ensure_assistant(
-    out: &mut impl Write,
-    open: &mut bool,
-    palette: Palette,
-) -> std::io::Result<()> {
-    if !*open {
-        write_assistant_open(out, palette)?;
-        *open = true;
-    }
-    Ok(())
+    let mut events = Vec::new();
+    section_open_events(&mut events, Style::ERROR, "ERROR", palette.wrap);
+    let body = if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    };
+    events.push(TuiEvent::Text(body));
+    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
 }
 
 /// `[N image(s) attached]` note for a user message carrying images; `None`
@@ -267,21 +184,18 @@ pub fn attachment_note(content: &[Content]) -> Option<String> {
     }
 }
 
-/// Replay saved messages with the same section layout as the live REPL.
+/// Event form of the saved-history replay: the same section/paragraph layout
+/// the live producer streams ([`SectionState`]), built from stored messages.
 ///
 /// Only USER / ASSISTANT headers. Thinking summaries and tools are paragraphs
 /// inside ASSISTANT. Thinking is stored in session history for resume, but
 /// backends strip it when composing API requests. Live ERROR sections are not
-/// part of history and are not replayed here.
-pub fn write_session_history(
-    out: &mut impl Write,
-    messages: &[Message],
-    palette: Palette,
-) -> std::io::Result<()> {
-    let mut assistant_open = false;
-    // True when the ASSISTANT body already has a finished paragraph (text or tool).
-    let mut need_blank = false;
-
+/// part of history and are not replayed. Storage keeps assistant content and
+/// tool_uses as separate lists (interleaving is lost), so replay renders
+/// content paragraphs first, then tool paragraphs, per message.
+pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
+    let mut st = SectionState::new();
+    let mut events = Vec::new();
     for msg in messages {
         match msg {
             Message::UserMessage { content } => {
@@ -297,23 +211,24 @@ pub fn write_session_history(
                 if text.is_empty() && note.is_none() {
                     continue;
                 }
-                writeln!(out, "{}", palette.user(&user_rule(palette.wrap)))?;
-                writeln!(out, "{}", palette.user("USER"))?;
-                writeln!(out)?;
+                styled_line(&mut events, Style::USER, &user_rule(palette.wrap));
+                styled_line(&mut events, Style::USER, "USER");
+                events.push(TuiEvent::Text("\n".into()));
                 // Wrap-only (no markdown styling): the user's own words replay
                 // as typed, at the transcript width — same as the live echo.
                 if !text.is_empty() {
-                    write_block(
-                        out,
-                        &render_block(&text, Palette::plain().with_wrap(palette.wrap)),
-                    )?;
+                    let rendered = render_block(&text, Palette::plain().with_wrap(palette.wrap));
+                    let ends_nl = rendered.ends_with('\n');
+                    events.push(TuiEvent::Text(rendered));
+                    if !ends_nl {
+                        events.push(TuiEvent::Text("\n".into()));
+                    }
                 }
                 if let Some(note) = note {
-                    writeln!(out, "{note}")?;
+                    events.push(TuiEvent::Text(format!("{note}\n")));
                 }
                 // Next assistant turn opens a fresh ASSISTANT section.
-                assistant_open = false;
-                need_blank = false;
+                st = SectionState::new();
             }
             Message::AssistantMessage {
                 content, tool_uses, ..
@@ -321,12 +236,10 @@ pub fn write_session_history(
                 for c in content {
                     match c {
                         Content::Text { text } if !text.is_empty() => {
-                            ensure_assistant(out, &mut assistant_open, palette)?;
-                            if need_blank {
-                                writeln!(out)?;
-                            }
-                            write_block(out, &render_block(text, palette))?;
-                            need_blank = true;
+                            let mut r = MarkdownRenderer::new(palette);
+                            let mut body = r.feed_events(text);
+                            body.extend(r.finish_events());
+                            replay_paragraph(&mut st, &mut events, body, palette);
                         }
                         Content::Thinking { text, redacted, .. } => {
                             let body = if *redacted {
@@ -336,43 +249,59 @@ pub fn write_session_history(
                             } else {
                                 text.clone()
                             };
-                            ensure_assistant(out, &mut assistant_open, palette)?;
-                            if need_blank {
-                                writeln!(out)?;
-                            }
-                            // Same shape as the live sink: one `Thinking: …` paragraph.
-                            write_block(
-                                out,
-                                &render_block_with_base(&format!("Thinking: {body}"), palette, "2"),
-                            )?;
-                            need_blank = true;
+                            // Same shape as the live stream: one dim
+                            // `Thinking: …` paragraph.
+                            let mut r = MarkdownRenderer::with_base(palette, "2");
+                            let mut body = r.feed_events(&format!("Thinking: {body}"));
+                            body.extend(r.finish_events());
+                            replay_paragraph(&mut st, &mut events, body, palette);
                         }
                         _ => {}
                     }
                 }
                 for tu in tool_uses {
-                    ensure_assistant(out, &mut assistant_open, palette)?;
-                    if need_blank {
-                        writeln!(out)?;
-                    }
-                    write!(
-                        out,
-                        "{}",
-                        format_tool_invocation(&tu.name, &tu.input, palette)
-                    )?;
-                    need_blank = true;
+                    st.ensure_assistant(&mut events, palette.wrap);
+                    st.separate_paragraph_if_needed(&mut events);
+                    tool_invocation_events(&mut events, &tu.name, &tu.input);
+                    st.at_line_start = true;
+                    st.need_blank = true;
                 }
             }
             Message::ToolResults { .. } => {}
         }
     }
-    Ok(())
+    events
 }
 
-pub fn print_session_history(messages: &[Message], palette: Palette) {
-    let mut out = std::io::stdout();
-    let _ = write_session_history(&mut out, messages, palette);
-    let _ = out.flush();
+/// One finished paragraph inside ASSISTANT: open the section if needed,
+/// blank-separate, emit the pre-rendered body with exactly one trailing
+/// newline (decided on the encoded tail, as the terminal sees it).
+fn replay_paragraph(
+    st: &mut SectionState,
+    events: &mut Vec<TuiEvent>,
+    body: Vec<TuiEvent>,
+    palette: Palette,
+) {
+    st.ensure_assistant(events, palette.wrap);
+    st.separate_paragraph_if_needed(events);
+    let ends_nl = encoded_ends_with_newline(&body, palette.enabled);
+    events.extend(body);
+    if !ends_nl {
+        events.push(TuiEvent::Text("\n".into()));
+    }
+    st.at_line_start = true;
+    st.need_blank = true;
+}
+
+/// Replay saved messages with the same section layout as the live REPL
+/// (encoding facade over [`history_events`]).
+pub fn write_session_history(
+    out: &mut impl Write,
+    messages: &[Message],
+    palette: Palette,
+) -> std::io::Result<()> {
+    let events = history_events(messages, palette);
+    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
 }
 
 /// Truncate a display string to `max_chars` (including a trailing `…` when shortened).
@@ -407,22 +336,16 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
     }
 }
 
-/// Render `name(<pretty json>)` for tool paragraphs inside ASSISTANT.
+/// Render `name(<pretty json>)` for tool paragraphs inside ASSISTANT
+/// (encoding facade over [`crate::tui`]'s tool-invocation events).
 ///
 /// Long string values are truncated first, then objects/arrays are pretty-printed
 /// with 2-space indent; scalars stay compact. Always ends with a trailing newline.
 /// Only the tool name is styled; the JSON body stays plain.
 pub fn format_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
-    let name = palette.tool_name(name);
-    let display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
-    match &display {
-        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-            let pretty =
-                serde_json::to_string_pretty(&display).unwrap_or_else(|_| display.to_string());
-            format!("{name}({pretty})\n")
-        }
-        other => format!("{name}({other})\n"),
-    }
+    let mut events = Vec::new();
+    tool_invocation_events(&mut events, name, input);
+    encode_ansi(&events, palette.enabled)
 }
 
 #[cfg(test)]
@@ -792,8 +715,6 @@ mod tests {
         write_error_section(&mut buf, "boom", Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(!rendered.contains('\x1b'));
-        assert_eq!(Palette::plain().thinking_on(), "");
-        assert_eq!(Palette::plain().reset(), "");
     }
 
     #[test]

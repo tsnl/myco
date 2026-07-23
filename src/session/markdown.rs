@@ -1468,7 +1468,6 @@ fn split_cell_lines(events: Vec<TuiEvent>) -> CellLines {
                     cur.push(TuiEvent::Text(rest.to_string()));
                 }
             }
-            TuiEvent::Begin(_) => {}
         }
     }
     lines.push((cur, cur_w));
@@ -1871,12 +1870,12 @@ mod tests {
     }
 
     #[test]
-    fn base_style_matches_palette_thinking_bytes() {
-        // Must equal Palette::thinking()'s framing for plain content.
-        let expected = styled().thinking("Thinking: pondering");
+    fn base_style_frames_dim_thinking_paragraphs() {
+        // The dim base opens up front and resets at the end — the framing the
+        // CLI's `Thinking: …` paragraphs rely on.
         assert_eq!(
             render_block_with_base("Thinking: pondering", styled(), "2"),
-            expected
+            "\x1b[0;2mThinking: pondering\x1b[0m"
         );
         // Plain palette: identity.
         assert_eq!(

@@ -1,5 +1,5 @@
 //! End-to-end check for the per-session console mirror ([`myco::ConsoleLog`]):
-//! it strips ANSI, writes to `{id}.console`, and follows a session swap
+//! plain text lands in `{id}.console`, and the mirror follows a session swap
 //! (`/new`, `/compact`, `/resume`) to the new file.
 //!
 //! Sole test in its own binary so the process-global `MYCO_HOME` override does
@@ -9,7 +9,7 @@ use myco::tui::{ConsoleTuiSink, Style, TuiEvent, TuiSink};
 use myco::{ActiveSession, ConsoleLog, Session};
 
 #[test]
-fn mirror_strips_ansi_and_follows_session_swap() {
+fn mirror_appends_plain_text_and_follows_session_swap() {
     let dir = std::env::temp_dir().join(format!("myco-console-it-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: single-threaded test start, sole test in this binary.
@@ -20,9 +20,9 @@ fn mirror_strips_ansi_and_follows_session_swap() {
     let active = ActiveSession::new(first);
     let log = ConsoleLog::new(active.clone(), /*enabled*/ true);
 
-    // Styled bytes in → plain bytes on disk, across multiple appends.
-    log.append("\x1b[0;1;36mUSER\x1b[0m\n");
-    log.append("hello \x1b[1mworld\x1b[0m\n");
+    // Plain text in → the same bytes on disk, across multiple appends.
+    log.append("USER\n");
+    log.append("hello world\n");
     assert_eq!(
         std::fs::read_to_string(&first_console).unwrap(),
         "USER\nhello world\n"
@@ -53,7 +53,7 @@ fn mirror_strips_ansi_and_follows_session_swap() {
     disabled.append("should not appear\n");
     assert!(!third_console.exists());
 
-    // TuiEvent path (design sketch): a ConsoleTuiSink subscribed to the TUI
+    // TuiEvent path (the live wiring): a ConsoleTuiSink subscribed to the TUI
     // stream lands plain text in the same {id}.console file — style events
     // are simply never encoded, no stripping involved.
     let fourth = Session::new("m");

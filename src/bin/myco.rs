@@ -3,7 +3,7 @@ use std::{
     io::{IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,13 +14,12 @@ use myco::generative_model::{
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
-    Session, SessionListEntry, attachment_note, banner_rule, compact_session,
-    compact_subagent_prompt, expand_image_attachments, format_session_detail,
-    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
-    print_session_history, render_block, resolve_and_load_session, section_rule, usage_line,
-    user_header_line, user_rule, write_error_section,
+    ActiveSession, CompactOptions, ConsoleLog, Palette, RECENT_SESSION_LIMIT, Session,
+    SessionListEntry, attachment_note, compact_session, compact_subagent_prompt,
+    expand_image_attachments, format_session_detail, format_session_list_line,
+    link_compact_pair, list_sessions, render_block, resolve_and_load_session,
 };
+use myco::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer};
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
     ListRecentService, NullEventSink, SessionHistoryTool, SessionKind, SessionMetaTool,
@@ -492,8 +491,8 @@ fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
 async fn run_interactive(args: Args) {
     let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
     let model_key = catalog_model.spec.key.clone();
-    let palette = Palette::colored(app_config.colors_enabled)
-        .with_wrap(effective_wrap_width(app_config.wrap_max));
+    let colors = app_config.colors_enabled;
+    let wrap = effective_wrap_width(app_config.wrap_max);
 
     // Startup preflight: verify expected executables resolve (bash, tmux, fzf;
     // OpenSSH tools when remotes are configured), then unlock SSH identities
@@ -508,13 +507,19 @@ async fn run_interactive(args: Args) {
     let initial_session = initial_session_or_exit(&args, &model_key);
     let active_session = ActiveSession::new(initial_session);
 
-    // Plain-text console mirror ({id}.console), TTY-gated like colors/wrap. It
-    // resolves the current session id per append, so /new, /compact, /resume
-    // redirect it automatically. The agent can read it to see exactly what the
-    // user saw, including live-only WARNING/ERROR sections.
-    let console = Arc::new(ConsoleLog::new(
-        active_session.clone(),
-        app_config.stdout_is_tty,
+    // The Ui: one producer owning stdout and the plain-text console mirror
+    // ({id}.console, TTY-gated like colors/wrap). The mirror resolves the
+    // current session id per append, so /new, /compact, /resume redirect it
+    // automatically. The agent can read it to see exactly what the user saw,
+    // including live-only WARNING/ERROR sections and meta-command output.
+    let ui = Arc::new(TuiProducer::new(
+        Arc::new(StdoutTuiSink { colors }),
+        Arc::new(ConsoleTuiSink::new(ConsoleLog::new(
+            active_session.clone(),
+            app_config.stdout_is_tty,
+        ))),
+        colors,
+        wrap,
     ));
 
     let session_tool =
@@ -531,8 +536,7 @@ async fn run_interactive(args: Args) {
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
     let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
-    let sink = Arc::new(CliEventSink::new(palette, console.clone()));
-    let mut agent = Agent::new(model, harness.clone(), sink.clone());
+    let mut agent = Agent::new(model, harness.clone(), ui.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
@@ -551,21 +555,18 @@ async fn run_interactive(args: Args) {
     });
     // Startup chrome: headed banner block (rule, MYCO, model/session, key
     // hints). Hosts via /hosts, effort via /effort, config path via
-    // attach-failure hints. Rendered to a buffer so the console mirror gets
-    // the same bytes (stripped) the terminal does.
-    let mut chrome = Vec::new();
-    let _ = write_startup_banner(&mut chrome, &model_key, &session_label, palette);
+    // attach-failure hints.
+    ui.startup_banner(&model_key, &session_label);
     // Preflight problems (missing executables, ssh-agent) open one WARNING
     // block after the banner, before the first USER block; happy path silent.
-    let _ = preflight.write_warning_section(&mut chrome, palette);
+    if preflight.has_problems() {
+        ui.warning_section(&preflight.warning_body());
+    }
     // Blank line closes the startup chrome before the first USER rule
     // (or the resumed-history replay).
-    chrome.push(b'\n');
-    emit_mirrored(&console, &chrome);
-    // The resumed-history replay is not mirrored: {id}.console already holds it
-    // from the run(s) that produced it (the file is opened for append).
+    ui.blank_line();
     if resuming {
-        print_session_history(agent.history(), palette);
+        ui.replay_history(agent.history());
     }
 
     run_repl(
@@ -577,11 +578,10 @@ async fn run_interactive(args: Args) {
         &mut effort,
         debug_dump_api_requests,
         ctrl_l,
-        palette,
+        wrap,
         app_config.wrap_max,
         app_config.repaint_enabled,
-        sink,
-        console,
+        ui.clone(),
     )
     .await;
 
@@ -593,7 +593,7 @@ async fn run_interactive(args: Args) {
     }
     // Only announce a session id if we actually wrote one (non-empty history).
     if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
-        println!("session={}", active_session.id());
+        ui.line(&format!("session={}", active_session.id()));
     }
 }
 
@@ -693,26 +693,6 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
     editor
 }
 
-/// Write the startup banner: full-block rule, MYCO title, model/session lines, and
-/// the two hints worth surfacing before the first prompt (/help, newline chord).
-fn write_startup_banner(
-    out: &mut impl Write,
-    model_key: &str,
-    session_label: &str,
-    palette: Palette,
-) -> std::io::Result<()> {
-    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.banner("MYCO"))?;
-    writeln!(out)?;
-    writeln!(out, "Model: {model_key}")?;
-    writeln!(out, "Session: {session_label}")?;
-    writeln!(out)?;
-    writeln!(out, "/help for commands")?;
-    writeln!(out)?;
-    writeln!(out, "Alt-Enter or Ctrl-J for newline")?;
-    Ok(())
-}
-
 fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
     match resolve_and_load_session(id_or_prefix) {
         Ok(session) => session,
@@ -737,15 +717,14 @@ async fn run_repl(
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
-    mut palette: Palette,
+    wrap: Option<usize>,
     wrap_max: Option<usize>,
     repaint: bool,
-    sink: Arc<CliEventSink>,
-    console: Arc<ConsoleLog>,
+    ui: Arc<TuiProducer>,
 ) {
     let turn_cancel = TurnCancel::default();
     let sigint_listener = turn_cancel.install();
-    let mut last_wrap = palette.wrap;
+    let mut last_wrap = wrap;
     loop {
         // Re-measure the terminal each prompt: after a resize, reflow the
         // whole dialog at the new width (same clear+reprint as Ctrl-L). This
@@ -756,10 +735,9 @@ async fn run_repl(
         let wrap = effective_wrap_width(wrap_max);
         if wrap != last_wrap {
             last_wrap = wrap;
-            palette = palette.with_wrap(wrap);
-            sink.set_wrap(wrap);
+            ui.set_wrap(wrap);
             if repaint && !agent.history().is_empty() {
-                clear_and_reprint(agent, palette);
+                clear_and_reprint(agent, &ui);
             }
         }
         let max = agent.context_window_tokens();
@@ -770,17 +748,8 @@ async fn run_repl(
             None if agent.history().is_empty() => Some(0),
             None => None,
         };
-        let mut header = Vec::new();
-        let _ = writeln!(header, "{}", palette.user(&user_rule(palette.wrap)));
-        let _ = writeln!(header, "{}", palette.user(&user_header_line(used, max)));
-        if let Some(u) = usage {
-            let _ = writeln!(header, "{}", palette.user(&usage_line(u)));
-        }
-        for line in harness.running_tool_summaries(agent.context().agent_id) {
-            let _ = writeln!(header, "{}", palette.user(&format!("● {line}")));
-        }
-        let _ = writeln!(header);
-        emit_mirrored(&console, &header);
+        let running = harness.running_tool_summaries(agent.context().agent_id);
+        ui.user_header(used, max, usage, &running);
         // No "> " prefix; body is typed on the line after the USER header.
         // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
         // submits the whole buffer to the agent.
@@ -800,7 +769,7 @@ async fn run_repl(
         // Ctrl-L on an empty buffer submits an empty line + sets this flag:
         // clear scrollback and reprint the conversation.
         if ctrl_l.swap(false, Ordering::SeqCst) {
-            clear_and_reprint(agent, palette);
+            clear_and_reprint(agent, &ui);
             continue;
         }
 
@@ -808,15 +777,11 @@ async fn run_repl(
         if input.is_empty() {
             continue;
         }
-        reprint_input_wrapped(&line, palette, repaint);
+        reprint_input_wrapped(&line, last_wrap, repaint);
         // Mirror the submitted line once (wrap-only, as shown). rustyline echoed
         // it to the terminal but not to us; the re-echo above only moves the
         // cursor, so the console needs the logical text here.
-        console.append(&render_block(
-            &line,
-            Palette::plain().with_wrap(palette.wrap),
-        ));
-        console.append("\n");
+        ui.submitted_input(&line);
         if is_exit_command(&input) {
             break;
         }
@@ -828,7 +793,7 @@ async fn run_repl(
                     editor,
                     harness.clone(),
                     catalog_model,
-                    palette,
+                    &ui,
                     &turn_cancel,
                 )
                 .await;
@@ -843,33 +808,14 @@ async fn run_repl(
                 catalog_model,
                 effort,
                 debug_dump_api_requests,
-                palette,
+                &ui,
             );
             continue;
         }
 
-        run_user_turn(
-            agent,
-            session,
-            editor,
-            input,
-            palette,
-            &console,
-            &turn_cancel,
-        )
-        .await;
+        run_user_turn(agent, session, editor, input, &ui, &turn_cancel).await;
     }
     sigint_listener.abort();
-}
-
-/// Write rendered bytes to stdout and to the console mirror (the mirror strips
-/// ANSI). Used for buffered blocks (banner, preflight, ERROR); the streaming
-/// sink and REPL headers mirror their own `print!`s directly.
-fn emit_mirrored(console: &ConsoleLog, rendered: &[u8]) {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(rendered);
-    let _ = out.flush();
-    console.append(&String::from_utf8_lossy(rendered));
 }
 
 /// Effective wrap width right now: the configured cap bounded by the measured
@@ -899,14 +845,14 @@ fn input_echo_rows(line: &str, cols: usize) -> usize {
 /// the user's words stay exactly as typed. Skipped when wrap is off, repaint
 /// is unavailable (non-TTY stdout or `TERM=dumb`), the echo may have
 /// scrolled off-screen, or wrapping would change nothing.
-fn reprint_input_wrapped(line: &str, palette: Palette, repaint: bool) {
-    if palette.wrap.is_none() || !repaint {
+fn reprint_input_wrapped(line: &str, wrap: Option<usize>, repaint: bool) {
+    if wrap.is_none() || !repaint {
         return;
     }
     let Some((cols, screen_rows)) = myco::config::detect_terminal_size() else {
         return;
     };
-    let wrapped = render_block(line, Palette::plain().with_wrap(palette.wrap));
+    let wrapped = render_block(line, Palette::plain().with_wrap(wrap));
     if wrapped == line {
         return;
     }
@@ -966,8 +912,7 @@ async fn run_user_turn(
     session: &ActiveSession,
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     input: String,
-    palette: Palette,
-    console: &ConsoleLog,
+    ui: &TuiProducer,
     turn_cancel: &TurnCancel,
 ) {
     let _ = editor.add_history_entry(&input);
@@ -980,19 +925,14 @@ async fn run_user_turn(
     let content = match expand_image_attachments(&input) {
         Ok(c) => c,
         Err(e) => {
-            let mut block = Vec::new();
-            let _ = write_error_section(&mut block, &e, palette);
-            emit_mirrored(console, &block);
-            println!();
-            console.append("\n");
+            ui.error_section(&e);
+            ui.blank_line();
             return;
         }
     };
     // Same note, same position as replay: directly under the wrapped input.
     if let Some(note) = attachment_note(&content) {
-        println!("{note}");
-        console.append(&note);
-        console.append("\n");
+        ui.line(&note);
     }
     if let Err(e) = session.maybe_auto_title_from_user_text(&input) {
         eprintln!("warning: could not auto-title session: {e}");
@@ -1002,25 +942,15 @@ async fn run_user_turn(
 
     // First assistant section opens with its own blank line + thin rule + header.
     match agent.interact(content, cancel).await {
-        Ok(_) => {
-            println!();
-            console.append("\n");
-        }
-        Err(myco::AgentInteractionError::Cancelled) => {
-            println!();
-            println!("(cancelled)");
-            console.append("\n(cancelled)\n");
-        }
+        Ok(_) => ui.blank_line(),
+        Err(myco::AgentInteractionError::Cancelled) => ui.cancelled(),
         Err(e) => {
-            // Close any open ASSISTANT stream state and show a headed ERROR section.
-            // Generate failures (context overflow, provider errors) are live-only —
-            // not stored in session history — so resume/Ctrl-L will not replay them.
-            // Buffered so the console mirror captures this live-only section too.
-            let mut block = Vec::new();
-            let _ = write_error_section(&mut block, &e.to_string(), palette);
-            emit_mirrored(console, &block);
-            println!();
-            console.append("\n");
+            // Headed ERROR section (the agent already closed the ASSISTANT
+            // stream via TurnFinished). Generate failures (context overflow,
+            // provider errors) are live-only — not stored in session history —
+            // so resume/Ctrl-L will not replay them.
+            ui.error_section(&e.to_string());
+            ui.blank_line();
         }
     }
 
@@ -1046,7 +976,7 @@ async fn run_compact(
     editor: &mut Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
     catalog_model: &CatalogModel,
-    palette: Palette,
+    ui: &TuiProducer,
     turn_cancel: &TurnCancel,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
@@ -1059,7 +989,7 @@ async fn run_compact(
         return;
     }
 
-    println!("compacting session={} …", predecessor.id);
+    ui.line(&format!("compacting session={} …", predecessor.id));
 
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
@@ -1125,7 +1055,7 @@ async fn run_compact(
     match result {
         Ok(_) => {}
         Err(myco::AgentInteractionError::Cancelled) => {
-            println!("compact: cancelled (session unchanged)");
+            ui.line("compact: cancelled (session unchanged)");
             return;
         }
         Err(e) => {
@@ -1180,14 +1110,14 @@ async fn run_compact(
     agent.set_history(successor.messages.clone());
     agent.set_last_usage(successor.last_usage);
     reload_readline_history(editor, session);
-    clear_and_reprint(agent, palette);
-    println!(
+    clear_and_reprint(agent, ui);
+    ui.line(&format!(
         "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
         outcome.successor_id,
         outcome.predecessor_id,
         outcome.tail_messages,
         outcome.summary_path.display()
-    );
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,28 +1182,28 @@ fn handle_meta(
     catalog_model: &CatalogModel,
     effort: &mut Effort,
     debug_dump_api_requests: bool,
-    palette: Palette,
+    ui: &TuiProducer,
 ) {
     match cmd {
-        MetaCommand::Help => print_help(),
+        MetaCommand::Help => print_help(ui),
         MetaCommand::Session => {
             let _ = session.persist_messages(agent.history(), agent.last_usage(), false);
-            print!("{}", format_session_detail(&session.snapshot()));
+            ui.text(&format_session_detail(&session.snapshot()));
         }
         MetaCommand::Sessions => match list_sessions(0) {
             Ok(list) => {
                 let shown = RECENT_SESSION_LIMIT.min(list.len());
-                print_session_list(&list[..shown]);
+                print_session_list(&list[..shown], ui);
                 if list.len() > shown {
-                    println!(
+                    ui.line(&format!(
                         "  … {} more — bare /resume opens the session browser",
                         list.len() - shown
-                    );
+                    ));
                 }
             }
             Err(e) => eprintln!("Failed to list sessions: {e}"),
         },
-        MetaCommand::Hosts => print_host_status(harness),
+        MetaCommand::Hosts => print_host_status(harness, ui),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
             // A nested run stays nested across /new: carry kind + parent lineage.
@@ -1286,36 +1216,36 @@ fn handle_meta(
             agent.set_last_usage(None);
             reload_readline_history(editor, session);
             // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
-            clear_and_reprint(agent, palette);
-            println!("new session={}", session.id());
+            clear_and_reprint(agent, ui);
+            ui.line(&format!("new session={}", session.id()));
         }
         MetaCommand::Resume(arg) => {
             save_before_switch(agent, session, editor);
             match resolve_resume_session(arg) {
                 Ok(loaded) => {
                     install_session(agent, editor, session, &loaded);
-                    println!(
+                    ui.line(&format!(
                         "resumed session={}  messages={}",
                         session.id(),
                         agent.history().len()
-                    );
-                    print_session_history(agent.history(), palette);
+                    ));
+                    ui.replay_history(agent.history());
                 }
-                Err(e) if e == RESUME_CANCELLED => println!("resume cancelled"),
+                Err(e) if e == RESUME_CANCELLED => ui.line("resume cancelled"),
                 Err(e) => eprintln!("resume failed: {e}"),
             }
         }
         MetaCommand::Effort(arg) => match arg {
-            None => println!("effort={effort}  (low|medium|high|max)"),
+            None => ui.line(&format!("effort={effort}  (low|medium|high|max)")),
             Some(s) => match s.parse::<Effort>() {
-                Ok(next) if next == *effort => println!("effort={effort}  (unchanged)"),
+                Ok(next) if next == *effort => ui.line(&format!("effort={effort}  (unchanged)")),
                 Ok(next) => {
                     *effort = next;
                     let model =
                         build_model(catalog_model, harness, debug_dump_api_requests, *effort);
                     agent.set_model(model);
                     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-                    println!("effort={effort}");
+                    ui.line(&format!("effort={effort}"));
                 }
                 Err(e) => eprintln!("{e}"),
             },
@@ -1324,8 +1254,8 @@ fn handle_meta(
             None => {
                 let snap = session.snapshot();
                 match snap.title.as_deref() {
-                    Some(t) if !t.is_empty() => println!("title={t:?}"),
-                    _ => println!("title=(none)"),
+                    Some(t) if !t.is_empty() => ui.line(&format!("title={t:?}")),
+                    _ => ui.line("title=(none)"),
                 }
             }
             Some(t) if t.trim().is_empty() => {
@@ -1336,7 +1266,7 @@ fn handle_meta(
                 }) {
                     eprintln!("failed to clear title: {e}");
                 } else {
-                    println!("title=(none)");
+                    ui.line("title=(none)");
                 }
             }
             Some(t) => {
@@ -1347,7 +1277,7 @@ fn handle_meta(
                 }) {
                     eprintln!("failed to set title: {e}");
                 } else if let Some(title) = session.snapshot().title {
-                    println!("title={title:?}");
+                    ui.line(&format!("title={title:?}"));
                 }
             }
         },
@@ -1393,8 +1323,8 @@ fn print_cli_help(topic: &str) {
     }
 }
 
-fn print_help() {
-    println!(
+fn print_help(ui: &TuiProducer) {
+    ui.line(
         "\
 Commands:
   /help                 Show this help
@@ -1456,20 +1386,20 @@ Sessions are conversation memory only; shell/file state is not restored.
 Empty sessions (no messages) are not written to disk.
 On generate error after tools, history keeps user + assistant(tool_use) +
 tool_results (well-formed for resume). Cancel mid-tools records synthetic
-cancelled results for every tool_use."
+cancelled results for every tool_use.",
     );
 }
 
-fn print_host_status(harness: &Harness) {
+fn print_host_status(harness: &Harness, ui: &TuiProducer) {
     let statuses = harness.host_status();
     if statuses.is_empty() {
-        println!("hosts: (none)");
+        ui.line("hosts: (none)");
         return;
     }
-    println!(
+    ui.line(&format!(
         "hosts: default=local  ({} total; local always in-process)",
         statuses.len()
-    );
+    ));
     for s in statuses {
         // Local: always ok/in-process. Remotes: idle until first tool use; ok while
         // connected; DOWN after connect error.
@@ -1491,8 +1421,11 @@ fn print_host_status(harness: &Harness) {
             format!("  cmd={}", s.command.join(" "))
         };
         match &s.error {
-            Some(err) => println!("  [{state}] {}  tools={tools}{cmd}  err={err}", s.name),
-            None => println!("  [{state}] {}  tools={tools}{cmd}", s.name),
+            Some(err) => ui.line(&format!(
+                "  [{state}] {}  tools={tools}{cmd}  err={err}",
+                s.name
+            )),
+            None => ui.line(&format!("  [{state}] {}  tools={tools}{cmd}", s.name)),
         }
     }
 }
@@ -1594,27 +1527,29 @@ fn install_session(
     reload_readline_history(editor, active);
 }
 
-fn print_session_list(list: &[SessionListEntry]) {
+fn print_session_list(list: &[SessionListEntry], ui: &TuiProducer) {
     if list.is_empty() {
-        println!("(no sessions)");
+        ui.line("(no sessions)");
         return;
     }
     for (i, s) in list.iter().enumerate() {
-        println!("{}", format_session_list_line(i + 1, s));
+        ui.line(&format_session_list_line(i + 1, s));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Transcript helpers (layout lives in myco::session::transcript)
+// Transcript helpers (layout lives in myco::session::transcript / myco::tui)
 // ---------------------------------------------------------------------------
 
 /// Nuke scrollback + visible screen (same as `clear`), then reprint the whole
 /// conversation history so nothing is lost. Triggered by Ctrl-L; the prompt
-/// loop reprints the USER header on its next iteration.
-fn clear_and_reprint(agent: &Agent, palette: Palette) {
+/// loop reprints the USER header on its next iteration. The cursor codes and
+/// the replay are terminal-only: this is a redraw of content the console
+/// mirror already holds.
+fn clear_and_reprint(agent: &Agent, ui: &TuiProducer) {
     print!("\x1B[3J\x1B[2J\x1B[1;1H");
     let _ = std::io::stdout().flush();
-    print_session_history(agent.history(), palette);
+    ui.replay_history(agent.history());
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,320 +1641,13 @@ fn session_id_completions(prefix: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Event sink — sectioned live rendering
-// ---------------------------------------------------------------------------
-
-/// Live stdout rendering for the root agent.
-///
-/// Headed sections: USER (printed by the REPL), ASSISTANT (this sink), and
-/// ERROR (printed by the REPL on generate failure). Thinking summaries, tool
-/// invocations, and answer text are paragraphs inside a single ASSISTANT
-/// section for the whole agent turn (including multi-step tool loops).
-/// Thinking is also stored in session history for resume (backends strip it
-/// on the next API request). ERROR sections are live-only and not replayed.
-///
-/// Opening an ASSISTANT section:
-/// blank line + thin `SECTION_RULE` + `ASSISTANT` + blank line, then body.
-struct CliEventSink {
-    state: Mutex<SinkState>,
-    /// Behind a lock so the REPL can update the wrap width after a terminal
-    /// resize; renderers created afterwards pick it up.
-    palette: Mutex<Palette>,
-    /// Plain-text mirror: every byte this sink prints is also appended here
-    /// (ANSI stripped) so the agent can read the exact ASSISTANT transcript.
-    console: Arc<ConsoleLog>,
-}
-
-struct SinkState {
-    at_line_start: bool,
-    /// Whether the ASSISTANT header is already open for this agent turn.
-    assistant_open: bool,
-    /// True after a finished paragraph so the next one gets a blank line.
-    need_blank: bool,
-    /// True while streaming answer text (no blank lines between text deltas).
-    in_text_stream: bool,
-    /// Streaming markdown/wrap renderer for the current answer-text paragraph.
-    text_md: Option<MarkdownRenderer>,
-    /// Live thinking-summary line builder (UI only).
-    thinking_line_open: bool,
-    thinking_buf: String,
-    thinking_md: Option<MarkdownRenderer>,
-}
-
-impl CliEventSink {
-    fn new(palette: Palette, console: Arc<ConsoleLog>) -> Self {
-        Self {
-            state: Mutex::new(SinkState {
-                at_line_start: true,
-                assistant_open: false,
-                need_blank: false,
-                in_text_stream: false,
-                text_md: None,
-                thinking_line_open: false,
-                thinking_buf: String::new(),
-                thinking_md: None,
-            }),
-            palette: Mutex::new(palette),
-            console,
-        }
-    }
-
-    fn palette(&self) -> Palette {
-        *self.palette.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// `print!` to stdout and mirror the same bytes to the console log.
-    fn out(&self, s: &str) {
-        print!("{s}");
-        self.console.append(s);
-    }
-
-    /// `println!` to stdout and mirror the line (with its newline) to the log.
-    fn outln(&self, s: &str) {
-        println!("{s}");
-        self.console.append(s);
-        self.console.append("\n");
-    }
-
-    /// Bare `println!()` mirrored as a newline.
-    fn outln_blank(&self) {
-        println!();
-        self.console.append("\n");
-    }
-
-    /// Update the wrap width mid-session (terminal resize). An in-flight
-    /// paragraph keeps the width its renderer was created with.
-    fn set_wrap(&self, wrap: Option<usize>) {
-        let mut palette = self.palette.lock().unwrap_or_else(|e| e.into_inner());
-        *palette = palette.with_wrap(wrap);
-    }
-}
-
-impl CliEventSink {
-    fn with_state<R>(&self, f: impl FnOnce(&mut SinkState) -> R) -> R {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut state)
-    }
-
-    fn ensure_line_start(&self) {
-        let need_nl = self.with_state(|s| {
-            let need = !s.at_line_start;
-            s.at_line_start = true;
-            need
-        });
-        if need_nl {
-            self.outln_blank();
-        }
-    }
-
-    /// Open ASSISTANT once per agent turn (multi-step tool loops stay in one section).
-    fn ensure_assistant(&self) {
-        let need_open = self.with_state(|s| !s.assistant_open);
-        if !need_open {
-            return;
-        }
-        self.finish_thinking_line();
-        self.ensure_line_start();
-        self.outln_blank();
-        let palette = self.palette();
-        self.outln(&palette.assistant(&section_rule(palette.wrap)));
-        self.outln(&palette.assistant("ASSISTANT"));
-        self.outln_blank();
-        self.with_state(|s| {
-            s.at_line_start = true;
-            s.assistant_open = true;
-            s.need_blank = false;
-        });
-        let _ = std::io::stdout().flush();
-    }
-
-    /// Blank line before a subsequent paragraph inside ASSISTANT.
-    fn separate_paragraph_if_needed(&self) {
-        let need_blank = self.with_state(|s| s.need_blank);
-        if need_blank {
-            self.ensure_line_start();
-            self.outln_blank();
-            self.with_state(|s| s.at_line_start = true);
-        }
-    }
-
-    fn note_paragraph(&self) {
-        self.with_state(|s| s.need_blank = true);
-    }
-
-    /// Finish a live `Thinking: …` line with a trailing newline if one is open.
-    fn finish_thinking_line(&self) {
-        let tail = self.with_state(|s| {
-            if !s.thinking_line_open {
-                return None;
-            }
-            s.thinking_line_open = false;
-            s.thinking_buf.clear();
-            s.at_line_start = true;
-            s.in_text_stream = false;
-            // Thinking is a finished paragraph for spacing purposes.
-            s.need_blank = true;
-            Some(
-                s.thinking_md
-                    .take()
-                    .map(|mut r| r.finish())
-                    .unwrap_or_default(),
-            )
-        });
-        if let Some(tail) = tail {
-            // Flush the renderer and close the dim thinking style it opened.
-            self.outln(&tail);
-            let _ = std::io::stdout().flush();
-        }
-    }
-
-    /// Close the current answer-text stream: flush its renderer, mark the
-    /// paragraph finished.
-    fn end_text_stream(&self) {
-        let tail = self.with_state(|s| {
-            if !s.in_text_stream {
-                return None;
-            }
-            s.in_text_stream = false;
-            s.need_blank = true;
-            Some(s.text_md.take().map(|mut r| r.finish()).unwrap_or_default())
-        });
-        if let Some(tail) = tail
-            && !tail.is_empty()
-        {
-            self.out(&tail);
-            self.with_state(|s| s.at_line_start = tail.ends_with('\n'));
-            let _ = std::io::stdout().flush();
-        }
-    }
-}
-
-impl EventSink for CliEventSink {
-    fn emit(&self, event: AgentEvent) {
-        match event {
-            AgentEvent::ThinkingDelta {
-                text,
-                context: TraceContext { depth: 0, .. },
-            } => {
-                if text.is_empty() {
-                    return;
-                }
-                // Always show thinking summaries inside ASSISTANT as `Thinking: …`.
-                self.ensure_assistant();
-                let starting = self.with_state(|s| !s.thinking_line_open);
-                if starting {
-                    // End answer-text stream so thinking is its own paragraph.
-                    self.end_text_stream();
-                    self.separate_paragraph_if_needed();
-                    self.ensure_line_start();
-                    let palette = self.palette();
-                    let rendered = self.with_state(|s| {
-                        s.thinking_line_open = true;
-                        s.thinking_buf = text.clone();
-                        // Dim base stays open across deltas; finish_thinking_line resets.
-                        let r = s
-                            .thinking_md
-                            .insert(MarkdownRenderer::with_base(palette, "2"));
-                        let mut out = r.feed("Thinking: ");
-                        out.push_str(&r.feed(&text));
-                        out
-                    });
-                    self.out(&rendered);
-                } else {
-                    let rendered = self.with_state(|s| {
-                        s.thinking_buf.push_str(&text);
-                        s.thinking_md
-                            .as_mut()
-                            .map(|r| r.feed(&text))
-                            .unwrap_or_default()
-                    });
-                    self.out(&rendered);
-                }
-                let _ = std::io::stdout().flush();
-                self.with_state(|s| {
-                    s.at_line_start = s
-                        .thinking_md
-                        .as_ref()
-                        .is_some_and(|r| r.ends_at_line_start());
-                });
-            }
-            AgentEvent::TextDelta {
-                text,
-                context: TraceContext { depth: 0, .. },
-            } => {
-                if text.is_empty() {
-                    return;
-                }
-                self.finish_thinking_line();
-                self.ensure_assistant();
-                // Blank-separate only when starting a new text paragraph after
-                // thinking/tools — never between chunks of the same stream.
-                let start_new = self.with_state(|s| !s.in_text_stream && s.need_blank);
-                if start_new {
-                    self.separate_paragraph_if_needed();
-                }
-                let palette = self.palette();
-                let rendered = self.with_state(|s| {
-                    s.in_text_stream = true;
-                    s.need_blank = false;
-                    s.text_md
-                        .get_or_insert_with(|| MarkdownRenderer::new(palette))
-                        .feed(&text)
-                });
-                self.out(&rendered);
-                let _ = std::io::stdout().flush();
-                self.with_state(|s| {
-                    s.at_line_start = s.text_md.as_ref().is_some_and(|r| r.ends_at_line_start());
-                });
-            }
-            AgentEvent::TurnFinished {
-                context: TraceContext { depth: 0, .. },
-                ..
-            } => {
-                self.finish_thinking_line();
-                self.end_text_stream();
-                self.ensure_line_start();
-                // Close ASSISTANT for the next user turn (REPL prints USER next).
-                self.with_state(|s| {
-                    s.assistant_open = false;
-                    s.need_blank = false;
-                    s.in_text_stream = false;
-                });
-            }
-            // Root agent only — hide nested worker noise (depth>0, e.g. compact).
-            AgentEvent::ToolStarted {
-                tool_use,
-                context: TraceContext { depth: 0, .. },
-            } => {
-                // End any open text/thinking stream so the tool is its own paragraph.
-                self.finish_thinking_line();
-                self.end_text_stream();
-                self.ensure_assistant();
-                self.separate_paragraph_if_needed();
-                self.out(&format_tool_invocation(
-                    &tool_use.name,
-                    &tool_use.input,
-                    self.palette(),
-                ));
-                self.with_state(|s| {
-                    s.at_line_start = true;
-                    s.in_text_stream = false;
-                });
-                self.note_paragraph();
-                let _ = std::io::stdout().flush();
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Sink for `-p/--print`: root-agent answer text streams to stdout verbatim
 /// (no sections, colors, or wrapping — the output is meant for pipes).
 /// Thinking and tool activity are not rendered.
 #[derive(Default)]
 struct PrintEventSink {
     /// (wrote anything, ended with newline) — drives the closing newline.
-    tail: Mutex<(bool, bool)>,
+    tail: std::sync::Mutex<(bool, bool)>,
 }
 
 impl PrintEventSink {
@@ -2089,26 +1717,6 @@ mod tests {
                 }],
             },
         ]
-    }
-
-    #[test]
-    fn startup_banner_layout() {
-        let mut buf = Vec::new();
-        write_startup_banner(
-            &mut buf,
-            "hy3-free",
-            "993d14889c414aab81963843cccf8090 \"greeting\"",
-            Palette::plain(),
-        )
-        .unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        let expected = format!(
-            "{rule}\nMYCO\n\nModel: hy3-free\n\
-             Session: 993d14889c414aab81963843cccf8090 \"greeting\"\n\n\
-             /help for commands\n\nAlt-Enter or Ctrl-J for newline\n",
-            rule = banner_rule(None)
-        );
-        assert_eq!(text, expected);
     }
 
     #[test]

@@ -126,14 +126,15 @@ shows its command, uptime, and idle time; remote hosts are not queried for this.
 
 When stdout is a TTY, the interactive CLI mirrors everything it prints — the
 startup banner, preflight WARNING, USER headers + submitted input, the streamed
-ASSISTANT section, and live ERROR / `(cancelled)` notices — to a plain-text,
-ANSI-free file beside the session JSON: `~/.myco/session/<shard>/<id>.console`
-(shown as `console:` in `/session` and `session_meta` get). It is append-only
-and accumulates across runs of the same session.
+ASSISTANT section, live ERROR / `(cancelled)` notices, and meta-command output
+(`/hosts`, `/session`, …) — to a plain-text, ANSI-free file beside the session
+JSON: `~/.myco/session/<shard>/<id>.console` (shown as `console:` in `/session`
+and `session_meta` get). It is append-only and accumulates across runs of the
+same session.
 
 Read it (with your file tools) to see **exactly what the user saw**, in order —
 including the live-only WARNING / ERROR sections that never reach the message
 history. Useful for questions like "what was that warning at startup?" or "what
-did the last error say?". Two limits: cursor repaints (input re-echo, resize
-reflow) are not mirrored, so the file is the logical transcript, not a screen
-snapshot; and meta-command output (`/hosts`, `/session`, …) is not mirrored.
+did the last error say?". One limit: cursor repaints (input re-echo, resize
+reflow, the Ctrl-L / `/resume` transcript reprint) are not mirrored, so the
+file is the logical transcript, not a screen snapshot.
