@@ -743,6 +743,8 @@ async fn run_repl(
     sink: Arc<CliEventSink>,
     console: Arc<ConsoleLog>,
 ) {
+    let turn_cancel = TurnCancel::default();
+    let sigint_listener = turn_cancel.install();
     let mut last_wrap = palette.wrap;
     loop {
         // Re-measure the terminal each prompt: after a resize, reflow the
@@ -827,6 +829,7 @@ async fn run_repl(
                     harness.clone(),
                     catalog_model,
                     palette,
+                    &turn_cancel,
                 )
                 .await;
                 continue;
@@ -845,8 +848,18 @@ async fn run_repl(
             continue;
         }
 
-        run_user_turn(agent, session, editor, input, palette, &console).await;
+        run_user_turn(
+            agent,
+            session,
+            editor,
+            input,
+            palette,
+            &console,
+            &turn_cancel,
+        )
+        .await;
     }
+    sigint_listener.abort();
 }
 
 /// Write rendered bytes to stdout and to the console mirror (the mirror strips
@@ -906,6 +919,48 @@ fn reprint_input_wrapped(line: &str, palette: Palette, repaint: bool) {
     let _ = std::io::stdout().flush();
 }
 
+/// SIGINT → in-flight turn cancellation, REPL-scoped.
+///
+/// One persistent `ctrl_c()` listener cancels whichever token is currently
+/// armed. Any code that awaits a model turn (user turns, the compact worker)
+/// arms its token first and disarms after, so Ctrl-C always reaches the work
+/// in flight. A per-turn spawned/aborted listener is not enough: tokio's
+/// SIGINT handler stays installed process-wide after the first install, so a
+/// later await with no live listener (the old `/compact` path) swallowed
+/// Ctrl-C entirely. At the prompt rustyline owns the terminal in raw mode
+/// (^C arrives as a key, not a signal) and no token is armed.
+#[derive(Clone, Default)]
+struct TurnCancel {
+    slot: Arc<std::sync::Mutex<Option<myco::CancelToken>>>,
+}
+
+impl TurnCancel {
+    /// Spawn the process-wide SIGINT listener feeding this slot.
+    fn install(&self) -> tokio::task::JoinHandle<()> {
+        let slot = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break;
+                }
+                if let Some(token) = slot.slot.lock().unwrap().as_ref() {
+                    token.cancel();
+                }
+            }
+        })
+    }
+
+    fn arm(&self) -> myco::CancelToken {
+        let token = myco::CancelToken::new();
+        *self.slot.lock().unwrap() = Some(token.clone());
+        token
+    }
+
+    fn disarm(&self) {
+        *self.slot.lock().unwrap() = None;
+    }
+}
+
 async fn run_user_turn(
     agent: &mut Agent,
     session: &ActiveSession,
@@ -913,6 +968,7 @@ async fn run_user_turn(
     input: String,
     palette: Palette,
     console: &ConsoleLog,
+    turn_cancel: &TurnCancel,
 ) {
     let _ = editor.add_history_entry(&input);
     if let Err(e) = save_readline_history(editor, session) {
@@ -942,18 +998,7 @@ async fn run_user_turn(
         eprintln!("warning: could not auto-title session: {e}");
     }
 
-    // Cancel in-flight turn on Ctrl-C while interact runs. At the prompt, rustyline
-    // still owns Ctrl-C (clears the line). We only install a SIGINT bridge here.
-    let cancel = myco::CancelToken::new();
-    let cancel_on_sigint = cancel.clone();
-    let sigint_task = tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            cancel_on_sigint.cancel();
-        }
-    });
+    let cancel = turn_cancel.arm();
 
     // First assistant section opens with its own blank line + thin rule + header.
     match agent.interact(content, cancel).await {
@@ -979,7 +1024,7 @@ async fn run_user_turn(
         }
     }
 
-    sigint_task.abort();
+    turn_cancel.disarm();
 
     // Persist whatever history the agent has, including failed/cancelled turns.
     if let Err(e) = persist_session(agent, session, /*force*/ true) {
@@ -994,6 +1039,7 @@ async fn run_user_turn(
 // Compaction
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact(
     agent: &mut Agent,
     session: &ActiveSession,
@@ -1001,6 +1047,7 @@ async fn run_compact(
     harness: Arc<Harness>,
     catalog_model: &CatalogModel,
     palette: Palette,
+    turn_cancel: &TurnCancel,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
         eprintln!("compact: failed to persist current session: {e}");
@@ -1064,10 +1111,12 @@ async fn run_compact(
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
 
     let prompt = compact_subagent_prompt(&predecessor.id);
-    let cancel = myco::CancelToken::new();
+    // Ctrl-C during compaction cancels the worker turn like any user turn.
+    let cancel = turn_cancel.arm();
     let result = worker
         .interact(vec![Content::Text { text: prompt }], cancel)
         .await;
+    turn_cancel.disarm();
 
     worker_session.messages = worker.history().to_vec();
     worker_session.touch();
@@ -1075,6 +1124,10 @@ async fn run_compact(
 
     match result {
         Ok(_) => {}
+        Err(myco::AgentInteractionError::Cancelled) => {
+            println!("compact: cancelled (session unchanged)");
+            return;
+        }
         Err(e) => {
             eprintln!("compact: worker failed: {e}");
             return;
