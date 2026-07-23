@@ -12,7 +12,7 @@ cluster/GUI work outrank CLI trust + long-session viability.
 - Dual protocol drivers: Anthropic Messages + OpenAI Responses. Models are a config.toml catalog (`[gateways]`/`[models]`; auth = literal token or env/file source) — no built-in model list; any gateway (Anthropic, xAI, OpenRouter, local) via config
 - Streaming generate + thinking; `EventSink` / `AgentEvent` (CLI consumer is thin)
 - Host pool: local + SSH `myco --mode host`, soft-fail non-default, `/hosts`
-- Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp), `subagent` (single-shot)
+- Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp)
 - Concurrent tool uses per turn (`join_all`), including concurrent host-routed tools (pipelined NDJSON + concurrent host dispatch)
 - Session message resume (`~/.myco/session/…`); readline history
 - Session metadata v2: title, PR/worktree links, scratchpad; `session_meta` local tool;
@@ -133,9 +133,20 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 - [x] (REJECTED) **Todo / task-list tool** — durable checklist for long jobs (Claude TodoWrite-shaped).
   - Adds complexity. Can be achieved with a `TODO.md` file.
-- [ ] **Subagents: multi-turn + background**
-  - Kick off N in background; optional multi-turn supervisor interaction
-    (today: single-shot only; concurrent parent tools already work).
+- [x] **Subagents: multi-turn + background** — resolved by **dropping the
+      subagent toolset**: nested agents are `myco` itself driven over a bash
+      session (piped stdin/stdout; wrap/color auto-off; one prompt per line;
+      the `USER n/m` header marks each turn boundary). Bash sessions already
+      run in the background and support multi-turn `write`/`read`, so both
+      halves come free. Nesting is **local-only by doctrine** (brains — config,
+      keys, gateway network, session store — stay on the user's machine;
+      remotes stay hands); children pass `--parent-session <id>` so their
+      sessions are hidden and linked in the shared store.
+- [ ] **Remote nesting / gateway proxy** — running a whole agent *on* a remote
+      (vs local brain + remote hands) would need config, keys, and gateway
+      network there. If it is ever really needed, the principled fix is
+      proxying model traffic through the supervisor's machine (myco as a local
+      gateway for children). Not planned; nested agents run locally.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
 - [x] **`lynx_tui_browser`** — host tool via `lynx -dump` (search + simple browsing; link IDs).
   - Point at DDG Lite/HTML or Bing search URLs; follow numbered References.

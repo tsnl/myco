@@ -18,8 +18,8 @@ the local machine **and** on every concrete `Host` alias in your
   editor, text-mode browsing, and indexed search (keyword + semantic) on each host.
 - **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
   conversation history live under `~/.myco/` — pick up later with `/resume`.
-- **Sub-agents for long work.** Spin off focused agents so the main thread stays
-  small and cheap.
+- **Nested agents for long work.** myco drives itself: start `myco` in a bash
+  session to spin off focused agents so the main thread stays small and cheap.
 - **Skills and project guidance stay searchable.** Hosts auto-index skill packs
   and `AGENTS.md` / `CLAUDE.md` so the agent can find how _you_ work.
 - **Coming later:** multiplayer (multiple humans in the same agent workspace).

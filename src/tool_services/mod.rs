@@ -2,7 +2,7 @@
 //!
 //! Registered on a [`crate::host::HostWorker`]. The **standard** catalog is the same on
 //! every host. The agent **root** (in-process `local`) may instantiate additional
-//! services at configuration time (e.g. `session_meta`, `subagent`) — still
+//! services at configuration time (e.g. `session_meta`) — still
 //! [`ToolService`], just not installed on remotes.
 
 use std::sync::Arc;
@@ -114,25 +114,15 @@ fn scrub_schema(v: &mut serde_json::Value) {
 /// Ambient context for host tool-service invocations.
 #[derive(Clone)]
 pub struct HostDispatchContext {
-    /// Agent that owns this call (root or subagent); used for session ownership.
+    /// Agent that owns this call; used for session ownership.
     pub agent_id: uuid::Uuid,
     /// Cancel signal for the in-flight call / agent turn.
     pub cancel: CancelToken,
-    /// Set by the agent harness for **in-process** dispatches only.
-    ///
-    /// Tools like `subagent` downcast this to harness-provided root handles.
-    /// Remote NDJSON workers always leave this `None`.
-    pub agent_root: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl HostDispatchContext {
-    /// Context for remote / tests that need no agent-root hooks.
-    pub fn bare(agent_id: uuid::Uuid, cancel: CancelToken) -> Self {
-        Self {
-            agent_id,
-            cancel,
-            agent_root: None,
-        }
+    pub fn new(agent_id: uuid::Uuid, cancel: CancelToken) -> Self {
+        Self { agent_id, cancel }
     }
 }
 

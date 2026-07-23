@@ -106,6 +106,12 @@ struct Args {
     #[arg(long)]
     resume: Option<Option<String>>,
 
+    /// Run as a nested agent of the given supervisor session: the fresh session
+    /// is created hidden (`kind: subagent`) with this parent recorded. Used when
+    /// one myco drives another over a bash session (see `--help overview`).
+    #[arg(long, value_name = "SESSION_ID")]
+    parent_session: Option<String>,
+
     /// Reasoning / extended-thinking effort (low|medium|high|max). Default: high.
     /// Change mid-session with `/effort`.
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
@@ -223,9 +229,27 @@ async fn run_interactive(args: Args) {
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
+    if resuming && args.parent_session.is_some() {
+        // A resumed session already carries its kind/parent; rewriting them
+        // here would silently change a stored session's identity.
+        eprintln!("--parent-session applies only to a fresh session; drop it when resuming");
+        std::process::exit(2);
+    }
     let initial_session = match args.resume {
         Some(id_opt) => load_resume_session_or_exit(id_opt.as_deref()),
-        None => Session::new(model_key.clone()),
+        None => {
+            let mut fresh = Session::new(model_key.clone());
+            if let Some(parent) = args.parent_session.as_deref() {
+                let parent = parent.trim();
+                if parent.is_empty() {
+                    eprintln!("--parent-session needs a non-empty session id");
+                    std::process::exit(2);
+                }
+                fresh.kind = SessionKind::Subagent;
+                fresh.parent_session_id = Some(parent.to_string());
+            }
+            fresh
+        }
     };
     let active_session = ActiveSession::new(initial_session);
 
@@ -943,7 +967,12 @@ fn handle_meta(
         MetaCommand::Hosts => print_host_status(harness),
         MetaCommand::New => {
             save_before_switch(agent, session, editor);
-            session.replace(Session::new(catalog_model.spec.key.clone()));
+            // A nested run stays nested across /new: carry kind + parent lineage.
+            let snapshot = session.snapshot();
+            let mut fresh = Session::new(catalog_model.spec.key.clone());
+            fresh.kind = snapshot.kind;
+            fresh.parent_session_id = snapshot.parent_session_id.clone();
+            session.replace(fresh);
             agent.set_history(Vec::new());
             agent.set_last_usage(None);
             reload_readline_history(editor, session);
@@ -1093,7 +1122,7 @@ Hosts:
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
   $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
-  and knobs (enable_subagent, attach_timeout_secs). Auth per entry: a literal
+  and knobs (attach_timeout_secs). Auth per entry: a literal
   token string or a source table (env var / file / none); see --help overview.
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host. Use /hosts to list hosts and attach status
@@ -1650,7 +1679,7 @@ impl EventSink for CliEventSink {
                     s.in_text_stream = false;
                 });
             }
-            // Root agent only — hide nested subagent tool spam (and other depth>0 noise).
+            // Root agent only — hide nested worker noise (depth>0, e.g. compact).
             AgentEvent::ToolStarted {
                 tool_use,
                 context: TraceContext { depth: 0, .. },

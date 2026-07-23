@@ -1511,7 +1511,6 @@ mod tests {
         HostDispatchContext {
             agent_id,
             cancel: crate::core::CancelToken::new(),
-            agent_root: None,
         }
     }
 
@@ -2112,7 +2111,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id: uuid::Uuid::nil(),
                     cancel,
-                    agent_root: None,
                 },
             )
             .await;
@@ -2768,7 +2766,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                    agent_root: None,
                 },
             )
             .await;
@@ -2791,7 +2788,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_b,
                     cancel: crate::core::CancelToken::new(),
-                    agent_root: None,
                 },
             )
             .await;
@@ -2816,7 +2812,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                    agent_root: None,
                 },
             )
             .await;
@@ -2837,7 +2832,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id: owner_a,
                     cancel: crate::core::CancelToken::new(),
-                    agent_root: None,
                 },
             )
             .await;
@@ -2867,7 +2861,6 @@ mod tests {
                 HostDispatchContext {
                     agent_id,
                     cancel: crate::core::CancelToken::new(),
-                    agent_root: None,
                 },
             )
             .await;

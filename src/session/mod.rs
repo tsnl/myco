@@ -51,7 +51,8 @@ pub enum SessionKind {
     /// Interactive / user-visible conversation (REPL, successor after compact).
     #[default]
     User,
-    /// Nested agent run (`subagent` tool). Hidden by default in listings.
+    /// Nested agent run (`myco --parent-session <id>`; also written by the
+    /// removed `subagent` tool). Hidden by default in listings.
     Subagent,
     /// Compaction worker. Hidden by default in listings.
     Compact,

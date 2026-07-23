@@ -60,7 +60,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// No styling: session files, subagent logs, non-TTY output.
+    /// No styling: session files, non-TTY output.
     pub const fn plain() -> Self {
         Self {
             enabled: false,

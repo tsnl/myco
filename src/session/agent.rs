@@ -74,7 +74,7 @@ pub enum AgentEvent {
     /// A new agent session began. Emitted once when the agent id is assigned.
     AgentStarted {
         agent_id: Uuid,
-        /// Model id when known (e.g. subagent tool input); empty for unspecified.
+        /// Model id when known; empty for unspecified.
         model: String,
         parent_agent_id: Option<Uuid>,
         /// Provider tool-use id that spawned this agent, if any.
@@ -343,7 +343,6 @@ impl Agent {
 
         let work = self.harness.clone().dispatch_tool_use(
             tool_use.clone(),
-            self.sink.clone(),
             dispatch_context,
             cancel.clone(),
         );
