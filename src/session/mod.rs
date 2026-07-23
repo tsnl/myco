@@ -363,7 +363,9 @@ impl Session {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        // Minified, not pretty-printed: the file is rewritten every turn, and
+        // structured readers (`session_history`, `jq`) don't need indentation.
+        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         atomically_write(&path, &json)
     }
 
@@ -1011,6 +1013,34 @@ mod tests {
             "myco-session-unit-{}",
             uuid_simple_hex(Uuid::new_v4())
         ))
+    }
+
+    #[test]
+    fn save_writes_minified_single_line_json_that_loads_back() {
+        let _guard = myco_home_lock();
+        let dir = temp_session_root();
+        // SAFETY: test-only env override; held under myco_home_lock.
+        unsafe {
+            std::env::set_var("MYCO_HOME", &dir);
+        }
+
+        let mut session = Session::new("claude-haiku-4-5");
+        session.messages.push(Message::UserMessage {
+            content: vec![Content::Text {
+                text: "hello\nworld".into(),
+            }],
+        });
+        session.save().unwrap();
+
+        // Minified: no newlines outside JSON string escapes, no indentation.
+        let raw = fs::read_to_string(session.json_path()).unwrap();
+        assert!(!raw.contains('\n'), "expected single-line JSON: {raw:?}");
+
+        let loaded = Session::load(&session.json_path()).unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.messages.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
