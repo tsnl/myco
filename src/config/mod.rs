@@ -13,7 +13,7 @@
 //!
 //! Myco ships **no built-in models or gateways**: `[gateways.*]` and
 //! `[models.*]` in config.toml are the entire catalog (see
-//! [`crate::harness::example_config_toml`]). A model entry names a gateway (or
+//! [`example_config_toml`]). A model entry names a gateway (or
 //! inlines `protocol` / `base_url` / `auth`) plus per-model metadata
 //! (`api_id`, required `context_window`, `thinking`, `max_output_tokens`).
 //!
@@ -39,12 +39,19 @@ use crate::generative_model::{
     AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
     OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
 };
-use crate::harness::{
-    AuthEntry, FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases,
+use crate::harness::{HarnessConfig, load_ssh_host_aliases};
+
+pub mod file;
+pub use file::{
+    AuthEntry, FileConfig, GatewayEntry, ModelEntry, example_config_toml, load_file_config,
+    parse_file_config_str,
 };
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
+
+/// Default per-remote connect timeout (seconds) when the config file sets none.
+pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // Auth resolution
@@ -199,7 +206,7 @@ pub struct ConfigUserSettings {
     pub stdout_is_tty: Option<bool>,
     /// Config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
-    pub harness_config_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
     /// Model key override (CLI `--model`).
     /// `None` → config file `model` → sole catalog entry.
     pub model: Option<String>,
@@ -224,7 +231,7 @@ pub struct Config {
     pub repaint_enabled: bool,
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
-    pub harness_config_path: PathBuf,
+    pub config_path: PathBuf,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
@@ -267,18 +274,22 @@ impl Config {
             color,
             wrap,
             stdout_is_tty: tty_override,
-            harness_config_path,
+            config_path,
             model: model_override,
         } = settings;
 
         let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
-        let harness_config_path = resolve_harness_config_path(harness_config_path, &env)?;
-        let file = load_file(&harness_config_path)?;
+        let config_path = resolve_config_path(config_path, &env)?;
+        let file = load_file(&config_path)?;
 
         let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
 
-        let harness = file.into_harness_config(ssh_aliases()?);
+        let harness = HarnessConfig::from_ssh_aliases(
+            ssh_aliases()?,
+            file.attach_timeout_secs
+                .unwrap_or(DEFAULT_ATTACH_TIMEOUT_SECS),
+        );
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
         let repaint_enabled = stdout_is_tty && env("TERM").as_deref() != Some("dumb");
@@ -288,7 +299,7 @@ impl Config {
             colors_enabled,
             wrap_max,
             repaint_enabled,
-            harness_config_path,
+            config_path,
             harness,
             models,
             model,
@@ -297,7 +308,7 @@ impl Config {
 }
 
 /// `--config` override → `$MYCO_CONFIG` → `~/.myco/config.toml`.
-fn resolve_harness_config_path(
+fn resolve_config_path(
     override_path: Option<PathBuf>,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<PathBuf, String> {
@@ -490,7 +501,6 @@ fn resolve_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::parse_file_config_str;
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -800,7 +810,7 @@ context_window = 1000
             ConfigUserSettings::default(),
             env_of(&[("XAI_API_KEY", "xai")]),
             false,
-            |_| parse_file_config_str(&crate::harness::example_config_toml()),
+            |_| parse_file_config_str(&example_config_toml()),
             || Ok(Vec::new()),
             |_| Err("no files".into()),
         )
@@ -922,11 +932,11 @@ context_window = 1000
     }
 
     #[test]
-    fn harness_config_path_override_beats_env_beats_home_default() {
+    fn config_path_override_beats_env_beats_home_default() {
         let path_for = |override_path: Option<PathBuf>, env_pairs: &[(&str, &str)]| {
             let env = env_of(env_pairs);
             let env = move |k: &str| env(k).filter(|v: &String| !v.is_empty());
-            resolve_harness_config_path(override_path, &env).unwrap()
+            resolve_config_path(override_path, &env).unwrap()
         };
         assert_eq!(
             path_for(
@@ -943,10 +953,10 @@ context_window = 1000
     }
 
     #[test]
-    fn harness_loader_gets_resolved_path_and_result_is_stored() {
+    fn file_loader_gets_resolved_path_and_result_is_stored() {
         let cfg = Config::resolve_with(
             ConfigUserSettings {
-                harness_config_path: Some(PathBuf::from("/tmp/h.toml")),
+                config_path: Some(PathBuf::from("/tmp/h.toml")),
                 ..Default::default()
             },
             env_of(&[]),
@@ -957,7 +967,7 @@ context_window = 1000
                     "[models.m]\nprotocol = \"openai-responses\"\n\
                      base_url = \"https://h\"\ncontext_window = 1000\n",
                 )?;
-                file.attach_timeout_secs = 42;
+                file.attach_timeout_secs = Some(42);
                 Ok(file)
             },
             || Ok(vec!["devbox".into()]),
@@ -967,6 +977,14 @@ context_window = 1000
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
         assert_eq!(cfg.harness.remote_hosts.len(), 1);
         assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
+    }
+
+    #[test]
+    fn unset_attach_timeout_defaults_at_resolve() {
+        // CATALOG leaves attach_timeout_secs unset; the default lands here,
+        // not at parse.
+        let cfg = resolve_catalog_cfg(&[]);
+        assert_eq!(cfg.harness.attach_timeout_secs, DEFAULT_ATTACH_TIMEOUT_SECS);
     }
 
     #[test]

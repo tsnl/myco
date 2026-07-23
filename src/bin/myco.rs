@@ -380,7 +380,7 @@ fn read_piped_stdin() -> Option<String> {
 /// reads this, not the env or config files.
 fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
     let app_config = Config::resolve(ConfigUserSettings {
-        harness_config_path: args.config.clone(),
+        config_path: args.config.clone(),
         model: args.model.clone(),
         color: args.color,
         wrap: args.wrap,
@@ -394,7 +394,7 @@ fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
         Ok(m) => m.clone(),
         Err(e) => {
             eprintln!("{e}");
-            eprintln!("config: {}", app_config.harness_config_path.display());
+            eprintln!("config: {}", app_config.config_path.display());
             std::process::exit(2);
         }
     };
@@ -472,7 +472,7 @@ async fn attach_harness_or_exit(
                      try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
                 );
             }
-            eprintln!("config: {}", app_config.harness_config_path.display());
+            eprintln!("config: {}", app_config.config_path.display());
             std::process::exit(1);
         })
 }

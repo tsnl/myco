@@ -85,10 +85,10 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
-| `src/config/` | Startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), config file, color decision |
+| `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
-| `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), startup preflight (executables + ssh-agent) |
+| `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
