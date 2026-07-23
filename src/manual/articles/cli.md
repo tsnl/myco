@@ -26,20 +26,19 @@ which reports key modifiers.)
 
 ### Session browser
 
-Bare `/resume` opens a session picker. Inside tmux (>= 3.2) it runs as a
-`tmux display-popup` executing `myco --mode session-browser`: fzf-powered
-fuzzy search over titles with a transcript preview (from the `{id}.console`
-mirror) when `fzf` is installed, else a paged list. Outside tmux the same
-paged list runs inline (`m` = next page, `q` = cancel). `tmux` and `fzf` are
-both optional — nothing warns when they are missing.
+Bare `/resume` opens an fzf picker over visible sessions (fuzzy search on
+titles/metadata, transcript preview from the `{id}.console` mirror). Inside
+tmux it runs as a `display-popup` executing `myco --mode session-browser`;
+outside tmux fzf runs in the current terminal. `tmux` and `fzf` are expected
+on PATH (the startup preflight warns when missing); `/resume <id|prefix>`
+always works without them.
 
 `myco --mode session-browser` also runs standalone: it prints the picked
 session id to stdout (`--out FILE` writes it to a file instead; empty/absent
 file means cancelled), e.g. `myco --resume "$(myco --mode session-browser)"`.
 
-Content search: `--search QUERY` ranks sessions by match instead of recency;
-in the paged picker `s <text>` does the same and bare `s` restores the recency
-list. The corpus per session is title, first user message, scratchpad, and the
+Content search: `--search QUERY` ranks sessions by match instead of recency.
+The corpus per session is title, first user message, scratchpad, and the
 console-transcript tail — keyword (Tantivy) first, MiniLM semantic fallback
 when keywords find nothing, over a one-shot in-RAM index (nothing persists;
 the semantic pass pays a model load + corpus embed per call). fzf's own typing
@@ -50,8 +49,8 @@ past sessions by content.
 Startup banner is a small headed block (full-block rule, `MYCO`, model +
 session, `/help` and newline hints). Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,
-`lynx`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and ssh-agent
-issues; hosts via `/hosts`.
+`lynx`, `tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
+configured) and ssh-agent issues; hosts via `/hosts`.
 
 ### Models & config (quick)
 

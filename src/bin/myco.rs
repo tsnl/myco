@@ -164,8 +164,8 @@ enum Mode {
     Interactive,
     /// Tool runtime over stdin/stdout NDJSON.
     Host,
-    /// Standalone session picker (fzf when installed, else a paged prompt);
-    /// prints the chosen id, or writes it to `--out`.
+    /// Standalone fzf session picker; prints the chosen id, or writes it
+    /// to `--out`.
     SessionBrowser,
 }
 
@@ -1126,8 +1126,8 @@ Commands:
   /session              Show session metadata (title, links, scratchpad, path)
   /sessions             List recent sessions (title + link counts)
   /hosts                List configured hosts and attach status
-  /resume [id|prefix]   Resume a session (no arg: browser -- tmux popup when
-                        inside tmux >= 3.2, else an inline paged list)
+  /resume [id|prefix]   Resume a session (no arg: fzf browser, as a tmux
+                        popup when inside tmux)
   /new                  Start a new session (saves current; clears display)
   /effort [level]       Show or set reasoning effort (low|medium|high|max)
   /title [text]         Show or set session title (empty text clears)
@@ -1280,36 +1280,20 @@ fn resolve_resume_session(id_or_prefix: Option<&str>) -> Result<Session, String>
     match id_or_prefix {
         Some(id) => Session::load_by_id_or_prefix(id),
         None => {
-            if myco::session_browser::tmux_popup_available() {
+            let choice = if myco::session_browser::inside_tmux() {
                 match myco::session_browser::pick_via_tmux_popup() {
-                    Ok(Some(choice)) => return Session::load_by_id_or_prefix(&choice),
-                    Ok(None) => return Err(RESUME_CANCELLED.into()),
-                    // tmux failed; the inline picker below still works.
-                    Err(_) => {}
+                    Ok(choice) => choice,
+                    // Popup failed (e.g. tmux < 3.2); fzf still works inline.
+                    Err(_) => myco::session_browser::pick(None)?,
                 }
+            } else {
+                myco::session_browser::pick(None)?
+            };
+            match choice {
+                Some(id) => Session::load_by_id_or_prefix(&id),
+                None => Err(RESUME_CANCELLED.into()),
             }
-            pick_session_interactively()
         }
-    }
-}
-
-fn pick_session_interactively() -> Result<Session, String> {
-    let list = list_sessions(0)?;
-    if list.is_empty() {
-        return Err("no sessions found under ~/.myco/session".into());
-    }
-    let search = |query: &str| {
-        myco::session::search_sessions(
-            &list,
-            query,
-            myco::session_browser::SESSION_SEARCH_LIMIT,
-            /*force_semantic*/ false,
-        )
-        .map(|r| r.entries)
-    };
-    match myco::session_browser::pick_paged(&list, Some(&search))? {
-        Some(choice) => Session::load_by_id_or_prefix(&choice),
-        None => Err(RESUME_CANCELLED.into()),
     }
 }
 

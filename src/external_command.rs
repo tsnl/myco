@@ -95,31 +95,30 @@ pub static PS: ExternalCommand = ExternalCommand {
     fallback_dirs: &[],
 };
 
-/// Optional: bare `/resume` opens the session browser as a tmux popup when
-/// the CLI is running inside tmux; without it the inline picker is used.
+/// Bare `/resume` opens the session browser as a tmux popup when the CLI is
+/// running inside tmux (fzf runs in the current terminal otherwise).
 pub static TMUX: ExternalCommand = ExternalCommand {
     name: "tmux",
-    purpose: "the session browser cannot open as a tmux popup",
-    install_hint: "install tmux (optional)",
-    startup_check: StartupCheck::Never,
+    purpose: "bare /resume cannot open the session browser as a popup",
+    install_hint: "brew install tmux / apt install tmux",
+    startup_check: StartupCheck::Always,
     env_override: None,
     fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
 };
 
-/// Optional: fuzzy search + transcript preview in `--mode session-browser`;
-/// without it the browser falls back to a paged prompt.
+/// The session browser UI (`--mode session-browser`).
 pub static FZF: ExternalCommand = ExternalCommand {
     name: "fzf",
-    purpose: "the session browser cannot offer fuzzy search",
-    install_hint: "brew install fzf / apt install fzf (optional)",
-    startup_check: StartupCheck::Never,
+    purpose: "the session browser cannot run (resume by id still works)",
+    install_hint: "brew install fzf / apt install fzf",
+    startup_check: StartupCheck::Always,
     env_override: None,
     fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
 };
 
 /// Every registered program; the startup preflight iterates this.
 pub static ALL: &[&ExternalCommand] =
-    &[&BASH, &LYNX, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS, &TMUX, &FZF];
+    &[&BASH, &LYNX, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(
