@@ -142,6 +142,13 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
       keys, gateway network, session store — stay on the user's machine;
       remotes stay hands); children pass `--parent-session <id>` so their
       sessions are hidden and linked in the shared store.
+- [x] **Context forking** — `--parent-session <id> --fork` seeds the child with
+      the supervisor's saved conversation under a fresh hidden session id.
+      Sessions checkpoint mid-turn at replayable boundaries (after the user
+      message and each completed tool round), the current model key is stamped
+      into the system prompt (identity-free otherwise) so supervisors launch
+      same-model forks, and a same-model fork's first request re-reads the
+      supervisor's cached prompt prefix instead of rebuilding context.
 - [ ] **Remote nesting / gateway proxy** — running a whole agent *on* a remote
       (vs local brain + remote hands) would need config, keys, and gateway
       network there. If it is ever really needed, the principled fix is

@@ -146,3 +146,113 @@ context_window = 100000
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--parent-session … --fork` is the context-fork contract: the child's fresh
+/// hidden session is seeded with the parent's saved conversation under a new
+/// id, and the inherited transcript is NOT replayed to the pipe (a supervisor
+/// must never read its own context back as child output).
+#[tokio::test]
+async fn fork_seeds_child_with_parent_conversation() {
+    let dir = std::env::temp_dir().join(format!("myco-fork-{}", uuid::Uuid::new_v4().as_simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model = "pipetest"
+
+[models.pipetest]
+protocol = "openai-responses"
+base_url = "http://127.0.0.1:1/v1"
+auth = { source = "none" }
+context_window = 100000
+"#,
+    )
+    .unwrap();
+
+    let run = |args: Vec<String>, input: &'static [u8]| {
+        let dir = dir.clone();
+        let config_path = config_path.clone();
+        async move {
+            let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+                .args(args)
+                .env("MYCO_HOME", &dir)
+                .env("MYCO_CONFIG", &config_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn myco");
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin.write_all(input).await.unwrap();
+            drop(stdin);
+            let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+                .await
+                .expect("piped REPL must not hang")
+                .expect("wait myco");
+            assert!(
+                output.status.success(),
+                "status={:?}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+    };
+
+    // Parent run: one (failing) turn is enough — the user message is
+    // checkpointed to disk the moment it is submitted.
+    let parent_stdout = run(vec![], b"parent-marker-alpha\n/quit\n").await;
+    let parent_id = parent_stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("session="))
+        .expect("parent session id announced on exit")
+        .trim()
+        .to_string();
+
+    // Fork a child off the stored parent session.
+    let child_stdout = run(
+        vec![
+            "--parent-session".into(),
+            parent_id.clone(),
+            "--fork".into(),
+        ],
+        b"child-marker-beta\n/quit\n",
+    )
+    .await;
+    let child_id = child_stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("session="))
+        .expect("child session id announced on exit")
+        .trim()
+        .to_string();
+    assert_ne!(child_id, parent_id, "fork must mint a new session id");
+    assert!(
+        !child_stdout.contains("parent-marker-alpha"),
+        "inherited transcript must not replay to the pipe:\n{child_stdout}"
+    );
+
+    // The child session file: hidden, parented, seeded with the parent's
+    // conversation plus its own turn.
+    let child_path = std::fs::read_dir(dir.join("session"))
+        .expect("session store exists")
+        .flatten()
+        .filter(|shard| shard.path().is_dir())
+        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+        .map(|f| f.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n == format!("{child_id}.json").as_str())
+        })
+        .expect("child session file");
+    let session: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&child_path).unwrap()).unwrap();
+    assert_eq!(session["kind"], "subagent", "{session}");
+    assert_eq!(session["parent_session_id"], parent_id, "{session}");
+    let messages = serde_json::to_string(&session["messages"]).unwrap();
+    assert!(messages.contains("parent-marker-alpha"), "{messages}");
+    assert!(messages.contains("child-marker-beta"), "{messages}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
