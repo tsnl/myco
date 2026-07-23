@@ -1038,7 +1038,13 @@ fn render_locked_capture(buf: &Arc<Mutex<CappedCapture>>, max_bytes: usize) -> S
 }
 
 /// The shared middle-elision shape: verbatim head, one honest marker, tail.
-fn middle_elision(head: &[u8], tail: &[u8], omitted: usize, total: usize, max_bytes: usize) -> String {
+fn middle_elision(
+    head: &[u8],
+    tail: &[u8],
+    omitted: usize,
+    total: usize,
+    max_bytes: usize,
+) -> String {
     format!(
         "{}\n[... {omitted} bytes omitted ({total} bytes total, max_bytes={max_bytes}); \
          filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",

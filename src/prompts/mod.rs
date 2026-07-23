@@ -179,10 +179,7 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) {
 
 /// [`agent_prompt_epilogue`] against explicit dirs, so tests need no
 /// process-global `MYCO_HOME` / cwd override.
-fn epilogue_with(
-    home: Option<std::path::PathBuf>,
-    cwd: Option<std::path::PathBuf>,
-) -> String {
+fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
     let soul = home.and_then(|home| latest_soul(&home.join("workspace").join("soul")));
     if let Some((name, mut soul)) = soul {
@@ -246,13 +243,19 @@ mod tests {
 
         std::fs::write(dir.join("CLAUDE.md"), "claude_guidance_token\n").unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("# Project guidance (CLAUDE.md)"), "{prompt}");
+        assert!(
+            prompt.contains("# Project guidance (CLAUDE.md)"),
+            "{prompt}"
+        );
         assert!(prompt.contains("claude_guidance_token"), "{prompt}");
 
         // AGENTS.md wins over CLAUDE.md when both exist.
         std::fs::write(dir.join("AGENTS.md"), "agents_guidance_token\n").unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("# Project guidance (AGENTS.md)"), "{prompt}");
+        assert!(
+            prompt.contains("# Project guidance (AGENTS.md)"),
+            "{prompt}"
+        );
         assert!(prompt.contains("agents_guidance_token"), "{prompt}");
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
 

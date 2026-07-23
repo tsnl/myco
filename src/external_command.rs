@@ -108,8 +108,7 @@ pub static FZF: ExternalCommand = ExternalCommand {
 };
 
 /// Every registered program; the startup preflight iterates this.
-pub static ALL: &[&ExternalCommand] =
-    &[&BASH, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
+pub static ALL: &[&ExternalCommand] = &[&BASH, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(

@@ -41,10 +41,7 @@ pub fn search_sessions(
         return Err("query must not be empty".into());
     }
     let limit = limit.clamp(1, 200);
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.to_lowercase())
-        .collect();
+    let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
 
     let mut scored: Vec<(u64, &SessionListEntry)> = entries
         .iter()

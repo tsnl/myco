@@ -120,8 +120,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex",
 ]
 
@@ -491,27 +489,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git2"
-version = "0.20.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
-dependencies = [
- "bitflags",
- "libc",
- "libgit2-sys",
- "log",
- "openssl-probe",
- "openssl-sys",
- "url",
-]
-
-[[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -825,16 +802,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jobserver"
-version = "0.1.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
-dependencies = [
- "getrandom 0.4.2",
- "libc",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,52 +826,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "libgit2-sys"
-version = "0.18.5+1.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005d6ae6eac1912906073e069f7db60b1fa98e052a68227824afe3e3a1c59ca2"
-dependencies = [
- "cc",
- "libc",
- "libssh2-sys",
- "libz-sys",
- "openssl-sys",
- "pkg-config",
-]
-
-[[package]]
 name = "libredox"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "libssh2-sys"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c04141a07bb0c0bc461cb657808764de571702a59bc5c726c400ac9a7625e3ab"
-dependencies = [
- "cc",
- "libc",
- "libz-sys",
- "openssl-sys",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
-name = "libz-sys"
-version = "1.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
 ]
 
 [[package]]
@@ -980,7 +907,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "ssh2-config",
  "thiserror",
  "tokio",
  "toml",
@@ -1044,24 +970,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openssl-probe"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.117"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1101,12 +1009,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkg-config"
-version = "0.3.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "potential_utf"
@@ -1624,22 +1526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssh2-config"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2e5a3352c5c624ed815d37c1c4c760aeaa119352091ca93ca5566f4ad48562c"
-dependencies = [
- "anyhow",
- "bitflags",
- "dirs",
- "git2",
- "glob",
- "log",
- "thiserror",
- "wildmatch",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,12 +1869,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
 name = "want"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2151,12 +2031,6 @@ checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]
-
-[[package]]
-name = "wildmatch"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29333c3ea1ba8b17211763463ff24ee84e41c78224c16b001cd907e663a38c68"
 
 [[package]]
 name = "windows-core"
