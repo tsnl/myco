@@ -52,7 +52,7 @@ jobs:
     steps:
       # First checkout: the trigger ref, only to read the request file on push
       # events. The second checkout below switches to the publish branch.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve publish parameters
         id: params
@@ -85,7 +85,7 @@ jobs:
             echo "dry_run=$dry_run"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ steps.params.outputs.branch }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -145,7 +145,7 @@ jobs:
 
       - name: Create GitHub Release
         if: ${{ steps.params.outputs.dry_run != 'true' && steps.publish.outputs.published == 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.publish.outputs.tag_name }}
           name: ${{ steps.publish.outputs.new_version }}
