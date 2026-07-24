@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::*;
+use crate::core::image::{image_file_data_url, image_media_type};
+use crate::generative_model::Content;
 
 /// Gives agents tools to view, create, and edit files, and handle its view, str_replace, create,
 /// and insert commands.
@@ -24,8 +26,11 @@ impl TextEditorService {
     pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "str_replace_based_edit_tool".to_string(),
-            description: "A tool for viewing, creating, and editing files. Matches Anthropic tool."
-                .to_string(),
+            description:
+                "A tool for viewing, creating, and editing files. Matches Anthropic tool. \
+                          `view` on an image file (png/jpg/jpeg/gif/webp, max 5 MiB) returns the \
+                          image itself."
+                    .to_string(),
             // Schema comes from [`Input`] (flat object). The tagged [`ParsedInput`] enum is used
             // at runtime after conversion — schemars would emit root `oneOf` for that enum,
             // which Anthropic rejects (missing `input_schema.type`).
@@ -136,7 +141,7 @@ impl TextEditorService {
 
     fn cmd_view(&self, path: &str, view_range: Option<[i64; 2]>) -> generative_model::ToolResult {
         match view_path(path, view_range) {
-            Ok(text) => generative_model::ToolResult::text(text),
+            Ok(content) => generative_model::ToolResult::ok(content),
             Err(e) => generative_model::ToolResult::err(e),
         }
     }
@@ -198,7 +203,7 @@ impl TextEditorService {
 // File operations
 //
 
-fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String> {
+fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<Vec<Content>, String> {
     let path_buf = PathBuf::from(path);
     let metadata = std::fs::metadata(&path_buf)
         .map_err(|e| format!("Error reading metadata for '{path}': {e}"))?;
@@ -209,14 +214,30 @@ fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String>
                 "view_range is only supported for files, not directories (path: '{path}')"
             ));
         }
-        return view_directory(&path_buf, path);
+        return Ok(vec![Content::Text {
+            text: view_directory(&path_buf, path)?,
+        }]);
     }
 
     if !metadata.is_file() {
         return Err(format!("Path '{path}' is neither a file nor a directory"));
     }
 
-    view_file(&path_buf, path, view_range)
+    // Image files come back as an image block so the model can see them,
+    // not as (invalid-UTF-8) text.
+    if let Some(media_type) = image_media_type(path) {
+        if view_range.is_some() {
+            return Err(format!(
+                "view_range is not supported for image files (path: '{path}')"
+            ));
+        }
+        let source = image_file_data_url(&path_buf, media_type, &format!("'{path}'"))?;
+        return Ok(vec![Content::Image { source }]);
+    }
+
+    Ok(vec![Content::Text {
+        text: view_file(&path_buf, path, view_range)?,
+    }])
 }
 
 fn view_directory(path: &Path, path_display: &str) -> Result<String, String> {
@@ -1130,6 +1151,99 @@ mod tests {
         );
         assert!(!view.is_error, "{}", result_text(&view));
         assert_eq!(result_text(&view), "inserted\nline2");
+    }
+
+    #[test]
+    fn view_image_returns_image_block_with_data_url() {
+        let tmp = temp_dir();
+        let path = tmp.0.join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: path.to_string_lossy().into(),
+                view_range: None,
+            },
+        );
+        assert!(!view.is_error, "{}", result_text(&view));
+        assert_eq!(view.content.len(), 1);
+        match &view.content[0] {
+            Content::Image { source } => {
+                // 0x89 P N G → iVBORw==
+                assert_eq!(source, "data:image/png;base64,iVBORw==");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_image_rejects_view_range() {
+        let tmp = temp_dir();
+        let path = tmp.0.join("shot.jpg");
+        std::fs::write(&path, [1, 2, 3]).unwrap();
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: path.to_string_lossy().into(),
+                view_range: Some([1, 2]),
+            },
+        );
+        assert!(view.is_error);
+        assert!(
+            result_text(&view).contains("not supported for image files"),
+            "{}",
+            result_text(&view)
+        );
+    }
+
+    #[test]
+    fn view_oversized_image_errors_with_limit() {
+        let tmp = temp_dir();
+        let path = tmp.0.join("big.png");
+        std::fs::write(
+            &path,
+            vec![0u8; crate::core::image::MAX_IMAGE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: path.to_string_lossy().into(),
+                view_range: None,
+            },
+        );
+        assert!(view.is_error);
+        assert!(
+            result_text(&view).contains("limit is 5 MiB"),
+            "{}",
+            result_text(&view)
+        );
+    }
+
+    /// A directory whose name ends in .png is still listed, not decoded.
+    #[test]
+    fn view_directory_with_image_extension_lists_entries() {
+        let tmp = temp_dir();
+        let dir = tmp.0.join("assets.png");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "a.txt", "x");
+        let harness = harness();
+
+        let view = dispatch(
+            &harness,
+            ParsedInput::View {
+                path: dir.to_string_lossy().into(),
+                view_range: None,
+            },
+        );
+        assert!(!view.is_error, "{}", result_text(&view));
+        assert_eq!(result_text(&view), "a.txt");
     }
 
     #[test]

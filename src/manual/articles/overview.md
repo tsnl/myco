@@ -150,6 +150,9 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
   idle, or DOWN after a failed remote connect.
+- **Viewing images**: `str_replace_based_edit_tool` `view` on a png/jpg/jpeg/gif/webp
+  file (≤5 MiB) returns the image itself — the agent can look at screenshots and
+  figures on any host, same extensions and cap as user `@path` attachments.
 - **Text search** (per host): persistent watched roots via `index_directory` /
   `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
   file bodies **and** path/filename tokens) /
