@@ -237,7 +237,7 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                     out.push(ResponsesInputItem::FunctionCallOutput {
                         type_: "function_call_output",
                         call_id: result.id.clone(),
-                        output: tool_result_to_string(result),
+                        output: tool_result_to_output(result),
                     });
                 }
             }
@@ -318,24 +318,55 @@ fn image_url(source: &str) -> String {
     format!("data:image/png;base64,{source}")
 }
 
-fn tool_result_to_string(result: &ToolResult) -> String {
-    let text = result
+/// `function_call_output.output`: the plain-string form for text-only
+/// results, or `input_text` / `input_image` parts when a tool result carries
+/// images (e.g. the editor viewing an image file). Text-only stays a string
+/// for compatibility with OpenAI-compatible gateways that predate content
+/// parts in function outputs.
+fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
+    let text = {
+        let t = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                Content::Image { .. } | Content::Thinking { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if result.is_error && !t.is_empty() {
+            format!("Error: {t}")
+        } else if result.is_error {
+            "Error".into()
+        } else {
+            t
+        }
+    };
+
+    let images: Vec<&str> = result
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
             Content::Image { source } => Some(source.as_str()),
-            Content::Thinking { .. } => None,
+            _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if result.is_error && !text.is_empty() {
-        format!("Error: {text}")
-    } else if result.is_error {
-        "Error".into()
-    } else {
-        text
+        .collect();
+    if images.is_empty() {
+        return ResponsesFunctionOutput::Text(text);
     }
+
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(ResponsesContentPart::InputText { text });
+    }
+    parts.extend(
+        images
+            .into_iter()
+            .map(|source| ResponsesContentPart::InputImage {
+                image_url: image_url(source),
+            }),
+    );
+    ResponsesFunctionOutput::Parts(parts)
 }
 
 //
@@ -739,8 +770,17 @@ enum ResponsesInputItem {
         #[serde(rename = "type")]
         type_: &'static str,
         call_id: String,
-        output: String,
+        output: ResponsesFunctionOutput,
     },
+}
+
+/// Wire form of `function_call_output.output`: a string, or a content-part
+/// list when the result includes images (see [`tool_result_to_output`]).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ResponsesFunctionOutput {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
 }
 
 /// Message `content`: the plain-string form for text-only messages, or the
@@ -993,8 +1033,52 @@ mod tests {
                 call_id,
                 output,
                 ..
-            } if call_id == "call_1" && output == "hi\n"
+            } if call_id == "call_1" && *output == ResponsesFunctionOutput::Text("hi\n".into())
         ));
+        // Text-only output serializes as a plain string, not a parts array.
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(json[2]["output"], "hi\n");
+    }
+
+    #[test]
+    fn tool_result_image_becomes_output_parts() {
+        let input = [Message::ToolResults {
+            tool_use_results: vec![ToolResult {
+                id: "call_1".into(),
+                content: vec![
+                    Content::Text { text: "ok".into() },
+                    Content::Image {
+                        source: "data:image/png;base64,AAAA".into(),
+                    },
+                ],
+                is_error: false,
+            }],
+        }];
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        assert_eq!(json[0]["type"], "function_call_output");
+        assert_eq!(json[0]["output"][0]["type"], "input_text");
+        assert_eq!(json[0]["output"][0]["text"], "ok");
+        assert_eq!(json[0]["output"][1]["type"], "input_image");
+        assert_eq!(
+            json[0]["output"][1]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn image_only_tool_result_has_no_empty_text_part() {
+        let input = [Message::ToolResults {
+            tool_use_results: vec![ToolResult {
+                id: "call_1".into(),
+                content: vec![Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                }],
+                is_error: false,
+            }],
+        }];
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        assert_eq!(json[0]["output"].as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["output"][0]["type"], "input_image");
     }
 
     #[test]

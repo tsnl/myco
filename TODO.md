@@ -133,6 +133,10 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 - [x] **User multimodal (images)** — `@path` mentions in the REPL attach
       png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
       Responses sends `input_image` parts. Non-image files: see **Rich attach**.
+- [x] **Agent multimodal (images)** — editor `view` on an image file returns
+      `Content::Image` (same extensions/cap as `@path`), on any host. Anthropic
+      sends nested `tool_result` image blocks; OpenAI Responses sends
+      `function_call_output` content parts (`input_image`).
 - [ ] **Provider file upload for images** — inline data-URL images are re-sent on
       *every* generate call (every tool-loop step), so one attached image adds its
       base64 to the wire for the rest of the session. When that hurts, fix inside

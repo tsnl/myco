@@ -9,13 +9,9 @@
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
-
+pub use crate::core::image::MAX_IMAGE_BYTES;
+use crate::core::image::{image_file_data_url, image_media_type};
 use crate::generative_model::Content;
-
-/// Per-image size limit (matches the Anthropic API's 5 MB per-image cap; a
-/// clear local error beats a confusing provider 400).
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Expand `@<path>` image mentions in `input` into content blocks for
 /// `Agent::interact`: attached images first (providers prefer
@@ -43,21 +39,8 @@ pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
         }
 
         let expanded = expand_home(path);
-        let meta =
-            std::fs::metadata(&expanded).map_err(|e| format!("cannot read image @{path}: {e}"))?;
-        if meta.len() > MAX_IMAGE_BYTES {
-            return Err(format!(
-                "image @{path} is {:.1} MiB; the limit is {} MiB",
-                meta.len() as f64 / (1024.0 * 1024.0),
-                MAX_IMAGE_BYTES / (1024 * 1024),
-            ));
-        }
-        let bytes =
-            std::fs::read(&expanded).map_err(|e| format!("cannot read image @{path}: {e}"))?;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        content.push(Content::Image {
-            source: format!("data:{media_type};base64,{data}"),
-        });
+        let source = image_file_data_url(&expanded, media_type, &format!("@{path}"))?;
+        content.push(Content::Image { source });
         seen.push(path);
     }
 
@@ -65,20 +48,6 @@ pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
         text: input.to_string(),
     });
     Ok(content)
-}
-
-fn image_media_type(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path)
-        .extension()?
-        .to_str()?
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -93,6 +62,7 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::fs;
 
     fn temp_dir(tag: &str) -> PathBuf {

@@ -1190,6 +1190,38 @@ mod tests {
         assert!(convert_messages(&[], true).is_empty());
     }
 
+    /// An image inside a tool result (e.g. the editor viewing an image file)
+    /// must reach the API as a nested image block, not be dropped or
+    /// stringified.
+    #[test]
+    fn tool_result_image_serializes_as_nested_image_block() {
+        let input = [Message::ToolResults {
+            tool_use_results: vec![ToolResult {
+                id: "toolu_1".into(),
+                content: vec![Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                }],
+                is_error: false,
+            }],
+        }];
+        let json = serde_json::to_value(convert_messages(&input, false)).unwrap();
+        assert_eq!(json[0]["role"], "user");
+        assert_eq!(json[0]["content"][0]["type"], "tool_result");
+        assert_eq!(json[0]["content"][0]["content"][0]["type"], "image");
+        assert_eq!(
+            json[0]["content"][0]["content"][0]["source"]["type"],
+            "base64"
+        );
+        assert_eq!(
+            json[0]["content"][0]["content"][0]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            json[0]["content"][0]["content"][0]["source"]["data"],
+            "AAAA"
+        );
+    }
+
     #[test]
     fn image_source_url_and_base64_wire_format() {
         let url = AnthropicContent::from(Content::Image {
