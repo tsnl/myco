@@ -46,6 +46,10 @@ notify = "8.2.0"
 tantivy = "0.22"
 ssh2-config = "0.7.1"
 unicode-width = "0.2"
+# Magic-number sniffing so an image's media type comes from its bytes, not its
+# filename. `std` would pull `cfb` (MS Office compound files) for detection we
+# never use; the byte-slice matchers we need are available without it.
+infer = { version = "0.22.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Terminal width detection (TIOCGWINSZ) for `--wrap auto`.

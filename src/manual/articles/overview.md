@@ -150,9 +150,10 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
   idle, or DOWN after a failed remote connect.
-- **`view_image`** (per host): returns a png/jpg/jpeg/gif/webp file (≤5 MiB) as an image
-  the model can actually look at — screenshots, diagrams, rendered output. Same
-  extensions and cap as user `@path` attachments. Text files stay with the editor.
+- **`view_image`** (per host): returns a png/jpeg/gif/webp file (≤5 MiB) as an image the
+  model can actually look at — screenshots, diagrams, rendered output. The format is
+  read from the file's magic number, so the extension may be wrong or missing (user
+  `@path` attachments share the same detection and cap). Text files stay with the editor.
 - **Text search** (per host): persistent watched roots via `index_directory` /
   `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
   file bodies **and** path/filename tokens) /

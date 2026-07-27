@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::Async;
-use crate::core::image::{image_file_data_url, image_media_type};
+use crate::core::image::read_image_data_url;
 use crate::generative_model::{self, Content, ToolResult};
 
 use super::{HostDispatchContext, ToolService};
@@ -13,8 +13,9 @@ const TOOL_DESCRIPTION: &str = r#"
 Look at an image file: returns the image itself, so you can read screenshots, diagrams,
 and rendered output instead of guessing from filenames.
 
-Supported: png, jpg/jpeg, gif, webp — up to 5 MiB each. Anything else (including text
-files) belongs in `str_replace_based_edit_tool` view, which this tool does not replace.
+Supported: png, jpeg, gif, webp — up to 5 MiB each. The format is detected from the
+file's contents, so the extension can be wrong or missing. Anything else (including
+text files) belongs in `str_replace_based_edit_tool` view, which this does not replace.
 "#;
 
 /// Reads image files as [`Content::Image`]. Implements [`ToolService`] (host-placed).
@@ -40,15 +41,9 @@ impl ViewImageService {
         if path.is_empty() {
             return Err("view_image requires a non-empty path".to_string());
         }
-        let Some(media_type) = image_media_type(path) else {
-            return Err(format!(
-                "'{path}' is not a supported image (png, jpg, jpeg, gif, webp). \
-                 Use str_replace_based_edit_tool view for text files."
-            ));
-        };
 
-        // A directory can carry an image extension; reading it would surface a
-        // confusing OS error instead of naming the real problem.
+        // Reading a directory would surface a confusing OS error instead of
+        // naming the real problem.
         let path_buf = PathBuf::from(path);
         let metadata =
             std::fs::metadata(&path_buf).map_err(|e| format!("cannot read image '{path}': {e}"))?;
@@ -56,7 +51,7 @@ impl ViewImageService {
             return Err(format!("'{path}' is not a file"));
         }
 
-        let source = image_file_data_url(&path_buf, media_type, &format!("'{path}'"))?;
+        let source = read_image_data_url(&path_buf, &format!("'{path}'"))?;
         Ok(Content::Image { source })
     }
 }
@@ -100,6 +95,9 @@ mod tests {
     use crate::generative_model::ToolUse;
     use serde_json::json;
 
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+
     struct TempDir(PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
@@ -142,7 +140,7 @@ mod tests {
     fn returns_image_block_as_data_url() {
         let tmp = temp_dir();
         let path = tmp.0.join("shot.png");
-        std::fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(&path, PNG).unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(!result.is_error, "{}", error_text(&result));
@@ -154,11 +152,30 @@ mod tests {
         }
     }
 
+    /// Screenshots are routinely saved without an extension; the format comes
+    /// from the bytes, so there is nothing to gate on.
     #[test]
-    fn uppercase_extension_maps_media_type() {
+    fn reads_an_extensionless_file() {
         let tmp = temp_dir();
-        let path = tmp.0.join("photo.JPG");
-        std::fs::write(&path, [1]).unwrap();
+        let path = tmp.0.join("clipboard-grab");
+        std::fs::write(&path, JPEG).unwrap();
+
+        let result = view(&path.to_string_lossy());
+        assert!(!result.is_error, "{}", error_text(&result));
+        match &result.content[0] {
+            Content::Image { source } => {
+                assert!(source.starts_with("data:image/jpeg;base64,"), "{source}");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    /// A wrong extension must not decide the media type on the wire.
+    #[test]
+    fn mislabeled_extension_uses_the_real_media_type() {
+        let tmp = temp_dir();
+        let path = tmp.0.join("actually-a-jpeg.png");
+        std::fs::write(&path, JPEG).unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(!result.is_error, "{}", error_text(&result));
@@ -171,16 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn non_image_extension_points_at_the_editor() {
+    fn text_file_is_rejected() {
         let tmp = temp_dir();
         let path = tmp.0.join("notes.txt");
         std::fs::write(&path, "hi").unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(result.is_error);
-        let text = error_text(&result);
-        assert!(text.contains("not a supported image"), "{text}");
-        assert!(text.contains("str_replace_based_edit_tool"), "{text}");
+        assert!(
+            error_text(&result).contains("is not a png, jpeg, gif, or webp image"),
+            "{result:?}"
+        );
     }
 
     /// A directory named `*.png` must not be read as image bytes.
