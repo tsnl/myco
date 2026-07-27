@@ -1387,9 +1387,10 @@ Shortcuts:
 
 Images:
   Mention @path in a message to attach that image file as model input, e.g.
-  `what is wrong here? @ui/shot.png`. Extensions png/jpg/jpeg/gif/webp, up to
-  5 MiB each, `~/` expands, paths with spaces unsupported. The text is sent as
-  typed; a bad path errors before the model is called.
+  `what is wrong here? @ui/shot.png`. Extensions png/jpg/jpeg/gif/webp select
+  the mention, the format is read from the file itself, up to 5 MiB each, `~/`
+  expands, paths with spaces unsupported. The text is sent as typed; a bad path
+  or non-image file errors before the model is called.
 
 Thinking/reasoning is always requested (default effort=high). The UI shows a
 `Thinking: …` summary inside ASSISTANT; it is stored in session history for
@@ -2199,7 +2200,8 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let img = dir.join("shot.png");
-        fs::write(&img, b"not-really-a-png").unwrap();
+        // Real PNG magic number: the media type is sniffed from the bytes.
+        fs::write(&img, [0x89, 0x50, 0x4E, 0x47]).unwrap();
 
         let arg = format!("what is this? @{}", img.display());
         let content = print_turn_content(Some(&arg), arg.clone()).unwrap();
