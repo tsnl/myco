@@ -1,5 +1,5 @@
-//! Image file policy shared by REPL `@path` attachments and the editor's
-//! `view`: which extensions count as images, the per-image size cap, and
+//! Image file policy shared by REPL `@path` attachments and the `view_image`
+//! tool: which extensions count as images, the per-image size cap, and
 //! file → `data:` URL reading.
 
 use std::path::Path;
@@ -24,7 +24,7 @@ pub fn image_media_type(path: &str) -> Option<&'static str> {
 
 /// Read an image file and encode it as a `data:` URL, enforcing
 /// [`MAX_IMAGE_BYTES`]. `label` is how the path appears in error messages
-/// (the REPL uses `@path`, the editor quotes it).
+/// (the REPL uses `@path`, `view_image` quotes it).
 pub fn image_file_data_url(path: &Path, media_type: &str, label: &str) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
     if meta.len() > MAX_IMAGE_BYTES {

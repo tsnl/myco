@@ -320,9 +320,9 @@ fn image_url(source: &str) -> String {
 
 /// `function_call_output.output`: the plain-string form for text-only
 /// results, or `input_text` / `input_image` parts when a tool result carries
-/// images (e.g. the editor viewing an image file). Text-only stays a string
-/// for compatibility with OpenAI-compatible gateways that predate content
-/// parts in function outputs.
+/// images (e.g. `view_image`). Text-only stays a string for compatibility
+/// with OpenAI-compatible gateways that predate content parts in function
+/// outputs.
 fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
     let text = {
         let t = result

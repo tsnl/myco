@@ -1190,9 +1190,8 @@ mod tests {
         assert!(convert_messages(&[], true).is_empty());
     }
 
-    /// An image inside a tool result (e.g. the editor viewing an image file)
-    /// must reach the API as a nested image block, not be dropped or
-    /// stringified.
+    /// An image inside a tool result (e.g. `view_image`) must reach the API as
+    /// a nested image block, not be dropped or stringified.
     #[test]
     fn tool_result_image_serializes_as_nested_image_block() {
         let input = [Message::ToolResults {
