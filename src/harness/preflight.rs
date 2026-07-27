@@ -3,7 +3,8 @@
 //! Interactive startup verifies that the external programs myco spawns
 //! (declared in [`crate::external_command`]) actually resolve on the agent
 //! machine. Results fold into the same WARNING block as the ssh-agent
-//! preflight ([`SshAgentPreflightReport`]) — one section after the banner,
+//! preflight ([`SshAgentPreflightReport`]) and the soul size check
+//! ([`crate::prompts::soul_truncation`]) — one section after the banner,
 //! silent when everything resolves. Remote hosts are not probed here; they
 //! report missing programs as tool errors at call time.
 
@@ -12,6 +13,7 @@ use std::io::Write;
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
+use crate::prompts::{SoulTruncation, soul_truncation};
 use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`check_expected_executables`].
@@ -71,10 +73,12 @@ fn missing_executables(
         .collect()
 }
 
-/// Everything interactive startup checks before the first prompt: expected
-/// executables, then ssh-agent identities.
+/// Everything interactive startup checks before the first prompt: the soul
+/// size cap, expected executables, then ssh-agent identities.
 #[derive(Debug, Default, Clone)]
 pub struct StartupPreflight {
+    /// Set when the newest soul version does not fit under `max_soul_bytes`.
+    pub soul: Option<SoulTruncation>,
     pub executables: ExecutableCheckReport,
     pub ssh: SshAgentPreflightReport,
 }
@@ -83,22 +87,31 @@ impl StartupPreflight {
     /// Executable check first; the ssh-agent preflight runs only when the
     /// OpenSSH tools it spawns actually resolve — otherwise every step would
     /// fail with spawn errors the missing-executable lines already explain.
-    pub fn run(hosts: &[HostConfig]) -> Self {
+    /// `max_soul_bytes` is the resolved config cap the prompts will use.
+    pub fn run(hosts: &[HostConfig], max_soul_bytes: usize) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
             SshAgentPreflightReport::default()
         } else {
             ensure_remote_ssh_identities(hosts)
         };
-        Self { executables, ssh }
+        Self {
+            soul: soul_truncation(max_soul_bytes),
+            executables,
+            ssh,
+        }
     }
 
     pub fn has_problems(&self) -> bool {
-        !self.executables.is_clean() || self.ssh.has_problems()
+        self.soul.is_some() || !self.executables.is_clean() || self.ssh.has_problems()
     }
 
-    /// Write all preflight problems as one WARNING section (executables first,
-    /// then ssh-agent). Writes nothing on the happy path.
+    /// Write all preflight problems as one WARNING section. Writes nothing on
+    /// the happy path.
+    ///
+    /// The soul goes first: a cut soul is invisible everywhere else (the agent
+    /// simply runs with less of itself), while missing executables and ssh
+    /// keys announce themselves again at the tool call that needs them.
     pub fn write_warning_section(
         &self,
         out: &mut impl Write,
@@ -108,12 +121,28 @@ impl StartupPreflight {
             return Ok(());
         }
         write_warning_open(out, palette)?;
+        write_soul_body(self.soul.as_ref(), out)?;
         self.executables.write_body(out)?;
         if self.ssh.has_problems() {
             self.ssh.write_body(out)?;
         }
         Ok(())
     }
+}
+
+/// Soul lines only (no rule/header); writes nothing when the soul fits.
+fn write_soul_body(cut: Option<&SoulTruncation>, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(cut) = cut else { return Ok(()) };
+    writeln!(out, "soul/{}: {}", cut.version, cut.describe())?;
+    writeln!(
+        out,
+        "every agent prompt from now on carries only the first {} of that version",
+        cut.human_limit()
+    )?;
+    writeln!(
+        out,
+        "hint: write a shorter soul revision, or raise `max_soul_bytes` in config.toml"
+    )
 }
 
 /// Print preflight problems as a WARNING block on stdout, after the startup
@@ -161,6 +190,7 @@ mod tests {
     #[test]
     fn silent_when_everything_resolves() {
         let pf = StartupPreflight {
+            soul: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(true, |_| true),
             },
@@ -173,6 +203,7 @@ mod tests {
     #[test]
     fn missing_tmux_opens_warning_with_install_hint() {
         let pf = StartupPreflight {
+            soul: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(false, |e| e.name != "tmux"),
             },
@@ -193,6 +224,7 @@ mod tests {
     #[test]
     fn combined_block_has_one_header_executables_before_ssh() {
         let pf = StartupPreflight {
+            soul: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(true, |e| e.name != "ssh"),
             },
@@ -215,6 +247,7 @@ mod tests {
         // A clean-but-noted ssh report (e.g. "no SSH-backed hosts") must not
         // leak into a WARNING block opened for missing executables.
         let pf = StartupPreflight {
+            soul: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(false, |e| e.name != "tmux"),
             },
@@ -226,6 +259,61 @@ mod tests {
         let out = warning_output(&pf);
         assert!(out.contains("missing executable tmux"), "{out}");
         assert!(!out.contains("note:"), "{out}");
+    }
+
+    #[test]
+    fn truncated_soul_warns_first_and_names_the_version() {
+        let pf = StartupPreflight {
+            soul: Some(SoulTruncation {
+                version: "20260722T0215-3f2a.md".into(),
+                bytes: 132_000,
+                limit: 64 * 1024,
+            }),
+            executables: ExecutableCheckReport {
+                missing: missing_executables(false, |e| e.name != "tmux"),
+            },
+            ssh: SshAgentPreflightReport::default(),
+        };
+        assert!(pf.has_problems());
+        let out = warning_output(&pf);
+        assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
+        assert!(
+            out.contains(
+                "soul/20260722T0215-3f2a.md: soul truncated at 64 KiB of 128.9 KiB \
+                 (max_soul_bytes)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("only the first 64 KiB"), "{out}");
+        assert!(
+            out.contains("raise `max_soul_bytes` in config.toml"),
+            "{out}"
+        );
+        // The soul leads the block; the other checks follow it.
+        let soul_at = out.find("soul/20260722T0215").unwrap();
+        let exec_at = out.find("missing executable tmux").unwrap();
+        assert!(soul_at < exec_at, "{out}");
+    }
+
+    #[test]
+    fn a_truncated_soul_alone_is_enough_to_open_the_block() {
+        // Nothing else wrong: the soul still gets its own headed WARNING.
+        let pf = StartupPreflight {
+            soul: Some(SoulTruncation {
+                version: "20260722T0215-3f2a.md".into(),
+                bytes: 4096,
+                limit: 2048,
+            }),
+            executables: ExecutableCheckReport {
+                missing: missing_executables(true, |_| true),
+            },
+            ssh: SshAgentPreflightReport::default(),
+        };
+        assert!(pf.has_problems());
+        let out = warning_output(&pf);
+        assert!(out.contains("WARNING\n"), "{out}");
+        assert!(out.contains("soul truncated at 2 KiB of 4 KiB"), "{out}");
+        assert!(!out.contains("missing executable"), "{out}");
     }
 
     #[test]
