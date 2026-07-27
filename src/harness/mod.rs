@@ -580,6 +580,23 @@ mod tests {
         );
     }
 
+    /// Images are readable on remotes too, which only holds if `view_image`
+    /// is a standard host tool carrying the routing `host` field.
+    #[test]
+    fn view_image_is_standard_host_tool_with_routing_host() {
+        let harness = Harness::local_with_services(Vec::new());
+        let view_image = harness
+            .tool_specs()
+            .into_iter()
+            .find(|s| s.name == "view_image")
+            .expect("view_image in standard catalog");
+        assert!(
+            view_image.input_schema["properties"]["host"].is_object(),
+            "view_image should get injected routing host: {:?}",
+            view_image.input_schema
+        );
+    }
+
     // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
     // test, and #[tokio::test] runs on a current-thread runtime.
     #[allow(clippy::await_holding_lock)]

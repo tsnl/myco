@@ -16,6 +16,9 @@ pub use bash_service::BashService;
 pub mod text_editor_service;
 pub use text_editor_service::TextEditorService;
 
+pub mod view_image_service;
+pub use view_image_service::ViewImageService;
+
 pub mod manual_service;
 pub use manual_service::ManualService;
 

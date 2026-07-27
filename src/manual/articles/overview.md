@@ -15,7 +15,7 @@ myco (interactive) / Agent
   └── Harness (routing, config, root-configured services)
         ├── HostController "local"   → in-process HostWorker (always on)
         └── HostController "…"       → ssh … myco --mode host (lazy remote)
-              └── bash, str_replace_based_edit_tool, manual, text search (per host)
+              └── bash, str_replace_based_edit_tool, view_image, manual, text search (per host)
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
@@ -143,16 +143,16 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Host routing
 
-- Host tools (`bash`, `str_replace_based_edit_tool`, `manual`, text search, …) accept optional input field **`host`**.
+- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`, `manual`, text search, …) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
 - Bash `session_id`s are **per host** (and per agent id). Do not assume a session on `local`
   exists on `devbox`.
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
   idle, or DOWN after a failed remote connect.
-- **Viewing images**: `str_replace_based_edit_tool` `view` on a png/jpg/jpeg/gif/webp
-  file (≤5 MiB) returns the image itself — the agent can look at screenshots and
-  figures on any host, same extensions and cap as user `@path` attachments.
+- **`view_image`** (per host): returns a png/jpg/jpeg/gif/webp file (≤5 MiB) as an image
+  the model can actually look at — screenshots, diagrams, rendered output. Same
+  extensions and cap as user `@path` attachments. Text files stay with the editor.
 - **Text search** (per host): persistent watched roots via `index_directory` /
   `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
   file bodies **and** path/filename tokens) /

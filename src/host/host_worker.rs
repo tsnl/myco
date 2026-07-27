@@ -15,7 +15,7 @@ use crate::generative_model::{self, ToolUse};
 use crate::host::protocol::{Request, Response};
 use crate::tool_services::{
     BashService, BrowserService, HostDispatchContext, ManualService, TextEditorService,
-    TextSearchToolService, ToolService,
+    TextSearchToolService, ToolService, ViewImageService,
 };
 
 /// Worker process: tool registry + NDJSON serve loop.
@@ -69,6 +69,7 @@ impl HostWorker {
         [
             BashService::specs(),
             TextEditorService::specs(),
+            ViewImageService::specs(),
             ManualService::specs(),
             BrowserService::specs(),
             TextSearchToolService::specs(),
@@ -82,6 +83,7 @@ impl HostWorker {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
+            Arc::new(ViewImageService::new()) as Arc<dyn ToolService>,
             Arc::new(ManualService::new()) as Arc<dyn ToolService>,
             Arc::new(BrowserService::new()) as Arc<dyn ToolService>,
             Arc::new(search) as Arc<dyn ToolService>,
