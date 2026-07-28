@@ -30,7 +30,7 @@ Article ids: `overview`, `cli`, `harness-ops`.
 Quick map (details in `manual`):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
-  (`attach_timeout_secs`).
+  (`attach_timeout_secs`, `max_soul_bytes`).
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - **To act on a remote machine, set `host` on the tool call — do not run `ssh <alias> …` from
@@ -120,21 +120,83 @@ pub fn model_stamp(model_key: &str) -> String {
     )
 }
 
+/// Cap used when `config.toml` sets no `max_soul_bytes`.
+///
 /// Backstop so one runaway soul revision cannot bloat every future prompt
 /// (the fragment asks for about a screenful; same cap as the session
-/// scratchpad). The truncation marker tells the agent to write a shorter one.
-const MAX_SOUL_BYTES: usize = 64 * 1024;
+/// scratchpad). The truncation marker tells the agent to write a shorter one,
+/// and startup warns the user ([`soul_truncation`]).
+pub const DEFAULT_MAX_SOUL_BYTES: usize = 64 * 1024;
+
+/// Same backstop for injected project guidance (`AGENTS.md` / `CLAUDE.md`).
+/// Not user-configurable: `max_soul_bytes` is named for the soul and sizing
+/// the two together would surprise anyone who lowers it to shorten the soul.
+const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
+
+/// A soul version that did not fit under the `max_soul_bytes` cap. Losing the
+/// tail of the soul is silent from inside the prompt, so this is surfaced two
+/// ways: a marker in the prompt itself and a startup WARNING for the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoulTruncation {
+    /// Filename of the truncated version, under `workspace/soul/`.
+    pub version: String,
+    /// Size of the trimmed version on disk.
+    pub bytes: usize,
+    /// The `max_soul_bytes` cap it was cut to.
+    pub limit: usize,
+}
+
+impl SoulTruncation {
+    /// One line naming the cut, shared by the in-prompt marker and the
+    /// startup warning so both report the same numbers.
+    pub fn describe(&self) -> String {
+        format!(
+            "soul truncated at {} of {} (max_soul_bytes)",
+            self.human_limit(),
+            human_bytes(self.bytes)
+        )
+    }
+
+    /// The cap as a size for humans, e.g. `64 KiB`.
+    pub fn human_limit(&self) -> String {
+        human_bytes(self.limit)
+    }
+}
+
+/// Byte counts for humans: `64 KiB`, `128.9 KiB`, `512 B`.
+fn human_bytes(n: usize) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let kib = n as f64 / 1024.0;
+    if (kib.round() - kib).abs() < 0.05 {
+        format!("{} KiB", kib.round() as usize)
+    } else {
+        format!("{kib:.1} KiB")
+    }
+}
 
 /// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
-/// `MYCO_HOME`) and the launch directory's project guidance (`AGENTS.md` /
-/// `CLAUDE.md`), when present. Read at model build time — session start,
-/// model switch, each worker spawn — so a running agent's prompt never
-/// changes mid-conversation and the cached conversation prefix stays valid.
-pub fn agent_prompt_epilogue() -> String {
+/// `MYCO_HOME`, capped at `max_soul_bytes`) and the launch directory's project
+/// guidance (`AGENTS.md` / `CLAUDE.md`), when present. Read at model build
+/// time — session start, model switch, each worker spawn — so a running
+/// agent's prompt never changes mid-conversation and the cached conversation
+/// prefix stays valid.
+pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
     epilogue_with(
         crate::session::myco_home().ok(),
         std::env::current_dir().ok(),
+        max_soul_bytes,
     )
+}
+
+/// Whether the soul the next agent prompt will carry is cut short by the
+/// `max_soul_bytes` cap. Startup calls this to warn before the first turn;
+/// `None` means the soul fits (or there is none).
+pub fn soul_truncation(max_soul_bytes: usize) -> Option<SoulTruncation> {
+    let home = crate::session::myco_home().ok()?;
+    let dir = home.join("workspace").join("soul");
+    capped_soul(&dir, max_soul_bytes)?.2
 }
 
 /// The current soul snapshot: filename and trimmed contents of the
@@ -172,10 +234,29 @@ fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
     None
 }
 
+/// The current soul as it goes into a prompt: version name, text cut to
+/// `max_bytes` (on a char boundary, with a marker naming the cut), and the
+/// truncation record when the on-disk version did not fit.
+fn capped_soul(
+    dir: &std::path::Path,
+    max_bytes: usize,
+) -> Option<(String, String, Option<SoulTruncation>)> {
+    let (version, mut text) = latest_soul(dir)?;
+    let cut = SoulTruncation {
+        version: version.clone(),
+        bytes: text.len(),
+        limit: max_bytes,
+    };
+    let marker = format!("\n\n[{} — write a shorter revision]", cut.describe());
+    let truncated = cap_bytes(&mut text, max_bytes, &marker);
+    Some((version, text, truncated.then_some(cut)))
+}
+
 /// Truncate to `max` bytes on a char boundary, appending `marker` when cut.
-fn cap_bytes(text: &mut String, max: usize, marker: &str) {
+/// Returns whether anything was cut, so callers can report it.
+fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
     if text.len() <= max {
-        return;
+        return false;
     }
     let mut end = max;
     while !text.is_char_boundary(end) {
@@ -183,19 +264,20 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) {
     }
     text.truncate(end);
     text.push_str(marker);
+    true
 }
 
 /// [`agent_prompt_epilogue`] against explicit dirs, so tests need no
 /// process-global `MYCO_HOME` / cwd override.
-fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
+fn epilogue_with(
+    home: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    max_soul_bytes: usize,
+) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
-    let soul = home.and_then(|home| latest_soul(&home.join("workspace").join("soul")));
-    if let Some((name, mut soul)) = soul {
-        cap_bytes(
-            &mut soul,
-            MAX_SOUL_BYTES,
-            "\n\n[soul truncated at 64 KiB — write a shorter revision]",
-        );
+    let soul =
+        home.and_then(|home| capped_soul(&home.join("workspace").join("soul"), max_soul_bytes));
+    if let Some((name, soul, _)) = soul {
         prompt.push_str(&format!(
             "\n---\n\n# Soul\n\n(current version: soul/{name})\n\n{soul}\n"
         ));
@@ -203,7 +285,7 @@ fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBu
     if let Some((name, mut guidance)) = cwd.as_deref().and_then(project_guidance) {
         cap_bytes(
             &mut guidance,
-            MAX_SOUL_BYTES,
+            MAX_GUIDANCE_BYTES,
             "\n\n[project guidance truncated at 64 KiB]",
         );
         prompt.push_str(&format!(
@@ -252,7 +334,7 @@ mod tests {
     fn project_guidance_is_appended_from_cwd() {
         let dir = std::env::temp_dir().join(format!("myco-guidance-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let epilogue = || epilogue_with(None, Some(dir.clone()));
+        let epilogue = || epilogue_with(None, Some(dir.clone()), DEFAULT_MAX_SOUL_BYTES);
 
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
@@ -294,7 +376,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
         let soul_dir = dir.join("workspace").join("soul");
         std::fs::create_dir_all(&soul_dir).unwrap();
-        let epilogue = || epilogue_with(Some(dir.clone()), None);
+        let epilogue = || epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
 
         // No versions: the epilogue alone.
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
@@ -334,13 +416,68 @@ mod tests {
         // the prompt bounded no matter what got written.
         std::fs::write(
             soul_dir.join("20290101T0000-dddd.md"),
-            "x".repeat(MAX_SOUL_BYTES * 2),
+            "x".repeat(DEFAULT_MAX_SOUL_BYTES * 2),
         )
         .unwrap();
         let prompt = epilogue();
         assert!(prompt.contains("[soul truncated at 64 KiB"), "{prompt}");
-        assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_SOUL_BYTES + 200);
+        assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + DEFAULT_MAX_SOUL_BYTES + 200);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cap_is_configurable_and_reports_what_it_cut() {
+        let dir = std::env::temp_dir().join(format!("myco-soul-cap-{}", uuid::Uuid::new_v4()));
+        let soul_dir = dir.join("workspace").join("soul");
+        std::fs::create_dir_all(&soul_dir).unwrap();
+        // Multi-byte tail: the cut lands on a char boundary, never mid-char.
+        let body = "é".repeat(1000);
+        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), &body).unwrap();
+
+        // A cap above the version's size leaves it verbatim and unreported.
+        let (_, text, cut) = capped_soul(&soul_dir, DEFAULT_MAX_SOUL_BYTES).unwrap();
+        assert_eq!(text, body);
+        assert_eq!(cut, None);
+
+        // A tighter cap from config.toml applies instead of the default.
+        let (_, text, cut) = capped_soul(&soul_dir, 501).unwrap();
+        let cut = cut.expect("501 < 2000 bytes should truncate");
+        assert_eq!(cut.version, "20260101T0000-aaaa.md");
+        assert_eq!((cut.bytes, cut.limit), (2000, 501));
+        // 501 is mid-`é`, so the text is cut back to 500 plus the marker.
+        assert!(text.starts_with(&"é".repeat(250)), "{text}");
+        assert!(text.contains("[soul truncated at 501 B of 2 KiB"), "{text}");
+        assert!(text.contains("write a shorter revision"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lowering_the_soul_cap_leaves_project_guidance_alone() {
+        // `max_soul_bytes` is named for the soul; shrinking it to shorten a
+        // soul must not silently start cutting AGENTS.md too.
+        let dir = std::env::temp_dir().join(format!("myco-both-{}", uuid::Uuid::new_v4()));
+        let soul_dir = dir.join("workspace").join("soul");
+        std::fs::create_dir_all(&soul_dir).unwrap();
+        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "s".repeat(4000)).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "g".repeat(4000)).unwrap();
+
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()), 1024);
+        assert!(
+            prompt.contains("[soul truncated at 1 KiB of 3.9 KiB"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("[project guidance truncated"), "{prompt}");
+        assert!(prompt.contains(&"g".repeat(4000)), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_counts_read_as_sizes() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(64 * 1024), "64 KiB");
+        assert_eq!(human_bytes(132_000), "128.9 KiB");
     }
 }

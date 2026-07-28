@@ -8,8 +8,8 @@
 //! reads them natively — myco only adds `BatchMode=yes`.
 //!
 //! `~/.myco/config.toml` holds the model catalog (`[gateways]` / `[models]`,
-//! default `model`) and the myco knobs (`attach_timeout_secs`). The
-//! **local** host is always available in-process
+//! default `model`) and the myco knobs (`attach_timeout_secs`,
+//! `max_soul_bytes`). The **local** host is always available in-process
 //! and is never configured. Path defaulting, loading, and catalog resolution
 //! happen in [`crate::config::Config`].
 
@@ -43,6 +43,11 @@ pub struct FileConfig {
     /// `0` disables the timeout. (Config key kept as `attach_timeout_secs`.)
     #[serde(default = "default_attach_timeout_secs")]
     pub attach_timeout_secs: u64,
+    /// Cap on the soul text appended to every agent system prompt
+    /// (`workspace/soul/`, newest version). A longer version is cut to this
+    /// many bytes with a marker, and startup warns loudly that it happened.
+    #[serde(default = "default_max_soul_bytes")]
+    pub max_soul_bytes: usize,
 }
 
 impl Default for FileConfig {
@@ -52,6 +57,7 @@ impl Default for FileConfig {
             gateways: BTreeMap::new(),
             models: BTreeMap::new(),
             attach_timeout_secs: default_attach_timeout_secs(),
+            max_soul_bytes: default_max_soul_bytes(),
         }
     }
 }
@@ -185,6 +191,10 @@ impl TryFrom<toml::Value> for AuthEntry {
 
 fn default_attach_timeout_secs() -> u64 {
     10
+}
+
+fn default_max_soul_bytes() -> usize {
+    crate::prompts::DEFAULT_MAX_SOUL_BYTES
 }
 
 impl FileConfig {
@@ -331,6 +341,11 @@ model = "grok-4.5-build"
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 # Remotes connect lazily; startup does not wait for them.
 attach_timeout_secs = 10
+
+# Cap on the soul (~/.myco/workspace/soul/, newest version) appended to every
+# agent system prompt. A longer version is cut to this many bytes and startup
+# prints a WARNING naming the version. Default 65536 (64 KiB).
+max_soul_bytes = 65_536
 
 [gateways.anthropic]
 protocol = "anthropic-messages"

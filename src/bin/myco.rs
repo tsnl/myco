@@ -257,7 +257,8 @@ async fn run_print(args: Args) {
     let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
     let model_key = catalog_model.spec.key.clone();
 
-    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
+    let preflight =
+        StartupPreflight::run(&app_config.harness.remote_hosts, app_config.max_soul_bytes);
     let mut warn = Vec::new();
     let _ = preflight.write_warning_section(&mut warn, Palette::plain());
     if !warn.is_empty() {
@@ -282,6 +283,7 @@ async fn run_print(args: Args) {
         &harness,
         args.debug_dump_api_requests,
         args.effort,
+        app_config.max_soul_bytes,
     );
     let sink = Arc::new(PrintEventSink::default());
     let mut agent = Agent::new(model, harness, sink.clone());
@@ -499,9 +501,11 @@ async fn run_interactive(args: Args) {
     // OpenSSH tools when remotes are configured), then unlock SSH identities
     // via the existing ssh-agent before attach — remote hosts use
     // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never
-    // need to prompt on the host pipe.
+    // need to prompt on the host pipe. Also checks whether the soul the agent
+    // is about to run with fits under `max_soul_bytes`.
     // Problems are printed after the banner (WARNING block), not here.
-    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
+    let preflight =
+        StartupPreflight::run(&app_config.harness.remote_hosts, app_config.max_soul_bytes);
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let resuming = args.resume.is_some();
@@ -530,7 +534,14 @@ async fn run_interactive(args: Args) {
     // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
     let mut effort = args.effort;
     let debug_dump_api_requests = args.debug_dump_api_requests;
-    let model = build_model(&catalog_model, &harness, debug_dump_api_requests, effort);
+    let max_soul_bytes = app_config.max_soul_bytes;
+    let model = build_model(
+        &catalog_model,
+        &harness,
+        debug_dump_api_requests,
+        effort,
+        max_soul_bytes,
+    );
     let sink = Arc::new(CliEventSink::new(palette, console.clone()));
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
@@ -580,6 +591,7 @@ async fn run_interactive(args: Args) {
         palette,
         app_config.wrap_max,
         app_config.repaint_enabled,
+        max_soul_bytes,
         sink,
         console,
     )
@@ -602,6 +614,7 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
+    max_soul_bytes: usize,
 ) -> Arc<dyn generative_model::GenerativeModel> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
@@ -625,7 +638,7 @@ fn build_model(
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
-            prompts::agent_prompt_epilogue(),
+            prompts::agent_prompt_epilogue(max_soul_bytes),
             prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
@@ -738,6 +751,7 @@ async fn run_repl(
     mut palette: Palette,
     wrap_max: Option<usize>,
     repaint: bool,
+    max_soul_bytes: usize,
     sink: Arc<CliEventSink>,
     console: Arc<ConsoleLog>,
 ) {
@@ -825,6 +839,7 @@ async fn run_repl(
                     harness.clone(),
                     catalog_model,
                     palette,
+                    max_soul_bytes,
                     &console,
                 )
                 .await;
@@ -840,6 +855,7 @@ async fn run_repl(
                 effort,
                 debug_dump_api_requests,
                 palette,
+                max_soul_bytes,
             );
             continue;
         }
@@ -993,6 +1009,7 @@ async fn run_user_turn(
 // Compaction
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact(
     agent: &mut Agent,
     session: &ActiveSession,
@@ -1000,6 +1017,7 @@ async fn run_compact(
     harness: Arc<Harness>,
     catalog_model: &CatalogModel,
     palette: Palette,
+    max_soul_bytes: usize,
     console: &ConsoleLog,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
@@ -1042,7 +1060,7 @@ async fn run_compact(
             "You are a myco compaction worker. Follow the user instruction exactly. \
              Prefer session_history over bash for reading sessions."
                 .to_string(),
-            prompts::agent_prompt_epilogue(),
+            prompts::agent_prompt_epilogue(max_soul_bytes),
             prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n\n"),
@@ -1208,6 +1226,7 @@ fn handle_meta(
     effort: &mut Effort,
     debug_dump_api_requests: bool,
     palette: Palette,
+    max_soul_bytes: usize,
 ) {
     match cmd {
         MetaCommand::Help => print_help(),
@@ -1266,8 +1285,13 @@ fn handle_meta(
                 Ok(next) if next == *effort => println!("effort={effort}  (unchanged)"),
                 Ok(next) => {
                     *effort = next;
-                    let model =
-                        build_model(catalog_model, harness, debug_dump_api_requests, *effort);
+                    let model = build_model(
+                        catalog_model,
+                        harness,
+                        debug_dump_api_requests,
+                        *effort,
+                        max_soul_bytes,
+                    );
                     agent.set_model(model);
                     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
                     println!("effort={effort}");
@@ -1399,7 +1423,7 @@ Hosts:
   ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
   `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
   $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
-  and knobs (attach_timeout_secs). Auth per entry: a literal
+  and knobs (attach_timeout_secs, max_soul_bytes). Auth per entry: a literal
   token string or a source table (env var / file / none); see --help overview.
   Host tools accept optional input field `host` (default: local).
   Sessions (bash) are per-host. Use /hosts to list hosts and attach status
@@ -1407,6 +1431,11 @@ Hosts:
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
   passphrases on the NDJSON pipe). It is silent when clean; problems open a
   WARNING block. Missing keys: ssh-add, then restart.
+
+The newest ~/.myco/workspace/soul/ version is appended to every agent system
+prompt. One longer than max_soul_bytes (config.toml; default 65536) is cut to
+that size, and startup says so loudly in the same WARNING block — naming the
+version and both sizes. Raise the knob or write a shorter revision.
 
 Sessions are conversation memory only; shell/file state is not restored.
 Empty sessions (no messages) are not written to disk.

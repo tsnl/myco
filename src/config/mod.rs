@@ -5,9 +5,10 @@
 //! config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), and
 //! produces fully resolved settings — the **model catalog**, the host pool
 //! (remote hosts from `~/.ssh/config` `Host` aliases), the default model key
-//! (`--model` → config file `model` → sole catalog entry), and the color
-//! decision for stdout rendering. Downstream code reads the resolved fields;
-//! nothing else reads these environment variables or files.
+//! (`--model` → config file `model` → sole catalog entry), the soul size cap
+//! (`max_soul_bytes`), and the color decision for stdout rendering. Downstream
+//! code reads the resolved fields; nothing else reads these environment
+//! variables or files.
 //!
 //! ## Model catalog
 //!
@@ -234,6 +235,11 @@ pub struct Config {
     /// Always present in the catalog; credential presence is still checked at
     /// use time via [`ModelCatalog::get`].
     pub model: String,
+    /// Cap on the soul appended to every agent system prompt (config file
+    /// `max_soul_bytes`, default [`crate::prompts::DEFAULT_MAX_SOUL_BYTES`]).
+    /// Passed to [`crate::prompts::agent_prompt_epilogue`] at every model
+    /// build, and checked at startup so a cut soul is warned about.
+    pub max_soul_bytes: usize,
 }
 
 impl Config {
@@ -278,6 +284,7 @@ impl Config {
         let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
 
+        let max_soul_bytes = file.max_soul_bytes;
         let harness = file.into_harness_config(ssh_aliases()?);
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
@@ -292,6 +299,7 @@ impl Config {
             harness,
             models,
             model,
+            max_soul_bytes,
         })
     }
 }
@@ -967,6 +975,32 @@ context_window = 1000
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
         assert_eq!(cfg.harness.remote_hosts.len(), 1);
         assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
+    }
+
+    #[test]
+    fn max_soul_bytes_comes_from_the_config_file() {
+        let resolve = |extra_toml: &str| {
+            let toml = format!(
+                "{extra_toml}\n[models.m]\nprotocol = \"openai-responses\"\n\
+                 base_url = \"https://h\"\ncontext_window = 1000\n"
+            );
+            Config::resolve_with(
+                ConfigUserSettings::default(),
+                env_of(&[]),
+                false,
+                move |_| parse_file_config_str(&toml),
+                || Ok(Vec::new()),
+                |_| Err("no files".into()),
+            )
+            .unwrap()
+            .max_soul_bytes
+        };
+        // Unset → the prompts default, so an untouched config.toml keeps the
+        // 64 KiB backstop.
+        assert_eq!(resolve(""), crate::prompts::DEFAULT_MAX_SOUL_BYTES);
+        assert_eq!(resolve("max_soul_bytes = 4096"), 4096);
+        // TOML underscore separators are the shape the example config uses.
+        assert_eq!(resolve("max_soul_bytes = 131_072"), 131_072);
     }
 
     #[test]

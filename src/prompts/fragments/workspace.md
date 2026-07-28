@@ -18,7 +18,11 @@ anything longer belongs in workspace files it points to — write it to a
 `.`-prefixed temp name inside `soul/`, then `mv` it to a name that sorts after
 the live one (UTC-timestamp-prefixed works: `20260722T0215-3f2a.md`). Never
 modify or truncate an existing version; delete superseded versions only after
-your revision is in place. Concurrent revisions cannot clobber each other:
+your revision is in place. A version over the `max_soul_bytes` cap (config.toml;
+64 KiB by default) reaches the prompt cut short, marked in place where it was
+cut, and the user is warned at startup — if you see that marker above, your soul
+is incomplete: write a shorter revision that points at workspace files for the
+detail. Concurrent revisions cannot clobber each other:
 both files land, the later name wins the prompt, and the next revision merges
 anything the earlier one added.
 
