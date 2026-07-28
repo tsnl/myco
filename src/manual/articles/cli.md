@@ -117,6 +117,12 @@ summary inside a unified ASSISTANT section; it is stored in session history for 
 but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
 ERROR section (live only; not stored in session history).
 
+`/compact` starts over rather than appending: it clears the screen (scrollback included) and
+prints a **COMPACTED** banner — the same `█` rule + bold title as the startup banner — listing
+the successor session, the predecessor it came from, how many tail messages were kept, and the
+summary path. Nothing is lost: both sessions are on disk, the console mirror keeps the whole
+run, and Ctrl-L reprints the successor's summary + kept tail.
+
 Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,
 compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`
 (no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
@@ -130,8 +136,9 @@ shows its command, uptime, and idle time; remote hosts are not queried for this.
 
 When stdout is a TTY, the interactive CLI mirrors everything it prints — the
 startup banner, preflight WARNING, USER headers + submitted input, the streamed
-ASSISTANT section, and live ERROR / `(cancelled)` notices — to a plain-text,
-ANSI-free file beside the session JSON: `~/.myco/session/<shard>/<id>.console`
+ASSISTANT section, the `/compact` progress line + COMPACTED banner, and live
+ERROR / `(cancelled)` notices — to a plain-text, ANSI-free file beside the
+session JSON: `~/.myco/session/<shard>/<id>.console`
 (shown as `console:` in `/session` and `session_meta` get). It is append-only
 and accumulates across runs of the same session.
 
