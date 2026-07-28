@@ -81,7 +81,8 @@ attachments. No console mirror is written in print mode.
 - Models come from the `[gateways]` / `[models]` catalog in
   `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
   catalog key; default is config.toml `model`, or the sole configured entry.
-- A gateway holds `protocol` (`anthropic-messages` | `openai-responses`),
+- A gateway holds `protocol` (`anthropic-messages` | `openai-responses` |
+  `openai-completions`),
   `base_url`, and `auth` — the token itself as a string, or a source table:
   `{ source = "env", var_name = "…" }` / `{ source = "file", path = "…" }` /
   `{ source = "none" }` (omit for no auth). A model names its gateway plus

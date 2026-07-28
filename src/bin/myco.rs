@@ -626,7 +626,7 @@ fn build_model(
             // Always enable thinking; effort controls how hard the model thinks.
             c.effort = Some(effort);
         }
-        BackendConfig::OpenAIResponses(c) => {
+        BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
             if debug_dump_api_requests {
                 c.debug_dump_api_requests = true;
             }
