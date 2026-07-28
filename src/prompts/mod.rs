@@ -33,6 +33,11 @@ Quick map (details in `manual`):
   (`attach_timeout_secs`).
 - Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
+- **To act on a remote machine, set `host` on the tool call — do not run `ssh <alias> …` from
+  local `bash`.** A host worker keeps one persistent SSH connection, so each call skips connection
+  setup, and you get real bash sessions, the editor, and search on that machine. Shell out to
+  `ssh`/`scp` only for what a host worker cannot do itself: diagnosing a DOWN host, installing
+  `myco` there, or moving files between machines.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
 - Text search: host **persistently indexes** (watched) `.claude/skills`, `SKILL.md` folders, and
   `AGENTS.md`/`CLAUDE.md`. Use `indexed_exact_text_search` / `indexed_semantic_text_search` for
@@ -192,6 +197,9 @@ mod tests {
         // submitted only by a trailing newline.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("self-contained turn"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains(r#"ending each `write` with `"\n"`"#));
+        // Remote work goes through the `host` field, not local `ssh`.
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("do not run `ssh <alias> …` from"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("persistent SSH connection"));
         // runtime catalog pointer, not full policy-as-articles
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
