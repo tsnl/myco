@@ -216,20 +216,36 @@ pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> st
     Ok(())
 }
 
-/// Write the COMPACTED banner: full-block rule, `COMPACTED` title, then the
-/// successor/predecessor pair, tail size, and summary path.
+/// Write a banner open: full-block rule, bold title, blank line, then body.
 ///
-/// Banner family (`█` rule, bold uncolored) rather than a USER/ASSISTANT
-/// section, because a compaction *is* a fresh start — the same shape the
-/// startup banner uses, printed onto the cleared screen it hands over to.
+/// The banner counterpart of the section openers above, shared by the startup
+/// (`MYCO`) and compaction (`COMPACTED`) banners. Two deliberate differences
+/// from a section: bold-uncolored rather than the USER/ASSISTANT palette, and
+/// **no leading blank line** — a banner begins a screen instead of separating
+/// itself from the block before it.
+pub fn write_banner_open(
+    out: &mut (impl Write + ?Sized),
+    title: &str,
+    palette: Palette,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
+    writeln!(out, "{}", palette.banner(title))?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Write the full COMPACTED banner: banner open, then the successor/predecessor
+/// pair, tail size, and summary path (the [`write_error_section`] shape).
+///
+/// Banner family rather than a USER/ASSISTANT section because a compaction *is*
+/// a fresh start — the same open the startup banner uses, printed onto the
+/// cleared screen it hands over to.
 pub fn write_compacted_banner(
     out: &mut impl Write,
     outcome: &super::CompactOutcome,
     palette: Palette,
 ) -> std::io::Result<()> {
-    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.banner("COMPACTED"))?;
-    writeln!(out)?;
+    write_banner_open(out, "COMPACTED", palette)?;
     writeln!(out, "Session: {}", outcome.successor_id)?;
     writeln!(out, "From: {}", outcome.predecessor_id)?;
     writeln!(
@@ -520,6 +536,21 @@ mod tests {
             summary_path: std::path::PathBuf::from("/home/u/.myco/sessions/993d1488.summary.md"),
             tail_messages,
         }
+    }
+
+    #[test]
+    fn write_banner_open_layout() {
+        let mut buf = Vec::new();
+        write_banner_open(&mut buf, "MYCO", Palette::plain()).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        // No leading blank line — unlike the section openers, a banner starts a screen.
+        assert_eq!(rendered, format!("{BANNER_RULE}\nMYCO\n\n"));
+
+        let mut buf = Vec::new();
+        write_banner_open(&mut buf, "COMPACTED", Palette::colored(true)).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("\x1b[0;1mCOMPACTED\x1b[0m\n"));
+        assert!(rendered.contains(&format!("\x1b[0;1m{BANNER_RULE}\x1b[0m\n")));
     }
 
     #[test]

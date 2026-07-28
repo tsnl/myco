@@ -15,11 +15,11 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactOptions, ConsoleLog, MarkdownRenderer, Palette, RECENT_SESSION_LIMIT,
-    Session, SessionListEntry, attachment_note, banner_rule, compact_session,
-    compact_subagent_prompt, expand_image_attachments, format_session_detail,
-    format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
-    print_session_history, render_block, resolve_and_load_session, section_rule, usage_line,
-    user_header_line, user_rule, write_compacted_banner, write_error_section,
+    Session, SessionListEntry, attachment_note, compact_session, compact_subagent_prompt,
+    expand_image_attachments, format_session_detail, format_session_list_line,
+    format_tool_invocation, link_compact_pair, list_sessions, print_session_history, render_block,
+    resolve_and_load_session, section_rule, usage_line, user_header_line, user_rule,
+    write_banner_open, write_compacted_banner, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
@@ -719,9 +719,7 @@ fn write_startup_banner(
     session_label: &str,
     palette: Palette,
 ) -> std::io::Result<()> {
-    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
-    writeln!(out, "{}", palette.banner("MYCO"))?;
-    writeln!(out)?;
+    write_banner_open(out, "MYCO", palette)?;
     writeln!(out, "Model: {model_key}")?;
     writeln!(out, "Session: {session_label}")?;
     writeln!(out)?;
@@ -2040,6 +2038,7 @@ impl EventSink for PrintEventSink {
 mod tests {
     use super::*;
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
+    use myco::session::banner_rule;
     use serde_json::json;
     use std::time::Duration;
 
