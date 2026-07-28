@@ -5,6 +5,9 @@
 //! invocations are paragraphs inside ASSISTANT. ERROR is used for live
 //! generate failures, WARNING for startup preflight problems; both are
 //! live-only (not stored in session history).
+//!
+//! COMPACTED is a banner, not a section: `/compact` clears the screen and
+//! opens the successor with it, the way the startup banner opens a run.
 
 use std::io::Write;
 
@@ -210,6 +213,36 @@ pub fn write_error_open(out: &mut (impl Write + ?Sized), palette: Palette) -> st
     writeln!(out, "{}", palette.error(&section_rule(palette.wrap)))?;
     writeln!(out, "{}", palette.error("ERROR"))?;
     writeln!(out)?;
+    Ok(())
+}
+
+/// Write the COMPACTED banner: full-block rule, `COMPACTED` title, then the
+/// successor/predecessor pair, tail size, and summary path.
+///
+/// Banner family (`█` rule, bold uncolored) rather than a USER/ASSISTANT
+/// section, because a compaction *is* a fresh start — the same shape the
+/// startup banner uses, printed onto the cleared screen it hands over to.
+pub fn write_compacted_banner(
+    out: &mut impl Write,
+    outcome: &super::CompactOutcome,
+    palette: Palette,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", palette.banner(&banner_rule(palette.wrap)))?;
+    writeln!(out, "{}", palette.banner("COMPACTED"))?;
+    writeln!(out)?;
+    writeln!(out, "Session: {}", outcome.successor_id)?;
+    writeln!(out, "From: {}", outcome.predecessor_id)?;
+    writeln!(
+        out,
+        "Kept: {} {}",
+        outcome.tail_messages,
+        if outcome.tail_messages == 1 {
+            "message"
+        } else {
+            "messages"
+        }
+    )?;
+    writeln!(out, "Summary: {}", outcome.summary_path.display())?;
     Ok(())
 }
 
@@ -478,6 +511,54 @@ mod tests {
             cached_output_tokens: 0,
         };
         assert_eq!(usage_line(uncached), "⚙ last turn: input 500 · output 42");
+    }
+
+    fn sample_outcome(tail_messages: usize) -> crate::session::CompactOutcome {
+        crate::session::CompactOutcome {
+            predecessor_id: "993d14889c414aab81963843cccf8090".into(),
+            successor_id: "1c0ffee0dead0beef0000000000000aa".into(),
+            summary_path: std::path::PathBuf::from("/home/u/.myco/sessions/993d1488.summary.md"),
+            tail_messages,
+        }
+    }
+
+    #[test]
+    fn compacted_banner_layout() {
+        let mut buf = Vec::new();
+        write_compacted_banner(&mut buf, &sample_outcome(7), Palette::plain()).unwrap();
+        let expected = format!(
+            "{rule}\nCOMPACTED\n\n\
+             Session: 1c0ffee0dead0beef0000000000000aa\n\
+             From: 993d14889c414aab81963843cccf8090\n\
+             Kept: 7 messages\n\
+             Summary: /home/u/.myco/sessions/993d1488.summary.md\n",
+            rule = banner_rule(None)
+        );
+        assert_eq!(String::from_utf8(buf).unwrap(), expected);
+    }
+
+    #[test]
+    fn compacted_banner_singular_tail() {
+        let mut buf = Vec::new();
+        write_compacted_banner(&mut buf, &sample_outcome(1), Palette::plain()).unwrap();
+        assert!(
+            String::from_utf8(buf)
+                .unwrap()
+                .contains("Kept: 1 message\n"),
+            "single kept message should not be pluralized"
+        );
+    }
+
+    #[test]
+    fn compacted_banner_rule_follows_wrap_width() {
+        let mut buf = Vec::new();
+        let palette = Palette::plain().with_wrap(Some(40));
+        write_compacted_banner(&mut buf, &sample_outcome(2), palette).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.starts_with(&format!("{}\nCOMPACTED\n", "█".repeat(40))),
+            "{text}"
+        );
     }
 
     fn sample_messages() -> Vec<Message> {
@@ -798,6 +879,7 @@ mod tests {
         let mut buf = Vec::new();
         write_session_history(&mut buf, &sample_messages(), Palette::plain()).unwrap();
         write_error_section(&mut buf, "boom", Palette::plain()).unwrap();
+        write_compacted_banner(&mut buf, &sample_outcome(3), Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(!rendered.contains('\x1b'));
         assert_eq!(Palette::plain().thinking_on(), "");
@@ -823,6 +905,15 @@ mod tests {
         write_error_section(&mut buf, "boom", palette).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(rendered.contains("\x1b[0;1;31mERROR\x1b[0m\n\nboom\n"));
+
+        // COMPACTED joins the banner family: bold, uncolored rule + title,
+        // plain detail lines.
+        let mut buf = Vec::new();
+        write_compacted_banner(&mut buf, &sample_outcome(3), palette).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains(&format!("\x1b[0;1m{BANNER_RULE}\x1b[0m\n")));
+        assert!(rendered.contains("\x1b[0;1mCOMPACTED\x1b[0m\n"));
+        assert!(rendered.contains("\nKept: 3 messages\n"));
     }
 
     #[test]

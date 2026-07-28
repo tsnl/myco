@@ -19,7 +19,7 @@ use myco::session::{
     compact_subagent_prompt, expand_image_attachments, format_session_detail,
     format_session_list_line, format_tool_invocation, link_compact_pair, list_sessions,
     print_session_history, render_block, resolve_and_load_session, section_rule, usage_line,
-    user_header_line, user_rule, write_error_section,
+    user_header_line, user_rule, write_compacted_banner, write_error_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
@@ -845,6 +845,7 @@ async fn run_repl(
                     harness.clone(),
                     catalog_model,
                     palette,
+                    &console,
                 )
                 .await;
                 continue;
@@ -1019,6 +1020,7 @@ async fn run_compact(
     harness: Arc<Harness>,
     catalog_model: &CatalogModel,
     palette: Palette,
+    console: &ConsoleLog,
 ) {
     if let Err(e) = session.persist_messages(agent.history(), agent.last_usage(), true) {
         eprintln!("compact: failed to persist current session: {e}");
@@ -1030,7 +1032,12 @@ async fn run_compact(
         return;
     }
 
-    println!("compacting session={} …", predecessor.id);
+    // Progress line, not chrome: the COMPACTED banner replaces it on success,
+    // and it survives on screen (and in the mirror) when the worker fails.
+    emit_mirrored(
+        console,
+        format!("compacting session={} …\n", predecessor.id).as_bytes(),
+    );
 
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
@@ -1145,14 +1152,17 @@ async fn run_compact(
     agent.set_history(successor.messages.clone());
     agent.set_last_usage(successor.last_usage);
     reload_readline_history(editor, session);
-    clear_and_reprint(agent, palette);
-    println!(
-        "compacted → new session={}  from={}  kept_tail={} messages  summary={}",
-        outcome.successor_id,
-        outcome.predecessor_id,
-        outcome.tail_messages,
-        outcome.summary_path.display()
-    );
+
+    // Compaction starts over: wipe the screen the predecessor filled and hand
+    // the successor a COMPACTED banner instead of a replayed transcript. The
+    // conversation is not lost — it is on disk in both sessions and in the
+    // console mirror, and Ctrl-L reprints the successor's summary + tail.
+    clear_screen();
+    let mut chrome = Vec::new();
+    let _ = write_compacted_banner(&mut chrome, &outcome, palette);
+    // Blank line closes the banner before the next USER rule, matching startup.
+    chrome.push(b'\n');
+    emit_mirrored(console, &chrome);
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,12 +1583,19 @@ fn print_session_list(list: &[SessionListEntry]) {
 // Transcript helpers (layout lives in myco::session::transcript)
 // ---------------------------------------------------------------------------
 
-/// Nuke scrollback + visible screen (same as `clear`), then reprint the whole
-/// conversation history so nothing is lost. Triggered by Ctrl-L; the prompt
-/// loop reprints the USER header on its next iteration.
-fn clear_and_reprint(agent: &Agent, palette: Palette) {
+/// Nuke scrollback + visible screen (same as `clear`), leaving the cursor at
+/// the top. Callers decide what goes onto the blank screen: the whole
+/// conversation ([`clear_and_reprint`]) or a fresh banner (`/compact`).
+fn clear_screen() {
     print!("\x1B[3J\x1B[2J\x1B[1;1H");
     let _ = std::io::stdout().flush();
+}
+
+/// Clear, then reprint the whole conversation history so nothing is lost.
+/// Triggered by Ctrl-L and by resize reflow; the prompt loop reprints the USER
+/// header on its next iteration.
+fn clear_and_reprint(agent: &Agent, palette: Palette) {
+    clear_screen();
     print_session_history(agent.history(), palette);
 }
 
