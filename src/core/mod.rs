@@ -7,6 +7,8 @@ use tokio::sync::watch;
 
 pub use futures::StreamExt;
 
+pub mod image;
+
 pub type Async<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type AsyncStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 

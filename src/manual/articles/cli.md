@@ -25,12 +25,14 @@ use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
 Mentioning `@<path>` in a message attaches that file as image input (extensions
-png/jpg/jpeg/gif/webp, up to 5 MiB each; whitespace-delimited, so paths with
-spaces are unsupported; `~/` expands). The text is sent exactly as typed — the
-`@` mentions stay in it — and a `[N image(s) attached]` note prints directly
-under the wrapped input, identical live and in replay (`/resume`, Ctrl-L); the
-image bytes are never printed. A bad path opens an ERROR section before the
-model is called; nothing is silently dropped.
+png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the
+file's magic number, so a mislabeled file is caught here rather than by the
+provider; up to 5 MiB each; whitespace-delimited, so paths with spaces are
+unsupported; `~/` expands). The text is sent exactly as typed — the `@` mentions
+stay in it — and a `[N image(s) attached]` note prints directly under the
+wrapped input, identical live and in replay (`/resume`, Ctrl-L); the image bytes
+are never printed. A bad path or a file that is not really an image opens an
+ERROR section before the model is called; nothing is silently dropped.
 
 ### Session browser
 

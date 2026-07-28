@@ -1,0 +1,171 @@
+//! Image file policy shared by REPL `@path` attachments and the `view_image`
+//! tool: the per-image size cap, magic-number type detection, and
+//! file → `data:` URL reading.
+
+use std::path::Path;
+
+use base64::Engine as _;
+
+/// Per-image size limit (matches the Anthropic API's 5 MB per-image cap; a
+/// clear local error beats a confusing provider 400).
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Media types the model APIs accept. `infer` recognizes far more formats
+/// than this, so detection is filtered down to what we can actually send.
+const SUPPORTED_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Whether a path *looks* like an image by extension.
+///
+/// Only for deciding which REPL `@token`s are attachment mentions — that call
+/// happens before the file is read. The media type actually sent to the
+/// provider always comes from the bytes ([`read_image_data_url`]).
+pub fn looks_like_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+        })
+}
+
+/// Read an image file and encode it as a `data:` URL, enforcing
+/// [`MAX_IMAGE_BYTES`].
+///
+/// The media type comes from the file's magic number, not its name: a `.png`
+/// that is really a JPEG would otherwise reach the provider tagged
+/// `image/png` and be rejected by a decoder we cannot see. `label` is how the
+/// path appears in error messages (the REPL uses `@path`, `view_image` quotes
+/// it).
+pub fn read_image_data_url(path: &Path, label: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image {label} is {:.1} MiB; the limit is {} MiB",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
+    let media_type = infer::get(&bytes)
+        .map(|kind| kind.mime_type())
+        .filter(|mime| SUPPORTED_MEDIA_TYPES.contains(mime))
+        .ok_or_else(|| format!("{label} is not a png, jpeg, gif, or webp image"))?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{media_type};base64,{data}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smallest byte strings `infer`'s matchers accept, per format.
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    const GIF: &[u8] = b"GIF89a";
+    const WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBP";
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir() -> TempDir {
+        let dir = std::env::temp_dir().join(format!("myco-image-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+
+    fn write(dir: &TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.0.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn extension_filter_is_case_insensitive_and_rejects_non_images() {
+        assert!(looks_like_image_path("shot.png"));
+        assert!(looks_like_image_path("photo.JPG"));
+        assert!(looks_like_image_path("/a/b/anim.gif"));
+        assert!(looks_like_image_path("x.webp"));
+        assert!(!looks_like_image_path("notes.txt"));
+        assert!(!looks_like_image_path("alice"));
+    }
+
+    #[test]
+    fn media_type_comes_from_bytes_for_every_supported_format() {
+        let dir = temp_dir();
+        for (name, bytes, want) in [
+            ("a.png", PNG, "image/png"),
+            ("b.jpg", JPEG, "image/jpeg"),
+            ("c.gif", GIF, "image/gif"),
+            ("d.webp", WEBP, "image/webp"),
+        ] {
+            let path = write(&dir, name, bytes);
+            let url = read_image_data_url(&path, name).unwrap();
+            assert!(url.starts_with(&format!("data:{want};base64,")), "{url}");
+        }
+    }
+
+    /// The reason we sniff: the extension can lie, and a wrong `media_type`
+    /// on the wire is a provider-side decode error we cannot diagnose.
+    #[test]
+    fn mislabeled_extension_uses_the_real_media_type() {
+        let dir = temp_dir();
+        let path = write(&dir, "actually-a-jpeg.png", JPEG);
+        let url = read_image_data_url(&path, "@actually-a-jpeg.png").unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
+    }
+
+    #[test]
+    fn round_trips_the_bytes() {
+        let dir = temp_dir();
+        let path = write(&dir, "a.png", PNG);
+        let url = read_image_data_url(&path, "a.png").unwrap();
+        let b64 = url.strip_prefix("data:image/png;base64,").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded, PNG);
+    }
+
+    /// A recognized non-image (PDF) and unrecognized bytes both fail the same
+    /// way: only the four accepted media types get through.
+    #[test]
+    fn non_image_content_is_rejected() {
+        let dir = temp_dir();
+        for (name, bytes) in [
+            ("doc.png", &b"%PDF-1.7\n"[..]),
+            ("notes.png", &b"just text"[..]),
+            ("empty.png", &b""[..]),
+        ] {
+            let path = write(&dir, name, bytes);
+            let err = read_image_data_url(&path, name).unwrap_err();
+            assert!(
+                err.contains("is not a png, jpeg, gif, or webp image"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Size is checked from metadata before the read, so an oversized file is
+    /// never pulled into memory just to be rejected.
+    #[test]
+    fn oversized_image_errors_with_limit() {
+        let dir = temp_dir();
+        let path = write(&dir, "big.png", &vec![0u8; MAX_IMAGE_BYTES as usize + 1]);
+        let err = read_image_data_url(&path, "@big.png").unwrap_err();
+        assert!(err.contains("limit is 5 MiB"), "{err}");
+    }
+
+    #[test]
+    fn missing_file_errors_naming_the_label() {
+        let err =
+            read_image_data_url(Path::new("/definitely/missing.png"), "@missing.png").unwrap_err();
+        assert!(err.contains("@missing.png"), "{err}");
+    }
+}

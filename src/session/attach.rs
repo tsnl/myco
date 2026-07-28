@@ -2,26 +2,23 @@
 //!
 //! A whitespace-delimited `@<path>` token whose extension is a supported image
 //! type (png, jpg, jpeg, gif, webp) attaches that file to the user message as
-//! [`Content::Image`] (a `data:` URL the protocol drivers understand). The
+//! [`Content::Image`] (a `data:` URL the protocol drivers understand); the
+//! extension only selects the token, the media type comes from the bytes. The
 //! typed text is sent unchanged — `@` tokens stay in it, so the model can tie
 //! each mention to its attached image. Paths with whitespace are not
 //! supported; a `@token` with any other extension is ordinary text.
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
-
+pub use crate::core::image::MAX_IMAGE_BYTES;
+use crate::core::image::{looks_like_image_path, read_image_data_url};
 use crate::generative_model::Content;
-
-/// Per-image size limit (matches the Anthropic API's 5 MB per-image cap; a
-/// clear local error beats a confusing provider 400).
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Expand `@<path>` image mentions in `input` into content blocks for
 /// `Agent::interact`: attached images first (providers prefer
 /// image-before-text), then the input text exactly as typed. Repeated
-/// mentions of one path attach it once. Any unreadable or oversized image
-/// fails the whole message so the user can fix the path and resubmit —
+/// mentions of one path attach it once. Any unreadable, oversized, or
+/// non-image file fails the whole message so the user can fix it and resubmit —
 /// nothing is silently dropped.
 pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
     let mut content = Vec::new();
@@ -35,29 +32,16 @@ pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
         let Some(path) = token.strip_prefix('@') else {
             continue;
         };
-        let Some(media_type) = image_media_type(path) else {
+        if !looks_like_image_path(path) {
             continue;
-        };
+        }
         if seen.contains(&path) {
             continue;
         }
 
         let expanded = expand_home(path);
-        let meta =
-            std::fs::metadata(&expanded).map_err(|e| format!("cannot read image @{path}: {e}"))?;
-        if meta.len() > MAX_IMAGE_BYTES {
-            return Err(format!(
-                "image @{path} is {:.1} MiB; the limit is {} MiB",
-                meta.len() as f64 / (1024.0 * 1024.0),
-                MAX_IMAGE_BYTES / (1024 * 1024),
-            ));
-        }
-        let bytes =
-            std::fs::read(&expanded).map_err(|e| format!("cannot read image @{path}: {e}"))?;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        content.push(Content::Image {
-            source: format!("data:{media_type};base64,{data}"),
-        });
+        let source = read_image_data_url(&expanded, &format!("@{path}"))?;
+        content.push(Content::Image { source });
         seen.push(path);
     }
 
@@ -65,20 +49,6 @@ pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
         text: input.to_string(),
     });
     Ok(content)
-}
-
-fn image_media_type(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path)
-        .extension()?
-        .to_str()?
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -93,7 +63,12 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::fs;
+
+    /// Real magic numbers: the media type is sniffed from these bytes.
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -118,7 +93,7 @@ mod tests {
     fn attaches_image_as_data_url_and_keeps_text_as_typed() {
         let dir = temp_dir("png");
         let path = dir.join("shot.png");
-        fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        fs::write(&path, PNG).unwrap();
         let input = format!("what is wrong in @{}?", path.display());
 
         let parsed = expand_image_attachments(&input).unwrap();
@@ -129,7 +104,7 @@ mod tests {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .unwrap();
-                assert_eq!(decoded, [0x89, b'P', b'N', b'G']);
+                assert_eq!(decoded, PNG);
             }
             other => panic!("expected image first, got {other:?}"),
         }
@@ -146,7 +121,7 @@ mod tests {
     fn trailing_punctuation_is_not_part_of_the_path() {
         let dir = temp_dir("punct");
         let path = dir.join("shot.png");
-        fs::write(&path, [1, 2, 3]).unwrap();
+        fs::write(&path, PNG).unwrap();
 
         let parsed = expand_image_attachments(&format!("look at @{}.", path.display())).unwrap();
         assert_eq!(parsed.len(), 2);
@@ -155,11 +130,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The uppercase extension selects the token; the media type is sniffed.
     #[test]
-    fn uppercase_extension_maps_media_type() {
+    fn uppercase_extension_is_still_an_attachment_mention() {
         let dir = temp_dir("jpg");
         let path = dir.join("photo.JPG");
-        fs::write(&path, [1]).unwrap();
+        fs::write(&path, JPEG).unwrap();
 
         let parsed = expand_image_attachments(&format!("@{}", path.display())).unwrap();
         match &parsed[0] {
@@ -196,11 +172,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// An `@mention` that is not actually an image fails the message rather
+    /// than sending bytes the provider will reject.
+    #[test]
+    fn image_extension_over_non_image_bytes_fails_the_message() {
+        let dir = temp_dir("fake");
+        let path = dir.join("notes.png");
+        fs::write(&path, b"just text").unwrap();
+
+        let err = expand_image_attachments(&format!("@{}", path.display())).unwrap_err();
+        assert!(
+            err.contains("is not a png, jpeg, gif, or webp image"),
+            "{err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn repeated_mention_attaches_once() {
         let dir = temp_dir("dup");
         let path = dir.join("shot.png");
-        fs::write(&path, [7]).unwrap();
+        fs::write(&path, PNG).unwrap();
         let p = path.display();
 
         let parsed = expand_image_attachments(&format!("@{p} and again @{p}")).unwrap();
