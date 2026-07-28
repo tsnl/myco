@@ -6,9 +6,11 @@ use myco::generative_model::{
 };
 
 mod scripted_model;
+mod stub_http_server;
 mod transcript;
 
 pub use scripted_model::ScriptedModel;
+pub use stub_http_server::StubHttpServer;
 pub use transcript::format_transcript;
 
 static INIT: Once = Once::new();
