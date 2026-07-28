@@ -26,7 +26,7 @@ When goals conflict, rank them:
    no silent corruption on long runs.
 2. **Simplicity** — minimum code that solves the real problem.
 3. **Operability** — agents and humans can diagnose hosts, config, and failures
-   (`manual`, `/hosts`, clear errors).
+   (the on-disk manual, `/hosts`, clear errors).
 4. **Features / cleverness / premature generality** — last.
 
 A plainer design that stays reliable beats a flexible one that hangs, desyncs
@@ -39,7 +39,7 @@ hosts, or lies about resume.
 - No speculative abstraction, no config for futures that may never ship, no
   error taxonomies for impossible cases.
 - No features beyond what was asked in the task at hand.
-- Prefer one honest limitation (document it in `manual` / `TODO.md`) over a
+- Prefer one honest limitation (document it in the manual / `TODO.md`) over a
   half-working generality.
 - When in doubt: cut it, inline it, or simplify it.
 
@@ -59,8 +59,10 @@ hosts, or lies about resume.
   `local` in-process or remote worker) over “machine/node/target” in code,
   config, tool schemas, and CLI. User-facing marketing may say “machines”;
   the domain word is still `host`.
-- **Manual articles** (`src/manual/articles/`, also `myco --help <id>`) are the
-  runtime contract for agents. Keep them accurate when behavior changes.
+- **Manual articles** (`src/manual/articles/`) are the runtime contract for
+  agents: startup copies them to `~/.myco/manual/<version>/<commit>/` and the
+  system prompt sends agents there to read and `rg` them (also
+  `myco --help <id>`). Keep them accurate when behavior changes.
 - **Tests are claims.** Prefer names that state the invariant
   (`cancel_during_slow_tool_records_cancelled_result`, not `test_cancel_1`).
 
@@ -71,7 +73,7 @@ myco (interactive) / Agent
   └── Harness (routing, config, root-only services)
         ├── HostController "local"  → in-process HostWorker (always on)
         └── HostController "…"      → ssh … myco --mode host (lazy remote)
-              └── standard tools: bash, editor, manual
+              └── standard tools: bash, editor, view_image
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
@@ -92,7 +94,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
-| `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
+| `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + soul / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/tui/` | The rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks; replay shares its layout helpers |
 | `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
@@ -108,8 +110,9 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
-- **Builds are offline** beyond the crates.io fetch — no build script, no
-  network at compile time. Ship platform-matched binaries; do not scp across
+- **Builds are offline** beyond the crates.io fetch — `build.rs` shells out to
+  local `git` for the commit that keys the manual export and does nothing else;
+  no network at compile time. Ship platform-matched binaries; do not scp across
   glibc/arch boundaries.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
@@ -164,7 +167,8 @@ cargo run --locked --bin myco
 
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
-- Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.
+- Runtime docs for agents: `~/.myco/manual/<version>/<commit>/` (written at
+  startup) or `myco --help overview|cli|harness-ops`.
 
 ## What not to do
 

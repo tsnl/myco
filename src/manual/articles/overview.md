@@ -15,13 +15,13 @@ myco (interactive) / Agent
   └── Harness (routing, config, root-configured services)
         ├── HostController "local"   → in-process HostWorker (always on)
         └── HostController "…"       → ssh … myco --mode host (lazy remote)
-              └── bash, str_replace_based_edit_tool, view_image, manual, text search (per host)
+              └── bash, str_replace_based_edit_tool, view_image (per host)
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
   **local** host worker (standard tools plus root-only services such as `session_meta`).
-- **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
-  text search) over NDJSON via SSH.
+- **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor,
+  `view_image`) over NDJSON via SSH.
 - **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
   session **on the local host**, passing `--parent-session <its own session id>` (myco stamps
   that id in a `# Session` block on the first user message of every session, so an agent needs
@@ -47,6 +47,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
+| `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
 | `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
@@ -166,7 +167,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Host routing
 
-- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`, `manual`, …) accept optional input field **`host`**.
+- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
 - Bash `session_id`s are **per host** (and per agent id). Do not assume a session on `local`
   exists on `devbox`.

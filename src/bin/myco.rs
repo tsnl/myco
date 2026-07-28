@@ -73,7 +73,8 @@ const SLASH_COMMANDS: &[&str] = &[
 )]
 struct Args {
     /// Show CLI help, or print a manual article when ARTICLE is given
-    /// (e.g. `myco --help overview`). Same articles as the `manual` host tool.
+    /// (e.g. `myco --help overview`). Same articles startup exports to
+    /// `~/.myco/manual/<version>/<commit>/` for agents to read.
     #[arg(
         long = "help",
         short = 'h',
@@ -1387,6 +1388,11 @@ Hosts:
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
   passphrases on the NDJSON pipe). It is silent when clean; problems open a
   WARNING block. Missing keys: ssh-add, then restart.
+
+Startup copies this manual to ~/.myco/manual/<version>/<commit>/ (index.md plus
+one file per article) and every agent system prompt names that directory, so
+agents read and search the docs with rg and the editor. --help <article> prints
+the same text.
 
 The newest ~/.myco/workspace/soul/ version is appended to every agent system
 prompt. One longer than max_soul_bytes (config.toml; default 65536) is cut to
