@@ -312,94 +312,71 @@ impl Agent {
                 });
             }
 
-            match output.turn_end_reason {
-                // A tool_use stop with zero accumulated tool calls is malformed
-                // (e.g. a content block the accumulator ignored). Retrying with
-                // unchanged history would loop generate forever, and pushing an
-                // empty ToolResults message is rejected by the API — fail loud.
-                TurnEndReason::ToolUse if output.tool_uses.is_empty() => {
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: vec![],
-                        turn_end_reason: Some(TurnEndReason::ToolUse),
-                    });
-                    return self.finish_generate_error(GenerateError::MalformedResponseError(
-                        "turn ended in tool_use but streamed zero tool uses".into(),
-                    ));
+            let reason = output.turn_end_reason.clone();
+
+            // A tool_use stop with zero accumulated tool calls is malformed
+            // (e.g. a content block the accumulator ignored). Retrying with
+            // unchanged history would loop generate forever, and pushing an
+            // empty ToolResults message is rejected by the API — fail loud.
+            if matches!(reason, TurnEndReason::ToolUse) && output.tool_uses.is_empty() {
+                self.history.push(Message::AssistantMessage {
+                    content: output.content,
+                    tool_uses: vec![],
+                    turn_end_reason: Some(TurnEndReason::ToolUse),
+                });
+                return self.finish_generate_error(GenerateError::MalformedResponseError(
+                    "turn ended in tool_use but streamed zero tool uses".into(),
+                ));
+            }
+
+            // Return answer content only; history keeps thinking for resume/UI.
+            // Backends strip thinking when composing the next request.
+            let content = answer_content(&output.content);
+            let tool_uses = output.tool_uses;
+            // Persist full content (including thinking summaries) for session
+            // resume/UI. Backends strip thinking when composing the next request.
+            self.history.push(Message::AssistantMessage {
+                content: output.content,
+                tool_uses: tool_uses.clone(),
+                turn_end_reason: Some(reason.clone()),
+            });
+
+            // Tool calls are answered whenever the turn carries them — the stop
+            // reason does not decide this. `max_tokens` truncates a turn
+            // mid-call, so the block arrives under a non-`tool_use` stop; a
+            // tool_use nothing responds to makes the whole history unsendable
+            // (every later request resends it), which strands the session on the
+            // provider's "tool_use without tool_result" error.
+            if !tool_uses.is_empty() {
+                // Dispatch every tool use in this turn concurrently. join_all preserves
+                // input order so tool_results[i] matches tool_uses[i]; events may
+                // interleave freely while tools run. Each tool races against cancel so
+                // unfinished work returns a synthetic cancelled ToolResult.
+                let tool_use_results = future::join_all(
+                    tool_uses
+                        .into_iter()
+                        .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
+                )
+                .await;
+
+                self.history.push(Message::ToolResults { tool_use_results });
+                self.emit_checkpoint();
+
+                // If cancel fired during tools, do not start another generate — the
+                // transcript already has matching tool results for every tool_use.
+                if cancel.is_cancelled() {
+                    return self.finish_cancelled();
                 }
-                TurnEndReason::ToolUse => {
-                    // Persist full content (including thinking summaries) for session
-                    // resume/UI. Backends strip thinking when composing the next request.
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: output.tool_uses.clone(),
-                        turn_end_reason: Some(TurnEndReason::ToolUse),
-                    });
+            }
 
-                    // Dispatch every tool use in this turn concurrently. join_all preserves
-                    // input order so tool_results[i] matches tool_uses[i]; events may
-                    // interleave freely while tools run. Each tool races against cancel so
-                    // unfinished work returns a synthetic cancelled ToolResult.
-                    let tool_results = future::join_all(
-                        output
-                            .tool_uses
-                            .into_iter()
-                            .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
-                    )
-                    .await;
-
-                    self.history.push(Message::ToolResults {
-                        tool_use_results: tool_results,
-                    });
-                    self.emit_checkpoint();
-
-                    // If cancel fired during tools, do not start another generate — the
-                    // transcript already has matching tool results for every tool_use.
-                    if cancel.is_cancelled() {
-                        return self.finish_cancelled();
-                    }
-                }
-                reason => {
-                    // Return answer content only; history keeps thinking for resume/UI.
-                    // Backends strip thinking when composing the next request.
-                    let content = answer_content(&output.content);
-                    let unanswered = output.tool_uses.clone();
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: output.tool_uses,
-                        turn_end_reason: Some(reason.clone()),
-                    });
-
-                    // A non-`tool_use` stop can still carry tool_use blocks: hitting
-                    // `max_tokens` truncates the turn mid-call, often with the input
-                    // still empty (`{}`). Those calls are never dispatched, so without
-                    // this the turn ends with a tool_use nothing answers — and every
-                    // later request resends that history, so the next user message
-                    // ("Continue") fails with the provider's "tool_use without
-                    // tool_result" error and the session is stuck for good.
-                    //
-                    // Answer each dangling call with an explicit error instead. The
-                    // call is *not* executed: its arguments were cut off mid-stream,
-                    // so running it would run something the model never finished
-                    // asking for.
-                    if !unanswered.is_empty() {
-                        let tool_use_results = unanswered
-                            .iter()
-                            .map(|tool_use| {
-                                ToolResult::err(truncated_tool_use_message(tool_use, Some(&reason)))
-                                    .with_id(tool_use.id.clone())
-                            })
-                            .collect();
-                        self.history.push(Message::ToolResults { tool_use_results });
-                        self.emit_checkpoint();
-                    }
-
-                    self.sink.emit(AgentEvent::TurnFinished {
-                        reason,
-                        context: self.context.clone(),
-                    });
-                    return Ok(content);
-                }
+            // `tool_use` is the only stop that continues the turn; everything
+            // else hands control back with whatever the model managed to say.
+            if !matches!(reason, TurnEndReason::ToolUse) {
+                self.sink.emit(AgentEvent::TurnFinished {
+                    reason,
+                    context: self.context.clone(),
+                });
+                return Ok(content);
             }
         }
     }
@@ -1300,13 +1277,16 @@ mod tests {
     }
 
     /// `max_tokens` can cut a turn off mid-tool-call: the stop reason is not
-    /// `tool_use`, so nothing dispatches, but the tool_use block is still in the
-    /// assistant message (typically with `input: {}` — the arguments never
-    /// streamed). Providers reject any later request carrying a tool_use with no
-    /// matching tool_result, so the turn must not be left that way: the very next
-    /// user message would fail and keep failing.
+    /// `tool_use`, but the tool_use block is still in the assistant message
+    /// (typically with `input: {}` — the arguments never streamed). Tool calls
+    /// are answered on their presence, not on the stop reason, because providers
+    /// reject any later request carrying a tool_use with no matching tool_result:
+    /// leaving it unanswered fails the very next user message, and every one
+    /// after it. Here the truncated call reaches the real bash tool, which
+    /// rejects the empty input — an error result, but a well-formed turn.
     #[tokio::test]
     async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use() {
+        // The standard local services include the real bash tool.
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![
             GenerateOutput {
@@ -1348,8 +1328,7 @@ mod tests {
                     Content::Text { text } => text.clone(),
                     other => panic!("expected text, got {other:?}"),
                 };
-                assert!(text.contains("was not executed"), "text={text}");
-                assert!(text.contains("output token limit"), "text={text}");
+                assert!(text.contains("empty bash input"), "text={text}");
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
