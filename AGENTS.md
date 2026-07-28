@@ -71,7 +71,7 @@ myco (interactive) / Agent
   └── Harness (routing, config, root-only services)
         ├── HostController "local"  → in-process HostWorker (always on)
         └── HostController "…"      → ssh … myco --mode host (lazy remote)
-              └── standard tools: bash, editor, manual, lynx browser, text search
+              └── standard tools: bash, editor, manual
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a

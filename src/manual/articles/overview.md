@@ -143,7 +143,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Host routing
 
-- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`, `manual`, text search, …) accept optional input field **`host`**.
+- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`, `manual`, …) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
 - Bash `session_id`s are **per host** (and per agent id). Do not assume a session on `local`
   exists on `devbox`.
@@ -154,13 +154,9 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
   model can actually look at — screenshots, diagrams, rendered output. The format is
   read from the file's magic number, so the extension may be wrong or missing (user
   `@path` attachments share the same detection and cap). Text files stay with the editor.
-- **Text search** (per host): persistent watched roots via `index_directory` /
-  `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
-  file bodies **and** path/filename tokens) /
-  `indexed_semantic_text_search` (Candle **MiniLM**, weights baked in at compile
-  time). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
-  `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
-  code trees; only register small repeated scopes.
+- **Text search**: `bash` + `rg`/`grep` on the target host. myco ships no
+  search tools of its own; project guidance (`AGENTS.md`/`CLAUDE.md`, skill
+  packs) is read with the editor or `rg` like any other file.
 
 ## Agent workspace
 

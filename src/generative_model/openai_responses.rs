@@ -276,7 +276,9 @@ fn content_to_input_text(content: &[Content]) -> String {
         .iter()
         .filter_map(|c| match c {
             Content::Text { text } => Some(text.as_str()),
-            // Thinking is not sent as ordinary assistant text on OpenAI Responses.
+            // Assistant turns carry no images; thinking is not sent as
+            // ordinary assistant text on OpenAI Responses. User images and
+            // tool-result images take the `input_image` paths below.
             Content::Image { .. } | Content::Thinking { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -506,6 +508,15 @@ impl StreamAccumulator {
                         arguments,
                         ..
                     } => {
+                        // An id-less or nameless call is poison: it would flow into
+                        // persisted history and 400 on every later request (resume
+                        // included). Fail loud like the arguments-without-item path.
+                        let (Some(call_id), Some(name)) = (call_id, name) else {
+                            return Err(GenerateError::MalformedResponseError(format!(
+                                "OpenAI Responses: function_call output_item.added for \
+                                 output_index={output_index} is missing call_id or name"
+                            )));
+                        };
                         let tool_index = self.tool_use_count();
                         self.output_kinds[output_index] =
                             Some(OutputKind::ToolUse { index: tool_index });
@@ -513,8 +524,8 @@ impl StreamAccumulator {
                         self.saw_tool_call = true;
                         out.push(MessagePart::ToolUseStart(ToolUseStart {
                             index: tool_index,
-                            id: call_id.unwrap_or_default(),
-                            name: name.unwrap_or_default(),
+                            id: call_id,
+                            name,
                         }));
                     }
                     ResponsesOutputItem::Other => {
@@ -1079,6 +1090,29 @@ mod tests {
         let json = serde_json::to_value(convert_messages(&input)).unwrap();
         assert_eq!(json[0]["output"].as_array().unwrap().len(), 1);
         assert_eq!(json[0]["output"][0]["type"], "input_image");
+    }
+
+    /// A function_call item without call_id/name must fail the stream, not
+    /// flow an empty id into persisted history (which would 400 every later
+    /// request, resume included).
+    #[test]
+    fn function_call_without_call_id_fails_loud() {
+        let mut acc = StreamAccumulator::default();
+        let err = acc
+            .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
+                output_index: 0,
+                item: ResponsesOutputItem::FunctionCall {
+                    id: None,
+                    call_id: None,
+                    name: Some("bash".into()),
+                    arguments: None,
+                },
+            })
+            .expect_err("missing call_id must be malformed");
+        assert!(
+            matches!(err, GenerateError::MalformedResponseError(_)),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub fn pick(search: Option<&str>) -> Result<Option<String>, String> {
     }
     let entries = match search {
         Some(query) => {
-            let report = search_sessions(&all, query, SESSION_SEARCH_LIMIT, false)?;
+            let report = search_sessions(&all, query, SESSION_SEARCH_LIMIT)?;
             if report.entries.is_empty() {
                 return Err(format!("no sessions matched {query:?}"));
             }
