@@ -16,7 +16,7 @@ pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, HistoryCheckpoint, NullEventSink,
     TraceContext, uuid_simple_hex,
 };
-pub use attach::{MAX_IMAGE_BYTES, expand_image_attachments};
+pub use attach::{MAX_IMAGE_BYTES, MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
 pub use compact::{
     CompactOptions, CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
     link_compact_pair, run_compact_worker, select_tail,

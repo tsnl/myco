@@ -8,7 +8,17 @@ use base64::Engine as _;
 
 /// Per-image size limit (matches the Anthropic API's 5 MB per-image cap; a
 /// clear local error beats a confusing provider 400).
+///
+/// Measured on the **base64 payload**, not the file on disk: images travel as
+/// `data:` URLs, and base64 inflates by 4/3, so a 5 MiB file is already a
+/// 6.7 MiB upload. Checking the file size instead understates every image by a
+/// third and lets rejects through to the provider.
 pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Size of `bytes` once base64-encoded — what a request actually carries.
+pub fn base64_len(bytes: u64) -> u64 {
+    bytes.div_ceil(3).saturating_mul(4)
+}
 
 /// Media types the model APIs accept. `infer` recognizes far more formats
 /// than this, so detection is filtered down to what we can actually send.
@@ -41,10 +51,13 @@ pub fn looks_like_image_path(path: &str) -> bool {
 /// it).
 pub fn read_image_data_url(path: &Path, label: &str) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
-    if meta.len() > MAX_IMAGE_BYTES {
+    let encoded = base64_len(meta.len());
+    if encoded > MAX_IMAGE_BYTES {
         return Err(format!(
-            "image {label} is {:.1} MiB; the limit is {} MiB",
+            "image {label} is {:.1} MiB ({:.1} MiB encoded for upload); the limit is {} MiB. \
+             Resize or re-compress it and resubmit",
             meta.len() as f64 / (1024.0 * 1024.0),
+            encoded as f64 / (1024.0 * 1024.0),
             MAX_IMAGE_BYTES / (1024 * 1024),
         ));
     }
@@ -159,7 +172,21 @@ mod tests {
         let dir = temp_dir();
         let path = write(&dir, "big.png", &vec![0u8; MAX_IMAGE_BYTES as usize + 1]);
         let err = read_image_data_url(&path, "@big.png").unwrap_err();
-        assert!(err.contains("limit is 5 MiB"), "{err}");
+        assert!(err.contains("the limit is 5 MiB"), "{err}");
+    }
+
+    /// The cap is on the uploaded payload, not the file: base64 inflates by
+    /// 4/3, so a 4 MiB file is already over a 5 MiB encoded limit. Checking
+    /// the file size instead would wave this one through to the provider.
+    #[test]
+    fn limit_is_measured_on_the_base64_payload() {
+        assert_eq!(base64_len(3), 4);
+        assert_eq!(base64_len(4), 8);
+
+        let dir = temp_dir();
+        let path = write(&dir, "shot.png", &vec![0u8; 4 * 1024 * 1024]);
+        let err = read_image_data_url(&path, "@shot.png").unwrap_err();
+        assert!(err.contains("5.3 MiB encoded"), "{err}");
     }
 
     #[test]

@@ -202,6 +202,12 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
   - Adds complexity. No real benefit.
 - [x] (REJECTED) **Rewind / branch conversation** — undo last turn or fork session after a bad path.
   - Rarely used in practice. Adds complexity.
+  - Still rejected as a *user-facing* feature. The narrow automatic case ships:
+    a request over the provider's size cap is unretryable (every later turn
+    resends it), so `AgentInteractionError::recovery()` reports
+    `Recovery::OmitLastMessage` and the CLI calls
+    `Agent::rewind_last_user_turn()` to unwedge the session. No `/rewind`
+    command, no branching.
 
 ---
 

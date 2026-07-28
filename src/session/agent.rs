@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::core::CancelToken;
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
+    MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
 
@@ -207,6 +207,32 @@ impl Agent {
     /// Swap the generative model (e.g. mid-session `/effort` rebuild). History is kept.
     pub fn set_model(&mut self, model: Arc<dyn GenerativeModel>) {
         self.model = model;
+    }
+
+    /// Drop the last user turn — that message and everything the agent produced
+    /// after it — and return the removed user content.
+    ///
+    /// The recovery for [`Recovery::OmitLastMessage`]: a request the provider
+    /// rejects for its *size* is rejected again on every later turn, because
+    /// every later turn resends it. Truncating at the last `UserMessage` leaves
+    /// a well-formed prefix — the boundary is exactly where the previous turn
+    /// ended — so the session continues instead of failing forever.
+    ///
+    /// `None` when there is no user message to remove; history is untouched.
+    pub fn rewind_last_user_turn(&mut self) -> Option<Vec<Content>> {
+        let at = self
+            .history
+            .iter()
+            .rposition(|m| matches!(m, Message::UserMessage { .. }))?;
+        let mut dropped = self.history.split_off(at);
+        // Usage described the request that just failed; it no longer describes
+        // this history. Callers re-establish it on the next successful turn.
+        self.last_usage = None;
+        self.emit_checkpoint();
+        match dropped.remove(0) {
+            Message::UserMessage { content } => Some(content),
+            other => unreachable!("rposition matched a user message, got {other:?}"),
+        }
     }
 
     /// Set the context window used for the USER `N/M` token header.
@@ -475,6 +501,19 @@ pub enum AgentInteractionError {
     /// had already started (synthetic cancelled tool results are recorded).
     #[error("cancelled")]
     Cancelled,
+}
+
+impl AgentInteractionError {
+    /// Whether the failed turn can be resubmitted as-is, or the last user
+    /// message has to be rewound out of history first
+    /// ([`Agent::rewind_last_user_turn`]).
+    pub fn recovery(&self) -> Recovery {
+        match self {
+            AgentInteractionError::GenerateError(e) => e.recovery(),
+            // History is well-formed after a cancel; the same turn can be re-sent.
+            AgentInteractionError::Cancelled => Recovery::Retry,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1135,6 +1174,102 @@ mod tests {
             agent.history()[1],
             Message::AssistantMessage { .. }
         ));
+    }
+
+    /// Model whose every generate fails with an oversized-request error.
+    struct TooLargeModel;
+
+    impl GenerativeModel for TooLargeModel {
+        fn generate(
+            &self,
+            _input: &[Message],
+        ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
+            Box::pin(stream::once(async {
+                Err(GenerateError::RequestTooLargeError("42 MiB".into()))
+            }))
+        }
+    }
+
+    /// An oversized request is a property of the history, so the top-level
+    /// error must say the last message has to come out — not "try again".
+    #[tokio::test]
+    async fn oversized_request_reports_omit_last_message() {
+        let harness = Harness::local_with_services(vec![]);
+        let mut agent = Agent::new(Arc::new(TooLargeModel), harness, Arc::new(NullEventSink));
+        let err = agent
+            .interact(
+                vec![Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect_err("oversized request should fail");
+
+        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+
+        // Rewinding takes the offending turn back out and returns its content,
+        // leaving a history the provider will accept again.
+        let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
+        assert!(matches!(dropped[0], Content::Image { .. }));
+        assert!(agent.history().is_empty());
+        assert!(agent.rewind_last_user_turn().is_none());
+    }
+
+    #[test]
+    fn generate_errors_other_than_size_are_retryable() {
+        assert_eq!(
+            GenerateError::ExecutionError("provider 500".into()).recovery(),
+            Recovery::Retry
+        );
+        assert_eq!(AgentInteractionError::Cancelled.recovery(), Recovery::Retry);
+    }
+
+    /// Rewinding mid-turn drops the assistant/tool messages that followed the
+    /// user message too — the remaining prefix must end where the *previous*
+    /// turn ended, or the next request is malformed.
+    #[tokio::test]
+    async fn rewind_drops_the_whole_turn_and_keeps_earlier_ones() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent.set_history(vec![
+            Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "first".into(),
+                }],
+            },
+            Message::AssistantMessage {
+                content: vec![Content::Text { text: "ok".into() }],
+                tool_uses: vec![],
+                turn_end_reason: Some(TurnEndReason::EndTurn),
+            },
+            Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "second".into(),
+                }],
+            },
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "noop".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: Some(TurnEndReason::ToolUse),
+            },
+            Message::ToolResults {
+                tool_use_results: vec![ToolResult::text("done").with_id("call_1")],
+            },
+        ]);
+
+        let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
+        assert!(matches!(&dropped[0], Content::Text { text } if text == "second"));
+
+        let history = agent.history();
+        assert_eq!(history.len(), 2);
+        assert!(matches!(history[0], Message::UserMessage { .. }));
+        assert!(matches!(history[1], Message::AssistantMessage { .. }));
     }
 
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.

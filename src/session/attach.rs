@@ -7,12 +7,25 @@
 //! typed text is sent unchanged — `@` tokens stay in it, so the model can tie
 //! each mention to its attached image. Paths with whitespace are not
 //! supported; a `@token` with any other extension is ordinary text.
+//!
+//! Limits are measured on the **base64 payload actually uploaded**, not the
+//! file on disk: base64 inflates by 4/3, and providers cap the encoded image
+//! and the whole request. Per-message budgets alone cannot keep a session under
+//! the request cap — images accumulate in history — so the drivers also
+//! preflight the composed request (`generative_model::MAX_REQUEST_BYTES`).
+//! myco does not re-encode images; a file over the limit is rejected with the
+//! sizes named so the user can downscale it and resubmit.
 
 use std::path::PathBuf;
 
 pub use crate::core::image::MAX_IMAGE_BYTES;
 use crate::core::image::{looks_like_image_path, read_image_data_url};
 use crate::generative_model::Content;
+
+/// Limit on the combined upload payload of one message's attachments. Well
+/// under the request cap so a single message still leaves room for the
+/// conversation it is appended to.
+pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Expand `@<path>` image mentions in `input` into content blocks for
 /// `Agent::interact`: attached images first (providers prefer
@@ -23,6 +36,7 @@ use crate::generative_model::Content;
 pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
     let mut content = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
+    let mut encoded_total: u64 = 0;
 
     for token in input.split_whitespace() {
         // Sentence position: "see @shot.png." / "(@shot.png)" — trailing
@@ -40,7 +54,18 @@ pub fn expand_image_attachments(input: &str) -> Result<Vec<Content>, String> {
         }
 
         let expanded = expand_home(path);
+        // `read_image_data_url` caps each image; this budget caps the message,
+        // measured on the same `data:` URL the request will carry.
         let source = read_image_data_url(&expanded, &format!("@{path}"))?;
+        encoded_total += source.len() as u64;
+        if encoded_total > MAX_MESSAGE_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachments total {:.1} MiB encoded for upload; the per-message limit is \
+                 {} MiB. Send fewer images per message",
+                encoded_total as f64 / (1024.0 * 1024.0),
+                MAX_MESSAGE_ATTACHMENT_BYTES / (1024 * 1024),
+            ));
+        }
         content.push(Content::Image { source });
         seen.push(path);
     }
@@ -160,14 +185,24 @@ mod tests {
         assert!(err.contains("@definitely-missing.png"), "{err}");
     }
 
+    /// Individually-legal images still fail as a batch: the per-message budget
+    /// is what keeps one turn from blowing the request cap on its own.
+    /// (The per-image cap itself lives in `core::image` and is tested there.)
     #[test]
-    fn oversized_image_fails_with_limit() {
-        let dir = temp_dir("big");
-        let path = dir.join("big.png");
-        fs::write(&path, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
+    fn attachments_over_the_message_budget_fail() {
+        let dir = temp_dir("budget");
+        // 3.5 MiB each → ~4.67 MiB encoded; five clear the 20 MiB budget.
+        let mut bytes = vec![0u8; 7 * 512 * 1024];
+        bytes[..PNG.len()].copy_from_slice(PNG);
+        let mut input = String::new();
+        for i in 0..5 {
+            let path = dir.join(format!("shot{i}.png"));
+            fs::write(&path, &bytes).unwrap();
+            input.push_str(&format!("@{} ", path.display()));
+        }
 
-        let err = expand_image_attachments(&format!("@{}", path.display())).unwrap_err();
-        assert!(err.contains("limit is 5 MiB"), "{err}");
+        let err = expand_image_attachments(&input).unwrap_err();
+        assert!(err.contains("per-message limit is 20 MiB"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
     }
