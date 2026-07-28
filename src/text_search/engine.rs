@@ -503,7 +503,7 @@ impl TextSearchEngine {
             hits,
             roots_used,
             note: if semantic {
-                "semantic = Candle MiniLM (compile-time weights) cosine over indexed files. \
+                "semantic = Candle MiniLM cosine over indexed files. \
                  Prefer for skills / AGENTS.md intent; use exact for identifiers."
                     .into()
             } else {

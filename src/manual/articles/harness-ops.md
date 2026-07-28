@@ -20,7 +20,7 @@ agent laptop.
 
 - **`git`** — worktrees/branches, repo inspection, and `git archive` when shipping local source to remotes.
 - **`gh`** — GitHub CLI for PRs, issues, and release workflows the agent often drives.
-- **`curl`** — `build.rs` MiniLM asset fetch at compile time, and downloading release source tarballs.
+- **`curl`** — `scripts/seed-minilm-weights.sh` (optional MiniLM pre-seed) and downloading release source tarballs.
 
 Also needed when **building from source**: stable **Rust / cargo** (and `curl` as above). Optional
 `trunk` + `wasm32-unknown-unknown` only for **`crates/myco-gui`**.
@@ -112,25 +112,31 @@ git archive --format=tar.gz -o /tmp/myco-src.tgz "${REF:-HEAD}"
 first if the install must include uncommitted edits. Untracked files are never in the archive;
 add/commit them if they are required to build.
 
-### Embedding weights (MiniLM / Candle) — fully embedded in the binary
+### Embedding weights (MiniLM / Candle) — fetched at runtime into `~/.myco/models`
 
-Semantic search bakes all-MiniLM-L6-v2 (Candle) into `myco` at **compile time**
-(`build.rs` stages under `OUT_DIR` + `include_bytes!`). Runtime never reads weight
-files and never downloads from Hugging Face.
+Semantic search uses all-MiniLM-L6-v2 (Candle). The ~87 MiB of weights are **not**
+in the binary and **not** in git: `myco` downloads them on the first semantic
+search into `~/.myco/models/all-MiniLM-L6-v2/` and verifies each file's sha256
+against `src/text_search/embed_weights/MODEL.manifest`. There is no `build.rs`.
 
 | Stage | What you need |
 |-------|----------------|
-| **Running / shipping** | The **`myco` binary only** for that OS/CPU/libc. No model pack, no `embed_weights/` on the target. |
-| **Compiling from source** | Network so `build.rs` (`hf-hub`) can populate the shared Hub cache and stage into `OUT_DIR` (or seed via warm `HF_HOME` / `MYCO_EMBED_CACHE` / `src/text_search/embed_weights/`). |
+| **Compiling from source** | Rust/cargo. **No network for the build**, no weight files, no HF cache. |
+| **Running** | Network once per machine (first semantic search), or a pre-seeded `~/.myco/models` / `MYCO_EMBED_CACHE`. Everything else works offline regardless. |
 
-Source tarballs / crates.io packages / `git archive` do not ship the ~87 MiB weight
-files (gitignored; not part of the package). That only matters when **building**; a
-finished binary already contains the weights. Details:
-`src/text_search/embed_weights/README.md`.
+| Var | Effect |
+|-----|--------|
+| `MYCO_EMBED_CACHE` | Read/write assets here instead of `~/.myco/models/…` |
+| `MYCO_EMBED_OFFLINE=1` | Never download; semantic search errors if the cache is cold |
+| `MYCO_EMBED_ENDPOINT` / `HF_ENDPOINT` | Mirror base URL (default `https://huggingface.co`) |
 
-Because weights are embedded, a **release only needs platform-matched binaries**. Do not scp
-binaries across mismatched OS/arch/glibc; for those hosts, build there or use a matching
-release asset.
+On an air-gapped host, copy the three files (`model.safetensors`, `tokenizer.json`,
+`config.json`) into `~/.myco/models/all-MiniLM-L6-v2/` — digests are checked, so
+any transport is fine. Details: `src/text_search/embed_weights/README.md`.
+
+A **release only needs platform-matched binaries**. Do not scp binaries across
+mismatched OS/arch/glibc; for those hosts, build there or use a matching release
+asset.
 
 ### Install on each remote host (build from source)
 
@@ -153,15 +159,16 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || { echo "cargo/rustc required on host"; exit 1; }
-  # build.rs uses hf-hub (shared HF cache) then stages MiniLM assets into OUT_DIR.
+  # No network needed for the build: MiniLM assets are fetched on first use.
   cargo install --path ~/src/myco-src --force --locked --root "$HOME/.local"
   # ~/.local/bin is the usual remote install path in multi-host setups
   ~/.local/bin/myco --version
 '
 ```
 
-- Require **Rust/cargo** (and network once for `hf-hub` MiniLM assets, or a warm Hub cache) when building from source. Prefer a
-  prebuilt **same-platform** binary when available (weights already inside).
+- Require **Rust/cargo** when building from source; the build itself is offline. Prefer a
+  prebuilt **same-platform** binary when available. Either way the host needs network once
+  (or a seeded `~/.myco/models`) before semantic search works.
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
   `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`.

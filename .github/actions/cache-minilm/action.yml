@@ -1,0 +1,26 @@
+name: Seed MiniLM embed weights
+description: >
+  Restore/save ~/.myco/models and pre-seed the MiniLM assets that myco
+  otherwise downloads on its first semantic search. Building myco needs no
+  network; this only keeps the test suite from paying for the fetch.
+
+inputs:
+  cache-key-prefix:
+    description: Key prefix; bump to invalidate a poisoned cache.
+    required: false
+    default: minilm-models-v1
+
+runs:
+  using: composite
+  steps:
+    - name: Cache ~/.myco/models
+      uses: actions/cache@v5
+      with:
+        path: ~/.myco/models
+        key: ${{ inputs.cache-key-prefix }}-${{ hashFiles('src/text_search/embed_weights/MODEL.manifest') }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-
+
+    - name: Seed MiniLM assets
+      shell: bash
+      run: bash scripts/seed-minilm-weights.sh

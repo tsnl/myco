@@ -214,7 +214,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
   - Host tools: `index_directory`, `indexed_exact_text_search`,
     `indexed_semantic_text_search` (Candle MiniLM), `drop_directory_index`
   - Exact: Tantivy (in-RAM); semantic: Candle MiniLM + cosine
-    (weights: build.rs downloads safetensors → embed_weights/ gitignored + include_bytes; no ORT)
+    (weights: safetensors fetched at runtime into ~/.myco/models, sha256-verified; no ORT)
   - Auto-index: `.claude/skills`, `.myco/skills`, `SKILL.md` dirs, `AGENTS.md`/`CLAUDE.md`
   - Persistent watched roots + `notify` incremental updates; parent expand in place
   - [ ] tree-sitter structure index (next)

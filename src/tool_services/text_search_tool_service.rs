@@ -48,10 +48,10 @@ const SEMANTIC_SEARCH_DESC: &str = r#"
 Semantic search over persistently indexed roots using **Candle** (all-MiniLM-L6-v2)
 embeddings and cosine similarity. Best for skills / AGENTS.md intent queries
 ("how do I extract PDFs"). Same coverage rules as exact search.
-Weights are embedded at **compile time** (`build.rs` uses `hf-hub` into the
-shared Hub cache, then stages under `OUT_DIR`; no ONNX Runtime). Rebuild with
-network or a warm HF cache if assets are missing (see embed_weights/README.md /
-harness-ops).
+Weights (~87 MiB, no ONNX Runtime) are fetched on first use into
+`~/.myco/models/` and reused offline afterwards; the first semantic search on a
+cold machine needs network unless that cache was seeded (see
+embed_weights/README.md / harness-ops).
 
 Not a substitute for grep over a full repo. Prefer exact (Tantivy) search for symbols.
 "#;
@@ -375,7 +375,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        // Semantic uses compile-time MiniLM (Candle); should work offline after a successful build.
+        // Semantic uses MiniLM (Candle); offline once ~/.myco/models is warm.
         assert!(!sem.is_error, "semantic search: {}", tool_text(&sem));
         assert!(tool_text(&sem).contains("hits"), "{sem:?}");
     }

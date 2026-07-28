@@ -91,11 +91,8 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
-      - name: Cache Hugging Face Hub (MiniLM)
-        uses: ./.github/actions/cache-hf-hub
-
       - name: Seed MiniLM embed weights
-        run: bash scripts/seed-minilm-weights.sh
+        uses: ./.github/actions/cache-minilm
 
       - name: Semver bump and cargo publish
         id: publish
@@ -140,7 +137,9 @@ jobs:
           ```
 
           Platform-matched binaries are not attached here yet; build on the target
-          host (MiniLM weights are baked in at compile time). See `myco --help harness-ops`.
+          host. Building needs no network; MiniLM embedding weights (~87 MiB) are
+          fetched into `~/.myco/models/` on the first semantic search. See
+          `myco --help harness-ops`.
           BOILERPLATE
 
       - name: Create GitHub Release

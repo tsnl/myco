@@ -2,14 +2,22 @@
 
 Semantic search uses **Candle** + **all-MiniLM-L6-v2** (no ONNX Runtime).
 
-`build.rs` downloads via the **`hf-hub`** crate (Rust counterpart of Python
-`huggingface_hub`) into the **shared Hub cache** (`HF_HUB_CACHE` /
-`$HF_HOME/hub` / `~/.cache/huggingface/hub`), then stages copies under
-**`OUT_DIR/embed_weights/`** and generates `OUT_DIR/embed_assets.rs` so
-`include_bytes!` bakes them into the `myco` binary without modifying the
-package source tree (required for `cargo publish` verify).
+Weights are **not** compiled into the binary and **not** stored in git (LFS or
+otherwise). `src/text_search/embed_assets.rs` fetches them on the first
+semantic search into:
 
-Only this README and `MODEL.manifest` are tracked in git.
+```
+$MYCO_EMBED_CACHE  →  else  ~/.myco/models/all-MiniLM-L6-v2/
+```
+
+and verifies every file against the sha256 digests in `MODEL.manifest`, which
+is compiled in with `include_str!` and is the single source of truth shared
+with `scripts/seed-minilm-weights.sh`. A file that is missing or fails its
+digest is re-downloaded; writes are atomic, so concurrent `myco` processes
+can't observe a half-written blob.
+
+This directory holds only the manifest and this README — building `myco`
+needs no network, and there is no `build.rs`.
 
 | File | Source |
 |------|--------|
@@ -17,32 +25,27 @@ Only this README and `MODEL.manifest` are tracked in git.
 | `tokenizer.json` | same repo |
 | `config.json` | same repo |
 
-## Caching (worktrees / CI)
+## Environment
 
-Downloads are **system-wide** (or `HF_HOME`-scoped), not per-worktree:
+| Var | Effect |
+|-----|--------|
+| `MYCO_EMBED_CACHE` | Directory to read/write instead of `~/.myco/models/…` |
+| `MYCO_EMBED_OFFLINE=1` | Never download; error if the cache is incomplete |
+| `MYCO_EMBED_ENDPOINT` / `HF_ENDPOINT` | Mirror base URL (default `https://huggingface.co`) |
 
-- Default: `~/.cache/huggingface/` (same layout as Python `huggingface_hub`)
-- Override: `HF_HOME`, `HF_HUB_CACHE`, or `HF_ENDPOINT` / `MYCO_EMBED_ENDPOINT`
-- GitHub Actions: workflow sets `HF_HOME=$GITHUB_WORKSPACE/.hf` and caches
-  `.hf/hub` (plus the optional flat seed dir below)
+The cache deliberately ignores `MYCO_HOME`: tests and `--mode host` workers
+retarget that at throwaway directories, and an 87 MiB download must not follow
+session storage around.
 
-A second worktree / branch build reuses the hub cache automatically.
+## Seeding
 
-## Seeding / offline builds
-
-Preferred: let `build.rs` fetch once via `hf-hub` (network on first build).
-
-Optional flat seed — place files here **or** set `MYCO_EMBED_CACHE` (checked
-before the Hub cache):
+Optional — only to avoid paying for the download on first search (CI does this
+so the test suite starts warm):
 
 ```bash
-# optional; usually unnecessary once the hub cache is warm
-bash scripts/seed-minilm-weights.sh
-# or:
-export MYCO_EMBED_CACHE=/path/to/dir-with-model.safetensors-tokenizer-config
+bash scripts/seed-minilm-weights.sh          # → ~/.myco/models/all-MiniLM-L6-v2
+MYCO_EMBED_CACHE=/opt/minilm bash scripts/seed-minilm-weights.sh
 ```
 
-`MYCO_EMBED_OFFLINE=1` fails the build if assets cannot be found in
-`MYCO_EMBED_CACHE` / this directory / the Hub cache / `OUT_DIR`.
-
-After a successful build, weights live **inside** the binary (no runtime model pack).
+Copying the three files between machines works too — the digests are checked,
+not the provenance.

@@ -92,7 +92,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
-| `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
+| `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights fetched to `~/.myco/models`) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |
 | `crates/myco-gui/` | Optional Yew UI — not on the critical CLI path |
@@ -160,9 +160,10 @@ cargo test --locked --test integration_test   # and other tests/ binaries as nee
 cargo run --locked --bin myco
 ```
 
-- First build may download MiniLM assets via `build.rs` (`hf-hub` → shared
-  Hugging Face cache → `OUT_DIR`) unless `MYCO_EMBED_OFFLINE=1` with a warm
-  hub cache / `MYCO_EMBED_CACHE` / pre-seeded `src/text_search/embed_weights/`.
+- The build needs no network. MiniLM assets are downloaded on the first
+  semantic search into `~/.myco/models/` (override `MYCO_EMBED_CACHE`, forbid
+  with `MYCO_EMBED_OFFLINE=1`, pre-seed with
+  `bash scripts/seed-minilm-weights.sh`). Tests that embed need that cache warm.
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `manual` tool or `myco --help overview|cli|harness-ops`.

@@ -30,9 +30,10 @@ the local machine **and** on every concrete `Host` alias in your
 cargo install myco
 ```
 
-Needs stable Rust, network on the first build (`build.rs` bakes MiniLM
-embedding weights into the binary via `hf-hub`), and `ssh`, `lynx`, `uv`,
-`bash`, `tmux`, `fzf` on `PATH` (`git`, `gh`, `curl` recommended).
+Needs stable Rust and `ssh`, `lynx`, `uv`, `bash`, `tmux`, `fzf` on `PATH`
+(`git`, `gh`, `curl` recommended). The build itself needs no network; the
+MiniLM embedding weights are fetched into `~/.myco/models/` the first time
+semantic search runs.
 
 ## Use
 
@@ -74,7 +75,9 @@ cargo run --locked --bin myco
 bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre-commit
 ```
 
-Semantic search embeds **all-MiniLM-L6-v2** at compile time: `build.rs`
-downloads into the shared Hugging Face cache and bakes the weights into the
-binary — nothing large is in git. Offline seed:
-`bash scripts/seed-minilm-weights.sh` or `MYCO_EMBED_CACHE`.
+Semantic search uses **all-MiniLM-L6-v2** (Candle). The ~87 MiB of weights are
+downloaded on first use into `~/.myco/models/all-MiniLM-L6-v2/` and checked
+against the sha256 digests in `src/text_search/embed_weights/MODEL.manifest` —
+nothing large is in git, and the build never touches the network. Pre-seed with
+`bash scripts/seed-minilm-weights.sh`; point elsewhere with `MYCO_EMBED_CACHE`;
+forbid the download with `MYCO_EMBED_OFFLINE=1`.

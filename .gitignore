@@ -7,7 +7,8 @@ __pycache__
 .myco
 .myco/worktrees/
 
-# Embed assets (fetched by build.rs; only README + MODEL.manifest tracked)
+# Embed assets live in ~/.myco/models (fetched at runtime), never in the tree.
+# Only README + MODEL.manifest are tracked here.
 src/text_search/embed_weights/*
 !src/text_search/embed_weights/README.md
 !src/text_search/embed_weights/MODEL.manifest

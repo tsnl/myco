@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# Prefetch MiniLM assets so build.rs (hf-hub) can hit a warm cache.
+# Pre-seed the MiniLM embedding assets myco fetches on first semantic search.
 #
-# Primary seed path remains a flat directory that build.rs accepts via
-# MYCO_EMBED_CACHE or the gitignored src/text_search/embed_weights/ tree.
-# After the first real cargo build, blobs also live under the shared Hub
-# cache (HF_HUB_CACHE / $HF_HOME/hub / ~/.cache/huggingface/hub), which is
-# what worktrees and GHA should reuse.
+# myco downloads these itself at runtime; this script only warms the cache so
+# the first search (or a CI test run) does not pay for it. Destination:
+#   $MYCO_EMBED_CACHE, else ~/.myco/models/all-MiniLM-L6-v2
+# which is exactly what src/text_search/embed_assets.rs reads.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_ID="sentence-transformers/all-MiniLM-L6-v2"
 MANIFEST="$ROOT/src/text_search/embed_weights/MODEL.manifest"
-SEED_DIR="${MYCO_EMBED_CACHE:-$ROOT/src/text_search/embed_weights}"
+SEED_DIR="${MYCO_EMBED_CACHE:-$HOME/.myco/models/all-MiniLM-L6-v2}"
 
 ENDPOINT="${MYCO_EMBED_ENDPOINT:-${HF_ENDPOINT:-https://huggingface.co}}"
 ENDPOINT="${ENDPOINT%/}"

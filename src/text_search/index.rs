@@ -661,8 +661,9 @@ mod tests {
     #[test]
     fn semantic_search_basic() {
         let mut idx = SearchIndex::new().unwrap();
-        // Uses compile-time embedded MiniLM (Candle; build.rs).
-        embed_for_index("warmup").expect("MiniLM embedder must load offline");
+        // Uses MiniLM (Candle) assets from ~/.myco/models (seeded on first use).
+        embed_for_index("warmup")
+            .expect("MiniLM assets must be available (see embed_weights/README.md)");
         let skill = "---\nname: pdf\ndescription: Extract PDF text and fill forms\n---\n";
         let other = "recipe for banana bread and muffins\n";
         idx.upsert_file(

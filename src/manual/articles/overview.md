@@ -153,8 +153,8 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 - **Text search** (per host): persistent watched roots via `index_directory` /
   `drop_directory_index`, query with `indexed_exact_text_search` (Tantivy over
   file bodies **and** path/filename tokens) /
-  `indexed_semantic_text_search` (Candle **MiniLM**, weights baked in at compile
-  time). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
+  `indexed_semantic_text_search` (Candle **MiniLM**, weights fetched on first
+  use into `~/.myco/models/`). On host start, auto-registers `.claude/skills`, `SKILL.md` directories, and
   `AGENTS.md`/`CLAUDE.md` under a bounded walk of cwd. Prefer `bash` + `rg` for large
   code trees; only register small repeated scopes.
 

@@ -205,8 +205,9 @@ mod tests {
 
     #[test]
     fn semantic_forced_ranks_by_meaning() {
-        // Uses compile-time embedded MiniLM (Candle; build.rs).
-        embed_for_index("warmup").expect("MiniLM embedder must load offline");
+        // Uses MiniLM (Candle) assets from ~/.myco/models (seeded on first use).
+        embed_for_index("warmup")
+            .expect("MiniLM assets must be available (see embed_weights/README.md)");
         let dir = temp_dir("semantic");
         let entries = vec![
             entry("aaa", "how to cook pasta with tomato sauce and basil", &dir),
