@@ -91,7 +91,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/harness/` | Host pool, config file shape (`~/.ssh/config` hosts + `~/.myco/config.toml` catalog/knobs), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/text_search/` | Tantivy exact + Candle MiniLM semantic search (weights baked in) |
 | `src/manual/` | Embedded runtime articles for the `manual` tool / `--help` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) |

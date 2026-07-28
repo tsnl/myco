@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::core::*;
 
+use super::openai_common::{image_url, images_of, text_of, tool_result_text};
 use super::*;
 
 /// OpenAI Responses API settings ([`BackendConfig::OpenAIResponses`]).
@@ -249,7 +250,7 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                 // Test the *rendered* text: a thinking-only turn has non-empty
                 // `content` that renders to "", and an empty assistant item is
                 // rejected by providers on every later request.
-                let text = content_to_input_text(content);
+                let text = text_of(content);
                 if !text.is_empty() {
                     out.push(ResponsesInputItem::Message {
                         role: "assistant".into(),
@@ -271,23 +272,11 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
     out
 }
 
-fn content_to_input_text(content: &[Content]) -> String {
-    content
-        .iter()
-        .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
-            // Thinking is not sent as ordinary assistant text on OpenAI Responses.
-            Content::Image { .. } | Content::Thinking { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// User message content: plain string when text-only, `input_text` /
 /// `input_image` parts when images are attached.
 fn user_content_to_input(content: &[Content]) -> ResponsesMessageContent {
     if !content.iter().any(|c| matches!(c, Content::Image { .. })) {
-        return ResponsesMessageContent::Text(content_to_input_text(content));
+        return ResponsesMessageContent::Text(text_of(content));
     }
     ResponsesMessageContent::Parts(
         content
@@ -305,52 +294,14 @@ fn user_content_to_input(content: &[Content]) -> ResponsesMessageContent {
     )
 }
 
-/// `input_image.image_url` accepts http(s) and `data:` URLs. Same source
-/// policy as the Anthropic driver: pass URLs through, treat anything else as
-/// raw base64 PNG.
-fn image_url(source: &str) -> String {
-    if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("data:")
-    {
-        return source.to_string();
-    }
-    format!("data:image/png;base64,{source}")
-}
-
 /// `function_call_output.output`: the plain-string form for text-only
 /// results, or `input_text` / `input_image` parts when a tool result carries
 /// images (e.g. `view_image`). Text-only stays a string for compatibility
 /// with OpenAI-compatible gateways that predate content parts in function
 /// outputs.
 fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
-    let text = {
-        let t = result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                Content::Image { .. } | Content::Thinking { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if result.is_error && !t.is_empty() {
-            format!("Error: {t}")
-        } else if result.is_error {
-            "Error".into()
-        } else {
-            t
-        }
-    };
-
-    let images: Vec<&str> = result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            Content::Image { source } => Some(source.as_str()),
-            _ => None,
-        })
-        .collect();
+    let text = tool_result_text(result);
+    let images = images_of(&result.content);
     if images.is_empty() {
         return ResponsesFunctionOutput::Text(text);
     }
@@ -1112,16 +1063,6 @@ mod tests {
         }];
         let json = serde_json::to_value(convert_messages(&input)).unwrap();
         assert_eq!(json[0]["content"], "hi");
-    }
-
-    #[test]
-    fn image_url_passes_urls_and_wraps_raw_base64() {
-        assert_eq!(image_url("https://x.test/a.png"), "https://x.test/a.png");
-        assert_eq!(
-            image_url("data:image/jpeg;base64,AA"),
-            "data:image/jpeg;base64,AA"
-        );
-        assert_eq!(image_url("iVBOR"), "data:image/png;base64,iVBOR");
     }
 
     #[test]

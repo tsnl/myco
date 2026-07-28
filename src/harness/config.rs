@@ -60,7 +60,8 @@ impl Default for FileConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayEntry {
-    /// Wire protocol: `"anthropic-messages"` or `"openai-responses"`.
+    /// Wire protocol: `"anthropic-messages"`, `"openai-responses"`, or
+    /// `"openai-completions"`.
     pub protocol: Protocol,
     /// Base URL including any path prefix, e.g. `https://openrouter.ai/api/v1`.
     pub base_url: String,
@@ -93,7 +94,8 @@ pub struct ModelEntry {
     /// auto-compact heuristics — a wrong silent default would corrupt both).
     pub context_window: u64,
     /// `"adaptive"` | `"budget"` | `"effort"` | `"none"`.
-    /// Default per protocol: anthropic-messages → adaptive, openai-responses → effort.
+    /// Default per protocol: anthropic-messages → adaptive, both OpenAI
+    /// dialects → effort.
     #[serde(default)]
     pub thinking: Option<ThinkingMode>,
     /// Per-generate output token cap (default 8192).
@@ -347,6 +349,12 @@ protocol = "openai-responses"
 base_url = "https://openrouter.ai/api/v1"
 auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
+# Servers that only speak the older /chat/completions dialect (llama.cpp,
+# Ollama, vLLM, DeepSeek, Groq, …).
+[gateways.ollama]
+protocol = "openai-completions"
+base_url = "http://localhost:11434/v1"
+
 [models.claude-opus-4-8]
 gateway = "anthropic"
 context_window = 1_000_000
@@ -365,6 +373,12 @@ context_window = 500_000
 gateway = "openrouter"
 api_id = "moonshotai/kimi-k3"  # wire id differs from the short key
 context_window = 1_000_000
+
+[models.qwen-local]
+gateway = "ollama"
+api_id = "qwen3:8b"
+thinking = "none"            # models without reasoning reject reasoning_effort
+context_window = 32_768
 "#
     .to_string()
 }
@@ -623,11 +637,15 @@ context_window = 1000
     fn example_config_parses() {
         let file = parse_file_config_str(&example_config_toml()).unwrap();
         assert_eq!(file.model.as_deref(), Some("grok-4.5-build"));
-        assert_eq!(file.gateways.len(), 3);
-        assert_eq!(file.models.len(), 4);
+        assert_eq!(file.gateways.len(), 4);
+        assert_eq!(file.models.len(), 5);
         assert_eq!(
             file.models["kimi-k3"].api_id.as_deref(),
             Some("moonshotai/kimi-k3")
+        );
+        assert_eq!(
+            file.gateways["ollama"].protocol,
+            Protocol::OpenAICompletions
         );
     }
 }

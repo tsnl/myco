@@ -10,6 +10,11 @@ pub use anthropic::AnthropicBackendConfig;
 mod openai_responses;
 pub use openai_responses::OpenAIResponsesBackendConfig;
 
+mod openai_completions;
+pub use openai_completions::OpenAICompletionsBackendConfig;
+
+mod openai_common;
+
 mod sse_parser;
 use sse_parser::SseParser;
 
@@ -36,6 +41,8 @@ pub enum Protocol {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAIResponses,
+    #[serde(rename = "openai-completions")]
+    OpenAICompletions,
 }
 
 impl std::fmt::Display for Protocol {
@@ -43,6 +50,7 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::AnthropicMessages => f.write_str("anthropic-messages"),
             Protocol::OpenAIResponses => f.write_str("openai-responses"),
+            Protocol::OpenAICompletions => f.write_str("openai-completions"),
         }
     }
 }
@@ -51,7 +59,7 @@ impl std::fmt::Display for Protocol {
 ///
 /// Serde strings are the config.toml `thinking` values. Compatibility is
 /// per-protocol (validated at catalog resolution): Anthropic Messages takes
-/// `adaptive` | `budget` | `none`; OpenAI Responses takes `effort` | `none`.
+/// `adaptive` | `budget` | `none`; both OpenAI dialects take `effort` | `none`.
 #[derive(
     Debug,
     Clone,
@@ -71,7 +79,7 @@ pub enum ThinkingMode {
     /// Anthropic `thinking.type: "enabled"` + a `budget_tokens` mapped from
     /// [`Effort`] (e.g. Haiku 4.5).
     Budget,
-    /// OpenAI-style `reasoning.effort`.
+    /// OpenAI-style `reasoning.effort` / `reasoning_effort`.
     Effort,
     /// Do not request thinking.
     None,
@@ -93,7 +101,7 @@ impl ThinkingMode {
     pub fn default_for(protocol: Protocol) -> Self {
         match protocol {
             Protocol::AnthropicMessages => ThinkingMode::Adaptive,
-            Protocol::OpenAIResponses => ThinkingMode::Effort,
+            Protocol::OpenAIResponses | Protocol::OpenAICompletions => ThinkingMode::Effort,
         }
     }
 
@@ -106,7 +114,7 @@ impl ThinkingMode {
                     ThinkingMode::Adaptive | ThinkingMode::Budget | ThinkingMode::None
                 )
             }
-            Protocol::OpenAIResponses => {
+            Protocol::OpenAIResponses | Protocol::OpenAICompletions => {
                 matches!(self, ThinkingMode::Effort | ThinkingMode::None)
             }
         }
@@ -268,6 +276,7 @@ impl std::str::FromStr for Effort {
 pub enum BackendConfig {
     Anthropic(AnthropicBackendConfig),
     OpenAIResponses(OpenAIResponsesBackendConfig),
+    OpenAICompletions(OpenAICompletionsBackendConfig),
 }
 
 impl BackendConfig {
@@ -275,6 +284,7 @@ impl BackendConfig {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
             BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
+            BackendConfig::OpenAICompletions(_) => Protocol::OpenAICompletions,
         }
     }
 }
@@ -302,6 +312,10 @@ pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, Mo
         }
         BackendConfig::OpenAIResponses(backend) => {
             let model = openai_responses::OpenAIResponsesGenerativeModel::new(config, backend)?;
+            Ok(model as Arc<dyn GenerativeModel>)
+        }
+        BackendConfig::OpenAICompletions(backend) => {
+            let model = openai_completions::OpenAICompletionsGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
         }
     }
@@ -874,6 +888,13 @@ mod tests {
         assert!(ThinkingMode::None.compatible_with(Protocol::OpenAIResponses));
         assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAIResponses));
         assert!(!ThinkingMode::Budget.compatible_with(Protocol::OpenAIResponses));
+        // Both OpenAI dialects take the same effort-shaped thinking.
+        assert_eq!(
+            ThinkingMode::default_for(Protocol::OpenAICompletions),
+            ThinkingMode::Effort
+        );
+        assert!(ThinkingMode::None.compatible_with(Protocol::OpenAICompletions));
+        assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAICompletions));
     }
 
     #[test]
@@ -885,6 +906,10 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Protocol>(serde_json::json!("openai-responses")).unwrap(),
             Protocol::OpenAIResponses
+        );
+        assert_eq!(
+            serde_json::from_value::<Protocol>(serde_json::json!("openai-completions")).unwrap(),
+            Protocol::OpenAICompletions
         );
     }
 

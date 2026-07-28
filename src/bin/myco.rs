@@ -636,6 +636,12 @@ fn build_model(
             }
             c.effort = Some(effort);
         }
+        BackendConfig::OpenAICompletions(c) => {
+            if debug_dump_api_requests {
+                c.debug_dump_api_requests = true;
+            }
+            c.effort = Some(effort);
+        }
     }
 
     generative_model::new(GenerativeModelConfig {

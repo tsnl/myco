@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
     AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
-    OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
+    OpenAICompletionsBackendConfig, OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
 };
 use crate::harness::{
     AuthEntry, FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases,
@@ -361,7 +361,8 @@ fn resolve_catalog(
         if !thinking.compatible_with(protocol) {
             return Err(format!(
                 "model `{key}`: thinking `{thinking}` is not valid for protocol `{protocol}` \
-                 (anthropic-messages: adaptive|budget|none; openai-responses: effort|none)"
+                 (anthropic-messages: adaptive|budget|none; \
+                 openai-responses / openai-completions: effort|none)"
             ));
         }
 
@@ -400,6 +401,14 @@ fn resolve_catalog(
             }),
             Protocol::OpenAIResponses => {
                 BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig {
+                    base_url,
+                    auth_token: token,
+                    max_output_tokens: Some(max_output),
+                    ..Default::default()
+                })
+            }
+            Protocol::OpenAICompletions => {
+                BackendConfig::OpenAICompletions(OpenAICompletionsBackendConfig {
                     base_url,
                     auth_token: token,
                     max_output_tokens: Some(max_output),
@@ -606,6 +615,30 @@ context_window = 200_000
         let err = cfg.models.get("kimi-k3").unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
         assert!(err.contains("kimi-k3"), "{err}");
+    }
+
+    #[test]
+    fn openai_completions_protocol_gets_a_chat_completions_backend() {
+        let toml_text = r#"
+[models.local-qwen]
+protocol = "openai-completions"
+base_url = "http://localhost:11434/v1"
+thinking = "none"
+context_window = 32_768
+max_output_tokens = 4096
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        let entry = cfg.models.get("local-qwen").unwrap();
+        assert_eq!(entry.spec.protocol, Protocol::OpenAICompletions);
+        assert_eq!(entry.spec.thinking, ThinkingMode::None);
+        match &entry.backend {
+            BackendConfig::OpenAICompletions(b) => {
+                assert_eq!(b.base_url, "http://localhost:11434/v1");
+                assert_eq!(b.auth_token, "");
+                assert_eq!(b.max_output_tokens, Some(4096));
+            }
+            other => panic!("expected OpenAI Chat Completions backend, got {other:?}"),
+        }
     }
 
     #[test]

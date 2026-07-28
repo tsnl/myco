@@ -2,8 +2,8 @@
 use std::sync::Once;
 
 use myco::generative_model::{
-    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAIResponsesBackendConfig, Protocol,
-    ThinkingMode,
+    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAICompletionsBackendConfig,
+    OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
 };
 
 mod scripted_model;
@@ -60,6 +60,25 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
         auth_token: std::env::var("XAI_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .unwrap_or_default(),
+        ..Default::default()
+    });
+    (spec, backend)
+}
+
+/// Same OpenRouter model over the Chat Completions dialect
+/// (`{base_url}/chat/completions`) instead of Responses.
+pub fn live_openrouter_completions_kimi() -> (ModelSpec, BackendConfig) {
+    let spec = ModelSpec {
+        key: "kimi-k3".into(),
+        api_id: "moonshotai/kimi-k3".into(),
+        protocol: Protocol::OpenAICompletions,
+        thinking: ThinkingMode::Effort,
+        context_window_tokens: 1_000_000,
+    };
+    let backend = BackendConfig::OpenAICompletions(OpenAICompletionsBackendConfig {
+        base_url: std::env::var("OPENROUTER_BASE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
+        auth_token: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
         ..Default::default()
     });
     (spec, backend)
