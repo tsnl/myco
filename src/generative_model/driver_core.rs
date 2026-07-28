@@ -64,8 +64,17 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
 
     tokio::spawn(async move {
         let result = async {
-            let response = request
-                .send()
+            // Build first so the composed body can be measured: providers cap
+            // the whole request, and images accumulate in history, so a session
+            // can cross the cap turns after the attachment was sent. Rejecting
+            // here beats a 413 after a multi-megabyte upload.
+            let (client, request) = request.build_split();
+            let request = request.map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
+            if let Some(body) = request.body().and_then(|b| b.as_bytes()) {
+                check_request_size(body.len(), provider)?;
+            }
+            let response = client
+                .execute(request)
                 .await
                 .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
             let response = check_status(response, provider).await?;
@@ -84,6 +93,8 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
 
 /// Map a non-success HTTP status to an error carrying the response body
 /// (providers put the actionable detail in a JSON body, not the status line).
+/// A size rejection keeps its own variant so the caller rewinds rather than
+/// retrying a request that can only fail again.
 async fn check_status(
     response: reqwest::Response,
     provider: &str,
@@ -96,9 +107,10 @@ async fn check_status(
         .text()
         .await
         .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-    Err(GenerateError::ExecutionError(format!(
-        "{provider} API returned HTTP {status}: {body}"
-    )))
+    Err(http_error(
+        status,
+        format!("{provider} API returned HTTP {status}: {body}"),
+    ))
 }
 
 async fn drive_sse_stream<A: SseAccumulator>(

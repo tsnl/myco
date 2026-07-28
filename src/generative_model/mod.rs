@@ -936,6 +936,46 @@ mod tests {
         assert!(err.to_string().contains("speaks openai-responses"), "{err}");
     }
 
+    /// The preflight is the whole point of the rewind path: a request that is
+    /// too big must be refused *before* upload, and must say so in a way the
+    /// top level can act on.
+    #[test]
+    fn oversized_request_is_refused_before_upload() {
+        assert!(check_request_size(MAX_REQUEST_BYTES, "Anthropic").is_ok());
+
+        let err = check_request_size(MAX_REQUEST_BYTES + 1, "Anthropic").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::RequestTooLargeError(_)),
+            "{err:?}"
+        );
+        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+        assert!(err.to_string().contains("the limit is 30 MiB"), "{err}");
+    }
+
+    /// A provider that rejects the size itself lands on the same variant, so
+    /// the caller rewinds whether the cap was caught locally or remotely.
+    #[test]
+    fn provider_size_rejections_map_to_the_same_recovery() {
+        let too_large = http_error(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "HTTP 413: too big".into(),
+        );
+        assert_eq!(too_large.recovery(), Recovery::OmitLastMessage);
+
+        // Anthropic reports it as a 400 whose body names the error type.
+        let named = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"HTTP 400: {"error":{"type":"request_too_large"}}"#.into(),
+        );
+        assert_eq!(named.recovery(), Recovery::OmitLastMessage);
+
+        let unrelated = http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "HTTP 500: overloaded".into(),
+        );
+        assert_eq!(unrelated.recovery(), Recovery::Retry);
+    }
+
     #[test]
     fn message_types_serde_roundtrip() {
         let messages = vec![
@@ -980,6 +1020,34 @@ mod tests {
     }
 }
 
+/// What a caller can do about a failed turn.
+///
+/// Failures that are a property of the *history* cannot be fixed by trying
+/// again — every later turn resends that history and fails the same way, which
+/// wedges the session. This is the top-level signal for those: it says whether
+/// the last user message has to come back out (see
+/// [`crate::session::Agent::rewind_last_user_turn`]) before the conversation
+/// can continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Nothing about the history is known to be at fault; resubmitting as-is
+    /// may work (provider blip, refusal, malformed stream).
+    Retry,
+    /// The request is too big for the provider. Retrying unchanged fails
+    /// identically — drop the last user message (typically the one carrying an
+    /// oversized attachment) and the session can go on.
+    OmitLastMessage,
+}
+
+/// Ceiling on one serialized API request body, checked before upload.
+///
+/// Providers cap the whole request (Anthropic: 32 MB), not just each image, and
+/// attachments accumulate in history — so a session that was fine for several
+/// turns can cross the cap and then fail on *every* subsequent turn. Checking
+/// locally, with headroom under the provider's number, turns a confusing 413
+/// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
+pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
+
 #[derive(thiserror::Error, Debug)]
 pub enum GenerateError {
     #[error("Something went wrong while generating a response: {0}")]
@@ -990,4 +1058,50 @@ pub enum GenerateError {
 
     #[error("Generation succeeded, but the output was malformed or corrupted: {0}")]
     MalformedResponseError(String),
+
+    /// Request exceeds the provider's size limit — locally detected, or the
+    /// provider's own 413. Not retryable without shrinking the history.
+    #[error("The request is too large to send: {0}")]
+    RequestTooLargeError(String),
+}
+
+impl GenerateError {
+    pub fn recovery(&self) -> Recovery {
+        match self {
+            GenerateError::RequestTooLargeError(_) => Recovery::OmitLastMessage,
+            GenerateError::ExecutionError(_)
+            | GenerateError::RefusalError(_)
+            | GenerateError::MalformedResponseError(_) => Recovery::Retry,
+        }
+    }
+}
+
+/// Refuse a composed request body over [`MAX_REQUEST_BYTES`].
+///
+/// Takes the already-serialized length so the checked size is exactly the size
+/// uploaded — no second serialization pass over a multi-megabyte body.
+pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), GenerateError> {
+    if len > MAX_REQUEST_BYTES {
+        return Err(GenerateError::RequestTooLargeError(format!(
+            "the {provider} request is {:.1} MiB; the limit is {} MiB. \
+             Attached images stay in the conversation and add up — drop the last \
+             message (or start a new session) to get back under it",
+            len as f64 / (1024.0 * 1024.0),
+            MAX_REQUEST_BYTES / (1024 * 1024),
+        )));
+    }
+    Ok(())
+}
+
+/// Map a provider HTTP status to the right error variant: 413 (and the
+/// occasional 400 that names the size) is a size failure, not a generic one.
+pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
+    let too_large = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        || message.contains("request_too_large")
+        || message.contains("request too large");
+    if too_large {
+        GenerateError::RequestTooLargeError(message)
+    } else {
+        GenerateError::ExecutionError(message)
+    }
 }

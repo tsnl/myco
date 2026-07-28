@@ -10,7 +10,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Recovery,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -314,6 +314,13 @@ async fn run_print(args: Args) {
     sigint_task.abort();
     sink.finish();
 
+    // A too-large request would fail identically on every later turn of a
+    // resumed session; take the offending message back out before saving.
+    let rewound = match &result {
+        Err(e) if e.recovery() == Recovery::OmitLastMessage => agent.rewind_last_user_turn(),
+        _ => None,
+    };
+
     // Persist whatever history the agent has, including failed/cancelled turns.
     if let Err(e) = persist_session(&agent, &active_session, /*force*/ true) {
         eprintln!("warning: could not save session: {e}");
@@ -330,8 +337,29 @@ async fn run_print(args: Args) {
         }
         Err(e) => {
             eprintln!("myco: {e}");
+            if let Some(dropped) = rewound {
+                eprintln!(
+                    "myco: the last message was removed from the conversation so the session \
+                     can continue{}.",
+                    describe_dropped_images(&dropped)
+                );
+            }
             std::process::exit(1);
         }
+    }
+}
+
+/// Parenthetical naming the images a rewound message carried, for the notice
+/// that explains why it is gone. Empty when it carried none.
+fn describe_dropped_images(dropped: &[Content]) -> String {
+    match dropped
+        .iter()
+        .filter(|c| matches!(c, Content::Image { .. }))
+        .count()
+    {
+        0 => String::new(),
+        1 => " (it carried 1 image)".into(),
+        n => format!(" (it carried {n} images)"),
     }
 }
 
@@ -948,7 +976,21 @@ impl ReplSession {
                 // stream via TurnFinished). Generate failures (context overflow,
                 // provider errors) are live-only — not stored in session history —
                 // so resume/Ctrl-L will not replay them.
-                self.ui.error_section(&e.to_string());
+                let mut message = e.to_string();
+                // A too-large request fails identically on every later turn,
+                // because every later turn resends it. Rewind the offending
+                // message out of history here rather than leaving the session
+                // unable to continue.
+                if e.recovery() == Recovery::OmitLastMessage
+                    && let Some(dropped) = self.agent.rewind_last_user_turn()
+                {
+                    message.push_str(&format!(
+                        "\n\nThe last message was removed from the conversation so the session \
+                         can continue{}.",
+                        describe_dropped_images(&dropped)
+                    ));
+                }
+                self.ui.error_section(&message);
                 self.ui.blank_line();
             }
         }

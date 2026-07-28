@@ -27,12 +27,27 @@ which reports key modifiers.)
 Mentioning `@<path>` in a message attaches that file as image input (extensions
 png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the
 file's magic number, so a mislabeled file is caught here rather than by the
-provider; up to 5 MiB each; whitespace-delimited, so paths with spaces are
-unsupported; `~/` expands). The text is sent exactly as typed — the `@` mentions
-stay in it — and a `[N image(s) attached]` note prints directly under the
-wrapped input, identical live and in replay (`/resume`, Ctrl-L); the image bytes
-are never printed. A bad path or a file that is not really an image opens an
-ERROR section before the model is called; nothing is silently dropped.
+provider; whitespace-delimited, so paths with spaces are unsupported; `~/`
+expands). The text is sent exactly as typed — the `@` mentions stay in it — and
+a `[N image(s) attached]` note prints directly under the wrapped input,
+identical live and in replay (`/resume`, Ctrl-L); the image bytes are never
+printed. A bad path or a file that is not really an image opens an ERROR
+section before the model is called; nothing is silently dropped.
+
+Size limits are measured on the **base64 payload uploaded**, which is 4/3 of the
+file on disk: 5 MiB per image (so ~3.75 MiB on disk, and the same cap applies to
+`view_image`) and 20 MiB of attachments per message. myco does not re-encode
+images — an oversized file is rejected with both sizes named, so downscale it
+and resubmit.
+
+Images stay in the conversation, so a session accumulates them and can cross the
+provider's **whole-request** cap (Anthropic: 32 MB) turns after the attachment
+was sent. myco checks each composed request against a 30 MiB ceiling before
+uploading it, and maps the provider's own 413 to the same failure. That failure
+is not retryable — every later turn resends the same history — so myco **rewinds
+the last user message out of the conversation** and says so in the ERROR
+section. The session continues; re-send the message with a smaller image, or
+`/compact` (or `/new`) to shed history.
 
 ### Session browser
 
