@@ -106,9 +106,17 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
       ordinary tools; `workspace/soul/` holds maildir-style write-once soul
       snapshots, and the newest is appended verbatim to every agent system
-      prompt at model build time. Replaced the earlier root-only `memory`
-      tool (structured UUID-keyed entries + dedicated search) — (REJECT) that
-      abstraction: plain files the agent organizes itself cover the same need.
+      prompt at model build time, followed by a bounded `# Workspace Files`
+      listing (path, UTC day, title) of everything else there. Replaced the
+      earlier root-only `memory` tool (structured UUID-keyed entries +
+      dedicated search) — (REJECT) that abstraction: plain files the agent
+      organizes itself cover the same need.
+- [ ] **Workspace recall follow-up** — a second appended fragment (e.g. newest
+      snapshot in `workspace/pin/`) if working-set churn starts forcing soul
+      revisions often enough to cost forks their cached prompt prefix. Deferred
+      until there is evidence: one prompt-resident memory beats two. Past the
+      listing, recall is `rg` over `~/.myco/workspace/` like any other tree —
+      search tooling stays cut.
 
 ---
 
