@@ -43,7 +43,7 @@ myco (interactive) / Agent
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt (see below). |
+| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
 top-level keys must come before the tables, per TOML):
@@ -179,6 +179,19 @@ A version longer than `max_soul_bytes` (config.toml; default 65536 = 64 KiB) is
 cut to that many bytes with a marker in the prompt, and startup opens a WARNING
 naming the version and both sizes — a soul silently losing its tail is otherwise
 invisible. Raise the knob or write a shorter revision.
+
+The rest of the workspace is listed, not quoted: a `# Workspace Files` section
+gives each visible file's path (relative to `workspace/`), the UTC day it last
+changed, and its title (first markdown heading, else first non-empty line). Hidden
+names, symlinks, `soul/` itself, and binary titles are skipped; the walk and the
+rendered block are bounded (4 levels, 200 files, 8 KiB) with a marker when files
+are left out. The prompt's appended blocks run least to most volatile — soul,
+then project guidance, then this listing — and the listing uses days rather than
+timestamps and path order rather than recency, so ordinary workspace writes leave
+the shared prompt prefix intact for same-model forks. The prompt fragment asks the
+agent to keep the soul an index over these files — a dated one-line distillation
+plus a pointer per entry, pruned on every revision — so recall does not depend on
+the agent remembering to look.
 
 ## Product limits (V1)
 

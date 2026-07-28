@@ -5,6 +5,10 @@
 //! [`crate::manual`] and are browsed via the `manual` host tool /
 //! `myco --help [id]`.
 
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+
 /// Epilogue appended to every agent system prompt.
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
     r#"
@@ -177,11 +181,11 @@ fn human_bytes(n: usize) -> String {
 }
 
 /// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
-/// `MYCO_HOME`, capped at `max_soul_bytes`) and the launch directory's project
-/// guidance (`AGENTS.md` / `CLAUDE.md`), when present. Read at model build
-/// time — session start, model switch, each worker spawn — so a running
-/// agent's prompt never changes mid-conversation and the cached conversation
-/// prefix stays valid.
+/// `MYCO_HOME`, capped at `max_soul_bytes`), the launch directory's project
+/// guidance (`AGENTS.md` / `CLAUDE.md`), and a listing of the rest of the
+/// workspace, when present. Read at model build time — session start, model
+/// switch, each worker spawn — so a running agent's prompt never changes
+/// mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
     epilogue_with(
         crate::session::myco_home().ok(),
@@ -203,8 +207,8 @@ pub fn soul_truncation(max_soul_bytes: usize) -> Option<SoulTruncation> {
 /// lexicographically last visible `*.md` in `workspace/soul/`. Versions are
 /// write-once maildir-style files, so "newest name wins" is the whole
 /// contract — a whitespace-only newest version reads as "no soul".
-fn latest_soul(dir: &std::path::Path) -> Option<(String, String)> {
-    let mut versions: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(dir)
+fn latest_soul(dir: &Path) -> Option<(String, String)> {
+    let mut versions: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|entry| {
@@ -269,14 +273,22 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 
 /// [`agent_prompt_epilogue`] against explicit dirs, so tests need no
 /// process-global `MYCO_HOME` / cwd override.
+///
+/// Blocks are ordered least to most volatile, because every agent's prompt
+/// carries them as a prefix: the soul changes only on a deliberate revision,
+/// project guidance only when the repo's own file does, while any new workspace
+/// file rewrites the listing. Keeping the churniest block last leaves the
+/// longest shared prefix for same-model forks to hit in the prompt cache.
 fn epilogue_with(
     home: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
     max_soul_bytes: usize,
 ) -> String {
+    let workspace = home.map(|home| home.join("workspace"));
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
-    let soul =
-        home.and_then(|home| capped_soul(&home.join("workspace").join("soul"), max_soul_bytes));
+    let soul = workspace
+        .as_deref()
+        .and_then(|ws| capped_soul(&ws.join("soul"), max_soul_bytes));
     if let Some((name, soul, _)) = soul {
         prompt.push_str(&format!(
             "\n---\n\n# Soul\n\n(current version: soul/{name})\n\n{soul}\n"
@@ -292,7 +304,177 @@ fn epilogue_with(
             "\n---\n\n# Project guidance ({name})\n\n{guidance}\n"
         ));
     }
+    if let Some(listing) = workspace.as_deref().and_then(workspace_listing) {
+        prompt.push_str(&listing);
+    }
     prompt
+}
+
+/// Bounds on the workspace listing. A workspace can hold anything, so the
+/// prompt cost is capped here rather than by asking the agent to delete notes.
+const MAX_LISTING_BYTES: usize = 8 * 1024;
+const MAX_LISTING_ENTRIES: usize = 200;
+/// Nested layout is the agent's business, but an unbounded walk is not.
+const MAX_LISTING_DEPTH: u32 = 4;
+/// Files stat'd before the walk gives up, so a huge tree cannot stall startup.
+const MAX_LISTING_SCAN: usize = 4_000;
+/// Enough of each file to reach its first heading without reading the body.
+const TITLE_PROBE_BYTES: usize = 512;
+const MAX_TITLE_CHARS: usize = 80;
+
+/// A `# Workspace Files` section: one line per workspace file, giving its path
+/// relative to `workspace/`, the UTC day it last changed, and its title.
+///
+/// This is the read side of the workspace. A file the agent has forgotten is a
+/// file it will not open, so the listing makes existence free to check while
+/// leaving contents to a deliberate read.
+///
+/// Two choices keep the block cache-stable, since it lands in every agent's
+/// prompt prefix: days rather than timestamps (repeated writes to a file
+/// already listed as today change nothing), and path order rather than recency
+/// (touching one file cannot reshuffle the block). `soul/` is skipped — the
+/// live version is already quoted above, and its superseded siblings are noise.
+fn workspace_listing(workspace: &Path) -> Option<String> {
+    let mut entries = Vec::new();
+    collect_listing(workspace, workspace, 0, &mut entries);
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort();
+
+    let total = entries.len();
+    let mut body = String::new();
+    let mut shown = 0usize;
+    for (path, day, title) in entries {
+        let line = match title {
+            Some(title) => format!("- `{path}` — {day} — {title}\n"),
+            None => format!("- `{path}` — {day}\n"),
+        };
+        if shown == MAX_LISTING_ENTRIES || body.len() + line.len() > MAX_LISTING_BYTES {
+            break;
+        }
+        body.push_str(&line);
+        shown += 1;
+    }
+    // "at least", because the walk itself stops at MAX_LISTING_SCAN.
+    if shown < total {
+        body.push_str(&format!(
+            "\n[at least {} more file(s) not listed — consolidate the workspace]\n",
+            total - shown
+        ));
+    }
+
+    Some(format!(
+        "\n---\n\n# Workspace Files\n\nUnder `~/.myco/workspace/` — path, UTC day \
+         last changed, title. A listing, not the contents: read the files that \
+         touch your task.\n\n{body}"
+    ))
+}
+
+/// Walk `dir`, pushing `(relative path, day, title)` per visible regular file.
+/// Hidden names are skipped (in-progress writes use them) and symlinks are
+/// never followed, matching skill discovery.
+fn collect_listing(
+    root: &Path,
+    dir: &Path,
+    depth: u32,
+    out: &mut Vec<(String, String, Option<String>)>,
+) {
+    if depth > MAX_LISTING_DEPTH || out.len() >= MAX_LISTING_SCAN {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut subdirs = Vec::new();
+    for entry in read.flatten() {
+        // Also inside the loop: one flat directory can hold more files than the
+        // whole scan budget, and each costs a stat plus a title probe.
+        if out.len() >= MAX_LISTING_SCAN {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if name.starts_with('.') || file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if depth == 0 && name == "soul" {
+                continue;
+            }
+            subdirs.push(entry.path());
+        } else if file_type.is_file() {
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let day = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|at| DateTime::<Utc>::from(at).format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            out.push((
+                relative.to_string_lossy().to_string(),
+                day,
+                file_title(&path),
+            ));
+        }
+    }
+
+    for sub in subdirs {
+        collect_listing(root, &sub, depth + 1, out);
+    }
+}
+
+/// First markdown heading in the file's opening bytes, else its first
+/// non-empty line. `None` when the head holds neither (binaries, blank files).
+fn file_title(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut head = vec![0u8; TITLE_PROBE_BYTES];
+    let mut file = std::fs::File::open(path).ok()?;
+    let read = file.read(&mut head).ok()?;
+    head.truncate(read);
+    // A NUL in the head means binary; nothing quotable, and a lossy decode
+    // would spray control bytes through every agent's prompt.
+    if head.contains(&0) {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&head);
+
+    let mut first_line = None;
+    for line in head.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(heading) = line.strip_prefix('#') {
+            if let Some(title) = clean_title(heading.trim_start_matches('#').trim()) {
+                return Some(title);
+            }
+            continue;
+        }
+        first_line = first_line.or(Some(line));
+    }
+    first_line.and_then(clean_title)
+}
+
+/// Title with control characters dropped and length capped. `None` when
+/// nothing printable survives, so the line renders as path and day alone.
+fn clean_title(title: &str) -> Option<String> {
+    let printable: String = title.chars().filter(|c| !c.is_control()).collect();
+    let printable = printable.trim();
+    if printable.is_empty() {
+        return None;
+    }
+    let mut clamped: String = printable.chars().take(MAX_TITLE_CHARS).collect();
+    if clamped.chars().count() < printable.chars().count() {
+        clamped.push('…');
+    }
+    Some(clamped)
 }
 
 #[cfg(test)]
@@ -324,7 +506,6 @@ mod tests {
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/soul/"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("write-once, never edited in place"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("consult and maintain them often"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
     }
 
@@ -357,6 +538,21 @@ mod tests {
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The soul is prompt-resident, so the fragment has to say what earns a
+    /// place there (distilled dated pointers), what keeps it honest (prune on
+    /// every add, evidence over prompt), and that the listing exists to read
+    /// from.
+    #[test]
+    fn workspace_fragment_biases_toward_recording_and_pruning() {
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("index over the workspace"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("distilled line and the pointer"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Date every line"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Every revision that adds also prunes"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Evidence beats the prompt"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`# Workspace Files` section"));
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("read the listed files"));
     }
 
     #[test]
@@ -475,9 +671,90 @@ mod tests {
     }
 
     #[test]
+    fn workspace_listing_names_visible_files_after_the_soul() {
+        let dir = std::env::temp_dir().join(format!("myco-listing-{}", uuid::Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        let soul_dir = workspace.join("soul");
+        std::fs::create_dir_all(&soul_dir).unwrap();
+        std::fs::create_dir_all(workspace.join("notes")).unwrap();
+
+        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "soul_token_alpha\n").unwrap();
+        std::fs::write(
+            workspace.join("notes").join("devbox.md"),
+            "# Devbox build gotchas\n\nthe long material\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("scratch.txt"), "\n\nfirst line wins\n").unwrap();
+        std::fs::write(workspace.join(".tmp-draft.md"), "# hidden_token\n").unwrap();
+        std::fs::write(workspace.join("index.bin"), b"\x00\x01binary_token\n").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "agents_guidance_token\n").unwrap();
+
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()), DEFAULT_MAX_SOUL_BYTES);
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+
+        // Churniest block last: a new workspace file must not invalidate the
+        // soul's or the guidance's share of the cached prefix. Anchor on the
+        // `---` delimiter — the fragment names both headings in its own prose.
+        let block_at = |heading: &str| prompt.find(&format!("\n---\n\n{heading}")).unwrap();
+        let listing_at = block_at("# Workspace Files\n");
+        assert!(block_at("# Soul\n") < listing_at, "{prompt}");
+        assert!(block_at("# Project guidance (") < listing_at, "{prompt}");
+
+        // Path relative to workspace/, UTC day, first heading as the title.
+        assert!(
+            prompt.contains(&format!(
+                "- `notes/devbox.md` — {today} — Devbox build gotchas\n"
+            )),
+            "{prompt}"
+        );
+        // No heading: the first non-empty line stands in.
+        assert!(
+            prompt.contains(&format!("- `scratch.txt` — {today} — first line wins\n")),
+            "{prompt}"
+        );
+        // A binary file is still worth knowing about, but nothing in it is
+        // quotable — path and day, no title, no control bytes in the prompt.
+        assert!(
+            prompt.contains(&format!("- `index.bin` — {today}\n")),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("binary_token"), "{prompt}");
+
+        // The live soul is already quoted above and superseded versions are
+        // noise; hidden names are writes still in flight.
+        assert!(!prompt.contains("- `soul/"), "{prompt}");
+        assert!(!prompt.contains("hidden_token"), "{prompt}");
+        assert!(!prompt.contains(".tmp-draft.md"), "{prompt}");
+        // AGENTS.md is the launch directory's, not the workspace's.
+        assert!(!prompt.contains("- `AGENTS.md`"), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn byte_counts_read_as_sizes() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(64 * 1024), "64 KiB");
         assert_eq!(human_bytes(132_000), "128.9 KiB");
+    }
+
+    #[test]
+    fn oversized_workspace_listing_is_capped_with_a_marker() {
+        let dir = std::env::temp_dir().join(format!("myco-listing-cap-{}", uuid::Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let overflow = 25;
+        for i in 0..(MAX_LISTING_ENTRIES + overflow) {
+            std::fs::write(workspace.join(format!("n-{i:03}.md")), "# t\n").unwrap();
+        }
+
+        let prompt = epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
+        assert!(
+            prompt.contains(&format!("[at least {overflow} more file(s) not listed")),
+            "{prompt}"
+        );
+        assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_LISTING_BYTES + 500);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
