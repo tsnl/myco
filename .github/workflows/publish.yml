@@ -135,7 +135,7 @@ jobs:
           ```
 
           Platform-matched binaries are not attached here yet; build on the target
-          host (MiniLM weights are baked in at compile time). See `myco --help harness-ops`.
+          host. See `myco --help harness-ops`.
           BOILERPLATE
 
       - name: Create GitHub Release

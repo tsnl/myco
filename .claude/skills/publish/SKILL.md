@@ -165,5 +165,4 @@ Source of truth: `.github/workflows/publish.yml`.
 
 - Attaching multi-platform binary assets (not in the workflow yet; document
   source/install only).
-- Publishing `crates/myco-gui` (not part of the root package publish).
 - Live LLM integration tests (ignored in CI; unrelated to release).

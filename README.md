@@ -39,7 +39,7 @@ semantic code search).
 
 ```bash
 myco    # runs the default model from your config.toml; --model <key> to switch
-myco -p "explain build.rs"        # print mode: one turn, answer on stdout, exit
+myco -p "explain src/host/protocol.rs"   # print mode: one turn, answer on stdout, exit
 git diff | myco -p "review this"  # piped stdin becomes context for the prompt
 ```
 
