@@ -178,6 +178,11 @@ fn format_stats(session: &Session) -> String {
     )
 }
 
+/// Total-output cap for `range`: the per-message `max_chars` alone lets a
+/// whole-session range emit ~1 MB — on exactly the long sessions this tool
+/// serves (compaction workers). Stop honestly instead.
+const RANGE_TOTAL_CHARS: usize = 64_000;
+
 fn format_range(session: &Session, start: usize, end: usize, max_chars: usize) -> String {
     let n = session.messages.len();
     let start = start.min(n);
@@ -185,6 +190,13 @@ fn format_range(session: &Session, start: usize, end: usize, max_chars: usize) -
     let mut out = format!("messages [{start}, {end}) of {n}  (max_chars={max_chars})\n");
     for (i, msg) in session.messages[start..end].iter().enumerate() {
         let idx = start + i;
+        if out.len() >= RANGE_TOTAL_CHARS {
+            out.push_str(&format!(
+                "\n(stopped at index {idx} of requested [{start}, {end}) — total output cap \
+                 {RANGE_TOTAL_CHARS} chars reached; narrow the range or lower max_chars)\n"
+            ));
+            return out;
+        }
         out.push_str(&format!("\n--- [{idx}] {} ---\n", message_kind(msg)));
         out.push_str(&preview_message(msg, max_chars));
         out.push('\n');
@@ -398,5 +410,28 @@ mod tests {
         }
         // `format!` must not have swallowed the literal `{id}` placeholder.
         assert!(d.contains("{id}.summary.md"), "{d}");
+    }
+
+    /// A whole-session range on a long session must stop at the total cap
+    /// with an honest marker, not emit ~1 MB into the caller's context.
+    #[test]
+    fn range_stops_at_total_output_cap() {
+        use crate::generative_model::{Content, Message};
+        let mut session = crate::session::Session::new("test-model");
+        for i in 0..200 {
+            session.messages.push(Message::UserMessage {
+                content: vec![Content::Text {
+                    text: format!("msg {i}: {}", "x".repeat(2_000)),
+                }],
+            });
+        }
+        let out = format_range(&session, 0, session.messages.len(), 2_000);
+        assert!(
+            out.len() < RANGE_TOTAL_CHARS + 4_000,
+            "output should stop near the cap, got {} chars",
+            out.len()
+        );
+        assert!(out.contains("stopped at index"), "{}", &out[..200]);
+        assert!(out.contains("narrow the range"), "missing hint");
     }
 }
