@@ -7,8 +7,7 @@
 //! [`ExternalCommand::command`] / [`ExternalCommand::tokio_command`], never
 //! `Command::new("literal")` — so a new external process cannot skip the
 //! registry or the preflight (enforced by the
-//! `every_literal_spawn_goes_through_the_registry` test). `build.rs` programs
-//! are out of scope: build scripts cannot use the crate.
+//! `every_literal_spawn_goes_through_the_registry` test).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

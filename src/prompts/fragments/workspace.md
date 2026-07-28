@@ -35,7 +35,7 @@ to have. Make it an index over the workspace, not the archive:
   that worked, the shape of a subsystem. A file can be long, and a uniquely
   named one cannot collide with a concurrent agent's write.
 - **The soul carries the distilled line and the pointer.** `2026-07-22 —
-  devbox builds hang unless MYCO_EMBED_OFFLINE=1 → notes/devbox-build.md`. One
+  devbox builds OOM at the default job count, use `-j4` → notes/devbox-build.md`. One
   line is enough to recognize the situation when it recurs; the file has the rest.
 - **Date every line.** An old date marks something to re-verify, not a fact to
   act on.
