@@ -84,7 +84,7 @@ referenced gateway; a model may also inline all three and skip `gateway`.
 
 ```toml
 [gateways.anthropic]
-protocol = "anthropic-messages"        # or "openai-responses"
+protocol = "anthropic-messages"        # {base_url}/v1/messages
 base_url = "https://api.anthropic.com"
 auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 
@@ -92,6 +92,10 @@ auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 protocol = "openai-responses"          # requests go to {base_url}/responses
 base_url = "https://openrouter.ai/api/v1"
 auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
+
+[gateways.ollama]
+protocol = "openai-completions"        # requests go to {base_url}/chat/completions
+base_url = "http://localhost:11434/v1"
 
 [models.claude-opus-4-8]
 gateway = "anthropic"
@@ -108,15 +112,28 @@ api_id = "moonshotai/kimi-k3"          # wire id; defaults to the key
 context_window = 1_000_000
 
 [models.local-qwen]                    # inline, no gateway ref; no auth
-protocol = "openai-responses"
+protocol = "openai-completions"
 base_url = "http://localhost:11434/v1"
+api_id = "qwen3:8b"
+thinking = "none"                      # no reasoning: don't send an effort
 context_window = 32768
 ```
+
+Pick the protocol by what the endpoint serves: `openai-responses` for the
+Responses API (`{base_url}/responses` — OpenAI, xAI, OpenRouter),
+`openai-completions` for the older Chat Completions dialect
+(`{base_url}/chat/completions`) that llama.cpp, Ollama, vLLM, LM Studio,
+DeepSeek, Groq and friends speak. Chat Completions has no reasoning-summary
+channel, so thinking there comes from the provider's `reasoning_content` /
+`reasoning` deltas (nothing shown when a server sends neither), the output cap
+goes out as `max_completion_tokens`, and a tool result's images follow in a
+user message because a `tool` message may only carry text.
 
 Per-model fields: `api_id` (wire id, defaults to the key), required
 `context_window` (drives `USER n/m` + auto-compact), `thinking`
 (`anthropic-messages`: `adaptive` (default) | `budget` | `none`;
-`openai-responses`: `effort` (default) | `none`), `max_output_tokens`
+`openai-responses` / `openai-completions`: `effort` (default) | `none` — use
+`none` for models that reject a reasoning effort), `max_output_tokens`
 (default 8192).
 
 **Auth** is per gateway, overridable per model. The `auth` value is either

@@ -4,6 +4,7 @@ use futures::StreamExt;
 use myco::generative_model::{Content, GenerateOutput, GenerativeModel, Message, TurnEndReason};
 
 mod anthropic;
+mod openai_completions;
 mod openai_responses;
 
 /// Multi-turn messaging smoke test against any dyn GenerativeModel.

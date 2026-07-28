@@ -2,14 +2,15 @@
 use std::sync::Once;
 
 use myco::generative_model::{
-    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAIResponsesBackendConfig, Protocol,
-    ThinkingMode,
+    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAIBackendConfig, Protocol, ThinkingMode,
 };
 
 mod scripted_model;
+mod stub_http_server;
 mod transcript;
 
 pub use scripted_model::ScriptedModel;
+pub use stub_http_server::StubHttpServer;
 pub use transcript::format_transcript;
 
 static INIT: Once = Once::new();
@@ -53,7 +54,7 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
         thinking: ThinkingMode::Effort,
         context_window_tokens: 500_000,
     };
-    let backend = BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig {
+    let backend = BackendConfig::OpenAIResponses(OpenAIBackendConfig {
         base_url: std::env::var("XAI_API_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| "https://api.x.ai/v1".into()),
@@ -65,19 +66,26 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
     (spec, backend)
 }
 
-pub fn live_openrouter_kimi() -> (ModelSpec, BackendConfig) {
+/// One OpenRouter model over either OpenAI dialect — the same gateway serves
+/// `/responses` and `/chat/completions`, so `protocol` picks which driver the
+/// test exercises.
+pub fn live_openrouter_kimi(protocol: Protocol) -> (ModelSpec, BackendConfig) {
     let spec = ModelSpec {
         key: "kimi-k3".into(),
         api_id: "moonshotai/kimi-k3".into(),
-        protocol: Protocol::OpenAIResponses,
+        protocol,
         thinking: ThinkingMode::Effort,
         context_window_tokens: 1_000_000,
     };
-    let backend = BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig {
+    let openai = OpenAIBackendConfig {
         base_url: std::env::var("OPENROUTER_BASE_URL")
             .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
         auth_token: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
         ..Default::default()
-    });
+    };
+    let backend = match protocol {
+        Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
+        _ => BackendConfig::OpenAIResponses(openai),
+    };
     (spec, backend)
 }

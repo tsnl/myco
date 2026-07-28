@@ -1,5 +1,5 @@
 use super::*;
-use myco::generative_model::GenerativeModelConfig;
+use myco::generative_model::{GenerativeModelConfig, Protocol};
 
 #[tokio::test]
 #[ignore = "live provider API; needs XAI_API_KEY; run with: cargo test -- --ignored"]
@@ -23,7 +23,7 @@ async fn test_openai_responses_model_messaging() {
 async fn test_openrouter_model_messaging() {
     crate::test_utils::load_dotenv();
 
-    let (spec, backend) = crate::test_utils::live_openrouter_kimi();
+    let (spec, backend) = crate::test_utils::live_openrouter_kimi(Protocol::OpenAIResponses);
     let model = myco::generative_model::new(GenerativeModelConfig {
         model: spec,
         tools: Vec::new(),

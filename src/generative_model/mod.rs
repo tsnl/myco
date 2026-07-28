@@ -9,8 +9,11 @@ pub use anthropic::AnthropicBackendConfig;
 
 mod driver_core;
 
+mod openai_common;
+pub use openai_common::OpenAIBackendConfig;
+
+mod openai_completions;
 mod openai_responses;
-pub use openai_responses::OpenAIResponsesBackendConfig;
 
 mod sse_parser;
 use sse_parser::SseParser;
@@ -38,6 +41,8 @@ pub enum Protocol {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAIResponses,
+    #[serde(rename = "openai-completions")]
+    OpenAICompletions,
 }
 
 impl std::fmt::Display for Protocol {
@@ -45,6 +50,7 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::AnthropicMessages => f.write_str("anthropic-messages"),
             Protocol::OpenAIResponses => f.write_str("openai-responses"),
+            Protocol::OpenAICompletions => f.write_str("openai-completions"),
         }
     }
 }
@@ -95,7 +101,7 @@ impl ThinkingMode {
     pub fn default_for(protocol: Protocol) -> Self {
         match protocol {
             Protocol::AnthropicMessages => ThinkingMode::Adaptive,
-            Protocol::OpenAIResponses => ThinkingMode::Effort,
+            Protocol::OpenAIResponses | Protocol::OpenAICompletions => ThinkingMode::Effort,
         }
     }
 
@@ -108,7 +114,7 @@ impl ThinkingMode {
                     ThinkingMode::Adaptive | ThinkingMode::Budget | ThinkingMode::None
                 )
             }
-            Protocol::OpenAIResponses => {
+            Protocol::OpenAIResponses | Protocol::OpenAICompletions => {
                 matches!(self, ThinkingMode::Effort | ThinkingMode::None)
             }
         }
@@ -269,7 +275,10 @@ impl std::str::FromStr for Effort {
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
     Anthropic(AnthropicBackendConfig),
-    OpenAIResponses(OpenAIResponsesBackendConfig),
+    /// Responses API (`{base_url}/responses`).
+    OpenAIResponses(OpenAIBackendConfig),
+    /// Chat Completions API (`{base_url}/chat/completions`).
+    OpenAICompletions(OpenAIBackendConfig),
 }
 
 impl BackendConfig {
@@ -277,6 +286,7 @@ impl BackendConfig {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
             BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
+            BackendConfig::OpenAICompletions(_) => Protocol::OpenAICompletions,
         }
     }
 }
@@ -304,6 +314,10 @@ pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, Mo
         }
         BackendConfig::OpenAIResponses(backend) => {
             let model = openai_responses::OpenAIResponsesGenerativeModel::new(config, backend)?;
+            Ok(model as Arc<dyn GenerativeModel>)
+        }
+        BackendConfig::OpenAICompletions(backend) => {
+            let model = openai_completions::OpenAICompletionsGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
         }
     }
@@ -867,6 +881,13 @@ mod tests {
         assert!(ThinkingMode::None.compatible_with(Protocol::AnthropicMessages));
         assert!(!ThinkingMode::Effort.compatible_with(Protocol::AnthropicMessages));
         assert!(ThinkingMode::None.compatible_with(Protocol::OpenAIResponses));
+        // Both OpenAI dialects take the same effort-shaped thinking.
+        assert_eq!(
+            ThinkingMode::default_for(Protocol::OpenAICompletions),
+            ThinkingMode::Effort
+        );
+        assert!(ThinkingMode::None.compatible_with(Protocol::OpenAICompletions));
+        assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAICompletions));
         assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAIResponses));
         assert!(!ThinkingMode::Budget.compatible_with(Protocol::OpenAIResponses));
     }
@@ -880,6 +901,10 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Protocol>(serde_json::json!("openai-responses")).unwrap(),
             Protocol::OpenAIResponses
+        );
+        assert_eq!(
+            serde_json::from_value::<Protocol>(serde_json::json!("openai-completions")).unwrap(),
+            Protocol::OpenAICompletions
         );
     }
 
@@ -910,7 +935,7 @@ mod tests {
     fn catalog_get_reports_deferred_auth_error() {
         let entry = CatalogModel {
             spec: spec("kimi", Protocol::OpenAIResponses),
-            backend: BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig::default()),
+            backend: BackendConfig::OpenAIResponses(OpenAIBackendConfig::default()),
             auth_error: Some("model `kimi`: auth env:OPENROUTER_API_KEY is unset".into()),
         };
         let catalog = ModelCatalog::new([("kimi".to_string(), entry)].into());
