@@ -1,221 +1,42 @@
-//! OpenAI Responses API backend (also used by xAI / Grok and OpenRouter gateways).
+//! Responses dialect (`{base_url}/responses`): OpenAI, xAI / Grok, OpenRouter.
 //!
 //! Ref: https://platform.openai.com/docs/api-reference/responses
 //! Streaming: https://platform.openai.com/docs/guides/streaming-responses?api-mode=responses
 //! xAI: https://docs.x.ai/docs/guides/function-calling
 //! OpenRouter: https://openrouter.ai/docs/api/api-reference/responses/create-responses
+//!
+//! Only reasoning *summaries* (`reasoning_summary_text`) become
+//! [`Content::Thinking`]; raw `reasoning_text` streams are ignored.
 
-use std::sync::Arc;
-
-use crate::core::*;
-
-use super::openai_common::{image_url, images_of, text_of, tool_result_text};
 use super::*;
 
-/// OpenAI Responses API settings ([`BackendConfig::OpenAIResponses`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OpenAIResponsesBackendConfig {
-    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1` or
-    /// `https://openrouter.ai/api/v1`. Requests go to `{base_url}/responses`.
-    pub base_url: String,
-    pub auth_token: String,
-    pub max_output_tokens: Option<usize>,
-    pub debug_dump_api_requests: bool,
-    /// When set, request provider reasoning/thinking at this effort.
-    ///
-    /// OpenAI-style gateways may honor `reasoning.effort`; others may ignore it.
-    /// Only reasoning *summaries* (`reasoning_summary_text`) are mapped to
-    /// [`Content::Thinking`]; raw `reasoning_text` streams are ignored.
-    /// Defaults to [`Effort::DEFAULT`] so reasoning is always requested.
-    pub effort: Option<Effort>,
-}
-
-impl Default for OpenAIResponsesBackendConfig {
-    fn default() -> Self {
-        Self {
-            // No built-in gateway: the catalog (config.toml) supplies base_url.
-            base_url: String::new(),
-            auth_token: String::new(),
-            max_output_tokens: Some(8192),
-            debug_dump_api_requests: false,
-            effort: Some(Effort::DEFAULT),
-        }
-    }
-}
-
-/// Stateless OpenAI Responses driver. Conversation history is owned by the caller.
-pub struct OpenAIResponsesGenerativeModel {
-    model: ModelSpec,
-    system_prompt: String,
-    tools: Vec<ResponsesTool>,
-    backend: OpenAIResponsesBackendConfig,
-    client: reqwest::Client,
-}
-
-impl OpenAIResponsesGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: OpenAIResponsesBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.protocol != Protocol::OpenAIResponses {
-            return Err(ModelCreationError::BadConfig(format!(
-                "model `{}` speaks {}, not {}",
-                config.model,
-                config.model.protocol,
-                Protocol::OpenAIResponses
-            )));
-        }
-
-        let mut headers = reqwest::header::HeaderMap::from_iter([(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        )]);
-        // Empty token = `auth = "none"` in the catalog (local servers); send no
-        // Authorization header. Credential *presence* is the catalog's job
-        // (`ModelCatalog::get`), not the driver's.
-        if !backend.auth_token.is_empty() {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                // Never echo the token into the error: it ends up in logs.
-                format!("Bearer {}", backend.auth_token)
-                    .parse()
-                    .map_err(|e| {
-                        ModelCreationError::BadConfig(format!(
-                            "auth token is not a valid HTTP header value: {e}"
-                        ))
-                    })?,
-            );
-        }
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
-
-        let tools = config
-            .tools
-            .into_iter()
-            .map(|spec| ResponsesTool {
-                type_: "function".into(),
-                name: spec.name,
-                description: spec.description,
-                parameters: spec.input_schema,
-            })
-            .collect();
-
-        Ok(Arc::new(Self {
-            model: config.model,
-            system_prompt: config.system_prompt,
-            tools,
-            backend,
-            client,
-        }))
-    }
-
-    async fn start_response_stream(
-        &self,
-        input: &[ResponsesInputItem],
-    ) -> Result<reqwest::Response, GenerateError> {
-        // Best-effort enablement across OpenAI-compatible gateways.
-        // Unknown fields are typically ignored by servers that don't support
-        // them — but an unknown *value* is a 400: `max` is Anthropic-only
-        // (Responses accepts minimal|low|medium|high), so clamp it.
-        // `thinking = "none"` in the catalog suppresses the field entirely.
-        let reasoning = if self.model.thinking == ThinkingMode::Effort {
-            self.backend.effort.map(|effort| ResponsesReasoningConfig {
-                effort: Some(match effort {
-                    Effort::Max => Effort::High.as_str(),
-                    other => other.as_str(),
-                }),
-            })
-        } else {
-            None
-        };
-        let request = ResponsesCreateRequest {
-            model: &self.model.api_id,
-            input,
-            instructions: if self.system_prompt.is_empty() {
-                None
-            } else {
-                Some(self.system_prompt.as_str())
-            },
-            tools: if self.tools.is_empty() {
-                None
-            } else {
-                Some(&self.tools)
-            },
-            max_output_tokens: self.backend.max_output_tokens,
-            // Stateless client: full history is resent every turn. Do not retain
-            // conversations server-side (OpenAI default is store=true).
-            store: false,
-            stream: true,
-            reasoning,
-        };
-
-        if self.backend.debug_dump_api_requests {
-            eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
-        }
-
-        let base = self.backend.base_url.trim_end_matches('/');
-        let raw_response = self
-            .client
-            .post(format!("{base}/responses"))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-
-        if !raw_response.status().is_success() {
-            let status = raw_response.status();
-            let body = raw_response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-            return Err(GenerateError::ExecutionError(format!(
-                "OpenAI Responses API returned HTTP {status}: {body}"
-            )));
-        }
-
-        Ok(raw_response)
-    }
-}
-
-impl GenerativeModel for OpenAIResponsesGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let input_items = convert_messages(input);
-        let model = self.model.clone();
-        let system_prompt = self.system_prompt.clone();
-        let tools = self.tools.clone();
-        let backend = self.backend.clone();
-        let client = self.client.clone();
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
-
-        tokio::spawn(async move {
-            let driver = OpenAIResponsesGenerativeModel {
-                model,
-                system_prompt,
-                tools,
-                backend,
-                client,
-            };
-
-            let response = match driver.start_response_stream(&input_items).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            if let Err(e) = drive_responses_sse_stream(response, tx.clone()).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
-    }
+/// Build one `POST /responses` body.
+pub(super) fn request_body(driver: &OpenAIGenerativeModel, input: &[Message]) -> serde_json::Value {
+    let tools: Vec<ResponsesTool> = driver
+        .tools
+        .iter()
+        .map(|spec| ResponsesTool {
+            type_: "function",
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            parameters: spec.input_schema.clone(),
+        })
+        .collect();
+    let request = ResponsesCreateRequest {
+        model: &driver.model.api_id,
+        input: convert_messages(input),
+        instructions: (!driver.system_prompt.is_empty()).then_some(&driver.system_prompt),
+        tools: (!tools.is_empty()).then_some(tools),
+        max_output_tokens: driver.backend.max_output_tokens,
+        // Stateless client: full history is resent every turn. Do not retain
+        // conversations server-side (OpenAI default is store=true).
+        store: false,
+        stream: true,
+        reasoning: reasoning_effort(driver).map(|effort| ResponsesReasoningConfig {
+            effort: Some(effort),
+        }),
+    };
+    serde_json::to_value(&request).expect("responses request serializes")
 }
 
 //
@@ -321,67 +142,18 @@ fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
 }
 
 //
-// SSE streaming
+// Stream decoding
 //
-
-async fn drive_responses_sse_stream(
-    response: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
-) -> Result<(), GenerateError> {
-    if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped (turn cancelled): stop reading so the response
-        // body drops and the provider stops generating/billing.
-        return Ok(());
-    }
-
-    let mut byte_stream = response.bytes_stream();
-    let mut sse = SseParser::default();
-    let mut acc = StreamAccumulator::default();
-
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!(
-                "Error reading OpenAI Responses stream body: {e:?}"
-            ))
-        })?;
-
-        for data in sse.push(&chunk) {
-            let event: ResponsesStreamEvent = serde_json::from_str(&data).map_err(|e| {
-                GenerateError::MalformedResponseError(format!(
-                    "Failed to parse OpenAI Responses SSE event JSON: {e}; data={data}"
-                ))
-            })?;
-
-            for item in acc.handle_event(event)? {
-                if tx.send(Ok(item)).await.is_err() {
-                    // Consumer dropped (turn cancelled): stop reading so the
-                    // response body drops and the provider stops generating.
-                    return Ok(());
-                }
-            }
-
-            if acc.finished {
-                break;
-            }
-        }
-
-        if acc.finished {
-            break;
-        }
-    }
-
-    acc.finish()?;
-    Ok(())
-}
 
 /// Maps Responses `output_index` slots onto separate content / tool-use index spaces.
 #[derive(Default)]
-struct StreamAccumulator {
+pub(super) struct Decoder {
     output_kinds: Vec<Option<OutputKind>>,
     tool_input_json: Vec<Option<String>>,
     saw_tool_call: bool,
     stop_reason: Option<TurnEndReason>,
-    finished: bool,
+    /// Set by `response.completed`: the turn is over on the wire.
+    pub(super) finished: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -392,7 +164,16 @@ enum OutputKind {
     Ignored,
 }
 
-impl StreamAccumulator {
+impl Decoder {
+    pub(super) fn handle(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+        let event: ResponsesStreamEvent = serde_json::from_str(data).map_err(|e| {
+            GenerateError::MalformedResponseError(format!(
+                "Failed to parse OpenAI Responses SSE event JSON: {e}; data={data}"
+            ))
+        })?;
+        self.handle_event(event)
+    }
+
     fn ensure_slot(&mut self, output_index: usize) {
         while self.output_kinds.len() <= output_index {
             self.output_kinds.push(None);
@@ -645,7 +426,7 @@ impl StreamAccumulator {
         Ok(out)
     }
 
-    fn finish(self) -> Result<(), GenerateError> {
+    pub(super) fn finish(self) -> Result<(), GenerateError> {
         if self.stop_reason.is_none() {
             return Err(GenerateError::MalformedResponseError(
                 "OpenAI Responses stream ended without response.completed".into(),
@@ -674,11 +455,11 @@ impl StreamAccumulator {
 #[derive(Debug, serde::Serialize)]
 struct ResponsesCreateRequest<'a> {
     model: &'a str,
-    input: &'a [ResponsesInputItem],
+    input: Vec<ResponsesInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ResponsesTool]>,
+    tools: Option<Vec<ResponsesTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<usize>,
     /// When false, the API does not persist the response server-side.
@@ -697,7 +478,7 @@ struct ResponsesReasoningConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 struct ResponsesTool {
     #[serde(rename = "type")]
-    type_: String,
+    type_: &'static str,
     name: String,
     description: String,
     parameters: serde_json::Value,
@@ -1080,19 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn sse_parser_basic() {
-        let mut parser = SseParser::default();
-        let chunk = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
-                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n";
-        let events = parser.push(chunk);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].contains("response.created"));
-        assert!(events[1].contains("output_text.delta"));
-    }
-
-    #[test]
     fn stream_accumulator_reasoning_to_thinking() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
@@ -1142,7 +912,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_ignores_raw_reasoning_text() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
@@ -1183,7 +953,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_text_and_tool() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
@@ -1270,7 +1040,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_end_turn_without_tools() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         acc.handle_event(ResponsesStreamEvent::ResponseOutputTextDelta {
             output_index: 0,
             delta: "ok".into(),
@@ -1295,25 +1065,21 @@ mod tests {
     }
 
     #[test]
-    fn request_disables_server_side_store() {
-        let request = ResponsesCreateRequest {
-            model: "grok-4.5-build",
-            input: &[],
-            instructions: None,
-            tools: None,
-            max_output_tokens: Some(128),
-            store: false,
-            stream: true,
-            reasoning: None,
-        };
-        let json = serde_json::to_value(&request).unwrap();
+    fn request_streams_without_server_side_store() {
+        let mut driver = super::super::tests::driver(Protocol::OpenAIResponses);
+        driver.system_prompt = "be helpful".into();
+        let json = request_body(&driver, &[]);
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["instructions"], "be helpful");
         assert_eq!(json["store"], false);
         assert_eq!(json["stream"], true);
+        assert_eq!(json["max_output_tokens"], 128);
+        assert_eq!(json["reasoning"]["effort"], "high");
     }
 
     #[test]
     fn arguments_delta_without_item_added_is_malformed() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let err = acc
             .handle_event(ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index: 0,
@@ -1330,7 +1096,7 @@ mod tests {
 
     #[test]
     fn incomplete_content_filter_is_refusal() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let err = acc
             .handle_event(ResponsesStreamEvent::ResponseCompleted {
                 response: ResponsesCompletedBody {

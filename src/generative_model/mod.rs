@@ -7,13 +7,8 @@ use crate::core::*;
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
 
-mod openai_responses;
-pub use openai_responses::OpenAIResponsesBackendConfig;
-
-mod openai_completions;
-pub use openai_completions::OpenAICompletionsBackendConfig;
-
-mod openai_common;
+mod openai;
+pub use openai::OpenAIBackendConfig;
 
 mod sse_parser;
 use sse_parser::SseParser;
@@ -275,8 +270,10 @@ impl std::str::FromStr for Effort {
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
     Anthropic(AnthropicBackendConfig),
-    OpenAIResponses(OpenAIResponsesBackendConfig),
-    OpenAICompletions(OpenAICompletionsBackendConfig),
+    /// Responses API (`{base_url}/responses`).
+    OpenAIResponses(OpenAIBackendConfig),
+    /// Chat Completions API (`{base_url}/chat/completions`).
+    OpenAICompletions(OpenAIBackendConfig),
 }
 
 impl BackendConfig {
@@ -310,12 +307,9 @@ pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, Mo
             let model = anthropic::AnthropicGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
         }
-        BackendConfig::OpenAIResponses(backend) => {
-            let model = openai_responses::OpenAIResponsesGenerativeModel::new(config, backend)?;
-            Ok(model as Arc<dyn GenerativeModel>)
-        }
-        BackendConfig::OpenAICompletions(backend) => {
-            let model = openai_completions::OpenAICompletionsGenerativeModel::new(config, backend)?;
+        // One driver, two dialects: the model's protocol picks the wire format.
+        BackendConfig::OpenAIResponses(backend) | BackendConfig::OpenAICompletions(backend) => {
+            let model = openai::OpenAIGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
         }
     }
@@ -940,7 +934,7 @@ mod tests {
     fn catalog_get_reports_deferred_auth_error() {
         let entry = CatalogModel {
             spec: spec("kimi", Protocol::OpenAIResponses),
-            backend: BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig::default()),
+            backend: BackendConfig::OpenAIResponses(OpenAIBackendConfig::default()),
             auth_error: Some("model `kimi`: auth env:OPENROUTER_API_KEY is unset".into()),
         };
         let catalog = ModelCatalog::new([("kimi".to_string(), entry)].into());

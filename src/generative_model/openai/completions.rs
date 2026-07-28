@@ -1,8 +1,6 @@
-//! OpenAI Chat Completions API backend.
-//!
-//! The `{base_url}/chat/completions` dialect: OpenAI itself plus the servers
-//! that emulate it and never shipped the newer Responses API (llama.cpp,
-//! Ollama, vLLM, LM Studio, DeepSeek, Groq, Together, …).
+//! Chat Completions dialect (`{base_url}/chat/completions`): OpenAI plus the
+//! servers that emulate it and never shipped the newer Responses API
+//! (llama.cpp, Ollama, vLLM, LM Studio, DeepSeek, Groq, Together, …).
 //!
 //! Ref: https://platform.openai.com/docs/api-reference/chat/create
 //! Streaming: https://platform.openai.com/docs/api-reference/chat-streaming
@@ -21,209 +19,35 @@
 //! A `tool` message may only carry text here, so images in a tool result (e.g.
 //! `view_image`) ride in a user message after the round's tool replies.
 
-use std::sync::Arc;
-
-use crate::core::*;
-
-use super::openai_common::{image_url, images_of, text_of, tool_result_text};
 use super::*;
 
-/// OpenAI Chat Completions API settings ([`BackendConfig::OpenAICompletions`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OpenAICompletionsBackendConfig {
-    /// Base URL including any path prefix, e.g. `https://api.openai.com/v1` or
-    /// `http://localhost:11434/v1`. Requests go to `{base_url}/chat/completions`.
-    pub base_url: String,
-    pub auth_token: String,
-    pub max_output_tokens: Option<usize>,
-    pub debug_dump_api_requests: bool,
-    /// When set, request provider reasoning at this effort (`reasoning_effort`).
-    ///
-    /// Servers that predate the field ignore it; OpenAI rejects it on
-    /// non-reasoning models, so those need `thinking = "none"` in the catalog.
-    /// Defaults to [`Effort::DEFAULT`] so reasoning is always requested.
-    pub effort: Option<Effort>,
-}
-
-impl Default for OpenAICompletionsBackendConfig {
-    fn default() -> Self {
-        Self {
-            // No built-in gateway: the catalog (config.toml) supplies base_url.
-            base_url: String::new(),
-            auth_token: String::new(),
-            max_output_tokens: Some(8192),
-            debug_dump_api_requests: false,
-            effort: Some(Effort::DEFAULT),
-        }
-    }
-}
-
-/// Stateless Chat Completions driver. Conversation history is owned by the caller.
-pub struct OpenAICompletionsGenerativeModel {
-    model: ModelSpec,
-    system_prompt: String,
-    tools: Vec<ChatTool>,
-    backend: OpenAICompletionsBackendConfig,
-    client: reqwest::Client,
-}
-
-impl OpenAICompletionsGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: OpenAICompletionsBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.protocol != Protocol::OpenAICompletions {
-            return Err(ModelCreationError::BadConfig(format!(
-                "model `{}` speaks {}, not {}",
-                config.model,
-                config.model.protocol,
-                Protocol::OpenAICompletions
-            )));
-        }
-
-        let mut headers = reqwest::header::HeaderMap::from_iter([(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        )]);
-        // Empty token = `auth = "none"` in the catalog (local servers); send no
-        // Authorization header. Credential *presence* is the catalog's job
-        // (`ModelCatalog::get`), not the driver's.
-        if !backend.auth_token.is_empty() {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                // Never echo the token into the error: it ends up in logs.
-                format!("Bearer {}", backend.auth_token)
-                    .parse()
-                    .map_err(|e| {
-                        ModelCreationError::BadConfig(format!(
-                            "auth token is not a valid HTTP header value: {e}"
-                        ))
-                    })?,
-            );
-        }
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))?;
-
-        let tools = config
-            .tools
-            .into_iter()
-            .map(|spec| ChatTool {
-                type_: "function",
-                function: ChatToolFunction {
-                    name: spec.name,
-                    description: spec.description,
-                    parameters: spec.input_schema,
-                },
-            })
-            .collect();
-
-        Ok(Arc::new(Self {
-            model: config.model,
-            system_prompt: config.system_prompt,
-            tools,
-            backend,
-            client,
-        }))
-    }
-
-    async fn start_completion_stream(
-        &self,
-        messages: &[ChatMessage],
-    ) -> Result<reqwest::Response, GenerateError> {
-        // `max` is Anthropic-only (Chat Completions takes minimal|low|medium|high),
-        // so clamp it. `thinking = "none"` suppresses the field entirely.
-        let reasoning_effort = if self.model.thinking == ThinkingMode::Effort {
-            self.backend.effort.map(|effort| match effort {
-                Effort::Max => Effort::High.as_str(),
-                other => other.as_str(),
-            })
-        } else {
-            None
-        };
-        let request = ChatCompletionsRequest {
-            model: &self.model.api_id,
-            messages,
-            tools: if self.tools.is_empty() {
-                None
-            } else {
-                Some(&self.tools)
+/// Build one `POST /chat/completions` body.
+pub(super) fn request_body(driver: &OpenAIGenerativeModel, input: &[Message]) -> serde_json::Value {
+    let tools: Vec<ChatTool> = driver
+        .tools
+        .iter()
+        .map(|spec| ChatTool {
+            type_: "function",
+            function: ChatToolFunction {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                parameters: spec.input_schema.clone(),
             },
-            max_completion_tokens: self.backend.max_output_tokens,
-            reasoning_effort,
-            stream: true,
-            // Usage is omitted from streamed responses unless asked for.
-            stream_options: ChatStreamOptions {
-                include_usage: true,
-            },
-        };
-
-        if self.backend.debug_dump_api_requests {
-            eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
-        }
-
-        let base = self.backend.base_url.trim_end_matches('/');
-        let raw_response = self
-            .client
-            .post(format!("{base}/chat/completions"))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-
-        if !raw_response.status().is_success() {
-            let status = raw_response.status();
-            let body = raw_response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-            return Err(GenerateError::ExecutionError(format!(
-                "OpenAI Chat Completions API returned HTTP {status}: {body}"
-            )));
-        }
-
-        Ok(raw_response)
-    }
-}
-
-impl GenerativeModel for OpenAICompletionsGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(&self.system_prompt, input);
-        let model = self.model.clone();
-        let system_prompt = self.system_prompt.clone();
-        let tools = self.tools.clone();
-        let backend = self.backend.clone();
-        let client = self.client.clone();
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
-
-        tokio::spawn(async move {
-            let driver = OpenAICompletionsGenerativeModel {
-                model,
-                system_prompt,
-                tools,
-                backend,
-                client,
-            };
-
-            let response = match driver.start_completion_stream(&messages).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            if let Err(e) = drive_completions_sse_stream(response, tx.clone()).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
-    }
+        })
+        .collect();
+    let request = ChatCompletionsRequest {
+        model: &driver.model.api_id,
+        messages: convert_messages(&driver.system_prompt, input),
+        tools: (!tools.is_empty()).then_some(tools),
+        max_completion_tokens: driver.backend.max_output_tokens,
+        reasoning_effort: reasoning_effort(driver),
+        stream: true,
+        // Usage is omitted from streamed responses unless asked for.
+        stream_options: ChatStreamOptions {
+            include_usage: true,
+        },
+    };
+    serde_json::to_value(&request).expect("chat completions request serializes")
 }
 
 //
@@ -348,53 +172,12 @@ fn user_content(content: &[Content]) -> ChatContent {
 }
 
 //
-// SSE streaming
+// Stream decoding
 //
-
-async fn drive_completions_sse_stream(
-    response: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
-) -> Result<(), GenerateError> {
-    if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
-        // Consumer dropped (turn cancelled): stop reading so the response
-        // body drops and the provider stops generating/billing.
-        return Ok(());
-    }
-
-    let mut byte_stream = response.bytes_stream();
-    let mut sse = SseParser::default();
-    let mut acc = StreamAccumulator::default();
-
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!(
-                "Error reading OpenAI Chat Completions stream body: {e:?}"
-            ))
-        })?;
-
-        for data in sse.push(&chunk) {
-            let event: ChatCompletionChunk = serde_json::from_str(&data).map_err(|e| {
-                GenerateError::MalformedResponseError(format!(
-                    "Failed to parse OpenAI Chat Completions SSE event JSON: {e}; data={data}"
-                ))
-            })?;
-
-            for item in acc.handle_chunk(event)? {
-                if tx.send(Ok(item)).await.is_err() {
-                    // Consumer dropped (turn cancelled): stop reading so the
-                    // response body drops and the provider stops generating.
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    acc.finish()
-}
 
 /// Folds the single `delta` channel into myco's indexed content / tool-use slots.
 #[derive(Default)]
-struct StreamAccumulator {
+pub(super) struct Decoder {
     /// Content-block indices handed out to the thinking and text blocks, in
     /// arrival order (Chat Completions streams at most one of each).
     next_content_index: usize,
@@ -411,7 +194,16 @@ struct ToolCallSlot {
     arguments: String,
 }
 
-impl StreamAccumulator {
+impl Decoder {
+    pub(super) fn handle(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+        let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(|e| {
+            GenerateError::MalformedResponseError(format!(
+                "Failed to parse OpenAI Chat Completions SSE event JSON: {e}; data={data}"
+            ))
+        })?;
+        self.handle_chunk(chunk)
+    }
+
     fn take_content_index(&mut self) -> usize {
         let index = self.next_content_index;
         self.next_content_index += 1;
@@ -558,7 +350,7 @@ impl StreamAccumulator {
         Ok(out)
     }
 
-    fn finish(self) -> Result<(), GenerateError> {
+    pub(super) fn finish(self) -> Result<(), GenerateError> {
         if self.stop_reason.is_none() {
             return Err(GenerateError::MalformedResponseError(
                 "OpenAI Chat Completions stream ended without a finish_reason".into(),
@@ -591,9 +383,9 @@ impl StreamAccumulator {
 #[derive(Debug, serde::Serialize)]
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ChatTool]>,
+    tools: Option<Vec<ChatTool>>,
     /// The current output cap field; `max_tokens` is deprecated and rejected
     /// by reasoning models.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -927,18 +719,10 @@ mod tests {
 
     #[test]
     fn request_asks_for_usage_and_the_modern_token_cap() {
-        let request = ChatCompletionsRequest {
-            model: "gpt-5.1",
-            messages: &[],
-            tools: None,
-            max_completion_tokens: Some(128),
-            reasoning_effort: Some("high"),
-            stream: true,
-            stream_options: ChatStreamOptions {
-                include_usage: true,
-            },
-        };
-        let json = serde_json::to_value(&request).unwrap();
+        let driver = super::super::tests::driver(Protocol::OpenAICompletions);
+        let json = request_body(&driver, &[]);
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["stream"], true);
         assert_eq!(json["max_completion_tokens"], 128);
         assert!(json.get("max_tokens").is_none(), "{json}");
         assert_eq!(json["reasoning_effort"], "high");
@@ -947,7 +731,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_reasoning_then_text() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
 
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -1001,7 +785,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_openrouter_reasoning_spelling() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
                 "choices": [{"delta": {"reasoning": "thinking hard"}}]
@@ -1015,7 +799,7 @@ mod tests {
 
     #[test]
     fn stream_accumulator_streams_tool_call_across_chunks() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
 
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -1067,7 +851,7 @@ mod tests {
 
     #[test]
     fn parallel_tool_calls_get_distinct_indices() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
                 "choices": [{"delta": {"tool_calls": [
@@ -1088,7 +872,7 @@ mod tests {
 
     #[test]
     fn stop_after_tool_calls_is_tool_use() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         acc.handle_chunk(chunk(serde_json::json!({
             "choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "call_1", "function": {"name": "bash", "arguments": "{}"}}
@@ -1108,7 +892,7 @@ mod tests {
 
     #[test]
     fn finish_reason_length_is_max_tokens_and_filter_is_refusal() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
                 "choices": [{"delta": {}, "finish_reason": "length"}]
@@ -1119,7 +903,7 @@ mod tests {
             MessagePart::TurnEndReason(TurnEndReason::MaxTokens)
         ));
 
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
                 "choices": [{"delta": {}, "finish_reason": "content_filter"}]
@@ -1130,7 +914,7 @@ mod tests {
 
     #[test]
     fn tool_call_without_id_or_name_is_malformed() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
                 "choices": [{"delta": {"tool_calls": [
@@ -1148,7 +932,7 @@ mod tests {
 
     #[test]
     fn stream_error_payload_is_an_execution_error() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
                 "error": {"message": "upstream is down", "code": 502}
@@ -1164,7 +948,7 @@ mod tests {
 
     #[test]
     fn stream_without_finish_reason_is_malformed() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         acc.handle_chunk(chunk(serde_json::json!({
             "choices": [{"delta": {"content": "truncated"}}]
         })))
@@ -1175,7 +959,7 @@ mod tests {
 
     #[test]
     fn invalid_tool_arguments_fail_at_finish() {
-        let mut acc = StreamAccumulator::default();
+        let mut acc = Decoder::default();
         acc.handle_chunk(chunk(serde_json::json!({
             "choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "call_1", "function": {"name": "bash", "arguments": "{\"a\":"}}

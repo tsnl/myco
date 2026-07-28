@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
     AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
-    OpenAICompletionsBackendConfig, OpenAIResponsesBackendConfig, Protocol, ThinkingMode,
+    OpenAIBackendConfig, Protocol, ThinkingMode,
 };
 use crate::harness::{
     AuthEntry, FileConfig, HarnessConfig, load_file_config, load_ssh_host_aliases,
@@ -399,21 +399,19 @@ fn resolve_catalog(
                 max_tokens_per_generate: max_output,
                 ..Default::default()
             }),
-            Protocol::OpenAIResponses => {
-                BackendConfig::OpenAIResponses(OpenAIResponsesBackendConfig {
+            // Both OpenAI dialects take the same settings; the variant only
+            // records which wire format the gateway serves.
+            Protocol::OpenAIResponses | Protocol::OpenAICompletions => {
+                let openai = OpenAIBackendConfig {
                     base_url,
                     auth_token: token,
                     max_output_tokens: Some(max_output),
                     ..Default::default()
-                })
-            }
-            Protocol::OpenAICompletions => {
-                BackendConfig::OpenAICompletions(OpenAICompletionsBackendConfig {
-                    base_url,
-                    auth_token: token,
-                    max_output_tokens: Some(max_output),
-                    ..Default::default()
-                })
+                };
+                match protocol {
+                    Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
+                    _ => BackendConfig::OpenAIResponses(openai),
+                }
             }
         };
 
