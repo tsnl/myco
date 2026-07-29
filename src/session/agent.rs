@@ -65,22 +65,14 @@ impl TraceContext {
     }
 }
 
-/// Live events emitted by the agent runtime (and services that spawn nested agents).
+/// Live events emitted by the agent runtime.
 ///
-/// All ongoing work is attributed via [`TraceContext::agent_id`]. Nested agents are announced
-/// once with [`AgentEvent::AgentStarted`]; subsequent events for that agent reuse the same id.
+/// Every variant carries the [`TraceContext`] of the agent that produced it, so
+/// a sink can attribute work and filter by nesting depth. Turn-accumulated
+/// token usage is *not* an event: it is read from [`Agent::last_usage`] at the
+/// prompt, where the CLI needs it.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// A new agent session began. Emitted once when the agent id is assigned.
-    AgentStarted {
-        agent_id: Uuid,
-        /// Model id when known; empty for unspecified.
-        model: String,
-        parent_agent_id: Option<Uuid>,
-        /// Provider tool-use id that spawned this agent, if any.
-        parent_tool_use_id: Option<String>,
-        depth: usize,
-    },
     /// Incremental assistant text (for streaming UX).
     TextDelta { text: String, context: TraceContext },
     /// Incremental thinking *summary* text (streamed for UI; also stored in history).
@@ -89,27 +81,8 @@ pub enum AgentEvent {
         tool_use: ToolUse,
         context: TraceContext,
     },
-    ToolFinished {
-        /// Provider tool-use id.
-        tool_use_id: String,
-        is_error: bool,
-        context: TraceContext,
-    },
     TurnFinished {
         reason: TurnEndReason,
-        context: TraceContext,
-    },
-    /// Turn-accumulated usage, fired after each generate call: input side is
-    /// the latest request's prompt (≈ live context), output side sums across
-    /// the turn's generate calls so far (one per tool round-trip).
-    Usage {
-        usage: TokenUsage,
-        context: TraceContext,
-    },
-    /// An agent session ended. Optional harness-written log path for nested/transcript agents.
-    AgentFinished {
-        log_path: Option<String>,
-        is_error: bool,
         context: TraceContext,
     },
 }
@@ -300,10 +273,6 @@ impl Agent {
                     ..usage
                 };
                 self.last_usage = Some(usage);
-                self.sink.emit(AgentEvent::Usage {
-                    usage,
-                    context: self.context.clone(),
-                });
             }
 
             let reason = output.turn_end_reason.clone();
@@ -437,12 +406,6 @@ impl Agent {
             }
             result = &mut work => result,
         };
-
-        self.sink.emit(AgentEvent::ToolFinished {
-            tool_use_id: tool_use.id,
-            is_error: result.is_error,
-            context: self.context.clone(),
-        });
 
         result
     }
