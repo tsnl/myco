@@ -79,6 +79,11 @@ summaries; `close` the session when done. The child's session is hidden (`kind: 
 parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
 get-by-id or `list` with `include_hidden: true`.
 
+Interrupting a child: `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The
+child cancels its in-flight turn, returns to its prompt, and stays writable — use it when a child
+runs long or goes down the wrong path, and keep driving the same session. `close` remains the way
+to end it.
+
 One-shot delegation: for a single self-contained task, skip the live session — a plain one-shot
 `bash` run of `myco -p "<task>" --parent-session <your-session-id>` does one turn and exits.
 Stdout is the answer text alone (no headers to parse; process exit is the turn boundary) and

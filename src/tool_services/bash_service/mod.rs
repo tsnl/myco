@@ -87,6 +87,15 @@ impl BashService {
                 - write: write `stdin` to a session, then collect a snapshot (process stays \
                 alive).\n\
                 - read: collect more output without writing (process stays alive).\n\
+                - signal: deliver a signal to the session's **process group**, then return \
+                a snapshot like `write`. `signal` is `int` (default), `term`, or `hup`; \
+                SIGKILL is `close`. `int` is a terminal Ctrl-C: a child that handles SIGINT \
+                survives and stays writable — a nested `myco` cancels its in-flight turn and \
+                returns to its prompt, so this interrupts a child without losing its \
+                session. A child with **no** handler dies instead (`exit_signal: 2`); \
+                sessions have no job control, so there is no separate foreground group to \
+                signal and the whole group gets it. Either way the session is not reaped — \
+                that is still `close`.\n\
                 - close: kill and reap a session.\n\
                 - list: list live sessions. Note the session cap ({MAX_SESSIONS}) is shared \
                 by every agent on the host while `list` shows only yours — if `start` \
@@ -268,6 +277,24 @@ impl BashService {
             } => {
                 self.session_read(&session_id, owner, timeout_ms, idle_ms, max_bytes, cancel)
                     .await
+            }
+            Action::Signal {
+                session_id,
+                signal,
+                timeout_ms,
+                idle_ms,
+                max_bytes,
+            } => {
+                self.session_signal(
+                    &session_id,
+                    owner,
+                    signal,
+                    timeout_ms,
+                    idle_ms,
+                    max_bytes,
+                    cancel,
+                )
+                .await
             }
             Action::Close { session_id } => self.session_close(&session_id, owner).await,
             Action::List => self.session_list(owner),
@@ -575,6 +602,70 @@ impl BashService {
             .await
         {
             Ok(s) => generative_model::ToolResult::text(s.format()),
+            Err(e) => generative_model::ToolResult::err(e),
+        }
+    }
+
+    /// Deliver `signal` to a session's process group, then collect a snapshot
+    /// like `write` does — the interesting output is the child's *reaction*, so
+    /// making the caller `read` separately would just cost a round trip.
+    #[allow(clippy::too_many_arguments)]
+    async fn session_signal(
+        &self,
+        session_id: &str,
+        owner: Uuid,
+        signal: SignalKind,
+        timeout_ms: u64,
+        idle_ms: u64,
+        max_bytes: usize,
+        cancel: crate::core::CancelToken,
+    ) -> generative_model::ToolResult {
+        if let Err(e) = self.ensure_owner(session_id, owner) {
+            return generative_model::ToolResult::err(e);
+        }
+        let pid = {
+            let sessions = self.sessions();
+            let Some(session) = sessions.get(session_id) else {
+                return generative_model::ToolResult::err(format!(
+                    "unknown session {session_id:?}"
+                ));
+            };
+            if session
+                .shared
+                .buffer
+                .lock()
+                .map(|b| b.exited)
+                .unwrap_or(false)
+            {
+                return generative_model::ToolResult::err(format!(
+                    "session {session_id:?} has already exited; nothing to signal"
+                ));
+            }
+            // Bump generation so the collect below measures its idle gap from
+            // the signal, not from output that predates it.
+            session.shared.generation.fetch_add(1, Ordering::SeqCst);
+            session.pid
+        };
+
+        if let Err(e) = signal_process_group(pid, signal.as_libc()) {
+            return generative_model::ToolResult::err(format!(
+                "could not send {} to session {session_id:?}: {e}",
+                signal.name()
+            ));
+        }
+
+        match self
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .await
+        {
+            Ok(s) => {
+                let mut text = s.format();
+                text.push_str(&format!(
+                    "\n(sent {} to the session process group)\n",
+                    signal.name()
+                ));
+                generative_model::ToolResult::text(text)
+            }
             Err(e) => generative_model::ToolResult::err(e),
         }
     }
@@ -1356,6 +1447,9 @@ pub struct Input {
     /// Bytes to write to the session's stdin (`start` / `write`).
     #[serde(default)]
     stdin: Option<String>,
+    /// Signal to deliver for `signal`. Default `int`.
+    #[serde(default)]
+    signal: Option<SignalKind>,
     /// Hard wait ceiling in milliseconds.
     /// - start/write/read: default 30000 (30s), max 1800000 (30 min); early return on idle/byte cap.
     /// - exec: default 60000 (60s), max 1800000 (30 min); waits for process exit.
@@ -1380,8 +1474,44 @@ enum ActionKind {
     Start,
     Write,
     Read,
+    Signal,
     Close,
     List,
+}
+
+/// Signals a supervisor may deliver to a session. Deliberately small: SIGKILL
+/// is `close` (which also reaps the session), and anything outside this set has
+/// no established use against a session's process group.
+#[derive(
+    Clone, Copy, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+enum SignalKind {
+    /// Interrupt, as a terminal Ctrl-C. A nested `myco` cancels its in-flight
+    /// turn and stays at the prompt.
+    Int,
+    /// Ask the process to terminate.
+    Term,
+    /// Hangup.
+    Hup,
+}
+
+impl SignalKind {
+    fn as_libc(self) -> libc::c_int {
+        match self {
+            SignalKind::Int => libc::SIGINT,
+            SignalKind::Term => libc::SIGTERM,
+            SignalKind::Hup => libc::SIGHUP,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SignalKind::Int => "SIGINT",
+            SignalKind::Term => "SIGTERM",
+            SignalKind::Hup => "SIGHUP",
+        }
+    }
 }
 
 /// Internal validated action after parsing [`Input`].
@@ -1411,6 +1541,13 @@ enum Action {
     },
     Read {
         session_id: String,
+        timeout_ms: u64,
+        idle_ms: u64,
+        max_bytes: usize,
+    },
+    Signal {
+        session_id: String,
+        signal: SignalKind,
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
@@ -1563,6 +1700,22 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .ok_or_else(|| "read requires `session_id`".to_string())?;
             Ok(Action::Read {
                 session_id,
+                timeout_ms: session_timeout(input)?,
+                idle_ms,
+                max_bytes,
+            })
+        }
+        ActionKind::Signal => {
+            if cwd.is_some() {
+                return Err("`cwd` is only valid on `exec` / `start`".into());
+            }
+            let session_id = input
+                .session_id
+                .clone()
+                .ok_or_else(|| "signal requires `session_id`".to_string())?;
+            Ok(Action::Signal {
+                session_id,
+                signal: input.signal.unwrap_or(SignalKind::Int),
                 timeout_ms: session_timeout(input)?,
                 idle_ms,
                 max_bytes,
