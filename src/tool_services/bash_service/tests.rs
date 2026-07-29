@@ -172,7 +172,7 @@ fn rejects_blank_command() {
 
 #[test]
 fn rejects_blank_session_id() {
-    for action in ["start", "write", "read", "close"] {
+    for action in ["start", "write", "read", "signal", "close"] {
         let input: Input = serde_json::from_value(
             json!({"action": action, "session_id": "  ", "stdin": "x", "command": "true"}),
         )

@@ -1598,8 +1598,8 @@ fn reject_if_command_starts_with_cd(command: &str) -> Result<(), String> {
 /// looks like.
 const EMPTY_INPUT_ERROR: &str = "empty bash input: the tool use carried no parameters. \
      Pass `command` for a one-shot run (e.g. {\"command\": \"ls -la\", \"cwd\": \"/repo\"}), \
-     or `action` with its parameters (exec/start/write/read/close/list; every session \
-     action but `list` also needs `session_id`).";
+     or `action` with its parameters (exec/start/write/read/signal/close/list; every \
+     session action but `list` also needs `session_id`).";
 
 /// JSON type name for error messages (`null`, `string`, `array`, …).
 fn json_type_name(value: &serde_json::Value) -> &'static str {
@@ -1622,6 +1622,7 @@ fn is_empty_object(input: &Input) -> bool {
         cwd,
         session_id,
         stdin,
+        signal,
         timeout_ms,
         idle_ms,
         max_bytes,
@@ -1631,6 +1632,7 @@ fn is_empty_object(input: &Input) -> bool {
         && cwd.is_none()
         && session_id.is_none()
         && stdin.is_none()
+        && signal.is_none()
         && timeout_ms.is_none()
         && idle_ms.is_none()
         && max_bytes.is_none()
@@ -1792,6 +1794,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "signal requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             Ok(Action::Signal {
                 session_id,
                 signal: input.signal.unwrap_or(SignalKind::Int),
