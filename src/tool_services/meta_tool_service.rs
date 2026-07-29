@@ -375,6 +375,7 @@ enum LinkKind {
 mod tests {
     use super::*;
     use crate::CancelToken;
+    use crate::test_support::{result_text, temp_home};
     use crate::tool_services::{HostDispatchContext, ToolService};
     use std::sync::Arc;
 
@@ -383,21 +384,9 @@ mod tests {
         (SessionMetaTool::new(active.clone()), active)
     }
 
-    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
-    // test, and #[tokio::test] runs on a current-thread runtime.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn set_title_and_get() {
-        let _guard = crate::session::lock_myco_home_for_test();
-        let dir = std::env::temp_dir().join(format!(
-            "myco-meta-tool-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("meta-tool");
 
         let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
@@ -429,30 +418,8 @@ mod tests {
             )
             .await;
         assert!(!got.is_error, "{got:?}");
-        let text = got
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
+        let text = result_text(&got);
         assert!(text.contains("My Feature"), "{text}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
-    }
-
-    fn result_text(r: &generative_model::ToolResult) -> String {
-        r.content
-            .iter()
-            .filter_map(|c| match c {
-                generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The advertised schema must be safe for OpenAI-compatible gateways:
@@ -498,21 +465,9 @@ mod tests {
 
     /// Null-filled mutations must error instead of silently clearing state,
     /// and a missing `action` must be a hard error instead of a silent `get`.
-    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
-    // test, and #[tokio::test] runs on a current-thread runtime.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn null_and_missing_fields_error_instead_of_clearing() {
-        let _guard = crate::session::lock_myco_home_for_test();
-        let dir = std::env::temp_dir().join(format!(
-            "myco-meta-guards-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("meta-guards");
 
         let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
@@ -585,28 +540,11 @@ mod tests {
             .await;
         assert!(missing.is_error, "{missing:?}");
         assert!(result_text(&missing).contains("action"), "{missing:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
-    // Deliberate guard-across-await: it serializes MYCO_HOME for the whole
-    // test, and #[tokio::test] runs on a current-thread runtime.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn executable_path_returns_absolute_path() {
-        let _guard = crate::session::lock_myco_home_for_test();
-        let dir = std::env::temp_dir().join(format!(
-            "myco-meta-exe-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("meta-exe");
 
         let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
@@ -621,25 +559,13 @@ mod tests {
             )
             .await;
         assert!(!got.is_error, "{got:?}");
-        let text = got
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
+        let text = result_text(&got);
         let path = text.trim();
         assert!(!path.is_empty(), "{text}");
         assert!(
             std::path::Path::new(path).is_absolute(),
             "expected absolute path, got {path:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
     #[tokio::test]

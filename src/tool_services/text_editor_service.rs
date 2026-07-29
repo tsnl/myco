@@ -30,9 +30,9 @@ impl TextEditorService {
             name: "str_replace_based_edit_tool".to_string(),
             description: "A tool for viewing, creating, and editing files. Matches Anthropic tool."
                 .to_string(),
-            // Schema comes from [`Input`] (flat object). The tagged [`ParsedInput`] enum is used
-            // at runtime after conversion — schemars would emit root `oneOf` for that enum,
-            // which Anthropic rejects (missing `input_schema.type`).
+            // Schema comes from [`Input`]: one flat object, so schemars emits the
+            // root `type: "object"` Anthropic requires (a tagged per-command enum
+            // would emit root `oneOf`, which Anthropic rejects).
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
@@ -57,13 +57,10 @@ impl ToolService for TextEditorService {
                     ));
                 }
             };
-            let parsed = match ParsedInput::try_from(input) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    return generative_model::ToolResult::err(e);
-                }
-            };
-            self.execute(parsed)
+            match self.execute(input) {
+                Ok(text) => generative_model::ToolResult::text(text),
+                Err(e) => generative_model::ToolResult::err(e),
+            }
         })
     }
 }
@@ -73,7 +70,18 @@ impl TextEditorService {
         Self::default()
     }
 
-    fn execute(&self, input: ParsedInput) -> generative_model::ToolResult {
+    fn execute(&self, input: Input) -> Result<String, String> {
+        let Input {
+            command,
+            path,
+            view_range,
+            old_str,
+            new_str,
+            file_text,
+            insert_line,
+            insert_text,
+        } = input;
+
         // One guard across check + mutate + record: concurrent same-turn edits
         // of one file serialize here, so the stamp that authorized a write can
         // never go stale between its check and the write it authorized, and
@@ -81,95 +89,44 @@ impl TextEditorService {
         // left behind.
         let mut read_files = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
 
-        for path in input.mutated_files() {
-            if let Err(e) = ensure_mutated_file_already_read(&read_files, &path) {
-                return generative_model::ToolResult::err(e);
+        let output = match command {
+            Command::View => view_path(&path, view_range)?,
+            Command::StrReplace => {
+                let old_str = require(old_str, "str_replace", "old_str")?;
+                let new_str = require(new_str, "str_replace", "new_str")?;
+                ensure_mutated_file_already_read(&read_files, Path::new(&path))?;
+                str_replace_in_file(&path, &old_str, &new_str)?;
+                "Successfully replaced text at exactly one location.".to_string()
             }
-        }
-
-        let result = match &input {
-            ParsedInput::View { path, view_range } => self.cmd_view(path, *view_range),
-            ParsedInput::StrReplace {
-                path,
-                old_str,
-                new_str,
-            } => self.cmd_str_replace(path, old_str, new_str),
-            ParsedInput::Create { path, file_text } => self.cmd_create(path, file_text),
-            ParsedInput::Insert {
-                path,
-                insert_line,
-                insert_text,
-            } => self.cmd_insert(path, *insert_line, insert_text),
+            // No read-stamp check: new files cannot have been read.
+            Command::Create => {
+                let file_text = require(file_text, "create", "file_text")?;
+                create_file(&path, &file_text)?
+            }
+            Command::Insert => {
+                let insert_line = require(insert_line, "insert", "insert_line")?;
+                let insert_text = require(insert_text, "insert", "insert_text")?;
+                ensure_mutated_file_already_read(&read_files, Path::new(&path))?;
+                insert_in_file(&path, insert_line, &insert_text)?;
+                format!("Successfully inserted text after line {insert_line}.")
+            }
         };
 
         // On success, record the fingerprint so subsequent tool-driven edits
         // don't require a re-view, while external on-disk changes still fail
-        // the guard.
-        if !result.is_error {
-            record_read_files(&mut read_files, input.read_files());
+        // the guard. (A directory view has no fingerprint and is skipped.)
+        if let Ok(fingerprint) = file_fingerprint(Path::new(&path)) {
+            read_files.insert(PathBuf::from(path), fingerprint);
         }
-
-        result
+        Ok(output)
     }
+}
 
-    fn cmd_view(&self, path: &str, view_range: Option<[i64; 2]>) -> generative_model::ToolResult {
-        match view_path(path, view_range) {
-            Ok(text) => generative_model::ToolResult::text(text),
-            Err(e) => generative_model::ToolResult::err(e),
-        }
-    }
-
-    fn cmd_str_replace(
-        &self,
-        path: &str,
-        old_str: &str,
-        new_str: &str,
-    ) -> generative_model::ToolResult {
-        match str_replace_in_file(path, old_str, new_str) {
-            Ok(()) => generative_model::ToolResult::text(
-                "Successfully replaced text at exactly one location.",
-            ),
-            Err(e) => generative_model::ToolResult::err(e),
-        }
-    }
-
-    fn cmd_create(&self, path: &str, file_text: &str) -> generative_model::ToolResult {
-        let path_buf = PathBuf::from(path);
-        if path_buf.exists() {
-            return generative_model::ToolResult::err(format!(
-                "File already exists at '{path}'. Use str_replace or insert to modify it, or choose a new path."
-            ));
-        }
-        if let Some(parent) = path_buf.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return generative_model::ToolResult::err(format!(
-                "Error creating parent directories for '{path}': {e}"
-            ));
-        }
-        match atomically_write_file(&path_buf, file_text.as_bytes()) {
-            Ok(()) => generative_model::ToolResult::text(format!("Created file '{path}'.")),
-            Err(e) => {
-                generative_model::ToolResult::err(format!("Error creating file '{path}': {e}"))
-            }
-        }
-    }
-
-    fn cmd_insert(
-        &self,
-        path: &str,
-        insert_line: i64,
-        insert_text: &str,
-    ) -> generative_model::ToolResult {
-        match insert_in_file(path, insert_line, insert_text) {
-            Ok(()) => generative_model::ToolResult::text(format!(
-                "Successfully inserted text after line {insert_line}."
-            )),
-            Err(e) => generative_model::ToolResult::err(e),
-        }
-    }
+/// Missing per-command required field. Checked before the read-stamp guard so
+/// a malformed call names its missing field (e.g. "str_replace requires
+/// `old_str`") instead of failing as an unread file.
+fn require<T>(field: Option<T>, command: &str, name: &str) -> Result<T, String> {
+    field.ok_or_else(|| format!("{command} requires `{name}`"))
 }
 
 //
@@ -203,14 +160,6 @@ fn ensure_mutated_file_already_read(
         ));
     }
     Ok(())
-}
-
-fn record_read_files(read_files: &mut HashMap<PathBuf, u64>, paths: Vec<PathBuf>) {
-    for path in paths {
-        if let Ok(fingerprint) = file_fingerprint(&path) {
-            read_files.insert(path, fingerprint);
-        }
-    }
 }
 
 fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String> {
@@ -408,6 +357,27 @@ fn str_replace_in_file(path: &str, old_str: &str, new_str: &str) -> Result<(), S
         .map_err(|e| format!("Error writing file '{path}': {e}"))
 }
 
+fn create_file(path: &str, file_text: &str) -> Result<String, String> {
+    let path_buf = PathBuf::from(path);
+    if path_buf.exists() {
+        return Err(format!(
+            "File already exists at '{path}'. Use str_replace or insert to modify it, or choose a new path."
+        ));
+    }
+    if let Some(parent) = path_buf.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "Error creating parent directories for '{path}': {e}"
+        ));
+    }
+    atomically_write_file(&path_buf, file_text.as_bytes())
+        .map_err(|e| format!("Error creating file '{path}': {e}"))?;
+    Ok(format!("Created file '{path}'."))
+}
+
 /// Insert `insert_text` after line `insert_line` (0 = beginning of file).
 fn insert_in_file(path: &str, insert_line: i64, insert_text: &str) -> Result<(), String> {
     if insert_line < 0 {
@@ -497,7 +467,8 @@ pub enum Command {
 /// Wire / JSON-Schema shape for the text-editor tool: one flat object with all fields.
 ///
 /// Anthropic requires `input_schema.type == "object"`. Schemars emits that for this struct.
-/// Convert to [`ParsedInput`] after deserialize so execution can pattern-match per command.
+/// Per-command required fields stay `Option` here; [`TextEditorService::execute`] validates
+/// them in its match arms, naming any missing field.
 ///
 /// ```json
 /// { "command": "view", "path": "primes.py" }
@@ -533,195 +504,13 @@ pub struct Input {
     pub insert_text: Option<String>,
 }
 
-/// Type-safe per-command text-editor input (runtime form).
-///
-/// Prefer deserializing [`Input`] from the wire, then [`ParsedInput::try_from`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum ParsedInput {
-    /// Examine a file or list a directory.
-    View {
-        /// Path to the file or directory to view.
-        path: String,
-        /// Optional 1-indexed inclusive line range `[start, end]`.
-        /// Use `-1` for `end` to read through the end of the file.
-        /// Only applies when viewing files, not directories.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view_range: Option<[i64; 2]>,
-    },
-    /// Replace exactly one occurrence of `old_str` with `new_str` in a file.
-    StrReplace {
-        /// Path to the file to modify.
-        path: String,
-        /// Exact text to replace (must match whitespace and indentation).
-        old_str: String,
-        /// Replacement text.
-        new_str: String,
-    },
-    /// Create a new file with the given contents.
-    Create {
-        /// Path where the new file should be created.
-        path: String,
-        /// Content to write to the new file.
-        file_text: String,
-    },
-    /// Insert text after a given line number.
-    Insert {
-        /// Path to the file to modify.
-        path: String,
-        /// Line number after which to insert text (`0` = beginning of file).
-        insert_line: i64,
-        /// Text to insert.
-        insert_text: String,
-    },
-}
-
-impl From<ParsedInput> for Input {
-    fn from(input: ParsedInput) -> Self {
-        match input {
-            ParsedInput::View { path, view_range } => Self {
-                command: Command::View,
-                path,
-                view_range,
-                old_str: None,
-                new_str: None,
-                file_text: None,
-                insert_line: None,
-                insert_text: None,
-            },
-            ParsedInput::StrReplace {
-                path,
-                old_str,
-                new_str,
-            } => Self {
-                command: Command::StrReplace,
-                path,
-                view_range: None,
-                old_str: Some(old_str),
-                new_str: Some(new_str),
-                file_text: None,
-                insert_line: None,
-                insert_text: None,
-            },
-            ParsedInput::Create { path, file_text } => Self {
-                command: Command::Create,
-                path,
-                view_range: None,
-                old_str: None,
-                new_str: None,
-                file_text: Some(file_text),
-                insert_line: None,
-                insert_text: None,
-            },
-            ParsedInput::Insert {
-                path,
-                insert_line,
-                insert_text,
-            } => Self {
-                command: Command::Insert,
-                path,
-                view_range: None,
-                old_str: None,
-                new_str: None,
-                file_text: None,
-                insert_line: Some(insert_line),
-                insert_text: Some(insert_text),
-            },
-        }
-    }
-}
-
-impl TryFrom<Input> for ParsedInput {
-    type Error = String;
-
-    fn try_from(input: Input) -> Result<Self, Self::Error> {
-        match input.command {
-            Command::View => Ok(ParsedInput::View {
-                path: input.path,
-                view_range: input.view_range,
-            }),
-            Command::StrReplace => {
-                let old_str = input
-                    .old_str
-                    .ok_or_else(|| "str_replace requires `old_str`".to_string())?;
-                let new_str = input
-                    .new_str
-                    .ok_or_else(|| "str_replace requires `new_str`".to_string())?;
-                Ok(ParsedInput::StrReplace {
-                    path: input.path,
-                    old_str,
-                    new_str,
-                })
-            }
-            Command::Create => {
-                let file_text = input
-                    .file_text
-                    .ok_or_else(|| "create requires `file_text`".to_string())?;
-                Ok(ParsedInput::Create {
-                    path: input.path,
-                    file_text,
-                })
-            }
-            Command::Insert => {
-                let insert_line = input
-                    .insert_line
-                    .ok_or_else(|| "insert requires `insert_line`".to_string())?;
-                let insert_text = input
-                    .insert_text
-                    .ok_or_else(|| "insert requires `insert_text`".to_string())?;
-                Ok(ParsedInput::Insert {
-                    path: input.path,
-                    insert_line,
-                    insert_text,
-                })
-            }
-        }
-    }
-}
-
-impl ParsedInput {
-    /// Paths this command will modify. `create` is excluded: new files cannot have been read.
-    fn mutated_files(&self) -> Vec<PathBuf> {
-        match self {
-            ParsedInput::View { .. } | ParsedInput::Create { .. } => Vec::default(),
-            ParsedInput::StrReplace { path, .. } | ParsedInput::Insert { path, .. } => {
-                vec![PathBuf::from(path)]
-            }
-        }
-    }
-
-    /// Paths whose last-modified time should be recorded after a successful command.
-    fn read_files(&self) -> Vec<PathBuf> {
-        match self {
-            ParsedInput::View { path, .. }
-            | ParsedInput::StrReplace { path, .. }
-            | ParsedInput::Create { path, .. }
-            | ParsedInput::Insert { path, .. } => {
-                vec![PathBuf::from(path)]
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::HostWorker;
+    use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
     use std::sync::Arc;
-
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("myco-text-editor-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
 
     fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -729,29 +518,7 @@ mod tests {
         path
     }
 
-    fn tool_use(parsed: ParsedInput) -> generative_model::ToolUse {
-        // Wire format is [`Input`]; [`ParsedInput`] is only the runtime form.
-        let input = Input::from(parsed);
-        generative_model::ToolUse {
-            id: "test".into(),
-            name: "str_replace_based_edit_tool".into(),
-            input: serde_json::to_value(input).unwrap(),
-        }
-    }
-
-    fn result_text(result: &generative_model::ToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// HostWorker with a single shared [`TextEditorService`] (stateful read LMT map).
+    /// HostWorker with a single shared [`TextEditorService`] (stateful read-stamp map).
     fn harness() -> Arc<HostWorker> {
         Arc::new(HostWorker::new(
             "test",
@@ -759,9 +526,17 @@ mod tests {
         ))
     }
 
-    fn dispatch(harness: &Arc<HostWorker>, input: ParsedInput) -> generative_model::ToolResult {
+    /// Dispatch a wire-shaped input (same flat JSON the model sends).
+    fn dispatch(
+        harness: &Arc<HostWorker>,
+        input: serde_json::Value,
+    ) -> generative_model::ToolResult {
         futures::executor::block_on(harness.dispatch_tool_use(
-            tool_use(input),
+            generative_model::ToolUse {
+                id: "test".into(),
+                name: "str_replace_based_edit_tool".into(),
+                input,
+            },
             HostDispatchContext {
                 agent_id: uuid::Uuid::nil(),
                 cancel: crate::core::CancelToken::new(),
@@ -769,115 +544,18 @@ mod tests {
         ))
     }
 
-    fn assert_input_roundtrip(parsed: ParsedInput, expected_json: serde_json::Value) {
-        let input = Input::from(parsed.clone());
-        let value = serde_json::to_value(&input).unwrap();
-        assert_eq!(value, expected_json);
-        let wire: Input = serde_json::from_value(value).unwrap();
-        assert_eq!(ParsedInput::try_from(wire).unwrap(), parsed);
-    }
-
+    /// A malformed call must name its missing field, not fail some later
+    /// guard (the path here was never read, so a reordered check would
+    /// surface the read-stamp error instead).
     #[test]
-    fn view_roundtrip() {
-        assert_input_roundtrip(
-            ParsedInput::View {
-                path: "primes.py".into(),
-                view_range: None,
-            },
-            json!({
-                "command": "view",
-                "path": "primes.py",
-            }),
+    fn str_replace_missing_fields_errors() {
+        let harness = harness();
+        let result = dispatch(
+            &harness,
+            json!({"command": "str_replace", "path": "x.py", "new_str": "y"}),
         );
-    }
-
-    #[test]
-    fn view_with_range_roundtrip() {
-        assert_input_roundtrip(
-            ParsedInput::View {
-                path: "primes.py".into(),
-                view_range: Some([1, 10]),
-            },
-            json!({
-                "command": "view",
-                "path": "primes.py",
-                "view_range": [1, 10],
-            }),
-        );
-    }
-
-    #[test]
-    fn str_replace_roundtrip() {
-        assert_input_roundtrip(
-            ParsedInput::StrReplace {
-                path: "primes.py".into(),
-                old_str: "    for num in range(2, limit + 1)".into(),
-                new_str: "    for num in range(2, limit + 1):".into(),
-            },
-            json!({
-                "command": "str_replace",
-                "path": "primes.py",
-                "old_str": "    for num in range(2, limit + 1)",
-                "new_str": "    for num in range(2, limit + 1):",
-            }),
-        );
-    }
-
-    #[test]
-    fn create_roundtrip() {
-        assert_input_roundtrip(
-            ParsedInput::Create {
-                path: "test_primes.py".into(),
-                file_text: "print('hi')\n".into(),
-            },
-            json!({
-                "command": "create",
-                "path": "test_primes.py",
-                "file_text": "print('hi')\n",
-            }),
-        );
-    }
-
-    #[test]
-    fn insert_roundtrip() {
-        assert_input_roundtrip(
-            ParsedInput::Insert {
-                path: "primes.py".into(),
-                insert_line: 0,
-                insert_text: "\"\"\"Module docstring.\"\"\"\n".into(),
-            },
-            json!({
-                "command": "insert",
-                "path": "primes.py",
-                "insert_line": 0,
-                "insert_text": "\"\"\"Module docstring.\"\"\"\n",
-            }),
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_command() {
-        let err = serde_json::from_value::<Input>(json!({
-            "command": "delete",
-            "path": "x.py",
-        }))
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown variant") || err.to_string().contains("delete"));
-    }
-
-    #[test]
-    fn str_replace_missing_fields_errors_on_convert() {
-        let input = Input {
-            command: Command::StrReplace,
-            path: "x.py".into(),
-            view_range: None,
-            old_str: None,
-            new_str: Some("y".into()),
-            file_text: None,
-            insert_line: None,
-            insert_text: None,
-        };
-        let err = ParsedInput::try_from(input).unwrap_err();
+        assert!(result.is_error);
+        let err = result_text(&result);
         assert!(err.contains("old_str"), "{err}");
     }
 
@@ -997,28 +675,23 @@ mod tests {
 
     #[test]
     fn view_then_str_replace() {
-        let tmp = temp_dir();
-        let path = write_file(&tmp.0, "primes.py", "for x in y\n");
+        let tmp = temp_dir("text-editor");
+        let path = write_file(tmp.path(), "primes.py", "for x in y\n");
         let path_str = path.to_string_lossy().into_owned();
         let harness = harness();
 
-        let view = dispatch(
-            &harness,
-            ParsedInput::View {
-                path: path_str.clone(),
-                view_range: None,
-            },
-        );
+        let view = dispatch(&harness, json!({"command": "view", "path": &path_str}));
         assert!(!view.is_error, "{}", result_text(&view));
         assert_eq!(result_text(&view), "for x in y\n");
 
         let edit = dispatch(
             &harness,
-            ParsedInput::StrReplace {
-                path: path_str.clone(),
-                old_str: "for x in y".into(),
-                new_str: "for x in y:".into(),
-            },
+            json!({
+                "command": "str_replace",
+                "path": &path_str,
+                "old_str": "for x in y",
+                "new_str": "for x in y:",
+            }),
         );
         assert!(!edit.is_error, "{}", result_text(&edit));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "for x in y:\n");
@@ -1028,29 +701,24 @@ mod tests {
     /// symlink with a regular file (which forks the content).
     #[test]
     fn str_replace_through_symlink_edits_target() {
-        let tmp = temp_dir();
-        let target = write_file(&tmp.0, "real.md", "old text\n");
-        let link = tmp.0.join("link.md");
+        let tmp = temp_dir("text-editor");
+        let target = write_file(tmp.path(), "real.md", "old text\n");
+        let link = tmp.path().join("link.md");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let link_str = link.to_string_lossy().into_owned();
         let harness = harness();
 
-        let view = dispatch(
-            &harness,
-            ParsedInput::View {
-                path: link_str.clone(),
-                view_range: None,
-            },
-        );
+        let view = dispatch(&harness, json!({"command": "view", "path": &link_str}));
         assert!(!view.is_error, "{}", result_text(&view));
 
         let edit = dispatch(
             &harness,
-            ParsedInput::StrReplace {
-                path: link_str,
-                old_str: "old text".into(),
-                new_str: "new text".into(),
-            },
+            json!({
+                "command": "str_replace",
+                "path": &link_str,
+                "old_str": "old text",
+                "new_str": "new text",
+            }),
         );
         assert!(!edit.is_error, "{}", result_text(&edit));
         assert!(
@@ -1062,17 +730,18 @@ mod tests {
 
     #[test]
     fn str_replace_without_view_errors() {
-        let tmp = temp_dir();
-        let path = write_file(&tmp.0, "f.py", "a\n");
+        let tmp = temp_dir("text-editor");
+        let path = write_file(tmp.path(), "f.py", "a\n");
         let harness = harness();
 
         let result = dispatch(
             &harness,
-            ParsedInput::StrReplace {
-                path: path.to_string_lossy().into(),
-                old_str: "a".into(),
-                new_str: "b".into(),
-            },
+            json!({
+                "command": "str_replace",
+                "path": path.to_string_lossy(),
+                "old_str": "a",
+                "new_str": "b",
+            }),
         );
         assert!(result.is_error);
         assert!(result_text(&result).contains("was not read"));
@@ -1080,18 +749,12 @@ mod tests {
 
     #[test]
     fn external_modification_blocks_str_replace() {
-        let tmp = temp_dir();
-        let path = write_file(&tmp.0, "f.py", "hello\n");
+        let tmp = temp_dir("text-editor");
+        let path = write_file(tmp.path(), "f.py", "hello\n");
         let path_str = path.to_string_lossy().into_owned();
         let harness = harness();
 
-        let view = dispatch(
-            &harness,
-            ParsedInput::View {
-                path: path_str.clone(),
-                view_range: None,
-            },
-        );
+        let view = dispatch(&harness, json!({"command": "view", "path": &path_str}));
         assert!(!view.is_error);
 
         // Immediate external write — the guard fingerprints content, so no
@@ -1100,11 +763,12 @@ mod tests {
 
         let edit = dispatch(
             &harness,
-            ParsedInput::StrReplace {
-                path: path_str,
-                old_str: "hello".into(),
-                new_str: "hi".into(),
-            },
+            json!({
+                "command": "str_replace",
+                "path": &path_str,
+                "old_str": "hello",
+                "new_str": "hi",
+            }),
         );
         assert!(edit.is_error, "{}", result_text(&edit));
         assert!(result_text(&edit).contains("modified on disk"));
@@ -1112,28 +776,31 @@ mod tests {
 
     #[test]
     fn create_insert_and_view_range() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("new.py");
+        let tmp = temp_dir("text-editor");
+        let path = tmp.path().join("new.py");
         let path_str = path.to_string_lossy().into_owned();
         let harness = harness();
 
         let create = dispatch(
             &harness,
-            ParsedInput::Create {
-                path: path_str.clone(),
-                file_text: "line1\nline2\nline3\n".into(),
-            },
+            json!({
+                "command": "create",
+                "path": &path_str,
+                "file_text": "line1\nline2\nline3\n",
+            }),
         );
         assert!(!create.is_error, "{}", result_text(&create));
 
-        // Create records LMT, so insert may proceed without an explicit view.
+        // Create records the read stamp, so insert may proceed without an
+        // explicit view.
         let insert = dispatch(
             &harness,
-            ParsedInput::Insert {
-                path: path_str.clone(),
-                insert_line: 1,
-                insert_text: "inserted\n".into(),
-            },
+            json!({
+                "command": "insert",
+                "path": &path_str,
+                "insert_line": 1,
+                "insert_text": "inserted\n",
+            }),
         );
         assert!(!insert.is_error, "{}", result_text(&insert));
         assert_eq!(
@@ -1143,10 +810,7 @@ mod tests {
 
         let view = dispatch(
             &harness,
-            ParsedInput::View {
-                path: path_str,
-                view_range: Some([2, 3]),
-            },
+            json!({"command": "view", "path": &path_str, "view_range": [2, 3]}),
         );
         assert!(!view.is_error, "{}", result_text(&view));
         assert_eq!(result_text(&view), "inserted\nline2");
@@ -1154,16 +818,17 @@ mod tests {
 
     #[test]
     fn create_rejects_existing_file() {
-        let tmp = temp_dir();
-        let path = write_file(&tmp.0, "exists.py", "x\n");
+        let tmp = temp_dir("text-editor");
+        let path = write_file(tmp.path(), "exists.py", "x\n");
         let harness = harness();
 
         let result = dispatch(
             &harness,
-            ParsedInput::Create {
-                path: path.to_string_lossy().into(),
-                file_text: "y\n".into(),
-            },
+            json!({
+                "command": "create",
+                "path": path.to_string_lossy(),
+                "file_text": "y\n",
+            }),
         );
         assert!(result.is_error);
         assert!(result_text(&result).contains("already exists"));
@@ -1173,17 +838,14 @@ mod tests {
     /// view_range instead of dumping the whole file into context.
     #[test]
     fn unranged_view_of_huge_file_is_capped() {
-        let tmp = temp_dir();
+        let tmp = temp_dir("text-editor");
         let big = "x".repeat((MAX_VIEW_BYTES + 1) as usize);
-        let path = write_file(&tmp.0, "huge.log", &big);
+        let path = write_file(tmp.path(), "huge.log", &big);
         let harness = harness();
 
         let view = dispatch(
             &harness,
-            ParsedInput::View {
-                path: path.to_string_lossy().into(),
-                view_range: None,
-            },
+            json!({"command": "view", "path": path.to_string_lossy()}),
         );
         assert!(view.is_error, "{}", result_text(&view));
         assert!(
@@ -1195,10 +857,7 @@ mod tests {
         // A ranged view of the same file still works.
         let ranged = dispatch(
             &harness,
-            ParsedInput::View {
-                path: path.to_string_lossy().into(),
-                view_range: Some([1, 1]),
-            },
+            json!({"command": "view", "path": path.to_string_lossy(), "view_range": [1, 1]}),
         );
         assert!(!ranged.is_error, "{}", result_text(&ranged));
     }

@@ -107,19 +107,10 @@ enum ActionKind {
 mod tests {
     use super::*;
     use crate::CancelToken;
-    use crate::generative_model::{Content, ToolUse};
+    use crate::generative_model::ToolUse;
+    use crate::test_support::result_text;
     use serde_json::json;
     use std::sync::Arc;
-
-    fn tool_text(r: &generative_model::ToolResult) -> String {
-        r.content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
 
     fn ctx() -> HostDispatchContext {
         HostDispatchContext {
@@ -143,7 +134,7 @@ mod tests {
             )
             .await;
         assert!(!list.is_error, "{list:?}");
-        let list_text = tool_text(&list);
+        let list_text = result_text(&list);
         assert!(list_text.contains("harness-ops"), "{list_text}");
 
         let get = tool
@@ -157,7 +148,7 @@ mod tests {
             )
             .await;
         assert!(!get.is_error, "{get:?}");
-        let body = tool_text(&get);
+        let body = result_text(&get);
         assert!(body.contains("git archive"), "{body}");
         assert!(body.contains("github.com/tsnl/myco/releases"), "{body}");
         assert!(body.contains("executable_path"), "{body}");

@@ -93,23 +93,11 @@ mod tests {
     use crate::core::CancelToken;
     use crate::core::image::MAX_IMAGE_BYTES;
     use crate::generative_model::ToolUse;
+    use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
 
     const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
-
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("myco-view-image-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
 
     fn view(path: &str) -> ToolResult {
         futures::executor::block_on(Arc::new(ViewImageService::new()).dispatch_tool_use(
@@ -125,25 +113,14 @@ mod tests {
         ))
     }
 
-    fn error_text(result: &ToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn returns_image_block_as_data_url() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("shot.png");
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("shot.png");
         std::fs::write(&path, PNG).unwrap();
 
         let result = view(&path.to_string_lossy());
-        assert!(!result.is_error, "{}", error_text(&result));
+        assert!(!result.is_error, "{}", result_text(&result));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
             // 0x89 P N G → iVBORw==
@@ -156,12 +133,12 @@ mod tests {
     /// from the bytes, so there is nothing to gate on.
     #[test]
     fn reads_an_extensionless_file() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("clipboard-grab");
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("clipboard-grab");
         std::fs::write(&path, JPEG).unwrap();
 
         let result = view(&path.to_string_lossy());
-        assert!(!result.is_error, "{}", error_text(&result));
+        assert!(!result.is_error, "{}", result_text(&result));
         match &result.content[0] {
             Content::Image { source } => {
                 assert!(source.starts_with("data:image/jpeg;base64,"), "{source}");
@@ -173,12 +150,12 @@ mod tests {
     /// A wrong extension must not decide the media type on the wire.
     #[test]
     fn mislabeled_extension_uses_the_real_media_type() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("actually-a-jpeg.png");
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("actually-a-jpeg.png");
         std::fs::write(&path, JPEG).unwrap();
 
         let result = view(&path.to_string_lossy());
-        assert!(!result.is_error, "{}", error_text(&result));
+        assert!(!result.is_error, "{}", result_text(&result));
         match &result.content[0] {
             Content::Image { source } => {
                 assert!(source.starts_with("data:image/jpeg;base64,"), "{source}");
@@ -189,14 +166,14 @@ mod tests {
 
     #[test]
     fn text_file_is_rejected() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("notes.txt");
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "hi").unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(result.is_error);
         assert!(
-            error_text(&result).contains("is not a png, jpeg, gif, or webp image"),
+            result_text(&result).contains("is not a png, jpeg, gif, or webp image"),
             "{result:?}"
         );
     }
@@ -204,13 +181,13 @@ mod tests {
     /// A directory named `*.png` must not be read as image bytes.
     #[test]
     fn directory_with_image_extension_errors() {
-        let tmp = temp_dir();
-        let dir = tmp.0.join("assets.png");
+        let tmp = temp_dir("view-image");
+        let dir = tmp.path().join("assets.png");
         std::fs::create_dir_all(&dir).unwrap();
 
         let result = view(&dir.to_string_lossy());
         assert!(result.is_error);
-        assert!(error_text(&result).contains("is not a file"), "{result:?}");
+        assert!(result_text(&result).contains("is not a file"), "{result:?}");
     }
 
     #[test]
@@ -218,19 +195,22 @@ mod tests {
         let result = view("/definitely/missing/shot.png");
         assert!(result.is_error);
         assert!(
-            error_text(&result).contains("/definitely/missing/shot.png"),
+            result_text(&result).contains("/definitely/missing/shot.png"),
             "{result:?}"
         );
     }
 
     #[test]
     fn oversized_image_errors_with_limit() {
-        let tmp = temp_dir();
-        let path = tmp.0.join("big.png");
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("big.png");
         std::fs::write(&path, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(result.is_error);
-        assert!(error_text(&result).contains("limit is 5 MiB"), "{result:?}");
+        assert!(
+            result_text(&result).contains("limit is 5 MiB"),
+            "{result:?}"
+        );
     }
 }
