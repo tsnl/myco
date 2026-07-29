@@ -1,4 +1,4 @@
-//! Host tool services (bash, text editor, manual, …).
+//! Host tool services (bash, text editor, …).
 //!
 //! Registered on a [`crate::host::HostWorker`]. The **standard** catalog is the same on
 //! every host. The agent **root** (in-process `local`) may instantiate additional
@@ -18,9 +18,6 @@ pub use text_editor_service::TextEditorService;
 
 pub mod view_image_service;
 pub use view_image_service::ViewImageService;
-
-pub mod manual_service;
-pub use manual_service::ManualService;
 
 pub mod meta_tool_service;
 pub use meta_tool_service::SessionMetaTool;

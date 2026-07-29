@@ -39,7 +39,7 @@ Actions (`action` is required):
   `host`+`path`.
 - executable_path: absolute path of the running `myco` agent binary
   (`std::env::current_exe`). Use with bash (`$path --version`) to read the package
-  version when deciding how to update remotes (see manual `harness-ops`).
+  version when deciding how to update remotes (see `harness-ops.md` in the manual).
 - pid: OS process id of the running `myco` agent process (`std::process::id`).
   Use with bash to inspect the live process (`ps -p $pid`, `/proc/$pid`) — e.g.
   memory use or open files — without guessing which `myco` is you (nested agents

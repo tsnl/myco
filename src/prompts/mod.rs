@@ -2,8 +2,8 @@
 //!
 //! Always-on agent policy (worktrees, computer-use, coding norms, user
 //! authority, the agent workspace) lives here. Longer runtime docs live in
-//! [`crate::manual`] and are browsed via the `manual` host tool /
-//! `myco --help [id]`.
+//! [`crate::manual`], exported to disk at startup, and pointed at from the
+//! `# Manual` section below.
 
 use std::path::{Path, PathBuf};
 
@@ -25,13 +25,14 @@ You are running inside **myco**: a mycelial agent runtime. The same agent patter
 scale — supervisors drive **nested myco agents** as ordinary commands (see Nested Agents below),
 and tools run on **hosts** (hands) spanning local and remote machines. The **local** host is always
 enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. Local
-tools (`session_meta`) stay in the agent process; host tools (`bash`, editor, `manual`) run on
+tools (`session_meta`) stay in the agent process; host tools (`bash`, editor) run on
 a host worker (local in-process or remote).
 
-**Browse runtime docs with the `manual` tool** (`list` / `get` by id) or `myco --help <id>`.
-Article ids: `overview`, `cli`, `harness-ops`.
+**Runtime docs are markdown files on disk** — see *Manual* below for the directory this build
+exported them to. Read and search them with the tools you already have (`rg`, the editor);
+`index.md` names the articles: `overview.md`, `cli.md`, `harness-ops.md`.
 
-Quick map (details in `manual`):
+Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
   (`attach_timeout_secs`, `max_soul_bytes`).
@@ -50,7 +51,7 @@ Quick map (details in `manual`):
   (`.claude/skills`, `SKILL.md` folders) — read them with the editor or `rg` when the task
   touches how this project works.
 - You cannot run slash-commands (`/hosts`, `/session`, …); tell the user which to run.
-- Updating `myco` on **remote** hosts: compile **on the target** (see `manual` `harness-ops`).
+- Updating `myco` on **remote** hosts: compile **on the target** (see `harness-ops.md`).
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
   `myco --version`). Never scp prebuilt binaries across machines (glibc/arch mismatch).
@@ -66,7 +67,7 @@ Nest **on the local host only**. The brain stays on this machine — model acces
 the session store are shared by construction — and a nested agent reaches remote machines through
 its own host pool exactly as you do. Remote hosts stay hands, not brains: they need only `myco` on
 PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
-cleanly over one SSH connection per host with ControlMaster — see `manual` `harness-ops`.)
+cleanly over one SSH connection per host with ControlMaster — see `harness-ops.md`.)
 
 Recipe: read your own session id off the newest `# Session` block in this conversation — myco
 stamps one on the first user message of every session (`session_meta` action=get reports it too,
@@ -340,17 +341,21 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 /// process-global `MYCO_HOME` / cwd override.
 ///
 /// Blocks are ordered least to most volatile, because every agent's prompt
-/// carries them as a prefix: the soul changes only on a deliberate revision,
-/// project guidance only when the repo's own file does, while any new workspace
-/// file rewrites the listing. Keeping the churniest block last leaves the
-/// longest shared prefix for same-model forks to hit in the prompt cache.
+/// carries them as a prefix: the manual path changes only when the binary
+/// does, the soul only on a deliberate revision, project guidance only when
+/// the repo's own file does, while any new workspace file rewrites the
+/// listing. Keeping the churniest block last leaves the longest shared prefix
+/// for same-model forks to hit in the prompt cache.
 fn epilogue_with(
     home: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
     max_soul_bytes: usize,
 ) -> String {
-    let workspace = home.map(|home| home.join("workspace"));
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
+    if let Some(home) = home.as_deref() {
+        prompt.push_str(&manual_section(&crate::manual::dir(home)));
+    }
+    let workspace = home.map(|home| home.join("workspace"));
     let soul = workspace
         .as_deref()
         .and_then(|ws| capped_soul(&ws.join("soul"), max_soul_bytes));
@@ -373,6 +378,20 @@ fn epilogue_with(
         prompt.push_str(&listing);
     }
     prompt
+}
+
+/// Where startup exported this build's manual ([`crate::manual::export`]).
+/// The directory is named rather than quoted: the articles run to tens of
+/// kilobytes, and an agent that can `rg` them does not need them in context.
+fn manual_section(dir: &Path) -> String {
+    format!(
+        "\n---\n\n# Manual\n\nRuntime docs for this myco build: `{}` (`index.md` plus one file \
+         per article). Search them like any other files — `rg -n 'ControlMaster' {}`. They are \
+         this binary's own docs, refreshed at startup, so trust them over memory when host, \
+         install, or config behavior is unclear.\n",
+        dir.display(),
+        dir.display(),
+    )
 }
 
 /// Bounds on the workspace listing. A workspace can hold anything, so the
@@ -561,8 +580,9 @@ mod tests {
         // Remote work goes through the `host` field, not local `ssh`.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("do not run `ssh <alias> …` from"));
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("persistent SSH connection"));
-        // runtime catalog pointer, not full policy-as-articles
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops`"));
+        // runtime docs are files to search, not a tool to call
+        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops.md`"));
+        assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`manual` tool"));
         // Search guidance is bash-first; myco ships no search tools of its own.
         // Semantic search is the external `ck` companion, probed per host.
         assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`rg`"));
@@ -605,6 +625,24 @@ mod tests {
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manual is not a tool any more, so the prompt has to carry the
+    /// resolved path — an agent told only `~/.myco` would guess wrong under
+    /// `MYCO_HOME`, and a stale build's directory is a different one.
+    #[test]
+    fn manual_path_in_the_prompt_follows_myco_home() {
+        let home =
+            std::env::temp_dir().join(format!("myco-manual-prompt-{}", uuid::Uuid::new_v4()));
+        let prompt = epilogue_with(Some(home.clone()), None, DEFAULT_MAX_SOUL_BYTES);
+        let dir = crate::manual::dir(&home);
+        assert!(prompt.contains("# Manual"), "{prompt}");
+        assert!(prompt.contains(&dir.display().to_string()), "{prompt}");
+        assert!(prompt.contains("index.md"), "{prompt}");
+
+        // No home to resolve: no path claimed rather than a guessed one.
+        let blind = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
+        assert!(!blind.contains("# Manual"), "{blind}");
     }
 
     /// The soul is prompt-resident, so the fragment has to say what earns a
@@ -685,8 +723,13 @@ mod tests {
         std::fs::create_dir_all(&soul_dir).unwrap();
         let epilogue = || epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
 
-        // No versions: the epilogue alone.
-        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+        // No versions: the epilogue plus the unconditional Manual block, and
+        // nothing else.
+        let base = format!(
+            "{DEFAULT_AGENT_PROMPT_EPILOGUE}{}",
+            manual_section(&crate::manual::dir(&dir))
+        );
+        assert_eq!(epilogue(), base);
 
         // One version: appended verbatim under the promised heading, with the
         // live version named so agents know what to supersede.
@@ -717,7 +760,7 @@ mod tests {
         // A whitespace-only newest version reads as a cleared soul — no
         // fallback to older versions.
         std::fs::write(soul_dir.join("20280101T0000-cccc.md"), "  \n\n").unwrap();
-        assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
+        assert_eq!(epilogue(), base);
 
         // An oversized version is truncated with a visible marker, keeping
         // the prompt bounded no matter what got written.
@@ -728,7 +771,7 @@ mod tests {
         .unwrap();
         let prompt = epilogue();
         assert!(prompt.contains("[soul truncated at 64 KiB"), "{prompt}");
-        assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + DEFAULT_MAX_SOUL_BYTES + 200);
+        assert!(prompt.len() < base.len() + DEFAULT_MAX_SOUL_BYTES + 200);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
