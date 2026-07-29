@@ -77,8 +77,15 @@ pub fn compact_session(
         predecessor.summary_path().display()
     ));
 
+    // Compaction mints a new session id, so the successor's first message
+    // stamps its own — the resume block below names the predecessor.
     let mut messages = vec![Message::UserMessage {
-        content: vec![Content::Text { text: resume }],
+        content: vec![
+            Content::Text {
+                text: prompts::session_stamp(&successor.id, successor.created_at),
+            },
+            Content::Text { text: resume },
+        ],
     }];
     messages.extend(tail.iter().cloned());
     let tail_messages = messages.len().saturating_sub(1);
@@ -415,6 +422,21 @@ mod tests {
         assert_eq!(out.predecessor_id, pred.id);
         assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
         assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
+        // Compaction mints a new id, so the successor's first message stamps
+        // its own — an agent that compacts must not keep quoting the
+        // predecessor's id as its session.
+        let Message::UserMessage { content } = &succ.messages[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(&content[0], Content::Text { text }
+                if prompts::is_session_stamp(text) && text.contains(&succ.id)),
+            "{content:?}"
+        );
+        assert!(
+            matches!(&content[1], Content::Text { text } if text.contains(&pred.id)),
+            "{content:?}"
+        );
         assert!(
             std::fs::read_to_string(pred.summary_path())
                 .unwrap()

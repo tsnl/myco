@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 
 /// Epilogue appended to every agent system prompt.
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
@@ -68,7 +68,9 @@ its own host pool exactly as you do. Remote hosts stay hands, not brains: they n
 PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
 cleanly over one SSH connection per host with ControlMaster — see `manual` `harness-ops`.)
 
-Recipe: find your own session id (`session_meta` action=get), then `bash` action=start with
+Recipe: read your own session id off the newest `# Session` block in this conversation — myco
+stamps one on the first user message of every session (`session_meta` action=get reports it too,
+with the rest of the metadata) — then `bash` action=start with
 `command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
 one prompt per line, ending each `write` with `"\n"` — each line is a self-contained turn kept to
 a single line, and only the trailing newline submits it. Stdin passes through unmodified, so a
@@ -130,6 +132,61 @@ pub fn model_stamp(model_key: &str) -> String {
         "---\n\n# Current Model\n\nCatalog key: `{model_key}` — pass `--model {model_key}` when \
          spawning nested or forked myco agents to keep them on this model.\n"
     )
+}
+
+/// Heading of the block [`session_stamp`] builds, and the marker that tells a
+/// stamp apart from something a user typed.
+const SESSION_STAMP_HEADING: &str = "# Session";
+
+/// Where this agent is running, as a block for the **first user message** of a
+/// conversation: the session id `--resume` / `--parent-session` take, when the
+/// session began, and the directory myco was launched in — the facts an agent
+/// would otherwise spend a `session_meta` round trip and a `pwd` to learn.
+///
+/// It rides a message rather than the system prompt for the reason
+/// [`model_stamp`] documents: the prompt must stay byte-identical across an
+/// agent and its forks, and every field here is per-process. A fork inherits
+/// the parent's stamped first message, so it stamps its own onto the first
+/// message it adds — hence "from here on", and hence the newest block wins.
+///
+/// `started_at` is the session's creation time, so the line is honest about
+/// being a start rather than a clock: a session open for days would otherwise
+/// carry a confidently wrong "now" in its prompt, and `date` is always right.
+pub fn session_stamp(session_id: &str, started_at: DateTime<Utc>) -> String {
+    stamp_with(
+        session_id,
+        started_at,
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// [`session_stamp`] against an explicit launch directory, so tests need no
+/// process-global cwd override.
+fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -> String {
+    let started = started_at
+        .with_timezone(&Local)
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut block = format!(
+        "{SESSION_STAMP_HEADING}\n\n- Session id: `{session_id}` — this conversation from here \
+         on. Spawn nested myco agents with `--parent-session {session_id}`; `session_meta` \
+         action=get has the rest of this session's metadata.\n- Started: {started} — when this \
+         session began, not the current time; run `date` for that.\n"
+    );
+    if let Some(cwd) = cwd {
+        block.push_str(&format!(
+            "- Launch directory: `{}` — where myco was started, so `bash` on the local host \
+             begins there unless a call passes `cwd`.\n",
+            cwd.display()
+        ));
+    }
+    block
+}
+
+/// Whether a user-message text block is a [`session_stamp`] rather than the
+/// user's own words. Session labels and search snippets read the first user
+/// message, and the stamp is myco's payload, not something anyone typed.
+pub fn is_session_stamp(text: &str) -> bool {
+    text.starts_with(SESSION_STAMP_HEADING)
 }
 
 /// Cap used when `config.toml` sets no `max_soul_bytes`.
@@ -575,6 +632,50 @@ mod tests {
         assert!(stamp.contains("# Current Model"), "{stamp}");
         assert!(stamp.contains("`grok-4`"), "{stamp}");
         assert!(stamp.contains("--model grok-4"), "{stamp}");
+    }
+
+    /// Where the agent is running reaches it through the conversation, never
+    /// the system prompt: a per-process value there would change the prompt
+    /// bytes per agent and break fork prompt-cache reuse from the first byte.
+    #[test]
+    fn session_stamp_names_the_session_and_stays_out_of_the_system_prompt() {
+        let id = "cafef00dcafef00dcafef00dcafef00d";
+        let started_at = DateTime::parse_from_rfc3339("2026-07-29T14:02:11Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stamp = stamp_with(id, started_at, Some(Path::new("/home/user/myco")));
+
+        assert!(stamp.contains(&format!("`{id}`")), "{stamp}");
+        assert!(stamp.contains(&format!("--parent-session {id}")), "{stamp}");
+        assert!(stamp.contains("`/home/user/myco`"), "{stamp}");
+        assert!(is_session_stamp(&stamp), "{stamp}");
+        assert!(!is_session_stamp("please compact the session"));
+
+        // The rendered time is the session's start instant, whatever zone the
+        // machine renders it in, and it says so — a session open for days must
+        // not read as a clock.
+        let rendered = stamp
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("- Started: "))
+            .expect("a Started line");
+        let (time, note) = rendered.split_once(' ').expect("time then note");
+        assert_eq!(
+            DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .with_timezone(&Utc),
+            started_at,
+            "{stamp}"
+        );
+        assert!(note.contains("not the current time"), "{stamp}");
+
+        // A launch directory myco cannot read drops the line rather than
+        // guessing at one.
+        assert!(!stamp_with(id, started_at, None).contains("Launch directory"));
+
+        let prompt = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
+        assert!(!prompt.contains(id), "{prompt}");
+        // The epilogue points agents at the stamp instead of a tool call.
+        assert!(prompt.contains("newest `# Session` block"), "{prompt}");
     }
 
     #[test]
