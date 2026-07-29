@@ -121,9 +121,7 @@ impl HostWorker {
         match msg {
             Request::Hello => {
                 let response = Response::HelloOk {
-                    name: self.name.clone(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    tools: self.tool_specs(),
                 };
                 if let Err(e) = write_locked(&writer, &response).await {
                     eprintln!("host worker: write hello failed: {e}");
@@ -148,22 +146,19 @@ impl HostWorker {
                     eprintln!("host worker: write tool result failed: {e}");
                 }
             }
-            Request::AgentFinished { id, agent_id } => {
+            Request::AgentFinished { agent_id } => {
+                // Fire-and-forget: no reply message exists for this request.
                 self.notify_agent_finished(agent_id);
-                let response = Response::AgentFinishedOk { id, agent_id };
-                if let Err(e) = write_locked(&writer, &response).await {
-                    eprintln!("host worker: write agent_finished failed: {e}");
-                }
             }
         }
     }
 
     /// Serve until `reader` hits EOF.
     ///
-    /// The read loop only waits on the next request line. Hello, tool calls,
-    /// agent_finished, and error replies are all spawned and write through
-    /// `writer` under a mutex. On EOF, in-flight tasks are joined so results
-    /// are flushed before return.
+    /// The read loop only waits on the next request line. Each request is
+    /// handled on a spawned task; hello, tool-result, and error replies write
+    /// through `writer` under a mutex. On EOF, in-flight tasks are joined so
+    /// results are flushed before return.
     pub async fn serve<R, W>(self: &Arc<Self>, reader: R, writer: W) -> Result<(), String>
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,

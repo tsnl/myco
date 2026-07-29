@@ -20,7 +20,7 @@ pub use config::{
 pub use core::CancelToken;
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
-    SshAgentPreflightReport, StartupPreflight, default_local_host_command, default_ssh_config_path,
+    SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
     ensure_remote_ssh_identities, load_ssh_host_aliases, print_startup_preflight,
     ssh_config_host_aliases,
 };

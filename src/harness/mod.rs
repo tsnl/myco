@@ -28,9 +28,7 @@ pub use preflight::{
 };
 
 mod ssh;
-pub use ssh::{
-    SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_destination_from_command,
-};
+pub use ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -86,6 +84,7 @@ impl Default for HarnessConfig {
 }
 
 /// Resolve `myco --mode host` argv (used by tests that still spawn a local subprocess).
+#[cfg(test)]
 pub fn default_local_host_command() -> Vec<String> {
     vec![
         myco_program(),
@@ -96,6 +95,7 @@ pub fn default_local_host_command() -> Vec<String> {
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn myco_program() -> String {
     // cargo integration tests set this when the package builds the binary.
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_myco")
@@ -167,8 +167,38 @@ impl Harness {
             }
         }
 
-        let mut hosts = HashMap::new();
-        let mut host_commands = HashMap::new();
+        let mut harness = Self::local_harness(root_services);
+        let connect_timeout = config.attach_timeout_secs;
+        for host_cfg in config.remote_hosts {
+            harness
+                .host_commands
+                .insert(host_cfg.name.clone(), host_cfg.command.clone());
+            let name = host_cfg.name.clone();
+            harness.hosts.insert(
+                name,
+                HostController::with_timeout(host_cfg, connect_timeout),
+            );
+        }
+
+        Ok(Arc::new(harness))
+    }
+
+    /// Test helper: attach only the in-process local host.
+    pub async fn attach_local_for_tests() -> Result<Arc<Self>, String> {
+        Self::attach(HarnessConfig::default()).await
+    }
+
+    /// In-process harness for unit tests: local host only, with the given services
+    /// (plus the standard catalog).
+    pub fn local_with_services(extra: Vec<Arc<dyn ToolService>>) -> Arc<Self> {
+        Arc::new(Self::local_harness(extra))
+    }
+
+    /// Local-only harness: the always-on in-process worker (standard catalog
+    /// plus `root_services`) and the advertised tool specs — routing `host`
+    /// injected for multi-host tools, root-only schemas kept verbatim.
+    /// [`Self::attach_with_root_services`] adds remotes on top.
+    fn local_harness(root_services: Vec<Arc<dyn ToolService>>) -> Self {
         let mut host_tool_names = std::collections::HashSet::new();
         let mut root_only_tool_names = std::collections::HashSet::new();
         let mut tool_specs = Vec::new();
@@ -200,75 +230,19 @@ impl Harness {
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
         let local = HostController::in_process("local", local_worker);
-        host_commands.insert("local".into(), vec!["in-process".into()]);
-        hosts.insert("local".into(), local);
-
-        let connect_timeout = config.attach_timeout_secs;
-        for host_cfg in config.remote_hosts {
-            host_commands.insert(host_cfg.name.clone(), host_cfg.command.clone());
-            let name = host_cfg.name.clone();
-            hosts.insert(
-                name,
-                HostController::with_timeout(host_cfg, connect_timeout),
-            );
-        }
-
-        Ok(Arc::new(Self {
-            hosts,
-            host_commands,
-            default_host: "local".into(),
-            host_tool_names,
-            root_only_tool_names,
-            tool_specs,
-        }))
-    }
-
-    /// Test helper: attach only the in-process local host.
-    pub async fn attach_local_for_tests() -> Result<Arc<Self>, String> {
-        Self::attach(HarnessConfig::default()).await
-    }
-
-    /// In-process harness for unit tests: local host only, with the given services
-    /// (plus the standard catalog).
-    pub fn local_with_services(extra: Vec<Arc<dyn ToolService>>) -> Arc<Self> {
-        let standard = crate::host::HostWorker::standard_services();
-        let mut host_tool_names = std::collections::HashSet::new();
-        let mut root_only_tool_names = std::collections::HashSet::new();
-        let mut tool_specs = Vec::new();
-        let mut seen = HashMap::<String, ()>::new();
-        for service in &standard {
-            for spec in service.tool_specs() {
-                host_tool_names.insert(spec.name.clone());
-                if seen.insert(spec.name.clone(), ()).is_none() {
-                    tool_specs.push(inject_host_field(spec));
-                }
-            }
-        }
-        for service in &extra {
-            for spec in service.tool_specs() {
-                host_tool_names.insert(spec.name.clone());
-                root_only_tool_names.insert(spec.name.clone());
-                if seen.insert(spec.name.clone(), ()).is_none() {
-                    tool_specs.push(spec);
-                }
-            }
-        }
-        let mut services = standard;
-        services.extend(extra);
-        let worker = Arc::new(crate::host::HostWorker::new("local", services));
-        let local = HostController::in_process("local", worker);
         let mut hosts = HashMap::new();
         let mut host_commands = HashMap::new();
         hosts.insert("local".into(), local);
         host_commands.insert("local".into(), vec!["in-process".into()]);
-        Arc::new(Self {
+
+        Self {
             hosts,
             host_commands,
             default_host: "local".into(),
             host_tool_names,
             root_only_tool_names,
             tool_specs,
-        })
+        }
     }
 
     pub fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
@@ -417,34 +391,16 @@ fn strip_host_field(tool_use: &mut generative_model::ToolUse) {
 }
 
 /// Inject optional `host` into a host tool's JSON schema so models can target machines.
+///
+/// Host tool schemas are static in-repo objects with a `properties` object
+/// (pinned by `standard_catalog_is_bash_editor_view_image_manual_only`), so
+/// anything else is a bug worth a panic, not a fallback.
 fn inject_host_field(mut spec: generative_model::ToolSpec) -> generative_model::ToolSpec {
-    let schema = &mut spec.input_schema;
-    if !schema.is_object() {
-        return spec;
-    }
-    let Some(props) = schema
-        .as_object_mut()
-        .and_then(|o| o.get_mut("properties"))
+    let props = spec
+        .input_schema
+        .get_mut("properties")
         .and_then(|p| p.as_object_mut())
-    else {
-        // Ensure properties object exists.
-        if let Some(obj) = schema.as_object_mut() {
-            obj.entry("properties")
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
-                props.insert(
-                    "host".into(),
-                    serde_json::json!({
-                        "type": ["string", "null"],
-                        "description":
-                            "Target host name (optional; defaults to \"local\"). Local is always in-process; remotes are named in config. Sessions are per-host.",
-                    }),
-                );
-            }
-        }
-        return spec;
-    };
-
+        .expect("host tool input_schema must have a properties object");
     if !props.contains_key("host") {
         props.insert(
             "host".into(),
@@ -463,7 +419,51 @@ fn inject_host_field(mut spec: generative_model::ToolSpec) -> generative_model::
 mod tests {
     use super::*;
     use crate::generative_model::ToolUse;
+    use crate::test_support::result_text;
     use serde_json::json;
+
+    /// Dispatch `name` with `input` through the harness under `context`.
+    async fn call_on(
+        harness: &Arc<Harness>,
+        context: TraceContext,
+        name: &str,
+        input: serde_json::Value,
+    ) -> generative_model::ToolResult {
+        harness
+            .clone()
+            .dispatch_tool_use(
+                ToolUse {
+                    id: "t".into(),
+                    name: name.into(),
+                    input,
+                },
+                context,
+                CancelToken::new(),
+            )
+            .await
+    }
+
+    async fn call(
+        harness: &Arc<Harness>,
+        name: &str,
+        input: serde_json::Value,
+    ) -> generative_model::ToolResult {
+        call_on(harness, TraceContext::default(), name, input).await
+    }
+
+    /// Remote-host config spawning this build's `myco --mode host` (not SSH).
+    fn subprocess_host(name: &str, program: String) -> HostConfig {
+        HostConfig {
+            name: name.into(),
+            command: vec![
+                program,
+                "--mode".into(),
+                "host".into(),
+                "--name".into(),
+                name.into(),
+            ],
+        }
+    }
 
     #[test]
     fn resolve_host_defaults_and_overrides() {
@@ -560,8 +560,6 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn root_only_tools_keep_host_field_and_run_local() {
-        use crate::CancelToken;
-        use crate::generative_model::Content;
         use crate::session::{ActiveSession, Session};
         use crate::tool_services::SessionMetaTool;
 
@@ -599,33 +597,20 @@ mod tests {
             "routing host description should not overwrite session_meta: {host_desc}"
         );
 
-        let result = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t1".into(),
-                    name: "session_meta".into(),
-                    input: json!({
-                        "action": "add_link",
-                        "link_kind": "worktree",
-                        "host": "devbox",
-                        "path": "/tmp/wt",
-                        "branch": "feat/x"
-                    }),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
+        let result = call(
+            &harness,
+            "session_meta",
+            json!({
+                "action": "add_link",
+                "link_kind": "worktree",
+                "host": "devbox",
+                "path": "/tmp/wt",
+                "branch": "feat/x"
+            }),
+        )
+        .await;
         assert!(!result.is_error, "{result:?}");
-        let text: String = result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
+        let text = result_text(&result);
         assert!(text.contains("devbox"), "{text}");
         assert!(text.contains("/tmp/wt"), "{text}");
         let links = active.snapshot().links;
@@ -637,6 +622,9 @@ mod tests {
         }
     }
 
+    // Bash execution on the in-process local host is
+    // `host_controller::in_process_local_host_is_always_connected`'s claim;
+    // here only the harness-level status shape matters.
     #[tokio::test]
     async fn local_is_always_present_and_connected() {
         let harness = Harness::attach(HarnessConfig::default())
@@ -649,22 +637,6 @@ mod tests {
         assert!(status[0].connected);
         assert!(status[0].in_process);
         assert_eq!(status[0].command, vec!["in-process".to_string()]);
-
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "printf 'on-local\\n'"}),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
-        assert!(!r.is_error, "{r:?}");
-        let text = tool_text(&r);
-        assert!(text.contains("on-local"), "{text}");
     }
 
     #[tokio::test]
@@ -681,28 +653,8 @@ mod tests {
             // Host hello can be slow under parallel suite load.
             attach_timeout_secs: 60,
             remote_hosts: vec![
-                HostConfig {
-                    name: "a".into(),
-                    command: vec![
-                        program.clone(),
-                        "--mode".into(),
-                        "host".into(),
-                        "--name".into(),
-                        "a".into(),
-                    ],
-                    ssh_destination: None,
-                },
-                HostConfig {
-                    name: "b".into(),
-                    command: vec![
-                        program,
-                        "--mode".into(),
-                        "host".into(),
-                        "--name".into(),
-                        "b".into(),
-                    ],
-                    ssh_destination: None,
-                },
+                subprocess_host("a", program.clone()),
+                subprocess_host("b", program),
             ],
         };
         let harness = Harness::attach(cfg).await.expect("attach");
@@ -711,59 +663,25 @@ mod tests {
         assert_eq!(status.len(), 3); // local + a + b
         let local = status.iter().find(|s| s.name == "local").unwrap();
         assert!(local.connected && local.in_process);
-        assert!(
-            status
-                .iter()
-                .filter(|s| s.name != "local")
-                .all(|s| !s.connected)
-        );
-
-        // Default → local (in-process).
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "printf 'on-local\\n'"}),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
-        assert!(!r.is_error, "{r:?}");
-        assert!(tool_text(&r).contains("on-local"), "{}", tool_text(&r));
 
         // Explicit host b (subprocess).
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t2".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "printf 'on-b\\n'", "host": "b"}),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
+        let r = call(
+            &harness,
+            "bash",
+            json!({"command": "printf 'on-b\\n'", "host": "b"}),
+        )
+        .await;
         assert!(!r.is_error, "{r:?}");
-        assert!(tool_text(&r).contains("on-b"), "{}", tool_text(&r));
+        assert!(result_text(&r).contains("on-b"), "{}", result_text(&r));
 
         // Unknown host.
-        let r = harness
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t3".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "true", "host": "nope"}),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
+        let r = call(&harness, "bash", json!({"command": "true", "host": "nope"})).await;
         assert!(r.is_error);
-        assert!(tool_text(&r).contains("unknown host"), "{}", tool_text(&r));
+        assert!(
+            result_text(&r).contains("unknown host"),
+            "{}",
+            result_text(&r)
+        );
     }
 
     #[tokio::test]
@@ -773,7 +691,6 @@ mod tests {
             remote_hosts: vec![HostConfig {
                 name: "ghost".into(),
                 command: vec!["/nonexistent/myco-please-fail".into()],
-                ssh_destination: None,
             }],
         };
         let harness = Harness::attach(cfg)
@@ -784,20 +701,14 @@ mod tests {
         assert!(!ghost.connected, "{ghost:?}");
         assert!(ghost.error.is_none(), "no error until first use: {ghost:?}");
 
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "true", "host": "ghost"}),
-                },
-                TraceContext::default(),
-                CancelToken::new(),
-            )
-            .await;
+        let r = call(
+            &harness,
+            "bash",
+            json!({"command": "true", "host": "ghost"}),
+        )
+        .await;
         assert!(r.is_error);
-        let text = tool_text(&r);
+        let text = result_text(&r);
         assert!(
             text.contains("ghost") || text.contains("spawn") || text.contains("No such"),
             "{text}"
@@ -823,24 +734,19 @@ mod tests {
         };
         assert!(harness.running_tool_summaries(agent_id).is_empty());
 
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t".into(),
-                    name: "bash".into(),
-                    input: json!({
-                        "action": "start",
-                        "session_id": "summary-probe",
-                        "command": "bash -c 'sleep 30'",
-                        "timeout_ms": 500,
-                        "idle_ms": 100,
-                    }),
-                },
-                context.clone(),
-                CancelToken::new(),
-            )
-            .await;
+        let r = call_on(
+            &harness,
+            context.clone(),
+            "bash",
+            json!({
+                "action": "start",
+                "session_id": "summary-probe",
+                "command": "bash -c 'sleep 30'",
+                "timeout_ms": 500,
+                "idle_ms": 100,
+            }),
+        )
+        .await;
         assert!(!r.is_error, "{r:?}");
 
         let lines = harness.running_tool_summaries(agent_id);
@@ -853,30 +759,14 @@ mod tests {
             "other agents must not see this session"
         );
 
-        let r = harness
-            .clone()
-            .dispatch_tool_use(
-                ToolUse {
-                    id: "t2".into(),
-                    name: "bash".into(),
-                    input: json!({"action": "close", "session_id": "summary-probe"}),
-                },
-                context,
-                CancelToken::new(),
-            )
-            .await;
+        let r = call_on(
+            &harness,
+            context,
+            "bash",
+            json!({"action": "close", "session_id": "summary-probe"}),
+        )
+        .await;
         assert!(!r.is_error, "{r:?}");
         assert!(harness.running_tool_summaries(agent_id).is_empty());
-    }
-
-    fn tool_text(r: &generative_model::ToolResult) -> String {
-        r.content
-            .iter()
-            .filter_map(|c| match c {
-                generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
