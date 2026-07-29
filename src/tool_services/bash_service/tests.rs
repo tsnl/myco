@@ -107,7 +107,82 @@ fn bare_command_resolves_to_exec() {
 #[test]
 fn rejects_empty_input() {
     let input: Input = serde_json::from_value(json!({})).unwrap();
-    assert!(resolve_action(&input).is_err());
+    let err = resolve_action(&input).unwrap_err();
+    assert!(err.contains("empty bash input"), "err={err}");
+    // The message has to be actionable: name the fields that would fix it.
+    assert!(
+        err.contains("command") && err.contains("action"),
+        "err={err}"
+    );
+}
+
+/// `{"input": {}}` is a real thing models emit. It must come back as an error
+/// tool result the agent can recover from — never a dropped or empty success.
+#[tokio::test]
+async fn empty_input_dispatch_returns_error_result() {
+    let result = dispatch_json(harness(), json!({})).await;
+    assert!(result.is_error, "expected an error result: {result:?}");
+    assert_eq!(result.id, "test");
+    let text = result_text(&result);
+    assert!(text.contains("empty bash input"), "text={text}");
+}
+
+/// Explicit nulls are the same nothing as `{}`.
+#[tokio::test]
+async fn all_null_input_dispatch_returns_error_result() {
+    let result = dispatch_json(
+        harness(),
+        json!({"action": null, "command": null, "session_id": null}),
+    )
+    .await;
+    assert!(result.is_error, "expected an error result: {result:?}");
+    assert!(result_text(&result).contains("empty bash input"));
+}
+
+/// Non-object inputs (`null`, a bare string, a list) are malformed too.
+#[tokio::test]
+async fn non_object_input_dispatch_returns_error_result() {
+    for value in [json!(null), json!("ls"), json!([]), json!(7)] {
+        let result = dispatch_json(harness(), value.clone()).await;
+        assert!(result.is_error, "value={value} result={result:?}");
+        let text = result_text(&result);
+        assert!(
+            text.contains("must be a JSON object"),
+            "value={value} text={text}"
+        );
+    }
+}
+
+/// A blank `command` would run `bash -c ""`: exit 0, no output, nothing done.
+#[test]
+fn rejects_blank_command() {
+    for command in ["", "   ", "\n\t"] {
+        let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
+        let err = resolve_action(&input).unwrap_err();
+        assert!(err.contains("`command` must be a non-empty"), "err={err}");
+
+        let input: Input = serde_json::from_value(
+            json!({"action": "start", "session_id": "s", "command": command}),
+        )
+        .unwrap();
+        let err = resolve_action(&input).unwrap_err();
+        assert!(err.contains("`command` must be a non-empty"), "err={err}");
+    }
+}
+
+#[test]
+fn rejects_blank_session_id() {
+    for action in ["start", "write", "read", "signal", "close"] {
+        let input: Input = serde_json::from_value(
+            json!({"action": action, "session_id": "  ", "stdin": "x", "command": "true"}),
+        )
+        .unwrap();
+        let err = resolve_action(&input).unwrap_err();
+        assert!(
+            err.contains("`session_id` must be a non-empty"),
+            "action={action} err={err}"
+        );
+    }
 }
 
 /// The tool description is the model-facing contract: it must state the

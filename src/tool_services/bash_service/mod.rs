@@ -134,6 +134,15 @@ impl ToolService for BashService {
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
+            // Anything but a JSON object (missing input, a bare string, a list)
+            // is malformed: report it as such rather than letting serde's
+            // "invalid type" message stand in for the real problem.
+            if !tool_use.input.is_object() {
+                return generative_model::ToolResult::err(format!(
+                    "bash input must be a JSON object, got {}. {EMPTY_INPUT_ERROR}",
+                    json_type_name(&tool_use.input),
+                ));
+            }
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(input) => input,
                 Err(e) => {
@@ -1581,6 +1590,64 @@ fn reject_if_command_starts_with_cd(command: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Message for a `bash` tool use whose input object carries nothing at all.
+///
+/// Every [`Input`] field is optional (the tool infers `exec` from a bare
+/// `command`), so `{}` deserializes cleanly and only surfaces later as a
+/// missing action. Name the actual problem, and show what a usable call
+/// looks like.
+const EMPTY_INPUT_ERROR: &str = "empty bash input: the tool use carried no parameters. \
+     Pass `command` for a one-shot run (e.g. {\"command\": \"ls -la\", \"cwd\": \"/repo\"}), \
+     or `action` with its parameters (exec/start/write/read/signal/close/list; every \
+     session action but `list` also needs `session_id`).";
+
+/// JSON type name for error messages (`null`, `string`, `array`, …).
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// True when no field of `input` was set (`{}`, or explicit nulls).
+fn is_empty_object(input: &Input) -> bool {
+    // Destructured so a new field cannot silently fall out of this check.
+    let Input {
+        action,
+        command,
+        cwd,
+        session_id,
+        stdin,
+        signal,
+        timeout_ms,
+        idle_ms,
+        max_bytes,
+    } = input;
+    action.is_none()
+        && command.is_none()
+        && cwd.is_none()
+        && session_id.is_none()
+        && stdin.is_none()
+        && signal.is_none()
+        && timeout_ms.is_none()
+        && idle_ms.is_none()
+        && max_bytes.is_none()
+}
+
+/// Reject blank strings where a value is required: `bash -c ""` exits 0 with no
+/// output, and a blank `session_id` would name an unreachable session — both
+/// look like the tool did nothing rather than like a malformed call.
+fn require_non_blank(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("`{field}` must be a non-empty string"));
+    }
+    Ok(())
+}
+
 fn normalize_cwd(cwd: Option<&String>) -> Result<Option<String>, String> {
     match cwd {
         None => Ok(None),
@@ -1610,8 +1677,17 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 ActionKind::Write
             } else if input.session_id.is_some() {
                 ActionKind::Read
+            } else if is_empty_object(input) {
+                // A tool use with `input: {}` (or only null fields) carries no
+                // work at all. Say so explicitly instead of leaving the agent to
+                // guess which of the six actions it forgot to name.
+                return Err(EMPTY_INPUT_ERROR.into());
             } else {
-                return Err("missing action (and no command/session_id to infer one from)".into());
+                return Err(
+                    "missing action (and no command/session_id to infer one from); \
+                            pass `action` (exec/start/write/read/close/list)"
+                        .into(),
+                );
             }
         }
     };
@@ -1644,6 +1720,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .command
                 .clone()
                 .ok_or_else(|| "exec requires `command`".to_string())?;
+            require_non_blank("command", &command)?;
             reject_if_command_starts_with_cd(&command)?;
             Ok(Action::Exec {
                 command,
@@ -1657,7 +1734,9 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "start requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             if let Some(command) = input.command.as_deref() {
+                require_non_blank("command", command)?;
                 reject_if_command_starts_with_cd(command)?;
             }
             Ok(Action::Start {
@@ -1678,6 +1757,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "write requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             let stdin = input
                 .stdin
                 .clone()
@@ -1698,6 +1778,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "read requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             Ok(Action::Read {
                 session_id,
                 timeout_ms: session_timeout(input)?,
@@ -1713,6 +1794,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "signal requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             Ok(Action::Signal {
                 session_id,
                 signal: input.signal.unwrap_or(SignalKind::Int),
@@ -1729,6 +1811,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .session_id
                 .clone()
                 .ok_or_else(|| "close requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
             Ok(Action::Close { session_id })
         }
         ActionKind::List => {

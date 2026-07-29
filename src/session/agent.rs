@@ -306,68 +306,71 @@ impl Agent {
                 });
             }
 
-            match output.turn_end_reason {
-                // A tool_use stop with zero accumulated tool calls is malformed
-                // (e.g. a content block the accumulator ignored). Retrying with
-                // unchanged history would loop generate forever, and pushing an
-                // empty ToolResults message is rejected by the API — fail loud.
-                TurnEndReason::ToolUse if output.tool_uses.is_empty() => {
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: vec![],
-                        turn_end_reason: Some(TurnEndReason::ToolUse),
-                    });
-                    return self.finish_generate_error(GenerateError::MalformedResponseError(
-                        "turn ended in tool_use but streamed zero tool uses".into(),
-                    ));
-                }
-                TurnEndReason::ToolUse => {
-                    // Persist full content (including thinking summaries) for session
-                    // resume/UI. Backends strip thinking when composing the next request.
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: output.tool_uses.clone(),
-                        turn_end_reason: Some(TurnEndReason::ToolUse),
-                    });
+            let reason = output.turn_end_reason.clone();
 
-                    // Dispatch every tool use in this turn concurrently. join_all preserves
-                    // input order so tool_results[i] matches tool_uses[i]; events may
-                    // interleave freely while tools run. Each tool races against cancel so
-                    // unfinished work returns a synthetic cancelled ToolResult.
-                    let tool_results = future::join_all(
-                        output
-                            .tool_uses
-                            .into_iter()
-                            .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
-                    )
-                    .await;
+            // A tool_use stop with zero accumulated tool calls is malformed
+            // (e.g. a content block the accumulator ignored). Retrying with
+            // unchanged history would loop generate forever, and pushing an
+            // empty ToolResults message is rejected by the API — fail loud.
+            if matches!(reason, TurnEndReason::ToolUse) && output.tool_uses.is_empty() {
+                self.history.push(Message::AssistantMessage {
+                    content: output.content,
+                    tool_uses: vec![],
+                    turn_end_reason: Some(TurnEndReason::ToolUse),
+                });
+                return self.finish_generate_error(GenerateError::MalformedResponseError(
+                    "turn ended in tool_use but streamed zero tool uses".into(),
+                ));
+            }
 
-                    self.history.push(Message::ToolResults {
-                        tool_use_results: tool_results,
-                    });
-                    self.emit_checkpoint();
+            // Return answer content only; history keeps thinking for resume/UI.
+            // Backends strip thinking when composing the next request.
+            let content = answer_content(&output.content);
+            let tool_uses = output.tool_uses;
+            // Persist full content (including thinking summaries) for session
+            // resume/UI. Backends strip thinking when composing the next request.
+            self.history.push(Message::AssistantMessage {
+                content: output.content,
+                tool_uses: tool_uses.clone(),
+                turn_end_reason: Some(reason.clone()),
+            });
 
-                    // If cancel fired during tools, do not start another generate — the
-                    // transcript already has matching tool results for every tool_use.
-                    if cancel.is_cancelled() {
-                        return self.finish_cancelled();
-                    }
+            // Tool calls are answered whenever the turn carries them — the stop
+            // reason does not decide this. `max_tokens` truncates a turn
+            // mid-call, so the block arrives under a non-`tool_use` stop; a
+            // tool_use nothing responds to makes the whole history unsendable
+            // (every later request resends it), which strands the session on the
+            // provider's "tool_use without tool_result" error.
+            if !tool_uses.is_empty() {
+                // Dispatch every tool use in this turn concurrently. join_all preserves
+                // input order so tool_results[i] matches tool_uses[i]; events may
+                // interleave freely while tools run. Each tool races against cancel so
+                // unfinished work returns a synthetic cancelled ToolResult.
+                let tool_use_results = future::join_all(
+                    tool_uses
+                        .into_iter()
+                        .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
+                )
+                .await;
+
+                self.history.push(Message::ToolResults { tool_use_results });
+                self.emit_checkpoint();
+
+                // If cancel fired during tools, do not start another generate — the
+                // transcript already has matching tool results for every tool_use.
+                if cancel.is_cancelled() {
+                    return self.finish_cancelled();
                 }
-                reason => {
-                    // Return answer content only; history keeps thinking for resume/UI.
-                    // Backends strip thinking when composing the next request.
-                    let content = answer_content(&output.content);
-                    self.history.push(Message::AssistantMessage {
-                        content: output.content,
-                        tool_uses: output.tool_uses,
-                        turn_end_reason: Some(reason.clone()),
-                    });
-                    self.sink.emit(AgentEvent::TurnFinished {
-                        reason,
-                        context: self.context.clone(),
-                    });
-                    return Ok(content);
-                }
+            }
+
+            // `tool_use` is the only stop that continues the turn; everything
+            // else hands control back with whatever the model managed to say.
+            if !matches!(reason, TurnEndReason::ToolUse) {
+                self.sink.emit(AgentEvent::TurnFinished {
+                    reason,
+                    context: self.context.clone(),
+                });
+                return Ok(content);
             }
         }
     }
@@ -1174,6 +1177,98 @@ mod tests {
             agent.history()[1],
             Message::AssistantMessage { .. }
         ));
+    }
+
+    /// `max_tokens` can cut a turn off mid-tool-call: the stop reason is not
+    /// `tool_use`, but the tool_use block is still in the assistant message
+    /// (typically with `input: {}` — the arguments never streamed). Tool calls
+    /// are answered on their presence, not on the stop reason, because providers
+    /// reject any later request carrying a tool_use with no matching tool_result:
+    /// leaving it unanswered fails the very next user message, and every one
+    /// after it. Here the truncated call reaches the real bash tool, which
+    /// rejects the empty input — an error result, but a well-formed turn.
+    #[tokio::test]
+    async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use() {
+        // The standard local services include the real bash tool.
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "let me check".into(),
+                }],
+                tool_uses: vec![ToolUse {
+                    id: "toolu_truncated".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                }],
+                turn_end_reason: TurnEndReason::MaxTokens,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text { text: "ok".into() }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
+            .interact(
+                vec![Content::Text { text: "hi".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("turn should return the partial answer, not an error");
+
+        // user + assistant(tool_use) + tool_results — the tool_use is answered.
+        assert_eq!(agent.history().len(), 3);
+        match &agent.history()[2] {
+            Message::ToolResults { tool_use_results } => {
+                assert_eq!(tool_use_results.len(), 1);
+                assert_eq!(tool_use_results[0].id, "toolu_truncated");
+                assert!(tool_use_results[0].is_error);
+                let text = match &tool_use_results[0].content[0] {
+                    Content::Text { text } => text.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                assert!(text.contains("empty bash input"), "text={text}");
+            }
+            other => panic!("expected ToolResults, got {other:?}"),
+        }
+
+        // And the session continues: the next turn generates against a history
+        // the provider accepts, instead of failing on the dangling tool_use.
+        let reply = agent
+            .interact(
+                vec![Content::Text {
+                    text: "Continue".into(),
+                }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("follow-up turn should succeed");
+        assert!(matches!(&reply[0], Content::Text { text } if text == "ok"));
+    }
+
+    /// A turn that ends cleanly with no tool calls gains no ToolResults message.
+    #[tokio::test]
+    async fn plain_end_turn_pushes_no_tool_results() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![Content::Text { text: "hi".into() }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
+            .interact(
+                vec![Content::Text { text: "hi".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("turn should succeed");
+        assert_eq!(agent.history().len(), 2);
     }
 
     /// Model whose every generate fails with an oversized-request error.
