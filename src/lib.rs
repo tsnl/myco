@@ -11,6 +11,9 @@ pub mod session_browser;
 pub mod tool_services;
 pub mod tui;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use config::{
     ColorMode, Config, ConfigUserSettings, WrapMode, example_config_toml, load_file_config,
 };
