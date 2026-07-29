@@ -73,6 +73,7 @@ pub fn read_image_data_url(path: &Path, label: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TempDir, temp_dir};
 
     /// Smallest byte strings `infer`'s matchers accept, per format.
     const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
@@ -80,21 +81,8 @@ mod tests {
     const GIF: &[u8] = b"GIF89a";
     const WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBP";
 
-    struct TempDir(std::path::PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("myco-image-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-
     fn write(dir: &TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = dir.0.join(name);
+        let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         path
     }
@@ -111,7 +99,7 @@ mod tests {
 
     #[test]
     fn media_type_comes_from_bytes_for_every_supported_format() {
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         for (name, bytes, want) in [
             ("a.png", PNG, "image/png"),
             ("b.jpg", JPEG, "image/jpeg"),
@@ -128,7 +116,7 @@ mod tests {
     /// on the wire is a provider-side decode error we cannot diagnose.
     #[test]
     fn mislabeled_extension_uses_the_real_media_type() {
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         let path = write(&dir, "actually-a-jpeg.png", JPEG);
         let url = read_image_data_url(&path, "@actually-a-jpeg.png").unwrap();
         assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
@@ -136,7 +124,7 @@ mod tests {
 
     #[test]
     fn round_trips_the_bytes() {
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         let path = write(&dir, "a.png", PNG);
         let url = read_image_data_url(&path, "a.png").unwrap();
         let b64 = url.strip_prefix("data:image/png;base64,").unwrap();
@@ -150,7 +138,7 @@ mod tests {
     /// way: only the four accepted media types get through.
     #[test]
     fn non_image_content_is_rejected() {
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         for (name, bytes) in [
             ("doc.png", &b"%PDF-1.7\n"[..]),
             ("notes.png", &b"just text"[..]),
@@ -169,7 +157,7 @@ mod tests {
     /// never pulled into memory just to be rejected.
     #[test]
     fn oversized_image_errors_with_limit() {
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         let path = write(&dir, "big.png", &vec![0u8; MAX_IMAGE_BYTES as usize + 1]);
         let err = read_image_data_url(&path, "@big.png").unwrap_err();
         assert!(err.contains("the limit is 5 MiB"), "{err}");
@@ -183,7 +171,7 @@ mod tests {
         assert_eq!(base64_len(3), 4);
         assert_eq!(base64_len(4), 8);
 
-        let dir = temp_dir();
+        let dir = temp_dir("image");
         let path = write(&dir, "shot.png", &vec![0u8; 4 * 1024 * 1024]);
         let err = read_image_data_url(&path, "@shot.png").unwrap_err();
         assert!(err.contains("5.3 MiB encoded"), "{err}");

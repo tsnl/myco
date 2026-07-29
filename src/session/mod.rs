@@ -551,16 +551,6 @@ pub fn list_sessions_filtered(
     Ok(metas)
 }
 
-/// List every readable **visible** session (no limit). Wrong-version files are omitted.
-pub fn list_all_sessions() -> Result<Vec<SessionListEntry>, String> {
-    list_sessions(0)
-}
-
-/// List every readable session including hidden (no limit).
-pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, String> {
-    list_sessions_filtered(0, true)
-}
-
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
     // Prefer full parse so version is enforced; fall back is not used for wrong version.
     let session = Session::load(path)?;

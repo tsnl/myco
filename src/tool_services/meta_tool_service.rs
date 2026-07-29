@@ -9,8 +9,8 @@ use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, list_all_sessions, list_all_sessions_including_hidden,
-    normalize_pr_url, parse_pr_fields, search_sessions,
+    format_session_list_line, list_sessions_filtered, normalize_pr_url, parse_pr_fields,
+    search_sessions,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -134,11 +134,7 @@ impl SessionMetaTool {
         query: Option<&str>,
     ) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
-        let mut list = if include_hidden {
-            list_all_sessions_including_hidden()?
-        } else {
-            list_all_sessions()?
-        };
+        let mut list = list_sessions_filtered(0, include_hidden)?;
         let mut header = String::new();
         match query {
             None => {
