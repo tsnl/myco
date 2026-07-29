@@ -27,10 +27,10 @@ pub use harness::{
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
-    ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOptions, CompactOutcome,
-    ConsoleLog, EventSink, NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
-    SessionListEntry, TraceContext, compact_session, compact_subagent_prompt, link_compact_pair,
-    select_tail, uuid_simple_hex,
+    ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOutcome, ConsoleLog, EventSink,
+    NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink, SessionListEntry,
+    TraceContext, compact_session, compact_subagent_prompt, link_compact_pair, select_tail,
+    uuid_simple_hex,
 };
 pub use tool_services::{
     HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool, SessionMetaTool,

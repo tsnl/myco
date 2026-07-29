@@ -710,7 +710,6 @@ impl EventSink for TuiProducer {
             } => self.tool_started(&tool_use.name, &tool_use.input),
             AgentEvent::TurnFinished {
                 context: TraceContext { depth: 0, .. },
-                ..
             } => self.turn_finished(),
             _ => {}
         }
@@ -760,7 +759,7 @@ fn end_text_stream(st: &mut ProducerState, events: &mut Vec<TuiEvent>, colors: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{ToolUse, TurnEndReason};
+    use crate::generative_model::ToolUse;
 
     /// Capturing sink for assertions on the raw stream.
     #[derive(Default)]
@@ -901,10 +900,7 @@ mod tests {
             text: "Some **bold** and `code` in a paragraph that wraps.".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         producer.error_section("boom");
 
         let events = terminal.events();
@@ -935,10 +931,7 @@ mod tests {
             text: "hello".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         assert_eq!(terminal.events(), mirror.events());
         assert!(!terminal.events().is_empty());
     }
@@ -955,10 +948,7 @@ mod tests {
             text: " two".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         let plain = encode_plain(&terminal.events());
         assert_eq!(plain.matches("ASSISTANT\n").count(), 1);
         assert!(plain.contains("one two\n"));
@@ -968,10 +958,7 @@ mod tests {
             text: "three".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         let plain = encode_plain(&terminal.events());
         assert_eq!(plain.matches("ASSISTANT\n").count(), 2);
     }
@@ -992,10 +979,7 @@ mod tests {
             text: "done".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         let plain = encode_plain(&terminal.events());
         // One ASSISTANT section: thinking line, blank line, answer text.
         assert!(
@@ -1027,10 +1011,7 @@ mod tests {
             text: "and after".into(),
             context: ctx(0),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(0) });
         let plain = encode_plain(&terminal.events());
         assert!(
             plain.contains("running now\n\nbash({\n  \"command\": \"echo hi\"\n})\n\nand after\n"),
@@ -1060,10 +1041,7 @@ mod tests {
             },
             context: ctx(1),
         });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(1),
-        });
+        producer.emit(AgentEvent::TurnFinished { context: ctx(1) });
         assert!(terminal.events().is_empty());
         assert!(mirror.events().is_empty());
     }

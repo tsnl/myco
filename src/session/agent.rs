@@ -21,20 +21,14 @@ pub fn uuid_simple_hex(id: Uuid) -> String {
 
 /// Correlation / nesting context carried on every event.
 ///
-/// Every running agent (root or nested) has a stable [`Self::agent_id`]. Nesting is expressed with
-/// `depth` and optional `parent_tool_use_id`, not with separate event types per agent role.
-///
-/// Tool-use ids remain provider opaque strings (Anthropic `toolu_…`, OpenAI `call_…`); they are
-/// not UUIDs and must round-trip unchanged to the model API.
+/// Every running agent (root or nested) has a stable [`Self::agent_id`]. Nesting is expressed
+/// with `depth`, not with separate event types per agent role.
 #[derive(Debug, Clone)]
 pub struct TraceContext {
     /// Stable id for this agent session (root or subagent).
     pub agent_id: Uuid,
     /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
     pub depth: usize,
-    /// Tool use that is currently in flight / spawned this nested work, if any.
-    /// Provider-issued id (string), not a UUID.
-    pub parent_tool_use_id: Option<String>,
 }
 
 impl Default for TraceContext {
@@ -42,7 +36,6 @@ impl Default for TraceContext {
         Self {
             agent_id: Uuid::nil(),
             depth: 0,
-            parent_tool_use_id: None,
         }
     }
 }
@@ -52,64 +45,30 @@ impl TraceContext {
         Self {
             agent_id: Uuid::new_v4(),
             depth: 0,
-            parent_tool_use_id: None,
-        }
-    }
-
-    pub fn child_agent(&self, agent_id: Uuid, parent_tool_use_id: Option<String>) -> Self {
-        Self {
-            agent_id,
-            depth: self.depth + 1,
-            parent_tool_use_id,
         }
     }
 }
 
-/// Live events emitted by the agent runtime (and services that spawn nested agents).
+/// Live events emitted by the agent runtime.
 ///
-/// All ongoing work is attributed via [`TraceContext::agent_id`]. Nested agents are announced
-/// once with [`AgentEvent::AgentStarted`]; subsequent events for that agent reuse the same id.
+/// All ongoing work is attributed via [`TraceContext::agent_id`].
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// A new agent session began. Emitted once when the agent id is assigned.
-    AgentStarted {
-        agent_id: Uuid,
-        /// Model id when known; empty for unspecified.
-        model: String,
-        parent_agent_id: Option<Uuid>,
-        /// Provider tool-use id that spawned this agent, if any.
-        parent_tool_use_id: Option<String>,
-        depth: usize,
-    },
     /// Incremental assistant text (for streaming UX).
-    TextDelta { text: String, context: TraceContext },
+    TextDelta {
+        text: String,
+        context: TraceContext,
+    },
     /// Incremental thinking *summary* text (streamed for UI; also stored in history).
-    ThinkingDelta { text: String, context: TraceContext },
+    ThinkingDelta {
+        text: String,
+        context: TraceContext,
+    },
     ToolStarted {
         tool_use: ToolUse,
         context: TraceContext,
     },
-    ToolFinished {
-        /// Provider tool-use id.
-        tool_use_id: String,
-        is_error: bool,
-        context: TraceContext,
-    },
     TurnFinished {
-        reason: TurnEndReason,
-        context: TraceContext,
-    },
-    /// Turn-accumulated usage, fired after each generate call: input side is
-    /// the latest request's prompt (≈ live context), output side sums across
-    /// the turn's generate calls so far (one per tool round-trip).
-    Usage {
-        usage: TokenUsage,
-        context: TraceContext,
-    },
-    /// An agent session ended. Optional harness-written log path for nested/transcript agents.
-    AgentFinished {
-        log_path: Option<String>,
-        is_error: bool,
         context: TraceContext,
     },
 }
@@ -295,14 +254,9 @@ impl Agent {
 
             if let Some(usage) = output.usage {
                 turn_output += usage.output_tokens;
-                let usage = TokenUsage {
+                self.last_usage = Some(TokenUsage {
                     output_tokens: turn_output,
                     ..usage
-                };
-                self.last_usage = Some(usage);
-                self.sink.emit(AgentEvent::Usage {
-                    usage,
-                    context: self.context.clone(),
                 });
             }
 
@@ -367,7 +321,6 @@ impl Agent {
             // else hands control back with whatever the model managed to say.
             if !matches!(reason, TurnEndReason::ToolUse) {
                 self.sink.emit(AgentEvent::TurnFinished {
-                    reason,
                     context: self.context.clone(),
                 });
                 return Ok(content);
@@ -377,7 +330,6 @@ impl Agent {
 
     fn finish_cancelled(&self) -> Result<Vec<Content>, AgentInteractionError> {
         self.sink.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::Other("cancelled".into()),
             context: self.context.clone(),
         });
         Err(AgentInteractionError::Cancelled)
@@ -391,7 +343,6 @@ impl Agent {
         error: GenerateError,
     ) -> Result<Vec<Content>, AgentInteractionError> {
         self.sink.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::Other("generate_error".into()),
             context: self.context.clone(),
         });
         Err(AgentInteractionError::GenerateError(error))
@@ -403,18 +354,11 @@ impl Agent {
             context: self.context.clone(),
         });
 
-        // Tools run in the same agent session; only parent_tool_use_id updates for correlation.
-        let dispatch_context = TraceContext {
-            agent_id: self.context.agent_id,
-            depth: self.context.depth,
-            parent_tool_use_id: Some(tool_use.id.clone()),
-        };
-
-        let work = self.harness.clone().dispatch_tool_use(
-            tool_use.clone(),
-            dispatch_context,
-            cancel.clone(),
-        );
+        let id = tool_use.id.clone();
+        let work =
+            self.harness
+                .clone()
+                .dispatch_tool_use(tool_use, self.context.clone(), cancel.clone());
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it
@@ -427,24 +371,16 @@ impl Agent {
         // expires; for subprocess hosts that only abandons this waiter —
         // the pipe demuxes by correlation id, so siblings are unaffected.
         let mut work = std::pin::pin!(work);
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
                     Ok(result) => result,
-                    Err(_) => ToolResult::err("cancelled").with_id(tool_use.id.clone()),
+                    Err(_) => ToolResult::err("cancelled").with_id(id),
                 }
             }
             result = &mut work => result,
-        };
-
-        self.sink.emit(AgentEvent::ToolFinished {
-            tool_use_id: tool_use.id,
-            is_error: result.is_error,
-            context: self.context.clone(),
-        });
-
-        result
+        }
     }
 }
 
@@ -524,99 +460,14 @@ mod tests {
     use super::*;
     use crate::core::Async;
     use crate::generative_model::{GenerateError, MessagePart, ToolSpec};
+    use crate::test_support::{
+        ScriptedModel, assistant, assistant_tool, result_text, tool_results, user,
+    };
     use crate::tool_services::{HostDispatchContext, ToolService};
     use futures::stream;
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-
-    /// Scripted model: each `generate` call yields the next pre-baked output as a stream.
-    /// Construct with scripts in call order (FIFO).
-    struct ScriptedModel {
-        scripts: Mutex<std::collections::VecDeque<GenerateOutput>>,
-    }
-
-    impl ScriptedModel {
-        fn new(scripts: Vec<GenerateOutput>) -> Arc<Self> {
-            Arc::new(Self {
-                scripts: Mutex::new(scripts.into()),
-            })
-        }
-    }
-
-    impl GenerativeModel for ScriptedModel {
-        fn generate(
-            &self,
-            _input: &[Message],
-        ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
-            let output = self
-                .scripts
-                .lock()
-                .expect("scripts lock")
-                .pop_front()
-                .expect("scripted model ran out of outputs");
-
-            let mut parts = vec![MessagePart::MessageStart];
-            for (i, c) in output.content.iter().enumerate() {
-                match c {
-                    Content::Text { text } => {
-                        parts.push(MessagePart::ContentStart(
-                            generative_model::ContentStart::Text { index: i },
-                        ));
-                        parts.push(MessagePart::ContentDelta(ContentDelta::Text {
-                            index: i,
-                            delta: text.clone(),
-                        }));
-                    }
-                    Content::Image { source } => {
-                        parts.push(MessagePart::ContentStart(
-                            generative_model::ContentStart::Image { index: i },
-                        ));
-                        parts.push(MessagePart::ContentDelta(ContentDelta::Image {
-                            index: i,
-                            delta: source.clone(),
-                        }));
-                    }
-                    Content::Thinking {
-                        text,
-                        signature,
-                        redacted,
-                    } => {
-                        parts.push(MessagePart::ContentStart(
-                            generative_model::ContentStart::Thinking {
-                                index: i,
-                                signature: signature.clone(),
-                                redacted: *redacted,
-                            },
-                        ));
-                        if !text.is_empty() && !*redacted {
-                            parts.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                                index: i,
-                                delta: text.clone(),
-                            }));
-                        }
-                    }
-                }
-            }
-            for (i, tu) in output.tool_uses.iter().enumerate() {
-                parts.push(MessagePart::ToolUseStart(generative_model::ToolUseStart {
-                    index: i,
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                }));
-                parts.push(MessagePart::ToolUseDelta(generative_model::ToolUseDelta {
-                    index: i,
-                    input_json_delta: tu.input.to_string(),
-                }));
-            }
-            if let Some(usage) = output.usage {
-                parts.push(MessagePart::Usage(usage));
-            }
-            parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
-
-            Box::pin(stream::iter(parts.into_iter().map(Ok)))
-        }
-    }
 
     /// Sleeps, records start/end instants, returns the configured label.
     struct SlowService {
@@ -1019,55 +870,10 @@ mod tests {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 1);
                 assert!(tool_use_results[0].is_error);
-                let text = tool_use_results[0]
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
+                let text = result_text(&tool_use_results[0]);
                 assert!(text.contains("cancelled"), "{text}");
             }
             other => panic!("expected ToolResults, got {other:?}"),
-        }
-    }
-
-    /// Model that yields scripted successes then a generate error on a later call.
-    struct FailAfterScriptsModel {
-        scripts: Mutex<std::collections::VecDeque<GenerateOutput>>,
-        fail_message: String,
-    }
-
-    impl FailAfterScriptsModel {
-        fn new(scripts: Vec<GenerateOutput>, fail_message: impl Into<String>) -> Arc<Self> {
-            Arc::new(Self {
-                scripts: Mutex::new(scripts.into()),
-                fail_message: fail_message.into(),
-            })
-        }
-    }
-
-    impl GenerativeModel for FailAfterScriptsModel {
-        fn generate(
-            &self,
-            _input: &[Message],
-        ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
-            let maybe = self.scripts.lock().expect("scripts lock").pop_front();
-            match maybe {
-                Some(output) => {
-                    // Reuse ScriptedModel streaming shape via a one-shot queue.
-                    let one = ScriptedModel::new(vec![output]);
-                    one.generate(&[])
-                }
-                None => {
-                    let msg = self.fail_message.clone();
-                    Box::pin(stream::once(async move {
-                        Err(GenerateError::ExecutionError(msg))
-                    }))
-                }
-            }
         }
     }
 
@@ -1080,19 +886,19 @@ mod tests {
             ends: Arc::new(Mutex::new(Vec::new())),
         });
         let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
-        let model = FailAfterScriptsModel::new(
-            vec![GenerateOutput {
-                content: vec![],
-                tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
-                    name: "slow_a".into(),
-                    input: json!({}),
-                }],
-                turn_end_reason: TurnEndReason::ToolUse,
-                usage: None,
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                id: "call_1".into(),
+                name: "slow_a".into(),
+                input: json!({}),
             }],
-            "provider 500 after tools",
-        );
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        }])
+        .then_fail(GenerateError::ExecutionError(
+            "provider 500 after tools".into(),
+        ));
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
@@ -1137,7 +943,9 @@ mod tests {
     #[tokio::test]
     async fn generate_error_before_assistant_keeps_only_user() {
         let harness = Harness::local_with_services(vec![]);
-        let model = FailAfterScriptsModel::new(vec![], "boom on first generate");
+        let model = ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError(
+            "boom on first generate".into(),
+        ));
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
@@ -1227,10 +1035,7 @@ mod tests {
                 assert_eq!(tool_use_results.len(), 1);
                 assert_eq!(tool_use_results[0].id, "toolu_truncated");
                 assert!(tool_use_results[0].is_error);
-                let text = match &tool_use_results[0].content[0] {
-                    Content::Text { text } => text.clone(),
-                    other => panic!("expected text, got {other:?}"),
-                };
+                let text = result_text(&tool_use_results[0]);
                 assert!(text.contains("empty bash input"), "text={text}");
             }
             other => panic!("expected ToolResults, got {other:?}"),
@@ -1271,26 +1076,16 @@ mod tests {
         assert_eq!(agent.history().len(), 2);
     }
 
-    /// Model whose every generate fails with an oversized-request error.
-    struct TooLargeModel;
-
-    impl GenerativeModel for TooLargeModel {
-        fn generate(
-            &self,
-            _input: &[Message],
-        ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
-            Box::pin(stream::once(async {
-                Err(GenerateError::RequestTooLargeError("42 MiB".into()))
-            }))
-        }
-    }
-
     /// An oversized request is a property of the history, so the top-level
     /// error must say the last message has to come out — not "try again".
+    /// (The rewind contract itself is proven by
+    /// `rewind_drops_the_whole_turn_and_keeps_earlier_ones`.)
     #[tokio::test]
     async fn oversized_request_reports_omit_last_message() {
         let harness = Harness::local_with_services(vec![]);
-        let mut agent = Agent::new(Arc::new(TooLargeModel), harness, Arc::new(NullEventSink));
+        let model = ScriptedModel::new(vec![])
+            .then_fail(GenerateError::RequestTooLargeError("42 MiB".into()));
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
                 vec![Content::Image {
@@ -1302,21 +1097,12 @@ mod tests {
             .expect_err("oversized request should fail");
 
         assert_eq!(err.recovery(), Recovery::OmitLastMessage);
-
-        // Rewinding takes the offending turn back out and returns its content,
-        // leaving a history the provider will accept again.
-        let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
-        assert!(matches!(dropped[0], Content::Image { .. }));
-        assert!(agent.history().is_empty());
-        assert!(agent.rewind_last_user_turn().is_none());
     }
 
+    /// History is well-formed after a cancel, so the same turn can be re-sent.
+    /// (Generate-error recovery mapping is proven in `generative_model` tests.)
     #[test]
-    fn generate_errors_other_than_size_are_retryable() {
-        assert_eq!(
-            GenerateError::ExecutionError("provider 500".into()).recovery(),
-            Recovery::Retry
-        );
+    fn cancelled_interaction_is_retryable() {
         assert_eq!(AgentInteractionError::Cancelled.recovery(), Recovery::Retry);
     }
 
@@ -1329,33 +1115,11 @@ mod tests {
         let model = ScriptedModel::new(vec![]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         agent.set_history(vec![
-            Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "first".into(),
-                }],
-            },
-            Message::AssistantMessage {
-                content: vec![Content::Text { text: "ok".into() }],
-                tool_uses: vec![],
-                turn_end_reason: Some(TurnEndReason::EndTurn),
-            },
-            Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "second".into(),
-                }],
-            },
-            Message::AssistantMessage {
-                content: vec![],
-                tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
-                    name: "noop".into(),
-                    input: json!({}),
-                }],
-                turn_end_reason: Some(TurnEndReason::ToolUse),
-            },
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult::text("done").with_id("call_1")],
-            },
+            user("first"),
+            assistant("ok"),
+            user("second"),
+            assistant_tool(None, "call_1", "noop", json!({})),
+            tool_results(&[("call_1", "done")]),
         ]);
 
         let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
@@ -1370,42 +1134,18 @@ mod tests {
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.
     #[tokio::test]
     async fn resume_after_tools_mid_turn_continues_cleanly() {
-        let slow = Arc::new(SlowService {
-            name: "slow_a".into(),
-            delay: Duration::from_millis(1),
-            starts: Arc::new(Mutex::new(Vec::new())),
-            ends: Arc::new(Mutex::new(Vec::new())),
-        });
-        let harness = Harness::local_with_services(vec![slow.clone() as Arc<dyn ToolService>]);
-        let model = FailAfterScriptsModel::new(
-            vec![GenerateOutput {
-                content: vec![],
-                tool_uses: vec![ToolUse {
-                    id: "call_mid".into(),
-                    name: "slow_a".into(),
-                    input: json!({}),
-                }],
-                turn_end_reason: TurnEndReason::ToolUse,
-                usage: None,
-            }],
-            "simulated crash after tools",
-        );
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let _ = agent
-            .interact(
-                vec![Content::Text {
-                    text: "mid turn".into(),
-                }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect_err("fail after tools");
-
-        let snapshot = agent.history().to_vec();
-        assert_eq!(snapshot.len(), 3);
+        // The well-formed mid-turn snapshot a checkpoint would have persisted
+        // before the crash: user + assistant(tool_use) + matching tool_results
+        // (the shape `generate_error_after_tool_results_keeps_well_formed_history`
+        // proves the agent leaves behind).
+        let snapshot = vec![
+            user("mid turn"),
+            assistant_tool(None, "call_mid", "slow_a", json!({})),
+            tool_results(&[("call_mid", "done:call_mid")]),
+        ];
 
         // "Resume": new agent, same well-formed history, model only needs EndTurn.
-        let harness2 = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let harness = Harness::local_with_services(vec![]);
         let resume_model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text {
                 text: "recovered".into(),
@@ -1414,7 +1154,7 @@ mod tests {
             turn_end_reason: TurnEndReason::EndTurn,
             usage: None,
         }]);
-        let mut resumed = Agent::new(resume_model, harness2, Arc::new(NullEventSink));
+        let mut resumed = Agent::new(resume_model, harness, Arc::new(NullEventSink));
         resumed.set_history(snapshot);
 
         // Continue by interacting with a follow-up user message (CLI would re-prompt);

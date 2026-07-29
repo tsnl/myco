@@ -129,7 +129,7 @@ fn read_tail(path: &Path, cap: u64) -> Option<String> {
 mod tests {
     use super::*;
     use crate::session::{LinkCounts, SessionKind};
-    use std::path::PathBuf;
+    use crate::test_support::temp_dir;
 
     fn entry(id: &str, snippet: &str, dir: &Path) -> SessionListEntry {
         SessionListEntry {
@@ -147,64 +147,58 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "myco-session-search-{tag}-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn query_matches_snippet_content_case_insensitively() {
-        let dir = temp_dir("exact");
+        let dir = temp_dir("search-exact");
         let entries = vec![
-            entry("aaa", "we debugged the Kubernetes ingress controller", &dir),
-            entry("bbb", "wrote a haiku about rust lifetimes", &dir),
+            entry(
+                "aaa",
+                "we debugged the Kubernetes ingress controller",
+                dir.path(),
+            ),
+            entry("bbb", "wrote a haiku about rust lifetimes", dir.path()),
         ];
         let r = search_sessions(&entries, "kubernetes", 10).unwrap();
         assert_eq!(r.mode, "keyword");
         assert_eq!(r.entries.len(), 1, "{:?}", r.entries);
         assert_eq!(r.entries[0].id, "aaa");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn console_tail_is_searchable() {
-        let dir = temp_dir("console");
-        let entries = vec![entry("aaa", "hello", &dir), entry("bbb", "unrelated", &dir)];
+        let dir = temp_dir("search-console");
+        let entries = vec![
+            entry("aaa", "hello", dir.path()),
+            entry("bbb", "unrelated", dir.path()),
+        ];
         std::fs::write(
-            dir.join("aaa.console"),
+            dir.path().join("aaa.console"),
             "ASSISTANT\n\nthe root cause was the flibbertigibbet flag\n",
         )
         .unwrap();
         let r = search_sessions(&entries, "flibbertigibbet", 10).unwrap();
         assert_eq!(r.entries.len(), 1);
         assert_eq!(r.entries[0].id, "aaa");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn more_hits_rank_higher() {
-        let dir = temp_dir("rank");
+        let dir = temp_dir("search-rank");
         let entries = vec![
-            entry("aaa", "wasm wasm wasm build pipeline", &dir),
-            entry("bbb", "one mention of wasm here", &dir),
+            entry("aaa", "wasm wasm wasm build pipeline", dir.path()),
+            entry("bbb", "one mention of wasm here", dir.path()),
         ];
         let r = search_sessions(&entries, "wasm", 10).unwrap();
         assert_eq!(r.entries.len(), 2);
         assert_eq!(r.entries[0].id, "aaa");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn empty_query_errors_and_empty_corpus_is_empty() {
-        let dir = temp_dir("empty");
-        assert!(search_sessions(&[entry("aaa", "x", &dir)], "  ", 10).is_err());
+        let dir = temp_dir("search-empty");
+        assert!(search_sessions(&[entry("aaa", "x", dir.path())], "  ", 10).is_err());
         let r = search_sessions(&[], "anything", 10).unwrap();
         assert!(r.entries.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

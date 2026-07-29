@@ -18,18 +18,17 @@ pub use agent::{
 };
 pub use attach::{MAX_IMAGE_BYTES, MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
 pub use compact::{
-    CompactOptions, CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
+    CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
     link_compact_pair, run_compact_worker, select_tail,
 };
 pub use console_log::ConsoleLog;
 pub use markdown::{MarkdownRenderer, render_block};
 pub use search::{SessionSearchReport, search_sessions};
 pub use transcript::{
-    BANNER_RULE, Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, USER_RULE, attachment_note,
-    banner_open_events, banner_rule, compacted_banner_events, format_tokens,
-    format_tool_invocation, history_events, section_rule, truncate_display_string,
-    truncate_json_strings, usage_line, user_header_line, user_rule, write_banner_open,
-    write_compacted_banner, write_error_section, write_session_history, write_warning_open,
+    Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, attachment_note, banner_open_events,
+    banner_rule, compacted_banner_events, format_tokens, history_events, section_rule,
+    truncate_json_strings, usage_line, user_header_line, user_rule, write_error_section,
+    write_warning_open,
 };
 
 use std::fs;
@@ -74,21 +73,12 @@ impl std::fmt::Display for SessionKind {
 }
 
 impl SessionKind {
-    /// Serde skip helper: omit `kind` on disk when it is the default.
+    /// The one visibility predicate: only [`SessionKind::User`] sessions show
+    /// in default `/sessions` / bare `--resume` / `session_meta list` —
+    /// visibility is derived from kind, not a separate stored flag. Doubles as
+    /// the serde skip helper (omit `kind` on disk when it is the default).
     pub fn is_user(&self) -> bool {
         matches!(self, SessionKind::User)
-    }
-
-    /// Visible in default `/sessions` / bare `--resume` / `session_meta list`.
-    ///
-    /// Visibility is derived from kind (not a separate stored flag): only
-    /// [`SessionKind::User`] sessions are visible.
-    pub fn is_visible(self) -> bool {
-        matches!(self, SessionKind::User)
-    }
-
-    pub fn is_hidden(self) -> bool {
-        !self.is_visible()
     }
 }
 
@@ -114,7 +104,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// Classification for filtering and UI. Visibility is derived via
-    /// [`SessionKind::is_visible`] (only [`SessionKind::User`] is listed by default).
+    /// [`SessionKind::is_user`] (only [`SessionKind::User`] is listed by default).
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
     /// Session this one was compacted from, if any.
@@ -296,13 +286,10 @@ impl Session {
         }
     }
 
-    /// Whether this session appears in default listings (derived from [`Self::kind`]).
-    pub fn is_visible(&self) -> bool {
-        self.kind.is_visible()
-    }
-
+    /// Whether this session is omitted from default listings (derived from
+    /// [`Self::kind`]).
     pub fn is_hidden(&self) -> bool {
-        self.kind.is_hidden()
+        !self.kind.is_user()
     }
 
     /// Sibling summary file written by compact workers: `{id}.summary.md`.
@@ -318,7 +305,7 @@ impl Session {
         parent_session_id: Option<String>,
     ) -> Self {
         debug_assert!(
-            kind.is_hidden(),
+            !kind.is_user(),
             "new_hidden requires a non-user SessionKind"
         );
         let mut s = Self::new_with_id(model, id);
@@ -549,7 +536,7 @@ pub fn list_sessions_filtered(
     for path in iter_session_json_files(&root)? {
         match session_list_entry_from_path(&path) {
             Ok(entry) => {
-                if include_hidden || entry.kind.is_visible() {
+                if include_hidden || entry.kind.is_user() {
                     metas.push(entry);
                 }
             }
@@ -764,10 +751,10 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
             entry.link_counts.prs, entry.link_counts.worktrees
         )
     };
-    let hidden = if entry.kind.is_hidden() {
-        format!("  [{}]", entry.kind)
-    } else {
+    let hidden = if entry.kind.is_user() {
         String::new()
+    } else {
+        format!("  [{}]", entry.kind)
     };
     format!(
         "  {:>2}. {}  {}  model={}  msgs={}{}{}  {}",
@@ -783,39 +770,45 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
 }
 
 pub fn format_session_detail(session: &Session) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("id:        {}\n", session.id));
-    out.push_str(&format!("path:      {}\n", session.json_path().display()));
     let console = session.console_path();
-    if console.exists() {
-        out.push_str(&format!("console:   {}\n", console.display()));
+    // (label incl. padding, value); `None` rows are omitted.
+    let rows: [(&str, Option<String>); 13] = [
+        ("id:        ", Some(session.id.clone())),
+        (
+            "path:      ",
+            Some(session.json_path().display().to_string()),
+        ),
+        (
+            "console:   ",
+            console.exists().then(|| console.display().to_string()),
+        ),
+        ("created:   ", Some(session.created_at.to_rfc3339())),
+        ("updated:   ", Some(session.updated_at.to_rfc3339())),
+        ("model:     ", Some(session.model.clone())),
+        ("messages:  ", Some(session.messages.len().to_string())),
+        ("kind:      ", Some(session.kind.to_string())),
+        ("hidden:    ", Some(session.is_hidden().to_string())),
+        ("parent:    ", session.parent_session_id.clone()),
+        ("predecessor: ", session.predecessor_id.clone()),
+        ("successor:   ", session.successor_id.clone()),
+        (
+            "title:     ",
+            Some(
+                session
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("(none)")
+                    .to_string(),
+            ),
+        ),
+    ];
+    let mut out = String::new();
+    for (label, value) in rows {
+        if let Some(value) = value {
+            out.push_str(&format!("{label}{value}\n"));
+        }
     }
-    out.push_str(&format!("created:   {}\n", session.created_at.to_rfc3339()));
-    out.push_str(&format!("updated:   {}\n", session.updated_at.to_rfc3339()));
-    out.push_str(&format!("model:     {}\n", session.model));
-    out.push_str(&format!("messages:  {}\n", session.messages.len()));
-    out.push_str(&format!("kind:      {}\n", session.kind));
-    out.push_str(&format!(
-        "hidden:    {}\n",
-        if session.is_hidden() { "true" } else { "false" }
-    ));
-    if let Some(parent) = session.parent_session_id.as_deref() {
-        out.push_str(&format!("parent:    {parent}\n"));
-    }
-    if let Some(id) = session.predecessor_id.as_deref() {
-        out.push_str(&format!("predecessor: {id}\n"));
-    }
-    if let Some(id) = session.successor_id.as_deref() {
-        out.push_str(&format!("successor:   {id}\n"));
-    }
-    out.push_str(&format!(
-        "title:     {}\n",
-        session
-            .title
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .unwrap_or("(none)")
-    ));
     if session.links.is_empty() {
         out.push_str("links:     (none)\n");
     } else {
@@ -1009,34 +1002,24 @@ pub(crate) fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::generative_model::{Content, Message, TokenUsage};
-    use std::time::Duration;
+    use crate::test_support::{temp_dir, temp_home, user};
 
-    fn myco_home_lock() -> std::sync::MutexGuard<'static, ()> {
-        lock_myco_home_for_test()
-    }
+    /// Pre-`last_usage` / pre-`kind` v2 file: absent optional fields must default.
+    const LEGACY_V2_JSON: &[u8] = br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#;
 
-    fn temp_session_root() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "myco-session-unit-{}",
-            uuid_simple_hex(Uuid::new_v4())
-        ))
+    fn load_legacy_v2() -> Session {
+        let dir = temp_dir("session-legacy");
+        let path = dir.path().join("legacy.json");
+        fs::write(&path, LEGACY_V2_JSON).unwrap();
+        Session::load(&path).unwrap()
     }
 
     #[test]
     fn save_writes_minified_single_line_json_that_loads_back() {
-        let _guard = myco_home_lock();
-        let dir = temp_session_root();
-        // SAFETY: test-only env override; held under myco_home_lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("session-save");
 
         let mut session = Session::new("claude-haiku-4-5");
-        session.messages.push(Message::UserMessage {
-            content: vec![Content::Text {
-                text: "hello\nworld".into(),
-            }],
-        });
+        session.messages.push(user("hello\nworld"));
         session.save().unwrap();
 
         // Minified: no newlines outside JSON string escapes, no indentation.
@@ -1046,8 +1029,6 @@ mod tests {
         let loaded = Session::load(&session.json_path()).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.messages.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1126,36 +1107,19 @@ mod tests {
 
     #[test]
     fn session_file_roundtrip_v2() {
-        let dir = temp_session_root();
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sess.json");
+        let dir = temp_dir("session-roundtrip");
+        let path = dir.path().join("sess.json");
 
-        let mut session = Session {
-            version: SESSION_FILE_VERSION,
-            id: "aabbccddeeff00112233445566778899".into(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            model: "claude-opus-4-8".into(),
-            messages: vec![Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "hello".into(),
-                }],
-            }],
-            title: Some("hello session".into()),
-            links: vec![SessionLink::Worktree {
-                host: "local".into(),
-                path: "/tmp/x".into(),
-                branch: None,
-                note: None,
-            }],
-            scratchpad: "notes".into(),
-            parent_session_id: None,
-            kind: SessionKind::User,
-            predecessor_id: None,
-            successor_id: None,
-            last_usage: None,
-        };
-        session.updated_at = session.created_at + Duration::from_secs(1);
+        let mut session = Session::new("claude-opus-4-8");
+        session.messages = vec![user("hello")];
+        session.title = Some("hello session".into());
+        session.links = vec![SessionLink::Worktree {
+            host: "local".into(),
+            path: "/tmp/x".into(),
+            branch: None,
+            note: None,
+        }];
+        session.scratchpad = "notes".into();
 
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
@@ -1166,8 +1130,6 @@ mod tests {
         assert_eq!(loaded.scratchpad, "notes");
         assert_eq!(loaded.links.len(), 1);
         assert_eq!(loaded.messages.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Session labels, snippets, and search read the first user message; the
@@ -1198,9 +1160,7 @@ mod tests {
         let mut parent = Session::new_with_id("modelkey", "aa00bb11cc22dd33ee44ff5566778899");
         parent.title = Some("parent title".into());
         parent.scratchpad = "parent notes".into();
-        parent.messages = vec![Message::UserMessage {
-            content: vec![Content::Text { text: "hi".into() }],
-        }];
+        parent.messages = vec![user("hi")];
         parent.last_usage = Some(TokenUsage {
             input_tokens: 100,
             output_tokens: 10,
@@ -1226,10 +1186,8 @@ mod tests {
 
     #[test]
     fn last_usage_persists_and_old_sessions_default_none() {
-        let dir = temp_session_root();
-        fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join("with_usage.json");
+        let dir = temp_dir("session-usage");
+        let path = dir.path().join("with_usage.json");
         let mut session =
             Session::new_with_id("claude-opus-4-8", "aa00bb11cc22dd33ee44ff5566778899");
         session.last_usage = Some(TokenUsage {
@@ -1243,29 +1201,13 @@ mod tests {
         assert_eq!(loaded.last_usage, session.last_usage);
         assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
 
-        let old = dir.join("old.json");
-        fs::write(
-            &old,
-            br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
-        )
-        .unwrap();
-        assert!(Session::load(&old).unwrap().last_usage.is_none());
-
-        let _ = fs::remove_dir_all(&dir);
+        assert!(load_legacy_v2().last_usage.is_none());
     }
 
     #[test]
     fn persist_messages_records_usage_and_none_keeps_last() {
-        let _guard = myco_home_lock();
-        let dir = temp_session_root();
-        // SAFETY: test-only env override; held under myco_home_lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("session-persist");
 
-        let msg = |t: &str| Message::UserMessage {
-            content: vec![Content::Text { text: t.into() }],
-        };
         let usage = TokenUsage {
             input_tokens: 5_000,
             output_tokens: 100,
@@ -1275,7 +1217,7 @@ mod tests {
         let id = active.id();
 
         active
-            .persist_messages(&[msg("hi")], Some(usage), true)
+            .persist_messages(&[user("hi")], Some(usage), true)
             .unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id).unwrap().last_usage,
@@ -1283,24 +1225,18 @@ mod tests {
         );
 
         active
-            .persist_messages(&[msg("hi"), msg("more")], None, true)
+            .persist_messages(&[user("hi"), user("more")], None, true)
             .unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id).unwrap().last_usage,
             Some(usage)
         );
-
-        let _ = fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
     #[test]
     fn reject_wrong_version() {
-        let dir = temp_session_root();
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("old.json");
+        let dir = temp_dir("session-version");
+        let path = dir.path().join("old.json");
         fs::write(
             &path,
             br#"{"version":1,"id":"aa","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
@@ -1308,17 +1244,11 @@ mod tests {
         .unwrap();
         let err = Session::load(&path).unwrap_err();
         assert!(err.contains("unsupported session version"), "{err}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn active_session_auto_title_once() {
-        let _guard = myco_home_lock();
-        let dir = temp_session_root();
-        // SAFETY: test-only env override; held under myco_home_lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("session-title");
         let s = ActiveSession::new(Session::new("claude-haiku-4-5"));
         assert!(
             s.maybe_auto_title_from_user_text("First line\n\nmore")
@@ -1327,10 +1257,6 @@ mod tests {
         assert_eq!(s.snapshot().title.as_deref(), Some("First line"));
         assert!(!s.maybe_auto_title_from_user_text("Second").unwrap());
         assert_eq!(s.snapshot().title.as_deref(), Some("First line"));
-        let _ = fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
     #[test]
@@ -1344,19 +1270,10 @@ mod tests {
 
     #[test]
     fn hidden_default_false_and_omitted_from_list() {
-        let _guard = myco_home_lock();
-        let dir = temp_session_root();
-        // SAFETY: test-only env override; held under myco_home_lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("session-hidden");
 
         let mut visible = Session::new("claude-haiku-4-5");
-        visible.messages.push(Message::UserMessage {
-            content: vec![Content::Text {
-                text: "visible".into(),
-            }],
-        });
+        visible.messages.push(user("visible"));
         visible.save().unwrap();
 
         let mut hidden = Session::new_hidden(
@@ -1365,11 +1282,7 @@ mod tests {
             SessionKind::Subagent,
             Some(visible.id.clone()),
         );
-        hidden.messages.push(Message::UserMessage {
-            content: vec![Content::Text {
-                text: "hidden subagent".into(),
-            }],
-        });
+        hidden.messages.push(user("hidden subagent"));
         hidden.save().unwrap();
 
         let listed = list_sessions(0).unwrap();
@@ -1383,7 +1296,7 @@ mod tests {
         );
 
         let all = list_sessions_filtered(0, true).unwrap();
-        assert!(all.iter().any(|e| e.id == hidden.id && e.kind.is_hidden()));
+        assert!(all.iter().any(|e| e.id == hidden.id && !e.kind.is_user()));
 
         // Bare resume resolves most recent *visible* session.
         let resumed = resolve_and_load_session(None).unwrap();
@@ -1397,28 +1310,14 @@ mod tests {
             loaded.parent_session_id.as_deref(),
             Some(visible.id.as_str())
         );
-
-        let _ = fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
+    /// No kind/parent fields on disk — serde defaults to user (visible).
     #[test]
     fn old_session_json_defaults_kind_user() {
-        let dir = temp_session_root();
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("legacy.json");
-        // No kind/parent fields — serde defaults to user (visible).
-        fs::write(
-            &path,
-            br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
-        )
-        .unwrap();
-        let s = Session::load(&path).unwrap();
+        let s = load_legacy_v2();
         assert!(!s.is_hidden());
         assert_eq!(s.kind, SessionKind::User);
         assert!(s.parent_session_id.is_none());
-        let _ = fs::remove_dir_all(&dir);
     }
 }

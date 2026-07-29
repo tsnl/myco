@@ -11,23 +11,10 @@ use crate::session::{
     uuid_simple_hex,
 };
 
-/// Options for [`compact_session`].
-#[derive(Debug, Clone)]
-pub struct CompactOptions {
-    /// How many trailing user-turns to keep verbatim (well-formed).
-    pub tail_user_turns: usize,
-    /// Max chars for any single tool body retained in the tail.
-    pub tail_tool_body_max_chars: usize,
-}
-
-impl Default for CompactOptions {
-    fn default() -> Self {
-        Self {
-            tail_user_turns: 2,
-            tail_tool_body_max_chars: 4_000,
-        }
-    }
-}
+/// How many trailing user-turns the successor keeps verbatim (well-formed).
+const TAIL_USER_TURNS: usize = 2;
+/// Max chars for any single tool body retained in the tail.
+const TAIL_TOOL_BODY_MAX_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone)]
 pub struct CompactOutcome {
@@ -45,7 +32,6 @@ pub fn compact_session(
     predecessor: &Session,
     summary_markdown: &str,
     model: &str,
-    opts: &CompactOptions,
 ) -> Result<(Session, CompactOutcome), String> {
     if predecessor.messages.is_empty() {
         return Err("cannot compact an empty session".into());
@@ -56,8 +42,8 @@ pub fn compact_session(
 
     let tail = select_tail(
         &predecessor.messages,
-        opts.tail_user_turns,
-        opts.tail_tool_body_max_chars,
+        TAIL_USER_TURNS,
+        TAIL_TOOL_BODY_MAX_CHARS,
     );
 
     let mut successor = Session::new(model);
@@ -182,7 +168,6 @@ pub async fn run_compact_worker(
         TraceContext {
             agent_id: worker_id,
             depth: 1,
-            parent_tool_use_id: None,
         },
     );
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
@@ -219,13 +204,8 @@ pub async fn run_compact_worker(
         }
     };
 
-    let (successor, outcome) = compact_session(
-        predecessor,
-        &summary,
-        &catalog_model.spec.key,
-        &CompactOptions::default(),
-    )
-    .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor: {e}")))?;
+    let (successor, outcome) = compact_session(predecessor, &summary, &catalog_model.spec.key)
+        .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor: {e}")))?;
 
     let mut pred = predecessor.clone();
     link_compact_pair(&mut pred, &successor)
@@ -323,59 +303,24 @@ Rules:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{ToolResult, ToolUse, TurnEndReason};
-    use crate::session::uuid_simple_hex;
+    use crate::test_support::{assistant, assistant_tool, temp_home, tool_results, user};
     use serde_json::json;
 
-    fn user(text: &str) -> Message {
-        Message::UserMessage {
-            content: vec![Content::Text { text: text.into() }],
-        }
-    }
-
-    fn assistant_end(text: &str) -> Message {
-        Message::AssistantMessage {
-            content: vec![Content::Text { text: text.into() }],
-            tool_uses: vec![],
-            turn_end_reason: Some(TurnEndReason::EndTurn),
-        }
-    }
-
     fn assistant_tools() -> Message {
-        Message::AssistantMessage {
-            content: vec![],
-            tool_uses: vec![ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: json!({"command": "echo hi"}),
-            }],
-            turn_end_reason: Some(TurnEndReason::ToolUse),
-        }
-    }
-
-    fn tool_results() -> Message {
-        Message::ToolResults {
-            tool_use_results: vec![ToolResult {
-                id: "t1".into(),
-                content: vec![Content::Text {
-                    text: "hi\n".into(),
-                }],
-                is_error: false,
-            }],
-        }
+        assistant_tool(None, "t1", "bash", json!({"command": "echo hi"}))
     }
 
     #[test]
     fn select_tail_keeps_last_user_turns_and_tool_loop() {
         let messages = vec![
             user("old"),
-            assistant_end("old a"),
+            assistant("old a"),
             user("mid"),
             assistant_tools(),
-            tool_results(),
-            assistant_end("mid a"),
+            tool_results(&[("t1", "hi\n")]),
+            assistant("mid a"),
             user("new"),
-            assistant_end("new a"),
+            assistant("new a"),
         ];
         let tail = select_tail(&messages, 2, 1000);
         assert!(matches!(tail[0], Message::UserMessage { .. }));
@@ -397,28 +342,15 @@ mod tests {
 
     #[test]
     fn compact_session_seeds_resume_and_links() {
-        let _guard = crate::session::lock_myco_home_for_test();
-        let dir = std::env::temp_dir().join(format!(
-            "myco-compact-{}",
-            uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("compact");
 
         let mut pred = Session::new("claude-haiku-4-5");
-        pred.messages = vec![user("hello"), assistant_end("world")];
+        pred.messages = vec![user("hello"), assistant("world")];
         pred.title = Some("t".into());
         pred.save().unwrap();
 
-        let (succ, out) = compact_session(
-            &pred,
-            "## Goal\nDo the thing\n",
-            "claude-haiku-4-5",
-            &CompactOptions::default(),
-        )
-        .unwrap();
+        let (succ, out) =
+            compact_session(&pred, "## Goal\nDo the thing\n", "claude-haiku-4-5").unwrap();
         assert_eq!(out.predecessor_id, pred.id);
         assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
         assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
@@ -442,10 +374,5 @@ mod tests {
                 .unwrap()
                 .contains("Do the thing")
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 }

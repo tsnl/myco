@@ -20,30 +20,25 @@ use crate::tui::{
     styled_line, tool_invocation_events,
 };
 
-/// Full-block 72-col rule above the startup banner — the heaviest rule in the
-/// UI (banner `█` > user `═` > section `─`), so launch stands out even
-/// uncolored. Block element rather than box drawing: the box-drawing heavy
-/// line `━` is not reliably thicker than the double `═` across terminal fonts.
-pub const BANNER_RULE: &str =
-    "████████████████████████████████████████████████████████████████████████";
-
-/// Double-line 72-col rule before each user turn (UTF-8 box drawing, no ANSI).
-pub const USER_RULE: &str =
-    "════════════════════════════════════════════════════════════════════════";
-
-/// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER uses USER_RULE).
+/// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER
+/// uses [`user_rule`]).
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
-/// Rule width when wrap is off (matches [`USER_RULE`] / [`SECTION_RULE`]).
+/// Rule width when wrap is off (matches [`SECTION_RULE`]).
 pub const DEFAULT_RULE_WIDTH: usize = 72;
 
-/// Startup banner rule sized to the wrap width (default-width when wrap is off).
+/// Full-block startup-banner rule sized to the wrap width (default-width when
+/// wrap is off) — the heaviest rule in the UI (banner `█` > user `═` > section
+/// `─`), so launch stands out even uncolored. Block element rather than box
+/// drawing: the box-drawing heavy line `━` is not reliably thicker than the
+/// double `═` across terminal fonts.
 pub fn banner_rule(wrap: Option<usize>) -> String {
     "█".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
 }
 
-/// USER rule sized to the wrap width (default-width when wrap is off).
+/// Double-line rule before each user turn (UTF-8 box drawing, no ANSI), sized
+/// to the wrap width (default-width when wrap is off).
 pub fn user_rule(wrap: Option<usize>) -> String {
     "═".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
 }
@@ -154,16 +149,6 @@ pub fn banner_open_events(title: &str, wrap: Option<usize>) -> Vec<TuiEvent> {
     events
 }
 
-/// Write a banner open (encoding facade over [`banner_open_events`]).
-pub fn write_banner_open(
-    out: &mut (impl Write + ?Sized),
-    title: &str,
-    palette: Palette,
-) -> std::io::Result<()> {
-    let events = banner_open_events(title, palette.wrap);
-    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
-}
-
 /// The full COMPACTED banner: banner open, then the successor/predecessor
 /// pair, tail size, and summary path.
 ///
@@ -188,16 +173,6 @@ pub fn compacted_banner_events(
         outcome.summary_path.display(),
     )));
     events
-}
-
-/// Write the full COMPACTED banner (facade over [`compacted_banner_events`]).
-pub fn write_compacted_banner(
-    out: &mut impl Write,
-    outcome: &super::CompactOutcome,
-    palette: Palette,
-) -> std::io::Result<()> {
-    let events = compacted_banner_events(outcome, palette.wrap);
-    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
 }
 
 /// Write a WARNING section open: blank line, thin rule, header, blank line,
@@ -354,19 +329,8 @@ fn replay_paragraph(
     st.need_blank = true;
 }
 
-/// Replay saved messages with the same section layout as the live REPL
-/// (encoding facade over [`history_events`]).
-pub fn write_session_history(
-    out: &mut impl Write,
-    messages: &[Message],
-    palette: Palette,
-) -> std::io::Result<()> {
-    let events = history_events(messages, palette);
-    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
-}
-
 /// Truncate a display string to `max_chars` (including a trailing `…` when shortened).
-pub fn truncate_display_string(s: &str, max_chars: usize) -> String {
+fn truncate_display_string(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
@@ -397,23 +361,33 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
     }
 }
 
-/// Render `name(<pretty json>)` for tool paragraphs inside ASSISTANT
-/// (encoding facade over [`crate::tui`]'s tool-invocation events).
-///
-/// Long string values are truncated first, then objects/arrays are pretty-printed
-/// with 2-space indent; scalars stay compact. Always ends with a trailing newline.
-/// Only the tool name is styled; the JSON body stays plain.
-pub fn format_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
-    let mut events = Vec::new();
-    tool_invocation_events(&mut events, name, input);
-    encode_ansi(&events, palette.enabled)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
+    use crate::generative_model::{Content, Message, ToolUse, TurnEndReason};
+    use crate::test_support::{assistant, thinking, thinking_msg, tool_loop, user};
     use serde_json::json;
+
+    /// Replay bytes as a terminal sees them: events, ANSI-encoded.
+    fn render_history(messages: &[Message], palette: Palette) -> String {
+        encode_ansi(&history_events(messages, palette), palette.enabled)
+    }
+
+    fn render_compacted_banner(
+        outcome: &crate::session::CompactOutcome,
+        palette: Palette,
+    ) -> String {
+        encode_ansi(
+            &compacted_banner_events(outcome, palette.wrap),
+            palette.enabled,
+        )
+    }
+
+    fn render_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
+        let mut events = Vec::new();
+        tool_invocation_events(&mut events, name, input);
+        encode_ansi(&events, palette.enabled)
+    }
 
     #[test]
     fn format_tokens_scales_and_drops_trailing_zero() {
@@ -466,24 +440,19 @@ mod tests {
     }
 
     #[test]
-    fn write_banner_open_layout() {
-        let mut buf = Vec::new();
-        write_banner_open(&mut buf, "MYCO", Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+    fn banner_open_layout() {
+        let rendered = encode_ansi(&banner_open_events("MYCO", None), false);
         // No leading blank line — unlike the section openers, a banner starts a screen.
-        assert_eq!(rendered, format!("{BANNER_RULE}\nMYCO\n\n"));
+        assert_eq!(rendered, format!("{}\nMYCO\n\n", banner_rule(None)));
 
-        let mut buf = Vec::new();
-        write_banner_open(&mut buf, "COMPACTED", Palette::colored(true)).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = encode_ansi(&banner_open_events("COMPACTED", None), true);
         assert!(rendered.contains("\x1b[0;1mCOMPACTED\x1b[0m\n"));
-        assert!(rendered.contains(&format!("\x1b[0;1m{BANNER_RULE}\x1b[0m\n")));
+        assert!(rendered.contains(&format!("\x1b[0;1m{}\x1b[0m\n", banner_rule(None))));
     }
 
     #[test]
     fn compacted_banner_layout() {
-        let mut buf = Vec::new();
-        write_compacted_banner(&mut buf, &sample_outcome(7), Palette::plain()).unwrap();
+        let rendered = render_compacted_banner(&sample_outcome(7), Palette::plain());
         let expected = format!(
             "{rule}\nCOMPACTED\n\n\
              Session: 1c0ffee0dead0beef0000000000000aa\n\
@@ -492,16 +461,13 @@ mod tests {
              Summary: /home/u/.myco/sessions/993d1488.summary.md\n",
             rule = banner_rule(None)
         );
-        assert_eq!(String::from_utf8(buf).unwrap(), expected);
+        assert_eq!(rendered, expected);
     }
 
     #[test]
     fn compacted_banner_singular_tail() {
-        let mut buf = Vec::new();
-        write_compacted_banner(&mut buf, &sample_outcome(1), Palette::plain()).unwrap();
         assert!(
-            String::from_utf8(buf)
-                .unwrap()
+            render_compacted_banner(&sample_outcome(1), Palette::plain())
                 .contains("Kept: 1 message\n"),
             "single kept message should not be pluralized"
         );
@@ -509,65 +475,19 @@ mod tests {
 
     #[test]
     fn compacted_banner_rule_follows_wrap_width() {
-        let mut buf = Vec::new();
         let palette = Palette::plain().with_wrap(Some(40));
-        write_compacted_banner(&mut buf, &sample_outcome(2), palette).unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        let text = render_compacted_banner(&sample_outcome(2), palette);
         assert!(
             text.starts_with(&format!("{}\nCOMPACTED\n", "█".repeat(40))),
             "{text}"
         );
     }
 
-    fn sample_messages() -> Vec<Message> {
-        vec![
-            Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "hello".into(),
-                }],
-            },
-            Message::AssistantMessage {
-                content: vec![Content::Text {
-                    text: "hi there".into(),
-                }],
-                tool_uses: vec![ToolUse {
-                    id: "toolu_1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "echo hi"}),
-                }],
-                turn_end_reason: Some(TurnEndReason::ToolUse),
-            },
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult {
-                    id: "toolu_1".into(),
-                    content: vec![Content::Text {
-                        text: "hi\n".into(),
-                    }],
-                    is_error: false,
-                }],
-            },
-            Message::AssistantMessage {
-                content: vec![Content::Text {
-                    text: "done".into(),
-                }],
-                tool_uses: vec![],
-                turn_end_reason: Some(TurnEndReason::EndTurn),
-            },
-            Message::AssistantMessage {
-                content: vec![],
-                tool_uses: vec![],
-                turn_end_reason: Some(TurnEndReason::Other("Anthropic::PauseTurn".into())),
-            },
-        ]
-    }
-
     #[test]
-    fn write_session_history_section_layout() {
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &sample_messages(), Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+    fn session_history_section_layout() {
+        let rendered = render_history(&tool_loop(), Palette::plain());
 
-        assert!(rendered.contains(USER_RULE));
+        assert!(rendered.contains(&user_rule(None)));
         assert!(rendered.contains("USER\n\nhello\n"));
         assert!(!rendered.contains("> hello"));
         // Tools live inside ASSISTANT (no TOOL header). One ASSISTANT open per turn.
@@ -578,26 +498,20 @@ mod tests {
         assert!(rendered.contains("hi there\n\nbash({\n  \"command\": \"echo hi\"\n})\n"));
         // Blank line before section rule/header.
         assert!(rendered.contains("\n\n────────────────────────────────"));
-        // Tool results silent.
-        assert!(!rendered.contains("toolu_1"));
+        // Tool results silent (no tool-use id leaks).
+        assert!(!rendered.contains("t1"));
         // Multi-step assistant messages (tool loop) stay in one ASSISTANT section.
         assert!(rendered.contains("done\n"));
         assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
     }
 
     #[test]
-    fn write_session_history_thinking_and_tools_in_assistant() {
+    fn session_history_thinking_and_tools_in_assistant() {
         let messages = vec![
-            Message::UserMessage {
-                content: vec![Content::Text { text: "q".into() }],
-            },
+            user("q"),
             Message::AssistantMessage {
                 content: vec![
-                    Content::Thinking {
-                        text: "step a\nstep b".into(),
-                        signature: None,
-                        redacted: false,
-                    },
+                    thinking("step a\nstep b"),
                     Content::Text {
                         text: "answer".into(),
                     },
@@ -617,9 +531,7 @@ mod tests {
                 turn_end_reason: Some(TurnEndReason::ToolUse),
             },
         ];
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&messages, Palette::plain());
 
         assert!(!rendered.contains("THINKING\n"));
         assert!(!rendered.contains("TOOL\n"));
@@ -666,9 +578,7 @@ mod tests {
                 },
             ],
         }];
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&messages, Palette::plain());
         assert!(rendered.contains("look at @shot.png\n[1 image attached]\n"));
         // The base64 payload never hits the terminal.
         assert!(!rendered.contains("AAAA"));
@@ -678,22 +588,10 @@ mod tests {
     fn wrapped_palette_wraps_prose_and_sizes_rules() {
         let palette = Palette::plain().with_wrap(Some(20));
         let messages = vec![
-            Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "user words that go past twenty columns".into(),
-                }],
-            },
-            Message::AssistantMessage {
-                content: vec![Content::Text {
-                    text: "one two three four five six seven".into(),
-                }],
-                tool_uses: vec![],
-                turn_end_reason: Some(TurnEndReason::EndTurn),
-            },
+            user("user words that go past twenty columns"),
+            assistant("one two three four five six seven"),
         ];
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages, palette).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&messages, palette);
         assert!(rendered.contains(&"═".repeat(20)), "{rendered}");
         assert!(!rendered.contains(&"═".repeat(21)), "{rendered}");
         assert!(
@@ -705,9 +603,9 @@ mod tests {
             rendered.contains("user words that go\npast twenty columns\n"),
             "{rendered}"
         );
-        // Rule fns match the legacy fixed rules when wrap is off.
-        assert_eq!(banner_rule(None), BANNER_RULE);
-        assert_eq!(user_rule(None), USER_RULE);
+        // Rule fns default to the fixed 72-col width when wrap is off.
+        assert_eq!(banner_rule(None).chars().count(), DEFAULT_RULE_WIDTH);
+        assert_eq!(user_rule(None).chars().count(), DEFAULT_RULE_WIDTH);
         assert_eq!(section_rule(None), SECTION_RULE);
     }
 
@@ -738,8 +636,8 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_invocation_pretty_prints_objects() {
-        let rendered = format_tool_invocation(
+    fn tool_invocation_pretty_prints_objects() {
+        let rendered = render_tool_invocation(
             "bash",
             &json!({"action": "start", "session_id": "s", "timeout_ms": 1000}),
             Palette::plain(),
@@ -750,19 +648,19 @@ mod tests {
         );
         // Scalars stay compact.
         assert_eq!(
-            format_tool_invocation("x", &json!(42), Palette::plain()),
+            render_tool_invocation("x", &json!(42), Palette::plain()),
             "x(42)\n"
         );
         assert_eq!(
-            format_tool_invocation("x", &json!("hi"), Palette::plain()),
+            render_tool_invocation("x", &json!("hi"), Palette::plain()),
             "x(\"hi\")\n"
         );
     }
 
     #[test]
-    fn format_tool_invocation_truncates_long_strings() {
+    fn tool_invocation_truncates_long_strings() {
         let long = "a".repeat(TOOL_DISPLAY_STRING_MAX + 50);
-        let rendered = format_tool_invocation(
+        let rendered = render_tool_invocation(
             "write",
             &json!({
                 "path": "f.txt",
@@ -781,7 +679,7 @@ mod tests {
         // Short strings unchanged.
         assert!(rendered.contains("\"items\": [\n    \"short\","));
         // Scalar long string.
-        let scalar = format_tool_invocation(
+        let scalar = render_tool_invocation(
             "echo",
             &json!("d".repeat(TOOL_DISPLAY_STRING_MAX + 5)),
             Palette::plain(),
@@ -801,16 +699,8 @@ mod tests {
     fn thinking_blocks_are_replayed_from_history() {
         let messages = vec![Message::AssistantMessage {
             content: vec![
-                Content::Thinking {
-                    text: "secret-thought-aaa".into(),
-                    signature: None,
-                    redacted: false,
-                },
-                Content::Thinking {
-                    text: "secret-thought-bbb".into(),
-                    signature: None,
-                    redacted: false,
-                },
+                thinking("secret-thought-aaa"),
+                thinking("secret-thought-bbb"),
                 Content::Text {
                     text: "done".into(),
                 },
@@ -818,9 +708,7 @@ mod tests {
             tool_uses: vec![],
             turn_end_reason: Some(TurnEndReason::EndTurn),
         }];
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages, Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&messages, Palette::plain());
         assert!(!rendered.contains("THINKING\n"));
         assert!(rendered.contains("Thinking: secret-thought-aaa\n"));
         assert!(rendered.contains("Thinking: secret-thought-bbb\n"));
@@ -835,23 +723,24 @@ mod tests {
     #[test]
     fn plain_palette_emits_no_ansi() {
         let mut buf = Vec::new();
-        write_session_history(&mut buf, &sample_messages(), Palette::plain()).unwrap();
         write_error_section(&mut buf, "boom", Palette::plain()).unwrap();
-        write_compacted_banner(&mut buf, &sample_outcome(3), Palette::plain()).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let mut rendered = render_history(&tool_loop(), Palette::plain());
+        rendered.push_str(std::str::from_utf8(&buf).unwrap());
+        rendered.push_str(&render_compacted_banner(
+            &sample_outcome(3),
+            Palette::plain(),
+        ));
         assert!(!rendered.contains('\x1b'));
     }
 
     #[test]
     fn colored_palette_styles_headers_but_not_bodies() {
         let palette = Palette::colored(true);
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &sample_messages(), palette).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&tool_loop(), palette);
 
         // Headers and rules are wrapped in SGR sequences…
         assert!(rendered.contains("\x1b[0;1;36mUSER\x1b[0m\n"));
-        assert!(rendered.contains(&format!("\x1b[0;1;36m{USER_RULE}\x1b[0m\n")));
+        assert!(rendered.contains(&format!("\x1b[0;1;36m{}\x1b[0m\n", user_rule(None))));
         assert!(rendered.contains("\x1b[0;1;32mASSISTANT\x1b[0m\n"));
         // …while message bodies stay plain.
         assert!(rendered.contains("\nhello\n"));
@@ -864,17 +753,15 @@ mod tests {
 
         // COMPACTED joins the banner family: bold, uncolored rule + title,
         // plain detail lines.
-        let mut buf = Vec::new();
-        write_compacted_banner(&mut buf, &sample_outcome(3), palette).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
-        assert!(rendered.contains(&format!("\x1b[0;1m{BANNER_RULE}\x1b[0m\n")));
+        let rendered = render_compacted_banner(&sample_outcome(3), palette);
+        assert!(rendered.contains(&format!("\x1b[0;1m{}\x1b[0m\n", banner_rule(None))));
         assert!(rendered.contains("\x1b[0;1mCOMPACTED\x1b[0m\n"));
         assert!(rendered.contains("\nKept: 3 messages\n"));
     }
 
     #[test]
     fn colored_tool_invocation_styles_only_the_name() {
-        let rendered = format_tool_invocation(
+        let rendered = render_tool_invocation(
             "bash",
             &json!({"command": "echo hi"}),
             Palette::colored(true),
@@ -886,18 +773,7 @@ mod tests {
 
     #[test]
     fn colored_thinking_paragraph_is_dimmed() {
-        let messages = vec![Message::AssistantMessage {
-            content: vec![Content::Thinking {
-                text: "pondering".into(),
-                signature: None,
-                redacted: false,
-            }],
-            tool_uses: vec![],
-            turn_end_reason: Some(TurnEndReason::EndTurn),
-        }];
-        let mut buf = Vec::new();
-        write_session_history(&mut buf, &messages, Palette::colored(true)).unwrap();
-        let rendered = String::from_utf8(buf).unwrap();
+        let rendered = render_history(&[thinking_msg(&["pondering"])], Palette::colored(true));
         assert!(rendered.contains("\x1b[0;2mThinking: pondering\x1b[0m\n"));
     }
 }

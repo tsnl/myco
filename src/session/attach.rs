@@ -88,21 +88,13 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_dir;
     use base64::Engine as _;
     use std::fs;
 
     /// Real magic numbers: the media type is sniffed from these bytes.
     const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "myco-attach-test-{tag}-{}",
-            crate::uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn plain_text_passes_through() {
@@ -116,8 +108,8 @@ mod tests {
 
     #[test]
     fn attaches_image_as_data_url_and_keeps_text_as_typed() {
-        let dir = temp_dir("png");
-        let path = dir.join("shot.png");
+        let dir = temp_dir("attach-png");
+        let path = dir.path().join("shot.png");
         fs::write(&path, PNG).unwrap();
         let input = format!("what is wrong in @{}?", path.display());
 
@@ -138,28 +130,24 @@ mod tests {
             &parsed[1],
             Content::Text { text } if *text == input
         ));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn trailing_punctuation_is_not_part_of_the_path() {
-        let dir = temp_dir("punct");
-        let path = dir.join("shot.png");
+        let dir = temp_dir("attach-punct");
+        let path = dir.path().join("shot.png");
         fs::write(&path, PNG).unwrap();
 
         let parsed = expand_image_attachments(&format!("look at @{}.", path.display())).unwrap();
         assert_eq!(parsed.len(), 2);
         assert!(matches!(&parsed[0], Content::Image { .. }));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The uppercase extension selects the token; the media type is sniffed.
     #[test]
     fn uppercase_extension_is_still_an_attachment_mention() {
-        let dir = temp_dir("jpg");
-        let path = dir.join("photo.JPG");
+        let dir = temp_dir("attach-jpg");
+        let path = dir.path().join("photo.JPG");
         fs::write(&path, JPEG).unwrap();
 
         let parsed = expand_image_attachments(&format!("@{}", path.display())).unwrap();
@@ -169,8 +157,6 @@ mod tests {
             }
             other => panic!("expected image, got {other:?}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -190,29 +176,27 @@ mod tests {
     /// (The per-image cap itself lives in `core::image` and is tested there.)
     #[test]
     fn attachments_over_the_message_budget_fail() {
-        let dir = temp_dir("budget");
+        let dir = temp_dir("attach-budget");
         // 3.5 MiB each → ~4.67 MiB encoded; five clear the 20 MiB budget.
         let mut bytes = vec![0u8; 7 * 512 * 1024];
         bytes[..PNG.len()].copy_from_slice(PNG);
         let mut input = String::new();
         for i in 0..5 {
-            let path = dir.join(format!("shot{i}.png"));
+            let path = dir.path().join(format!("shot{i}.png"));
             fs::write(&path, &bytes).unwrap();
             input.push_str(&format!("@{} ", path.display()));
         }
 
         let err = expand_image_attachments(&input).unwrap_err();
         assert!(err.contains("per-message limit is 20 MiB"), "{err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// An `@mention` that is not actually an image fails the message rather
     /// than sending bytes the provider will reject.
     #[test]
     fn image_extension_over_non_image_bytes_fails_the_message() {
-        let dir = temp_dir("fake");
-        let path = dir.join("notes.png");
+        let dir = temp_dir("attach-fake");
+        let path = dir.path().join("notes.png");
         fs::write(&path, b"just text").unwrap();
 
         let err = expand_image_attachments(&format!("@{}", path.display())).unwrap_err();
@@ -220,20 +204,16 @@ mod tests {
             err.contains("is not a png, jpeg, gif, or webp image"),
             "{err}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn repeated_mention_attaches_once() {
-        let dir = temp_dir("dup");
-        let path = dir.join("shot.png");
+        let dir = temp_dir("attach-dup");
+        let path = dir.path().join("shot.png");
         fs::write(&path, PNG).unwrap();
         let p = path.display();
 
         let parsed = expand_image_attachments(&format!("@{p} and again @{p}")).unwrap();
         assert_eq!(parsed.len(), 2); // one image + the text
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }
