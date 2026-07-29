@@ -54,12 +54,13 @@ use crate::session::{
 // Events
 // ---------------------------------------------------------------------------
 
-/// Terminal color roles used by the CLI (encoded as SGR 31/32/33/36).
+/// Terminal color roles used by the CLI (encoded as SGR 31/32/33/34/36).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Red,
     Green,
     Yellow,
+    Blue,
     Cyan,
 }
 
@@ -71,6 +72,7 @@ pub struct Style {
     pub dim: bool,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     pub color: Option<Color>,
 }
 
@@ -80,6 +82,7 @@ impl Style {
         dim: false,
         bold: false,
         italic: false,
+        underline: false,
         color: None,
     };
     /// USER rule + header: bold cyan.
@@ -117,9 +120,21 @@ impl Style {
         ..Style::RESET
     };
 
-    /// Encode as SGR: attribute order dim(2), bold(1), italic(3), color —
-    /// with the `0;` prefix that clears any style an interrupted stream left
-    /// open. [`Style::RESET`] encodes as plain `\x1b[0m`.
+    /// `self` decorated as hyperlink text: underlined blue, the browser-style
+    /// link affordance. The other attributes pass through, so a link inside
+    /// bold or dim text keeps its weight; only the color is overridden.
+    pub fn linked(self) -> Style {
+        Style {
+            underline: true,
+            color: Some(Color::Blue),
+            ..self
+        }
+    }
+
+    /// Encode as SGR: attribute order dim(2), bold(1), italic(3),
+    /// underline(4), color — with the `0;` prefix that clears any style an
+    /// interrupted stream left open. [`Style::RESET`] encodes as plain
+    /// `\x1b[0m`.
     pub fn sgr(&self) -> String {
         let mut attrs: Vec<&str> = Vec::new();
         if self.dim {
@@ -131,11 +146,15 @@ impl Style {
         if self.italic {
             attrs.push("3");
         }
+        if self.underline {
+            attrs.push("4");
+        }
         if let Some(color) = self.color {
             attrs.push(match color {
                 Color::Red => "31",
                 Color::Green => "32",
                 Color::Yellow => "33",
+                Color::Blue => "34",
                 Color::Cyan => "36",
             });
         }
@@ -829,6 +848,9 @@ mod tests {
         };
         assert_eq!(bold_code.sgr(), "\x1b[0;1;36m");
         assert_eq!(Style::RESET.sgr(), "\x1b[0m");
+        // Hyperlink decoration: underline + blue over the base attributes.
+        assert_eq!(Style::RESET.linked().sgr(), "\x1b[0;4;34m");
+        assert_eq!(Style::THINKING.linked().sgr(), "\x1b[0;2;4;34m");
     }
 
     #[test]

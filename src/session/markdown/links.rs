@@ -128,43 +128,46 @@ impl MarkdownRenderer {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        OSC_CLOSE, osc_open, plain, render, render_char_chunks, strip_escapes, styled, styled_wrap,
+        LINK_SGR, OSC_CLOSE, osc_open, plain, render, render_char_chunks, strip_escapes, styled,
+        styled_wrap,
     };
     use super::*;
 
     #[test]
     fn bare_url_becomes_osc8_hyperlink() {
-        // The visible text is the URL itself; the OSC 8 target is the same URL.
+        // The visible text is the URL itself, underlined blue; the OSC 8
+        // target is the same URL.
         let url = "https://example.com/x";
         assert_eq!(
             render("see https://example.com/x now", styled()),
-            format!("see {}{url}{OSC_CLOSE} now", osc_open(url))
+            format!("see {}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE} now", osc_open(url))
         );
         // `http://` is detected the same as `https://`.
         let url = "http://a.test/p";
         assert_eq!(
             render("go http://a.test/p", styled()),
-            format!("go {}{url}{OSC_CLOSE}", osc_open(url))
+            format!("go {}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE}", osc_open(url))
         );
     }
 
     #[test]
     fn bare_url_trailing_punctuation_stays_outside_link() {
-        // Sentence punctuation after the URL is visible but not part of the link.
+        // Sentence punctuation after the URL is visible but not part of the
+        // link — and not styled as one either.
         let url = "https://example.com";
         assert_eq!(
             render("Visit https://example.com.", styled()),
-            format!("Visit {}{url}{OSC_CLOSE}.", osc_open(url))
+            format!("Visit {}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE}.", osc_open(url))
         );
         // A wrapping paren is excluded; balanced inner parens are kept.
         assert_eq!(
             render("(https://example.com)", styled()),
-            format!("({}{url}{OSC_CLOSE})", osc_open(url))
+            format!("({}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE})", osc_open(url))
         );
         let wiki = "https://en.wikipedia.org/wiki/Foo_(bar)";
         assert_eq!(
             render("see https://en.wikipedia.org/wiki/Foo_(bar).", styled()),
-            format!("see {}{wiki}{OSC_CLOSE}.", osc_open(wiki))
+            format!("see {}{LINK_SGR}{wiki}\x1b[0m{OSC_CLOSE}.", osc_open(wiki))
         );
     }
 
@@ -216,7 +219,7 @@ mod tests {
         let url = "https://h.test/a/b?c=d";
         assert_eq!(
             render(input, styled()),
-            format!("go {}{url}{OSC_CLOSE} ok", osc_open(url))
+            format!("go {}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE} ok", osc_open(url))
         );
     }
 
@@ -253,7 +256,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{}https://vis.test{OSC_CLOSE}",
+                "{}{LINK_SGR}https://vis.test\x1b[0m{OSC_CLOSE}",
                 osc_open("https://tgt.test")
             )
         );
@@ -268,7 +271,10 @@ mod tests {
             &format!("see {url}"),
             Palette::colored(true).with_wrap(Some(12)),
         );
-        assert_eq!(out, format!("see\n{}{url}{OSC_CLOSE}", osc_open(url)));
+        assert_eq!(
+            out,
+            format!("see\n{}{LINK_SGR}{url}\x1b[0m{OSC_CLOSE}", osc_open(url))
+        );
     }
 
     #[test]
