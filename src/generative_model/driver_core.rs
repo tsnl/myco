@@ -51,6 +51,30 @@ pub(super) trait SseAccumulator: Send + 'static {
     fn finish(self) -> Result<(), GenerateError>;
 }
 
+/// Shared end-of-stream validation behind every driver's
+/// [`SseAccumulator::finish`]: a stop reason must have arrived, and each
+/// accumulated tool-call argument string must parse as JSON (empty = `{}`).
+pub(super) fn validate_finish<'a>(
+    provider: &str,
+    stop_reason_seen: bool,
+    tool_args: impl IntoIterator<Item = (usize, &'a str)>,
+) -> Result<(), GenerateError> {
+    if !stop_reason_seen {
+        return Err(GenerateError::MalformedResponseError(format!(
+            "{provider} stream ended without a stop reason"
+        )));
+    }
+    for (i, args) in tool_args {
+        let json = if args.is_empty() { "{}" } else { args };
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
+            return Err(GenerateError::MalformedResponseError(format!(
+                "Malformed stream: {provider} tool call arguments at index {i} invalid: {e}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Send `request` in a spawned task and bridge its SSE stream into the
 /// [`GenerativeModel::generate`] stream shape. Dropping the returned stream
 /// cancels generation: the task's channel sends fail, it returns, and the HTTP
@@ -59,6 +83,7 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     request: reqwest::RequestBuilder,
     acc: A,
     provider: &'static str,
+    debug_dump_api_requests: bool,
 ) -> AsyncStream<Result<MessagePart, GenerateError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
 
@@ -71,6 +96,11 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
             let (client, request) = request.build_split();
             let request = request.map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
             if let Some(body) = request.body().and_then(|b| b.as_bytes()) {
+                if debug_dump_api_requests {
+                    // The exact serialized body, dumped before the size check
+                    // so an over-limit request can still be inspected.
+                    eprintln!("{}", String::from_utf8_lossy(body));
+                }
                 check_request_size(body.len(), provider)?;
             }
             let response = client

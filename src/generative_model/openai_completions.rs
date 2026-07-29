@@ -26,7 +26,8 @@ use crate::core::*;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
-    OpenAIBackendConfig, image_url, images_of, reasoning_effort, text_of, tool_result_text,
+    OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
+    tool_result_text, user_content_parts,
 };
 use super::*;
 
@@ -44,15 +45,6 @@ impl OpenAICompletionsGenerativeModel {
         config: GenerativeModelConfig,
         backend: OpenAIBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.protocol != Protocol::OpenAICompletions {
-            return Err(ModelCreationError::BadConfig(format!(
-                "model `{}` speaks {}, not {}",
-                config.model,
-                config.model.protocol,
-                Protocol::OpenAICompletions
-            )));
-        }
-
         let auth = (!backend.auth_token.is_empty())
             .then(|| ("authorization", format!("Bearer {}", backend.auth_token)));
         let client = driver_core::build_client(auth, &[])?;
@@ -94,10 +86,6 @@ impl OpenAICompletionsGenerativeModel {
             },
         };
 
-        if self.backend.debug_dump_api_requests {
-            eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
-        }
-
         let base = self.backend.base_url.trim_end_matches('/');
         self.client
             .post(format!("{base}/chat/completions"))
@@ -112,6 +100,7 @@ impl GenerativeModel for OpenAICompletionsGenerativeModel {
             self.completion_request(&messages),
             StreamAccumulator::default(),
             "OpenAI Chat Completions",
+            self.backend.debug_dump_api_requests,
         )
     }
 }
@@ -218,23 +207,19 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
 /// User message content: plain string when text-only, `text` / `image_url`
 /// parts when images are attached.
 fn user_content(content: &[Content]) -> ChatContent {
-    if !content.iter().any(|c| matches!(c, Content::Image { .. })) {
-        return ChatContent::Text(text_of(content));
+    let parts = user_content_parts(
+        content,
+        |text| ChatContentPart::Text { text: text.into() },
+        |source| ChatContentPart::ImageUrl {
+            image_url: ChatImageUrl {
+                url: image_url(source),
+            },
+        },
+    );
+    match parts {
+        Some(parts) => ChatContent::Parts(parts),
+        None => ChatContent::Text(text_of(content)),
     }
-    ChatContent::Parts(
-        content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(ChatContentPart::Text { text: text.clone() }),
-                Content::Image { source } => Some(ChatContentPart::ImageUrl {
-                    image_url: ChatImageUrl {
-                        url: image_url(source),
-                    },
-                }),
-                Content::Thinking { .. } => None,
-            })
-            .collect(),
-    )
 }
 
 //
@@ -415,26 +400,14 @@ impl SseAccumulator for StreamAccumulator {
     }
 
     fn finish(self) -> Result<(), GenerateError> {
-        if self.stop_reason.is_none() {
-            return Err(GenerateError::MalformedResponseError(
-                "OpenAI Chat Completions stream ended without a finish_reason".into(),
-            ));
-        }
-
-        for (i, arguments) in self.tool_arguments.iter().enumerate() {
-            let json = if arguments.is_empty() {
-                "{}"
-            } else {
-                arguments.as_str()
-            };
-            if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
-                return Err(GenerateError::MalformedResponseError(format!(
-                    "Malformed stream: tool call arguments at index {i} invalid: {e}"
-                )));
-            }
-        }
-
-        Ok(())
+        driver_core::validate_finish(
+            "OpenAI Chat Completions",
+            self.stop_reason.is_some(),
+            self.tool_arguments
+                .iter()
+                .enumerate()
+                .map(|(i, args)| (i, args.as_str())),
+        )
     }
 }
 
@@ -530,7 +503,7 @@ struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
-    usage: Option<ChatUsage>,
+    usage: Option<OpenAIUsage>,
     /// Some gateways report mid-stream failures as a 200 carrying this.
     #[serde(default)]
     error: Option<serde_json::Value>,
@@ -576,36 +549,6 @@ struct ChatToolCallFunctionDelta {
     arguments: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ChatUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-    #[serde(default)]
-    prompt_tokens_details: Option<ChatPromptTokensDetails>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ChatPromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-impl ChatUsage {
-    fn into_token_usage(self) -> TokenUsage {
-        // prompt_tokens is already the full prompt; cached_tokens is a subset.
-        TokenUsage {
-            input_tokens: self.prompt_tokens,
-            output_tokens: self.completion_tokens,
-            cached_input_tokens: self
-                .prompt_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0),
-        }
-    }
-}
-
 //
 // Tests
 //
@@ -613,35 +556,18 @@ impl ChatUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        assistant_tool, expect_text_delta, expect_thinking_delta, expect_tool_args_delta,
+        expect_tool_start, expect_turn_end, tool_results, user,
+    };
 
     fn chunk(json: serde_json::Value) -> ChatCompletionChunk {
         serde_json::from_value(json).expect("chunk")
     }
 
     #[test]
-    fn usage_reports_cached_input_as_subset() {
-        let usage = ChatUsage {
-            prompt_tokens: 10_000,
-            completion_tokens: 200,
-            prompt_tokens_details: Some(ChatPromptTokensDetails {
-                cached_tokens: Some(8_000),
-            }),
-        }
-        .into_token_usage();
-        assert_eq!(usage.input_tokens, 10_000);
-        assert_eq!(usage.output_tokens, 200);
-        assert_eq!(usage.cached_input_tokens, 8_000);
-        assert_eq!(usage.context_tokens(), 10_000);
-    }
-
-    #[test]
     fn system_prompt_leads_the_message_list() {
-        let messages = convert_messages(
-            "be helpful",
-            &[Message::UserMessage {
-                content: vec![Content::Text { text: "hi".into() }],
-            }],
-        );
+        let messages = convert_messages("be helpful", &[user("hi")]);
         let json = serde_json::to_value(&messages).unwrap();
         assert_eq!(json[0]["role"], "system");
         assert_eq!(json[0]["content"], "be helpful");
@@ -652,26 +578,13 @@ mod tests {
     #[test]
     fn convert_tool_use_and_tool_result() {
         let input = [
-            Message::AssistantMessage {
-                content: vec![Content::Text {
-                    text: "checking".into(),
-                }],
-                tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({"command": "echo hi"}),
-                }],
-                turn_end_reason: Some(TurnEndReason::ToolUse),
-            },
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult {
-                    id: "call_1".into(),
-                    content: vec![Content::Text {
-                        text: "hi\n".into(),
-                    }],
-                    is_error: false,
-                }],
-            },
+            assistant_tool(
+                Some("checking"),
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "echo hi"}),
+            ),
+            tool_results(&[("call_1", "hi\n")]),
         ];
         let json = serde_json::to_value(convert_messages("", &input)).unwrap();
         assert_eq!(json[0]["role"], "assistant");
@@ -791,10 +704,7 @@ mod tests {
             items[0],
             MessagePart::ContentStart(ContentStart::Thinking { index: 0, .. })
         ));
-        assert!(matches!(
-            &items[1],
-            MessagePart::ContentDelta(ContentDelta::Thinking { index: 0, delta }) if delta == "step one"
-        ));
+        expect_thinking_delta(&items[1], 0, "step one");
 
         let items = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -805,10 +715,7 @@ mod tests {
             items[0],
             MessagePart::ContentStart(ContentStart::Text { index: 1 })
         ));
-        assert!(matches!(
-            &items[1],
-            MessagePart::ContentDelta(ContentDelta::Text { index: 1, delta }) if delta == "Paris"
-        ));
+        expect_text_delta(&items[1], 1, "Paris");
 
         // Second text delta reuses the open block.
         let items = acc
@@ -817,14 +724,8 @@ mod tests {
                 "usage": {"prompt_tokens": 12, "completion_tokens": 3}
             })))
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::ContentDelta(ContentDelta::Text { index: 1, .. })
-        ));
-        assert!(matches!(
-            items[1],
-            MessagePart::TurnEndReason(TurnEndReason::EndTurn)
-        ));
+        expect_text_delta(&items[0], 1, "!");
+        expect_turn_end(&items[1], TurnEndReason::EndTurn);
         match items[2] {
             MessagePart::Usage(usage) => assert_eq!(usage.input_tokens, 12),
             ref other => panic!("expected usage, got {other:?}"),
@@ -840,10 +741,7 @@ mod tests {
                 "choices": [{"delta": {"reasoning": "thinking hard"}}]
             })))
             .unwrap();
-        assert!(matches!(
-            &items[1],
-            MessagePart::ContentDelta(ContentDelta::Thinking { delta, .. }) if delta == "thinking hard"
-        ));
+        expect_thinking_delta(&items[1], 0, "thinking hard");
     }
 
     #[test]
@@ -860,14 +758,7 @@ mod tests {
                 }]}}]
             })))
             .unwrap();
-        match &items[0] {
-            MessagePart::ToolUseStart(ToolUseStart { index, id, name }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(id, "call_1");
-                assert_eq!(name, "get_weather");
-            }
-            other => panic!("expected tool use start, got {other:?}"),
-        }
+        expect_tool_start(&items[0], 0, "call_1", "get_weather");
         assert_eq!(items.len(), 1, "empty arguments must not emit a delta");
 
         for fragment in [r#"{"city""#, r#":"SF"}"#] {
@@ -879,11 +770,7 @@ mod tests {
                     }]}}]
                 })))
                 .unwrap();
-            assert!(matches!(
-                &items[0],
-                MessagePart::ToolUseDelta(ToolUseDelta { index: 0, input_json_delta })
-                    if input_json_delta == fragment
-            ));
+            expect_tool_args_delta(&items[0], 0, fragment);
         }
 
         let items = acc
@@ -891,10 +778,7 @@ mod tests {
                 "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
             })))
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::TurnEndReason(TurnEndReason::ToolUse)
-        ));
+        expect_turn_end(&items[0], TurnEndReason::ToolUse);
         acc.finish().unwrap();
     }
 
@@ -933,10 +817,7 @@ mod tests {
                 "choices": [{"delta": {}, "finish_reason": "stop"}]
             })))
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::TurnEndReason(TurnEndReason::ToolUse)
-        ));
+        expect_turn_end(&items[0], TurnEndReason::ToolUse);
     }
 
     #[test]
@@ -947,10 +828,7 @@ mod tests {
                 "choices": [{"delta": {}, "finish_reason": "length"}]
             })))
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::TurnEndReason(TurnEndReason::MaxTokens)
-        ));
+        expect_turn_end(&items[0], TurnEndReason::MaxTokens);
 
         let mut acc = StreamAccumulator::default();
         let err = acc

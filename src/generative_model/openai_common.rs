@@ -40,6 +40,40 @@ impl Default for OpenAIBackendConfig {
     }
 }
 
+/// Usage block shared by both OpenAI dialects. The wire spellings differ —
+/// Responses reports `input_tokens` / `output_tokens` / `input_tokens_details`,
+/// Chat Completions `prompt_tokens` / `completion_tokens` /
+/// `prompt_tokens_details` — but the shape and semantics are identical.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct OpenAIUsage {
+    #[serde(default, alias = "prompt_tokens")]
+    input_tokens: u64,
+    #[serde(default, alias = "completion_tokens")]
+    output_tokens: u64,
+    #[serde(default, alias = "prompt_tokens_details")]
+    input_tokens_details: Option<OpenAIInputTokensDetails>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct OpenAIInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl OpenAIUsage {
+    pub(super) fn into_token_usage(self) -> TokenUsage {
+        // input_tokens is already the full prompt; cached_tokens is a subset.
+        TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self
+                .input_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// History text: `Text` blocks joined by newlines.
 ///
 /// Assistant turns carry no images; thinking is never echoed back to the
@@ -66,6 +100,30 @@ pub(super) fn image_url(source: &str) -> String {
         return source.to_string();
     }
     format!("data:image/png;base64,{source}")
+}
+
+/// Shared algorithm for a user message's content in either dialect: `None`
+/// when the message is text-only (callers then use the plain-string wire
+/// form), or the text/image parts in order, built with the dialect's part
+/// constructors. Thinking never appears in user messages' wire content.
+pub(super) fn user_content_parts<P>(
+    content: &[Content],
+    text: impl Fn(&str) -> P,
+    image: impl Fn(&str) -> P,
+) -> Option<Vec<P>> {
+    if !content.iter().any(|c| matches!(c, Content::Image { .. })) {
+        return None;
+    }
+    Some(
+        content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text: t } => Some(text(t)),
+                Content::Image { source } => Some(image(source)),
+                Content::Thinking { .. } => None,
+            })
+            .collect(),
+    )
 }
 
 /// Image sources in arrival order (e.g. a `view_image` tool result).
@@ -114,6 +172,30 @@ pub(super) fn reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_reports_cached_input_as_subset() {
+        // One shared struct decodes both dialects' spellings of the same block.
+        for json in [
+            serde_json::json!({
+                "input_tokens": 10_000,
+                "output_tokens": 200,
+                "input_tokens_details": {"cached_tokens": 8_000}
+            }),
+            serde_json::json!({
+                "prompt_tokens": 10_000,
+                "completion_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 8_000}
+            }),
+        ] {
+            let usage: OpenAIUsage = serde_json::from_value(json).expect("decode usage");
+            let usage = usage.into_token_usage();
+            assert_eq!(usage.input_tokens, 10_000);
+            assert_eq!(usage.output_tokens, 200);
+            assert_eq!(usage.cached_input_tokens, 8_000);
+            assert_eq!(usage.context_tokens(), 10_000);
+        }
+    }
 
     #[test]
     fn image_url_passes_urls_and_wraps_raw_base64() {

@@ -19,7 +19,6 @@ pub struct AnthropicBackendConfig {
     pub anthropic_base_url: String,
     pub anthropic_auth_token: String,
     pub max_tokens_per_generate: usize,
-    pub enable_prompt_caching: bool,
     pub debug_dump_api_requests: bool,
     /// When set, enables Anthropic extended thinking at this effort level.
     ///
@@ -39,7 +38,6 @@ impl Default for AnthropicBackendConfig {
             anthropic_base_url: String::new(),
             anthropic_auth_token: String::new(),
             max_tokens_per_generate: 8192,
-            enable_prompt_caching: true,
             debug_dump_api_requests: false,
             effort: Some(Effort::DEFAULT),
         }
@@ -60,15 +58,6 @@ impl AnthropicGenerativeModel {
         config: GenerativeModelConfig,
         backend: AnthropicBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.protocol != Protocol::AnthropicMessages {
-            return Err(ModelCreationError::BadConfig(format!(
-                "model `{}` speaks {}, not {}",
-                config.model,
-                config.model.protocol,
-                Protocol::AnthropicMessages
-            )));
-        }
-
         // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
         // `x-api-key` header and rejects them as `Authorization: Bearer`;
         // Bearer is the convention for gateway/OAuth tokens. Pick by token
@@ -113,11 +102,7 @@ impl AnthropicGenerativeModel {
             Some(vec![AnthropicSystemText {
                 type_: "text",
                 text: &self.system_prompt,
-                cache_control: if self.backend.enable_prompt_caching {
-                    Some(AnthropicCacheControl::Ephemeral)
-                } else {
-                    None
-                },
+                cache_control: Some(AnthropicCacheControl::Ephemeral),
             }])
         };
 
@@ -143,10 +128,6 @@ impl AnthropicGenerativeModel {
             output_config,
         };
 
-        if self.backend.debug_dump_api_requests {
-            eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
-        }
-
         self.client
             .post(format!("{}/v1/messages", self.backend.anthropic_base_url))
             .json(&request)
@@ -155,11 +136,12 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(input, self.backend.enable_prompt_caching);
+        let messages = convert_messages(input);
         driver_core::spawn_generate(
             self.message_request(&messages),
             StreamAccumulator::default(),
             "Anthropic",
+            self.backend.debug_dump_api_requests,
         )
     }
 }
@@ -202,6 +184,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                             .filter_map(answer_block)
                             .collect(),
                         is_error: result.is_error,
+                        cache_control: None,
                     })
                     .collect(),
             ),
@@ -218,6 +201,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                         id: tool_use.id.clone(),
                         name: tool_use.name.clone(),
                         input: tool_use.input.clone(),
+                        cache_control: None,
                     });
                 }
                 // A thinking-only turn (e.g. max_tokens hit mid-thinking)
@@ -257,23 +241,25 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
     runs.into_boxed_slice()
 }
 
-fn convert_messages(input: &[Message], enable_cache: bool) -> Vec<AnthropicMessage> {
+fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
     // Merge into role-alternating runs, then emit one message per run — rolling
-    // cache breakpoints onto the last two. Marking a block caches the whole prefix
-    // up to it, and two breakpoints (rather than one) keep the previous turn's
-    // write inside Anthropic's 20-block lookback as the conversation grows — the
-    // recommended multi-turn pattern:
+    // cache breakpoints onto the final block of the last two. Marking a block
+    // caches the whole prefix up to it, and two breakpoints (rather than one)
+    // keep the previous turn's write inside Anthropic's 20-block lookback as the
+    // conversation grows — the recommended multi-turn pattern:
     // <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
     let runs = merge_same_role_turns(input);
     let count = runs.len();
     runs.into_vec()
         .into_iter()
         .enumerate()
-        .map(|(i, MessageRun { role, content })| AnthropicMessage {
-            role,
-            content,
-            cache_control: (enable_cache && i + 2 >= count)
-                .then_some(AnthropicCacheControl::Ephemeral),
+        .map(|(i, MessageRun { role, mut content })| {
+            if i + 2 >= count
+                && let Some(last) = content.last_mut()
+            {
+                *last.cache_control_mut() = Some(AnthropicCacheControl::Ephemeral);
+            }
+            AnthropicMessage { role, content }
         })
         .collect()
 }
@@ -305,12 +291,7 @@ impl SseAccumulator for StreamAccumulator {
     }
 
     fn finish(self) -> Result<(), GenerateError> {
-        if self.stop_reason.is_none() {
-            return Err(GenerateError::MalformedResponseError(
-                "Anthropic stream ended without a stop_reason".into(),
-            ));
-        }
-        Ok(())
+        driver_core::validate_finish("Anthropic", self.stop_reason.is_some(), std::iter::empty())
     }
 }
 
@@ -454,7 +435,7 @@ impl StreamAccumulator {
                     (Slot::Ignored, _) | (_, AnthropicDelta::Other) => {}
                 }
             }
-            AnthropicStreamEvent::ContentBlockStop { .. } => {}
+            AnthropicStreamEvent::ContentBlockStop => {}
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 if let Some(u) = usage {
                     out.push(MessagePart::Usage(u.into_token_usage()));
@@ -505,11 +486,7 @@ enum AnthropicStreamEvent {
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: AnthropicDelta },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop {
-        #[serde(default)]
-        #[allow(dead_code)]
-        index: usize,
-    },
+    ContentBlockStop,
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: AnthropicMessageDelta,
@@ -622,83 +599,41 @@ enum AnthropicRole {
     User,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct AnthropicMessage {
     role: AnthropicRole,
     content: Vec<AnthropicContent>,
-    /// When set, a cache breakpoint is attached to the final content block at
-    /// serialization time — Anthropic only accepts `cache_control` on blocks, so
-    /// the message-level flag is lowered onto the last block on the wire.
-    cache_control: Option<AnthropicCacheControl>,
 }
 
-/// Serializes `{role, content}`, splicing `cache_control` onto the last content
-/// block when the message is a cache breakpoint. Anthropic then caches the whole
-/// prefix (tools + system + prior messages) up to and including that block.
-impl serde::Serialize for AnthropicMessage {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut msg = serializer.serialize_struct("AnthropicMessage", 2)?;
-        msg.serialize_field("role", &self.role)?;
-        match self.cache_control {
-            Some(cache_control) => msg.serialize_field(
-                "content",
-                &TrailingCache {
-                    blocks: &self.content,
-                    cache_control,
-                },
-            )?,
-            None => msg.serialize_field("content", &self.content)?,
-        }
-        msg.end()
-    }
-}
-
-/// Serializes a block list, injecting `cache_control` into the final block only.
-struct TrailingCache<'a> {
-    blocks: &'a [AnthropicContent],
-    cache_control: AnthropicCacheControl,
-}
-
-impl serde::Serialize for TrailingCache<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{Error, SerializeSeq};
-        let last = self.blocks.len().saturating_sub(1);
-        let mut seq = serializer.serialize_seq(Some(self.blocks.len()))?;
-        for (i, block) in self.blocks.iter().enumerate() {
-            if i == last {
-                // `cache_control` isn't a field on the block enum; splice it into the
-                // serialized object so only this final block carries the breakpoint.
-                let mut value = serde_json::to_value(block).map_err(Error::custom)?;
-                if let serde_json::Value::Object(map) = &mut value {
-                    map.insert(
-                        "cache_control".to_string(),
-                        serde_json::to_value(self.cache_control).map_err(Error::custom)?,
-                    );
-                }
-                seq.serialize_element(&value)?;
-            } else {
-                seq.serialize_element(block)?;
-            }
-        }
-        seq.end()
-    }
-}
-
+/// One content block. Every kind carries an optional `cache_control` because
+/// Anthropic only accepts cache breakpoints on blocks — [`convert_messages`]
+/// sets it on the final block of a breakpoint message, and Anthropic then
+/// caches the whole prefix (tools + system + prior messages) up to and
+/// including that block.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(tag = "type")]
 enum AnthropicContent {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
 
     #[serde(rename = "image")]
-    Image { source: AnthropicImageSource },
+    Image {
+        source: AnthropicImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
 
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 
     #[serde(rename = "tool_result")]
@@ -706,7 +641,21 @@ enum AnthropicContent {
         tool_use_id: String,
         content: Vec<AnthropicContent>,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+impl AnthropicContent {
+    /// The block's `cache_control` slot, whatever its kind.
+    fn cache_control_mut(&mut self) -> &mut Option<AnthropicCacheControl> {
+        match self {
+            AnthropicContent::Text { cache_control, .. }
+            | AnthropicContent::Image { cache_control, .. }
+            | AnthropicContent::ToolUse { cache_control, .. }
+            | AnthropicContent::ToolResult { cache_control, .. } => cache_control,
+        }
+    }
 }
 
 /// Wire form of Anthropic image `source`. Public `Content::Image.source` is an opaque
@@ -749,9 +698,13 @@ fn anthropic_image_source(source: String) -> AnthropicImageSource {
 /// (module invariant), so `Content::Thinking` yields `None`.
 fn answer_block(content: Content) -> Option<AnthropicContent> {
     match content {
-        Content::Text { text } => Some(AnthropicContent::Text { text }),
+        Content::Text { text } => Some(AnthropicContent::Text {
+            text,
+            cache_control: None,
+        }),
         Content::Image { source } => Some(AnthropicContent::Image {
             source: anthropic_image_source(source),
+            cache_control: None,
         }),
         Content::Thinking { .. } => None,
     }
@@ -839,7 +792,7 @@ struct AnthropicSystemText<'a> {
     cache_control: Option<AnthropicCacheControl>,
 }
 
-#[derive(Debug, serde::Serialize, Clone, Copy)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 #[serde(tag = "type")]
 enum AnthropicCacheControl {
     #[serde(rename = "ephemeral")]
@@ -897,6 +850,10 @@ impl From<AnthropicStopReason> for TurnEndReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        assistant, expect_text_delta, expect_thinking_delta, expect_tool_args_delta,
+        expect_tool_start, tool_results, user,
+    };
 
     #[test]
     fn test_role_serdes() {
@@ -909,6 +866,7 @@ mod tests {
     fn test_content_serdes() {
         let content = AnthropicContent::Text {
             text: "Hello, world".to_string(),
+            cache_control: None,
         };
         let json = serde_json::to_string(&content).unwrap();
         assert_eq!(json, r#"{"type":"text","text":"Hello, world"}"#);
@@ -916,22 +874,8 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_mark_last_two_messages() {
-        let input = [
-            Message::UserMessage {
-                content: vec![Content::Text { text: "one".into() }],
-            },
-            Message::AssistantMessage {
-                content: vec![Content::Text { text: "two".into() }],
-                tool_uses: vec![],
-                turn_end_reason: None,
-            },
-            Message::UserMessage {
-                content: vec![Content::Text {
-                    text: "three".into(),
-                }],
-            },
-        ];
-        let json = serde_json::to_value(convert_messages(&input, true)).unwrap();
+        let input = [user("one"), assistant("two"), user("three")];
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
         // The final two messages carry a breakpoint on their last block.
         assert_eq!(json[2]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(json[1]["content"][0]["cache_control"]["type"], "ephemeral");
@@ -966,7 +910,7 @@ mod tests {
                 ],
             },
         ];
-        let json = serde_json::to_value(convert_messages(&input, true)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
         // Last message has two tool_result blocks; only the final one is marked.
         assert_eq!(json[1]["content"][1]["cache_control"]["type"], "ephemeral");
         assert!(json[1]["content"][0].get("cache_control").is_none());
@@ -979,17 +923,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_breakpoints_absent_when_disabled() {
-        let input = [Message::UserMessage {
-            content: vec![Content::Text { text: "hi".into() }],
-        }];
-        let json = serde_json::to_value(convert_messages(&input, false)).unwrap();
-        assert!(json[0]["content"][0].get("cache_control").is_none());
-    }
-
-    #[test]
     fn convert_messages_empty_is_noop() {
-        assert!(convert_messages(&[], true).is_empty());
+        assert!(convert_messages(&[]).is_empty());
     }
 
     /// An image inside a tool result (e.g. `view_image`) must reach the API as
@@ -1005,7 +940,7 @@ mod tests {
                 is_error: false,
             }],
         }];
-        let json = serde_json::to_value(convert_messages(&input, false)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
         assert_eq!(json[0]["role"], "user");
         assert_eq!(json[0]["content"][0]["type"], "tool_result");
         assert_eq!(json[0]["content"][0]["content"][0]["type"], "image");
@@ -1177,31 +1112,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sse_parser_basic() {
-        let mut parser = SseParser::default();
-        let chunk = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
-                      data: {\"type\":\"ping\"}\n\n";
-        let events = parser.push(chunk);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].contains("message_start"));
-        assert!(events[1].contains("ping"));
-    }
-
-    #[test]
     fn test_convert_messages_merges_consecutive_user() {
-        let input = [
-            Message::UserMessage {
-                content: vec![Content::Text { text: "hi".into() }],
-            },
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult {
-                    id: "toolu_1".into(),
-                    content: vec![Content::Text { text: "ok".into() }],
-                    is_error: false,
-                }],
-            },
-        ];
-        let msgs = convert_messages(&input, false);
+        let input = [user("hi"), tool_results(&[("toolu_1", "ok")])];
+        let msgs = convert_messages(&input);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, AnthropicRole::User));
         assert_eq!(msgs[0].content.len(), 2);
@@ -1263,13 +1176,7 @@ mod tests {
                 },
             })
             .unwrap();
-        match &parts[0] {
-            MessagePart::ContentDelta(ContentDelta::Thinking { index, delta }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(delta, "step 1");
-            }
-            other => panic!("expected thinking delta, got {other:?}"),
-        }
+        expect_thinking_delta(&parts[0], 0, "step 1");
 
         let parts = acc
             .handle_event(AnthropicStreamEvent::ContentBlockStart {
@@ -1282,10 +1189,7 @@ mod tests {
             &parts[0],
             MessagePart::ContentStart(ContentStart::Text { index: 1 })
         ));
-        assert!(matches!(
-            &parts[1],
-            MessagePart::ContentDelta(ContentDelta::Text { index: 1, delta }) if delta == "hi"
-        ));
+        expect_text_delta(&parts[1], 1, "hi");
     }
 
     #[test]
@@ -1311,13 +1215,7 @@ mod tests {
                 delta: AnthropicDelta::TextDelta { text: "Hi".into() },
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ContentDelta(ContentDelta::Text { index, delta }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(delta, "Hi");
-            }
-            _ => panic!(),
-        }
+        expect_text_delta(&items[0], 0, "Hi");
 
         let items = acc
             .handle_event(AnthropicStreamEvent::ContentBlockStart {
@@ -1329,14 +1227,8 @@ mod tests {
                 },
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ToolUseStart(ToolUseStart { index, id, name }) => {
-                assert_eq!(*index, 0); // remapped tool index
-                assert_eq!(id, "toolu_1");
-                assert_eq!(name, "get_weather");
-            }
-            _ => panic!(),
-        }
+        // Remapped tool index: tool uses get their own index space.
+        expect_tool_start(&items[0], 0, "toolu_1", "get_weather");
 
         let items = acc
             .handle_event(AnthropicStreamEvent::ContentBlockDelta {
@@ -1346,16 +1238,7 @@ mod tests {
                 },
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ToolUseDelta(ToolUseDelta {
-                index,
-                input_json_delta,
-            }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(input_json_delta, r#"{"city":"SF"}"#);
-            }
-            _ => panic!(),
-        }
+        expect_tool_args_delta(&items[0], 0, r#"{"city":"SF"}"#);
 
         acc.handle_event(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDelta {
