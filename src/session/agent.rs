@@ -200,13 +200,7 @@ impl Agent {
     }
 
     /// Replace the conversation history (e.g. when resuming a saved session).
-    ///
-    /// Dangling tool_uses are repaired on the way in (see
-    /// [`repair_dangling_tool_uses`]): a session saved mid-truncation — or by
-    /// an older build that left the turn unanswered — is otherwise unsendable
-    /// forever, and resuming it would fail on the first message.
-    pub fn set_history(&mut self, mut history: Vec<Message>) {
-        repair_dangling_tool_uses(&mut history);
+    pub fn set_history(&mut self, history: Vec<Message>) {
         self.history = history;
     }
 
@@ -500,97 +494,6 @@ impl Drop for Agent {
         }
         self.harness.notify_agent_finished(self.context.agent_id);
     }
-}
-
-/// Result text for a tool call the turn ended on without ever making it — see
-/// the non-`tool_use` stop arm in [`Agent::interact`]. Names the stop reason so
-/// the model knows the call was cut off rather than rejected on merit, and says
-/// what to do about it. `reason` is `None` when repairing a saved history that
-/// recorded no stop reason.
-fn truncated_tool_use_message(tool_use: &ToolUse, reason: Option<&TurnEndReason>) -> String {
-    let cause = match reason {
-        Some(TurnEndReason::MaxTokens) => {
-            "the turn hit the output token limit before the call was complete".to_string()
-        }
-        Some(TurnEndReason::EndTurn) | None => {
-            "the turn ended before the call was dispatched".to_string()
-        }
-        Some(other) => format!("the turn ended ({other:?}) before the call was dispatched"),
-    };
-    format!(
-        "`{}` was not executed: {cause}. Its arguments may be incomplete, so nothing ran. \
-         Reissue the call if you still need it — keep it small enough to finish within one turn.",
-        tool_use.name,
-    )
-}
-
-/// Answer every tool_use in `history` that nothing responded to, in place.
-///
-/// Providers reject a request whose history holds a tool_use without a matching
-/// tool_result, and every later turn resends the whole history — so one dangling
-/// call makes a session permanently unsendable. Sessions saved by an older build
-/// (or written by another client) can carry one, so repair on the way in rather
-/// than failing the resume.
-///
-/// Returns the number of synthesized results.
-fn repair_dangling_tool_uses(history: &mut Vec<Message>) -> usize {
-    let mut repaired = 0;
-    let mut i = 0;
-    while i < history.len() {
-        let Message::AssistantMessage {
-            tool_uses,
-            turn_end_reason,
-            ..
-        } = &history[i]
-        else {
-            i += 1;
-            continue;
-        };
-        if tool_uses.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Results for this message, if any, are the immediately following
-        // message — that is the only position a provider accepts them in.
-        let answered: std::collections::HashSet<&str> = match history.get(i + 1) {
-            Some(Message::ToolResults { tool_use_results }) => {
-                tool_use_results.iter().map(|r| r.id.as_str()).collect()
-            }
-            _ => std::collections::HashSet::new(),
-        };
-        let missing: Vec<ToolResult> = tool_uses
-            .iter()
-            .filter(|tool_use| !answered.contains(tool_use.id.as_str()))
-            .map(|tool_use| {
-                ToolResult::err(truncated_tool_use_message(
-                    tool_use,
-                    turn_end_reason.as_ref(),
-                ))
-                .with_id(tool_use.id.clone())
-            })
-            .collect();
-
-        if missing.is_empty() {
-            i += 1;
-            continue;
-        }
-        repaired += missing.len();
-        match history.get_mut(i + 1) {
-            // Partially answered (e.g. a crash between dispatches): top it up.
-            Some(Message::ToolResults { tool_use_results }) => {
-                tool_use_results.extend(missing);
-            }
-            _ => history.insert(
-                i + 1,
-                Message::ToolResults {
-                    tool_use_results: missing,
-                },
-            ),
-        }
-        i += 2;
-    }
-    repaired
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1366,87 +1269,6 @@ mod tests {
             .await
             .expect("turn should succeed");
         assert_eq!(agent.history().len(), 2);
-    }
-
-    fn assistant_with_tool_use(id: &str, reason: TurnEndReason) -> Message {
-        Message::AssistantMessage {
-            content: vec![Content::Text {
-                text: "working".into(),
-            }],
-            tool_uses: vec![ToolUse {
-                id: id.into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }],
-            turn_end_reason: Some(reason),
-        }
-    }
-
-    /// A session saved by an older build can already hold the dangling tool_use.
-    /// Resuming it must not hand the provider a history it rejects.
-    #[test]
-    fn set_history_repairs_a_dangling_tool_use() {
-        let harness = Harness::local_with_services(vec![]);
-        let model = ScriptedModel::new(vec![]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent.set_history(vec![
-            Message::UserMessage {
-                content: vec![Content::Text { text: "hi".into() }],
-            },
-            assistant_with_tool_use("toolu_dangling", TurnEndReason::MaxTokens),
-        ]);
-
-        assert_eq!(agent.history().len(), 3);
-        match &agent.history()[2] {
-            Message::ToolResults { tool_use_results } => {
-                assert_eq!(tool_use_results.len(), 1);
-                assert_eq!(tool_use_results[0].id, "toolu_dangling");
-                assert!(tool_use_results[0].is_error);
-            }
-            other => panic!("expected ToolResults, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn repair_tops_up_partial_results_and_leaves_complete_history_alone() {
-        // Two calls, only one answered (e.g. a crash between dispatches).
-        let assistant = Message::AssistantMessage {
-            content: vec![],
-            tool_uses: vec![
-                ToolUse {
-                    id: "a".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({"command": "true"}),
-                },
-                ToolUse {
-                    id: "b".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
-            ],
-            turn_end_reason: Some(TurnEndReason::ToolUse),
-        };
-        let mut history = vec![
-            Message::UserMessage { content: vec![] },
-            assistant,
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult::text("ok").with_id("a")],
-            },
-        ];
-        assert_eq!(repair_dangling_tool_uses(&mut history), 1);
-        match &history[2] {
-            Message::ToolResults { tool_use_results } => {
-                assert_eq!(tool_use_results.len(), 2);
-                assert_eq!(tool_use_results[1].id, "b");
-                assert!(tool_use_results[1].is_error);
-            }
-            other => panic!("expected ToolResults, got {other:?}"),
-        }
-
-        // Already well-formed: nothing is added, nothing is touched.
-        let before = history.len();
-        assert_eq!(repair_dangling_tool_uses(&mut history), 0);
-        assert_eq!(history.len(), before);
     }
 
     /// Model whose every generate fails with an oversized-request error.
