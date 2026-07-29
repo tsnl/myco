@@ -343,6 +343,15 @@ context_window = 100000
     assert!(first[0].starts_with("# Session"), "{first:?}");
     assert!(first[0].contains(&parent_id), "{first:?}");
     assert!(first[1].contains("parent-marker-alpha"), "{first:?}");
+    // Where the agent is running, not just which session: the start time and
+    // the directory myco was launched in (this test process's own cwd, which
+    // the spawned binary inherits).
+    assert!(first[0].contains("- Started: "), "{first:?}");
+    let cwd = std::env::current_dir().unwrap();
+    assert!(
+        first[0].contains(&format!("`{}`", cwd.display())),
+        "{first:?}"
+    );
     // The first message only: later turns carry the user's words alone, so
     // one conversation states its session once.
     let later = parent["messages"]

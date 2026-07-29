@@ -1177,7 +1177,10 @@ mod tests {
         let messages = vec![Message::UserMessage {
             content: vec![
                 Content::Text {
-                    text: crate::prompts::session_stamp("aa00bb11cc22dd33ee44ff5566778899"),
+                    text: crate::prompts::session_stamp(
+                        "aa00bb11cc22dd33ee44ff5566778899",
+                        Utc::now(),
+                    ),
                 },
                 Content::Text {
                     text: "port the harness to windows".into(),

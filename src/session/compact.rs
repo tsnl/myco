@@ -82,7 +82,7 @@ pub fn compact_session(
     let mut messages = vec![Message::UserMessage {
         content: vec![
             Content::Text {
-                text: prompts::session_stamp(&successor.id),
+                text: prompts::session_stamp(&successor.id, successor.created_at),
             },
             Content::Text { text: resume },
         ],

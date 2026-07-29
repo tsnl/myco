@@ -294,7 +294,7 @@ async fn run_print(args: Args) {
         content.insert(
             0,
             Content::Text {
-                text: prompts::session_stamp(&active_session.id()),
+                text: prompts::session_stamp(&restored.id, restored.created_at),
             },
         );
     }
@@ -990,10 +990,11 @@ impl ReplSession {
         // `prompts::session_stamp`). `/new` empties the history, so a session
         // started mid-run stamps its own id on its first turn.
         if needs_session_stamp(self.agent.history(), self.forked) {
+            let (id, started_at) = self.session.with(|s| (s.id.clone(), s.created_at));
             content.insert(
                 0,
                 Content::Text {
-                    text: prompts::session_stamp(&self.session.id()),
+                    text: prompts::session_stamp(&id, started_at),
                 },
             );
         }
