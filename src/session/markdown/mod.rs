@@ -11,10 +11,11 @@
 //!   are consumed into presentation rather than printed — `*` / `` ` ``
 //!   emphasis runs turn into SGR, a `[text](url)` link becomes an OSC 8
 //!   hyperlink over its visible text, and a bare `http(s)://…` URL becomes one
-//!   over itself — while every *content* byte still reaches the output in
-//!   order. ATX headers are the exception: their `#` markers stay
-//!   visible (the line just styles bold). A stray delimiter can mis-style a
-//!   span, never corrupt content.
+//!   over itself (both rendered underlined blue, browser-style, because
+//!   terminals show no styling of their own for OSC 8 spans) — while every
+//!   *content* byte still reaches the output in order. ATX headers are the
+//!   exception: their `#` markers stay visible (the line just styles bold).
+//!   A stray delimiter can mis-style a span, never corrupt content.
 //!
 //! Internally the renderer is event-first: it produces a [`TuiEvent`] stream in
 //! which content ([`TuiEvent::Text`], escape-free, wrap applied) and
@@ -127,6 +128,15 @@ pub struct MarkdownRenderer {
     last_style: Option<Style>,
     /// Last visible char pushed to `out` was a newline (or nothing yet).
     emitted_line_start: bool,
+    /// The undecorated style as of the events already in `out`. Unlike
+    /// `last_style` (which runs ahead to marks still queued in the word
+    /// buffer), this is emission state: it is what a link open decorates
+    /// ([`Style::linked`]) and what the link close restores.
+    cur_style: Style,
+    /// An emitted [`TuiEvent::Link`] open has no close yet — text going out
+    /// right now is hyperlinked, so style events are decorated and a wrap
+    /// break must suspend the underline across its hang indent.
+    in_link: bool,
 
     bold: bool,
     italic: bool,
@@ -208,6 +218,8 @@ impl MarkdownRenderer {
             out: Vec::new(),
             last_style: None,
             emitted_line_start: true,
+            cur_style: base,
+            in_link: false,
             bold: false,
             italic: false,
             code: false,
@@ -777,10 +789,19 @@ impl MarkdownRenderer {
         {
             // Break: the run of breakable spaces becomes the newline.
             self.spaces = 0;
-            self.out_ch('\n');
             let hang = self.hang.min(width.saturating_sub(1));
+            // A break inside link text: suspend the link decoration over the
+            // hang indent so its spaces don't render underlined.
+            let relink = self.in_link && hang > 0;
+            if relink {
+                self.out.push(TuiEvent::Style(self.cur_style));
+            }
+            self.out_ch('\n');
             for _ in 0..hang {
                 self.out_ch(' ');
+            }
+            if relink {
+                self.out.push(TuiEvent::Style(self.cur_style.linked()));
             }
             self.col = hang;
         }
@@ -804,10 +825,10 @@ impl MarkdownRenderer {
                 self.out_str(&word[pos..off]);
                 pos = off;
             }
-            self.out.push(match mark {
-                Mark::Style(style) => TuiEvent::Style(style),
-                Mark::Link(target) => TuiEvent::Link(target),
-            });
+            match mark {
+                Mark::Style(style) => self.push_style_event(style),
+                Mark::Link(target) => self.push_link_event(target),
+            }
         }
         if pos < word.len() {
             self.out_str(&word[pos..]);
@@ -835,6 +856,7 @@ impl MarkdownRenderer {
             dim: self.base.dim,
             bold: self.base.bold || self.header || self.bold,
             italic: self.base.italic || self.italic,
+            underline: self.base.underline,
             color: if self.code {
                 Some(Color::Cyan)
             } else {
@@ -852,7 +874,7 @@ impl MarkdownRenderer {
         }
         self.last_style = Some(style);
         if self.overflow {
-            self.out.push(TuiEvent::Style(style));
+            self.push_style_event(style);
         } else {
             self.word_marks.push((self.word.len(), Mark::Style(style)));
         }
@@ -862,9 +884,38 @@ impl MarkdownRenderer {
     /// buffer like a style mark so it lands on the correct side of a wrap.
     fn emit_link(&mut self, target: Option<String>) {
         if self.overflow {
-            self.out.push(TuiEvent::Link(target));
+            self.push_link_event(target);
         } else {
             self.word_marks.push((self.word.len(), Mark::Link(target)));
+        }
+    }
+
+    /// Append a style event, decorated ([`Style::linked`]) while an emitted
+    /// hyperlink is open. `cur_style` stays undecorated: it is the state the
+    /// link close returns to.
+    fn push_style_event(&mut self, style: Style) {
+        self.cur_style = style;
+        self.out.push(TuiEvent::Style(if self.in_link {
+            style.linked()
+        } else {
+            style
+        }));
+    }
+
+    /// Append a hyperlink open/close event with its browser-style styling:
+    /// an open turns the span's text underlined blue over the current style,
+    /// a close restores the undecorated style before ending the OSC 8 span.
+    /// Terminals show no styling of their own for OSC 8 links (at most a
+    /// hover underline), so without this the link would be invisible.
+    fn push_link_event(&mut self, target: Option<String>) {
+        if target.is_some() {
+            self.out.push(TuiEvent::Link(target));
+            self.in_link = true;
+            self.out.push(TuiEvent::Style(self.cur_style.linked()));
+        } else {
+            self.out.push(TuiEvent::Style(self.cur_style));
+            self.in_link = false;
+            self.out.push(TuiEvent::Link(None));
         }
     }
 
@@ -999,6 +1050,8 @@ mod tests {
         format!("\x1b]8;;{url}\x1b\\")
     }
     pub(super) const OSC_CLOSE: &str = "\x1b]8;;\x1b\\";
+    /// The browser-style link decoration over plain text: underline + blue.
+    pub(super) const LINK_SGR: &str = "\x1b[0;4;34m";
 
     pub(super) fn styled_wrap(w: usize) -> Palette {
         Palette::colored(true).with_wrap(Some(w))
@@ -1096,15 +1149,20 @@ mod tests {
 
     #[test]
     fn styled_link_becomes_osc8_hyperlink() {
+        // The visible text is underlined blue inside the OSC 8 span — the
+        // browser-style affordance, since terminals leave OSC 8 text unstyled.
         let url = "https://example.com/x";
         assert_eq!(
             render("see [the docs](https://example.com/x) now", styled()),
-            format!("see {}the docs{OSC_CLOSE} now", osc_open(url))
+            format!(
+                "see {}{LINK_SGR}the docs\x1b[0m{OSC_CLOSE} now",
+                osc_open(url)
+            )
         );
         // A link abutting preceding text keeps that text outside the link.
         assert_eq!(
             render("pre[t](u)", styled()),
-            format!("pre{}t{OSC_CLOSE}", osc_open("u"))
+            format!("pre{}{LINK_SGR}t\x1b[0m{OSC_CLOSE}", osc_open("u"))
         );
     }
 
@@ -1132,10 +1190,40 @@ mod tests {
     fn link_split_across_chunks_matches_single_feed() {
         let input = "go [here](https://h.test/p) ok";
         assert_eq!(render(input, styled()), render_char_chunks(input, styled()));
-        // And the single-feed form is the OSC 8 hyperlink.
+        // And the single-feed form is the styled OSC 8 hyperlink.
         assert_eq!(
             render(input, styled()),
-            format!("go {}here{OSC_CLOSE} ok", osc_open("https://h.test/p"))
+            format!(
+                "go {}{LINK_SGR}here\x1b[0m{OSC_CLOSE} ok",
+                osc_open("https://h.test/p")
+            )
+        );
+    }
+
+    #[test]
+    fn link_decoration_composes_with_surrounding_emphasis() {
+        // Bold flows into the link (bold + underline + blue); the link close
+        // restores plain bold until the emphasis itself closes.
+        assert_eq!(
+            render("**[a](u)**", styled()),
+            format!(
+                "\x1b[0;1m{}\x1b[0;1;4;34ma\x1b[0;1m{OSC_CLOSE}\x1b[0m",
+                osc_open("u")
+            )
+        );
+    }
+
+    #[test]
+    fn wrapped_link_text_underline_skips_hang_indent() {
+        // A break inside link text suspends the decoration over the hang
+        // indent — continuation lines underline from their text, not their
+        // leading spaces (the OSC 8 span itself stays open across the break).
+        assert_eq!(
+            render("- [aaaa bbbb](u)", styled_wrap(8)),
+            format!(
+                "- {}{LINK_SGR}aaaa\x1b[0m\n  {LINK_SGR}bbbb\x1b[0m{OSC_CLOSE}",
+                osc_open("u")
+            )
         );
     }
 
