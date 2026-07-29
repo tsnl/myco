@@ -14,9 +14,7 @@ pub mod tui;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use config::{
-    ColorMode, Config, ConfigUserSettings, WrapMode, example_config_toml, load_file_config,
-};
+pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
 pub use core::CancelToken;
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,

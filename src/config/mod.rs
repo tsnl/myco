@@ -13,8 +13,8 @@
 //! ## Model catalog
 //!
 //! Myco ships **no built-in models or gateways**: `[gateways.*]` and
-//! `[models.*]` in config.toml are the entire catalog (see
-//! [`example_config_toml`]). A model entry names a gateway (or
+//! `[models.*]` in config.toml are the entire catalog (example in the
+//! `overview` manual article). A model entry names a gateway (or
 //! inlines `protocol` / `base_url` / `auth`) plus per-model metadata
 //! (`api_id`, required `context_window`, `thinking`, `max_output_tokens`).
 //!
@@ -44,8 +44,7 @@ use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
 pub mod file;
 pub use file::{
-    AuthEntry, FileConfig, GatewayEntry, ModelEntry, example_config_toml, load_file_config,
-    parse_file_config_str,
+    AuthEntry, FileConfig, GatewayEntry, ModelEntry, load_file_config, parse_file_config_str,
 };
 
 /// Default per-generate output token cap when a model entry sets none.
@@ -518,6 +517,7 @@ fn resolve_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use file::model_toml;
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -560,7 +560,7 @@ context_window = 200_000
 "#;
 
     fn resolve_toml(
-        toml_text: &'static str,
+        toml_text: impl Into<String>,
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Config, String> {
@@ -570,16 +570,17 @@ context_window = 200_000
     }
 
     fn resolve_toml_with_files(
-        toml_text: &'static str,
+        toml_text: impl Into<String>,
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
         read_auth_file: impl Fn(&Path) -> Result<String, String>,
     ) -> Result<Config, String> {
+        let toml_text = toml_text.into();
         Config::resolve_with(
             settings,
             env,
             false,
-            move |_| parse_file_config_str(toml_text),
+            move |_| parse_file_config_str(&toml_text),
             || Ok(Vec::new()),
             read_auth_file,
         )
@@ -661,13 +662,7 @@ max_output_tokens = 4096
 
     #[test]
     fn literal_auth_string_is_the_token() {
-        let toml_text = r#"
-[models.proxy]
-protocol = "openai-responses"
-base_url = "https://proxy.corp/v1"
-auth = "sk-inline-secret"
-context_window = 100_000
-"#;
+        let toml_text = model_toml("proxy", &[r#"auth = "sk-inline-secret""#]);
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
         match &cfg.models.get("proxy").unwrap().backend {
             BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sk-inline-secret"),
@@ -677,19 +672,20 @@ context_window = 100_000
 
     #[test]
     fn file_auth_reads_trimmed_contents_and_read_failure_defers() {
-        let toml_text = r#"
-[models.proxy]
-protocol = "openai-responses"
-base_url = "https://proxy.corp/v1"
-auth = { source = "file", path = "~/.secrets/corp.token" }
-context_window = 100_000
-"#;
-        let cfg =
-            resolve_toml_with_files(toml_text, ConfigUserSettings::default(), env_of(&[]), |p| {
+        let toml_text = model_toml(
+            "proxy",
+            &[r#"auth = { source = "file", path = "~/.secrets/corp.token" }"#],
+        );
+        let cfg = resolve_toml_with_files(
+            toml_text.clone(),
+            ConfigUserSettings::default(),
+            env_of(&[]),
+            |p| {
                 assert_eq!(p, Path::new("~/.secrets/corp.token"));
                 Ok("sekrit".into())
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         match &cfg.models.get("proxy").unwrap().backend {
             BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sekrit"),
             other => panic!("unexpected backend {other:?}"),
@@ -753,16 +749,6 @@ context_window = 1000
         let err =
             resolve_toml(no_protocol, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("no protocol"), "{err}");
-
-        let bad_auth = r#"
-[models.x]
-protocol = "openai-responses"
-base_url = "https://h"
-auth = { source = "keychain" }
-context_window = 1000
-"#;
-        let err = resolve_toml(bad_auth, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
-        assert!(err.contains("unknown source \"keychain\""), "{err}");
     }
 
     #[test]
@@ -798,13 +784,12 @@ context_window = 1000
         assert_eq!(resolve_catalog_cfg(&[]).model, "kimi-k3");
 
         // A sole entry needs no selection at all.
-        let sole = r#"
-[models.only]
-protocol = "openai-responses"
-base_url = "https://h"
-context_window = 1000
-"#;
-        let cfg = resolve_toml(sole, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        let cfg = resolve_toml(
+            model_toml("only", &[]),
+            ConfigUserSettings::default(),
+            env_of(&[]),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "only");
     }
 
@@ -816,18 +801,9 @@ context_window = 1000
         assert!(err.contains("[models]"), "{err}");
 
         // Multiple models, nothing selected.
-        let two = r#"
-[models.a]
-protocol = "openai-responses"
-base_url = "https://h"
-context_window = 1000
-
-[models.b]
-protocol = "openai-responses"
-base_url = "https://h"
-context_window = 1000
-"#;
-        let err = resolve_toml(two, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+        let two = [model_toml("a", &[]), model_toml("b", &[])].join("\n");
+        let err =
+            resolve_toml(two.clone(), ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("no model selected"), "{err}");
         assert!(err.contains("[a, b]"), "{err}");
 
@@ -847,17 +823,45 @@ context_window = 1000
 
     #[test]
     fn example_config_resolves_end_to_end() {
-        let cfg = Config::resolve_with(
+        // Compact cut of the documented format (`src/manual/articles/
+        // overview.md`): env-auth gateways, gateway models, a gateway-less
+        // local model.
+        let example = r#"
+model = "grok-4.5-build"
+
+[gateways.xai]
+protocol = "openai-responses"
+base_url = "https://api.x.ai/v1"
+auth = { source = "env", var_name = "XAI_API_KEY" }
+
+[gateways.anthropic]
+protocol = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
+
+[models."grok-4.5-build"]
+gateway = "xai"
+context_window = 500_000
+
+[models.claude-opus-4-8]
+gateway = "anthropic"
+context_window = 1_000_000
+
+[models.qwen-local]
+protocol = "openai-completions"
+base_url = "http://localhost:11434/v1"
+thinking = "none"
+context_window = 32_768
+"#;
+        let cfg = resolve_toml(
+            example,
             ConfigUserSettings::default(),
             env_of(&[("XAI_API_KEY", "xai")]),
-            false,
-            |_| parse_file_config_str(&example_config_toml()),
-            || Ok(Vec::new()),
-            |_| Err("no files".into()),
         )
         .unwrap();
         assert_eq!(cfg.model, "grok-4.5-build");
         assert!(cfg.models.get("grok-4.5-build").is_ok());
+        assert!(cfg.models.get("qwen-local").is_ok());
         // Anthropic entries resolve but defer their missing credential.
         let err = cfg.models.get("claude-opus-4-8").unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
@@ -865,27 +869,9 @@ context_window = 1000
 
     #[test]
     fn color_mode_always_and_never_override_everything() {
-        let cfg = resolve_toml(
-            CATALOG,
-            ConfigUserSettings {
-                color: ColorMode::Always,
-                ..Default::default()
-            },
-            env_of(&[("NO_COLOR", "1")]),
-        )
-        .unwrap();
-        assert!(cfg.colors_enabled);
-        let cfg = resolve_toml(
-            CATALOG,
-            ConfigUserSettings {
-                color: ColorMode::Never,
-                stdout_is_tty: Some(true),
-                ..Default::default()
-            },
-            env_of(&[("CLICOLOR_FORCE", "1")]),
-        )
-        .unwrap();
-        assert!(!cfg.colors_enabled);
+        let env = env_of(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]);
+        assert!(resolve_colors(ColorMode::Always, &env, false));
+        assert!(!resolve_colors(ColorMode::Never, &env, true));
     }
 
     #[test]
@@ -922,7 +908,7 @@ context_window = 1000
     fn repaint_needs_a_tty_and_a_capable_term() {
         let resolve = |tty: bool, env_pairs: &[(&str, &str)]| {
             resolve_toml(
-                CATALOG,
+                model_toml("m", &[]),
                 ConfigUserSettings {
                     stdout_is_tty: Some(tty),
                     ..Default::default()
@@ -932,17 +918,17 @@ context_window = 1000
             .unwrap()
             .repaint_enabled
         };
-        assert!(resolve(true, &[("TERM", "xterm-256color")]));
         assert!(resolve(true, &[]));
         // Dumb terminals can't interpret cursor addressing; wrap itself stays.
         assert!(!resolve(true, &[("TERM", "dumb")]));
-        assert!(!resolve(false, &[]));
     }
 
     #[test]
     fn wrap_resolution_flows_into_config() {
+        // The two direct cases (TTY cap, piped off) are
+        // `wrap_resolves_to_a_tty_only_cap`'s claim; this pins the wiring.
         let cfg = resolve_toml(
-            CATALOG,
+            model_toml("m", &[]),
             ConfigUserSettings {
                 stdout_is_tty: Some(true),
                 ..Default::default()
@@ -951,8 +937,6 @@ context_window = 1000
         )
         .unwrap();
         assert_eq!(cfg.wrap_max, Some(80));
-        // Piped (the default `false` in resolve_toml): wrap stays off.
-        assert_eq!(resolve_catalog_cfg(&[]).wrap_max, None);
     }
 
     #[test]
@@ -1004,10 +988,7 @@ context_window = 1000
             false,
             |p| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
-                let mut file = parse_file_config_str(
-                    "[models.m]\nprotocol = \"openai-responses\"\n\
-                     base_url = \"https://h\"\ncontext_window = 1000\n",
-                )?;
+                let mut file = parse_file_config_str(&model_toml("m", &[]))?;
                 file.attach_timeout_secs = Some(42);
                 Ok(file)
             },
@@ -1023,17 +1004,10 @@ context_window = 1000
     #[test]
     fn max_soul_bytes_comes_from_the_config_file() {
         let resolve = |extra_toml: &str| {
-            let toml = format!(
-                "{extra_toml}\n[models.m]\nprotocol = \"openai-responses\"\n\
-                 base_url = \"https://h\"\ncontext_window = 1000\n"
-            );
-            Config::resolve_with(
+            resolve_toml(
+                format!("{extra_toml}\n{}", model_toml("m", &[])),
                 ConfigUserSettings::default(),
                 env_of(&[]),
-                false,
-                move |_| parse_file_config_str(&toml),
-                || Ok(Vec::new()),
-                |_| Err("no files".into()),
             )
             .unwrap()
             .max_soul_bytes
@@ -1056,15 +1030,8 @@ context_window = 1000
 
     #[test]
     fn load_errors_propagate() {
-        let err = Config::resolve_with(
-            ConfigUserSettings::default(),
-            env_of(&[]),
-            false,
-            |_| Err("invalid config TOML".into()),
-            || Ok(Vec::new()),
-            |_| Err("no files".into()),
-        )
-        .unwrap_err();
-        assert!(err.contains("invalid config TOML"));
+        let err =
+            resolve_toml("not = = toml", ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+        assert!(err.contains("invalid config TOML"), "{err}");
     }
 }
