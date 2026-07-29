@@ -256,3 +256,128 @@ context_window = 100000
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every session tells the agent which session it is, in the conversation
+/// rather than the system prompt: the id is stamped on the first user message
+/// of a fresh session, and a context fork — which mints a new id but inherits
+/// the parent's stamped message — stamps its own on the first message it adds.
+#[tokio::test]
+async fn session_id_is_stamped_on_the_first_user_message() {
+    let dir = std::env::temp_dir().join(format!("myco-stamp-{}", uuid::Uuid::new_v4().as_simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model = "pipetest"
+
+[models.pipetest]
+protocol = "openai-responses"
+base_url = "http://127.0.0.1:1/v1"
+auth = { source = "none" }
+context_window = 100000
+"#,
+    )
+    .unwrap();
+
+    let run = |args: Vec<String>, input: &'static [u8]| {
+        let dir = dir.clone();
+        let config_path = config_path.clone();
+        async move {
+            let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+                .args(args)
+                .env("MYCO_HOME", &dir)
+                .env("MYCO_CONFIG", &config_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn myco");
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin.write_all(input).await.unwrap();
+            drop(stdin);
+            let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+                .await
+                .expect("piped REPL must not hang")
+                .expect("wait myco");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            stdout
+                .lines()
+                .rev()
+                .find_map(|l| l.trim().strip_prefix("session="))
+                .expect("session id announced on exit")
+                .trim()
+                .to_string()
+        }
+    };
+
+    let session_json = |id: &str| {
+        let path = std::fs::read_dir(dir.join("session"))
+            .expect("session store exists")
+            .flatten()
+            .filter(|shard| shard.path().is_dir())
+            .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+            .map(|f| f.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n == format!("{id}.json").as_str())
+            })
+            .expect("session file");
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+    };
+    // The text blocks of one stored user message, in order.
+    let user_texts = |message: &serde_json::Value| -> Vec<String> {
+        message["UserMessage"]["content"]
+            .as_array()
+            .expect("user message content")
+            .iter()
+            .filter_map(|c| Some(c["Text"]["text"].as_str()?.to_string()))
+            .collect()
+    };
+
+    // A fresh session: the stamp leads its first message, ahead of the words
+    // the user typed. The failing turns are enough — each user message is
+    // checkpointed the moment it is submitted.
+    let parent_id = run(vec![], b"parent-marker-alpha\nsecond-turn\n/quit\n").await;
+    let parent = session_json(&parent_id);
+    let first = user_texts(&parent["messages"][0]);
+    assert!(first[0].starts_with("# Session"), "{first:?}");
+    assert!(first[0].contains(&parent_id), "{first:?}");
+    assert!(first[1].contains("parent-marker-alpha"), "{first:?}");
+    // The first message only: later turns carry the user's words alone, so
+    // one conversation states its session once.
+    let later = parent["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m.get("UserMessage").is_some())
+        .map(user_texts)
+        .find(|texts| texts.iter().any(|t| t.contains("second-turn")))
+        .expect("the second turn");
+    assert!(!later.iter().any(|t| t.contains("# Session")), "{later:?}");
+
+    // A context fork: the inherited message still names the parent, and the
+    // child stamps its own id on the turn it adds.
+    let child_id = run(
+        vec![
+            "--parent-session".into(),
+            parent_id.clone(),
+            "--fork".into(),
+        ],
+        b"child-marker-beta\n/quit\n",
+    )
+    .await;
+    assert_ne!(child_id, parent_id, "fork must mint a new session id");
+    let child = session_json(&child_id);
+    let messages = child["messages"].as_array().expect("messages");
+    let inherited = user_texts(&messages[0]);
+    assert!(inherited[0].contains(&parent_id), "{inherited:?}");
+    let own = messages
+        .iter()
+        .map(user_texts)
+        .find(|texts| texts.iter().any(|t| t.contains("child-marker-beta")))
+        .expect("the fork's own turn");
+    assert!(own[0].starts_with("# Session"), "{own:?}");
+    assert!(own[0].contains(&child_id), "{own:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

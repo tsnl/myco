@@ -10,7 +10,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Recovery,
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -242,7 +242,7 @@ async fn run_print(args: Args) {
     };
     // `@path.png` mentions attach images, same contract as the REPL; a bad
     // path is a usage error before any config/model work.
-    let content = match print_turn_content(arg.as_deref(), prompt.clone()) {
+    let mut content = match print_turn_content(arg.as_deref(), prompt.clone()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("myco: {e}");
@@ -290,6 +290,14 @@ async fn run_print(args: Args) {
     let restored = active_session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
+    if needs_session_stamp(agent.history(), args.fork) {
+        content.insert(
+            0,
+            Content::Text {
+                text: prompts::session_stamp(&active_session.id()),
+            },
+        );
+    }
     // Mid-turn checkpoints, same as interactive: children forked off this run
     // see finished tool rounds, and a crash loses at most the in-flight round.
     wire_checkpoint(&mut agent, &active_session);
@@ -389,6 +397,15 @@ fn print_turn_content(arg: Option<&str>, prompt: String) -> Result<Vec<Content>,
         .collect();
     content.push(Content::Text { text: prompt });
     Ok(content)
+}
+
+/// Whether this run's first user message has to carry the session stamp
+/// ([`prompts::session_stamp`]). A fresh session has no history to carry it; a
+/// context fork inherits the *parent's* stamped first message, so the child
+/// stamps its own id onto the first message it adds. A resumed session already
+/// carries the stamp it was created with — same session, same id.
+fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
+    history.is_empty() || forked
 }
 
 /// Read piped stdin fully; `None` when stdin is a TTY or effectively empty.
@@ -623,6 +640,7 @@ async fn run_interactive(args: Args) {
         max_soul_bytes,
         ui: ui.clone(),
         turn_cancel: TurnCancel::default(),
+        forked: args.fork,
     };
     repl.run_repl().await;
 
@@ -768,6 +786,10 @@ struct ReplSession {
     max_soul_bytes: usize,
     ui: Arc<TuiProducer>,
     turn_cancel: TurnCancel,
+    /// This run started as a context fork, whose inherited first message
+    /// carries the *parent's* session stamp — cleared once this session has
+    /// stamped its own id ([`needs_session_stamp`]).
+    forked: bool,
 }
 
 impl ReplSession {
@@ -949,7 +971,7 @@ impl ReplSession {
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
         // the user can fix the path and resubmit — nothing is silently dropped.
-        let content = match expand_image_attachments(&input) {
+        let mut content = match expand_image_attachments(&input) {
             Ok(c) => c,
             Err(e) => {
                 self.ui.error_section(&e);
@@ -964,6 +986,18 @@ impl ReplSession {
         if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
             eprintln!("warning: could not auto-title session: {e}");
         }
+        // The session id rides the conversation, not the system prompt (see
+        // `prompts::session_stamp`). `/new` empties the history, so a session
+        // started mid-run stamps its own id on its first turn.
+        if needs_session_stamp(self.agent.history(), self.forked) {
+            content.insert(
+                0,
+                Content::Text {
+                    text: prompts::session_stamp(&self.session.id()),
+                },
+            );
+        }
+        self.forked = false;
 
         let cancel = self.turn_cancel.arm();
 
@@ -1827,6 +1861,21 @@ mod tests {
         assert!(matches!(session.kind, SessionKind::Subagent));
         assert_eq!(session.parent_session_id.as_deref(), Some("abc123"));
         assert!(session.messages.is_empty());
+    }
+
+    /// A session stamps its id on the first message of its own conversation:
+    /// once on a fresh session, again on the first message a context fork adds
+    /// (the inherited one names the parent), never on a resumed turn.
+    #[test]
+    fn session_stamp_covers_fresh_and_forked_runs_only() {
+        let seeded = [Message::UserMessage {
+            content: vec![Content::Text {
+                text: "inherited".into(),
+            }],
+        }];
+        assert!(needs_session_stamp(&[], /*forked*/ false));
+        assert!(needs_session_stamp(&seeded, /*forked*/ true));
+        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
     }
 
     #[test]

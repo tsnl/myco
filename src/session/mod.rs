@@ -713,13 +713,20 @@ pub fn normalize_title(raw: &str) -> Result<String, String> {
     Ok(one_line)
 }
 
+/// First user message as text, for session labels, snippets, and search. The
+/// session stamp myco prepends to that message is skipped — a label should read
+/// as what the user asked, not as myco's own payload.
 pub fn first_user_text_from_messages(messages: &[Message]) -> Option<String> {
     for msg in messages {
         if let Message::UserMessage { content } = msg {
             let text: String = content
                 .iter()
                 .filter_map(|c| match c {
-                    crate::generative_model::Content::Text { text } => Some(text.as_str()),
+                    crate::generative_model::Content::Text { text }
+                        if !crate::prompts::is_session_stamp(text) =>
+                    {
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1161,6 +1168,26 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Session labels, snippets, and search read the first user message; the
+    /// session stamp myco puts in front of it is not the user's words.
+    #[test]
+    fn first_user_text_skips_the_session_stamp() {
+        let messages = vec![Message::UserMessage {
+            content: vec![
+                Content::Text {
+                    text: crate::prompts::session_stamp("aa00bb11cc22dd33ee44ff5566778899"),
+                },
+                Content::Text {
+                    text: "port the harness to windows".into(),
+                },
+            ],
+        }];
+        assert_eq!(
+            first_user_text_from_messages(&messages).as_deref(),
+            Some("port the harness to windows")
+        );
     }
 
     #[test]

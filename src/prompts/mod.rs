@@ -68,7 +68,9 @@ its own host pool exactly as you do. Remote hosts stay hands, not brains: they n
 PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
 cleanly over one SSH connection per host with ControlMaster — see `manual` `harness-ops`.)
 
-Recipe: find your own session id (`session_meta` action=get), then `bash` action=start with
+Recipe: read your own session id off the newest `# Session` block in this conversation — myco
+stamps one on the first user message of every session (`session_meta` action=get reports it too,
+with the rest of the metadata) — then `bash` action=start with
 `command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
 one prompt per line, ending each `write` with `"\n"` — each line is a self-contained turn kept to
 a single line, and only the trailing newline submits it. Stdin passes through unmodified, so a
@@ -125,6 +127,34 @@ pub fn model_stamp(model_key: &str) -> String {
         "---\n\n# Current Model\n\nCatalog key: `{model_key}` — pass `--model {model_key}` when \
          spawning nested or forked myco agents to keep them on this model.\n"
     )
+}
+
+/// Heading of the block [`session_stamp`] builds, and the marker that tells a
+/// stamp apart from something a user typed.
+const SESSION_STAMP_HEADING: &str = "# Session";
+
+/// The running session's id, as a block for the **first user message** of a
+/// conversation — the id `--resume` / `--parent-session` take, so an agent
+/// knows which session it is without spending a `session_meta` round trip.
+///
+/// It rides a message rather than the system prompt for the reason
+/// [`model_stamp`] documents: the prompt must stay byte-identical across an
+/// agent and its forks, and a session id is per-process. A fork inherits the
+/// parent's stamped first message, so it stamps its own id onto the first
+/// message it adds — hence "from here on", and hence the newest block wins.
+pub fn session_stamp(session_id: &str) -> String {
+    format!(
+        "{SESSION_STAMP_HEADING}\n\nSession id: `{session_id}` — this conversation from here on. \
+         Spawn nested myco agents with `--parent-session {session_id}`; `session_meta` \
+         action=get has the rest of this session's metadata.\n"
+    )
+}
+
+/// Whether a user-message text block is a [`session_stamp`] rather than the
+/// user's own words. Session labels and search snippets read the first user
+/// message, and the stamp is myco's payload, not something anyone typed.
+pub fn is_session_stamp(text: &str) -> bool {
+    text.starts_with(SESSION_STAMP_HEADING)
 }
 
 /// Cap used when `config.toml` sets no `max_soul_bytes`.
@@ -570,6 +600,24 @@ mod tests {
         assert!(stamp.contains("# Current Model"), "{stamp}");
         assert!(stamp.contains("`grok-4`"), "{stamp}");
         assert!(stamp.contains("--model grok-4"), "{stamp}");
+    }
+
+    /// The session id reaches the agent through the conversation, never the
+    /// system prompt: a per-process value there would change the prompt bytes
+    /// per agent and break fork prompt-cache reuse from the first byte.
+    #[test]
+    fn session_stamp_names_the_session_and_stays_out_of_the_system_prompt() {
+        let id = "cafef00dcafef00dcafef00dcafef00d";
+        let stamp = session_stamp(id);
+        assert!(stamp.contains(&format!("`{id}`")), "{stamp}");
+        assert!(stamp.contains(&format!("--parent-session {id}")), "{stamp}");
+        assert!(is_session_stamp(&stamp), "{stamp}");
+        assert!(!is_session_stamp("please compact the session"));
+
+        let prompt = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
+        assert!(!prompt.contains(id), "{prompt}");
+        // The epilogue points agents at the stamp instead of a tool call.
+        assert!(prompt.contains("newest `# Session` block"), "{prompt}");
     }
 
     #[test]

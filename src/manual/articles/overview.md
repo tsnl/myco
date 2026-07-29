@@ -23,7 +23,9 @@ myco (interactive) / Agent
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor, `manual`,
   text search) over NDJSON via SSH.
 - **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
-  session **on the local host**, passing `--parent-session <its own session id>`, writes one
+  session **on the local host**, passing `--parent-session <its own session id>` (myco stamps
+  that id in a `# Session` block on the first user message of every session, so an agent needs
+  no lookup; `session_meta` get still reports it), writes one
   prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
   auto-off when piped). For a single self-contained task, print mode is the one-shot form:
   `myco -p "<task>" --parent-session <id>` runs one turn, streams the answer to stdout, and
@@ -33,7 +35,9 @@ myco (interactive) / Agent
   supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
   supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
   completed tool round) so forks start from the freshest replayable snapshot — never between a
-  tool call and its result. Remotes stay config/key-free hands.
+  tool call and its result. A fork inherits the supervisor's stamped first message and stamps its
+  own id on the first message it adds, so the newest `# Session` block is the running session's.
+  Remotes stay config/key-free hands.
 
 ## Config & paths
 
