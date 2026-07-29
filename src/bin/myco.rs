@@ -25,8 +25,8 @@ use myco::tui::{
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
-    ListRecentService, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, prompts,
+    ListRecentService, SessionHistoryTool, SessionKind, SessionMetaTool, SoulTool,
+    StartupPreflight, TraceContext, WrapMode, prompts,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -614,10 +614,12 @@ async fn boot<S: EventSink + 'static>(
         Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
+    let soul_tool =
+        Arc::new(SoulTool::new(app_config.max_soul_bytes)) as Arc<dyn myco::ToolService>;
     let harness = attach_harness_or_exit(
         &app_config,
         &preflight,
-        vec![session_tool, history_tool, list_recent_tool],
+        vec![session_tool, history_tool, list_recent_tool, soul_tool],
     )
     .await;
 

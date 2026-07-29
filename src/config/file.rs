@@ -35,11 +35,10 @@ pub struct FileConfig {
     /// resolve. (Config key kept as `attach_timeout_secs`.)
     #[serde(default)]
     pub attach_timeout_secs: Option<u64>,
-    /// Cap on the soul text appended to every agent system prompt
-    /// (`workspace/soul/`, newest version). A longer version is cut to this
-    /// many bytes with a marker, and startup warns loudly that it happened.
-    /// `None` = unset; [`crate::prompts::DEFAULT_MAX_SOUL_BYTES`] applies at
-    /// resolve.
+    /// Cap on the rendered soul (`workspace/soul/` entries) appended to every
+    /// agent system prompt. A longer soul is cut to this many bytes with a
+    /// marker, and startup warns loudly that it happened. `None` = unset;
+    /// [`crate::prompts::DEFAULT_MAX_SOUL_BYTES`] applies at resolve.
     #[serde(default)]
     pub max_soul_bytes: Option<usize>,
 }

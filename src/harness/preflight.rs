@@ -158,15 +158,16 @@ fn write_manual_body(failure: Option<&str>, out: &mut impl Write) -> std::io::Re
 /// Soul lines only (no rule/header); writes nothing when the soul fits.
 fn write_soul_body(cut: Option<&SoulTruncation>, out: &mut impl Write) -> std::io::Result<()> {
     let Some(cut) = cut else { return Ok(()) };
-    writeln!(out, "soul/{}: {}", cut.version, cut.describe())?;
+    writeln!(out, "soul ({} entries): {}", cut.entries, cut.describe())?;
     writeln!(
         out,
-        "every agent prompt from now on carries only the first {} of that version",
+        "every agent prompt from now on carries only the first {} of the rendered soul",
         cut.human_limit()
     )?;
     writeln!(
         out,
-        "hint: write a shorter soul revision, or raise `max_soul_bytes` in config.toml"
+        "hint: merge or remove soul entries (`soul` tool), move cold material to \
+         workspace files, or raise `max_soul_bytes` in config.toml"
     )
 }
 
@@ -284,33 +285,36 @@ mod tests {
         assert!(!out.contains("note:"), "{out}");
     }
 
-    // The exact truncation strings ("soul truncated at 64 KiB of 128.9 KiB")
+    // The exact truncation strings ("soul truncated at 256 KiB of 293 KiB")
     // are `soul_truncation`'s claim, pinned in `crate::prompts` tests; here
     // only the block's shape and ordering are at stake.
     #[test]
-    fn truncated_soul_warns_first_and_names_the_version() {
+    fn truncated_soul_warns_first_and_counts_entries() {
         let pf = preflight(
             Some(SoulTruncation {
-                version: "20260722T0215-3f2a.md".into(),
-                bytes: 132_000,
-                limit: 64 * 1024,
+                entries: 17,
+                bytes: 300_000,
+                limit: 256 * 1024,
             }),
             missing_executables(false, |e| e.name != "tmux"),
             SshAgentPreflightReport::default(),
         );
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(
-            out.contains("every agent prompt from now on carries only the first"),
+            out.contains(
+                "soul (17 entries): soul truncated at 256 KiB of 293 KiB (max_soul_bytes)"
+            ),
             "{out}"
         );
+        assert!(out.contains("only the first 256 KiB"), "{out}");
+        assert!(out.contains("merge or remove soul entries"), "{out}");
         assert!(
             out.contains("raise `max_soul_bytes` in config.toml"),
             "{out}"
         );
         // The soul leads the block; the other checks follow it.
-        let soul_at = out.find("soul/20260722T0215").unwrap();
+        let soul_at = out.find("soul (17 entries)").unwrap();
         let exec_at = out.find("missing executable tmux").unwrap();
         assert!(soul_at < exec_at, "{out}");
     }
@@ -320,7 +324,7 @@ mod tests {
         // Nothing else wrong: the soul alone still opens a WARNING block.
         let pf = preflight(
             Some(SoulTruncation {
-                version: "20260722T0215-3f2a.md".into(),
+                entries: 2,
                 bytes: 4096,
                 limit: 2048,
             }),
@@ -329,7 +333,7 @@ mod tests {
         );
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
+        assert!(out.contains("soul (2 entries):"), "{out}");
         assert!(!out.contains("missing executable"), "{out}");
     }
 

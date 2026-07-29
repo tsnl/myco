@@ -109,12 +109,16 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
 - [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
       ordinary tools; `workspace/soul/` holds maildir-style write-once soul
-      snapshots, and the newest is appended verbatim to every agent system
-      prompt at model build time, followed by a bounded `# Workspace Files`
-      listing (path, UTC day, title) of everything else there. Replaced the
-      earlier root-only `memory` tool (structured UUID-keyed entries +
-      dedicated search) — (REJECT) that abstraction: plain files the agent
-      organizes itself cover the same need.
+      **entries**, all rendered into every agent system prompt at model build
+      time, followed by a bounded `# Workspace Files` listing (path, UTC day,
+      title) of everything else there. The soul is the *default* home for
+      durable information (record eagerly; workspace files are the cold tier
+      for rarely-used or high-volume lookup data) — in-context beats scattered
+      files on 500K+ windows, and the block is prompt-cached. Edits go through
+      the root-only `soul` tool (add/replace/remove/list): write-once entries
+      make concurrent agents safe (adds never collide; racing replaces leave a
+      duplicate to merge, never a loss). Unlike the earlier rejected `memory`
+      tool there is no search — the soul is in-prompt by construction.
 - [ ] **Workspace recall follow-up** — a second appended fragment (e.g. newest
       snapshot in `workspace/pin/`) if working-set churn starts forcing soul
       revisions often enough to cost forks their cached prompt prefix. Deferred

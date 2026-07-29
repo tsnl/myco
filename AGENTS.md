@@ -98,6 +98,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + soul / project-guidance injection + the session stamp carried by a session's first user message |
+| `src/soul.rs` | Soul storage: maildir-style write-once entries under `~/.myco/workspace/soul/`, rendered into every prompt and edited via the root-only `soul` tool |
 | `src/tui/` | The whole rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks, the streaming markdown renderer (`markdown/`), and section/transcript layout + `Palette` (`transcript.rs`) that live output and replay share |
 | `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
 
@@ -107,7 +108,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   subprocess for the default host.
 - **Remotes are lazy** — connect on first tool use; soft-fail non-default hosts.
 - **Standard tool catalog is the same on every host**; root-only tools
-  (`session_meta`) are installed only on the in-process local worker.
+  (`session_meta`, `soul`) are installed only on the in-process local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
@@ -120,8 +121,9 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
 - **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
-  `manual` → `prompts` → `session` → `tool_services` → `host` → `harness` →
-  `agent` → `tui`. A module reaching *up* that list is the smell; the fix is
+  `manual` → `soul` → `prompts` → `session` → `tool_services` → `host` →
+  `harness` → `agent` → `tui`. A module reaching *up* that list is the smell;
+  the fix is
   usually that the shared thing belongs lower down (`myco_home` in `core`, not
   `session`) or that the caller wants data instead of rendering
   (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may

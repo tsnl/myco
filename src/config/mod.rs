@@ -1088,7 +1088,7 @@ context_window = 32_768
             .max_soul_bytes
         };
         // Unset → the prompts default, so an untouched config.toml keeps the
-        // 64 KiB backstop.
+        // 256 KiB backstop.
         assert_eq!(resolve(""), crate::prompts::DEFAULT_MAX_SOUL_BYTES);
         assert_eq!(resolve("max_soul_bytes = 4096"), 4096);
         // TOML underscore separators are the shape the example config uses.
