@@ -209,6 +209,18 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
     `Agent::rewind_last_user_turn()` to unwedge the session. No `/rewind`
     command, no branching.
 
+### Review UX
+
+- [ ] **Readable tool-use lines** — `TuiProducer` renders a started tool as its name
+      followed by its whole input object as pretty-printed JSON, one key per line, so
+      skimming a turn means reading JSON. What a reviewer wants is the command itself, with the
+      structural params (`cwd`, `host`, `session_id`, timeouts) as a compact suffix
+      rather than lines of their own. This is the real cost behind the retired
+      no-leading-`cd` guard: that rule pushed directories into `cwd` to keep command
+      lines legible, which is a rendering fix wearing a validation costume. Wants a
+      per-tool summary hook (bash → command line; editor → verb + path) with the
+      full JSON still available on demand.
+
 ---
 
 ### Uncategorized bugs

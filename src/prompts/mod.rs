@@ -43,7 +43,8 @@ Quick map (details in the manual):
   setup, and you get real bash sessions, the editor, and search on that machine. Shell out to
   `ssh`/`scp` only for what a host worker cannot do itself: diagnosing a DOWN host, installing
   `myco` there, or moving files between machines.
-- `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
+- `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` — the command line then shows
+  only what ran, which keeps your tool uses reviewable.
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). For
   search **by meaning**, use `ck` where installed (`ck --sem "query" dir/`; hybrid BM25 +
   semantic, persistent per-folder index, `cargo install ck-search`) — probe with

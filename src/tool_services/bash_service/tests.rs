@@ -203,8 +203,10 @@ fn tool_description_states_actual_defaults() {
     }
 }
 
+/// `cwd` is the preferred way to pick a directory, but a `cd`-prefixed command
+/// is an ordinary shell line and must run like any other.
 #[test]
-fn rejects_command_starting_with_cd() {
+fn allows_command_starting_with_cd() {
     for command in [
         "cd /tmp && ls",
         "  cd /tmp",
@@ -212,16 +214,6 @@ fn rejects_command_starting_with_cd() {
         "cd",
         "cd /tmp; ls",
     ] {
-        let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
-        let err = resolve_action(&input).unwrap_err();
-        assert!(
-            err.contains("must not start with `cd`") && err.contains("`cwd`"),
-            "command={command:?} err={err}"
-        );
-    }
-
-    // Not a leading shell `cd` word — allowed.
-    for command in ["cdo something", "echo cd /tmp", "true && cd /tmp"] {
         let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
         assert!(
             resolve_action(&input).is_ok(),
@@ -967,15 +959,24 @@ async fn exec_respects_cwd() {
 }
 
 #[tokio::test]
-async fn rejects_cd_prefix_at_dispatch() {
+async fn exec_runs_cd_prefixed_command() {
     let harness = harness();
-    let result = dispatch_json(harness, json!({"command": "cd /tmp && pwd"})).await;
-    assert!(result.is_error, "cd-prefixed command should fail");
+    let dir = std::env::temp_dir().join(format!("myco-cd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let result = dispatch_json(harness, json!({"command": format!("cd {dir_str} && pwd")})).await;
+    assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
+    // macOS /var is often a symlink to /private/var; compare canonical paths.
+    let expected = std::fs::canonicalize(&dir).unwrap();
+    let expected_s = expected.to_string_lossy();
     assert!(
-        text.contains("must not start with `cd`") && text.contains("`cwd`"),
-        "{text}"
+        text.contains(expected_s.as_ref()) || text.contains(&dir_str),
+        "expected pwd under {expected_s} or {dir_str}: {text}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Blocking dispatch path: over-max exec timeout must error immediately
