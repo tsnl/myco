@@ -6,24 +6,15 @@
 //! discarded by the demux reader. Host death / I/O error still fails waiters
 //! and clears the connection for lazy respawn.
 
+mod test_utils;
+
 use std::time::Duration;
 
 use myco::core::CancelToken;
-use myco::generative_model::{Content, ToolUse};
+use myco::generative_model::ToolUse;
 use myco::harness::HostController;
 use serde_json::json;
-
-fn tool_text(result: &myco::generative_model::ToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use test_utils::tool_text;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_midcall_then_next_call_succeeds() {

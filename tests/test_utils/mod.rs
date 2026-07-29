@@ -13,6 +13,19 @@ pub use scripted_model::ScriptedModel;
 pub use stub_http_server::StubHttpServer;
 pub use transcript::format_transcript;
 
+/// The joined text blocks of a tool result.
+pub fn tool_text(result: &myco::generative_model::ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            myco::generative_model::Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 static INIT: Once = Once::new();
 
 /// Load `.env` once (for live-model integration tests that need API keys).
