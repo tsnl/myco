@@ -23,14 +23,10 @@ pub use config::{
 pub use crate::host::{HostConfig, HostController};
 
 mod preflight;
-pub use preflight::{
-    ExecutableCheckReport, StartupPreflight, check_expected_executables, print_startup_preflight,
-};
+pub use preflight::{ExecutableCheckReport, StartupPreflight, check_expected_executables};
 
 mod ssh;
-pub use ssh::{
-    SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_destination_from_command,
-};
+pub use ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -85,8 +81,10 @@ impl Default for HarnessConfig {
     }
 }
 
-/// Resolve `myco --mode host` argv (used by tests that still spawn a local subprocess).
-pub fn default_local_host_command() -> Vec<String> {
+/// Resolve `myco --mode host` argv for tests that spawn a local subprocess
+/// instead of using the in-process local host.
+#[cfg(test)]
+pub(crate) fn default_local_host_command() -> Vec<String> {
     vec![
         myco_program(),
         "--mode".into(),
@@ -96,6 +94,7 @@ pub fn default_local_host_command() -> Vec<String> {
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn myco_program() -> String {
     // cargo integration tests set this when the package builds the binary.
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_myco")

@@ -183,15 +183,6 @@ fn write_soul_body(cut: Option<&SoulTruncation>, out: &mut impl Write) -> std::i
     )
 }
 
-/// Print preflight problems as a WARNING block on stdout, after the startup
-/// banner and before the first USER block. Happy path prints nothing.
-/// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
-pub fn print_startup_preflight(report: &StartupPreflight, palette: Palette) {
-    let mut out = std::io::stdout();
-    let _ = report.write_warning_section(&mut out, palette);
-    let _ = out.flush();
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

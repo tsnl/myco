@@ -21,7 +21,6 @@ use std::process::Stdio;
 
 use super::HostConfig;
 use crate::external_command::{SSH, SSH_ADD, SSH_KEYGEN};
-use crate::session::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
 #[derive(Debug, Default, Clone)]
@@ -51,22 +50,6 @@ impl SshAgentPreflightReport {
     /// unreachable or keys are still missing.
     pub fn has_problems(&self) -> bool {
         self.had_ssh_hosts && !(self.agent_ok && self.is_clean())
-    }
-
-    /// Write preflight problems as a WARNING section (thin rule + header +
-    /// body) to `out` — stdout live, or any buffer in tests. Writes nothing on
-    /// the happy path (no SSH hosts, or agent reachable with no keys missing).
-    /// The palette styles only the rule + header; body lines stay plain.
-    pub fn write_warning_section(
-        &self,
-        out: &mut impl Write,
-        palette: Palette,
-    ) -> std::io::Result<()> {
-        if !self.has_problems() {
-            return Ok(());
-        }
-        write_warning_open(out, palette)?;
-        self.write_body(out)
     }
 
     /// Body lines only (no rule/header) — shared with the combined startup
@@ -282,87 +265,19 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
 // ---------------------------------------------------------------------------
 
 /// `(configured_host_name, ssh_destination_alias)` for SSH-backed hosts.
-pub(crate) fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for h in hosts {
-        if let Some(alias) = h
-            .ssh_destination
-            .clone()
-            .or_else(|| ssh_destination_from_command(&h.command))
-        {
-            out.push((h.name.clone(), alias));
-        }
-    }
-    out
-}
-
-/// If `command` is an ssh invocation, return the destination host/alias token.
 ///
-/// Understands common one-arg flags (`-o`, `-i`, `-F`, …). Best-effort: myco
-/// configs are typically `["ssh", "-o", "BatchMode=yes", "alias", "myco", …]`.
-pub fn ssh_destination_from_command(command: &[String]) -> Option<String> {
-    let prog = command.first()?;
-    let is_ssh = Path::new(prog)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|n| n == "ssh" || n == "ssh.exe");
-    if !is_ssh {
-        return None;
-    }
-
-    // ssh options that consume the next argv token.
-    // See ssh(1); incomplete on purpose — enough for myco host commands.
-    const TAKES_ARG: &[&str] = &[
-        "b", "c", "D", "E", "e", "F", "I", "i", "J", "L", "l", "m", "O", "o", "p", "Q", "R", "S",
-        "W", "w",
-    ];
-
-    let mut i = 1usize;
-    while i < command.len() {
-        let arg = &command[i];
-        if arg == "--" {
-            return command.get(i + 1).cloned();
-        }
-        if let Some(rest) = arg.strip_prefix('-') {
-            if rest.is_empty() || rest.starts_with('-') {
-                // `--long` or `-` — treat as end of flags if unknown long form without value.
-                if rest.starts_with('-') {
-                    // e.g. --option=value or --option value — rare in myco configs.
-                    if rest.contains('=') {
-                        i += 1;
-                        continue;
-                    }
-                    // skip long option and its argument conservatively
-                    i += 2;
-                    continue;
-                }
-            }
-            // Clustered short options: -vv, -oBatchMode=yes, -i/path
-            let chars: Vec<char> = rest.chars().collect();
-            let mut j = 0usize;
-            let mut consumed_next = false;
-            while j < chars.len() {
-                let flag = chars[j].to_string();
-                if TAKES_ARG.contains(&flag.as_str()) {
-                    let inline: String = chars[j + 1..].iter().collect();
-                    if inline.is_empty() {
-                        consumed_next = true;
-                    }
-                    // rest of cluster is the argument (e.g. -oBatchMode=yes)
-                    break;
-                }
-                j += 1;
-            }
-            i += 1;
-            if consumed_next {
-                i += 1;
-            }
-            continue;
-        }
-        // First non-option token is the destination.
-        return Some(arg.clone());
-    }
-    None
+/// A host is SSH-backed exactly when it carries an `ssh_destination`, which
+/// [`crate::harness::HarnessConfig::from_ssh_aliases`] sets for every remote it
+/// builds from a `~/.ssh/config` alias.
+pub(crate) fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<(String, String)> {
+    hosts
+        .iter()
+        .filter_map(|h| {
+            h.ssh_destination
+                .clone()
+                .map(|alias| (h.name.clone(), alias))
+        })
+        .collect()
 }
 
 fn identity_files_for_alias(alias: &str) -> Result<Vec<PathBuf>, String> {
@@ -592,96 +507,35 @@ fn join_hosts(hosts: &BTreeSet<String>) -> String {
 mod tests {
     use super::*;
 
+    /// A host is SSH-backed exactly when it carries an `ssh_destination`.
     #[test]
-    fn parse_typical_myco_ssh_command() {
-        let cmd = vec![
-            "ssh".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "workstation".into(),
-            "myco".into(),
-            "--mode".into(),
-            "host".into(),
-            "--name".into(),
-            "workstation".into(),
+    fn only_hosts_with_an_ssh_destination_are_preflighted() {
+        let hosts = vec![
+            HostConfig {
+                name: "devbox".into(),
+                command: crate::harness::ssh_spawn_command("devbox"),
+                ssh_destination: Some("devbox".into()),
+            },
+            HostConfig {
+                name: "sub".into(),
+                command: vec!["/path/to/myco".into(), "--mode".into(), "host".into()],
+                ssh_destination: None,
+            },
         ];
         assert_eq!(
-            ssh_destination_from_command(&cmd).as_deref(),
-            Some("workstation")
+            ssh_host_targets(&hosts),
+            vec![("devbox".to_string(), "devbox".to_string())]
         );
     }
 
-    #[test]
-    fn parse_ssh_with_inline_o() {
-        let cmd = vec![
-            "ssh".into(),
-            "-oBatchMode=yes".into(),
-            "stark07".into(),
-            "myco".into(),
-        ];
-        assert_eq!(
-            ssh_destination_from_command(&cmd).as_deref(),
-            Some("stark07")
-        );
-    }
-
-    #[test]
-    fn parse_ignores_local_myco() {
-        let cmd = vec![
-            "/path/to/myco".into(),
-            "--mode".into(),
-            "host".into(),
-            "--name".into(),
-            "local".into(),
-        ];
-        assert_eq!(ssh_destination_from_command(&cmd), None);
-    }
-
-    #[test]
-    fn parse_ssh_with_identity_flag() {
-        let cmd = vec![
-            "ssh".into(),
-            "-i".into(),
-            "/tmp/key".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "devbox".into(),
-            "true".into(),
-        ];
-        assert_eq!(
-            ssh_destination_from_command(&cmd).as_deref(),
-            Some("devbox")
-        );
-    }
-
-    fn warning_output(report: &SshAgentPreflightReport) -> String {
+    fn warning_body_of(report: &SshAgentPreflightReport) -> String {
         let mut buf = Vec::new();
-        report
-            .write_warning_section(&mut buf, Palette::plain())
-            .unwrap();
+        report.write_body(&mut buf).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
     #[test]
-    fn warning_header_is_painted_when_colored() {
-        let report = SshAgentPreflightReport {
-            had_ssh_hosts: true,
-            agent_ok: false,
-            agent_status: "agent down".into(),
-            ..Default::default()
-        };
-        let mut buf = Vec::new();
-        report
-            .write_warning_section(&mut buf, Palette::colored(true))
-            .unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        // Rule + header carry the warning style; body lines stay plain.
-        assert!(out.contains("\x1b[0;1;33mWARNING\x1b[0m\n"));
-        assert!(out.contains("\nssh-agent: agent down\n"));
-    }
-
-    #[test]
-    fn warning_silent_on_happy_path() {
+    fn no_problems_on_happy_path() {
         let report = SshAgentPreflightReport {
             had_ssh_hosts: true,
             agent_ok: true,
@@ -690,13 +544,13 @@ mod tests {
             notes: vec!["host \"x\": ssh -G listed no IdentityFile".into()],
             ..Default::default()
         };
-        assert_eq!(warning_output(&report), "");
+        assert!(!report.has_problems());
     }
 
     #[test]
-    fn warning_silent_without_ssh_hosts() {
+    fn no_problems_without_ssh_hosts() {
         // Default report: no SSH hosts (agent_ok=false is irrelevant then).
-        assert_eq!(warning_output(&SshAgentPreflightReport::default()), "");
+        assert!(!SshAgentPreflightReport::default().has_problems());
     }
 
     #[test]
@@ -708,13 +562,9 @@ mod tests {
             notes: vec!["ssh-agent not reachable".into()],
             ..Default::default()
         };
-        let out = warning_output(&report);
-        // Full section layout: blank line, thin rule, header, blank line, body.
-        assert!(out.contains(&format!(
-            "{}\nWARNING\n\nssh-agent: Could not open a connection",
-            crate::session::SECTION_RULE
-        )));
-        assert!(out.starts_with('\n'));
+        assert!(report.has_problems());
+        let out = warning_body_of(&report);
+        assert!(out.starts_with("ssh-agent: Could not open a connection"));
         assert!(out.contains("note: ssh-agent not reachable"));
         // Hint only accompanies missing keys.
         assert!(!out.contains("hint:"));
@@ -732,8 +582,9 @@ mod tests {
             )],
             ..Default::default()
         };
-        let out = warning_output(&report);
-        assert!(out.contains("WARNING\n\nmissing key /home/u/.ssh/id_rsa: not in agent"));
+        assert!(report.has_problems());
+        let out = warning_body_of(&report);
+        assert!(out.starts_with("missing key /home/u/.ssh/id_rsa: not in agent"));
         assert!(out.contains("hint: run `ssh-add <key>`"));
         // Agent is fine; no agent status line.
         assert!(!out.contains("ssh-agent:"));
