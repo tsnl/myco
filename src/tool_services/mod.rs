@@ -126,20 +126,30 @@ impl HostDispatchContext {
     }
 }
 
-/// Best-effort SIGKILL of a whole process group: `kill(2)` with `-pgid`.
+/// Send `signal` to a whole process group: `kill(2)` with `-pgid`.
 ///
 /// Tool children are spawned with `.process_group(0)`, so the leader pid is
-/// also the pgid; killing only the leader would leave grandchildren orphaned
-/// under init. Direct syscall (no external `kill` binary), sync, and safe to
-/// call from `Drop`. Errors (e.g. group already gone) are ignored.
-pub(crate) fn kill_process_group(pid: Option<u32>) {
+/// also the pgid; signalling only the leader would miss grandchildren — and
+/// for SIGINT the group *is* the correct target, since a terminal Ctrl-C goes
+/// to the whole foreground process group. Direct syscall (no external `kill`
+/// binary) and sync, so it is safe to call from `Drop`.
+pub(crate) fn signal_process_group(pid: Option<u32>, signal: libc::c_int) -> std::io::Result<()> {
     let Some(pid) = pid else {
-        return;
+        return Err(std::io::Error::other("process has no pid"));
     };
     // SAFETY: kill(2) takes a pid and a signal number; no pointers involved.
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    let rc = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
+}
+
+/// Best-effort SIGKILL of a whole process group. Errors (e.g. group already
+/// gone) are ignored — callers are teardown paths with nothing to report to.
+pub(crate) fn kill_process_group(pid: Option<u32>) {
+    let _ = signal_process_group(pid, libc::SIGKILL);
 }
 
 /// A placeable host tool capability.

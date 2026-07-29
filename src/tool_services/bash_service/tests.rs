@@ -71,6 +71,7 @@ fn input_roundtrip_exec() {
         cwd: Some("/tmp".into()),
         session_id: None,
         stdin: None,
+        signal: None,
         timeout_ms: None,
         idle_ms: None,
         max_bytes: None,
@@ -876,6 +877,7 @@ async fn echo_stdout() {
             cwd: None,
             session_id: None,
             stdin: None,
+            signal: None,
             timeout_ms: None,
             idle_ms: None,
             max_bytes: None,
@@ -900,6 +902,7 @@ async fn nonzero_exit_still_ok_result() {
             cwd: None,
             session_id: None,
             stdin: None,
+            signal: None,
             timeout_ms: None,
             idle_ms: None,
             max_bytes: None,
@@ -922,6 +925,7 @@ async fn stderr_captured() {
             cwd: None,
             session_id: None,
             stdin: None,
+            signal: None,
             timeout_ms: None,
             idle_ms: None,
             max_bytes: None,
@@ -1627,4 +1631,240 @@ async fn agent_drop_reaps_owned_sessions() {
             "session should be reaped on agent finish"
         );
     }
+}
+
+// --- signal ------------------------------------------------------------------
+
+#[test]
+fn signal_defaults_to_int_and_requires_session_id() {
+    let input: Input = serde_json::from_value(json!({
+        "action": "signal",
+        "session_id": "s",
+    }))
+    .unwrap();
+    match resolve_action(&input).unwrap() {
+        Action::Signal { signal, .. } => assert_eq!(signal, SignalKind::Int),
+        other => panic!("expected Signal, got {other:?}"),
+    }
+
+    let input: Input = serde_json::from_value(json!({
+        "action": "signal",
+        "signal": "term",
+        "session_id": "s",
+    }))
+    .unwrap();
+    match resolve_action(&input).unwrap() {
+        Action::Signal { signal, .. } => assert_eq!(signal, SignalKind::Term),
+        other => panic!("expected Signal, got {other:?}"),
+    }
+
+    let input: Input = serde_json::from_value(json!({"action": "signal"})).unwrap();
+    let err = resolve_action(&input).unwrap_err();
+    assert!(err.contains("signal requires `session_id`"), "{err}");
+
+    let input: Input = serde_json::from_value(json!({
+        "action": "signal",
+        "session_id": "s",
+        "cwd": "/tmp",
+    }))
+    .unwrap();
+    let err = resolve_action(&input).unwrap_err();
+    assert!(err.contains("`cwd` is only valid"), "{err}");
+}
+
+/// A child with no SIGINT handler dies on the signal (`exit_signal: 2`), but
+/// the session entry survives for inspection — `close` is what reaps it.
+#[tokio::test]
+async fn signal_int_interrupts_running_command_without_reaping_session() {
+    let harness = harness();
+    let id = unique_id("sig");
+
+    let start = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "bash -c 'sleep 30; echo late'",
+            "timeout_ms": 500,
+            "idle_ms": 100,
+        }),
+    )
+    .await;
+    assert!(!start.is_error, "start: {}", result_text(&start));
+
+    let t0 = Instant::now();
+    let signal = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "signal",
+            "session_id": id,
+            "timeout_ms": 2_000,
+            "idle_ms": 200,
+        }),
+    )
+    .await;
+    assert!(!signal.is_error, "signal: {}", result_text(&signal));
+    let text = result_text(&signal);
+    assert!(
+        text.contains("SIGINT"),
+        "result should name the delivered signal: {text}"
+    );
+    assert!(
+        !text.contains("stdout:\nlate"),
+        "interrupted sleep must not reach its `echo late`: {text}"
+    );
+    assert!(
+        text.contains("exit_signal: Some(2)"),
+        "child without a handler should die on SIGINT: {text}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "signal must not wait out the 30s sleep, took {:?}",
+        t0.elapsed()
+    );
+
+    // Unlike `close`, the session stays in the table.
+    let list = dispatch_json(harness.clone(), json!({"action": "list"})).await;
+    assert!(
+        result_text(&list).contains(&id),
+        "signal must not reap the session: {}",
+        result_text(&list)
+    );
+
+    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+}
+
+/// The nested-agent case: a child that installs a SIGINT handler (as `myco`
+/// does, to cancel its in-flight turn) survives the signal and keeps reading
+/// stdin — so a supervisor can interrupt a child and carry on driving it.
+#[tokio::test]
+async fn signal_int_leaves_handler_installed_child_alive_and_writable() {
+    let harness = harness();
+    let id = unique_id("sighandler");
+
+    let start = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "bash -c 'trap \"echo INTERRUPTED\" INT; while read -r line; do echo \"got:$line\"; done'",
+            "timeout_ms": 1_000,
+            "idle_ms": 200,
+        }),
+    )
+    .await;
+    assert!(!start.is_error, "start: {}", result_text(&start));
+
+    let signal = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "signal",
+            "session_id": id,
+            "timeout_ms": 2_000,
+            "idle_ms": 300,
+        }),
+    )
+    .await;
+    assert!(!signal.is_error, "signal: {}", result_text(&signal));
+    let text = result_text(&signal);
+    assert!(
+        text.contains("INTERRUPTED"),
+        "child's SIGINT handler should have run: {text}"
+    );
+    assert!(
+        !text.contains("status: exited"),
+        "child handling SIGINT must stay alive: {text}"
+    );
+
+    // Still driveable after the interrupt — the reason `signal` exists.
+    let write = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "write",
+            "session_id": id,
+            "stdin": "still-there\n",
+            "timeout_ms": 2_000,
+            "idle_ms": 300,
+        }),
+    )
+    .await;
+    assert!(!write.is_error, "write: {}", result_text(&write));
+    assert!(
+        result_text(&write).contains("got:still-there"),
+        "session should still accept stdin after SIGINT: {}",
+        result_text(&write)
+    );
+
+    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+}
+
+#[tokio::test]
+async fn signal_on_exited_session_reports_error() {
+    let harness = harness();
+    let id = unique_id("sigexit");
+
+    let start = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "bash -c 'echo bye'",
+            "timeout_ms": 2_000,
+            "idle_ms": 200,
+        }),
+    )
+    .await;
+    assert!(!start.is_error, "start: {}", result_text(&start));
+
+    let signal = dispatch_json(
+        harness.clone(),
+        json!({"action": "signal", "session_id": id}),
+    )
+    .await;
+    assert!(signal.is_error, "expected error: {}", result_text(&signal));
+    assert!(
+        result_text(&signal).contains("already exited"),
+        "{}",
+        result_text(&signal)
+    );
+
+    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+}
+
+#[tokio::test]
+async fn signal_rejects_foreign_owner() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("sigown");
+
+    let start = service
+        .clone()
+        .dispatch_tool_use(
+            tool_use_json(json!({
+                "action": "start",
+                "session_id": id,
+                "command": "bash -c 'sleep 30'",
+                "timeout_ms": 500,
+                "idle_ms": 100,
+            })),
+            dispatch_ctx(owner),
+        )
+        .await;
+    assert!(!start.is_error, "start: {}", result_text(&start));
+
+    let signal = service
+        .clone()
+        .dispatch_tool_use(
+            tool_use_json(json!({"action": "signal", "session_id": id})),
+            dispatch_ctx(uuid::Uuid::new_v4()),
+        )
+        .await;
+    assert!(signal.is_error, "expected error: {}", result_text(&signal));
+    assert!(
+        result_text(&signal).contains("owned by another agent"),
+        "{}",
+        result_text(&signal)
+    );
+
+    service.reap_owner(owner);
 }
