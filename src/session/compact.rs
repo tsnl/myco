@@ -1,5 +1,6 @@
 //! Session compaction: archive predecessor, seed successor with summary + tail.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::CancelToken;
@@ -94,12 +95,51 @@ pub fn compact_session(
 }
 
 /// Link predecessor → successor on disk (updates both documents).
+///
+/// The successor is written first: a crash between the two saves must not leave
+/// the predecessor pointing at a `successor_id` that has no file behind it. The
+/// other order — an unreferenced successor on disk — is recoverable, since the
+/// predecessor still reads as un-compacted.
 pub fn link_compact_pair(predecessor: &mut Session, successor: &Session) -> Result<(), String> {
+    successor.save()?;
     predecessor.successor_id = Some(successor.id.clone());
     predecessor.touch();
-    predecessor.save()?;
-    successor.save()?;
-    Ok(())
+    predecessor.save()
+}
+
+/// Read the summary the worker was supposed to write, given whatever was in
+/// place before it ran.
+///
+/// A summary file is not proof of *this* run: `{id}.summary.md` survives from an
+/// earlier compaction of the same predecessor, so a worker that ends its turn
+/// without ever calling `write_summary` would otherwise have that stale text
+/// compacted in — a wrong result with no error. Requiring the content to have
+/// changed turns that into a loud failure, and unlike deleting the file up
+/// front it leaves the old summary intact for the successor that references it.
+fn read_fresh_summary(path: &Path, before: Option<&str>) -> Result<String, String> {
+    let summary = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(format!(
+                "worker finished but summary missing at {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    if summary.trim().is_empty() {
+        return Err(format!(
+            "worker finished but summary file is empty ({})",
+            path.display()
+        ));
+    }
+    if before == Some(summary.as_str()) {
+        return Err(format!(
+            "worker finished without writing a new summary; {} still holds the previous \
+             compaction's text (session unchanged)",
+            path.display()
+        ));
+    }
+    Ok(summary)
 }
 
 /// How [`run_compact_worker`] ended without producing a successor.
@@ -138,6 +178,11 @@ pub async fn run_compact_worker(
     if let Err(e) = worker_session.save() {
         eprintln!("warning: could not save compact worker session: {e}");
     }
+
+    // What the summary file holds before the worker runs, so a worker that never
+    // writes one cannot have stale text compacted in (see `read_fresh_summary`).
+    let summary_path = predecessor.summary_path();
+    let summary_before = std::fs::read_to_string(&summary_path).ok();
 
     let model = match generative_model::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
@@ -179,7 +224,9 @@ pub async fn run_compact_worker(
 
     worker_session.messages = worker.history().to_vec();
     worker_session.touch();
-    let _ = worker_session.save();
+    if let Err(e) = worker_session.save() {
+        eprintln!("warning: could not save compact worker session: {e}");
+    }
 
     match result {
         Ok(_) => {}
@@ -187,22 +234,8 @@ pub async fn run_compact_worker(
         Err(e) => return Err(CompactWorkerError::Failed(format!("worker failed: {e}"))),
     }
 
-    let summary_path = predecessor.summary_path();
-    let summary = match std::fs::read_to_string(&summary_path) {
-        Ok(s) if !s.trim().is_empty() => s,
-        Ok(_) => {
-            return Err(CompactWorkerError::Failed(format!(
-                "worker finished but summary file is empty ({})",
-                summary_path.display()
-            )));
-        }
-        Err(e) => {
-            return Err(CompactWorkerError::Failed(format!(
-                "worker finished but summary missing at {}: {e}",
-                summary_path.display()
-            )));
-        }
-    };
+    let summary = read_fresh_summary(&summary_path, summary_before.as_deref())
+        .map_err(CompactWorkerError::Failed)?;
 
     let (successor, outcome) = compact_session(predecessor, &summary, &catalog_model.spec.key)
         .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor: {e}")))?;
@@ -305,6 +338,83 @@ mod tests {
     use super::*;
     use crate::test_support::{assistant, assistant_tool, temp_home, tool_results, user};
     use serde_json::json;
+
+    /// A summary file left behind by an earlier compaction must not be mistaken
+    /// for this run's output: reusing it would compact a summary describing a
+    /// different conversation, with no error anywhere.
+    #[test]
+    fn a_stale_summary_is_rejected_instead_of_reused() {
+        let tmp = crate::test_support::temp_dir("compact-stale");
+        let dir = tmp.path();
+        let path = dir.join("s.summary.md");
+        let previous = "# Summary of an earlier compaction\n";
+        std::fs::write(&path, previous).unwrap();
+
+        let err = read_fresh_summary(&path, Some(previous)).expect_err("stale must be rejected");
+        assert!(err.contains("without writing a new summary"), "{err}");
+        assert!(err.contains("session unchanged"), "{err}");
+
+        // The old summary is left on disk — a successor from the earlier
+        // compaction still references it.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+
+        // A worker that actually rewrote it is accepted.
+        std::fs::write(&path, "# Fresh summary\n").unwrap();
+        assert_eq!(
+            read_fresh_summary(&path, Some(previous)).unwrap(),
+            "# Fresh summary\n"
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_summary_fails_loudly() {
+        let tmp = crate::test_support::temp_dir("compact-missing");
+        let dir = tmp.path();
+        let path = dir.join("s.summary.md");
+
+        let err = read_fresh_summary(&path, None).expect_err("missing must fail");
+        assert!(err.contains("summary missing"), "{err}");
+
+        std::fs::write(&path, "   \n\t\n").unwrap();
+        let err = read_fresh_summary(&path, None).expect_err("empty must fail");
+        assert!(err.contains("summary file is empty"), "{err}");
+
+        // First-ever compaction: nothing there before, so any content is fresh.
+        std::fs::write(&path, "# First\n").unwrap();
+        assert_eq!(read_fresh_summary(&path, None).unwrap(), "# First\n");
+    }
+
+    /// The successor document must exist before the predecessor points at it,
+    /// so a crash mid-link can never leave a dangling `successor_id`.
+    #[test]
+    fn linking_writes_the_successor_before_the_pointer_to_it() {
+        // RAII: points MYCO_HOME at a temp dir under the myco-home lock, and
+        // clears both on drop even if an assertion panics.
+        let _home = temp_home("compact-link");
+
+        let mut pred = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
+        pred.messages = vec![user("hello"), assistant("hi")];
+        pred.save().unwrap();
+
+        let successor = pred.fork_child("m");
+        link_compact_pair(&mut pred, &successor).unwrap();
+
+        // Both documents on disk, cross-linked.
+        let saved_pred = Session::load_by_id_or_prefix(&pred.id).unwrap();
+        let saved_succ = Session::load_by_id_or_prefix(&successor.id).unwrap();
+        assert_eq!(
+            saved_pred.successor_id.as_deref(),
+            Some(successor.id.as_str())
+        );
+        assert_eq!(saved_succ.id, successor.id);
+
+        // The pointer is only durable because the target already was: loading
+        // the id the predecessor names must succeed.
+        assert!(
+            Session::load_by_id_or_prefix(saved_pred.successor_id.as_deref().unwrap()).is_ok(),
+            "predecessor names a successor that is not on disk"
+        );
+    }
 
     fn assistant_tools() -> Message {
         assistant_tool(None, "t1", "bash", json!({"command": "echo hi"}))
