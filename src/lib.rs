@@ -2,10 +2,10 @@ pub mod agent;
 pub mod config;
 pub mod core;
 pub mod external_command;
-/// The model layer, extracted to its own crate ([`llm_wire`]) — three
+/// The model layer, extracted to its own crate ([`myco_llm_wire`]) — three
 /// streaming wire protocols behind one message model. Aliased here so call
 /// sites read as `generative_model::` regardless of the crate name.
-pub use llm_wire as generative_model;
+pub use myco_llm_wire as generative_model;
 pub mod harness;
 pub mod host;
 pub mod manual;

@@ -1,13 +1,11 @@
 [package]
-name = "llm-wire"
+name = "myco-llm-wire"
 version = "0.1.0"
 edition = "2024"
-description = "Streaming wire drivers for the Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions APIs, behind one message model"
+description = "Internal to myco: streaming wire drivers for the Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions APIs. No stability guarantee; use myco instead"
 repository = "https://github.com/tsnl/myco"
 homepage = "https://github.com/tsnl/myco"
 readme = "README.md"
-keywords = ["llm", "anthropic", "openai", "streaming", "sse"]
-categories = ["api-bindings", "asynchronous"]
 license = "MIT"
 
 [dependencies]

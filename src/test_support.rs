@@ -17,7 +17,9 @@ use crate::generative_model::{
     Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
     MessagePart, ToolResult, ToolUseDelta, ToolUseStart, TurnEndReason,
 };
-pub(crate) use llm_wire::test_support::{assistant, assistant_tool, thinking, tool_results, user};
+pub(crate) use myco_llm_wire::test_support::{
+    assistant, assistant_tool, thinking, tool_results, user,
+};
 
 // ---------------------------------------------------------------------------
 // ScriptedModel

@@ -1,6 +1,10 @@
-//! Streaming wire drivers for three LLM HTTP protocols, behind one message
-//! model: **Anthropic Messages**, **OpenAI Responses**, and **OpenAI Chat
-//! Completions**.
+//! Internal to myco: streaming wire drivers for three LLM HTTP protocols,
+//! behind one message model — **Anthropic Messages**, **OpenAI Responses**, and
+//! **OpenAI Chat Completions**.
+//!
+//! Published only because cargo requires a registry version for every
+//! dependency of a published crate. The API changes whenever myco needs it to,
+//! without a major version; use `myco` rather than depending on this directly.
 //!
 //! A [`GenerativeModel`] turns a conversation into an [`AsyncStream`] of
 //! [`MessagePart`]s — text and thinking deltas, tool calls as their arguments
@@ -26,9 +30,9 @@
 //!   rather than failing deserialization.
 //!
 //! ```no_run
-//! # use llm_wire::{Content, GenerativeModelConfig, Message, ModelCreationError};
+//! # use myco_llm_wire::{Content, GenerativeModelConfig, Message, ModelCreationError};
 //! # fn f(config: GenerativeModelConfig) -> Result<(), ModelCreationError> {
-//! let model = llm_wire::new(config)?;
+//! let model = myco_llm_wire::new(config)?;
 //! let parts = model.generate(&[Message::UserMessage {
 //!     content: vec![Content::Text { text: "hello".into() }],
 //! }]);

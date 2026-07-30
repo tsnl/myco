@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! llm-wire = { version = "0.1", features = ["test-util"] }
+//! myco-myco-llm-wire = { version = "0.1", features = ["test-util"] }
 //! ```
 
 use crate::{
