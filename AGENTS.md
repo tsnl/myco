@@ -89,7 +89,8 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/session/` | Agent loop, events, session files under `~/.myco/session/` |
+| `src/agent/` | The agent runtime: one turn driven to completion (`Agent::interact`), the `AgentEvent` / `EventSink` stream, and the `/compact` worker |
+| `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |

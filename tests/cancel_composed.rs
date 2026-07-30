@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use myco::CancelToken;
+use myco::agent::{Agent, AgentInteractionError, NullEventSink};
 use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
 use myco::harness::Harness;
-use myco::session::{Agent, AgentInteractionError, NullEventSink};
 use test_utils::ScriptedModel;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

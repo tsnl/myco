@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod config;
 pub mod core;
 pub mod external_command;
@@ -14,8 +15,12 @@ pub mod tui;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use agent::{
+    Agent, AgentEvent, AgentInteractionError, CompactWorkerError, EventSink, NullEventSink,
+    compact_subagent_prompt, run_compact_worker,
+};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
-pub use core::CancelToken;
+pub use core::{CancelToken, TraceContext, uuid_simple_hex};
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
     SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
@@ -25,10 +30,8 @@ pub use harness::{
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
-    ActiveSession, Agent, AgentEvent, AgentInteractionError, CompactOutcome, ConsoleLog, EventSink,
-    NullEventSink, SESSION_FILE_VERSION, Session, SessionKind, SessionLink, SessionListEntry,
-    TraceContext, compact_session, compact_subagent_prompt, link_compact_pair, select_tail,
-    uuid_simple_hex,
+    ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
+    SessionLink, SessionListEntry, compact_session, link_compact_pair, select_tail,
 };
 pub use tool_services::{
     HostDispatchContext, ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,

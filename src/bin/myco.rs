@@ -9,14 +9,15 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
+use myco::agent::{CompactWorkerError, run_compact_worker};
 use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactWorkerError, ConsoleLog, RECENT_SESSION_LIMIT, Session, SessionListEntry,
-    SessionLockError, SessionWriteLock, expand_image_attachments, format_session_detail,
-    format_session_list_line, list_sessions, resolve_and_load_session, run_compact_worker,
+    ActiveSession, ConsoleLog, RECENT_SESSION_LIMIT, Session, SessionListEntry, SessionLockError,
+    SessionWriteLock, expand_image_attachments, format_session_detail, format_session_list_line,
+    list_sessions, resolve_and_load_session,
 };
 use myco::tui::{
     ConsoleTuiSink, Palette, StdoutTuiSink, TuiProducer, attachment_note, render_block,

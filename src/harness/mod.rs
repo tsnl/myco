@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::TraceContext;
 use crate::core::{Async, CancelToken};
 use crate::generative_model;
-use crate::session::TraceContext;
 use crate::tool_services::ToolService;
 
 mod config;

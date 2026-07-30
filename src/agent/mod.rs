@@ -1,9 +1,26 @@
+//! The agent runtime: one user turn driven to completion against a model and a
+//! harness, plus the live [`AgentEvent`] stream a front-end renders.
+//!
+//! This is the top layer. It depends on the model drivers, the harness, and the
+//! session store; nothing they own depends back on it. That direction is the
+//! point of the module: `session/` is persistence and stays free of the harness,
+//! and a turn's correlation context lives in [`crate::core::TraceContext`] so the
+//! dispatch path can route on it without reaching up here.
+//!
+//! History well-formedness is the invariant everything else rests on: whatever
+//! a turn does — end cleanly, hit a provider error, get cancelled mid-tool, or
+//! get truncated mid-tool-call by `max_tokens` — the transcript it leaves behind
+//! must be a prefix the provider will accept on the next request. See
+//! [`Agent::interact`].
+
 use std::sync::Arc;
 
-use futures::future;
-use uuid::Uuid;
+mod compact_worker;
+pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 
-use crate::core::CancelToken;
+use futures::future;
+
+use crate::core::{CancelToken, TraceContext};
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
     MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
@@ -13,41 +30,6 @@ use crate::harness::Harness;
 //
 // Event sink — live observability for agent / tool activity
 //
-
-/// Format a UUID as a 32-char lowercase hex string (no hyphens).
-pub fn uuid_simple_hex(id: Uuid) -> String {
-    id.as_simple().to_string()
-}
-
-/// Correlation / nesting context carried on every event.
-///
-/// Every running agent (root or nested) has a stable [`Self::agent_id`]. Nesting is expressed
-/// with `depth`, not with separate event types per agent role.
-#[derive(Debug, Clone)]
-pub struct TraceContext {
-    /// Stable id for this agent session (root or subagent).
-    pub agent_id: Uuid,
-    /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
-    pub depth: usize,
-}
-
-impl Default for TraceContext {
-    fn default() -> Self {
-        Self {
-            agent_id: Uuid::nil(),
-            depth: 0,
-        }
-    }
-}
-
-impl TraceContext {
-    pub fn root() -> Self {
-        Self {
-            agent_id: Uuid::new_v4(),
-            depth: 0,
-        }
-    }
-}
 
 /// Live events emitted by the agent runtime.
 ///

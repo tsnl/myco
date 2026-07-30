@@ -228,7 +228,7 @@ mod tests {
     fn path_probe_finds_only_files_in_listed_dirs() {
         let dir = std::env::temp_dir().join(format!(
             "myco-exec-check-{}",
-            crate::session::uuid_simple_hex(uuid::Uuid::new_v4())
+            crate::core::uuid_simple_hex(uuid::Uuid::new_v4())
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("present"), "#!/bin/sh\n").unwrap();

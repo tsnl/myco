@@ -3,23 +3,22 @@
 //! Sessions live under `~/.myco/session/{shard}/{id}.json` (plus a sibling
 //! `.history` for readline). Schema is intentionally breaking vs earlier WIP
 //! files: only [`SESSION_FILE_VERSION`] is accepted.
+//!
+//! Persistence only: this module knows how a conversation is stored, not how one
+//! is produced. The agent runtime lives in [`crate::agent`] and depends on this
+//! module, never the other way round — which is why compaction is split, with
+//! the document logic ([`compact_session`], [`select_tail`],
+//! [`link_compact_pair`]) here and the worker that drives an agent to write the
+//! summary in [`crate::agent::run_compact_worker`].
 
-mod agent;
 mod attach;
 mod compact;
 mod console_log;
 mod lock;
 mod search;
 
-pub use agent::{
-    Agent, AgentEvent, AgentInteractionError, EventSink, HistoryCheckpoint, NullEventSink,
-    TraceContext, uuid_simple_hex,
-};
 pub use attach::{MAX_IMAGE_BYTES, MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
-pub use compact::{
-    CompactOutcome, CompactWorkerError, compact_session, compact_subagent_prompt,
-    link_compact_pair, run_compact_worker, select_tail,
-};
+pub use compact::{CompactOutcome, compact_session, link_compact_pair, select_tail};
 pub use console_log::ConsoleLog;
 pub use lock::{SessionLockError, SessionWriteLock};
 pub use search::{SessionSearchReport, search_sessions};
@@ -32,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::core::uuid_simple_hex;
 use crate::generative_model::{Message, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).

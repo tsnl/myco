@@ -752,7 +752,7 @@ impl BashService {
                 .unwrap_or(0);
             lines.push(format!(
                 "- id={id} owner={} cmdline={:?} status={exited} last_used_s_ago={last_used} created_s_ago={}",
-                crate::session::uuid_simple_hex(s.owner),
+                crate::core::uuid_simple_hex(s.owner),
                 s.cmdline,
                 s.created_at.elapsed().as_secs()
             ));
@@ -977,7 +977,7 @@ impl SessionSnapshot {
         out.push_str(&format!("session_id: {}\n", self.session_id));
         out.push_str(&format!(
             "owner: {}\n",
-            crate::session::uuid_simple_hex(self.owner)
+            crate::core::uuid_simple_hex(self.owner)
         ));
         out.push_str(&format!("cmdline: {:?}\n", self.cmdline));
         out.push_str(&format!("status: {}\n", self.status.as_str()));
