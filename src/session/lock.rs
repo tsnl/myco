@@ -7,7 +7,7 @@
 //!
 //! The guard is an advisory `flock(2)` on a sibling `{id}.lock`, held for as
 //! long as the session is live. The lock file is a separate inode on purpose:
-//! [`crate::session::atomically_write`] replaces `{id}.json` by rename, which
+//! [`crate::core::atomically_write`] replaces `{id}.json` by rename, which
 //! would leave a lock on the old inode.
 //!
 //! Reading is never blocked — `session_history`, `list_recent`, the session

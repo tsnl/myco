@@ -123,7 +123,7 @@ impl SessionHistoryTool {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                crate::session::atomically_write(path.as_path(), markdown.as_bytes())?;
+                crate::core::atomically_write(path.as_path(), markdown.as_bytes())?;
                 Ok(format!(
                     "summary written ({} bytes)\npath={}\n",
                     markdown.len(),

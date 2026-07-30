@@ -24,8 +24,7 @@ pub use core::{CancelToken, uuid_simple_hex};
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
     SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
-    ensure_remote_ssh_identities, load_ssh_host_aliases, print_startup_preflight,
-    ssh_config_host_aliases,
+    ensure_remote_ssh_identities, load_ssh_host_aliases, ssh_config_host_aliases,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;

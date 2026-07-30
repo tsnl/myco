@@ -254,7 +254,7 @@ fn human_bytes(n: usize) -> String {
 /// mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
     epilogue_with(
-        crate::session::myco_home().ok(),
+        crate::core::myco_home().ok(),
         std::env::current_dir().ok(),
         max_soul_bytes,
     )
@@ -264,7 +264,7 @@ pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
 /// `max_soul_bytes` cap. Startup calls this to warn before the first turn;
 /// `None` means the soul fits (or there is none).
 pub fn soul_truncation(max_soul_bytes: usize) -> Option<SoulTruncation> {
-    let home = crate::session::myco_home().ok()?;
+    let home = crate::core::myco_home().ok()?;
     let dir = home.join("workspace").join("soul");
     capped_soul(&dir, max_soul_bytes)?.2
 }
