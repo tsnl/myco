@@ -75,7 +75,7 @@ pub fn compact_session(
     if let Some(parent) = summary_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    crate::session::atomically_write(summary_path.as_path(), summary_markdown.as_bytes())?;
+    crate::core::atomically_write(summary_path.as_path(), summary_markdown.as_bytes())?;
 
     let outcome = CompactOutcome {
         predecessor_id: predecessor.id.clone(),

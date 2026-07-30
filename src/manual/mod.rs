@@ -79,7 +79,7 @@ fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
     if std::fs::read_to_string(path).is_ok_and(|on_disk| on_disk == content) {
         return Ok(());
     }
-    crate::session::atomically_write(path, content.as_bytes())
+    crate::core::atomically_write(path, content.as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 

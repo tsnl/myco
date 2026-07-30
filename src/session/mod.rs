@@ -22,14 +22,13 @@ pub use lock::{SessionLockError, SessionWriteLock};
 pub use search::{SessionSearchReport, search_sessions};
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::core::uuid_simple_hex;
+use crate::core::{atomically_write, myco_home, uuid_simple_hex};
 use crate::generative_model::{Message, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
@@ -476,18 +475,6 @@ impl Session {
 // Paths / listing / resolve
 // ---------------------------------------------------------------------------
 
-pub fn myco_home() -> Result<PathBuf, String> {
-    if let Ok(root) = std::env::var("MYCO_HOME") {
-        let p = PathBuf::from(root);
-        if !p.as_os_str().is_empty() {
-            return Ok(p);
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".myco"))
-        .ok_or_else(|| "could not resolve home directory".into())
-}
-
 pub fn session_root() -> Result<PathBuf, String> {
     Ok(myco_home()?.join("session"))
 }
@@ -498,15 +485,6 @@ pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
         Ok(root) => root.join(shard).join(format!("{id}.{ext}")),
         Err(_) => PathBuf::from(format!(".myco/session/{shard}/{id}.{ext}")),
     }
-}
-
-pub fn atomically_write(path: &Path, content: &[u8]) -> Result<(), String> {
-    let mut file = atomic_write_file::AtomicWriteFile::options()
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(content).map_err(|e| e.to_string())?;
-    file.commit().map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
