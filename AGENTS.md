@@ -88,6 +88,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
+| `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `src/agent/` | The agent runtime: one turn driven to completion (`Agent::interact`), the `AgentEvent` / `EventSink` stream, and the `/compact` worker |
 | `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
@@ -118,6 +119,13 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
+- **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
+  `manual` → `prompts` → `session` → `tool_services` → `host` → `harness` →
+  `agent` → `tui`. A module reaching *up* that list is the smell; the fix is
+  usually that the shared thing belongs lower down (`myco_home` in `core`, not
+  `session`) or that the caller wants data instead of rendering
+  (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
+  reach anywhere — test setup composes real layers on purpose.
 
 ## Code style
 
