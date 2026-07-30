@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::core::*;
+use crate::AsyncStream;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::*;
@@ -572,11 +572,11 @@ struct AnthropicUsage {
 }
 
 impl AnthropicUsage {
-    fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+    fn into_token_usage(self) -> crate::TokenUsage {
         // Full prompt = input + cache read + cache write; cached_input = reads.
         let cache_read = self.cache_read_input_tokens.unwrap_or(0);
         let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
-        crate::generative_model::TokenUsage {
+        crate::TokenUsage {
             input_tokens: self
                 .input_tokens
                 .saturating_add(cache_read)

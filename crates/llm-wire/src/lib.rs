@@ -1,8 +1,47 @@
+//! Streaming wire drivers for three LLM HTTP protocols, behind one message
+//! model: **Anthropic Messages**, **OpenAI Responses**, and **OpenAI Chat
+//! Completions**.
+//!
+//! A [`GenerativeModel`] turns a conversation into an [`AsyncStream`] of
+//! [`MessagePart`]s — text and thinking deltas, tool calls as their arguments
+//! arrive, token usage, and the [`TurnEndReason`] the provider reported. Build
+//! one with [`new`] from a [`GenerativeModelConfig`]; the protocol comes from
+//! the [`BackendConfig`] you pass, not from a model-name lookup, so any
+//! OpenAI-compatible or Anthropic-compatible gateway works by pointing
+//! `base_url` at it.
+//!
+//! What the drivers handle that a thin HTTP wrapper does not:
+//!
+//! - **Prompt caching.** Anthropic `cache_control` breakpoints roll forward as
+//!   the conversation grows, so a long session keeps paying cache-read prices.
+//! - **Thinking.** [`ThinkingMode`] covers the three shapes providers actually
+//!   use — Anthropic adaptive (`output_config.effort`), Anthropic budgeted
+//!   (`budget_tokens` derived from an [`Effort`]), and OpenAI
+//!   `reasoning.effort` — because which one a model accepts is a property of
+//!   the model, not the provider.
+//! - **Turn end.** [`TurnEndReason`] is reported on the streaming path, which
+//!   is what lets a caller tell a finished turn from one `max_tokens` cut off
+//!   mid-tool-call.
+//! - **Gateways that omit fields.** A missing `finish_reason` is tolerated
+//!   rather than failing deserialization.
+//!
+//! ```no_run
+//! # use llm_wire::{Content, GenerativeModelConfig, Message, ModelCreationError};
+//! # fn f(config: GenerativeModelConfig) -> Result<(), ModelCreationError> {
+//! let model = llm_wire::new(config)?;
+//! let parts = model.generate(&[Message::UserMessage {
+//!     content: vec![Content::Text { text: "hello".into() }],
+//! }]);
+//! // `parts` is an `AsyncStream<Result<MessagePart, GenerateError>>`.
+//! # Ok(()) }
+//! ```
+
 use std::{pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
-use crate::core::*;
+/// A boxed stream of `T`, the shape every driver returns.
+pub type AsyncStream<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
 
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
@@ -17,6 +56,9 @@ mod openai_responses;
 
 mod sse_parser;
 use sse_parser::SseParser;
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 
 pub trait GenerativeModel: Send + Sync {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
@@ -122,9 +164,9 @@ impl ThinkingMode {
 }
 
 /// A resolved model: everything the protocol drivers need, minus credentials
-/// (those live in [`BackendConfig`]). Built by `crate::config` from the
-/// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
-/// models.
+/// (those live in [`BackendConfig`]). There is no built-in model list — a
+/// caller resolves these from its own catalog, so a new model is a config
+/// entry rather than a release of this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     /// Catalog key: what the user types after `--model` and what sessions
@@ -1044,9 +1086,8 @@ mod tests {
 /// Failures that are a property of the *history* cannot be fixed by trying
 /// again — every later turn resends that history and fails the same way, which
 /// wedges the session. This is the top-level signal for those: it says whether
-/// the last user message has to come back out (see
-/// [`crate::session::Agent::rewind_last_user_turn`]) before the conversation
-/// can continue.
+/// the caller must take the last user message back out of the history before
+/// the conversation can continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
     /// Nothing about the history is known to be at fault; resubmitting as-is

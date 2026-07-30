@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/llm-wire"]
+
 [package]
 name = "myco"
 version = "0.3.0"
@@ -14,6 +17,7 @@ license = "MIT"
 [dependencies]
 atomic-write-file = "0.3.0"
 base64 = "0.22"
+llm-wire = { version = "0.1.0", path = "crates/llm-wire" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive"] }
 dirs = "6"
@@ -51,3 +55,6 @@ infer = { version = "0.22.0", default-features = false }
 [target.'cfg(unix)'.dependencies]
 # Terminal width detection (TIOCGWINSZ) for `--wrap auto`.
 libc = "0.2"
+
+[dev-dependencies]
+llm-wire = { version = "0.1.0", path = "crates/llm-wire", features = ["test-util"] }

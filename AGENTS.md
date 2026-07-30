@@ -95,7 +95,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `crates/llm-wire/` | Its own publishable crate — protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models. Aliased as `myco::generative_model`, so call sites read the same |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + soul / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/tui/` | The whole rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks, the streaming markdown renderer (`markdown/`), and section/transcript layout + `Palette` (`transcript.rs`) that live output and replay share |
@@ -119,13 +119,15 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
-  `manual` → `prompts` → `session` → `tool_services` → `host` → `harness` →
-  `agent` → `tui`. A module reaching *up* that list is the smell; the fix is
-  usually that the shared thing belongs lower down (`myco_home` in `core`, not
-  `session`) or that the caller wants data instead of rendering
-  (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
-  reach anywhere — test setup composes real layers on purpose.
+- **The module graph is acyclic.** Bottom-up: `core` → `manual` → `prompts` →
+  `session` → `tool_services` → `host` → `harness` → `agent` → `tui`, with the
+  `llm-wire` crate underneath all of them (it depends on nothing in `myco`,
+  which is what lets it publish on its own). A module reaching *up* that list is
+  the smell; the fix is usually that the shared thing belongs lower down
+  (`myco_home` in `core`, not `session`) or that the caller wants data instead
+  of rendering (`StartupPreflight::warning_body`, not a WARNING block).
+  `#[cfg(test)]` may reach anywhere — test setup composes real layers on
+  purpose.
 
 ## Code style
 

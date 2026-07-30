@@ -1,0 +1,33 @@
+[package]
+name = "llm-wire"
+version = "0.1.0"
+edition = "2024"
+description = "Streaming wire drivers for the Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions APIs, behind one message model"
+repository = "https://github.com/tsnl/myco"
+homepage = "https://github.com/tsnl/myco"
+readme = "README.md"
+keywords = ["llm", "anthropic", "openai", "streaming", "sse"]
+categories = ["api-bindings", "asynchronous"]
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+futures = "0.3.32"
+# The same TLS decision the workspace root documents: rustls + webpki-roots so a
+# release binary carries no dynamic dependency on the host's system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls"] }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["serde_derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+# `sync::mpsc` and `spawn` for the driver's stream pump; `rt` for the tests.
+tokio = { version = "1.52.3", features = ["rt", "sync", "macros"] }
+url = "2"
+
+[features]
+# Message builders and `MessagePart` stream assertions for downstream tests.
+# Off by default so ordinary builds carry no fixture code.
+test-util = []
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
