@@ -17,10 +17,10 @@ pub(crate) mod test_support;
 
 pub use agent::{
     Agent, AgentEvent, AgentInteractionError, CompactWorkerError, EventSink, NullEventSink,
-    compact_subagent_prompt, run_compact_worker,
+    TraceContext, compact_subagent_prompt, run_compact_worker,
 };
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
-pub use core::{CancelToken, TraceContext, uuid_simple_hex};
+pub use core::{CancelToken, uuid_simple_hex};
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
     SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,

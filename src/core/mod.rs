@@ -24,40 +24,6 @@ pub fn uuid_simple_hex(id: uuid::Uuid) -> String {
     id.as_simple().to_string()
 }
 
-/// Correlation / nesting context for one running agent, carried on every event
-/// it emits and on every tool dispatch it makes.
-///
-/// Lives here rather than beside the agent runtime because the dispatch path
-/// needs it without depending on that runtime: the harness routes on
-/// [`Self::agent_id`] (it keys per-agent host state, e.g. bash sessions) and
-/// display sinks filter on [`Self::depth`]. Nesting is expressed with `depth`,
-/// not with separate event types per agent role.
-#[derive(Debug, Clone)]
-pub struct TraceContext {
-    /// Stable id for this agent session (root or subagent).
-    pub agent_id: uuid::Uuid,
-    /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
-    pub depth: usize,
-}
-
-impl Default for TraceContext {
-    fn default() -> Self {
-        Self {
-            agent_id: uuid::Uuid::nil(),
-            depth: 0,
-        }
-    }
-}
-
-impl TraceContext {
-    pub fn root() -> Self {
-        Self {
-            agent_id: uuid::Uuid::new_v4(),
-            depth: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

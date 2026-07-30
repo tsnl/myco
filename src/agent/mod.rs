@@ -2,10 +2,12 @@
 //! harness, plus the live [`AgentEvent`] stream a front-end renders.
 //!
 //! This is the top layer. It depends on the model drivers, the harness, and the
-//! session store; nothing they own depends back on it. That direction is the
-//! point of the module: `session/` is persistence and stays free of the harness,
-//! and a turn's correlation context lives in [`crate::core::TraceContext`] so the
-//! dispatch path can route on it without reaching up here.
+//! session store; nothing they own depends back on it. `session/` is persistence
+//! and stays free of the harness, and the tool runtime stays free of *this*
+//! module because [`Harness::dispatch_tool_use`] asks only for the owning
+//! agent's `Uuid` — the identity it needs to key per-agent host state — rather
+//! than for [`TraceContext`], which is display attribution and belongs here with
+//! the events it annotates.
 //!
 //! History well-formedness is the invariant everything else rests on: whatever
 //! a turn does — end cleanly, hit a provider error, get cancelled mid-tool, or
@@ -20,16 +22,51 @@ pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compac
 
 use futures::future;
 
-use crate::core::{CancelToken, TraceContext};
+use crate::core::CancelToken;
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
     MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
+use uuid::Uuid;
 
 //
 // Event sink — live observability for agent / tool activity
 //
+
+/// Attribution carried on every [`AgentEvent`]: which agent produced it, and
+/// how deeply nested that agent is.
+///
+/// Display concern only. The dispatch path does **not** take this — the harness
+/// needs just the owning agent's id and asks for a `Uuid`, so this type never
+/// reaches the tool runtime and does not have to live in a shared layer to
+/// avoid a cycle. Nesting is expressed with `depth` rather than separate event
+/// types per agent role.
+#[derive(Debug, Clone)]
+pub struct TraceContext {
+    /// Stable id for this agent session (root or subagent).
+    pub agent_id: Uuid,
+    /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
+    pub depth: usize,
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self {
+            agent_id: Uuid::nil(),
+            depth: 0,
+        }
+    }
+}
+
+impl TraceContext {
+    pub fn root() -> Self {
+        Self {
+            agent_id: Uuid::new_v4(),
+            depth: 0,
+        }
+    }
+}
 
 /// Live events emitted by the agent runtime.
 ///
@@ -340,7 +377,7 @@ impl Agent {
         let work =
             self.harness
                 .clone()
-                .dispatch_tool_use(tool_use, self.context.clone(), cancel.clone());
+                .dispatch_tool_use(tool_use, self.context.agent_id, cancel.clone());
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it

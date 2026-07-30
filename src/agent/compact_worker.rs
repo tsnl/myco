@@ -11,13 +11,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::core::{CancelToken, TraceContext, uuid_simple_hex};
+use crate::core::{CancelToken, uuid_simple_hex};
 use crate::generative_model::{self, CatalogModel, Content, GenerativeModelConfig};
 use crate::harness::Harness;
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
 
-use super::{Agent, AgentInteractionError, NullEventSink};
+use super::{Agent, AgentInteractionError, NullEventSink, TraceContext};
 
 /// Read the summary the worker was supposed to write, given whatever was in
 /// place before it ran.

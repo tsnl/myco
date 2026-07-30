@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::core::TraceContext;
 use crate::core::{Async, CancelToken};
 use crate::generative_model;
 use crate::tool_services::ToolService;
@@ -284,10 +283,16 @@ impl Harness {
             .collect()
     }
 
+    /// Route one tool call to its host.
+    ///
+    /// Takes the owning agent's id, not a richer context: `agent_id` keys
+    /// per-agent host state (bash sessions) and is what the NDJSON protocol
+    /// carries, so the tool runtime never needs the agent's event-attribution
+    /// type. That is what keeps this module independent of `crate::agent`.
     pub fn dispatch_tool_use(
         self: Arc<Self>,
         mut tool_use: generative_model::ToolUse,
-        context: TraceContext,
+        agent_id: uuid::Uuid,
         cancel: CancelToken,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
@@ -325,7 +330,7 @@ impl Harness {
                 .with_id(id);
             };
 
-            client.call(context.agent_id, tool_use, cancel).await
+            client.call(agent_id, tool_use, cancel).await
         })
     }
 
@@ -422,10 +427,10 @@ mod tests {
     use crate::test_support::result_text;
     use serde_json::json;
 
-    /// Dispatch `name` with `input` through the harness under `context`.
+    /// Dispatch `name` with `input` through the harness on behalf of `agent_id`.
     async fn call_on(
         harness: &Arc<Harness>,
-        context: TraceContext,
+        agent_id: uuid::Uuid,
         name: &str,
         input: serde_json::Value,
     ) -> generative_model::ToolResult {
@@ -437,7 +442,7 @@ mod tests {
                     name: name.into(),
                     input,
                 },
-                context,
+                agent_id,
                 CancelToken::new(),
             )
             .await
@@ -448,7 +453,7 @@ mod tests {
         name: &str,
         input: serde_json::Value,
     ) -> generative_model::ToolResult {
-        call_on(harness, TraceContext::default(), name, input).await
+        call_on(harness, uuid::Uuid::nil(), name, input).await
     }
 
     /// Remote-host config spawning this build's `myco --mode host` (not SSH).
@@ -737,15 +742,11 @@ mod tests {
     async fn running_tool_summaries_surface_local_bash_sessions() {
         let harness = Harness::attach_local_for_tests().await.expect("attach");
         let agent_id = uuid::Uuid::new_v4();
-        let context = TraceContext {
-            agent_id,
-            ..TraceContext::default()
-        };
         assert!(harness.running_tool_summaries(agent_id).is_empty());
 
         let r = call_on(
             &harness,
-            context.clone(),
+            agent_id,
             "bash",
             json!({
                 "action": "start",
@@ -770,7 +771,7 @@ mod tests {
 
         let r = call_on(
             &harness,
-            context,
+            agent_id,
             "bash",
             json!({"action": "close", "session_id": "summary-probe"}),
         )
