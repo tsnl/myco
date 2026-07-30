@@ -8,6 +8,7 @@ mod agent;
 mod attach;
 mod compact;
 mod console_log;
+mod lock;
 mod markdown;
 mod search;
 mod transcript;
@@ -22,6 +23,7 @@ pub use compact::{
     link_compact_pair, run_compact_worker, select_tail,
 };
 pub use console_log::ConsoleLog;
+pub use lock::{SessionLockError, SessionWriteLock};
 pub use markdown::{MarkdownRenderer, render_block};
 pub use search::{SessionSearchReport, search_sessions};
 pub use transcript::{

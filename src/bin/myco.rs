@@ -15,9 +15,9 @@ use myco::generative_model::{
 use myco::host::HostWorker;
 use myco::session::{
     ActiveSession, CompactWorkerError, ConsoleLog, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, attachment_note, expand_image_attachments, format_session_detail,
-    format_session_list_line, list_sessions, render_block, resolve_and_load_session,
-    run_compact_worker,
+    SessionListEntry, SessionLockError, SessionWriteLock, attachment_note,
+    expand_image_attachments, format_session_detail, format_session_list_line, list_sessions,
+    render_block, resolve_and_load_session, run_compact_worker,
 };
 use myco::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer};
 use myco::{
@@ -266,6 +266,8 @@ async fn run_print(args: Args) {
     .await;
     let Boot {
         session: active_session,
+        // Bound, not dropped: the guard must outlive the turn.
+        session_lock: _session_lock,
         mut agent,
         ..
     } = boot;
@@ -501,6 +503,28 @@ async fn attach_harness_or_exit(
         })
 }
 
+/// Take the write lock for a session that is about to go live.
+///
+/// `Err` means another myco process holds it: both would rewrite the whole
+/// document every turn, so the loser's turns vanish. `Unavailable` is not fatal
+/// — a filesystem without `flock` must not stop myco from running — so it warns
+/// and returns `None`, and the caller proceeds unlocked.
+fn lock_session_or_report(session_id: &str) -> Result<Option<SessionWriteLock>, String> {
+    match SessionWriteLock::acquire(session_id) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(SessionLockError::Busy { path }) => Err(format!(
+            "session {session_id} is already open in another myco process.\n\
+             hint: use that window, start a fresh session, or `--fork` it into a child \
+             (lock: {})",
+            path.display()
+        )),
+        Err(e @ SessionLockError::Unavailable(_)) => {
+            eprintln!("warning: {e}; continuing without a single-writer guard");
+            Ok(None)
+        }
+    }
+}
+
 /// Persist agent history at replayable mid-turn boundaries (after the user
 /// message, after each completed tool round) so context forks and crash
 /// recovery see the freshest well-formed snapshot.
@@ -522,6 +546,9 @@ struct Boot {
     catalog_model: CatalogModel,
     preflight: StartupPreflight,
     session: ActiveSession,
+    /// Single-writer guard on the session, held for as long as it is live.
+    /// `None` when locking is unavailable on this filesystem.
+    session_lock: Option<SessionWriteLock>,
     harness: Arc<Harness>,
     agent: Agent,
 }
@@ -549,6 +576,14 @@ async fn boot<S: EventSink + 'static>(
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));
+    // Before the sink, whose console mirror already writes to this session.
+    let session_lock = match lock_session_or_report(&session.id()) {
+        Ok(lock) => lock,
+        Err(msg) => {
+            eprintln!("myco: {msg}");
+            std::process::exit(1);
+        }
+    };
     let sink = make_sink(&app_config, &preflight, &session);
 
     let session_tool =
@@ -584,6 +619,7 @@ async fn boot<S: EventSink + 'static>(
             catalog_model,
             preflight,
             session,
+            session_lock,
             harness,
             agent,
         },
@@ -618,6 +654,7 @@ async fn run_interactive(args: Args) {
         catalog_model,
         preflight,
         session: active_session,
+        session_lock,
         harness,
         agent,
     } = boot;
@@ -665,6 +702,7 @@ async fn run_interactive(args: Args) {
         ui: ui.clone(),
         turn_cancel: TurnCancel::default(),
         forked: args.fork,
+        session_lock,
     };
     repl.run_repl().await;
 
@@ -814,6 +852,10 @@ struct ReplSession {
     /// carries the *parent's* session stamp — cleared once this session has
     /// stamped its own id ([`needs_session_stamp`]).
     forked: bool,
+    /// Single-writer guard on the live session, swapped whenever the REPL
+    /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
+    /// unavailable on this filesystem.
+    session_lock: Option<SessionWriteLock>,
 }
 
 impl ReplSession {
@@ -1122,6 +1164,10 @@ impl ReplSession {
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
+        if let Err(msg) = self.relock_session(&successor.id) {
+            eprintln!("compact: {msg}");
+            return;
+        }
         self.session.replace(successor.clone());
         self.agent.set_history(successor.messages.clone());
         self.agent.set_last_usage(successor.last_usage);
@@ -1223,6 +1269,10 @@ impl ReplSession {
                 let mut fresh = Session::new(self.catalog_model.spec.key.clone());
                 fresh.kind = snapshot.kind;
                 fresh.parent_session_id = snapshot.parent_session_id.clone();
+                if let Err(msg) = self.relock_session(&fresh.id) {
+                    eprintln!("new session failed: {msg}");
+                    return;
+                }
                 self.session.replace(fresh);
                 self.agent.set_history(Vec::new());
                 self.agent.set_last_usage(None);
@@ -1235,6 +1285,10 @@ impl ReplSession {
                 self.save_before_switch();
                 match resolve_resume_session(arg) {
                     Ok(loaded) => {
+                        if let Err(msg) = self.relock_session(&loaded.id) {
+                            eprintln!("resume failed: {msg}");
+                            return;
+                        }
                         self.install_session(&loaded);
                         self.ui.line(&format!(
                             "resumed session={}  messages={}",
@@ -1317,6 +1371,25 @@ impl ReplSession {
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
+    }
+
+    /// Move the single-writer guard to `next_id` before that session goes live.
+    ///
+    /// The new lock is taken *before* the old one drops, so a refused switch
+    /// leaves this process still holding the session it is actually writing.
+    /// Re-selecting the live session is a no-op: a second `flock` from the same
+    /// process would otherwise report itself as busy.
+    fn relock_session(&mut self, next_id: &str) -> Result<(), String> {
+        let next_path = myco::session::session_file_path(next_id, "lock");
+        if self
+            .session_lock
+            .as_ref()
+            .is_some_and(|held| held.path() == next_path)
+        {
+            return Ok(());
+        }
+        self.session_lock = lock_session_or_report(next_id)?;
+        Ok(())
     }
 
     /// Make `loaded` the live session: swap it into the shared handle, reset
