@@ -523,6 +523,13 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
 }
 
 /// List sessions. When `include_hidden` is false, subagent/compact sessions are omitted.
+///
+/// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`]) are skipped
+/// rather than failing the listing, but never silently: they are reported once
+/// per process via [`warn_about_skipped_sessions`]. A session that vanishes from
+/// `/sessions` without a word is indistinguishable from one that was never
+/// there, and bare `--resume` would quietly open an *older* session instead of
+/// the newest one.
 pub fn list_sessions_filtered(
     limit: usize,
     include_hidden: bool,
@@ -532,23 +539,73 @@ pub fn list_sessions_filtered(
         return Ok(Vec::new());
     }
 
-    let mut metas = Vec::new();
-    for path in iter_session_json_files(&root)? {
-        match session_list_entry_from_path(&path) {
-            Ok(entry) => {
-                if include_hidden || entry.kind.is_user() {
-                    metas.push(entry);
-                }
-            }
-            Err(_) => continue, // skip corrupt / wrong-version files
-        }
-    }
+    let (mut metas, skipped) = collect_session_entries(&root, include_hidden)?;
+    warn_about_skipped_sessions(&skipped);
 
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
     if limit > 0 {
         metas.truncate(limit);
     }
     Ok(metas)
+}
+
+/// Listable session entries, plus `(path, reason)` for each file that could not
+/// be read.
+type SessionScan = (Vec<SessionListEntry>, Vec<(PathBuf, String)>);
+
+/// Read every session document under `root`, partitioned into listable entries
+/// and the ones that could not be read.
+fn collect_session_entries(root: &Path, include_hidden: bool) -> Result<SessionScan, String> {
+    let mut metas = Vec::new();
+    let mut skipped = Vec::new();
+    for path in iter_session_json_files(root)? {
+        match session_list_entry_from_path(&path) {
+            Ok(entry) => {
+                if include_hidden || entry.kind.is_user() {
+                    metas.push(entry);
+                }
+            }
+            Err(reason) => skipped.push((path, reason)),
+        }
+    }
+    Ok((metas, skipped))
+}
+
+/// Report unreadable session files on stderr, once per process.
+///
+/// Listings run several times a session (`/sessions`, bare `/resume`, the
+/// `session_meta` and `list_recent` tools); repeating the same warning each
+/// time would train the reader to ignore it.
+fn warn_about_skipped_sessions(skipped: &[(PathBuf, String)]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    if skipped.is_empty() || WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!(
+        "warning: {} session file(s) under {} could not be read and are omitted from listings",
+        skipped.len(),
+        session_root()
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| "~/.myco/session".into())
+    );
+    for (path, reason) in skipped.iter().take(3) {
+        eprintln!("  {}: {reason}", path.display());
+    }
+    if skipped.len() > 3 {
+        eprintln!("  … and {} more", skipped.len() - 3);
+    }
+}
+
+/// List every readable **visible** session (no limit). Wrong-version files are omitted.
+pub fn list_all_sessions() -> Result<Vec<SessionListEntry>, String> {
+    list_sessions(0)
+}
+
+/// List every readable session including hidden (no limit).
+pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_filtered(0, true)
 }
 
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
@@ -1221,6 +1278,173 @@ mod tests {
             Session::load_by_id_or_prefix(&id).unwrap().last_usage,
             Some(usage)
         );
+    }
+
+    /// The on-disk schema is a contract, and it is spelled with Rust
+    /// identifiers: `Message`, `Content`, `ToolUse`, `ToolResult` and
+    /// `TurnEndReason` serialize externally tagged with no `serde(rename)`
+    /// pinning them. Renaming a variant or a field therefore compiles, keeps
+    /// `version: 2`, and makes every stored session unreadable — after which
+    /// `list_sessions_filtered` drops the files from listings.
+    ///
+    /// This fixture is that contract written down: a v2 document covering every
+    /// variant of every persisted type. It must keep loading, and it must
+    /// re-serialize byte-for-byte. If this test fails, the disk format changed:
+    /// either revert the rename or bump [`SESSION_FILE_VERSION`] deliberately
+    /// and replace this fixture.
+    #[test]
+    fn v2_golden_fixture_loads_and_reserializes_byte_identically() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2_all_variants.json");
+
+        let session: Session = serde_json::from_str(FIXTURE).expect("fixture must parse as v2");
+
+        assert_eq!(session.version, SESSION_FILE_VERSION);
+        assert_eq!(session.id, "aabbccddeeff00112233445566778899");
+        assert_eq!(session.model, "opus-catalog-key");
+        assert_eq!(session.title.as_deref(), Some("every v2 variant"));
+        assert_eq!(session.scratchpad, "scratch notes");
+        assert_eq!(session.kind, SessionKind::Subagent);
+        assert!(session.is_hidden());
+        assert!(session.parent_session_id.is_some());
+        assert!(session.predecessor_id.is_some());
+        assert!(session.successor_id.is_some());
+
+        let usage = session.last_usage.expect("last_usage");
+        assert_eq!(usage.input_tokens, 12_345);
+        assert_eq!(usage.output_tokens, 678);
+        assert_eq!(usage.cached_input_tokens, 9_000);
+
+        // Both link kinds, with their optional fields populated.
+        assert_eq!(session.links.len(), 2);
+        match &session.links[0] {
+            SessionLink::GitHubPr { repo, number, .. } => {
+                assert_eq!(repo.as_deref(), Some("tsnl/myco"));
+                assert_eq!(*number, Some(1));
+            }
+            other => panic!("expected pr link, got {other:?}"),
+        }
+        match &session.links[1] {
+            SessionLink::Worktree { host, path, .. } => {
+                assert_eq!(host, "devbox");
+                assert_eq!(path, "/tmp/wt");
+            }
+            other => panic!("expected worktree link, got {other:?}"),
+        }
+
+        // Every Message variant, and every Content variant inside them.
+        use crate::generative_model::TurnEndReason;
+        assert_eq!(session.messages.len(), 6);
+        match &session.messages[0] {
+            Message::UserMessage { content } => {
+                assert!(
+                    matches!(&content[0], Content::Text { text } if text == "look at this shot")
+                );
+                assert!(
+                    matches!(&content[1], Content::Image { source } if source.starts_with("data:image/png"))
+                );
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+        match &session.messages[1] {
+            Message::AssistantMessage {
+                content,
+                tool_uses,
+                turn_end_reason,
+            } => {
+                // Signed thinking and the redacted placeholder both survive.
+                match &content[0] {
+                    Content::Thinking {
+                        text,
+                        signature,
+                        redacted,
+                    } => {
+                        assert_eq!(text, "weighing options");
+                        assert_eq!(signature.as_deref(), Some("sig-abc"));
+                        assert!(!redacted);
+                    }
+                    other => panic!("expected signed thinking, got {other:?}"),
+                }
+                assert!(
+                    matches!(&content[1], Content::Thinking { redacted, signature, .. } if *redacted && signature.is_none())
+                );
+                assert_eq!(tool_uses.len(), 1);
+                assert_eq!(tool_uses[0].id, "toolu_01");
+                assert_eq!(tool_uses[0].input["command"], "echo hi");
+                assert_eq!(*turn_end_reason, Some(TurnEndReason::ToolUse));
+            }
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        match &session.messages[2] {
+            Message::ToolResults { tool_use_results } => {
+                assert_eq!(tool_use_results.len(), 2);
+                assert!(!tool_use_results[0].is_error);
+                assert!(tool_use_results[1].is_error);
+            }
+            other => panic!("expected tool results, got {other:?}"),
+        }
+        // The remaining turn-end reasons, including the stringly-typed arm.
+        let reasons: Vec<_> = session.messages[3..]
+            .iter()
+            .map(|m| match m {
+                Message::AssistantMessage {
+                    turn_end_reason, ..
+                } => turn_end_reason.clone(),
+                other => panic!("expected assistant message, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some(TurnEndReason::MaxTokens),
+                Some(TurnEndReason::Other("Anthropic::PauseTurn".into())),
+                Some(TurnEndReason::EndTurn),
+            ]
+        );
+
+        // Round-trip: the bytes we write must be the bytes we accept.
+        let reserialized = format!("{}\n", serde_json::to_string_pretty(&session).unwrap());
+        assert_eq!(
+            reserialized, FIXTURE,
+            "session serialization drifted from the v2 fixture"
+        );
+    }
+
+    /// Unreadable files must be reported as skipped, not dropped on the floor:
+    /// a corrupt newest session would otherwise make bare `--resume` open an
+    /// older one with no explanation.
+    #[test]
+    fn corrupt_and_wrong_version_files_are_reported_as_skipped() {
+        let root = crate::test_support::temp_dir("session-skip");
+        let dir = root.path();
+        let shard = dir.join("aa");
+        fs::create_dir_all(&shard).unwrap();
+
+        let mut good = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
+        good.messages.push(Message::UserMessage {
+            content: vec![Content::Text {
+                text: "readable".into(),
+            }],
+        });
+        fs::write(
+            shard.join(format!("{}.json", good.id)),
+            serde_json::to_vec(&good).unwrap(),
+        )
+        .unwrap();
+
+        fs::write(shard.join("aabroken.json"), b"{ not json at all").unwrap();
+        fs::write(
+            shard.join("aalegacy.json"),
+            br#"{"version":1,"id":"aalegacy","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
+        )
+        .unwrap();
+
+        let (entries, skipped) = collect_session_entries(dir, false).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].id, good.id);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+
+        let reasons: String = skipped.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(reasons.contains("unsupported session version"), "{reasons}");
     }
 
     #[test]
