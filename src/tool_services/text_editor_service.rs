@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -436,7 +435,7 @@ fn insert_after_line(content: &str, insert_line: i64, insert_text: &str) -> Resu
 }
 
 fn atomically_write_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    // Resolve symlinks first: AtomicWriteFile replaces the path it is given,
+    // Resolve symlinks first: `atomically_write` replaces the path it is given,
     // so writing through the raw path would turn a symlink into a regular
     // file and silently fork its content away from the target.
     let target = match path.canonicalize() {
@@ -444,12 +443,7 @@ fn atomically_write_file(path: &Path, content: &[u8]) -> Result<(), String> {
         // New file (create): nothing to resolve yet.
         Err(_) => path.to_path_buf(),
     };
-    let mut file = atomic_write_file::AtomicWriteFile::options()
-        .open(&target)
-        .map_err(|e| e.to_string())?;
-    file.write_all(content).map_err(|e| e.to_string())?;
-    file.commit().map_err(|e| e.to_string())?;
-    Ok(())
+    crate::core::atomically_write(&target, content)
 }
 
 /// Command discriminator for the text-editor tool.
