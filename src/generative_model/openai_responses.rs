@@ -11,7 +11,8 @@ use crate::core::*;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
-    OpenAIBackendConfig, image_url, images_of, reasoning_effort, text_of, tool_result_text,
+    OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
+    tool_result_text, user_content_parts,
 };
 use super::*;
 
@@ -29,15 +30,6 @@ impl OpenAIResponsesGenerativeModel {
         config: GenerativeModelConfig,
         backend: OpenAIBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        if config.model.protocol != Protocol::OpenAIResponses {
-            return Err(ModelCreationError::BadConfig(format!(
-                "model `{}` speaks {}, not {}",
-                config.model,
-                config.model.protocol,
-                Protocol::OpenAIResponses
-            )));
-        }
-
         let auth = (!backend.auth_token.is_empty())
             .then(|| ("authorization", format!("Bearer {}", backend.auth_token)));
         let client = driver_core::build_client(auth, &[])?;
@@ -89,10 +81,6 @@ impl OpenAIResponsesGenerativeModel {
             reasoning,
         };
 
-        if self.backend.debug_dump_api_requests {
-            eprintln!("{}", serde_json::to_string_pretty(&request).unwrap());
-        }
-
         let base = self.backend.base_url.trim_end_matches('/');
         self.client.post(format!("{base}/responses")).json(&request)
     }
@@ -105,6 +93,7 @@ impl GenerativeModel for OpenAIResponsesGenerativeModel {
             self.response_request(&input_items),
             StreamAccumulator::default(),
             "OpenAI Responses",
+            self.backend.debug_dump_api_requests,
         )
     }
 }
@@ -166,23 +155,17 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
 /// User message content: plain string when text-only, `input_text` /
 /// `input_image` parts when images are attached.
 fn user_content_to_input(content: &[Content]) -> ResponsesMessageContent {
-    if !content.iter().any(|c| matches!(c, Content::Image { .. })) {
-        return ResponsesMessageContent::Text(text_of(content));
+    let parts = user_content_parts(
+        content,
+        |text| ResponsesContentPart::InputText { text: text.into() },
+        |source| ResponsesContentPart::InputImage {
+            image_url: image_url(source),
+        },
+    );
+    match parts {
+        Some(parts) => ResponsesMessageContent::Parts(parts),
+        None => ResponsesMessageContent::Text(text_of(content)),
     }
-    ResponsesMessageContent::Parts(
-        content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => {
-                    Some(ResponsesContentPart::InputText { text: text.clone() })
-                }
-                Content::Image { source } => Some(ResponsesContentPart::InputImage {
-                    image_url: image_url(source),
-                }),
-                Content::Thinking { .. } => None,
-            })
-            .collect(),
-    )
 }
 
 /// `function_call_output.output`: the plain-string form for text-only
@@ -243,24 +226,14 @@ impl SseAccumulator for StreamAccumulator {
     }
 
     fn finish(self) -> Result<(), GenerateError> {
-        if self.stop_reason.is_none() {
-            return Err(GenerateError::MalformedResponseError(
-                "OpenAI Responses stream ended without response.completed".into(),
-            ));
-        }
-
-        for (i, json) in self.tool_input_json.into_iter().enumerate() {
-            if let Some(json) = json {
-                let json = if json.is_empty() { "{}" } else { json.as_str() };
-                if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
-                    return Err(GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: function call arguments at output {i} invalid: {e}"
-                    )));
-                }
-            }
-        }
-
-        Ok(())
+        driver_core::validate_finish(
+            "OpenAI Responses",
+            self.stop_reason.is_some(),
+            self.tool_input_json
+                .iter()
+                .enumerate()
+                .filter_map(|(i, json)| json.as_deref().map(|j| (i, j))),
+        )
     }
 }
 
@@ -279,16 +252,15 @@ impl StreamAccumulator {
         let mut out = Vec::new();
 
         match event {
-            ResponsesStreamEvent::ResponseCreated { .. }
-            | ResponsesStreamEvent::ResponseInProgress { .. } => {}
+            ResponsesStreamEvent::ResponseCreated | ResponsesStreamEvent::ResponseInProgress => {}
             ResponsesStreamEvent::ResponseOutputItemAdded { output_index, item } => match item {
-                ResponsesOutputItem::Message { .. } => {
+                ResponsesOutputItem::Message => {
                     let content_index = self.slots.open_content(output_index);
                     out.push(MessagePart::ContentStart(ContentStart::Text {
                         index: content_index,
                     }));
                 }
-                ResponsesOutputItem::Reasoning { .. } => {
+                ResponsesOutputItem::Reasoning => {
                     let content_index = self.slots.open_thinking(output_index);
                     out.push(MessagePart::ContentStart(ContentStart::Thinking {
                         index: content_index,
@@ -300,7 +272,6 @@ impl StreamAccumulator {
                     call_id,
                     name,
                     arguments,
-                    ..
                 } => {
                     // An id-less or nameless call is poison: it would flow into
                     // persisted history and 400 on every later request (resume
@@ -327,7 +298,6 @@ impl StreamAccumulator {
             ResponsesStreamEvent::ResponseOutputTextDelta {
                 output_index,
                 delta,
-                ..
             } => {
                 // Lazy-open a content slot if the gateway skips output_item.added for text.
                 if self.slots.get(output_index).is_none() {
@@ -370,11 +340,10 @@ impl StreamAccumulator {
                 }
             }
             // Raw reasoning traces are intentionally dropped (summary-only public API).
-            ResponsesStreamEvent::ResponseReasoningTextDelta { .. } => {}
+            ResponsesStreamEvent::ResponseReasoningTextDelta => {}
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index,
                 delta,
-                ..
             } => {
                 match self.slots.get(output_index) {
                     Some(Slot::ToolUse { index }) => {
@@ -401,7 +370,6 @@ impl StreamAccumulator {
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDone {
                 output_index,
                 arguments,
-                ..
             } => {
                 if let Some(arguments) = arguments {
                     // Prefer the final assembled arguments when the gateway provides them.
@@ -572,17 +540,9 @@ enum ResponsesContentPart {
 #[serde(tag = "type")]
 enum ResponsesStreamEvent {
     #[serde(rename = "response.created")]
-    ResponseCreated {
-        #[serde(default)]
-        #[allow(dead_code)]
-        response: serde_json::Value,
-    },
+    ResponseCreated,
     #[serde(rename = "response.in_progress")]
-    ResponseInProgress {
-        #[serde(default)]
-        #[allow(dead_code)]
-        response: serde_json::Value,
-    },
+    ResponseInProgress,
     #[serde(rename = "response.output_item.added")]
     ResponseOutputItemAdded {
         #[serde(default)]
@@ -594,9 +554,6 @@ enum ResponsesStreamEvent {
         #[serde(default)]
         output_index: usize,
         delta: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        content_index: Option<usize>,
     },
     /// OpenAI reasoning summary stream (when reasoning is enabled).
     #[serde(rename = "response.reasoning_summary_text.delta")]
@@ -608,13 +565,7 @@ enum ResponsesStreamEvent {
     /// Some gateways stream raw reasoning text under this event name.
     /// Intentionally ignored (summary-only public thinking API).
     #[serde(rename = "response.reasoning_text.delta")]
-    ResponseReasoningTextDelta {
-        #[serde(default)]
-        #[allow(dead_code)]
-        output_index: usize,
-        #[allow(dead_code)]
-        delta: String,
-    },
+    ResponseReasoningTextDelta,
     #[serde(rename = "response.function_call_arguments.delta")]
     ResponseFunctionCallArgumentsDelta {
         #[serde(default)]
@@ -627,9 +578,6 @@ enum ResponsesStreamEvent {
         output_index: usize,
         #[serde(default)]
         arguments: Option<String>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        name: Option<String>,
     },
     #[serde(rename = "response.completed")]
     ResponseCompleted { response: ResponsesCompletedBody },
@@ -650,25 +598,11 @@ enum ResponsesStreamEvent {
 #[serde(tag = "type")]
 enum ResponsesOutputItem {
     #[serde(rename = "message")]
-    Message {
-        #[serde(default)]
-        #[allow(dead_code)]
-        id: Option<String>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        role: Option<String>,
-    },
+    Message,
     #[serde(rename = "reasoning")]
-    Reasoning {
-        #[serde(default)]
-        #[allow(dead_code)]
-        id: Option<String>,
-    },
+    Reasoning,
     #[serde(rename = "function_call")]
     FunctionCall {
-        #[serde(default)]
-        #[allow(dead_code)]
-        id: Option<String>,
         #[serde(default)]
         call_id: Option<String>,
         #[serde(default)]
@@ -689,37 +623,7 @@ struct ResponsesCompletedBody {
     #[serde(default)]
     error: Option<serde_json::Value>,
     #[serde(default)]
-    usage: Option<ResponsesUsage>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ResponsesUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    input_tokens_details: Option<ResponsesInputTokensDetails>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ResponsesInputTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-impl ResponsesUsage {
-    fn into_token_usage(self) -> crate::generative_model::TokenUsage {
-        // input_tokens is already the full prompt; cached_tokens is a subset.
-        crate::generative_model::TokenUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cached_input_tokens: self
-                .input_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0),
-        }
-    }
+    usage: Option<OpenAIUsage>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -735,46 +639,22 @@ struct ResponsesIncompleteDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn usage_reports_cached_input_as_subset() {
-        let usage = ResponsesUsage {
-            input_tokens: 10_000,
-            output_tokens: 200,
-            input_tokens_details: Some(ResponsesInputTokensDetails {
-                cached_tokens: Some(8_000),
-            }),
-        }
-        .into_token_usage();
-        assert_eq!(usage.input_tokens, 10_000);
-        assert_eq!(usage.cached_input_tokens, 8_000);
-        assert_eq!(usage.context_tokens(), 10_000);
-    }
+    use crate::test_support::{
+        assistant_tool, expect_text_delta, expect_thinking_delta, expect_tool_args_delta,
+        expect_tool_start, expect_turn_end, tool_results, user,
+    };
 
     #[test]
     fn convert_user_and_tool_results() {
         let input = [
-            Message::UserMessage {
-                content: vec![Content::Text { text: "hi".into() }],
-            },
-            Message::AssistantMessage {
-                content: vec![],
-                tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({"command": "echo hi"}),
-                }],
-                turn_end_reason: Some(TurnEndReason::ToolUse),
-            },
-            Message::ToolResults {
-                tool_use_results: vec![ToolResult {
-                    id: "call_1".into(),
-                    content: vec![Content::Text {
-                        text: "hi\n".into(),
-                    }],
-                    is_error: false,
-                }],
-            },
+            user("hi"),
+            assistant_tool(
+                None,
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "echo hi"}),
+            ),
+            tool_results(&[("call_1", "hi\n")]),
         ];
         let items = convert_messages(&input);
         assert_eq!(items.len(), 3);
@@ -856,7 +736,6 @@ mod tests {
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
                 item: ResponsesOutputItem::FunctionCall {
-                    id: None,
                     call_id: None,
                     name: Some("bash".into()),
                     arguments: None,
@@ -895,21 +774,9 @@ mod tests {
 
     #[test]
     fn text_only_user_message_stays_plain_string() {
-        let input = [Message::UserMessage {
-            content: vec![Content::Text { text: "hi".into() }],
-        }];
+        let input = [user("hi")];
         let json = serde_json::to_value(convert_messages(&input)).unwrap();
         assert_eq!(json[0]["content"], "hi");
-    }
-
-    #[test]
-    fn image_url_passes_urls_and_wraps_raw_base64() {
-        assert_eq!(image_url("https://x.test/a.png"), "https://x.test/a.png");
-        assert_eq!(
-            image_url("data:image/jpeg;base64,AA"),
-            "data:image/jpeg;base64,AA"
-        );
-        assert_eq!(image_url("iVBOR"), "data:image/png;base64,iVBOR");
     }
 
     #[test]
@@ -927,26 +794,13 @@ mod tests {
     }
 
     #[test]
-    fn sse_parser_basic() {
-        let mut parser = SseParser::default();
-        let chunk = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
-                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n";
-        let events = parser.push(chunk);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].contains("response.created"));
-        assert!(events[1].contains("output_text.delta"));
-    }
-
-    #[test]
     fn stream_accumulator_reasoning_to_thinking() {
         let mut acc = StreamAccumulator::default();
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
-                item: ResponsesOutputItem::Reasoning {
-                    id: Some("r1".into()),
-                },
+                item: ResponsesOutputItem::Reasoning,
             })
             .unwrap();
         assert!(matches!(
@@ -964,21 +818,12 @@ mod tests {
                 delta: "step one".into(),
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ContentDelta(ContentDelta::Thinking { index, delta }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(delta, "step one");
-            }
-            other => panic!("expected thinking delta, got {other:?}"),
-        }
+        expect_thinking_delta(&items[0], 0, "step one");
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 1,
-                item: ResponsesOutputItem::Message {
-                    id: None,
-                    role: Some("assistant".into()),
-                },
+                item: ResponsesOutputItem::Message,
             })
             .unwrap();
         assert!(matches!(
@@ -994,9 +839,7 @@ mod tests {
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
-                item: ResponsesOutputItem::Reasoning {
-                    id: Some("r1".into()),
-                },
+                item: ResponsesOutputItem::Reasoning,
             })
             .unwrap();
         assert!(matches!(
@@ -1006,10 +849,7 @@ mod tests {
 
         // Raw reasoning_text must not produce Thinking deltas (summary-only API).
         let items = acc
-            .handle_event(ResponsesStreamEvent::ResponseReasoningTextDelta {
-                output_index: 0,
-                delta: "secret chain of thought".into(),
-            })
+            .handle_event(ResponsesStreamEvent::ResponseReasoningTextDelta)
             .unwrap();
         assert!(items.is_empty());
 
@@ -1020,12 +860,7 @@ mod tests {
                 delta: "brief summary".into(),
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ContentDelta(ContentDelta::Thinking { delta, .. }) => {
-                assert_eq!(delta, "brief summary");
-            }
-            other => panic!("expected summary thinking delta, got {other:?}"),
-        }
+        expect_thinking_delta(&items[0], 0, "brief summary");
     }
 
     #[test]
@@ -1035,10 +870,7 @@ mod tests {
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
-                item: ResponsesOutputItem::Message {
-                    id: None,
-                    role: Some("assistant".into()),
-                },
+                item: ResponsesOutputItem::Message,
             })
             .unwrap();
         assert!(matches!(
@@ -1050,36 +882,21 @@ mod tests {
             .handle_event(ResponsesStreamEvent::ResponseOutputTextDelta {
                 output_index: 0,
                 delta: "Hi".into(),
-                content_index: Some(0),
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ContentDelta(ContentDelta::Text { index, delta }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(delta, "Hi");
-            }
-            _ => panic!(),
-        }
+        expect_text_delta(&items[0], 0, "Hi");
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 1,
                 item: ResponsesOutputItem::FunctionCall {
-                    id: Some("fc_1".into()),
                     call_id: Some("call_1".into()),
                     name: Some("get_weather".into()),
                     arguments: Some(String::new()),
                 },
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ToolUseStart(ToolUseStart { index, id, name }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(id, "call_1");
-                assert_eq!(name, "get_weather");
-            }
-            _ => panic!(),
-        }
+        expect_tool_start(&items[0], 0, "call_1", "get_weather");
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
@@ -1087,16 +904,7 @@ mod tests {
                 delta: r#"{"city":"SF"}"#.into(),
             })
             .unwrap();
-        match &items[0] {
-            MessagePart::ToolUseDelta(ToolUseDelta {
-                index,
-                input_json_delta,
-            }) => {
-                assert_eq!(*index, 0);
-                assert_eq!(input_json_delta, r#"{"city":"SF"}"#);
-            }
-            _ => panic!(),
-        }
+        expect_tool_args_delta(&items[0], 0, r#"{"city":"SF"}"#);
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseCompleted {
@@ -1108,10 +916,7 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::TurnEndReason(TurnEndReason::ToolUse)
-        ));
+        expect_turn_end(&items[0], TurnEndReason::ToolUse);
         acc.finish().unwrap();
     }
 
@@ -1121,7 +926,6 @@ mod tests {
         acc.handle_event(ResponsesStreamEvent::ResponseOutputTextDelta {
             output_index: 0,
             delta: "ok".into(),
-            content_index: None,
         })
         .unwrap();
         let items = acc
@@ -1134,10 +938,7 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(
-            items[0],
-            MessagePart::TurnEndReason(TurnEndReason::EndTurn)
-        ));
+        expect_turn_end(&items[0], TurnEndReason::EndTurn);
         acc.finish().unwrap();
     }
 

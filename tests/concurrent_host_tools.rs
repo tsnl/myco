@@ -1,114 +1,42 @@
 //! Regression: same-turn concurrent host tool uses (join_all) must complete.
 
+mod test_utils;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream;
-use myco::core::AsyncStream;
 use myco::core::CancelToken;
-use myco::generative_model::{
-    Content, GenerateError, GenerateOutput, GenerativeModel, Message, MessagePart, ToolUse,
-    TurnEndReason,
-};
+use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
 use myco::harness::{Harness, HarnessConfig};
 use myco::{Agent, NullEventSink};
 use serde_json::json;
-use std::sync::Arc;
-use std::sync::Mutex;
-
-struct ScriptedModel {
-    scripts: Mutex<std::collections::VecDeque<GenerateOutput>>,
-}
-
-impl ScriptedModel {
-    fn new(scripts: Vec<GenerateOutput>) -> Arc<Self> {
-        Arc::new(Self {
-            scripts: Mutex::new(scripts.into()),
-        })
-    }
-}
-
-impl GenerativeModel for ScriptedModel {
-    fn generate(&self, _input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let output = self
-            .scripts
-            .lock()
-            .expect("scripts lock")
-            .pop_front()
-            .expect("scripted model ran out of outputs");
-
-        let mut parts = vec![MessagePart::MessageStart];
-        for (i, c) in output.content.iter().enumerate() {
-            match c {
-                Content::Text { text } => {
-                    parts.push(MessagePart::ContentStart(
-                        myco::generative_model::ContentStart::Text { index: i },
-                    ));
-                    parts.push(MessagePart::ContentDelta(
-                        myco::generative_model::ContentDelta::Text {
-                            index: i,
-                            delta: text.clone(),
-                        },
-                    ));
-                }
-                Content::Image { source } => {
-                    parts.push(MessagePart::ContentStart(
-                        myco::generative_model::ContentStart::Image { index: i },
-                    ));
-                    parts.push(MessagePart::ContentDelta(
-                        myco::generative_model::ContentDelta::Image {
-                            index: i,
-                            delta: source.clone(),
-                        },
-                    ));
-                }
-                Content::Thinking {
-                    text,
-                    signature,
-                    redacted,
-                } => {
-                    parts.push(MessagePart::ContentStart(
-                        myco::generative_model::ContentStart::Thinking {
-                            index: i,
-                            signature: signature.clone(),
-                            redacted: *redacted,
-                        },
-                    ));
-                    if !text.is_empty() && !*redacted {
-                        parts.push(MessagePart::ContentDelta(
-                            myco::generative_model::ContentDelta::Thinking {
-                                index: i,
-                                delta: text.clone(),
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-        for (i, tu) in output.tool_uses.iter().enumerate() {
-            parts.push(MessagePart::ToolUseStart(
-                myco::generative_model::ToolUseStart {
-                    index: i,
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                },
-            ));
-            parts.push(MessagePart::ToolUseDelta(
-                myco::generative_model::ToolUseDelta {
-                    index: i,
-                    input_json_delta: tu.input.to_string(),
-                },
-            ));
-        }
-        parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
-        Box::pin(stream::iter(parts.into_iter().map(Ok)))
-    }
-}
+use test_utils::{ScriptedModel, tool_text};
 
 fn bash_tool(id: &str, command: &str) -> ToolUse {
     ToolUse {
         id: id.into(),
         name: "bash".into(),
         input: json!({"command": command, "timeout_ms": 5000}),
+    }
+}
+
+/// One scripted model turn: tool calls end the turn with `ToolUse`, a bare
+/// text reply ends it with `EndTurn`.
+fn scripted_turn(text: &str, tool_uses: Vec<ToolUse>) -> GenerateOutput {
+    let turn_end_reason = if tool_uses.is_empty() {
+        TurnEndReason::EndTurn
+    } else {
+        TurnEndReason::ToolUse
+    };
+    GenerateOutput {
+        content: if text.is_empty() {
+            vec![]
+        } else {
+            vec![Content::Text { text: text.into() }]
+        },
+        tool_uses,
+        turn_end_reason,
+        usage: None,
     }
 }
 
@@ -119,24 +47,15 @@ async fn agent_concurrent_host_bash_tools_complete() {
         .expect("attach local host");
 
     let model = ScriptedModel::new(vec![
-        GenerateOutput {
-            content: vec![],
-            tool_uses: vec![
+        scripted_turn(
+            "",
+            vec![
                 bash_tool("t1", "sleep 0.2; echo ONE"),
                 bash_tool("t2", "sleep 0.2; echo TWO"),
                 bash_tool("t3", "printf THREE"),
             ],
-            turn_end_reason: TurnEndReason::ToolUse,
-            usage: None,
-        },
-        GenerateOutput {
-            content: vec![Content::Text {
-                text: "done".into(),
-            }],
-            tool_uses: vec![],
-            turn_end_reason: TurnEndReason::EndTurn,
-            usage: None,
-        },
+        ),
+        scripted_turn("done", vec![]),
     ]);
 
     let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
@@ -171,19 +90,7 @@ async fn agent_concurrent_host_bash_tools_complete() {
                     tool_use_results[i]
                 );
             }
-            let texts: Vec<String> = tool_use_results
-                .iter()
-                .map(|r| {
-                    r.content
-                        .iter()
-                        .filter_map(|c| match c {
-                            Content::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .collect();
+            let texts: Vec<String> = tool_use_results.iter().map(tool_text).collect();
             assert!(texts[0].contains("ONE"), "{}", texts[0]);
             assert!(texts[1].contains("TWO"), "{}", texts[1]);
             assert!(texts[2].contains("THREE"), "{}", texts[2]);
@@ -200,32 +107,24 @@ async fn agent_concurrent_bash_and_editor_complete() {
 
     let tmp = std::env::temp_dir().join(format!("myco-concurrent-edit-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let path = tmp.to_string_lossy().to_string();
 
     let model = ScriptedModel::new(vec![
-        GenerateOutput {
-            content: vec![],
-            tool_uses: vec![
+        scripted_turn(
+            "",
+            vec![
                 bash_tool("b1", "echo from-bash"),
                 ToolUse {
                     id: "e1".into(),
                     name: "str_replace_based_edit_tool".into(),
                     input: json!({
                         "command": "create",
-                        "path": path,
+                        "path": tmp.to_string_lossy(),
                         "file_text": "hello-from-editor\n"
                     }),
                 },
             ],
-            turn_end_reason: TurnEndReason::ToolUse,
-            usage: None,
-        },
-        GenerateOutput {
-            content: vec![Content::Text { text: "ok".into() }],
-            tool_uses: vec![],
-            turn_end_reason: TurnEndReason::EndTurn,
-            usage: None,
-        },
+        ),
+        scripted_turn("ok", vec![]),
     ]);
 
     let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));

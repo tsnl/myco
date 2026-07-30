@@ -204,10 +204,6 @@ impl ModelCatalog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 /// Reasoning / extended-thinking effort level sent to providers.
@@ -420,16 +416,13 @@ pub enum Content {
     },
 }
 
-impl Content {
-    /// Final-answer content (excludes thinking).
-    pub fn is_answer(&self) -> bool {
-        matches!(self, Content::Text { .. } | Content::Image { .. })
-    }
-}
-
 /// Clone only answer blocks (`Text` / `Image`), dropping thinking.
 pub fn answer_content(content: &[Content]) -> Vec<Content> {
-    content.iter().filter(|c| c.is_answer()).cloned().collect()
+    content
+        .iter()
+        .filter(|c| matches!(c, Content::Text { .. } | Content::Image { .. }))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -602,70 +595,11 @@ impl GenerateOutput {
                         "Malformed stream: unexpected MessageStart".into(),
                     ));
                 }
-                MessagePart::ContentStart(ContentStart::Text { index }) => {
-                    ensure_slot(
-                        &mut content,
-                        index,
-                        Content::Text {
-                            text: String::new(),
-                        },
-                    );
+                MessagePart::ContentStart(start) => {
+                    let (index, block) = start_block(start);
+                    ensure_slot(&mut content, index, block);
                 }
-                MessagePart::ContentStart(ContentStart::Image { index }) => {
-                    ensure_slot(
-                        &mut content,
-                        index,
-                        Content::Image {
-                            source: String::new(),
-                        },
-                    );
-                }
-                MessagePart::ContentStart(ContentStart::Thinking {
-                    index,
-                    signature,
-                    redacted,
-                }) => {
-                    ensure_slot(
-                        &mut content,
-                        index,
-                        Content::Thinking {
-                            text: String::new(),
-                            signature,
-                            redacted,
-                        },
-                    );
-                }
-                MessagePart::ContentDelta(ContentDelta::Text { index, delta }) => {
-                    let Some(Some(Content::Text { text })) = content.get_mut(index) else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: text delta index {index} is out of bounds \
-                             or points to non-text content"
-                        )));
-                    };
-                    text.push_str(&delta);
-                }
-                MessagePart::ContentDelta(ContentDelta::Image { index, delta }) => {
-                    let Some(Some(Content::Image { source })) = content.get_mut(index) else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: image delta index {index} is out of bounds \
-                             or points to non-image content"
-                        )));
-                    };
-                    source.push_str(&delta);
-                }
-                MessagePart::ContentDelta(ContentDelta::Thinking { index, delta }) => {
-                    let Some(Some(Content::Thinking { text, redacted, .. })) =
-                        content.get_mut(index)
-                    else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: thinking delta index {index} is out of bounds \
-                             or points to non-thinking content"
-                        )));
-                    };
-                    if !*redacted {
-                        text.push_str(&delta);
-                    }
-                }
+                MessagePart::ContentDelta(delta) => apply_content_delta(&mut content, delta)?,
                 MessagePart::ToolUseStart(ToolUseStart { index, id, name }) => {
                     ensure_slot(
                         &mut tool_uses,
@@ -745,6 +679,66 @@ fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize, value: T) {
         slots.push(None);
     }
     slots[index] = Some(value);
+}
+
+/// The empty [`Content`] block a [`ContentStart`] opens, with its index.
+fn start_block(start: ContentStart) -> (usize, Content) {
+    match start {
+        ContentStart::Text { index } => (
+            index,
+            Content::Text {
+                text: String::new(),
+            },
+        ),
+        ContentStart::Image { index } => (
+            index,
+            Content::Image {
+                source: String::new(),
+            },
+        ),
+        ContentStart::Thinking {
+            index,
+            signature,
+            redacted,
+        } => (
+            index,
+            Content::Thinking {
+                text: String::new(),
+                signature,
+                redacted,
+            },
+        ),
+    }
+}
+
+/// Append a [`ContentDelta`] to its opened block; the slot must exist and be
+/// the matching kind (redacted thinking swallows its deltas).
+fn apply_content_delta(
+    content: &mut [Option<Content>],
+    delta: ContentDelta,
+) -> Result<(), GenerateError> {
+    let index = match &delta {
+        ContentDelta::Text { index, .. }
+        | ContentDelta::Image { index, .. }
+        | ContentDelta::Thinking { index, .. } => *index,
+    };
+    match (content.get_mut(index).and_then(Option::as_mut), delta) {
+        (Some(Content::Text { text }), ContentDelta::Text { delta, .. }) => text.push_str(&delta),
+        (Some(Content::Image { source }), ContentDelta::Image { delta, .. }) => {
+            source.push_str(&delta);
+        }
+        (Some(Content::Thinking { text, redacted, .. }), ContentDelta::Thinking { delta, .. }) => {
+            if !*redacted {
+                text.push_str(&delta);
+            }
+        }
+        _ => {
+            return Err(GenerateError::MalformedResponseError(format!(
+                "Malformed stream: content delta at index {index}: out of bounds or wrong kind"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]

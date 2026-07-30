@@ -26,7 +26,6 @@ impl HarnessConfig {
             .filter(|a| a != "local")
             .map(|alias| HostConfig {
                 command: ssh_spawn_command(&alias),
-                ssh_destination: Some(alias.clone()),
                 name: alias,
             })
             .collect();
@@ -289,7 +288,6 @@ Host gpu bastion
         let names: Vec<_> = cfg.remote_hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["devbox", "gpu", "bastion"]);
         let h = &cfg.remote_hosts[0];
-        assert_eq!(h.ssh_destination.as_deref(), Some("devbox"));
         // No per-host SSH flags: user/port/identity are ssh config's job.
         assert_eq!(
             h.command,
@@ -346,15 +344,16 @@ Match host something
 
     #[test]
     fn include_directives_are_followed() {
-        let dir = std::env::temp_dir().join(format!("myco-sshconf-include-{}", std::process::id()));
-        let confd = dir.join("conf.d");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::temp_dir("sshconf-include");
+        let confd = dir.path().join("conf.d");
         std::fs::create_dir_all(&confd).unwrap();
         std::fs::write(confd.join("a.conf"), "Host devbox\n  HostName a.example\n").unwrap();
         std::fs::write(confd.join("b.conf"), "Host gpu\n").unwrap();
-        let main = format!("Include {}/conf.d/*.conf\n\nHost laptop\n", dir.display());
+        let main = format!(
+            "Include {}/conf.d/*.conf\n\nHost laptop\n",
+            dir.path().display()
+        );
         let aliases = ssh_config_host_aliases(&mut main.as_bytes()).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
         assert!(aliases.contains(&"devbox".to_string()), "{aliases:?}");
         assert!(aliases.contains(&"gpu".to_string()), "{aliases:?}");
         assert!(aliases.contains(&"laptop".to_string()), "{aliases:?}");
@@ -362,28 +361,25 @@ Match host something
 
     #[test]
     fn include_subfile_with_quoted_path_and_eq_form() {
-        let dir = std::env::temp_dir().join(format!("myco-sshconf-sub-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("extra conf"), "Host devbox\n").unwrap();
-        let main = format!("Include=\"{}/extra conf\"\nHost laptop\n", dir.display());
+        let dir = crate::test_support::temp_dir("sshconf-sub");
+        std::fs::write(dir.path().join("extra conf"), "Host devbox\n").unwrap();
+        let main = format!(
+            "Include=\"{}/extra conf\"\nHost laptop\n",
+            dir.path().display()
+        );
         let aliases = ssh_config_host_aliases(&mut main.as_bytes()).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(aliases, ["devbox", "laptop"]);
     }
 
     #[test]
     fn include_cycle_terminates() {
-        let dir = std::env::temp_dir().join(format!("myco-sshconf-cycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = dir.join("a.conf");
-        let b = dir.join("b.conf");
+        let dir = crate::test_support::temp_dir("sshconf-cycle");
+        let a = dir.path().join("a.conf");
+        let b = dir.path().join("b.conf");
         std::fs::write(&a, format!("Host a\nInclude {}\n", b.display())).unwrap();
         std::fs::write(&b, format!("Host b\nInclude {}\n", a.display())).unwrap();
         let main = format!("Include {}\n", a.display());
         let aliases = ssh_config_host_aliases(&mut main.as_bytes()).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(aliases, ["a", "b"]);
     }
 

@@ -564,44 +564,62 @@ fn clean_title(title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TempDir, temp_dir};
+
+    /// Temp home-shaped dir with `workspace/soul/` created — the layout the
+    /// soul/workspace fixtures build on. Panic-safe cleanup via [`TempDir`].
+    fn soul_home(tag: &str) -> TempDir {
+        let home = temp_dir(tag);
+        std::fs::create_dir_all(home.path().join("workspace").join("soul")).unwrap();
+        home
+    }
 
     #[test]
     fn epilogue_includes_always_on_policy() {
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Git worktrees for new features"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Computer use"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Think Before Coding"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("User authority & privileged operations"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("force-merge"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("manual"));
-        // Nested-agent recipe: prompts are single-line, self-contained turns,
-        // submitted only by a trailing newline.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("self-contained turn"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains(r#"ending each `write` with `"\n"`"#));
-        // Remote work goes through the `host` field, not local `ssh`.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("do not run `ssh <alias> …` from"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("persistent SSH connection"));
-        // runtime docs are files to search, not a tool to call
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`harness-ops.md`"));
+        for needle in [
+            "Git worktrees for new features",
+            "Computer use",
+            "Think Before Coding",
+            "User authority & privileged operations",
+            "force-merge",
+            "manual",
+            // Nested-agent recipe: prompts are single-line, self-contained
+            // turns, submitted only by a trailing newline.
+            "self-contained turn",
+            r#"ending each `write` with `"\n"`"#,
+            // Remote work goes through the `host` field, not local `ssh`.
+            "do not run `ssh <alias> …` from",
+            "persistent SSH connection",
+            // runtime catalog pointer, not full policy-as-articles
+            "`harness-ops.md`",
+            // Search guidance is bash-first; myco ships no search tools of
+            // its own. Semantic search is the external `ck` companion.
+            "`rg`",
+            "`ck`",
+            // Free-form workspace policy: maildir-style soul versions, the
+            // recall/record habit, and the consistency caution.
+            "Workspace & soul",
+            "~/.myco/workspace/soul/",
+            "write-once, never edited in place",
+            "weakly consistent",
+        ] {
+            assert!(
+                DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
+                "missing: {needle}"
+            );
+        }
+        // #98 moved the manual to disk: the epilogue points at files to
+        // search, and must not advertise a `manual` tool any more.
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`manual` tool"));
-        // Search guidance is bash-first; myco ships no search tools of its own.
-        // Semantic search is the external `ck` companion, probed per host.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`rg`"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`ck`"));
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
-        // Free-form workspace policy: maildir-style soul versions, the
-        // recall/record habit, and the consistency caution.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Workspace & soul"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("~/.myco/workspace/soul/"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("write-once, never edited in place"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("weakly consistent"));
     }
 
     /// Project guidance from the launch directory is appended at model build
     /// time — AGENTS.md preferred, CLAUDE.md fallback, absent = no section.
     #[test]
     fn project_guidance_is_appended_from_cwd() {
-        let dir = std::env::temp_dir().join(format!("myco-guidance-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = temp_dir("guidance");
+        let dir = cwd.path().to_path_buf();
         let epilogue = || epilogue_with(None, Some(dir.clone()), DEFAULT_MAX_SOUL_BYTES);
 
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
@@ -623,8 +641,6 @@ mod tests {
         );
         assert!(prompt.contains("agents_guidance_token"), "{prompt}");
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The manual is not a tool any more, so the prompt has to carry the
@@ -651,21 +667,31 @@ mod tests {
     /// from.
     #[test]
     fn workspace_fragment_biases_toward_recording_and_pruning() {
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("index over the workspace"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("distilled line and the pointer"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Date every line"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Every revision that adds also prunes"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Evidence beats the prompt"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`# Workspace Files` section"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("read the listed files"));
+        for needle in [
+            "index over the workspace",
+            "distilled line and the pointer",
+            "Date every line",
+            "Every revision that adds also prunes",
+            "Evidence beats the prompt",
+            "`# Workspace Files` section",
+            "read the listed files",
+        ] {
+            assert!(
+                DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
+                "missing: {needle}"
+            );
+        }
     }
 
     #[test]
     fn fork_recipe_and_model_stamp_are_documented() {
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("Context forking"));
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("--fork"));
         // The epilogue points at the stamp; the stamp names the key and flag.
-        assert!(DEFAULT_AGENT_PROMPT_EPILOGUE.contains("at the end of this prompt"));
+        for needle in ["Context forking", "--fork", "at the end of this prompt"] {
+            assert!(
+                DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
+                "missing: {needle}"
+            );
+        }
         let stamp = model_stamp("grok-4");
         assert!(stamp.contains("# Current Model"), "{stamp}");
         assert!(stamp.contains("`grok-4`"), "{stamp}");
@@ -718,9 +744,9 @@ mod tests {
 
     #[test]
     fn newest_soul_version_is_appended_to_the_epilogue() {
-        let dir = std::env::temp_dir().join(format!("myco-soul-{}", uuid::Uuid::new_v4()));
+        let home = soul_home("soul");
+        let dir = home.path().to_path_buf();
         let soul_dir = dir.join("workspace").join("soul");
-        std::fs::create_dir_all(&soul_dir).unwrap();
         let epilogue = || epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
 
         // No versions: the epilogue plus the unconditional Manual block, and
@@ -771,16 +797,15 @@ mod tests {
         .unwrap();
         let prompt = epilogue();
         assert!(prompt.contains("[soul truncated at 64 KiB"), "{prompt}");
+        // `base` (not the bare const): since #98 the epilogue also carries the
+        // unconditional Manual block naming the exported directory.
         assert!(prompt.len() < base.len() + DEFAULT_MAX_SOUL_BYTES + 200);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_cap_is_configurable_and_reports_what_it_cut() {
-        let dir = std::env::temp_dir().join(format!("myco-soul-cap-{}", uuid::Uuid::new_v4()));
-        let soul_dir = dir.join("workspace").join("soul");
-        std::fs::create_dir_all(&soul_dir).unwrap();
+        let home = soul_home("soul-cap");
+        let soul_dir = home.path().join("workspace").join("soul");
         // Multi-byte tail: the cut lands on a char boundary, never mid-char.
         let body = "é".repeat(1000);
         std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), &body).unwrap();
@@ -799,17 +824,15 @@ mod tests {
         assert!(text.starts_with(&"é".repeat(250)), "{text}");
         assert!(text.contains("[soul truncated at 501 B of 2 KiB"), "{text}");
         assert!(text.contains("write a shorter revision"), "{text}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn lowering_the_soul_cap_leaves_project_guidance_alone() {
         // `max_soul_bytes` is named for the soul; shrinking it to shorten a
         // soul must not silently start cutting AGENTS.md too.
-        let dir = std::env::temp_dir().join(format!("myco-both-{}", uuid::Uuid::new_v4()));
+        let home = soul_home("both");
+        let dir = home.path().to_path_buf();
         let soul_dir = dir.join("workspace").join("soul");
-        std::fs::create_dir_all(&soul_dir).unwrap();
         std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "s".repeat(4000)).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "g".repeat(4000)).unwrap();
 
@@ -820,16 +843,14 @@ mod tests {
         );
         assert!(!prompt.contains("[project guidance truncated"), "{prompt}");
         assert!(prompt.contains(&"g".repeat(4000)), "{prompt}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn workspace_listing_names_visible_files_after_the_soul() {
-        let dir = std::env::temp_dir().join(format!("myco-listing-{}", uuid::Uuid::new_v4()));
+        let home = soul_home("listing");
+        let dir = home.path().to_path_buf();
         let workspace = dir.join("workspace");
         let soul_dir = workspace.join("soul");
-        std::fs::create_dir_all(&soul_dir).unwrap();
         std::fs::create_dir_all(workspace.join("notes")).unwrap();
 
         std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "soul_token_alpha\n").unwrap();
@@ -881,8 +902,6 @@ mod tests {
         assert!(!prompt.contains(".tmp-draft.md"), "{prompt}");
         // AGENTS.md is the launch directory's, not the workspace's.
         assert!(!prompt.contains("- `AGENTS.md`"), "{prompt}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -894,21 +913,23 @@ mod tests {
 
     #[test]
     fn oversized_workspace_listing_is_capped_with_a_marker() {
-        let dir = std::env::temp_dir().join(format!("myco-listing-cap-{}", uuid::Uuid::new_v4()));
-        let workspace = dir.join("workspace");
+        let home = temp_dir("listing-cap");
+        let workspace = home.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let overflow = 25;
         for i in 0..(MAX_LISTING_ENTRIES + overflow) {
             std::fs::write(workspace.join(format!("n-{i:03}.md")), "# t\n").unwrap();
         }
 
-        let prompt = epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
+        let prompt = epilogue_with(
+            Some(home.path().to_path_buf()),
+            None,
+            DEFAULT_MAX_SOUL_BYTES,
+        );
         assert!(
             prompt.contains(&format!("[at least {overflow} more file(s) not listed")),
             "{prompt}"
         );
         assert!(prompt.len() < DEFAULT_AGENT_PROMPT_EPILOGUE.len() + MAX_LISTING_BYTES + 500);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,8 +1,6 @@
-//! Streaming Markdown renderer with fence-aware word wrap.
-//!
-//! Feed arbitrary UTF-8 chunks ([`MarkdownRenderer::feed`]); deltas may split
-//! anywhere, including inside a delimiter run or a `[text](url)` link. Two
-//! invariants:
+//! Streaming Markdown renderer with fence-aware word wrap. Chunks
+//! ([`MarkdownRenderer::feed`]) may split anywhere, including inside a
+//! delimiter run or a `[text](url)` link. Two invariants:
 //!
 //! - **Disabled = identity**: styling off ⇒ output is byte-identical to input
 //!   (the non-TTY / [`Palette::plain`] guarantee). No delimiter is dropped, so
@@ -17,40 +15,20 @@
 //!   exception: their `#` markers stay visible (the line just styles bold).
 //!   A stray delimiter can mis-style a span, never corrupt content.
 //!
-//! Internally the renderer is event-first: it produces a [`TuiEvent`] stream in
-//! which content ([`TuiEvent::Text`], escape-free, wrap applied) and
-//! presentation state ([`TuiEvent::Style`] / [`TuiEvent::Link`], semantic) are
-//! separate variants ([`MarkdownRenderer::feed_events`] /
-//! [`MarkdownRenderer::finish_events`]). The String API
-//! ([`MarkdownRenderer::feed`] / [`MarkdownRenderer::finish`]) is a facade that
-//! encodes that stream ([`crate::tui::encode_ansi`]), gated by the palette's
-//! `enabled` flag.
+//! Internally event-first: content ([`TuiEvent::Text`], escape-free, wrapped)
+//! and presentation ([`TuiEvent::Style`] / [`TuiEvent::Link`]) are separate
+//! variants ([`MarkdownRenderer::feed_events`]); the String API is a facade
+//! that encodes that stream ([`crate::tui::encode_ansi`]).
 //!
-//! Supported: `**` / `*` emphasis toggles (with a light flanking check),
-//! `` ` `` inline code, `[text](url)` links and bare `http(s)://` URLs (both
-//! OSC 8 when styled), ATX headers, fenced code blocks (never styled or
-//! wrapped), indented (4-space) lines verbatim, list hanging indent, and —
-//! **styled only** — GFM pipe tables.
-//!
-//! Tables are the one construct that needs the whole block before *any* of it
-//! can be emitted (column widths depend on the widest cell), which append-only
-//! output can't revise after the fact. So a leading-`|` line opens a capture
-//! that buffers rows until the block's terminator, then draws a box-drawing
-//! table with display-width-aligned columns. It stays a hold-back stream: the
-//! header row is buffered until the next line confirms a delimiter row
-//! (`| --- | :-: |`); a candidate that never confirms replays verbatim as
-//! prose. A table that fits the wrap width renders at its natural width; one
-//! too wide reflows — columns are sized by max-min fair share and cell contents
-//! wrap into taller rows so it stays inside the terminal (only an unbreakable
-//! over-long word can still overflow). Horizontal rules separate the body rows
-//! so rows stay distinguishable even when wrapped cells make them several
-//! physical lines tall. Because capture is gated on styling,
-//! **plain mode passes tables through byte-identically**, keeping the identity
-//! guarantee for files and pipes.
-//!
-//! Out of scope — constructs that need non-linear layout or lookaside beyond
-//! the above: setext headers, reference links, `<…>` angle-bracket autolinks,
-//! images.
+//! Supported: `**` / `*` emphasis, `` ` `` inline code, links and bare
+//! `http(s)://` URLs, ATX headers, fenced / indented code (verbatim), list
+//! hanging indent, and — **styled only** — GFM pipe tables. Tables are the one
+//! construct that needs the whole block before any of it can be emitted
+//! (column widths), so a leading-`|` line opens a hold-back capture that
+//! confirms a delimiter row or replays verbatim; too-wide tables reflow.
+//! Because capture is gated on styling, plain mode passes tables through
+//! byte-identically. Out of scope: setext headers, reference links, `<…>`
+//! autolinks, images.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -1320,25 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn chunked_and_single_feed_agree_when_styled_and_wrapped() {
-        let palette = Palette::colored(true).with_wrap(Some(14));
-        let inputs = [
-            "Some **bold words** wrap across a few lines here\n",
-            "# Header line that wraps\n\n- bullet with `code span` inside and more text\n",
-            "```\nfenced content stays put\n```\ntrailing prose after the fence block\n",
-        ];
-        for input in inputs {
-            let mut r = MarkdownRenderer::new(palette);
-            let mut chunked = String::new();
-            for c in input.chars() {
-                chunked.push_str(&r.feed(&c.to_string()));
-            }
-            chunked.push_str(&r.finish());
-            assert_eq!(chunked, render_block(input, palette), "{input:?}");
-        }
-    }
-
-    #[test]
     fn styled_output_strips_to_visible_text() {
         // Styling on: emphasis/code delimiters are consumed (headers keep `#`),
         // so stripping SGR + normalizing whitespace yields the visible text.
@@ -1428,27 +1387,38 @@ mod tests {
         assert_eq!(links, vec![Some("https://h.test".to_string()), None]);
     }
 
+    /// Shared corpus for the chunked-agreement claims: emphasis wrap, header +
+    /// bullet + code span, and fence + trailing prose.
+    const AGREEMENT_PALETTE: Palette = Palette::colored(true).with_wrap(Some(14));
+    const AGREEMENT_INPUTS: [&str; 3] = [
+        "Some **bold words** wrap across a few lines here\n",
+        "# Header line that wraps\n\n- bullet with `code span` inside and more text\n",
+        "```\nfenced content stays put\n```\ntrailing prose after the fence block\n",
+    ];
+
     #[test]
-    fn event_and_string_paths_agree_bytewise() {
-        let palette = Palette::colored(true).with_wrap(Some(14));
-        let inputs = [
-            "Some **bold words** wrap across a few lines here\n",
-            "# Header line that wraps\n\n- bullet with `code span` inside and more text\n",
-            "```\nfenced content stays put\n```\ntrailing prose after the fence block\n",
-        ];
-        for input in inputs {
-            // Char-chunked event stream, SGR-encoded, equals the String path.
-            let mut r = MarkdownRenderer::new(palette);
+    fn chunked_and_event_paths_agree_bytewise_with_single_feed_when_styled_and_wrapped() {
+        for input in AGREEMENT_INPUTS {
+            let whole = render_block(input, AGREEMENT_PALETTE);
+
+            // Char-chunked String feed equals the single feed…
+            let mut r = MarkdownRenderer::new(AGREEMENT_PALETTE);
+            let mut chunked = String::new();
+            for c in input.chars() {
+                chunked.push_str(&r.feed(&c.to_string()));
+            }
+            chunked.push_str(&r.finish());
+            assert_eq!(chunked, whole, "{input:?}");
+
+            // …and the char-chunked event stream, SGR-encoded, equals the
+            // String path.
+            let mut r = MarkdownRenderer::new(AGREEMENT_PALETTE);
             let mut events = Vec::new();
             for c in input.chars() {
                 events.extend(r.feed_events(&c.to_string()));
             }
             events.extend(r.finish_events());
-            assert_eq!(
-                encode_ansi(&events, true),
-                render_block(input, palette),
-                "{input:?}"
-            );
+            assert_eq!(encode_ansi(&events, true), whole, "{input:?}");
         }
     }
 

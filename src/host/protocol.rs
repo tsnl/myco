@@ -4,7 +4,7 @@
 //! - [`Request`]  — controller → worker
 //! - [`Response`] — worker → controller
 
-use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
+use crate::generative_model::{ToolResult, ToolUse};
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -20,12 +20,9 @@ pub enum Request {
         agent_id: uuid::Uuid,
         tool_use: ToolUse,
     },
-    /// Reap agent-owned host state (bash sessions, …).
-    AgentFinished {
-        /// Correlation id echoed in [`Response::AgentFinishedOk`].
-        id: String,
-        agent_id: uuid::Uuid,
-    },
+    /// Reap agent-owned host state (bash sessions, …). Fire-and-forget: the
+    /// worker does not reply (host process exit is the hard guarantee).
+    AgentFinished { agent_id: uuid::Uuid },
 }
 
 impl Request {
@@ -47,17 +44,11 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     HelloOk {
-        name: String,
         version: String,
-        tools: Vec<ToolSpec>,
     },
     ToolResult {
         id: String,
         result: ToolResult,
-    },
-    AgentFinishedOk {
-        id: String,
-        agent_id: uuid::Uuid,
     },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]

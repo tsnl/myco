@@ -32,8 +32,6 @@ pub struct HostConfig {
     pub name: String,
     /// argv to spawn (e.g. `["ssh", "-o", "BatchMode=yes", "devbox", "myco", "--mode", "host", "--name", "devbox"]`).
     pub command: Vec<String>,
-    /// SSH destination alias/hostname when this host is SSH-backed (for preflight).
-    pub ssh_destination: Option<String>,
 }
 
 /// How the controller talks to its worker.
@@ -214,7 +212,7 @@ impl HostController {
             tool_use,
         };
 
-        let rx = match self.submit(&id, &request, /*connect_if_needed*/ true).await {
+        let rx = match self.submit(&id, &request).await {
             Ok(rx) => rx,
             Err(e) => {
                 return ToolResult::err(format!("host {:?}: {e}", self.name)).with_id(tool_id);
@@ -230,18 +228,11 @@ impl HostController {
             r = rx => r,
         };
 
+        // `run_reader` routes a reply to the waiter registered under exactly
+        // its id, so a delivered response is always this call's ToolResult or
+        // Error — never another call's reply and never a hello.
         match reply {
-            Ok(Response::ToolResult {
-                id: reply_id,
-                result,
-            }) => {
-                if reply_id != id {
-                    return ToolResult::err(format!(
-                        "host {:?}: correlation mismatch (sent {id}, got {reply_id})",
-                        self.name
-                    ))
-                    .with_id(tool_id);
-                }
+            Ok(Response::ToolResult { result, .. }) => {
                 let mut result = result;
                 if result.id.is_empty() {
                     result.id = tool_id;
@@ -251,10 +242,7 @@ impl HostController {
             Ok(Response::Error { message, .. }) => {
                 ToolResult::err(format!("host {:?}: {message}", self.name)).with_id(tool_id)
             }
-            Ok(other) => {
-                ToolResult::err(format!("host {:?}: unexpected reply: {other:?}", self.name))
-                    .with_id(tool_id)
-            }
+            Ok(Response::HelloOk { .. }) => unreachable!("hello is consumed during connect"),
             Err(_closed) => {
                 ToolResult::err(format!("host {:?}: connection closed", self.name)).with_id(tool_id)
             }
@@ -263,60 +251,43 @@ impl HostController {
 
     /// Notify the worker that an agent session ended (reap sessions, …).
     ///
-    /// In-process: runs immediately. Subprocess: no-ops if never connected.
+    /// In-process: runs immediately. Subprocess: fire-and-forget — the worker
+    /// reaps without replying, and a missing/dead connection is a quiet no-op
+    /// (worker process exit when the connection drops is the hard guarantee).
     pub async fn agent_finished(&self, agent_id: uuid::Uuid) -> Result<(), String> {
         match &self.backend {
             Backend::InProcess { worker } => {
                 worker.notify_agent_finished(agent_id);
                 Ok(())
             }
-            Backend::Subprocess { .. } => {
-                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-                let request = Request::AgentFinished {
-                    id: id.clone(),
-                    agent_id,
+            Backend::Subprocess { conn, .. } => {
+                let write_tx = {
+                    let slot = conn.lock().await;
+                    match slot.as_ref().filter(|c| !c.dead.load(Ordering::SeqCst)) {
+                        Some(c) => c.write_tx.clone(),
+                        // Not connected: nothing to reap on the worker.
+                        None => return Ok(()),
+                    }
                 };
-
-                let rx = match self
-                    .submit(&id, &request, /*connect_if_needed*/ false)
+                let bytes = Request::AgentFinished { agent_id }.encode()?;
+                write_tx
+                    .send(bytes)
                     .await
-                {
-                    Ok(rx) => rx,
-                    // Not connected yet: nothing to reap on the worker.
-                    Err(e) if e == "not connected" => return Ok(()),
-                    Err(e) => return Err(format!("host {:?}: {e}", self.name)),
-                };
-
-                match rx.await {
-                    Ok(Response::AgentFinishedOk { .. }) => Ok(()),
-                    Ok(Response::Error { message, .. }) => Err(format!(
-                        "host {:?}: agent_finished error: {message}",
-                        self.name
-                    )),
-                    Ok(other) => Err(format!(
-                        "host {:?}: unexpected agent_finished reply: {other:?}",
-                        self.name
-                    )),
-                    Err(_) => Err(format!(
-                        "host {:?}: agent_finished: connection closed",
-                        self.name
-                    )),
-                }
+                    .map_err(|_| format!("host {:?}: write: connection closed", self.name))
             }
         }
     }
 
-    /// Register waiter + enqueue request.
+    /// Register waiter + enqueue request, spawning the worker if `conn` is
+    /// `None` (or only holds a dead connection).
     ///
-    /// When `connect_if_needed`, spawns the worker if `conn` is `None` (or
-    /// only holds a dead connection). The connection mutex is held to
-    /// (re)connect and clone handles — never across the channel send — so a
-    /// wedged host cannot block sibling submits or cancels on this controller.
+    /// The connection mutex is held to (re)connect and clone handles — never
+    /// across the channel send — so a wedged host cannot block sibling submits
+    /// or cancels on this controller.
     async fn submit(
         &self,
         id: &str,
         request: &Request,
-        connect_if_needed: bool,
     ) -> Result<oneshot::Receiver<Response>, String> {
         let Backend::Subprocess {
             config,
@@ -341,9 +312,6 @@ impl HostController {
                 *slot = None;
             }
             if slot.is_none() {
-                if !connect_if_needed {
-                    return Err("not connected".into());
-                }
                 match connect_with_timeout(config, *connect_timeout_secs).await {
                     Ok(c) => {
                         if let Ok(mut err) = last_error.lock() {
@@ -481,7 +449,7 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
     let reply = Response::decode(&line)?;
 
     let version = match reply {
-        Response::HelloOk { version, .. } => version,
+        Response::HelloOk { version } => version,
         Response::Error { message, .. } => {
             let _ = child.start_kill();
             return Err(format!("hello error: {message}"));
@@ -619,12 +587,6 @@ async fn run_reader(
                     let _ = tx.send(msg);
                 }
             }
-            Response::AgentFinishedOk { id, .. } => {
-                let mut pending = pending.lock().await;
-                if let Some(tx) = pending.remove(id) {
-                    let _ = tx.send(msg);
-                }
-            }
             Response::Error { id: None, message } => {
                 break format!("host protocol error: {message}");
             }
@@ -646,19 +608,35 @@ async fn run_reader(
 mod tests {
     use super::*;
     use crate::generative_model::ToolUse;
+    use crate::test_support::text_parts;
     use serde_json::json;
     use std::time::{Duration, Instant};
 
-    fn tool_text(result: &ToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                crate::generative_model::Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
+    /// Subprocess host whose worker is `bash -c <script>` (scripted hellos,
+    /// deliberate deaths — no real myco binary needed).
+    fn scripted_host(name: &str, script: String) -> Arc<HostController> {
+        HostController::new(HostConfig {
+            name: name.into(),
+            command: vec!["bash".into(), "-c".into(), script],
+        })
+    }
+
+    /// One `hello_ok` NDJSON line claiming `version`.
+    fn hello_line(version: &str) -> String {
+        format!("{{\"type\":\"hello_ok\",\"version\":\"{version}\"}}")
+    }
+
+    async fn bash_call(ctl: &HostController, id: &str, command: &str) -> ToolResult {
+        ctl.call(
+            uuid::Uuid::nil(),
+            ToolUse {
+                id: id.into(),
+                name: "bash".into(),
+                input: json!({"command": command}),
+            },
+            CancelToken::new(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -672,19 +650,12 @@ mod tests {
             "expected bash tool from standard catalog"
         );
 
-        let result = ctl
-            .call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "printf 'hello-host\\n'"}),
-                },
-                CancelToken::new(),
-            )
-            .await;
+        let result = bash_call(&ctl, "t1", "printf 'hello-host\\n'").await;
         assert!(!result.is_error, "{result:?}");
-        assert!(tool_text(&result).contains("hello-host"), "{result:?}");
+        assert!(
+            text_parts(&result).join("").contains("hello-host"),
+            "{result:?}"
+        );
         assert!(ctl.is_connected());
     }
 
@@ -694,24 +665,8 @@ mod tests {
 
         // Real sleeps must overlap: serial would be ~2s, concurrent ~1s (+ slack).
         let t0 = Instant::now();
-        let a = ctl.call(
-            uuid::Uuid::nil(),
-            ToolUse {
-                id: "a".into(),
-                name: "bash".into(),
-                input: json!({"command": "sleep 1; echo AAA", "timeout_ms": 10000}),
-            },
-            CancelToken::new(),
-        );
-        let b = ctl.call(
-            uuid::Uuid::nil(),
-            ToolUse {
-                id: "b".into(),
-                name: "bash".into(),
-                input: json!({"command": "sleep 1; echo BBB", "timeout_ms": 10000}),
-            },
-            CancelToken::new(),
-        );
+        let a = bash_call(&ctl, "a", "sleep 1; echo AAA");
+        let b = bash_call(&ctl, "b", "sleep 1; echo BBB");
 
         let (ra, rb) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(a, b) })
             .await
@@ -720,8 +675,8 @@ mod tests {
         let wall = t0.elapsed();
         assert!(!ra.is_error, "a: {ra:?}");
         assert!(!rb.is_error, "b: {rb:?}");
-        assert!(tool_text(&ra).contains("AAA"), "{ra:?}");
-        assert!(tool_text(&rb).contains("BBB"), "{rb:?}");
+        assert!(text_parts(&ra).join("").contains("AAA"), "{ra:?}");
+        assert!(text_parts(&rb).join("").contains("BBB"), "{rb:?}");
         assert!(
             wall < Duration::from_millis(1700),
             "expected concurrent overlap (~1s), wall={wall:?}"
@@ -762,28 +717,20 @@ mod tests {
         );
         assert!(cancelled.is_error, "{cancelled:?}");
         assert!(
-            tool_text(&cancelled).contains("cancelled"),
+            text_parts(&cancelled).join("").contains("cancelled"),
             "expected cancelled result, got: {cancelled:?}"
         );
 
         // Next call must not hang: cancel cleanup must free the host path.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            ctl.call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "next".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "echo hello-after-cancel"}),
-                },
-                CancelToken::new(),
-            ),
+            bash_call(&ctl, "next", "echo hello-after-cancel"),
         )
         .await
         .expect("next call timed out");
         assert!(!result.is_error, "{result:?}");
         assert!(
-            tool_text(&result).contains("hello-after-cancel"),
+            text_parts(&result).join("").contains("hello-after-cancel"),
             "{result:?}"
         );
     }
@@ -796,32 +743,18 @@ mod tests {
     /// tool catalog that may no longer match.
     #[tokio::test]
     async fn version_skew_fails_connect_with_actionable_error() {
-        let hello = "{\"type\":\"hello_ok\",\"name\":\"old\",\"version\":\"0.0.1\",\"tools\":[]}";
-        let ctl = HostController::new(HostConfig {
-            name: "skewed".into(),
-            command: vec![
-                "bash".into(),
-                "-c".into(),
-                format!("read -r _line; printf '%s\\n' '{hello}'; sleep 5"),
-            ],
-            ssh_destination: None,
-        });
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            ctl.call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "t".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "true"}),
-                },
-                CancelToken::new(),
+        let ctl = scripted_host(
+            "skewed",
+            format!(
+                "read -r _line; printf '%s\\n' '{}'; sleep 5",
+                hello_line("0.0.1")
             ),
-        )
-        .await
-        .expect("skewed connect must fail fast");
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), bash_call(&ctl, "t", "true"))
+            .await
+            .expect("skewed connect must fail fast");
         assert!(result.is_error, "{result:?}");
-        let text = tool_text(&result);
+        let text = text_parts(&result).join("");
         assert!(text.contains("0.0.1"), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
         assert!(text.contains("rebuild"), "{text}");
@@ -829,33 +762,19 @@ mod tests {
 
     #[tokio::test]
     async fn dead_host_fails_calls_and_respawns_instead_of_hanging() {
-        let hello = format!(
-            "{{\"type\":\"hello_ok\",\"name\":\"fake\",\"version\":\"{}\",\"tools\":[]}}",
-            env!("CARGO_PKG_VERSION")
+        // Answers the hello handshake, then exits immediately.
+        let ctl = scripted_host(
+            "dies",
+            format!(
+                "read -r _line; printf '%s\\n' '{}'",
+                hello_line(env!("CARGO_PKG_VERSION"))
+            ),
         );
-        let ctl = HostController::new(HostConfig {
-            name: "dies".into(),
-            // Answers the hello handshake, then exits immediately.
-            command: vec![
-                "bash".into(),
-                "-c".into(),
-                format!("read -r _line; printf '%s\\n' '{hello}'"),
-            ],
-            ssh_destination: None,
-        });
 
         for attempt in 0..2 {
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                ctl.call(
-                    uuid::Uuid::nil(),
-                    ToolUse {
-                        id: format!("t{attempt}"),
-                        name: "bash".into(),
-                        input: json!({"command": "echo hi"}),
-                    },
-                    CancelToken::new(),
-                ),
+                bash_call(&ctl, &format!("t{attempt}"), "echo hi"),
             )
             .await
             .expect("call against dead host must fail fast, not hang");
@@ -869,23 +788,15 @@ mod tests {
         let ctl = HostController::new(HostConfig {
             name: "sub".into(),
             command: crate::harness::default_local_host_command(),
-            ssh_destination: None,
         });
 
         assert!(!ctl.is_connected());
-        let result = ctl
-            .call(
-                uuid::Uuid::nil(),
-                ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "printf 'via-sub\\n'"}),
-                },
-                CancelToken::new(),
-            )
-            .await;
+        let result = bash_call(&ctl, "t1", "printf 'via-sub\\n'").await;
         assert!(!result.is_error, "{result:?}");
-        assert!(tool_text(&result).contains("via-sub"), "{result:?}");
+        assert!(
+            text_parts(&result).join("").contains("via-sub"),
+            "{result:?}"
+        );
         assert!(ctl.is_connected());
     }
 }

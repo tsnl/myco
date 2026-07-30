@@ -9,7 +9,7 @@
 //! append-only, escape-free transcript of exactly what scrolled past — the
 //! agent can read it (via its file tools) to answer questions about the live
 //! session, including the live-only sections that never reach the JSON
-//! history (see [`crate::session::write_session_history`]).
+//! history (see [`crate::session::history_events`]).
 //!
 //! Escape-freedom is structural, not filtered: styling and content are
 //! different [`crate::tui::TuiEvent`] variants, and the plain encoding simply

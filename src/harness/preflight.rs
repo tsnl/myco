@@ -192,6 +192,17 @@ pub fn print_startup_preflight(report: &StartupPreflight, palette: Palette) {
     let _ = out.flush();
 }
 
+/// Test-only render of one report's `write_warning_section` with a plain
+/// palette (shared by the ssh-agent and combined-preflight tests).
+#[cfg(test)]
+pub(crate) fn warning_output(
+    write: impl FnOnce(&mut Vec<u8>, Palette) -> std::io::Result<()>,
+) -> String {
+    let mut buf = Vec::new();
+    write(&mut buf, Palette::plain()).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -200,11 +211,21 @@ pub fn print_startup_preflight(report: &StartupPreflight, palette: Palette) {
 mod tests {
     use super::*;
 
-    fn warning_output(pf: &StartupPreflight) -> String {
-        let mut buf = Vec::new();
-        pf.write_warning_section(&mut buf, Palette::plain())
-            .unwrap();
-        String::from_utf8(buf).unwrap()
+    fn preflight(
+        soul: Option<SoulTruncation>,
+        missing: Vec<&'static ExternalCommand>,
+        ssh: SshAgentPreflightReport,
+    ) -> StartupPreflight {
+        StartupPreflight {
+            manual: None,
+            soul,
+            executables: ExecutableCheckReport { missing },
+            ssh,
+        }
+    }
+
+    fn rendered(pf: &StartupPreflight) -> String {
+        warning_output(|out, p| pf.write_warning_section(out, p))
     }
 
     #[test]
@@ -227,30 +248,24 @@ mod tests {
 
     #[test]
     fn silent_when_everything_resolves() {
-        let pf = StartupPreflight {
-            manual: None,
-            soul: None,
-            executables: ExecutableCheckReport {
-                missing: missing_executables(true, |_| true),
-            },
-            ssh: SshAgentPreflightReport::default(),
-        };
+        let pf = preflight(
+            None,
+            missing_executables(true, |_| true),
+            SshAgentPreflightReport::default(),
+        );
         assert!(!pf.has_problems());
-        assert_eq!(warning_output(&pf), "");
+        assert_eq!(rendered(&pf), "");
     }
 
     #[test]
     fn missing_tmux_opens_warning_with_install_hint() {
-        let pf = StartupPreflight {
-            manual: None,
-            soul: None,
-            executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "tmux"),
-            },
-            ssh: SshAgentPreflightReport::default(),
-        };
-        let out = warning_output(&pf);
-        assert!(out.contains(&format!("{}\nWARNING\n\n", crate::session::SECTION_RULE)));
+        let pf = preflight(
+            None,
+            missing_executables(false, |e| e.name != "tmux"),
+            SshAgentPreflightReport::default(),
+        );
+        let out = rendered(&pf);
+        assert!(out.contains("WARNING"), "{out}");
         assert!(
             out.contains("missing executable tmux: bare /resume cannot open the session browser"),
             "{out}"
@@ -263,20 +278,17 @@ mod tests {
 
     #[test]
     fn combined_block_has_one_header_executables_before_ssh() {
-        let pf = StartupPreflight {
-            manual: None,
-            soul: None,
-            executables: ExecutableCheckReport {
-                missing: missing_executables(true, |e| e.name != "ssh"),
-            },
-            ssh: SshAgentPreflightReport {
+        let pf = preflight(
+            None,
+            missing_executables(true, |e| e.name != "ssh"),
+            SshAgentPreflightReport {
                 had_ssh_hosts: true,
                 agent_ok: false,
                 agent_status: "agent down".into(),
                 ..Default::default()
             },
-        };
-        let out = warning_output(&pf);
+        );
+        let out = rendered(&pf);
         assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
         let exec_at = out.find("missing executable ssh:").unwrap();
         let agent_at = out.find("ssh-agent: agent down").unwrap();
@@ -287,47 +299,41 @@ mod tests {
     fn clean_ssh_report_notes_stay_out_of_executable_warnings() {
         // A clean-but-noted ssh report (e.g. "no SSH-backed hosts") must not
         // leak into a WARNING block opened for missing executables.
-        let pf = StartupPreflight {
-            manual: None,
-            soul: None,
-            executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "tmux"),
-            },
-            ssh: SshAgentPreflightReport {
+        let pf = preflight(
+            None,
+            missing_executables(false, |e| e.name != "tmux"),
+            SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
                 ..Default::default()
             },
-        };
-        let out = warning_output(&pf);
+        );
+        let out = rendered(&pf);
         assert!(out.contains("missing executable tmux"), "{out}");
         assert!(!out.contains("note:"), "{out}");
     }
 
+    // The exact truncation strings ("soul truncated at 64 KiB of 128.9 KiB")
+    // are `soul_truncation`'s claim, pinned in `crate::prompts` tests; here
+    // only the block's shape and ordering are at stake.
     #[test]
     fn truncated_soul_warns_first_and_names_the_version() {
-        let pf = StartupPreflight {
-            manual: None,
-            soul: Some(SoulTruncation {
+        let pf = preflight(
+            Some(SoulTruncation {
                 version: "20260722T0215-3f2a.md".into(),
                 bytes: 132_000,
                 limit: 64 * 1024,
             }),
-            executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "tmux"),
-            },
-            ssh: SshAgentPreflightReport::default(),
-        };
+            missing_executables(false, |e| e.name != "tmux"),
+            SshAgentPreflightReport::default(),
+        );
         assert!(pf.has_problems());
-        let out = warning_output(&pf);
+        let out = rendered(&pf);
         assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
+        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(
-            out.contains(
-                "soul/20260722T0215-3f2a.md: soul truncated at 64 KiB of 128.9 KiB \
-                 (max_soul_bytes)"
-            ),
+            out.contains("every agent prompt from now on carries only the first"),
             "{out}"
         );
-        assert!(out.contains("only the first 64 KiB"), "{out}");
         assert!(
             out.contains("raise `max_soul_bytes` in config.toml"),
             "{out}"
@@ -341,22 +347,19 @@ mod tests {
     #[test]
     fn a_truncated_soul_alone_is_enough_to_open_the_block() {
         // Nothing else wrong: the soul still gets its own headed WARNING.
-        let pf = StartupPreflight {
-            manual: None,
-            soul: Some(SoulTruncation {
+        let pf = preflight(
+            Some(SoulTruncation {
                 version: "20260722T0215-3f2a.md".into(),
                 bytes: 4096,
                 limit: 2048,
             }),
-            executables: ExecutableCheckReport {
-                missing: missing_executables(true, |_| true),
-            },
-            ssh: SshAgentPreflightReport::default(),
-        };
+            missing_executables(true, |_| true),
+            SshAgentPreflightReport::default(),
+        );
         assert!(pf.has_problems());
-        let out = warning_output(&pf);
+        let out = rendered(&pf);
         assert!(out.contains("WARNING\n"), "{out}");
-        assert!(out.contains("soul truncated at 2 KiB of 4 KiB"), "{out}");
+        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(!out.contains("missing executable"), "{out}");
     }
 
@@ -373,7 +376,7 @@ mod tests {
             ssh: SshAgentPreflightReport::default(),
         };
         assert!(pf.has_problems());
-        let out = warning_output(&pf);
+        let out = rendered(&pf);
         assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
         assert!(
             out.contains("manual export failed: /home/u/.myco/manual/9.9.9/abc: permission denied"),

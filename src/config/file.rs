@@ -202,85 +202,19 @@ pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
     parse_file_config_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
 }
 
-/// Example config written by docs / first-run hints.
-pub fn example_config_toml() -> String {
-    r#"# Myco config (~/.myco/config.toml)
-# Override path with MYCO_CONFIG or myco --config.
-#
-# The local host is always enabled in-process. Remote hosts are NOT listed
-# here: every concrete `Host` alias in ~/.ssh/config (no wildcards; Includes
-# are followed) is a remote host of the same name, attached lazily as
-# `ssh <alias> myco --mode host`. Put user / port / identity / ProxyJump in
-# ~/.ssh/config; `myco` must be on the remote PATH non-interactive SSH uses.
-#
-# Models are configured here — myco ships none built in. A [gateways.*] entry
-# holds protocol + base_url + auth; a [models.*] entry is a model key you pass
-# to --model. The auth value is either the token itself ("sk-...") or a
-# source table: { source = "env", var_name = "NAME" },
-# { source = "file", path = "~/.secrets/x.token" }, { source = "none" }.
-# Omitting auth sends no auth header (fine for local servers).
-#
-# Top-level keys must come before the [gateways]/[models] tables (TOML).
-
-# Default model key when more than one model is configured (--model overrides).
-model = "grok-4.5-build"
-
-# Per-remote connect timeout in seconds on first tool use (0 disables).
-# Remotes connect lazily; startup does not wait for them.
-attach_timeout_secs = 10
-
-# Cap on the soul (~/.myco/workspace/soul/, newest version) appended to every
-# agent system prompt. A longer version is cut to this many bytes and startup
-# prints a WARNING naming the version. Default 65536 (64 KiB).
-max_soul_bytes = 65_536
-
-[gateways.anthropic]
-protocol = "anthropic-messages"
-base_url = "https://api.anthropic.com"
-auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
-
-[gateways.xai]
-protocol = "openai-responses"
-base_url = "https://api.x.ai/v1"
-auth = { source = "env", var_name = "XAI_API_KEY" }
-
-[gateways.openrouter]
-protocol = "openai-responses"
-base_url = "https://openrouter.ai/api/v1"
-auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
-
-# Servers that only speak the older /chat/completions dialect (llama.cpp,
-# Ollama, vLLM, DeepSeek, Groq, …).
-[gateways.ollama]
-protocol = "openai-completions"
-base_url = "http://localhost:11434/v1"
-
-[models.claude-opus-4-8]
-gateway = "anthropic"
-context_window = 1_000_000
-
-[models.claude-haiku-4-5]
-gateway = "anthropic"
-thinking = "budget"          # older models reject adaptive thinking
-context_window = 200_000
-
-# Keys with dots need quoting (TOML): [models."grok-4.5-build"]
-[models."grok-4.5-build"]
-gateway = "xai"
-context_window = 500_000
-
-[models.kimi-k3]
-gateway = "openrouter"
-api_id = "moonshotai/kimi-k3"  # wire id differs from the short key
-context_window = 1_000_000
-
-[models.qwen-local]
-gateway = "ollama"
-api_id = "qwen3:8b"
-thinking = "none"            # models without reasoning reject reasoning_effort
-context_window = 32_768
-"#
-    .to_string()
+/// `[models.KEY]` table with the boilerplate the shape tests retype: inline
+/// `openai-responses` protocol, a dummy base_url, `context_window = 1000`.
+/// `extra_lines` (e.g. an `auth = …` form) land between them.
+#[cfg(test)]
+pub(crate) fn model_toml(key: &str, extra_lines: &[&str]) -> String {
+    let mut out =
+        format!("[models.{key}]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n");
+    for line in extra_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("context_window = 1000\n");
+    out
 }
 
 #[cfg(test)]
@@ -335,12 +269,6 @@ protocol = "openai-responses"
 base_url = "https://openrouter.ai/api/v1"
 auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 
-# Servers that only speak the older /chat/completions dialect (llama.cpp,
-# Ollama, vLLM, DeepSeek, Groq, …).
-[gateways.ollama]
-protocol = "openai-completions"
-base_url = "http://localhost:11434/v1"
-
 [models.kimi-k3]
 gateway = "openrouter"
 api_id = "moonshotai/kimi-k3"
@@ -375,26 +303,16 @@ context_window = 32768
 
     #[test]
     fn auth_entry_forms_parse() {
-        let text = r#"
-[models.a]
-protocol = "openai-responses"
-base_url = "https://h"
-auth = "sk-literal-token"
-context_window = 1000
-
-[models.b]
-protocol = "openai-responses"
-base_url = "https://h"
-auth = { source = "file", path = "~/.secrets/x.token" }
-context_window = 1000
-
-[models.c]
-protocol = "openai-responses"
-base_url = "https://h"
-auth = { source = "none" }
-context_window = 1000
-"#;
-        let file = parse_file_config_str(text).unwrap();
+        let text = [
+            model_toml("a", &[r#"auth = "sk-literal-token""#]),
+            model_toml(
+                "b",
+                &[r#"auth = { source = "file", path = "~/.secrets/x.token" }"#],
+            ),
+            model_toml("c", &[r#"auth = { source = "none" }"#]),
+        ]
+        .join("\n");
+        let file = parse_file_config_str(&text).unwrap();
         assert_eq!(
             file.models["a"].auth,
             Some(AuthEntry::Token("sk-literal-token".into()))
@@ -410,24 +328,19 @@ context_window = 1000
 
     #[test]
     fn auth_entry_shape_errors_are_actionable() {
-        let bad_source = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
-                          auth = { source = \"keychain\" }\ncontext_window = 1000\n";
-        let err = parse_file_config_str(bad_source).unwrap_err();
+        let err_for =
+            |auth_line| parse_file_config_str(&model_toml("x", &[auth_line])).unwrap_err();
+
+        let err = err_for(r#"auth = { source = "keychain" }"#);
         assert!(err.contains("unknown source \"keychain\""), "{err}");
 
-        let missing_field = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
-                             auth = { source = \"env\" }\ncontext_window = 1000\n";
-        let err = parse_file_config_str(missing_field).unwrap_err();
+        let err = err_for(r#"auth = { source = "env" }"#);
         assert!(err.contains("`var_name`"), "{err}");
 
-        let extra_field = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
-                           auth = { source = \"none\", token = \"x\" }\ncontext_window = 1000\n";
-        let err = parse_file_config_str(extra_field).unwrap_err();
+        let err = err_for(r#"auth = { source = "none", token = "x" }"#);
         assert!(err.contains("unknown field `token`"), "{err}");
 
-        let bad_type = "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
-                        auth = 42\ncontext_window = 1000\n";
-        let err = parse_file_config_str(bad_type).unwrap_err();
+        let err = err_for("auth = 42");
         assert!(err.contains("invalid type"), "{err}");
     }
 
@@ -449,14 +362,46 @@ context_window = 1000
 
     #[test]
     fn example_config_parses() {
-        let file = parse_file_config_str(&example_config_toml()).unwrap();
+        // Compact cut of the documented format (`src/manual/articles/
+        // overview.md`): env-auth and literal-auth gateways, a gateway model
+        // with its own wire id, and a gateway-less local model.
+        let text = r#"
+model = "grok-4.5-build"
+attach_timeout_secs = 10
+
+[gateways.xai]
+protocol = "openai-responses"
+base_url = "https://api.x.ai/v1"
+auth = { source = "env", var_name = "XAI_API_KEY" }
+
+[gateways.proxy]
+protocol = "anthropic-messages"
+base_url = "https://claude-proxy.corp"
+auth = "sk-corp-token"
+
+[models."grok-4.5-build"]
+gateway = "xai"
+context_window = 500_000
+
+[models.kimi-k3]
+gateway = "xai"
+api_id = "moonshotai/kimi-k3"
+context_window = 1_000_000
+
+[models.qwen-local]
+protocol = "openai-completions"
+base_url = "http://localhost:11434/v1"
+thinking = "none"
+context_window = 32_768
+"#;
+        let file = parse_file_config_str(text).unwrap();
         assert_eq!(file.model.as_deref(), Some("grok-4.5-build"));
         assert_eq!(file.attach_timeout_secs, Some(10));
-        assert_eq!(file.gateways.len(), 4);
-        assert_eq!(file.models.len(), 5);
+        assert_eq!(file.gateways.len(), 2);
+        assert_eq!(file.models.len(), 3);
         assert_eq!(
-            file.gateways["ollama"].protocol,
-            Protocol::OpenAICompletions
+            file.models["qwen-local"].protocol,
+            Some(Protocol::OpenAICompletions)
         );
         assert_eq!(
             file.models["kimi-k3"].api_id.as_deref(),

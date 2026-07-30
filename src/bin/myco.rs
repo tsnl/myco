@@ -254,54 +254,31 @@ async fn run_print(args: Args) {
         eprintln!("{note}");
     }
 
-    let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
-    let model_key = catalog_model.spec.key.clone();
-
-    let preflight =
-        StartupPreflight::run(&app_config.harness.remote_hosts, app_config.max_soul_bytes);
-    let mut warn = Vec::new();
-    let _ = preflight.write_warning_section(&mut warn, Palette::plain());
-    if !warn.is_empty() {
-        let _ = std::io::stderr().write_all(&warn);
-    }
-
-    let active_session = ActiveSession::new(initial_session_or_exit(&args, &model_key));
-
-    let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
-    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
-    let harness = attach_harness_or_exit(
-        &app_config,
-        &preflight,
-        vec![session_tool, history_tool, list_recent_tool],
-    )
+    let (boot, sink) = boot(&args, |_, preflight, _| {
+        // Preflight problems go to stderr so stdout stays pipeable.
+        let mut warn = Vec::new();
+        let _ = preflight.write_warning_section(&mut warn, Palette::plain());
+        if !warn.is_empty() {
+            let _ = std::io::stderr().write_all(&warn);
+        }
+        Arc::new(PrintEventSink::default())
+    })
     .await;
+    let Boot {
+        session: active_session,
+        mut agent,
+        ..
+    } = boot;
 
-    let model = build_model(
-        &catalog_model,
-        &harness,
-        args.debug_dump_api_requests,
-        args.effort,
-        app_config.max_soul_bytes,
-    );
-    let sink = Arc::new(PrintEventSink::default());
-    let mut agent = Agent::new(model, harness, sink.clone());
-    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-    let restored = active_session.snapshot();
-    agent.set_history(restored.messages.clone());
-    agent.set_last_usage(restored.last_usage);
     if needs_session_stamp(agent.history(), args.fork) {
+        let (id, started_at) = active_session.with(|s| (s.id.clone(), s.created_at));
         content.insert(
             0,
             Content::Text {
-                text: prompts::session_stamp(&restored.id, restored.created_at),
+                text: prompts::session_stamp(&id, started_at),
             },
         );
     }
-    // Mid-turn checkpoints, same as interactive: children forked off this run
-    // see finished tool rounds, and a crash loses at most the in-flight round.
-    wire_checkpoint(&mut agent, &active_session);
 
     if let Err(e) = active_session.maybe_auto_title_from_user_text(&prompt) {
         eprintln!("warning: could not auto-title session: {e}");
@@ -536,44 +513,46 @@ fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
     }));
 }
 
-async fn run_interactive(args: Args) {
-    let (app_config, catalog_model) = resolve_app_config_or_exit(&args);
-    let model_key = catalog_model.spec.key.clone();
-    let colors = app_config.colors_enabled;
-    let wrap = effective_wrap_width(app_config.wrap_max);
+/// Everything both agent modes build identically before their first turn: the
+/// resolved config + catalog model, the preflight report, the starting
+/// session, the attached harness (root session services included), and an
+/// [`Agent`] wired with restored history and mid-turn checkpoints.
+struct Boot {
+    app_config: Config,
+    catalog_model: CatalogModel,
+    preflight: StartupPreflight,
+    session: ActiveSession,
+    harness: Arc<Harness>,
+    agent: Agent,
+}
+
+/// Shared startup for `-p/--print` and the interactive REPL. The one genuinely
+/// mode-specific piece — the agent's event sink — comes from `make_sink`,
+/// called as soon as config, preflight, and session exist; the concrete sink
+/// handle is returned alongside [`Boot`] for mode-side use.
+async fn boot<S: EventSink + 'static>(
+    args: &Args,
+    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
+) -> (Boot, Arc<S>) {
+    let (app_config, catalog_model) = resolve_app_config_or_exit(args);
 
     // Startup preflight: verify expected executables resolve (bash, tmux, fzf;
     // OpenSSH tools when remotes are configured), then unlock SSH identities
     // via the existing ssh-agent before attach — remote hosts use
     // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never
     // need to prompt on the host pipe. Also checks whether the soul the agent
-    // is about to run with fits under `max_soul_bytes`.
-    // Problems are printed after the banner (WARNING block), not here.
+    // is about to run with fits under `max_soul_bytes`. Problems are reported
+    // by the caller (interactive: WARNING block after the banner; print:
+    // stderr), not here.
     let preflight =
         StartupPreflight::run(&app_config.harness.remote_hosts, app_config.max_soul_bytes);
 
     // Session handle first so `session_meta` can share it with the agent harness.
-    let resuming = args.resume.is_some();
-    let initial_session = initial_session_or_exit(&args, &model_key);
-    let active_session = ActiveSession::new(initial_session);
-
-    // The Ui: one producer owning stdout and the plain-text console mirror
-    // ({id}.console, TTY-gated like colors/wrap). The mirror resolves the
-    // current session id per append, so /new, /compact, /resume redirect it
-    // automatically. The agent can read it to see exactly what the user saw,
-    // including live-only WARNING/ERROR sections and meta-command output.
-    let ui = Arc::new(TuiProducer::new(
-        Arc::new(StdoutTuiSink { colors }),
-        Arc::new(ConsoleTuiSink::new(ConsoleLog::new(
-            active_session.clone(),
-            app_config.stdout_is_tty,
-        ))),
-        colors,
-        wrap,
-    ));
+    let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));
+    let sink = make_sink(&app_config, &preflight, &session);
 
     let session_tool =
-        Arc::new(SessionMetaTool::new(active_session.clone())) as Arc<dyn myco::ToolService>;
+        Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
     let harness = attach_harness_or_exit(
@@ -582,25 +561,67 @@ async fn run_interactive(args: Args) {
         vec![session_tool, history_tool, list_recent_tool],
     )
     .await;
-    // Thinking/reasoning is always requested; UI shows summary lines only (not stored).
-    let effort = args.effort;
-    let debug_dump_api_requests = args.debug_dump_api_requests;
-    let max_soul_bytes = app_config.max_soul_bytes;
+
     let model = build_model(
         &catalog_model,
         &harness,
-        debug_dump_api_requests,
-        effort,
-        max_soul_bytes,
+        args.debug_dump_api_requests,
+        args.effort,
+        app_config.max_soul_bytes,
     );
-    let mut agent = Agent::new(model, harness.clone(), ui.clone());
+    let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-    let restored = active_session.snapshot();
+    let restored = session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
-    // Mid-turn checkpoints; the end-of-turn force-save in run_user_turn stays
-    // the backstop.
-    wire_checkpoint(&mut agent, &active_session);
+    // Mid-turn checkpoints: context forks and crash recovery see finished
+    // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
+    wire_checkpoint(&mut agent, &session);
+
+    (
+        Boot {
+            app_config,
+            catalog_model,
+            preflight,
+            session,
+            harness,
+            agent,
+        },
+        sink,
+    )
+}
+
+async fn run_interactive(args: Args) {
+    let resuming = args.resume.is_some();
+    let (boot, ui) = boot(&args, |config, _, session| {
+        // The Ui: one producer owning stdout and the plain-text console mirror
+        // ({id}.console, TTY-gated like colors/wrap). The mirror resolves the
+        // current session id per append, so /new, /compact, /resume redirect
+        // it automatically. The agent can read it to see exactly what the user
+        // saw, including live-only WARNING/ERROR sections and meta-command
+        // output.
+        Arc::new(TuiProducer::new(
+            Arc::new(StdoutTuiSink {
+                colors: config.colors_enabled,
+            }),
+            Arc::new(ConsoleTuiSink::new(ConsoleLog::new(
+                session.clone(),
+                config.stdout_is_tty,
+            ))),
+            config.colors_enabled,
+            effective_wrap_width(config.wrap_max),
+        ))
+    })
+    .await;
+    let Boot {
+        app_config,
+        catalog_model,
+        preflight,
+        session: active_session,
+        harness,
+        agent,
+    } = boot;
+    let wrap = effective_wrap_width(app_config.wrap_max);
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
@@ -613,7 +634,7 @@ async fn run_interactive(args: Args) {
     // Startup chrome: headed banner block (rule, MYCO, model/session, key
     // hints). Hosts via /hosts, effort via /effort, config path via
     // attach-failure hints.
-    ui.startup_banner(&model_key, &session_label);
+    ui.startup_banner(&catalog_model.spec.key, &session_label);
     // Preflight problems (missing executables, ssh-agent) open one WARNING
     // block after the banner, before the first USER block; happy path silent.
     if preflight.has_problems() {
@@ -626,19 +647,21 @@ async fn run_interactive(args: Args) {
         ui.replay_history(agent.history());
     }
 
+    // Thinking/reasoning is always requested; UI shows summary lines only
+    // (not stored).
     let mut repl = ReplSession {
         agent,
         session: active_session,
         editor,
         harness,
         catalog_model,
-        effort,
-        debug_dump_api_requests,
+        effort: args.effort,
+        debug_dump_api_requests: args.debug_dump_api_requests,
         ctrl_l,
         wrap,
         wrap_max: app_config.wrap_max,
         repaint: app_config.repaint_enabled,
-        max_soul_bytes,
+        max_soul_bytes: app_config.max_soul_bytes,
         ui: ui.clone(),
         turn_cancel: TurnCancel::default(),
         forked: args.fork,
@@ -1102,7 +1125,7 @@ impl ReplSession {
         self.session.replace(successor.clone());
         self.agent.set_history(successor.messages.clone());
         self.agent.set_last_usage(successor.last_usage);
-        reload_readline_history(&mut self.editor, &self.session);
+        load_readline_history(&mut self.editor, &self.session);
 
         // Compaction starts over: wipe the screen the predecessor filled and
         // hand the successor a COMPACTED banner instead of a replayed
@@ -1203,7 +1226,7 @@ impl ReplSession {
                 self.session.replace(fresh);
                 self.agent.set_history(Vec::new());
                 self.agent.set_last_usage(None);
-                reload_readline_history(&mut self.editor, &self.session);
+                load_readline_history(&mut self.editor, &self.session);
                 // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
                 clear_and_reprint(&self.agent, &self.ui);
                 self.ui.line(&format!("new session={}", self.session.id()));
@@ -1302,7 +1325,7 @@ impl ReplSession {
         self.session.replace(loaded.clone());
         self.agent.set_history(loaded.messages.clone());
         self.agent.set_last_usage(loaded.last_usage);
-        reload_readline_history(&mut self.editor, &self.session);
+        load_readline_history(&mut self.editor, &self.session);
     }
 }
 
@@ -1329,82 +1352,11 @@ fn print_cli_help(topic: &str) {
     }
 }
 
+/// `/help`: the `cli` manual article — the same content as `myco --help cli`
+/// and the `manual` host tool, so REPL help cannot drift from the docs.
 fn print_help(ui: &TuiProducer) {
-    ui.line(
-        "\
-Commands:
-  /help                 Show this help
-  /session              Show session metadata (title, links, scratchpad, path)
-  /sessions             List recent sessions (title + link counts)
-  /hosts                List configured hosts and attach status
-  /resume [id|prefix]   Resume a session (no arg: fzf browser, as a tmux
-                        popup when inside tmux)
-  /new                  Start a new session (saves current; clears display)
-  /effort [level]       Show or set reasoning effort (low|medium|high|max)
-  /title [text]         Show or set session title (empty text clears)
-  /compact              Compact context into a successor session (summary + tail)
-  /exit, /quit          Save and quit  (also: exit, quit, :q, Ctrl-D)
-
-Shortcuts:
-  Enter                 Submit the current buffer
-  Alt-Enter / Ctrl-J    Insert a newline (multiline input)
-                        Note: most terminals send Shift-Enter as plain Enter,
-                        which submits -- use Alt-Enter or Ctrl-J instead.
-                        (Shift-Enter does insert a newline on the Windows
-                        console, which reports modifiers.)
-  Ctrl-C                Cancel current line at prompt; cancel in-flight turn while running
-  Ctrl-L                Clear scrollback and reprint the conversation (empty prompt only)
-  Ctrl-D                Save and quit
-
-Images:
-  Mention @path in a message to attach that image file as model input, e.g.
-  `what is wrong here? @ui/shot.png`. Extensions png/jpg/jpeg/gif/webp select
-  the mention, the format is read from the file itself, up to 5 MiB each, `~/`
-  expands, paths with spaces unsupported. The text is sent as typed; a bad path
-  or non-image file errors before the model is called.
-
-Thinking/reasoning is always requested (default effort=high). The UI shows a
-`Thinking: …` summary inside ASSISTANT; it is stored in session history for
-resume but stripped from provider requests. Change effort with `/effort`.
-Generate failures open a headed ERROR section (live only; not in history).
-
-Each USER header shows `USER <used>/<max> (<pct>%)` context tokens, compact
-(`63.8k/200k`; 0/max until the provider reports usage). A `⚙`-prefixed line
-carries the finished turn's token counts (input = final request's prompt,
-output summed across the turn); below it, one `●`-prefixed line per
-still-running tool (live bash session on the in-process local host) shows
-its command, uptime, and idle time.
-
-Hosts:
-  Local is always enabled in-process (no subprocess). Remotes come from
-  ~/.ssh/config (Includes followed): every concrete Host alias is a lazy
-  `ssh <alias> myco --mode host` remote. ~/.myco/config.toml (or --config /
-  $MYCO_CONFIG) holds the model catalog ([gateways]/[models], default `model`)
-  and knobs (attach_timeout_secs, max_soul_bytes). Auth per entry: a literal
-  token string or a source table (env var / file / none); see --help overview.
-  Host tools accept optional input field `host` (default: local).
-  Sessions (bash) are per-host. Use /hosts to list hosts and attach status
-  (startup no longer prints them).
-  Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
-  passphrases on the NDJSON pipe). It is silent when clean; problems open a
-  WARNING block. Missing keys: ssh-add, then restart.
-
-Startup copies this manual to ~/.myco/manual/<version>/<commit>/ (index.md plus
-one file per article) and every agent system prompt names that directory, so
-agents read and search the docs with rg and the editor. --help <article> prints
-the same text.
-
-The newest ~/.myco/workspace/soul/ version is appended to every agent system
-prompt. One longer than max_soul_bytes (config.toml; default 65536) is cut to
-that size, and startup says so loudly in the same WARNING block — naming the
-version and both sizes. Raise the knob or write a shorter revision.
-
-Sessions are conversation memory only; shell/file state is not restored.
-Empty sessions (no messages) are not written to disk.
-On generate error after tools, history keeps user + assistant(tool_use) +
-tool_results (well-formed for resume). Cancel mid-tools records synthetic
-cancelled results for every tool_use.",
-    );
+    let article = myco::manual::format_article("cli").expect("`cli` article is embedded");
+    ui.line(article.trim_end());
 }
 
 fn print_host_status(harness: &Harness, ui: &TuiProducer) {
@@ -1481,21 +1433,18 @@ fn save_readline_history(
         .map_err(|e| e.to_string())
 }
 
+/// Replace the editor's history with the session's (`{id}.history`, beside
+/// the session file). Clearing first makes startup and the live-session
+/// switches (`/new`, `/resume`, `/compact`) one path — on a fresh editor the
+/// clear is a no-op.
 fn load_readline_history(editor: &mut Editor<ReplHelper, DefaultHistory>, session: &ActiveSession) {
     let history_path = session.with(|s| s.history_path());
+    editor.clear_history().ok();
     if let Err(e) = editor.load_history(&history_path)
         && history_path.exists()
     {
         eprintln!("warning: could not load readline history: {e}");
     }
-}
-
-fn reload_readline_history(
-    editor: &mut Editor<ReplHelper, DefaultHistory>,
-    session: &ActiveSession,
-) {
-    editor.clear_history().ok();
-    load_readline_history(editor, session);
 }
 
 // ---------------------------------------------------------------------------

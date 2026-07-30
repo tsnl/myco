@@ -1,45 +1,25 @@
 //! Semantic presentation events for the terminal front-end — the **TUI
 //! stream**, and its single producer, the interactive CLI's `Ui`.
 //!
-//! Everything the interactive CLI shows is expressed as a flat stream of
-//! [`TuiEvent`]s: content bytes ([`TuiEvent::Text`], escape-free, wrap
-//! decisions already applied), style state changes ([`TuiEvent::Style`],
-//! semantic attributes — no ANSI), and hyperlink spans ([`TuiEvent::Link`]).
-//! Subscribers ([`TuiSink`]) are dumb encoders:
+//! Everything the interactive CLI shows is a flat stream of [`TuiEvent`]s:
+//! content bytes ([`TuiEvent::Text`], escape-free, wrap decisions already
+//! applied), semantic style state ([`TuiEvent::Style`], no ANSI), and
+//! hyperlink spans ([`TuiEvent::Link`]). Sinks are dumb encoders
+//! ([`StdoutTuiSink`] → SGR/OSC 8, [`ConsoleTuiSink`] → `Text` bytes into the
+//! `{id}.console` mirror), which makes the mirror's escape-free invariant
+//! *structural*: `encode_plain(events)` equals `strip_sgr(encode_ansi(events))`
+//! by construction — there is nothing to strip.
 //!
-//! - [`StdoutTuiSink`] encodes `Style` as SGR ([`Style::sgr`]) and `Link` as
-//!   OSC 8, and writes to the terminal;
-//! - [`ConsoleTuiSink`] ignores `Style`/`Link` entirely and appends the `Text`
-//!   bytes to the per-session `{id}.console` mirror.
-//!
-//! This makes the mirror's escape-free invariant *structural*:
-//! `encode_plain(events)` equals `strip_sgr(encode_ansi(events))` by
-//! construction, because styling and content are different event variants —
-//! there is nothing to strip.
-//!
-//! Events come from one producer ([`TuiProducer`]), which owns both sinks and
-//! is the sole writer of user-visible output. It has two inputs, because
-//! chrome does not originate in the agent:
-//!
-//! - it implements [`EventSink`], translating root-agent [`AgentEvent`]s
-//!   (text/thinking/tool deltas; nested-agent events are ignored) through the
-//!   streaming markdown renderer's event path
-//!   ([`MarkdownRenderer::feed_events`]);
-//! - the REPL loop calls its chrome methods directly ([`Self::user_header`],
-//!   [`Self::error_section`], [`Self::line`], …).
-//!
-//! Two deliberate asymmetries between the sinks: the submitted input line
-//! ([`Self::submitted_input`]) goes to the mirror only (the line editor
-//! already echoed it to the terminal), and history replay
-//! ([`Self::replay_history`]) goes to the terminal only (the mirror already
-//! holds that content from when it streamed live). Cursor repaints (input
-//! re-echo, resize/Ctrl-L clears) are not events at all: they are redraws of
-//! content already in the stream, so they remain direct terminal writes —
-//! which is exactly why the console mirror never sees them.
-//!
-//! The saved-history replay ([`crate::session::history_events`]) is built on
-//! this module's section/paragraph helpers ([`SectionState`]), so live output
-//! and replay share one layout policy.
+//! [`TuiProducer`] owns both sinks and is the sole writer of user-visible
+//! output: it implements [`EventSink`] for root-agent deltas (nested-agent
+//! events are ignored) and exposes chrome methods to the REPL loop. Two
+//! deliberate asymmetries: the submitted input line goes to the mirror only
+//! (the line editor already echoed it), and history replay goes to the
+//! terminal only (the mirror already holds that content). Cursor repaints are
+//! redraws of content already in the stream — direct terminal writes, never
+//! events — which is exactly why the mirror never sees them. Saved-history
+//! replay ([`crate::session::history_events`]) is built on this module's
+//! [`SectionState`] helpers, so live output and replay share one layout policy.
 
 use std::sync::{Arc, Mutex};
 
@@ -251,14 +231,6 @@ pub(crate) fn encoded_ends_with_newline(events: &[TuiEvent], styled: bool) -> bo
         }
     }
     false
-}
-
-/// True when `encode_ansi(events, styled)` would be empty.
-pub(crate) fn encoded_is_empty(events: &[TuiEvent], styled: bool) -> bool {
-    events.iter().all(|event| match event {
-        TuiEvent::Text(text) => text.is_empty(),
-        TuiEvent::Style(_) | TuiEvent::Link(_) => !styled,
-    })
 }
 
 /// Terminal subscriber: SGR-encodes to stdout.
@@ -729,7 +701,6 @@ impl EventSink for TuiProducer {
             } => self.tool_started(&tool_use.name, &tool_use.input),
             AgentEvent::TurnFinished {
                 context: TraceContext { depth: 0, .. },
-                ..
             } => self.turn_finished(),
             _ => {}
         }
@@ -766,8 +737,11 @@ fn end_text_stream(st: &mut ProducerState, events: &mut Vec<TuiEvent>, colors: b
         .take()
         .map(|mut r| r.finish_events())
         .unwrap_or_default();
-    if !encoded_is_empty(&tail, colors) {
-        st.section.at_line_start = encoded_ends_with_newline(&tail, colors);
+    // Runs once per paragraph close, not per delta, so encoding the handful
+    // of tail events is cheap.
+    let encoded = encode_ansi(&tail, colors);
+    if !encoded.is_empty() {
+        st.section.at_line_start = encoded.ends_with('\n');
         events.extend(tail);
     }
 }
@@ -779,7 +753,7 @@ fn end_text_stream(st: &mut ProducerState, events: &mut Vec<TuiEvent>, colors: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{ToolUse, TurnEndReason};
+    use crate::generative_model::ToolUse;
 
     /// Capturing sink for assertions on the raw stream.
     #[derive(Default)]
@@ -814,6 +788,55 @@ mod tests {
         }
     }
 
+    // Emit shorthands: one agent event at `depth` (`_at`) or at the root.
+
+    fn text_at(p: &TuiProducer, depth: usize, text: &str) {
+        p.emit(AgentEvent::TextDelta {
+            text: text.into(),
+            context: ctx(depth),
+        });
+    }
+
+    fn text(p: &TuiProducer, text: &str) {
+        text_at(p, 0, text);
+    }
+
+    fn think_at(p: &TuiProducer, depth: usize, text: &str) {
+        p.emit(AgentEvent::ThinkingDelta {
+            text: text.into(),
+            context: ctx(depth),
+        });
+    }
+
+    fn think(p: &TuiProducer, text: &str) {
+        think_at(p, 0, text);
+    }
+
+    fn tool_at(p: &TuiProducer, depth: usize, name: &str, input: serde_json::Value) {
+        p.emit(AgentEvent::ToolStarted {
+            tool_use: ToolUse {
+                id: "t1".into(),
+                name: name.into(),
+                input,
+            },
+            context: ctx(depth),
+        });
+    }
+
+    fn tool(p: &TuiProducer, name: &str, input: serde_json::Value) {
+        tool_at(p, 0, name, input);
+    }
+
+    fn finish_at(p: &TuiProducer, depth: usize) {
+        p.emit(AgentEvent::TurnFinished {
+            context: ctx(depth),
+        });
+    }
+
+    fn finish(p: &TuiProducer) {
+        finish_at(p, 0);
+    }
+
     fn strip_sgr(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars();
@@ -839,7 +862,6 @@ mod tests {
         assert_eq!(Style::ERROR.sgr(), "\x1b[0;1;31m");
         assert_eq!(Style::WARNING.sgr(), "\x1b[0;1;33m");
         assert_eq!(Style::BANNER.sgr(), "\x1b[0;1m");
-        assert_eq!(Style::THINKING.sgr(), "\x1b[0;2m");
         // Markdown styles match the renderer's attribute order.
         let bold_code = Style {
             bold: true,
@@ -902,13 +924,19 @@ mod tests {
     fn startup_banner_matches_current_cli_bytes() {
         let (producer, terminal, _) = producer(None);
         producer.startup_banner("hy3-free", "993d14889c414aab81963843cccf8090 \"greeting\"");
-        let expected = format!(
-            "{rule}\nMYCO\n\nModel: hy3-free\n\
-             Session: 993d14889c414aab81963843cccf8090 \"greeting\"\n\n\
-             /help for commands\n\nAlt-Enter or Ctrl-J for newline\n",
-            rule = banner_rule(None)
+        let plain = encode_plain(&terminal.events());
+        // Head: the shared banner-open layout (rule, MYCO, blank line),
+        // pinned differentially against the layout helper.
+        let head = encode_plain(&crate::session::banner_open_events("MYCO", None));
+        let body = plain
+            .strip_prefix(&head)
+            .unwrap_or_else(|| panic!("banner must open with {head:?}: {plain:?}"));
+        // Body lines: the CLI-chrome pin.
+        assert_eq!(
+            body,
+            "Model: hy3-free\nSession: 993d14889c414aab81963843cccf8090 \"greeting\"\n\n\
+             /help for commands\n\nAlt-Enter or Ctrl-J for newline\n"
         );
-        assert_eq!(encode_plain(&terminal.events()), expected);
         // Styled: rule + MYCO are bold, body lines stay plain.
         let ansi = encode_ansi(&terminal.events(), true);
         assert!(ansi.contains("\x1b[0;1mMYCO\x1b[0m\n"));
@@ -919,14 +947,11 @@ mod tests {
     fn plain_encoding_is_structurally_stripped_ansi() {
         let (producer, terminal, _) = producer(Some(30));
         producer.user_header(Some(0), 100, None, &[]);
-        producer.emit(AgentEvent::TextDelta {
-            text: "Some **bold** and `code` in a paragraph that wraps.".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        text(
+            &producer,
+            "Some **bold** and `code` in a paragraph that wraps.",
+        );
+        finish(&producer);
         producer.error_section("boom");
 
         let events = terminal.events();
@@ -953,14 +978,8 @@ mod tests {
     fn broadcast_delivers_identical_streams_to_terminal_and_mirror() {
         let (producer, terminal, mirror) = producer(None);
         producer.user_header(Some(1), 2, None, &[]);
-        producer.emit(AgentEvent::TextDelta {
-            text: "hello".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        text(&producer, "hello");
+        finish(&producer);
         assert_eq!(terminal.events(), mirror.events());
         assert!(!terminal.events().is_empty());
     }
@@ -969,31 +988,16 @@ mod tests {
     fn assistant_section_opens_once_per_turn() {
         let (producer, terminal, _) = producer(None);
         producer.user_header(Some(0), 1, None, &[]);
-        producer.emit(AgentEvent::TextDelta {
-            text: "one".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TextDelta {
-            text: " two".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        text(&producer, "one");
+        text(&producer, " two");
+        finish(&producer);
         let plain = encode_plain(&terminal.events());
         assert_eq!(plain.matches("ASSISTANT\n").count(), 1);
         assert!(plain.contains("one two\n"));
         // Next user turn reopens the section.
         producer.user_header(Some(0), 1, None, &[]);
-        producer.emit(AgentEvent::TextDelta {
-            text: "three".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        text(&producer, "three");
+        finish(&producer);
         let plain = encode_plain(&terminal.events());
         assert_eq!(plain.matches("ASSISTANT\n").count(), 2);
     }
@@ -1002,22 +1006,10 @@ mod tests {
     fn thinking_line_streams_dim_and_paragraphs_blank_separate() {
         let (producer, terminal, _) = producer(None);
         producer.user_header(Some(0), 1, None, &[]);
-        producer.emit(AgentEvent::ThinkingDelta {
-            text: "plan".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::ThinkingDelta {
-            text: " it".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TextDelta {
-            text: "done".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        think(&producer, "plan");
+        think(&producer, " it");
+        text(&producer, "done");
+        finish(&producer);
         let plain = encode_plain(&terminal.events());
         // One ASSISTANT section: thinking line, blank line, answer text.
         assert!(
@@ -1033,26 +1025,10 @@ mod tests {
     fn tool_paragraphs_blank_separate_inside_assistant() {
         let (producer, terminal, _) = producer(None);
         producer.user_header(Some(0), 1, None, &[]);
-        producer.emit(AgentEvent::TextDelta {
-            text: "running now".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::ToolStarted {
-            tool_use: ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({"command": "echo hi"}),
-            },
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TextDelta {
-            text: "and after".into(),
-            context: ctx(0),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(0),
-        });
+        text(&producer, "running now");
+        tool(&producer, "bash", serde_json::json!({"command": "echo hi"}));
+        text(&producer, "and after");
+        finish(&producer);
         let plain = encode_plain(&terminal.events());
         assert!(
             plain.contains("running now\n\nbash({\n  \"command\": \"echo hi\"\n})\n\nand after\n"),
@@ -1066,26 +1042,10 @@ mod tests {
     #[test]
     fn nested_agent_events_are_ignored() {
         let (producer, terminal, mirror) = producer(None);
-        producer.emit(AgentEvent::TextDelta {
-            text: "worker noise".into(),
-            context: ctx(1),
-        });
-        producer.emit(AgentEvent::ThinkingDelta {
-            text: "worker thought".into(),
-            context: ctx(1),
-        });
-        producer.emit(AgentEvent::ToolStarted {
-            tool_use: ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            },
-            context: ctx(1),
-        });
-        producer.emit(AgentEvent::TurnFinished {
-            reason: TurnEndReason::EndTurn,
-            context: ctx(1),
-        });
+        text_at(&producer, 1, "worker noise");
+        think_at(&producer, 1, "worker thought");
+        tool_at(&producer, 1, "bash", serde_json::json!({}));
+        finish_at(&producer, 1);
         assert!(terminal.events().is_empty());
         assert!(mirror.events().is_empty());
     }

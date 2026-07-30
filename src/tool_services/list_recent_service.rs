@@ -135,9 +135,8 @@ mod tests {
     use super::*;
     use crate::CancelToken;
     use crate::generative_model::{Content, Message};
-    use crate::session::{
-        LinkCounts, Session, SessionKind, lock_myco_home_for_test, uuid_simple_hex,
-    };
+    use crate::session::{LinkCounts, Session, SessionKind};
+    use crate::test_support::{result_text, temp_home};
     use chrono::{Duration, Utc};
     use serde_json::json;
 
@@ -178,16 +177,6 @@ mod tests {
         assert_eq!(entries[order[0]].id, "newer");
     }
 
-    fn tool_text(r: &ToolResult) -> String {
-        r.content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn saved_session(model: &str, title: &str, user_text: &str) -> Session {
         let mut s = Session::new(model);
         s.title = Some(title.to_string());
@@ -200,21 +189,9 @@ mod tests {
         s
     }
 
-    // Holding the std MutexGuard across await is intended: it serializes the
-    // test, and #[tokio::test] runs on a current-thread runtime.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn lists_ranked_sessions_from_real_store() {
-        let _guard = lock_myco_home_for_test();
-        let dir = std::env::temp_dir().join(format!(
-            "myco-list-recent-{}",
-            uuid_simple_hex(uuid::Uuid::new_v4())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        let _home = temp_home("list-recent");
 
         let first = saved_session("m1", "host cancel work", "fix host-side cancel");
         let second = saved_session("m2", "docs pass", "tidy the readme");
@@ -231,14 +208,9 @@ mod tests {
             )
             .await;
         assert!(!list.is_error, "{list:?}");
-        let text = tool_text(&list);
+        let text = result_text(&list);
         assert!(text.contains(&first.id), "{text}");
         assert!(text.contains(&second.id), "{text}");
         assert!(text.contains("ranked by activity"), "{text}");
-
-        // SAFETY: test-only env cleanup; still under the myco-home lock.
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 }

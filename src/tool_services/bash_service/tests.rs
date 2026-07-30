@@ -1,14 +1,7 @@
 use super::*;
 use crate::host::HostWorker;
+use crate::test_support::{result_text, temp_dir};
 use serde_json::json;
-
-fn tool_use(input: Input) -> generative_model::ToolUse {
-    generative_model::ToolUse {
-        id: "test".into(),
-        name: "bash".into(),
-        input: serde_json::to_value(input).unwrap(),
-    }
-}
 
 fn tool_use_json(value: serde_json::Value) -> generative_model::ToolUse {
     generative_model::ToolUse {
@@ -16,18 +9,6 @@ fn tool_use_json(value: serde_json::Value) -> generative_model::ToolUse {
         name: "bash".into(),
         input: value,
     }
-}
-
-fn result_text(result: &generative_model::ToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            generative_model::Content::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn harness() -> Arc<HostWorker> {
@@ -38,16 +19,7 @@ fn harness() -> Arc<HostWorker> {
 }
 
 fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
-    HostDispatchContext {
-        agent_id,
-        cancel: crate::core::CancelToken::new(),
-    }
-}
-
-async fn dispatch(harness: Arc<HostWorker>, input: Input) -> generative_model::ToolResult {
-    harness
-        .dispatch_tool_use(tool_use(input), dispatch_ctx(uuid::Uuid::nil()))
-        .await
+    HostDispatchContext::new(agent_id, crate::core::CancelToken::new())
 }
 
 async fn dispatch_json(
@@ -59,29 +31,70 @@ async fn dispatch_json(
         .await
 }
 
+/// Owner-scoped dispatch straight at the service, for ownership / summary
+/// tests that need a specific `agent_id`.
+async fn dispatch_json_as(
+    service: &Arc<BashService>,
+    owner: uuid::Uuid,
+    value: serde_json::Value,
+) -> generative_model::ToolResult {
+    service
+        .clone()
+        .dispatch_tool_use(tool_use_json(value), dispatch_ctx(owner))
+        .await
+}
+
 fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().as_simple())
 }
 
-#[test]
-fn input_roundtrip_exec() {
-    let input = Input {
-        action: None,
-        command: Some("echo hi".into()),
-        cwd: Some("/tmp".into()),
-        session_id: None,
-        stdin: None,
-        signal: None,
-        timeout_ms: None,
-        idle_ms: None,
-        max_bytes: None,
-    };
-    let value = serde_json::to_value(&input).unwrap();
-    assert_eq!(value["command"], "echo hi");
-    assert_eq!(value["cwd"], "/tmp");
-    let parsed: Input = serde_json::from_value(value).unwrap();
-    assert_eq!(parsed.command.as_deref(), Some("echo hi"));
-    assert_eq!(parsed.cwd.as_deref(), Some("/tmp"));
+// Session-lifecycle helpers with default fast test timings. Tests where the
+// timings or extra fields ARE the claim build their own json via
+// `dispatch_json` instead.
+
+/// `start` a session (timeout 1s / idle 200ms), assert success, return the
+/// result text.
+async fn start_ok(harness: &Arc<HostWorker>, id: &str, command: &str) -> String {
+    let result = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": command,
+            "timeout_ms": 1000,
+            "idle_ms": 200,
+        }),
+    )
+    .await;
+    assert!(!result.is_error, "start: {}", result_text(&result));
+    result_text(&result)
+}
+
+/// `write` stdin into a session (timeout 1s / idle 300ms), assert success,
+/// return the result text.
+async fn write_ok(harness: &Arc<HostWorker>, id: &str, stdin: &str) -> String {
+    let result = dispatch_json(
+        harness.clone(),
+        json!({
+            "action": "write",
+            "session_id": id,
+            "stdin": stdin,
+            "timeout_ms": 1000,
+            "idle_ms": 300,
+        }),
+    )
+    .await;
+    assert!(!result.is_error, "write: {}", result_text(&result));
+    result_text(&result)
+}
+
+/// `close` a session, returning the raw result (cleanup callers ignore it).
+async fn close(harness: &Arc<HostWorker>, id: &str) -> generative_model::ToolResult {
+    dispatch_json(
+        harness.clone(),
+        json!({"action": "close", "session_id": id}),
+    )
+    .await
 }
 
 #[test]
@@ -116,27 +129,24 @@ fn rejects_empty_input() {
     );
 }
 
-/// `{"input": {}}` is a real thing models emit. It must come back as an error
-/// tool result the agent can recover from — never a dropped or empty success.
+/// `{"input": {}}` is a real thing models emit, and explicit nulls are the
+/// same nothing. Both must come back as an error tool result the agent can
+/// recover from — never a dropped or empty success.
 #[tokio::test]
 async fn empty_input_dispatch_returns_error_result() {
-    let result = dispatch_json(harness(), json!({})).await;
-    assert!(result.is_error, "expected an error result: {result:?}");
-    assert_eq!(result.id, "test");
-    let text = result_text(&result);
-    assert!(text.contains("empty bash input"), "text={text}");
-}
-
-/// Explicit nulls are the same nothing as `{}`.
-#[tokio::test]
-async fn all_null_input_dispatch_returns_error_result() {
-    let result = dispatch_json(
-        harness(),
+    for value in [
+        json!({}),
         json!({"action": null, "command": null, "session_id": null}),
-    )
-    .await;
-    assert!(result.is_error, "expected an error result: {result:?}");
-    assert!(result_text(&result).contains("empty bash input"));
+    ] {
+        let result = dispatch_json(harness(), value.clone()).await;
+        assert!(result.is_error, "value={value} expected error: {result:?}");
+        assert_eq!(result.id, "test");
+        let text = result_text(&result);
+        assert!(
+            text.contains("empty bash input"),
+            "value={value} text={text}"
+        );
+    }
 }
 
 /// Non-object inputs (`null`, a bare string, a list) are malformed too.
@@ -232,13 +242,18 @@ fn rejects_command_starting_with_cd() {
 
 #[test]
 fn rejects_cwd_on_non_spawn_actions() {
-    let input: Input = serde_json::from_value(json!({
-        "action": "list",
-        "cwd": "/tmp",
-    }))
-    .unwrap();
-    let err = resolve_action(&input).unwrap_err();
-    assert!(err.contains("`cwd` is only valid"), "{err}");
+    for action in ["write", "read", "signal", "close", "list"] {
+        let input: Input = serde_json::from_value(json!({
+            "action": action,
+            "cwd": "/tmp",
+        }))
+        .unwrap();
+        let err = resolve_action(&input).unwrap_err();
+        assert!(
+            err.contains("`cwd` is only valid"),
+            "action={action} err={err}"
+        );
+    }
 }
 
 #[test]
@@ -266,56 +281,43 @@ fn cwd_resolves_on_exec_and_start() {
     }
 }
 
+/// Shared timeout-resolution contract for one action shape: the default
+/// applies when omitted, an explicit under-ceiling value is preserved, and a
+/// value above the safety ceiling is rejected (not clamped).
+fn assert_timeout_resolution(base: serde_json::Value, default_ms: u64, max_ms: u64) {
+    let resolve = |timeout_ms: Option<u64>| {
+        let mut value = base.clone();
+        if let Some(t) = timeout_ms {
+            value["timeout_ms"] = t.into();
+        }
+        let input: Input = serde_json::from_value(value).unwrap();
+        resolve_action(&input)
+    };
+    let timeout_of = |action: Action| match action {
+        Action::Exec { timeout_ms, .. } | Action::Read { timeout_ms, .. } => timeout_ms,
+        other => panic!("expected Exec/Read, got {other:?}"),
+    };
+
+    // Default when omitted.
+    assert_eq!(timeout_of(resolve(None).unwrap()), default_ms);
+    // Explicit multi-minute value under the ceiling is preserved.
+    assert_eq!(timeout_of(resolve(Some(120_000)).unwrap()), 120_000);
+    // Above the safety ceiling is rejected (not clamped).
+    let err = resolve(Some(max_ms + 1)).unwrap_err();
+    assert!(
+        err.contains("exceeds max") && err.contains(&max_ms.to_string()),
+        "{err}"
+    );
+}
+
 #[test]
 fn timeout_ms_defaults_and_rejects_above_session_max() {
-    // Default when omitted.
-    let input: Input = serde_json::from_value(json!({
-        "action": "read",
-        "session_id": "s",
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Read { timeout_ms, .. } => assert_eq!(timeout_ms, DEFAULT_TIMEOUT_MS),
-        _ => panic!("expected Read"),
-    }
     assert_eq!(DEFAULT_TIMEOUT_MS, 30_000);
     assert_eq!(MAX_TIMEOUT_MS, 1_800_000);
-
-    // Explicit multi-minute value under the ceiling is preserved.
-    let input: Input = serde_json::from_value(json!({
-        "action": "read",
-        "session_id": "s",
-        "timeout_ms": 120_000,
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Read { timeout_ms, .. } => assert_eq!(timeout_ms, 120_000),
-        _ => panic!("expected Read"),
-    }
-
-    // Values under the cap are preserved.
-    let input: Input = serde_json::from_value(json!({
-        "action": "read",
-        "session_id": "s",
-        "timeout_ms": 250,
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Read { timeout_ms, .. } => assert_eq!(timeout_ms, 250),
-        _ => panic!("expected Read"),
-    }
-
-    // Above the safety ceiling is rejected (not clamped).
-    let input: Input = serde_json::from_value(json!({
-        "action": "read",
-        "session_id": "s",
-        "timeout_ms": 1_800_001,
-    }))
-    .unwrap();
-    let err = resolve_action(&input).unwrap_err();
-    assert!(
-        err.contains("exceeds max") && err.contains(&MAX_TIMEOUT_MS.to_string()),
-        "{err}"
+    assert_timeout_resolution(
+        json!({"action": "read", "session_id": "s"}),
+        DEFAULT_TIMEOUT_MS,
+        MAX_TIMEOUT_MS,
     );
 }
 
@@ -323,52 +325,10 @@ fn timeout_ms_defaults_and_rejects_above_session_max() {
 fn exec_timeout_ms_defaults_to_60s_and_rejects_above_max() {
     assert_eq!(DEFAULT_EXEC_TIMEOUT_MS, 60_000);
     assert_eq!(MAX_EXEC_TIMEOUT_MS, 1_800_000);
-
-    let input: Input = serde_json::from_value(json!({
-        "action": "exec",
-        "command": "true",
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Exec { timeout_ms, .. } => assert_eq!(timeout_ms, DEFAULT_EXEC_TIMEOUT_MS),
-        _ => panic!("expected Exec"),
-    }
-
-    // Explicit multi-minute value under the ceiling is preserved.
-    let input: Input = serde_json::from_value(json!({
-        "action": "exec",
-        "command": "true",
-        "timeout_ms": 120_000,
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Exec { timeout_ms, .. } => assert_eq!(timeout_ms, 120_000),
-        _ => panic!("expected Exec"),
-    }
-
-    // Under the max is preserved.
-    let input: Input = serde_json::from_value(json!({
-        "action": "exec",
-        "command": "true",
-        "timeout_ms": 5_000,
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Exec { timeout_ms, .. } => assert_eq!(timeout_ms, 5_000),
-        _ => panic!("expected Exec"),
-    }
-
-    // Above the safety ceiling is rejected.
-    let input: Input = serde_json::from_value(json!({
-        "action": "exec",
-        "command": "true",
-        "timeout_ms": 1_800_001,
-    }))
-    .unwrap();
-    let err = resolve_action(&input).unwrap_err();
-    assert!(
-        err.contains("exceeds max") && err.contains(&MAX_EXEC_TIMEOUT_MS.to_string()),
-        "{err}"
+    assert_timeout_resolution(
+        json!({"action": "exec", "command": "true"}),
+        DEFAULT_EXEC_TIMEOUT_MS,
+        MAX_EXEC_TIMEOUT_MS,
     );
 }
 
@@ -543,7 +503,8 @@ async fn exec_timeout_output_is_truncated() {
 }
 
 /// Silent long-lived child: tool must return quickly with timed_out while
-/// the process stays alive in the background for later read/close.
+/// the process stays alive in the background for later read/close — and the
+/// late `echo` must not appear in the returned stdout body.
 #[tokio::test]
 async fn session_returns_while_process_still_running() {
     let harness = harness();
@@ -578,6 +539,15 @@ async fn session_returns_while_process_still_running() {
         !text.contains("stdout:\nlate"),
         "must not wait for late output: {text}"
     );
+    // Stronger: the echo has not landed in the returned stdout section. (The
+    // status hint can legitimately contain the word "late", so parse the body.)
+    if let Some(rest) = text.split("stdout:\n").nth(1) {
+        let body = rest.split("stderr:\n").next().unwrap_or(rest);
+        assert!(
+            !body.contains("late"),
+            "should not have late output yet: {text}"
+        );
+    }
 
     // Process must still be live in the session table.
     let list = dispatch_json(harness.clone(), json!({"action": "list"})).await;
@@ -587,7 +557,7 @@ async fn session_returns_while_process_still_running() {
         result_text(&list)
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 /// Prompt-time summaries list only the caller's live sessions, one line
@@ -598,19 +568,18 @@ async fn running_tool_summaries_list_live_sessions_for_owner_only() {
     let owner = uuid::Uuid::new_v4();
     let id = unique_id("summary");
 
-    let start = service
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "start",
-                "session_id": id,
-                "command": "bash -c 'sleep 30'",
-                "timeout_ms": 500,
-                "idle_ms": 100,
-            })),
-            dispatch_ctx(owner),
-        )
-        .await;
+    let start = dispatch_json_as(
+        &service,
+        owner,
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "bash -c 'sleep 30'",
+            "timeout_ms": 500,
+            "idle_ms": 100,
+        }),
+    )
+    .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
 
     let lines = service.running_tool_summaries(owner);
@@ -625,14 +594,13 @@ async fn running_tool_summaries_list_live_sessions_for_owner_only() {
         "other agents must not see this session"
     );
 
-    let close = service
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({"action": "close", "session_id": id})),
-            dispatch_ctx(owner),
-        )
-        .await;
-    assert!(!close.is_error, "close: {}", result_text(&close));
+    let closed = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "close", "session_id": id}),
+    )
+    .await;
+    assert!(!closed.is_error, "close: {}", result_text(&closed));
     assert!(
         service.running_tool_summaries(owner).is_empty(),
         "closed sessions must not be listed"
@@ -641,17 +609,16 @@ async fn running_tool_summaries_list_live_sessions_for_owner_only() {
     // An exited-but-unclosed session is not running. Exit is observed by
     // an async waiter, so poll briefly instead of asserting immediately.
     let id2 = unique_id("exited");
-    let start = service
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "start",
-                "session_id": id2,
-                "command": "true",
-            })),
-            dispatch_ctx(owner),
-        )
-        .await;
+    let start = dispatch_json_as(
+        &service,
+        owner,
+        json!({
+            "action": "start",
+            "session_id": id2,
+            "command": "true",
+        }),
+    )
+    .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !service.running_tool_summaries(owner).is_empty() {
@@ -771,10 +738,8 @@ async fn exec_stdin_is_null_not_inherited() {
 #[tokio::test]
 async fn exec_timeout_kills_process_group_not_just_bash() {
     let harness = harness();
-    let marker = std::env::temp_dir().join(format!(
-        "myco-timeout-orphan-{}.marker",
-        uuid::Uuid::new_v4()
-    ));
+    let dir = temp_dir("timeout-orphan");
+    let marker = dir.path().join("still-alive.marker");
     let marker_s = marker.to_string_lossy().into_owned();
     // Unique sleep arg so we can find the grandchild without matching other tests.
     let sleep_tag = format!("17.{}", uuid::Uuid::new_v4().as_u128() % 100_000);
@@ -822,16 +787,11 @@ async fn exec_timeout_kills_process_group_not_just_bash() {
         !marker.exists(),
         "marker must not be written after timeout (orphan finished the command)"
     );
-    let _ = std::fs::remove_file(&marker);
 }
 
 #[tokio::test]
 async fn exec_cancel_kills_runaway() {
-    let service = Arc::new(BashService::new());
-    let harness = Arc::new(HostWorker::new(
-        "test",
-        vec![service.clone() as Arc<dyn ToolService>],
-    ));
+    let harness = harness();
     let cancel = crate::core::CancelToken::new();
     let cancel2 = cancel.clone();
     tokio::spawn(async move {
@@ -846,10 +806,7 @@ async fn exec_cancel_kills_runaway() {
                 "command": "sleep 30",
                 "timeout_ms": 10_000,
             })),
-            HostDispatchContext {
-                agent_id: uuid::Uuid::nil(),
-                cancel,
-            },
+            HostDispatchContext::new(uuid::Uuid::nil(), cancel),
         )
         .await;
     let elapsed = t0.elapsed();
@@ -868,22 +825,7 @@ async fn exec_cancel_kills_runaway() {
 
 #[tokio::test]
 async fn echo_stdout() {
-    let harness = harness();
-    let result = dispatch(
-        harness,
-        Input {
-            action: None,
-            command: Some("echo hello-from-bash".into()),
-            cwd: None,
-            session_id: None,
-            stdin: None,
-            signal: None,
-            timeout_ms: None,
-            idle_ms: None,
-            max_bytes: None,
-        },
-    )
-    .await;
+    let result = dispatch_json(harness(), json!({"command": "echo hello-from-bash"})).await;
     assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
     assert!(text.contains("hello-from-bash"), "{text}");
@@ -893,22 +835,7 @@ async fn echo_stdout() {
 
 #[tokio::test]
 async fn nonzero_exit_still_ok_result() {
-    let harness = harness();
-    let result = dispatch(
-        harness,
-        Input {
-            action: None,
-            command: Some("exit 7".into()),
-            cwd: None,
-            session_id: None,
-            stdin: None,
-            signal: None,
-            timeout_ms: None,
-            idle_ms: None,
-            max_bytes: None,
-        },
-    )
-    .await;
+    let result = dispatch_json(harness(), json!({"command": "exit 7"})).await;
     assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
     assert!(text.contains("Exit code: Some(7)"), "{text}");
@@ -916,22 +843,7 @@ async fn nonzero_exit_still_ok_result() {
 
 #[tokio::test]
 async fn stderr_captured() {
-    let harness = harness();
-    let result = dispatch(
-        harness,
-        Input {
-            action: None,
-            command: Some("echo err-msg 1>&2".into()),
-            cwd: None,
-            session_id: None,
-            stdin: None,
-            signal: None,
-            timeout_ms: None,
-            idle_ms: None,
-            max_bytes: None,
-        },
-    )
-    .await;
+    let result = dispatch_json(harness(), json!({"command": "echo err-msg 1>&2"})).await;
     assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
     assert!(text.contains("err-msg"), "{text}");
@@ -940,59 +852,33 @@ async fn stderr_captured() {
 
 #[tokio::test]
 async fn exec_respects_cwd() {
-    let harness = harness();
-    let dir = std::env::temp_dir().join(format!("myco-cwd-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir_str = dir.to_string_lossy().into_owned();
+    let dir = temp_dir("cwd");
+    let dir_str = dir.path().to_string_lossy().into_owned();
 
     let result = dispatch_json(
-        harness,
+        harness(),
         json!({
             "command": "pwd",
-            "cwd": dir_str,
+            "cwd": &dir_str,
         }),
     )
     .await;
     assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
     // macOS /var is often a symlink to /private/var; compare canonical paths.
-    let expected = std::fs::canonicalize(&dir).unwrap();
+    let expected = std::fs::canonicalize(dir.path()).unwrap();
     let expected_s = expected.to_string_lossy();
     assert!(
         text.contains(expected_s.as_ref()) || text.contains(&dir_str),
         "expected pwd under {expected_s} or {dir_str}: {text}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-async fn rejects_cd_prefix_at_dispatch() {
-    let harness = harness();
-    let result = dispatch_json(harness, json!({"command": "cd /tmp && pwd"})).await;
-    assert!(result.is_error, "cd-prefixed command should fail");
-    let text = result_text(&result);
-    assert!(
-        text.contains("must not start with `cd`") && text.contains("`cwd`"),
-        "{text}"
-    );
-}
-
-/// Blocking dispatch path: over-max exec timeout must error immediately
-/// (not clamp / not start the process).
-#[tokio::test]
-async fn dispatch_rejects_exec_timeout_above_max() {
-    let harness = harness();
+/// Blocking dispatch path: an over-max timeout must error immediately —
+/// not clamp, and not start the process first.
+async fn assert_dispatch_rejects_over_max(value: serde_json::Value, max_ms: u64) {
     let t0 = Instant::now();
-    let result = dispatch_json(
-        harness,
-        json!({
-            "action": "exec",
-            "command": "sleep 30",
-            "timeout_ms": 1_800_001,
-        }),
-    )
-    .await;
+    let result = dispatch_json(harness(), value).await;
     let elapsed = t0.elapsed();
     assert!(
         result.is_error,
@@ -1001,7 +887,7 @@ async fn dispatch_rejects_exec_timeout_above_max() {
     );
     let text = result_text(&result);
     assert!(
-        text.contains("exceeds max") && text.contains(&MAX_EXEC_TIMEOUT_MS.to_string()),
+        text.contains("exceeds max") && text.contains(&max_ms.to_string()),
         "{text}"
     );
     assert!(
@@ -1010,45 +896,39 @@ async fn dispatch_rejects_exec_timeout_above_max() {
     );
 }
 
-/// Blocking dispatch path: over-max session timeout must error.
+#[tokio::test]
+async fn dispatch_rejects_exec_timeout_above_max() {
+    assert_dispatch_rejects_over_max(
+        json!({
+            "action": "exec",
+            "command": "sleep 30",
+            "timeout_ms": 1_800_001,
+        }),
+        MAX_EXEC_TIMEOUT_MS,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn dispatch_rejects_session_timeout_above_max() {
-    let harness = harness();
-    let t0 = Instant::now();
-    let result = dispatch_json(
-        harness,
+    assert_dispatch_rejects_over_max(
         json!({
             "action": "start",
             "session_id": unique_id("tmax"),
             "command": "bash --noprofile --norc",
             "timeout_ms": 1_800_001,
         }),
+        MAX_TIMEOUT_MS,
     )
     .await;
-    let elapsed = t0.elapsed();
-    assert!(
-        result.is_error,
-        "expected tool error, got: {}",
-        result_text(&result)
-    );
-    let text = result_text(&result);
-    assert!(
-        text.contains("exceeds max") && text.contains(&MAX_TIMEOUT_MS.to_string()),
-        "{text}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "reject must be immediate, took {elapsed:?}: {text}"
-    );
 }
 
 #[tokio::test]
 async fn session_start_respects_cwd() {
     let harness = harness();
     let id = unique_id("cwd");
-    let dir = std::env::temp_dir().join(format!("myco-sess-cwd-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir_str = dir.to_string_lossy().into_owned();
+    let dir = temp_dir("sess-cwd");
+    let dir_str = dir.path().to_string_lossy().into_owned();
 
     let start = dispatch_json(
         harness.clone(),
@@ -1056,7 +936,7 @@ async fn session_start_respects_cwd() {
             "action": "start",
             "session_id": id,
             "command": "bash --noprofile --norc",
-            "cwd": dir_str,
+            "cwd": &dir_str,
             "idle_ms": 200,
             "timeout_ms": 1000,
         }),
@@ -1064,28 +944,15 @@ async fn session_start_respects_cwd() {
     .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
 
-    let write = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "pwd\n",
-            "idle_ms": 300,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!write.is_error, "write: {}", result_text(&write));
-    let text = result_text(&write);
-    let expected = std::fs::canonicalize(&dir).unwrap();
+    let text = write_ok(&harness, &id, "pwd\n").await;
+    let expected = std::fs::canonicalize(dir.path()).unwrap();
     let expected_s = expected.to_string_lossy();
     assert!(
         text.contains(expected_s.as_ref()) || text.contains(&dir_str),
         "session should start in cwd: {text}"
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
@@ -1093,37 +960,13 @@ async fn session_cat_roundtrip() {
     let harness = harness();
     let id = unique_id("cat");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "cat",
-            "idle_ms": 200,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
-    let start_text = result_text(&start);
+    let start_text = start_ok(&harness, &id, "cat").await;
     assert!(
         start_text.contains(&format!("session_id: {id}")),
         "{start_text}"
     );
 
-    let write = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "hello-session\n",
-            "idle_ms": 200,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!write.is_error, "write: {}", result_text(&write));
-    let write_text = result_text(&write);
+    let write_text = write_ok(&harness, &id, "hello-session\n").await;
     assert!(
         write_text.contains("hello-session"),
         "expected echo from cat: {write_text}"
@@ -1133,16 +976,16 @@ async fn session_cat_roundtrip() {
     assert!(!list.is_error, "list: {}", result_text(&list));
     assert!(result_text(&list).contains(&id), "{}", result_text(&list));
 
-    let close = dispatch_json(
-        harness.clone(),
-        json!({"action": "close", "session_id": id}),
-    )
-    .await;
-    assert!(!close.is_error, "close: {}", result_text(&close));
+    let close_result = close(&harness, &id).await;
     assert!(
-        result_text(&close).contains("session closed"),
+        !close_result.is_error,
+        "close: {}",
+        result_text(&close_result)
+    );
+    assert!(
+        result_text(&close_result).contains("session closed"),
         "{}",
-        result_text(&close)
+        result_text(&close_result)
     );
 
     let list2 = dispatch_json(harness, json!({"action": "list"})).await;
@@ -1161,66 +1004,20 @@ async fn session_interactive_shell_multi_turn() {
 
     // Non-interactive bash reading commands from stdin still keeps shell state.
     // Avoid `bash -i` here: prompts/job-control noise makes idle detection flaky in CI.
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash --noprofile --norc",
-            "idle_ms": 200,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
+    start_ok(&harness, &id, "bash --noprofile --norc").await;
 
-    let turn1 = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "export MYCO_MULTI_TURN=alive-from-turn-1\n",
-            "idle_ms": 200,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!turn1.is_error, "turn1: {}", result_text(&turn1));
+    write_ok(&harness, &id, "export MYCO_MULTI_TURN=alive-from-turn-1\n").await;
 
-    let turn2 = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "printf 'saw=%s\\n' \"$MYCO_MULTI_TURN\"\n",
-            "idle_ms": 300,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!turn2.is_error, "turn2: {}", result_text(&turn2));
-    let turn2_text = result_text(&turn2);
+    let turn2_text = write_ok(&harness, &id, "printf 'saw=%s\\n' \"$MYCO_MULTI_TURN\"\n").await;
     assert!(
         turn2_text.contains("saw=alive-from-turn-1"),
         "shell state must persist across writes: {turn2_text}"
     );
 
-    let turn3 = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "echo turn-3-still-here\n",
-            "idle_ms": 300,
-            "timeout_ms": 1000,
-        }),
-    )
-    .await;
-    assert!(!turn3.is_error, "turn3: {}", result_text(&turn3));
+    let turn3_text = write_ok(&harness, &id, "echo turn-3-still-here\n").await;
     assert!(
-        result_text(&turn3).contains("turn-3-still-here"),
-        "third turn should still talk to the same shell: {}",
-        result_text(&turn3)
+        turn3_text.contains("turn-3-still-here"),
+        "third turn should still talk to the same shell: {turn3_text}"
     );
 
     let list = dispatch_json(harness.clone(), json!({"action": "list"})).await;
@@ -1230,8 +1027,12 @@ async fn session_interactive_shell_multi_turn() {
         result_text(&list)
     );
 
-    let close = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
-    assert!(!close.is_error, "close: {}", result_text(&close));
+    let close_result = close(&harness, &id).await;
+    assert!(
+        !close_result.is_error,
+        "close: {}",
+        result_text(&close_result)
+    );
 }
 
 #[tokio::test]
@@ -1239,6 +1040,8 @@ async fn session_python_repl() {
     let harness = harness();
     let id = unique_id("py");
 
+    // Python's banner/prompt land on stderr and can be slow; give the REPL a
+    // longer idle window than the shell tests.
     let start = dispatch_json(
         harness.clone(),
         json!({
@@ -1251,75 +1054,33 @@ async fn session_python_repl() {
     )
     .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
-    // Banner / prompt may land on stderr for python -i.
-    let start_text = result_text(&start);
-    assert!(
-        start_text.contains("Python")
-            || start_text.contains(">>>")
-            || start_text.contains("status:"),
-        "{start_text}"
-    );
 
     let write = dispatch_json(
         harness.clone(),
         json!({
             "action": "write",
             "session_id": id,
-            "stdin": "print(2+2)\n",
+            "stdin": "print(6*7)\n",
             "idle_ms": 400,
             "timeout_ms": 1000,
         }),
     )
     .await;
     assert!(!write.is_error, "write: {}", result_text(&write));
+    // Unambiguous evaluation: the REPL must have computed 6*7, not merely
+    // echoed banner digits.
     let write_text = result_text(&write);
     assert!(
-        write_text.contains('4'),
-        "expected python to print 4: {write_text}"
+        write_text.lines().any(|l| l.trim() == "42"),
+        "expected python to evaluate 6*7 to a `42` line: {write_text}"
     );
 
-    let close = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
-    assert!(!close.is_error, "close: {}", result_text(&close));
-}
-
-#[tokio::test]
-async fn session_timeout_returns_partial() {
-    let harness = harness();
-    let id = unique_id("sleep");
-
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            // Prints once after 5s; our timeout is much shorter.
-            "command": "bash -c 'sleep 5; echo late'",
-            "idle_ms": 100,
-            "timeout_ms": 400,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
-    let text = result_text(&start);
+    let close_result = close(&harness, &id).await;
     assert!(
-        text.contains("timed_out") || text.contains("status: running"),
-        "expected timeout/running before output: {text}"
+        !close_result.is_error,
+        "close: {}",
+        result_text(&close_result)
     );
-    // The status hint contains the word "late" ("still live"); check the stdout body.
-    assert!(
-        !text.contains("stdout:\nlate") && !text.contains("stdout:\nlate\n"),
-        "should not have late output yet: {text}"
-    );
-    // Stronger: the echo has not landed in the returned stdout section.
-    if let Some(rest) = text.split("stdout:\n").nth(1) {
-        let body = rest.split("stderr:\n").next().unwrap_or(rest);
-        assert!(
-            !body.contains("late"),
-            "should not have late output yet: {text}"
-        );
-    }
-
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
 }
 
 #[tokio::test]
@@ -1327,18 +1088,7 @@ async fn session_duplicate_id_rejected() {
     let harness = harness();
     let id = unique_id("dup");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "cat",
-            "timeout_ms": 1000,
-            "idle_ms": 100,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
+    start_ok(&harness, &id, "cat").await;
 
     let start2 = dispatch_json(
         harness.clone(),
@@ -1356,7 +1106,7 @@ async fn session_duplicate_id_rejected() {
         result_text(&start2)
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
@@ -1384,18 +1134,7 @@ async fn session_byte_cap_truncates() {
     let harness = harness();
     let id = unique_id("big");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "cat",
-            "timeout_ms": 1000,
-            "idle_ms": 200,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
+    start_ok(&harness, &id, "cat").await;
 
     // Write more than max_bytes; cat will echo it all.
     let payload = "x".repeat(200);
@@ -1432,7 +1171,7 @@ async fn session_byte_cap_truncates() {
     .await;
     assert!(!read.is_error, "read: {}", result_text(&read));
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
@@ -1440,19 +1179,7 @@ async fn session_exited_process_reports_status() {
     let harness = harness();
     let id = unique_id("exit");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash -c 'echo bye; exit 3'",
-            "timeout_ms": 1000,
-            "idle_ms": 200,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
-    let text = result_text(&start);
+    let text = start_ok(&harness, &id, "bash -c 'echo bye; exit 3'").await;
     assert!(text.contains("bye"), "{text}");
     assert!(
         text.contains("exited") || text.contains("running"),
@@ -1479,36 +1206,28 @@ async fn session_exited_process_reports_status() {
         "start={text}\nread={read_text}"
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
 async fn session_foreign_owner_rejected() {
     let service = Arc::new(BashService::new());
-    let harness = Arc::new(HostWorker::new(
-        "test",
-        vec![service.clone() as Arc<dyn ToolService>],
-    ));
     let owner_a = uuid::Uuid::new_v4();
     let owner_b = uuid::Uuid::new_v4();
     let id = unique_id("own");
 
-    let start = harness
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "start",
-                "session_id": id,
-                "command": "cat",
-                "timeout_ms": 1000,
-                "idle_ms": 100,
-            })),
-            HostDispatchContext {
-                agent_id: owner_a,
-                cancel: crate::core::CancelToken::new(),
-            },
-        )
-        .await;
+    let start = dispatch_json_as(
+        &service,
+        owner_a,
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "cat",
+            "timeout_ms": 1000,
+            "idle_ms": 100,
+        }),
+    )
+    .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
     assert!(
         result_text(&start).contains("owner:"),
@@ -1517,20 +1236,16 @@ async fn session_foreign_owner_rejected() {
     );
 
     // Different agent cannot write.
-    let write = harness
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "write",
-                "session_id": id,
-                "stdin": "nope\n",
-            })),
-            HostDispatchContext {
-                agent_id: owner_b,
-                cancel: crate::core::CancelToken::new(),
-            },
-        )
-        .await;
+    let write = dispatch_json_as(
+        &service,
+        owner_b,
+        json!({
+            "action": "write",
+            "session_id": id,
+            "stdin": "nope\n",
+        }),
+    )
+    .await;
     assert!(write.is_error, "foreign write should fail");
     assert!(
         result_text(&write).contains("owned by another agent"),
@@ -1539,42 +1254,35 @@ async fn session_foreign_owner_rejected() {
     );
 
     // Owner can still write.
-    let write_ok = harness
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "write",
-                "session_id": id,
-                "stdin": "yep\n",
-                "timeout_ms": 1000,
-                "idle_ms": 200,
-            })),
-            HostDispatchContext {
-                agent_id: owner_a,
-                cancel: crate::core::CancelToken::new(),
-            },
-        )
-        .await;
+    let owner_write = dispatch_json_as(
+        &service,
+        owner_a,
+        json!({
+            "action": "write",
+            "session_id": id,
+            "stdin": "yep\n",
+            "timeout_ms": 1000,
+            "idle_ms": 200,
+        }),
+    )
+    .await;
     assert!(
-        !write_ok.is_error,
+        !owner_write.is_error,
         "owner write: {}",
-        result_text(&write_ok)
+        result_text(&owner_write)
     );
     assert!(
-        result_text(&write_ok).contains("yep"),
+        result_text(&owner_write).contains("yep"),
         "{}",
-        result_text(&write_ok)
+        result_text(&owner_write)
     );
 
-    let _ = harness
-        .dispatch_tool_use(
-            tool_use_json(json!({"action": "close", "session_id": id})),
-            HostDispatchContext {
-                agent_id: owner_a,
-                cancel: crate::core::CancelToken::new(),
-            },
-        )
-        .await;
+    let _ = dispatch_json_as(
+        &service,
+        owner_a,
+        json!({"action": "close", "session_id": id}),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1588,22 +1296,18 @@ async fn agent_drop_reaps_owned_sessions() {
     let id = unique_id("reap");
 
     // Start a long-lived session as this agent.
-    let start = harness
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "start",
-                "session_id": id,
-                "command": "cat",
-                "timeout_ms": 1000,
-                "idle_ms": 100,
-            })),
-            HostDispatchContext {
-                agent_id,
-                cancel: crate::core::CancelToken::new(),
-            },
-        )
-        .await;
+    let start = dispatch_json_as(
+        &service,
+        agent_id,
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "cat",
+            "timeout_ms": 1000,
+            "idle_ms": 100,
+        }),
+    )
+    .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
 
     // Session is live.
@@ -1613,16 +1317,9 @@ async fn agent_drop_reaps_owned_sessions() {
         assert_eq!(sessions.get(&id).unwrap().owner, agent_id);
     }
 
-    // Dropping an Agent with this id reaps the session.
-    {
-        // Minimal agent: we only need Drop → notify_agent_finished.
-        // Construct via with_context; model is unused on drop.
-        // Use a dummy model via a zero-tool scripted path — simplest is call
-        // harness.notify_agent_finished directly to unit-test the service side,
-        // and separately assert Agent::drop calls it.
-        // Direct service path:
-        harness.notify_agent_finished(agent_id);
-    }
+    // Agent teardown reaches the service through the harness broadcast
+    // (Agent::drop → notify_agent_finished) and reaps the session.
+    harness.notify_agent_finished(agent_id);
 
     {
         let sessions = service.sessions.lock().unwrap();
@@ -1661,15 +1358,6 @@ fn signal_defaults_to_int_and_requires_session_id() {
     let input: Input = serde_json::from_value(json!({"action": "signal"})).unwrap();
     let err = resolve_action(&input).unwrap_err();
     assert!(err.contains("signal requires `session_id`"), "{err}");
-
-    let input: Input = serde_json::from_value(json!({
-        "action": "signal",
-        "session_id": "s",
-        "cwd": "/tmp",
-    }))
-    .unwrap();
-    let err = resolve_action(&input).unwrap_err();
-    assert!(err.contains("`cwd` is only valid"), "{err}");
 }
 
 /// A child with no SIGINT handler dies on the signal (`exit_signal: 2`), but
@@ -1679,18 +1367,7 @@ async fn signal_int_interrupts_running_command_without_reaping_session() {
     let harness = harness();
     let id = unique_id("sig");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash -c 'sleep 30; echo late'",
-            "timeout_ms": 500,
-            "idle_ms": 100,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
+    start_ok(&harness, &id, "bash -c 'sleep 30; echo late'").await;
 
     let t0 = Instant::now();
     let signal = dispatch_json(
@@ -1731,7 +1408,7 @@ async fn signal_int_interrupts_running_command_without_reaping_session() {
         result_text(&list)
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 /// The nested-agent case: a child that installs a SIGINT handler (as `myco`
@@ -1742,18 +1419,12 @@ async fn signal_int_leaves_handler_installed_child_alive_and_writable() {
     let harness = harness();
     let id = unique_id("sighandler");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash -c 'trap \"echo INTERRUPTED\" INT; while read -r line; do echo \"got:$line\"; done'",
-            "timeout_ms": 1_000,
-            "idle_ms": 200,
-        }),
+    start_ok(
+        &harness,
+        &id,
+        "bash -c 'trap \"echo INTERRUPTED\" INT; while read -r line; do echo \"got:$line\"; done'",
     )
     .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
 
     let signal = dispatch_json(
         harness.clone(),
@@ -1777,25 +1448,13 @@ async fn signal_int_leaves_handler_installed_child_alive_and_writable() {
     );
 
     // Still driveable after the interrupt — the reason `signal` exists.
-    let write = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "write",
-            "session_id": id,
-            "stdin": "still-there\n",
-            "timeout_ms": 2_000,
-            "idle_ms": 300,
-        }),
-    )
-    .await;
-    assert!(!write.is_error, "write: {}", result_text(&write));
+    let write_text = write_ok(&harness, &id, "still-there\n").await;
     assert!(
-        result_text(&write).contains("got:still-there"),
-        "session should still accept stdin after SIGINT: {}",
-        result_text(&write)
+        write_text.contains("got:still-there"),
+        "session should still accept stdin after SIGINT: {write_text}"
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
@@ -1803,18 +1462,7 @@ async fn signal_on_exited_session_reports_error() {
     let harness = harness();
     let id = unique_id("sigexit");
 
-    let start = dispatch_json(
-        harness.clone(),
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash -c 'echo bye'",
-            "timeout_ms": 2_000,
-            "idle_ms": 200,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
+    start_ok(&harness, &id, "bash -c 'echo bye'").await;
 
     let signal = dispatch_json(
         harness.clone(),
@@ -1828,7 +1476,7 @@ async fn signal_on_exited_session_reports_error() {
         result_text(&signal)
     );
 
-    let _ = dispatch_json(harness, json!({"action": "close", "session_id": id})).await;
+    let _ = close(&harness, &id).await;
 }
 
 #[tokio::test]
@@ -1837,28 +1485,26 @@ async fn signal_rejects_foreign_owner() {
     let owner = uuid::Uuid::new_v4();
     let id = unique_id("sigown");
 
-    let start = service
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({
-                "action": "start",
-                "session_id": id,
-                "command": "bash -c 'sleep 30'",
-                "timeout_ms": 500,
-                "idle_ms": 100,
-            })),
-            dispatch_ctx(owner),
-        )
-        .await;
+    let start = dispatch_json_as(
+        &service,
+        owner,
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": "bash -c 'sleep 30'",
+            "timeout_ms": 500,
+            "idle_ms": 100,
+        }),
+    )
+    .await;
     assert!(!start.is_error, "start: {}", result_text(&start));
 
-    let signal = service
-        .clone()
-        .dispatch_tool_use(
-            tool_use_json(json!({"action": "signal", "session_id": id})),
-            dispatch_ctx(uuid::Uuid::new_v4()),
-        )
-        .await;
+    let signal = dispatch_json_as(
+        &service,
+        uuid::Uuid::new_v4(),
+        json!({"action": "signal", "session_id": id}),
+    )
+    .await;
     assert!(signal.is_error, "expected error: {}", result_text(&signal));
     assert!(
         result_text(&signal).contains("owned by another agent"),
