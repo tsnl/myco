@@ -188,9 +188,7 @@ enum Mode {
 // main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
-    let _ = dotenvy::dotenv();
+fn main() {
     let args = Args::parse();
     if let Some(topic) = args.help_topic.as_deref() {
         print_cli_help(topic);
@@ -200,12 +198,26 @@ async fn main() {
         eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
         std::process::exit(2);
     }
-    match args.mode {
-        Mode::Interactive if args.print.is_some() => run_print(args).await,
-        Mode::Interactive => run_interactive(args).await,
-        Mode::Host => run_host(args).await,
-        Mode::SessionBrowser => run_session_browser(args),
+    // Startup environment, before the tokio runtime exists so nothing reads
+    // the environment concurrently with these writes: the user's mycorc first
+    // (agent launches only — a remote host worker gets its environment from
+    // the SSH shell), then `.env` from the cwd, which never overrides
+    // variables already set — mycorc's included.
+    if args.mode == Mode::Interactive {
+        // SAFETY: single-threaded — the runtime is not built yet.
+        unsafe { myco::config::run_startup_rc() };
     }
+    let _ = dotenvy::dotenv();
+    tokio::runtime::Runtime::new()
+        .expect("failed to start tokio runtime")
+        .block_on(async {
+            match args.mode {
+                Mode::Interactive if args.print.is_some() => run_print(args).await,
+                Mode::Interactive => run_interactive(args).await,
+                Mode::Host => run_host(args).await,
+                Mode::SessionBrowser => run_session_browser(args),
+            }
+        });
 }
 
 /// `--mode session-browser`: standalone picker, spawned by the bare-/resume
@@ -1388,6 +1400,10 @@ Hosts:
   Startup runs an ssh-agent preflight for remotes (BatchMode cannot prompt for
   passphrases on the NDJSON pipe). It is silent when clean; problems open a
   WARNING block. Missing keys: ssh-add, then restart.
+
+Startup sources ~/.myco/mycorc (bash) when present, before .env and config —
+a bashrc for myco. Exported environment changes apply to myco and everything
+it spawns; a TTY launch lets it prompt (ssh-agent, ssh-add). --help overview.
 
 Startup copies this manual to ~/.myco/manual/<version>/<commit>/ (index.md plus
 one file per article) and every agent system prompt names that directory, so

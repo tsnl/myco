@@ -26,8 +26,9 @@
 //! *look up* (unset variable, unreadable file) is **not** a resolve error: it
 //! is reported when the model is actually used ([`ModelCatalog::get`]).
 //!
-//! Out of scope, deliberately: `.env` loading (dotenvy runs in `main` before
-//! resolution so env auth sources see its effect), `MYCO_HOME` (session storage
+//! Out of scope, deliberately: startup environment mutation (`main` sources
+//! the [`rc`] file and loads `.env` before resolution so env auth sources see
+//! their effect), `MYCO_HOME` (session storage
 //! root; read by session code that also runs in `--mode host` workers where
 //! no `Config` exists), and per-tool lookups like `MYCO_LYNX` (resolved at
 //! tool-call time on whichever host runs the tool).
@@ -43,10 +44,12 @@ use crate::generative_model::{
 use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
 pub mod file;
+pub mod rc;
 pub use file::{
     AuthEntry, FileConfig, GatewayEntry, ModelEntry, example_config_toml, load_file_config,
     parse_file_config_str,
 };
+pub use rc::run_startup_rc;
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;

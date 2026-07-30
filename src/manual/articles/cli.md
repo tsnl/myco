@@ -103,7 +103,9 @@ attachments. No console mirror is written in print mode.
   `{ source = "none" }` (omit for no auth). A model names its gateway plus
   `api_id` (wire id) and a required `context_window`.
 - Credentials that fail to look up error at model *use*, naming the source.
-- `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
+- `~/.myco/mycorc` (when present) is sourced by bash at startup and its
+  exported environment changes applied, then `.env` in cwd is loaded. Full
+  format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled

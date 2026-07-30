@@ -63,6 +63,12 @@ markdown styling (`--wrap auto|off|COLS` caps the width at min(cap, terminal
 width), default 80; resizes reflow the transcript at the next prompt; never
 inside code blocks, never when piped).
 
+An optional `~/.myco/mycorc` is sourced by bash at every launch, before `.env`
+and config — a bashrc for myco. Its exported environment changes apply to the
+whole run (model auth, every tool process), and on a terminal it can prompt:
+start `ssh-agent`, `ssh-add` keys, pull API keys from a secret manager.
+Details: `myco --help overview`.
+
 Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by
 non-interactive SSH. Runtime details: `myco --help overview`.

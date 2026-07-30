@@ -45,6 +45,7 @@ myco (interactive) / Agent
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/mycorc` | Optional startup rc, sourced by bash at every agent launch (see below). Not run by `--mode host`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
@@ -78,6 +79,39 @@ context_window = 500_000
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH
   (`~/.local/bin` and `~/.cargo/bin` are common).
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
+
+### Startup rc (`~/.myco/mycorc`)
+
+An optional bash script sourced once at every agent launch (interactive REPL
+and `-p` print mode) — essentially a bashrc for myco. It runs before `.env`
+loading and config resolution, so exported variables are visible to
+`auth = { source = "env", … }` lookups and inherited by every process myco
+spawns (local tools, `ssh` to remotes). Typical uses:
+
+```bash
+# ~/.myco/mycorc
+export CARGO_TARGET_DIR="$HOME/.cache/myco-target"
+export ANTHROPIC_API_KEY="$(secret-tool lookup service anthropic)"
+[ -S "$SSH_AUTH_SOCK" ] || eval "$(ssh-agent -s)" >/dev/null
+ssh-add -l >/dev/null 2>&1 || ssh-add    # may prompt on the terminal
+```
+
+Semantics:
+
+- When stdin is a terminal the script can prompt (ssh-add passphrases). On a
+  piped launch (`… | myco -p`, nested myco) it gets no stdin — it can never eat
+  the caller's input — so keep it non-blocking.
+- After the script finishes, its **exported environment diff** — variables
+  added, changed, or unset — is applied to the myco process. Shell-local state
+  (aliases, functions, cwd) does not carry over.
+- Its stdout is redirected to stderr (print-mode stdout carries only the
+  answer).
+- A missing file is skipped silently; a nonzero exit prints a warning and the
+  captured changes still apply (the environment dump runs from an EXIT trap,
+  so even an `exit` mid-rc leaves a usable snapshot).
+- Local process only: a remote `--mode host` worker inherits the environment
+  of the non-interactive SSH shell — set remote environment in the remote's
+  own `~/.bashrc` / `~/.ssh/environment`.
 
 ## Models & credentials (the catalog)
 
@@ -143,8 +177,9 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:
-`{ source = "env", var_name = "…" }` reads the process environment (`dotenvy`
-loads a `.env` from the cwd at startup); `{ source = "file", path = "…" }`
+`{ source = "env", var_name = "…" }` reads the process environment (the
+startup rc `~/.myco/mycorc` runs first, then a `.env` from the cwd is
+loaded); `{ source = "file", path = "…" }`
 reads the file's trimmed contents (`~/` expands; keeps secrets out of a
 shareable config); `{ source = "none" }` — or omitting `auth` — sends no auth
 header (local servers). A credential that fails to look up does **not** fail
