@@ -1,9 +1,10 @@
-//! Startup health check for expected executables + combined preflight WARNING.
+//! Startup work before the first prompt + the combined preflight WARNING.
 //!
-//! Interactive startup verifies that the external programs myco spawns
-//! (declared in [`crate::external_command`]) actually resolve on the agent
-//! machine. Results fold into the same WARNING block as the ssh-agent
-//! preflight ([`SshAgentPreflightReport`]) and the soul size check
+//! Startup exports the manual for this build ([`crate::manual::export`]) and
+//! verifies that the external programs myco spawns (declared in
+//! [`crate::external_command`]) actually resolve on the agent machine. Results
+//! fold into one WARNING block with the ssh-agent preflight
+//! ([`SshAgentPreflightReport`]) and the soul size check
 //! ([`crate::prompts::soul_truncation`]) — one section after the banner,
 //! silent when everything resolves. Remote hosts are not probed here; they
 //! report missing programs as tool errors at call time.
@@ -73,10 +74,13 @@ fn missing_executables(
         .collect()
 }
 
-/// Everything interactive startup checks before the first prompt: the soul
-/// size cap, expected executables, then ssh-agent identities.
+/// Everything startup does before the first prompt: export the manual, check
+/// the soul size cap and the expected executables, then ssh-agent identities.
 #[derive(Debug, Default, Clone)]
 pub struct StartupPreflight {
+    /// Why the manual export failed, when it did. Agents are told in their
+    /// system prompt to read those files, so a failure has to be visible.
+    pub manual: Option<String>,
     /// Set when the newest soul version does not fit under `max_soul_bytes`.
     pub soul: Option<SoulTruncation>,
     pub executables: ExecutableCheckReport,
@@ -84,10 +88,12 @@ pub struct StartupPreflight {
 }
 
 impl StartupPreflight {
-    /// Executable check first; the ssh-agent preflight runs only when the
-    /// OpenSSH tools it spawns actually resolve — otherwise every step would
-    /// fail with spawn errors the missing-executable lines already explain.
-    /// `max_soul_bytes` is the resolved config cap the prompts will use.
+    /// The manual export runs first (the prompt built right after this points
+    /// at its directory). Then the executable check; the ssh-agent preflight
+    /// runs only when the OpenSSH tools it spawns actually resolve —
+    /// otherwise every step would fail with spawn errors the
+    /// missing-executable lines already explain. `max_soul_bytes` is the
+    /// resolved config cap the prompts will use.
     pub fn run(hosts: &[HostConfig], max_soul_bytes: usize) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
@@ -96,6 +102,7 @@ impl StartupPreflight {
             ensure_remote_ssh_identities(hosts)
         };
         Self {
+            manual: export_manual().err(),
             soul: soul_truncation(max_soul_bytes),
             executables,
             ssh,
@@ -103,18 +110,23 @@ impl StartupPreflight {
     }
 
     pub fn has_problems(&self) -> bool {
-        self.soul.is_some() || !self.executables.is_clean() || self.ssh.has_problems()
+        self.manual.is_some()
+            || self.soul.is_some()
+            || !self.executables.is_clean()
+            || self.ssh.has_problems()
     }
 
-    /// Plain body lines of the WARNING section (soul first, then executables,
-    /// then ssh-agent; no rule/header). Empty on the happy path. The
-    /// interactive CLI feeds this to its Ui's WARNING section.
+    /// Plain body lines of the WARNING section (manual, soul, executables,
+    /// ssh-agent; no rule/header). Empty on the happy path. The interactive
+    /// CLI feeds this to its Ui's WARNING section.
     ///
-    /// The soul goes first: a cut soul is invisible everywhere else (the agent
-    /// simply runs with less of itself), while missing executables and ssh
-    /// keys announce themselves again at the tool call that needs them.
+    /// Order is by how invisible the problem is otherwise: a missing manual
+    /// export or a cut soul never announces itself again (the agent simply
+    /// runs without those bytes), while missing executables and ssh keys
+    /// resurface at the tool call that needs them.
     pub fn warning_body(&self) -> String {
         let mut out = Vec::new();
+        let _ = write_manual_body(self.manual.as_deref(), &mut out);
         let _ = write_soul_body(self.soul.as_ref(), &mut out);
         let _ = self.executables.write_body(&mut out);
         if self.ssh.has_problems() {
@@ -136,6 +148,24 @@ impl StartupPreflight {
         write_warning_open(out, palette)?;
         out.write_all(self.warning_body().as_bytes())
     }
+}
+
+/// Copy the manual articles to `<myco home>/manual/<version>/<commit>/` for
+/// this build, so agents can read and search them as ordinary files.
+fn export_manual() -> Result<(), String> {
+    crate::manual::export(&crate::session::myco_home()?).map(|_| ())
+}
+
+/// Manual-export lines only (no rule/header); writes nothing on success.
+fn write_manual_body(failure: Option<&str>, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    writeln!(out, "manual export failed: {failure}")?;
+    writeln!(
+        out,
+        "agents cannot read the runtime docs this session; `myco --help <id>` still works"
+    )
 }
 
 /// Soul lines only (no rule/header); writes nothing when the soul fits.
@@ -187,6 +217,7 @@ mod tests {
         ssh: SshAgentPreflightReport,
     ) -> StartupPreflight {
         StartupPreflight {
+            manual: None,
             soul,
             executables: ExecutableCheckReport { missing },
             ssh,
@@ -330,6 +361,31 @@ mod tests {
         assert!(out.contains("WARNING\n"), "{out}");
         assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(!out.contains("missing executable"), "{out}");
+    }
+
+    /// The prompt tells agents to read the exported files, so a failed export
+    /// has to reach the user — nothing else this session will mention it.
+    #[test]
+    fn failed_manual_export_warns_first_and_names_the_path() {
+        let pf = StartupPreflight {
+            manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
+            soul: None,
+            executables: ExecutableCheckReport {
+                missing: missing_executables(false, |e| e.name != "tmux"),
+            },
+            ssh: SshAgentPreflightReport::default(),
+        };
+        assert!(pf.has_problems());
+        let out = rendered(&pf);
+        assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
+        assert!(
+            out.contains("manual export failed: /home/u/.myco/manual/9.9.9/abc: permission denied"),
+            "{out}"
+        );
+        assert!(out.contains("`myco --help <id>` still works"), "{out}");
+        let manual_at = out.find("manual export failed").unwrap();
+        let exec_at = out.find("missing executable tmux").unwrap();
+        assert!(manual_at < exec_at, "{out}");
     }
 
     #[test]

@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_catalog_is_bash_editor_view_image_manual_only() {
+    fn standard_catalog_is_bash_editor_view_image_only() {
         let names: Vec<_> = crate::host::HostWorker::standard_tool_specs()
             .into_iter()
             .map(|s| s.name)
@@ -532,10 +532,11 @@ mod tests {
             "remotes must not advertise web_* tools: {names:?}"
         );
         assert!(names.contains(&"bash".to_string()));
-        assert!(names.contains(&"manual".to_string()));
         assert!(names.contains(&"str_replace_based_edit_tool".to_string()));
         assert!(names.contains(&"view_image".to_string()));
-        assert_eq!(names.len(), 4, "catalog grew unexpectedly: {names:?}");
+        // The manual is files on disk (`crate::manual::export`), not a tool.
+        assert!(!names.contains(&"manual".to_string()), "{names:?}");
+        assert_eq!(names.len(), 3, "catalog grew unexpectedly: {names:?}");
     }
 
     /// Images are readable on remotes too, which only holds if `view_image`

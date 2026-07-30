@@ -73,7 +73,8 @@ const SLASH_COMMANDS: &[&str] = &[
 )]
 struct Args {
     /// Show CLI help, or print a manual article when ARTICLE is given
-    /// (e.g. `myco --help overview`). Same articles as the `manual` host tool.
+    /// (e.g. `myco --help overview`). Same articles startup exports to
+    /// `~/.myco/manual/<version>/<commit>/` for agents to read.
     #[arg(
         long = "help",
         short = 'h',

@@ -468,7 +468,7 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
         let _ = child.start_kill();
         return Err(format!(
             "remote myco {version} does not match local {local_version}; \
-             rebuild myco on host {:?} (see `manual` harness-ops)",
+             rebuild myco on host {:?} (see harness-ops.md in the manual)",
             config.name
         ));
     }

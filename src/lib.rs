@@ -31,6 +31,5 @@ pub use session::{
     uuid_simple_hex,
 };
 pub use tool_services::{
-    HostDispatchContext, ListRecentService, ManualService, SessionHistoryTool, SessionMetaTool,
-    ToolService,
+    HostDispatchContext, ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
 };

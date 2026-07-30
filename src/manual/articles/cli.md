@@ -110,7 +110,9 @@ attachments. No console mirror is written in print mode.
   when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
   delimiters *removed* (the styling conveys them), `#` headers keep their
   markers, and both `[text](url)` and a bare `http(s)://` URL become a
-  clickable OSC 8 hyperlink (over `text`, or over the URL itself).
+  clickable OSC 8 hyperlink (over `text`, or over the URL itself), shown
+  underlined blue browser-style — terminals render OSC 8 spans unstyled, so
+  the decoration is what makes links visible before hover.
   `--wrap auto|off|COLS` sets a width *cap* (auto = 80); the effective width
   is min(cap, terminal width), re-measured every prompt — after a resize the
   dialog is cleared and reprinted at the new width (same as Ctrl-L). Fenced
