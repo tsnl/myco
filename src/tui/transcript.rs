@@ -156,7 +156,7 @@ pub fn banner_open_events(title: &str, wrap: Option<usize>) -> Vec<TuiEvent> {
 /// a fresh start — the same open the startup banner uses, printed onto the
 /// cleared screen.
 pub fn compacted_banner_events(
-    outcome: &super::CompactOutcome,
+    outcome: &crate::session::CompactOutcome,
     wrap: Option<usize>,
 ) -> Vec<TuiEvent> {
     let mut events = banner_open_events("COMPACTED", wrap);

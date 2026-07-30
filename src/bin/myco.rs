@@ -14,12 +14,13 @@ use myco::generative_model::{
 };
 use myco::host::HostWorker;
 use myco::session::{
-    ActiveSession, CompactWorkerError, ConsoleLog, Palette, RECENT_SESSION_LIMIT, Session,
-    SessionListEntry, SessionLockError, SessionWriteLock, attachment_note,
-    expand_image_attachments, format_session_detail, format_session_list_line, list_sessions,
-    render_block, resolve_and_load_session, run_compact_worker,
+    ActiveSession, CompactWorkerError, ConsoleLog, RECENT_SESSION_LIMIT, Session, SessionListEntry,
+    SessionLockError, SessionWriteLock, expand_image_attachments, format_session_detail,
+    format_session_list_line, list_sessions, resolve_and_load_session, run_compact_worker,
 };
-use myco::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer};
+use myco::tui::{
+    ConsoleTuiSink, Palette, StdoutTuiSink, TuiProducer, attachment_note, render_block,
+};
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
     ListRecentService, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,

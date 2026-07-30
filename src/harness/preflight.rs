@@ -15,7 +15,7 @@ use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
 use crate::prompts::{SoulTruncation, soul_truncation};
-use crate::session::{Palette, write_warning_open};
+use crate::tui::{Palette, write_warning_open};
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]

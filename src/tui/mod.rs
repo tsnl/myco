@@ -18,17 +18,24 @@
 //! terminal only (the mirror already holds that content). Cursor repaints are
 //! redraws of content already in the stream — direct terminal writes, never
 //! events — which is exactly why the mirror never sees them. Saved-history
-//! replay ([`crate::session::history_events`]) is built on this module's
+//! replay ([`history_events`]) is built on this module's
 //! [`SectionState`] helpers, so live output and replay share one layout policy.
 
 use std::sync::{Arc, Mutex};
 
-use crate::generative_model::{Message, TokenUsage};
-use crate::session::{
-    AgentEvent, ConsoleLog, EventSink, MarkdownRenderer, Palette, TOOL_DISPLAY_STRING_MAX,
-    TraceContext, banner_rule, history_events, render_block, section_rule, truncate_json_strings,
-    usage_line, user_header_line, user_rule,
+pub mod markdown;
+pub mod transcript;
+
+pub use markdown::{MarkdownRenderer, render_block, render_block_with_base};
+pub use transcript::{
+    Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, attachment_note, banner_open_events,
+    banner_rule, compacted_banner_events, format_tokens, history_events, section_rule,
+    truncate_json_strings, usage_line, user_header_line, user_rule, write_error_section,
+    write_warning_open,
 };
+
+use crate::generative_model::{Message, TokenUsage};
+use crate::session::{AgentEvent, ConsoleLog, EventSink, TraceContext};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -527,7 +534,7 @@ impl TuiProducer {
     /// conversation is still on disk in both sessions and the mirror.
     pub fn compacted_banner(&self, outcome: &crate::session::CompactOutcome) {
         let events = self.with_state(|st| {
-            let mut events = crate::session::compacted_banner_events(outcome, st.wrap);
+            let mut events = compacted_banner_events(outcome, st.wrap);
             // Blank line closes the banner before the next USER rule, matching startup.
             events.push(TuiEvent::Text("\n".into()));
             st.section = SectionState::new();
@@ -927,7 +934,7 @@ mod tests {
         let plain = encode_plain(&terminal.events());
         // Head: the shared banner-open layout (rule, MYCO, blank line),
         // pinned differentially against the layout helper.
-        let head = encode_plain(&crate::session::banner_open_events("MYCO", None));
+        let head = encode_plain(&banner_open_events("MYCO", None));
         let body = plain
             .strip_prefix(&head)
             .unwrap_or_else(|| panic!("banner must open with {head:?}: {plain:?}"));
@@ -1082,14 +1089,9 @@ mod tests {
     fn error_section_matches_write_error_section_bytes() {
         let (producer, terminal, _) = producer(None);
         producer.error_section("context length exceeded");
-        // Same bytes as `crate::session::write_error_section` (plain palette).
+        // Same bytes as `write_error_section` (plain palette).
         let mut expected = Vec::new();
-        crate::session::write_error_section(
-            &mut expected,
-            "context length exceeded",
-            Palette::plain(),
-        )
-        .unwrap();
+        write_error_section(&mut expected, "context length exceeded", Palette::plain()).unwrap();
         assert_eq!(
             encode_plain(&terminal.events()),
             String::from_utf8(expected).unwrap()
