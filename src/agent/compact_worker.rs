@@ -1,12 +1,10 @@
 //! The `/compact` worker lifecycle: run a hidden agent that summarises a
 //! session, then hand back the successor it seeds.
 //!
-//! Lives beside the agent runtime rather than under `session/` because it *is*
-//! an agent run — it builds a model, drives a turn against the harness, and
-//! only then calls into the session-side document logic
-//! ([`crate::session::compact_session`], [`crate::session::link_compact_pair`]).
-//! Keeping it here is what lets `session/` stay free of any dependency on the
-//! harness or the agent.
+//! An agent run: it builds a model, drives one turn against the harness to get
+//! the summary written, then calls the session-side document logic
+//! ([`crate::session::compact_session`], [`crate::session::link_compact_pair`])
+//! to seed and link the successor.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,15 +17,15 @@ use crate::session::{CompactOutcome, Session, SessionKind, compact_session, link
 
 use super::{Agent, AgentInteractionError, NullEventSink, TraceContext};
 
-/// Read the summary the worker was supposed to write, given whatever was in
-/// place before it ran.
+/// Read the summary this run wrote, where `before` is the file's content from
+/// before the worker started. Unchanged content is an error.
 ///
-/// A summary file is not proof of *this* run: `{id}.summary.md` survives from an
-/// earlier compaction of the same predecessor, so a worker that ends its turn
-/// without ever calling `write_summary` would otherwise have that stale text
-/// compacted in — a wrong result with no error. Requiring the content to have
-/// changed turns that into a loud failure, and unlike deleting the file up
-/// front it leaves the old summary intact for the successor that references it.
+/// `{id}.summary.md` survives an earlier compaction of the same predecessor, so
+/// its presence alone is not proof this run wrote one: a worker that ends its
+/// turn without calling `write_summary` would otherwise get the previous
+/// compaction's text — describing a shorter conversation — folded into the
+/// successor with no error anywhere. The stale file stays on disk, because the
+/// successor built by that earlier compaction names it by path.
 fn read_fresh_summary(path: &Path, before: Option<&str>) -> Result<String, String> {
     let summary = match std::fs::read_to_string(path) {
         Ok(s) => s,

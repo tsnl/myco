@@ -1,13 +1,9 @@
 //! The agent runtime: one user turn driven to completion against a model and a
 //! harness, plus the live [`AgentEvent`] stream a front-end renders.
 //!
-//! This is the top layer. It depends on the model drivers, the harness, and the
-//! session store; nothing they own depends back on it. `session/` is persistence
-//! and stays free of the harness, and the tool runtime stays free of *this*
-//! module because [`Harness::dispatch_tool_use`] asks only for the owning
-//! agent's `Uuid` — the identity it needs to key per-agent host state — rather
-//! than for [`TraceContext`], which is display attribution and belongs here with
-//! the events it annotates.
+//! The top layer: it depends on the model drivers, the harness and the session
+//! store, and none of them depend on it. [`TraceContext`] is display
+//! attribution, so it lives here; the harness takes a bare agent `Uuid`.
 //!
 //! History well-formedness is the invariant everything else rests on: whatever
 //! a turn does — end cleanly, hit a provider error, get cancelled mid-tool, or
@@ -37,11 +33,9 @@ use uuid::Uuid;
 /// Attribution carried on every [`AgentEvent`]: which agent produced it, and
 /// how deeply nested that agent is.
 ///
-/// Display concern only. The dispatch path does **not** take this — the harness
-/// needs just the owning agent's id and asks for a `Uuid`, so this type never
-/// reaches the tool runtime and does not have to live in a shared layer to
-/// avoid a cycle. Nesting is expressed with `depth` rather than separate event
-/// types per agent role.
+/// A display concern — sinks filter on [`Self::depth`] to show root-agent output
+/// and hide nested workers. One type for every agent role; nesting is a number,
+/// not a separate event per role.
 #[derive(Debug, Clone)]
 pub struct TraceContext {
     /// Stable id for this agent session (root or subagent).

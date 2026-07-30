@@ -283,12 +283,10 @@ impl Harness {
             .collect()
     }
 
-    /// Route one tool call to its host.
+    /// Route one tool call to its host on behalf of `agent_id`.
     ///
-    /// Takes the owning agent's id, not a richer context: `agent_id` keys
-    /// per-agent host state (bash sessions) and is what the NDJSON protocol
-    /// carries, so the tool runtime never needs the agent's event-attribution
-    /// type. That is what keeps this module independent of `crate::agent`.
+    /// `agent_id` owns any host state the call creates (bash sessions) and is
+    /// what the NDJSON protocol carries to remotes.
     pub fn dispatch_tool_use(
         self: Arc<Self>,
         mut tool_use: generative_model::ToolUse,

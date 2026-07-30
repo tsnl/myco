@@ -4,12 +4,10 @@
 //! `.history` for readline). Schema is intentionally breaking vs earlier WIP
 //! files: only [`SESSION_FILE_VERSION`] is accepted.
 //!
-//! Persistence only: this module knows how a conversation is stored, not how one
-//! is produced. The agent runtime lives in [`crate::agent`] and depends on this
-//! module, never the other way round — which is why compaction is split, with
-//! the document logic ([`compact_session`], [`select_tail`],
-//! [`link_compact_pair`]) here and the worker that drives an agent to write the
-//! summary in [`crate::agent::run_compact_worker`].
+//! Persistence only: how a conversation is stored, not how one is produced.
+//! Compaction is split along that line — the document work
+//! ([`compact_session`], [`select_tail`], [`link_compact_pair`]) is here, and the
+//! agent run that writes the summary is [`crate::agent::run_compact_worker`].
 
 mod attach;
 mod compact;
