@@ -96,7 +96,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + soul / project-guidance injection + the session stamp carried by a session's first user message |
-| `src/tui/` | The rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks; replay shares its layout helpers |
+| `src/tui/` | The whole rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks, the streaming markdown renderer (`markdown/`), and section/transcript layout + `Palette` (`transcript.rs`) that live output and replay share |
 | `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
 
 **Invariants worth protecting**

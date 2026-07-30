@@ -20,7 +20,7 @@ use std::process::Stdio;
 
 use super::HostConfig;
 use crate::external_command::{SSH, SSH_ADD, SSH_KEYGEN};
-use crate::session::{Palette, write_warning_open};
+use crate::tui::{Palette, write_warning_open};
 
 /// Outcome of [`ensure_remote_ssh_identities`].
 #[derive(Debug, Default, Clone)]

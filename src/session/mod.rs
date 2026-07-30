@@ -9,9 +9,7 @@ mod attach;
 mod compact;
 mod console_log;
 mod lock;
-mod markdown;
 mod search;
-mod transcript;
 
 pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, HistoryCheckpoint, NullEventSink,
@@ -24,14 +22,7 @@ pub use compact::{
 };
 pub use console_log::ConsoleLog;
 pub use lock::{SessionLockError, SessionWriteLock};
-pub use markdown::{MarkdownRenderer, render_block};
 pub use search::{SessionSearchReport, search_sessions};
-pub use transcript::{
-    Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, attachment_note, banner_open_events,
-    banner_rule, compacted_banner_events, format_tokens, history_events, section_rule,
-    truncate_json_strings, usage_line, user_header_line, user_rule, write_error_section,
-    write_warning_open,
-};
 
 use std::fs;
 use std::io::Write;
