@@ -21,6 +21,7 @@ use myco::session::{
 };
 use myco::tui::{
     ConsoleTuiSink, Palette, StdoutTuiSink, TuiProducer, attachment_note, render_block,
+    write_warning_section,
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
@@ -258,9 +259,9 @@ async fn run_print(args: Args) {
 
     let (boot, sink) = boot(&args, |_, preflight, _| {
         // Preflight problems go to stderr so stdout stays pipeable.
-        let mut warn = Vec::new();
-        let _ = preflight.write_warning_section(&mut warn, Palette::plain());
-        if !warn.is_empty() {
+        if preflight.has_problems() {
+            let mut warn = Vec::new();
+            let _ = write_warning_section(&mut warn, &preflight.warning_body(), Palette::plain());
             let _ = std::io::stderr().write_all(&warn);
         }
         Arc::new(PrintEventSink::default())

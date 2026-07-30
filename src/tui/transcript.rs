@@ -175,25 +175,35 @@ pub fn compacted_banner_events(
     events
 }
 
-/// Write a WARNING section open: blank line, thin rule, header, blank line,
-/// then body (written by the caller — preflight problem lines).
-pub fn write_warning_open(
+/// Write a WARNING section with body text: blank line, thin rule, header,
+/// blank line, then the body. Callers pass plain problem lines (startup
+/// preflight); the palette styles the rule and header only.
+pub fn write_warning_section(
     out: &mut (impl Write + ?Sized),
+    text: &str,
     palette: Palette,
 ) -> std::io::Result<()> {
-    let mut events = Vec::new();
-    section_open_events(&mut events, Style::WARNING, "WARNING", palette.wrap);
-    out.write_all(encode_ansi(&events, palette.enabled).as_bytes())
+    write_section(out, Style::WARNING, "WARNING", text, palette)
 }
 
 /// Write a full ERROR section with body text (trailing newline ensured).
 pub fn write_error_section(
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
+    text: &str,
+    palette: Palette,
+) -> std::io::Result<()> {
+    write_section(out, Style::ERROR, "ERROR", text, palette)
+}
+
+fn write_section(
+    out: &mut (impl Write + ?Sized),
+    style: Style,
+    header: &str,
     text: &str,
     palette: Palette,
 ) -> std::io::Result<()> {
     let mut events = Vec::new();
-    section_open_events(&mut events, Style::ERROR, "ERROR", palette.wrap);
+    section_open_events(&mut events, style, header, palette.wrap);
     let body = if text.ends_with('\n') {
         text.to_string()
     } else {
@@ -621,18 +631,36 @@ mod tests {
         assert!(rendered.starts_with('\n'));
     }
 
+    /// One header per section, whatever the body: the startup preflight folds
+    /// several unrelated problems into a single block.
     #[test]
-    fn write_warning_open_layout() {
+    fn write_warning_section_layout() {
+        let body = "missing executable tmux: no session browser\nssh-agent: agent down\n";
         let mut buf = Vec::new();
-        write_warning_open(&mut buf, Palette::plain()).unwrap();
+        write_warning_section(&mut buf, body, Palette::plain()).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
-        assert_eq!(rendered, format!("\n{SECTION_RULE}\nWARNING\n\n"));
+        assert_eq!(rendered, format!("\n{SECTION_RULE}\nWARNING\n\n{body}"));
+        assert_eq!(rendered.matches("WARNING").count(), 1, "{rendered}");
 
         let mut buf = Vec::new();
-        write_warning_open(&mut buf, Palette::colored(true)).unwrap();
+        write_warning_section(&mut buf, body, Palette::colored(true)).unwrap();
         let rendered = String::from_utf8(buf).unwrap();
         assert!(rendered.contains("\x1b[0;1;33mWARNING\x1b[0m\n"));
         assert!(rendered.contains(&format!("\x1b[0;1;33m{SECTION_RULE}\x1b[0m\n")));
+        // Body lines stay plain — the palette styles the rule and header only.
+        assert!(rendered.ends_with(body), "{rendered}");
+    }
+
+    /// A body that already ends in a newline does not gain a second one.
+    #[test]
+    fn section_body_newline_is_ensured_not_doubled() {
+        let render = |text: &str| {
+            let mut buf = Vec::new();
+            write_warning_section(&mut buf, text, Palette::plain()).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert_eq!(render("one line"), render("one line\n"));
+        assert!(render("one line").ends_with("one line\n"));
     }
 
     #[test]

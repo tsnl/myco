@@ -8,6 +8,10 @@
 //! ([`crate::prompts::soul_truncation`]) — one section after the banner,
 //! silent when everything resolves. Remote hosts are not probed here; they
 //! report missing programs as tool errors at call time.
+//!
+//! Reporting stops at plain text ([`StartupPreflight::warning_body`]); the
+//! caller owns the WARNING block around it, because the interactive REPL and
+//! `--print` put it in different places (the Ui's event stream vs. stderr).
 
 use std::io::Write;
 
@@ -15,7 +19,6 @@ use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
 use crate::prompts::{SoulTruncation, soul_truncation};
-use crate::tui::{Palette, write_warning_open};
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
@@ -116,9 +119,9 @@ impl StartupPreflight {
             || self.ssh.has_problems()
     }
 
-    /// Plain body lines of the WARNING section (manual, soul, executables,
-    /// ssh-agent; no rule/header). Empty on the happy path. The interactive
-    /// CLI feeds this to its Ui's WARNING section.
+    /// Every preflight problem as plain body lines — manual, soul, executables,
+    /// ssh-agent, in that order, with no rule or header. Empty when
+    /// [`Self::has_problems`] is false.
     ///
     /// Order is by how invisible the problem is otherwise: a missing manual
     /// export or a cut soul never announces itself again (the agent simply
@@ -129,24 +132,8 @@ impl StartupPreflight {
         let _ = write_manual_body(self.manual.as_deref(), &mut out);
         let _ = write_soul_body(self.soul.as_ref(), &mut out);
         let _ = self.executables.write_body(&mut out);
-        if self.ssh.has_problems() {
-            let _ = self.ssh.write_body(&mut out);
-        }
+        let _ = self.ssh.write_body(&mut out);
         String::from_utf8(out).unwrap_or_default()
-    }
-
-    /// Write all preflight problems as one WARNING section. Writes nothing on
-    /// the happy path.
-    pub fn write_warning_section(
-        &self,
-        out: &mut impl Write,
-        palette: Palette,
-    ) -> std::io::Result<()> {
-        if !self.has_problems() {
-            return Ok(());
-        }
-        write_warning_open(out, palette)?;
-        out.write_all(self.warning_body().as_bytes())
     }
 }
 
@@ -183,26 +170,6 @@ fn write_soul_body(cut: Option<&SoulTruncation>, out: &mut impl Write) -> std::i
     )
 }
 
-/// Print preflight problems as a WARNING block on stdout, after the startup
-/// banner and before the first USER block. Happy path prints nothing.
-/// Live-only, like ERROR: not stored in history, not replayed on Ctrl-L/resume.
-pub fn print_startup_preflight(report: &StartupPreflight, palette: Palette) {
-    let mut out = std::io::stdout();
-    let _ = report.write_warning_section(&mut out, palette);
-    let _ = out.flush();
-}
-
-/// Test-only render of one report's `write_warning_section` with a plain
-/// palette (shared by the ssh-agent and combined-preflight tests).
-#[cfg(test)]
-pub(crate) fn warning_output(
-    write: impl FnOnce(&mut Vec<u8>, Palette) -> std::io::Result<()>,
-) -> String {
-    let mut buf = Vec::new();
-    write(&mut buf, Palette::plain()).unwrap();
-    String::from_utf8(buf).unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -225,7 +192,12 @@ mod tests {
     }
 
     fn rendered(pf: &StartupPreflight) -> String {
-        warning_output(|out, p| pf.write_warning_section(out, p))
+        let body = pf.warning_body();
+        // Plain problem lines. The block's rule and header come from the caller
+        // (`tui::write_warning_section`), which is what keeps several unrelated
+        // problems inside one WARNING block.
+        assert!(!body.contains("WARNING"), "{body}");
+        body
     }
 
     #[test]
@@ -258,14 +230,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_tmux_opens_warning_with_install_hint() {
+    fn missing_tmux_reports_the_purpose_and_an_install_hint() {
         let pf = preflight(
             None,
             missing_executables(false, |e| e.name != "tmux"),
             SshAgentPreflightReport::default(),
         );
         let out = rendered(&pf);
-        assert!(out.contains("WARNING"), "{out}");
         assert!(
             out.contains("missing executable tmux: bare /resume cannot open the session browser"),
             "{out}"
@@ -276,8 +247,10 @@ mod tests {
         );
     }
 
+    /// Executables come before ssh-agent: a missing `ssh` binary explains the
+    /// agent failure that follows it.
     #[test]
-    fn combined_block_has_one_header_executables_before_ssh() {
+    fn executables_are_reported_before_ssh_agent() {
         let pf = preflight(
             None,
             missing_executables(true, |e| e.name != "ssh"),
@@ -289,7 +262,6 @@ mod tests {
             },
         );
         let out = rendered(&pf);
-        assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
         let exec_at = out.find("missing executable ssh:").unwrap();
         let agent_at = out.find("ssh-agent: agent down").unwrap();
         assert!(exec_at < agent_at, "{out}");
@@ -328,7 +300,6 @@ mod tests {
         );
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
         assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(
             out.contains("every agent prompt from now on carries only the first"),
@@ -345,8 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_soul_alone_is_enough_to_open_the_block() {
-        // Nothing else wrong: the soul still gets its own headed WARNING.
+    fn a_truncated_soul_alone_is_enough_to_report() {
+        // Nothing else wrong: the soul alone still opens a WARNING block.
         let pf = preflight(
             Some(SoulTruncation {
                 version: "20260722T0215-3f2a.md".into(),
@@ -358,7 +329,6 @@ mod tests {
         );
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert!(out.contains("WARNING\n"), "{out}");
         assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
         assert!(!out.contains("missing executable"), "{out}");
     }
@@ -377,7 +347,6 @@ mod tests {
         };
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert_eq!(out.matches("WARNING\n").count(), 1, "{out}");
         assert!(
             out.contains("manual export failed: /home/u/.myco/manual/9.9.9/abc: permission denied"),
             "{out}"

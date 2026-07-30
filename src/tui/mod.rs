@@ -31,7 +31,7 @@ pub use transcript::{
     Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, attachment_note, banner_open_events,
     banner_rule, compacted_banner_events, format_tokens, history_events, section_rule,
     truncate_json_strings, usage_line, user_header_line, user_rule, write_error_section,
-    write_warning_open,
+    write_warning_section,
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
