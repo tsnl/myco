@@ -1,7 +1,22 @@
+//! The agent runtime: one user turn driven to completion against a model and a
+//! harness, plus the live [`AgentEvent`] stream a front-end renders.
+//!
+//! The top layer: it depends on the model drivers, the harness and the session
+//! store, and none of them depend on it. [`TraceContext`] is display
+//! attribution, so it lives here; the harness takes a bare agent `Uuid`.
+//!
+//! History well-formedness is the invariant everything else rests on: whatever
+//! a turn does — end cleanly, hit a provider error, get cancelled mid-tool, or
+//! get truncated mid-tool-call by `max_tokens` — the transcript it leaves behind
+//! must be a prefix the provider will accept on the next request. See
+//! [`Agent::interact`].
+
 use std::sync::Arc;
 
+mod compact_worker;
+pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
+
 use futures::future;
-use uuid::Uuid;
 
 use crate::core::CancelToken;
 use crate::generative_model::{
@@ -9,20 +24,18 @@ use crate::generative_model::{
     MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
+use uuid::Uuid;
 
 //
 // Event sink — live observability for agent / tool activity
 //
 
-/// Format a UUID as a 32-char lowercase hex string (no hyphens).
-pub fn uuid_simple_hex(id: Uuid) -> String {
-    id.as_simple().to_string()
-}
-
-/// Correlation / nesting context carried on every event.
+/// Attribution carried on every [`AgentEvent`]: which agent produced it, and
+/// how deeply nested that agent is.
 ///
-/// Every running agent (root or nested) has a stable [`Self::agent_id`]. Nesting is expressed
-/// with `depth`, not with separate event types per agent role.
+/// A display concern — sinks filter on [`Self::depth`] to show root-agent output
+/// and hide nested workers. One type for every agent role; nesting is a number,
+/// not a separate event per role.
 #[derive(Debug, Clone)]
 pub struct TraceContext {
     /// Stable id for this agent session (root or subagent).
@@ -358,7 +371,7 @@ impl Agent {
         let work =
             self.harness
                 .clone()
-                .dispatch_tool_use(tool_use, self.context.clone(), cancel.clone());
+                .dispatch_tool_use(tool_use, self.context.agent_id, cancel.clone());
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it

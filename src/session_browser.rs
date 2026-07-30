@@ -16,10 +16,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
+use crate::core::uuid_simple_hex;
 use crate::external_command;
-use crate::session::{
-    SessionListEntry, list_sessions, search_sessions, session_label, uuid_simple_hex,
-};
+use crate::session::{SessionListEntry, list_sessions, search_sessions, session_label};
 
 /// Result cap for content search (`--search`).
 pub const SESSION_SEARCH_LIMIT: usize = 50;

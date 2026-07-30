@@ -19,6 +19,11 @@ pub use tokio_util::sync::CancellationToken as CancelToken;
 
 pub use futures::StreamExt;
 
+/// Format a UUID as a 32-char lowercase hex string (no hyphens).
+pub fn uuid_simple_hex(id: uuid::Uuid) -> String {
+    id.as_simple().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

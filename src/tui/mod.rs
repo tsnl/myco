@@ -34,8 +34,9 @@ pub use transcript::{
     write_warning_open,
 };
 
+use crate::agent::{AgentEvent, EventSink, TraceContext};
 use crate::generative_model::{Message, TokenUsage};
-use crate::session::{AgentEvent, ConsoleLog, EventSink, TraceContext};
+use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
 // Events
