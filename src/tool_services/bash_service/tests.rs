@@ -1868,3 +1868,28 @@ async fn signal_rejects_foreign_owner() {
 
     service.reap_owner(owner);
 }
+
+/// The advertised schema says `additionalProperties: false`; the struct must
+/// agree. A gateway that skips schema validation would otherwise let a typo'd
+/// field through, and the call would half-execute against defaults instead of
+/// telling the model it got the field name wrong.
+#[tokio::test]
+async fn a_typoed_field_is_rejected_not_silently_dropped() {
+    let harness = harness();
+    let result = dispatch_json(
+        harness,
+        // `timeout_millis` is not the field name; `timeout_ms` is.
+        json!({"command": "echo hi", "timeout_millis": 500}),
+    )
+    .await;
+    assert!(
+        result.is_error,
+        "unknown field should be an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("timeout_millis"),
+        "error should name the offending field: {}",
+        result_text(&result)
+    );
+}

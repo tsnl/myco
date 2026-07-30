@@ -82,6 +82,7 @@ impl ToolService for ViewImageService {
 #[derive(
     Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
 )]
+#[serde(deny_unknown_fields)]
 struct Input {
     /// Path to the image file to look at.
     path: String,

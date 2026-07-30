@@ -360,7 +360,12 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{t}…")
 }
 
+/// `deny_unknown_fields` also makes a routing `host` an error rather than a
+/// silent no-op: this is a root-only tool that always runs on `local`, so a call
+/// that asks for a remote must not come back with local results labelled as
+/// success.
 #[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     /// Session id or unique prefix (required).
     session_id: Option<String>,
