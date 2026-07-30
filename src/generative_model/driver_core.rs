@@ -2,7 +2,7 @@
 //! client construction, the spawned generate task (channel + request + stream
 //! bridge), the SSE drive loop, and stream-index remapping.
 
-use crate::core::*;
+use crate::core::AsyncStream;
 
 use super::*;
 

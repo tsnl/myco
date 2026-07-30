@@ -2,7 +2,7 @@ use std::{pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
-use crate::core::*;
+use crate::core::AsyncStream;
 
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;

@@ -125,7 +125,9 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   usually that the shared thing belongs lower down (`myco_home` in `core`, not
   `session`) or that the caller wants data instead of rendering
   (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
-  reach anywhere — test setup composes real layers on purpose.
+  reach anywhere — test setup composes real layers on purpose. Checked by
+  `tests/module_layering.rs`: myco is one crate, so `mod` boundaries carry no
+  guarantee cargo would give a workspace, and the test stands in for it.
 
 ## Code style
 
