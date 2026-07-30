@@ -659,14 +659,31 @@ mod tests {
         assert!(ctl.is_connected());
     }
 
+    /// Two calls on one host must run as overlapping intervals, not back to
+    /// back. Each command marks its own start on disk, sleeps, then reports
+    /// whether its sibling's mark was already there when it woke: both reports
+    /// positive means each call started before the other ended. Serial dispatch
+    /// cannot produce that — whichever ran first would find no sibling mark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_calls_pipeline_in_process() {
         let ctl = HostController::local_in_process();
+        let tmp = crate::test_support::temp_dir("host-concurrent");
+        let dir = tmp.path().display();
 
-        // Real sleeps must overlap: serial would be ~2s, concurrent ~1s (+ slack).
+        // The sleep is the overlap window: a sibling dispatched alongside us has
+        // marked its start long before we look, however loaded the machine is.
+        let script = |mine: &str, sibling: &str, marker: &str| {
+            format!(
+                "touch '{dir}/{mine}'; sleep 1; \
+                 if [ -e '{dir}/{sibling}' ]; then echo SAW-SIBLING; fi; echo {marker}"
+            )
+        };
+
+        let (script_a, script_b) = (script("a", "b", "AAA"), script("b", "a", "BBB"));
+
         let t0 = Instant::now();
-        let a = bash_call(&ctl, "a", "sleep 1; echo AAA");
-        let b = bash_call(&ctl, "b", "sleep 1; echo BBB");
+        let a = bash_call(&ctl, "a", &script_a);
+        let b = bash_call(&ctl, "b", &script_b);
 
         let (ra, rb) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(a, b) })
             .await
@@ -675,11 +692,22 @@ mod tests {
         let wall = t0.elapsed();
         assert!(!ra.is_error, "a: {ra:?}");
         assert!(!rb.is_error, "b: {rb:?}");
-        assert!(text_parts(&ra).join("").contains("AAA"), "{ra:?}");
-        assert!(text_parts(&rb).join("").contains("BBB"), "{rb:?}");
+        let out_a = text_parts(&ra).join("");
+        let out_b = text_parts(&rb).join("");
+        assert!(out_a.contains("AAA"), "{ra:?}");
+        assert!(out_b.contains("BBB"), "{rb:?}");
+
         assert!(
-            wall < Duration::from_millis(1700),
-            "expected concurrent overlap (~1s), wall={wall:?}"
+            out_a.contains("SAW-SIBLING") && out_b.contains("SAW-SIBLING"),
+            "expected overlapping execution: a={out_a:?} b={out_b:?}"
+        );
+
+        // Interval overlap above is the real concurrency signal. Wall clock is
+        // only a coarse guard against fully serial execution; allow large slack
+        // for CI / parallel suite load (scheduler jitter, other tests).
+        assert!(
+            wall < Duration::from_secs(8),
+            "expected concurrent wall time ~1s, got {wall:?}"
         );
     }
 
