@@ -292,6 +292,7 @@ impl SessionMetaTool {
 #[derive(
     Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
 )]
+#[serde(deny_unknown_fields)]
 struct Input {
     /// Action to perform (required).
     action: ActionKind,

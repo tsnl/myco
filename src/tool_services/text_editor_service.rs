@@ -478,6 +478,7 @@ pub enum Command {
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct Input {
     /// The command to execute.
     pub command: Command,

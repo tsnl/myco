@@ -121,6 +121,7 @@ fn activity_order(entries: &[SessionListEntry]) -> Vec<usize> {
 }
 
 #[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     /// Max sessions to return (default 10; 0 = all).
     #[serde(default)]

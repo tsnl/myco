@@ -1434,9 +1434,17 @@ async fn collect_output(
 // --- input schema ------------------------------------------------------------
 
 /// Wire input for the `bash` tool (flat object for Anthropic-friendly JSON Schema).
+///
+/// `deny_unknown_fields` keeps this struct honest about the schema it advertises:
+/// [`crate::tool_services::tool_input_schema`] declares
+/// `additionalProperties: false`, so a gateway that does not enforce the schema
+/// must not be the only thing standing between a typo'd field and a half-executed
+/// call. The harness strips the routing `host` before dispatch, so it never
+/// reaches here.
 #[derive(
     Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
 )]
+#[serde(deny_unknown_fields)]
 pub struct Input {
     /// Action to perform. Defaults to `exec` when omitted (or when only `command` is set).
     #[serde(default)]

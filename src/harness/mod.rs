@@ -539,6 +539,31 @@ mod tests {
         assert_eq!(names.len(), 3, "catalog grew unexpectedly: {names:?}");
     }
 
+    /// No standard tool may declare its own `host` property.
+    ///
+    /// Routing owns that name for multi-host tools: `inject_host_field` skips a
+    /// schema that already declares `host` (so the tool's own description
+    /// survives), but `dispatch_tool_use` still calls `strip_host_field` on the
+    /// way to the worker — so the model's value would be eaten and the tool
+    /// would see nothing, silently. A tool that genuinely needs its own `host`
+    /// has to be root-only, like `session_meta`.
+    #[test]
+    fn standard_tools_do_not_declare_their_own_host_property() {
+        for spec in crate::host::HostWorker::standard_tool_specs() {
+            let declares_host = spec
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .is_some_and(|props| props.contains_key("host"));
+            assert!(
+                !declares_host,
+                "standard tool {:?} declares its own `host`; routing would strip the \
+                 model's value before the tool ever saw it. Make it root-only instead.",
+                spec.name
+            );
+        }
+    }
+
     /// Images are readable on remotes too, which only holds if `view_image`
     /// is a standard host tool carrying the routing `host` field.
     #[test]
