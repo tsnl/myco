@@ -159,6 +159,42 @@ struct MessageRun {
     content: Vec<AnthropicContent>,
 }
 
+/// Rewrite a stored tool id into one Anthropic accepts.
+///
+/// Anthropic validates tool ids against `^[a-zA-Z0-9_-]+$`. Other providers do
+/// not: OpenAI-compatible gateways mint ids like `functions.bash:0`, and a
+/// session started on one of them carries those ids in its history forever. The
+/// whole history is resent on every turn, so resuming such a session on an
+/// Anthropic model 400s on the first request and every request after it — the
+/// session is wedged, not merely one turn.
+///
+/// Legal ids must pass through byte-identical: rewriting them would move the
+/// cached prefix on every Anthropic-native session. The rewrite is a pure
+/// function of the id, which is what keeps a `tool_use` and its `tool_result`
+/// pointing at each other without threading a map through the conversion.
+fn anthropic_tool_id(id: &str) -> String {
+    fn legal(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+
+    if !id.is_empty() && id.chars().all(legal) {
+        return id.to_string();
+    }
+
+    // Substitution alone collides — `a.b` and `a:b` both fold to `a_b` — and two
+    // tool_use blocks sharing an id is the same 400 wearing a different hat. The
+    // hash separates them; the substituted stem keeps debug dumps readable.
+    let stem: String = id.chars().map(|c| if legal(c) { c } else { '_' }).collect();
+    format!("{stem}_{:016x}", fnv1a(id))
+}
+
+/// FNV-1a. Dependency-free and stable across runs; not security-relevant.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Merge consecutive same-role turns into role-alternating runs. Anthropic
 /// requires alternating user/assistant roles, and tool-result blocks must lead
 /// the user turn they answer.
@@ -176,7 +212,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                 tool_use_results
                     .iter()
                     .map(|result| AnthropicContent::ToolResult {
-                        tool_use_id: result.id.clone(),
+                        tool_use_id: anthropic_tool_id(&result.id),
                         content: result
                             .content
                             .iter()
@@ -198,7 +234,7 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                     content.iter().cloned().filter_map(answer_block).collect();
                 for tool_use in tool_uses {
                     blocks.push(AnthropicContent::ToolUse {
-                        id: tool_use.id.clone(),
+                        id: anthropic_tool_id(&tool_use.id),
                         name: tool_use.name.clone(),
                         input: tool_use.input.clone(),
                         cache_control: None,
@@ -851,9 +887,16 @@ impl From<AnthropicStopReason> for TurnEndReason {
 mod tests {
     use super::*;
     use crate::test_support::{
-        assistant, expect_text_delta, expect_thinking_delta, expect_tool_args_delta,
-        expect_tool_start, tool_results, user,
+        assistant, assistant_tool, expect_text_delta, expect_thinking_delta,
+        expect_tool_args_delta, expect_tool_start, tool_results, user,
     };
+
+    fn is_legal_anthropic_id(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
 
     #[test]
     fn test_role_serdes() {
@@ -1124,6 +1167,52 @@ mod tests {
             AnthropicContent::ToolResult { .. }
         ));
         assert!(matches!(msgs[0].content[1], AnthropicContent::Text { .. }));
+    }
+
+    /// Resuming a session started on another provider: its tool ids may break
+    /// Anthropic's pattern, and rewriting them is only correct if the
+    /// `tool_use` and its `tool_result` still name each other.
+    #[test]
+    fn foreign_tool_ids_are_rewritten_and_still_pair_up() {
+        let input = [
+            user("hello"),
+            assistant_tool(None, "functions.bash:0", "bash", serde_json::json!({})),
+            tool_results(&[("functions.bash:0", "ok")]),
+        ];
+        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+
+        let tool_use_id = json[1]["content"][0]["id"].as_str().unwrap();
+        assert!(
+            is_legal_anthropic_id(tool_use_id),
+            "tool_use id {tool_use_id:?} still violates ^[a-zA-Z0-9_-]+$"
+        );
+        assert_eq!(tool_use_id, json[2]["content"][0]["tool_use_id"]);
+    }
+
+    /// A legal id must survive byte-identical: rewriting one would move the
+    /// cache breakpoint's prefix on every Anthropic-native session.
+    #[test]
+    fn legal_tool_ids_pass_through_unchanged() {
+        for id in [
+            "toolu_01A09q90qw90lq917835lq9",
+            "call_re9tQypxSAaAheStLjOqkkeP",
+        ] {
+            assert_eq!(anthropic_tool_id(id), id);
+        }
+    }
+
+    #[test]
+    fn rewritten_tool_ids_are_legal_and_stay_distinct() {
+        let ids = ["", "a.b", "a:b", "call_x|fc_y", "функция"];
+        let rewritten: Vec<String> = ids.iter().map(|id| anthropic_tool_id(id)).collect();
+
+        for id in &rewritten {
+            assert!(is_legal_anthropic_id(id), "rewrote to illegal id {id:?}");
+        }
+        // Substitution alone folds `a.b` and `a:b` together; duplicate tool_use
+        // ids are rejected just as hard as illegal ones.
+        let unique: std::collections::HashSet<&String> = rewritten.iter().collect();
+        assert_eq!(unique.len(), rewritten.len(), "collision in {rewritten:?}");
     }
 
     #[test]
