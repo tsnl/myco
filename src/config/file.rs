@@ -89,6 +89,12 @@ pub struct ModelEntry {
     /// Per-generate output token cap (default 8192).
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+    /// Largest image this model accepts, in bytes of the **base64 payload**
+    /// actually uploaded (base64 inflates a file by 4/3). Rejected locally by
+    /// `view_image` and REPL `@path` attachments. Unset →
+    /// [`crate::core::image::DEFAULT_MAX_IMAGE_BYTES`].
+    #[serde(default)]
+    pub max_image_bytes: Option<u64>,
 }
 
 /// The `auth` value on a gateway or model entry.
@@ -342,6 +348,18 @@ context_window = 32768
 
         let err = err_for("auth = 42");
         assert!(err.contains("invalid type"), "{err}");
+    }
+
+    #[test]
+    fn max_image_bytes_parses_as_set_or_unset() {
+        let text = [
+            model_toml("capped", &["max_image_bytes = 12_582_912"]),
+            model_toml("stock", &[]),
+        ]
+        .join("\n");
+        let file = parse_file_config_str(&text).unwrap();
+        assert_eq!(file.models["capped"].max_image_bytes, Some(12_582_912));
+        assert_eq!(file.models["stock"].max_image_bytes, None);
     }
 
     #[test]

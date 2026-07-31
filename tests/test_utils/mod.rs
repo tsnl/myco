@@ -47,6 +47,7 @@ pub fn live_anthropic_haiku() -> (ModelSpec, BackendConfig) {
         protocol: Protocol::AnthropicMessages,
         thinking: ThinkingMode::Budget,
         context_window_tokens: 200_000,
+        max_image_bytes: myco::core::image::DEFAULT_MAX_IMAGE_BYTES,
     };
     let backend = BackendConfig::Anthropic(AnthropicBackendConfig {
         anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL")
@@ -66,6 +67,7 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
         protocol: Protocol::OpenAIResponses,
         thinking: ThinkingMode::Effort,
         context_window_tokens: 500_000,
+        max_image_bytes: myco::core::image::DEFAULT_MAX_IMAGE_BYTES,
     };
     let backend = BackendConfig::OpenAIResponses(OpenAIBackendConfig {
         base_url: std::env::var("XAI_API_BASE_URL")
@@ -89,6 +91,7 @@ pub fn live_openrouter_kimi(protocol: Protocol) -> (ModelSpec, BackendConfig) {
         protocol,
         thinking: ThinkingMode::Effort,
         context_window_tokens: 1_000_000,
+        max_image_bytes: myco::core::image::DEFAULT_MAX_IMAGE_BYTES,
     };
     let openai = OpenAIBackendConfig {
         base_url: std::env::var("OPENROUTER_BASE_URL")

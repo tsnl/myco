@@ -97,22 +97,34 @@ impl HostController {
 
     /// Convenience: standard bash + editor worker named `"local"`.
     pub fn local_in_process() -> Arc<Self> {
-        Self::in_process("local", Arc::new(HostWorker::standard("local")))
+        Self::in_process(
+            "local",
+            Arc::new(HostWorker::standard(
+                "local",
+                crate::core::image::DEFAULT_MAX_IMAGE_BYTES,
+            )),
+        )
     }
 
     /// Create a remote/subprocess controller. The worker is **not** started until
     /// the first [`call`].
     pub fn new(config: HostConfig) -> Arc<Self> {
-        Self::with_timeout(config, 10)
+        Self::with_timeout(config, 10, crate::core::image::DEFAULT_MAX_IMAGE_BYTES)
     }
 
-    /// Like [`new`] with an explicit connect timeout (`0` disables it).
-    pub fn with_timeout(config: HostConfig, connect_timeout_secs: u64) -> Arc<Self> {
+    /// Like [`new`] with an explicit connect timeout (`0` disables it) and the
+    /// image cap the remote is spawned with — advertised before connecting, so
+    /// it must match the `--max-image-bytes` in `config.command`.
+    pub fn with_timeout(
+        config: HostConfig,
+        connect_timeout_secs: u64,
+        max_image_bytes: u64,
+    ) -> Arc<Self> {
         let name = config.name.clone();
         Arc::new(Self {
             name,
             next_id: AtomicU64::new(1),
-            tools: HostWorker::standard_tool_specs(),
+            tools: HostWorker::standard_tool_specs(max_image_bytes),
             backend: Backend::Subprocess {
                 config,
                 conn: Mutex::new(None),

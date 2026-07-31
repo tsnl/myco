@@ -293,10 +293,17 @@ impl Config {
         let max_soul_bytes = file
             .max_soul_bytes
             .unwrap_or(crate::prompts::DEFAULT_MAX_SOUL_BYTES);
+        // Host workers enforce the image cap where the file is read, so they
+        // are spawned with the cap of the model this process will run — fixed
+        // for the process, since the model is chosen once at startup.
         let harness = HarnessConfig::from_ssh_aliases(
             ssh_aliases()?,
             file.attach_timeout_secs
                 .unwrap_or(DEFAULT_ATTACH_TIMEOUT_SECS),
+            models
+                .spec(&model)
+                .map(|s| s.max_image_bytes)
+                .unwrap_or(crate::core::image::DEFAULT_MAX_IMAGE_BYTES),
         );
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
@@ -410,6 +417,9 @@ fn resolve_catalog(
             protocol,
             thinking,
             context_window_tokens: entry.context_window,
+            max_image_bytes: entry
+                .max_image_bytes
+                .unwrap_or(crate::core::image::DEFAULT_MAX_IMAGE_BYTES),
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let backend = match protocol {
@@ -634,6 +644,50 @@ context_window = 200_000
         let err = cfg.models.get("kimi-k3").unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
         assert!(err.contains("kimi-k3"), "{err}");
+    }
+
+    /// `max_image_bytes` is per model and defaults to the shared cap. The
+    /// resolved value must also reach the harness, which is what remote hosts
+    /// are spawned with — a default there would let a remote `view_image`
+    /// return images the model rejects.
+    #[test]
+    fn per_model_image_cap_defaults_and_reaches_the_harness() {
+        let default_cfg = resolve_catalog_cfg(&[("OPENROUTER_API_KEY", "or-key")]);
+        assert_eq!(
+            default_cfg.models.spec("kimi-k3").unwrap().max_image_bytes,
+            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+        );
+        assert_eq!(
+            default_cfg.harness.max_image_bytes,
+            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+        );
+
+        let toml_text = r#"
+model = "big-images"
+
+[models.big-images]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 32_768
+max_image_bytes = 12_582_912
+
+[models.stock]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 32_768
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.models.spec("big-images").unwrap().max_image_bytes,
+            12 * 1024 * 1024
+        );
+        // Untouched entries keep the default: the knob is per model, not global.
+        assert_eq!(
+            cfg.models.spec("stock").unwrap().max_image_bytes,
+            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+        );
+        // Hosts follow the *selected* model.
+        assert_eq!(cfg.harness.max_image_bytes, 12 * 1024 * 1024);
     }
 
     #[test]

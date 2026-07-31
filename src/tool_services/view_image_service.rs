@@ -4,34 +4,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::Async;
-use crate::core::image::read_image_data_url;
+use crate::core::image::{mib, read_image_data_url};
 use crate::generative_model::{self, Content, ToolResult};
 
 use super::{HostDispatchContext, ToolService};
 
+/// `{limit}` is the driving model's image cap — quoted so the model can skip a
+/// call it would only fail.
 const TOOL_DESCRIPTION: &str = r#"
 Look at an image file: returns the image itself, so you can read screenshots, diagrams,
 and rendered output instead of guessing from filenames.
 
-Supported: png, jpeg, gif, webp — up to 5 MiB each. The format is detected from the
-file's contents, so the extension can be wrong or missing. Anything else (including
-text files) belongs in `str_replace_based_edit_tool` view, which this does not replace.
+Supported: png, jpeg, gif, webp — up to {limit} each (measured on the base64 payload,
+which is 4/3 of the file). The format is detected from the file's contents, so the
+extension can be wrong or missing. Anything else (including text files) belongs in
+`str_replace_based_edit_tool` view, which this does not replace.
 "#;
 
 /// Reads image files as [`Content::Image`]. Implements [`ToolService`] (host-placed).
-#[derive(Default)]
-pub struct ViewImageService;
+pub struct ViewImageService {
+    /// Largest image this host will return, from the driving model's
+    /// `max_image_bytes` (see [`crate::host::HostWorker::standard`]).
+    max_image_bytes: u64,
+}
 
 impl ViewImageService {
-    pub fn new() -> Self {
-        Self
+    pub fn new(max_image_bytes: u64) -> Self {
+        Self { max_image_bytes }
     }
 
-    /// Tool schemas served by this service (static: no instance required).
-    pub fn specs() -> Vec<generative_model::ToolSpec> {
+    /// Tool schemas served by a service built with `max_image_bytes` (no
+    /// instance required; the cap is the only thing that varies).
+    pub fn specs(max_image_bytes: u64) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "view_image".to_string(),
-            description: TOOL_DESCRIPTION.to_string(),
+            description: TOOL_DESCRIPTION.replace("{limit}", &mib(max_image_bytes)),
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
@@ -51,14 +58,14 @@ impl ViewImageService {
             return Err(format!("'{path}' is not a file"));
         }
 
-        let source = read_image_data_url(&path_buf, &format!("'{path}'"))?;
+        let source = read_image_data_url(&path_buf, &format!("'{path}'"), self.max_image_bytes)?;
         Ok(Content::Image { source })
     }
 }
 
 impl ToolService for ViewImageService {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
-        Self::specs()
+        Self::specs(self.max_image_bytes)
     }
 
     fn dispatch_tool_use(
@@ -92,7 +99,7 @@ struct Input {
 mod tests {
     use super::*;
     use crate::core::CancelToken;
-    use crate::core::image::MAX_IMAGE_BYTES;
+    use crate::core::image::DEFAULT_MAX_IMAGE_BYTES;
     use crate::generative_model::ToolUse;
     use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
@@ -101,17 +108,23 @@ mod tests {
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
 
     fn view(path: &str) -> ToolResult {
-        futures::executor::block_on(Arc::new(ViewImageService::new()).dispatch_tool_use(
-            ToolUse {
-                id: "t1".into(),
-                name: "view_image".into(),
-                input: json!({ "path": path }),
-            },
-            HostDispatchContext {
-                agent_id: uuid::Uuid::nil(),
-                cancel: CancelToken::new(),
-            },
-        ))
+        view_capped(path, DEFAULT_MAX_IMAGE_BYTES)
+    }
+
+    fn view_capped(path: &str, max_image_bytes: u64) -> ToolResult {
+        futures::executor::block_on(
+            Arc::new(ViewImageService::new(max_image_bytes)).dispatch_tool_use(
+                ToolUse {
+                    id: "t1".into(),
+                    name: "view_image".into(),
+                    input: json!({ "path": path }),
+                },
+                HostDispatchContext {
+                    agent_id: uuid::Uuid::nil(),
+                    cancel: CancelToken::new(),
+                },
+            ),
+        )
     }
 
     #[test]
@@ -205,13 +218,46 @@ mod tests {
     fn oversized_image_errors_with_limit() {
         let tmp = temp_dir("view-image");
         let path = tmp.path().join("big.png");
-        std::fs::write(&path, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
+        std::fs::write(&path, vec![0u8; DEFAULT_MAX_IMAGE_BYTES as usize + 1]).unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(result.is_error);
         assert!(
-            result_text(&result).contains("limit is 5 MiB"),
+            result_text(&result).contains("limit is 5.0 MiB"),
             "{result:?}"
         );
+    }
+
+    /// The cap is the configured model's, and crossing it fails *this tool
+    /// use* — an error the model can act on, not a killed turn. The same file
+    /// is served under a model configured for larger images.
+    #[test]
+    fn cap_is_per_model_and_only_fails_the_tool_use() {
+        let tmp = temp_dir("view-image");
+        let path = tmp.path().join("shot.png");
+        // 4 MiB file → ~5.3 MiB encoded.
+        let mut bytes = vec![0u8; 4 * 1024 * 1024];
+        bytes[..PNG.len()].copy_from_slice(PNG);
+        std::fs::write(&path, &bytes).unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        let rejected = view_capped(&path, 2 * 1024 * 1024);
+        assert!(rejected.is_error);
+        assert!(
+            result_text(&rejected).contains("limit is 2.0 MiB"),
+            "{rejected:?}"
+        );
+
+        let accepted = view_capped(&path, 8 * 1024 * 1024);
+        assert!(!accepted.is_error, "{}", result_text(&accepted));
+        assert!(matches!(&accepted.content[0], Content::Image { .. }));
+    }
+
+    /// The advertised limit tracks the configuration; a stale "5 MiB" in the
+    /// description would send the model after calls that cannot succeed.
+    #[test]
+    fn description_quotes_the_configured_limit() {
+        let specs = ViewImageService::specs(20 * 1024 * 1024);
+        assert!(specs[0].description.contains("20.0 MiB"), "{specs:?}");
     }
 }
