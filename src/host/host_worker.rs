@@ -38,21 +38,21 @@ impl HostWorker {
 
     /// Standard host catalog (same on every host / remote binary).
     ///
-    /// `max_image_bytes` is the driving model's image cap: it bounds what
+    /// `max_image_base64_bytes` is the driving model's image cap: it bounds what
     /// `view_image` will read and is quoted in the tool's description, so a
     /// remote worker must be spawned with the same value the agent side
-    /// resolved (`--max-image-bytes`).
-    pub fn standard(name: impl Into<String>, max_image_bytes: u64) -> Self {
-        Self::new(name, Self::standard_services(max_image_bytes))
+    /// resolved (`--max-image-base64-bytes`).
+    pub fn standard(name: impl Into<String>, max_image_base64_bytes: u64) -> Self {
+        Self::new(name, Self::standard_services(max_image_base64_bytes))
     }
 
     /// Standard service list for building an extended local worker: the
     /// dispatchers behind [`Self::standard_tool_specs`].
-    pub fn standard_services(max_image_bytes: u64) -> Vec<Arc<dyn ToolService>> {
+    pub fn standard_services(max_image_base64_bytes: u64) -> Vec<Arc<dyn ToolService>> {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
-            Arc::new(ViewImageService::new(max_image_bytes)) as Arc<dyn ToolService>,
+            Arc::new(ViewImageService::new(max_image_base64_bytes)) as Arc<dyn ToolService>,
         ]
     }
 
@@ -64,11 +64,11 @@ impl HostWorker {
     /// connection exists. Concatenates the same per-service `specs()` the
     /// live services serve; a test pins this against a real worker so the
     /// two can never drift.
-    pub fn standard_tool_specs(max_image_bytes: u64) -> Vec<generative_model::ToolSpec> {
+    pub fn standard_tool_specs(max_image_base64_bytes: u64) -> Vec<generative_model::ToolSpec> {
         [
             BashService::specs(),
             TextEditorService::specs(),
-            ViewImageService::specs(max_image_bytes),
+            ViewImageService::specs(max_image_base64_bytes),
         ]
         .into_iter()
         .flatten()

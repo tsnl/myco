@@ -35,7 +35,7 @@ printed. A bad path or a file that is not really an image opens an ERROR
 section before the model is called; nothing is silently dropped.
 
 Size limits are measured on the **base64 payload uploaded**, which is 4/3 of the
-file on disk: per image, the running model's `max_image_bytes` (config.toml
+file on disk: per image, the running model's `max_image_base64_bytes` (config.toml
 `[models.KEY]`, default 5 MiB — so ~3.75 MiB on disk; `view_image` enforces the
 same cap on every host, and an image over it fails that tool use); and 20 MiB of
 attachments per message, which is myco's own budget and does not vary by model.

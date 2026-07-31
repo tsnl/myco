@@ -53,6 +53,20 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 /// Default per-remote connect timeout (seconds) when the config file sets none.
 pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 
+/// Default per-image cap when a model entry sets no `max_image_base64_bytes`
+/// (matches the Anthropic API's 5 MB per-image cap; a clear local error beats
+/// a confusing provider 400).
+///
+/// Measured on the **base64 payload**, not the file on disk: images travel as
+/// `data:` URLs, and base64 inflates by 4/3, so a 5 MiB file is already a
+/// 6.7 MiB upload. Checking the file size instead understates every image by a
+/// third and lets rejects through to the provider.
+///
+/// This is the only place the fallback exists: resolution turns it into a
+/// concrete `ModelSpec::max_image_base64_bytes`, and everything downstream
+/// takes that resolved value from its caller.
+pub const DEFAULT_MAX_IMAGE_BASE64_BYTES: u64 = 5 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Auth resolution
 // ---------------------------------------------------------------------------
@@ -302,8 +316,8 @@ impl Config {
                 .unwrap_or(DEFAULT_ATTACH_TIMEOUT_SECS),
             models
                 .spec(&model)
-                .map(|s| s.max_image_bytes)
-                .unwrap_or(crate::core::image::DEFAULT_MAX_IMAGE_BYTES),
+                .map(|s| s.max_image_base64_bytes)
+                .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
         );
         let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
         let wrap_max = resolve_wrap(wrap, stdout_is_tty);
@@ -417,9 +431,9 @@ fn resolve_catalog(
             protocol,
             thinking,
             context_window_tokens: entry.context_window,
-            max_image_bytes: entry
-                .max_image_bytes
-                .unwrap_or(crate::core::image::DEFAULT_MAX_IMAGE_BYTES),
+            max_image_base64_bytes: entry
+                .max_image_base64_bytes
+                .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let backend = match protocol {
@@ -646,7 +660,7 @@ context_window = 200_000
         assert!(err.contains("kimi-k3"), "{err}");
     }
 
-    /// `max_image_bytes` is per model and defaults to the shared cap. The
+    /// `max_image_base64_bytes` is per model and defaults to the shared cap. The
     /// resolved value must also reach the harness, which is what remote hosts
     /// are spawned with — a default there would let a remote `view_image`
     /// return images the model rejects.
@@ -654,12 +668,16 @@ context_window = 200_000
     fn per_model_image_cap_defaults_and_reaches_the_harness() {
         let default_cfg = resolve_catalog_cfg(&[("OPENROUTER_API_KEY", "or-key")]);
         assert_eq!(
-            default_cfg.models.spec("kimi-k3").unwrap().max_image_bytes,
-            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+            default_cfg
+                .models
+                .spec("kimi-k3")
+                .unwrap()
+                .max_image_base64_bytes,
+            DEFAULT_MAX_IMAGE_BASE64_BYTES
         );
         assert_eq!(
-            default_cfg.harness.max_image_bytes,
-            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+            default_cfg.harness.max_image_base64_bytes,
+            DEFAULT_MAX_IMAGE_BASE64_BYTES
         );
 
         let toml_text = r#"
@@ -669,7 +687,7 @@ model = "big-images"
 protocol = "openai-responses"
 base_url = "https://h"
 context_window = 32_768
-max_image_bytes = 12_582_912
+max_image_base64_bytes = 12_582_912
 
 [models.stock]
 protocol = "openai-responses"
@@ -678,16 +696,19 @@ context_window = 32_768
 "#;
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
         assert_eq!(
-            cfg.models.spec("big-images").unwrap().max_image_bytes,
+            cfg.models
+                .spec("big-images")
+                .unwrap()
+                .max_image_base64_bytes,
             12 * 1024 * 1024
         );
         // Untouched entries keep the default: the knob is per model, not global.
         assert_eq!(
-            cfg.models.spec("stock").unwrap().max_image_bytes,
-            crate::core::image::DEFAULT_MAX_IMAGE_BYTES
+            cfg.models.spec("stock").unwrap().max_image_base64_bytes,
+            DEFAULT_MAX_IMAGE_BASE64_BYTES
         );
         // Hosts follow the *selected* model.
-        assert_eq!(cfg.harness.max_image_bytes, 12 * 1024 * 1024);
+        assert_eq!(cfg.harness.max_image_base64_bytes, 12 * 1024 * 1024);
     }
 
     #[test]

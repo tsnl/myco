@@ -140,8 +140,9 @@ pub struct ModelSpec {
     /// Largest image this model accepts, measured on the base64 payload.
     /// Enforced locally by `view_image` and by REPL `@path` attachments so an
     /// oversized image fails with a clear message instead of a provider 400.
-    /// Config `max_image_bytes`; default [`crate::core::image::DEFAULT_MAX_IMAGE_BYTES`].
-    pub max_image_bytes: u64,
+    /// Always concrete: config resolution applies the `max_image_base64_bytes`
+    /// entry or its default, and callers downstream take this value.
+    pub max_image_base64_bytes: u64,
 }
 
 impl std::fmt::Display for ModelSpec {
@@ -871,7 +872,7 @@ mod tests {
             protocol,
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
-            max_image_bytes: crate::core::image::DEFAULT_MAX_IMAGE_BYTES,
+            max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
         }
     }
 

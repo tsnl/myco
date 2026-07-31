@@ -139,12 +139,12 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 (`anthropic-messages`: `adaptive` (default) | `budget` | `none`;
 `openai-responses` / `openai-completions`: `effort` (default) | `none` — use
 `none` for models that reject a reasoning effort), `max_output_tokens`
-(default 8192), `max_image_bytes` (largest image the model accepts, measured on
-the base64 payload actually uploaded — 4/3 of the file on disk; default 5 MiB,
-matching Anthropic's per-image cap). The image cap is enforced locally by
+(default 8192), `max_image_base64_bytes` (largest image the model accepts, as
+the name says measured on the uploaded base64 payload — 4/3 of the file on
+disk; default 5 MiB, matching Anthropic's per-image cap). The image cap is enforced locally by
 `view_image` and by REPL `@path` attachments, so an oversized image fails with a
 clear message naming both sizes instead of a provider 400. Remote hosts are
-spawned with the selected model's value (`myco --mode host --max-image-bytes`),
+spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
 which keeps every host in a session on the same limit.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
@@ -182,7 +182,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
   idle, or DOWN after a failed remote connect.
 - **`view_image`** (per host): returns a png/jpeg/gif/webp file as an image the
   model can actually look at — screenshots, diagrams, rendered output. Size is capped at
-  the running model's `max_image_bytes` (default 5 MiB, measured on the base64 payload);
+  the running model's `max_image_base64_bytes` (default 5 MiB, measured on the base64 payload);
   the tool's own description quotes the live limit, and going over fails that tool use.
   The format is read from the file's magic number, so the extension may be wrong or
   missing (user `@path` attachments share the same detection and cap). Text files stay

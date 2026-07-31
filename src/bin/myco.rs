@@ -119,10 +119,10 @@ struct Args {
 
     /// Largest image `view_image` will read, in bytes of the base64 payload.
     /// Only used with `--mode host`: the agent side passes its model's
-    /// `max_image_bytes` when it spawns a remote, so every host in a session
+    /// `max_image_base64_bytes` when it spawns a remote, so every host in a session
     /// enforces the same cap. Interactive runs take it from config.
-    #[arg(long, default_value_t = myco::core::image::DEFAULT_MAX_IMAGE_BYTES)]
-    max_image_bytes: u64,
+    #[arg(long, default_value_t = myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES)]
+    max_image_base64_bytes: u64,
 
     /// Model key from the config.toml [models] catalog.
     /// Default: `model` from config.toml, else the sole configured model.
@@ -231,7 +231,7 @@ fn run_session_browser(args: Args) {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name, args.max_image_bytes)
+    if let Err(e) = HostWorker::standard(args.name, args.max_image_base64_bytes)
         .serve_stdio()
         .await
     {
@@ -279,7 +279,7 @@ async fn run_print(args: Args) {
     let mut content = match print_turn_content(
         arg.as_deref(),
         prompt.clone(),
-        catalog_model.spec.max_image_bytes,
+        catalog_model.spec.max_image_base64_bytes,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -392,12 +392,13 @@ fn assemble_print_prompt(arg: Option<String>, piped: Option<String>) -> Result<S
 fn print_turn_content(
     arg: Option<&str>,
     prompt: String,
-    max_image_bytes: u64,
+    max_image_base64_bytes: u64,
 ) -> Result<Vec<Content>, String> {
-    let mut content: Vec<Content> = expand_image_attachments(arg.unwrap_or(""), max_image_bytes)?
-        .into_iter()
-        .filter(|c| matches!(c, Content::Image { .. }))
-        .collect();
+    let mut content: Vec<Content> =
+        expand_image_attachments(arg.unwrap_or(""), max_image_base64_bytes)?
+            .into_iter()
+            .filter(|c| matches!(c, Content::Image { .. }))
+            .collect();
     content.push(Content::Text { text: prompt });
     Ok(content)
 }
@@ -1060,15 +1061,17 @@ impl ReplSession {
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
         // the user can fix the path and resubmit — nothing is silently dropped.
-        let mut content =
-            match expand_image_attachments(&input, self.catalog_model.spec.max_image_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.ui.error_section(&e);
-                    self.ui.blank_line();
-                    return;
-                }
-            };
+        let mut content = match expand_image_attachments(
+            &input,
+            self.catalog_model.spec.max_image_base64_bytes,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ui.error_section(&e);
+                self.ui.blank_line();
+                return;
+            }
+        };
         // Same note, same position as replay: directly under the wrapped input.
         if let Some(note) = attachment_note(&content) {
             self.ui.line(&note);
@@ -1737,7 +1740,7 @@ impl EventSink for PrintEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myco::core::image::DEFAULT_MAX_IMAGE_BYTES;
+    use myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
     use myco::uuid_simple_hex;
     use serde_json::json;
@@ -1882,16 +1885,19 @@ mod tests {
         // A (missing) image path in the piped-stdin portion of the prompt must
         // not attach or error; the same path in the -p argument must error.
         let prompt = "diff mentions @no-such-file.png\n\nreview this".to_string();
-        let content =
-            print_turn_content(Some("review this"), prompt.clone(), DEFAULT_MAX_IMAGE_BYTES)
-                .unwrap();
+        let content = print_turn_content(
+            Some("review this"),
+            prompt.clone(),
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap();
         assert_eq!(content.len(), 1);
         assert!(matches!(&content[0], Content::Text { text } if *text == prompt));
         assert!(
             print_turn_content(
                 Some("look at @no-such-file.png"),
                 prompt,
-                DEFAULT_MAX_IMAGE_BYTES,
+                DEFAULT_MAX_IMAGE_BASE64_BYTES,
             )
             .is_err()
         );
@@ -1909,7 +1915,8 @@ mod tests {
         fs::write(&img, [0x89, 0x50, 0x4E, 0x47]).unwrap();
 
         let arg = format!("what is this? @{}", img.display());
-        let content = print_turn_content(Some(&arg), arg.clone(), DEFAULT_MAX_IMAGE_BYTES).unwrap();
+        let content =
+            print_turn_content(Some(&arg), arg.clone(), DEFAULT_MAX_IMAGE_BASE64_BYTES).unwrap();
         assert_eq!(content.len(), 2);
         assert!(matches!(&content[0], Content::Image { .. }));
         assert!(matches!(&content[1], Content::Text { text } if *text == arg));

@@ -18,7 +18,7 @@ use test_utils::tool_text;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_midcall_then_next_call_succeeds() {
-    let client = HostController::local_in_process();
+    let client = HostController::local_in_process(myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES);
 
     let cancel = CancelToken::new();
     // Same-task delayed cancel (avoids spawn scheduling races under suite load).
@@ -84,7 +84,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
 
 #[tokio::test]
 async fn drop_midcall_then_next_call_succeeds() {
-    let client = HostController::local_in_process();
+    let client = HostController::local_in_process(myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES);
 
     // Simulate agent tokio::select! dropping the call future on Ctrl-C.
     let slow = client.call(

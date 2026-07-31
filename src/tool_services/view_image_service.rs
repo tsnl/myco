@@ -24,21 +24,23 @@ extension can be wrong or missing. Anything else (including text files) belongs 
 /// Reads image files as [`Content::Image`]. Implements [`ToolService`] (host-placed).
 pub struct ViewImageService {
     /// Largest image this host will return, from the driving model's
-    /// `max_image_bytes` (see [`crate::host::HostWorker::standard`]).
-    max_image_bytes: u64,
+    /// `max_image_base64_bytes` (see [`crate::host::HostWorker::standard`]).
+    max_image_base64_bytes: u64,
 }
 
 impl ViewImageService {
-    pub fn new(max_image_bytes: u64) -> Self {
-        Self { max_image_bytes }
+    pub fn new(max_image_base64_bytes: u64) -> Self {
+        Self {
+            max_image_base64_bytes,
+        }
     }
 
-    /// Tool schemas served by a service built with `max_image_bytes` (no
+    /// Tool schemas served by a service built with `max_image_base64_bytes` (no
     /// instance required; the cap is the only thing that varies).
-    pub fn specs(max_image_bytes: u64) -> Vec<generative_model::ToolSpec> {
+    pub fn specs(max_image_base64_bytes: u64) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "view_image".to_string(),
-            description: TOOL_DESCRIPTION.replace("{limit}", &mib(max_image_bytes)),
+            description: TOOL_DESCRIPTION.replace("{limit}", &mib(max_image_base64_bytes)),
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
@@ -58,14 +60,15 @@ impl ViewImageService {
             return Err(format!("'{path}' is not a file"));
         }
 
-        let source = read_image_data_url(&path_buf, &format!("'{path}'"), self.max_image_bytes)?;
+        let source =
+            read_image_data_url(&path_buf, &format!("'{path}'"), self.max_image_base64_bytes)?;
         Ok(Content::Image { source })
     }
 }
 
 impl ToolService for ViewImageService {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
-        Self::specs(self.max_image_bytes)
+        Self::specs(self.max_image_base64_bytes)
     }
 
     fn dispatch_tool_use(
@@ -98,8 +101,8 @@ struct Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::core::CancelToken;
-    use crate::core::image::DEFAULT_MAX_IMAGE_BYTES;
     use crate::generative_model::ToolUse;
     use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
@@ -108,12 +111,12 @@ mod tests {
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
 
     fn view(path: &str) -> ToolResult {
-        view_capped(path, DEFAULT_MAX_IMAGE_BYTES)
+        view_capped(path, DEFAULT_MAX_IMAGE_BASE64_BYTES)
     }
 
-    fn view_capped(path: &str, max_image_bytes: u64) -> ToolResult {
+    fn view_capped(path: &str, max_image_base64_bytes: u64) -> ToolResult {
         futures::executor::block_on(
-            Arc::new(ViewImageService::new(max_image_bytes)).dispatch_tool_use(
+            Arc::new(ViewImageService::new(max_image_base64_bytes)).dispatch_tool_use(
                 ToolUse {
                     id: "t1".into(),
                     name: "view_image".into(),
@@ -218,7 +221,11 @@ mod tests {
     fn oversized_image_errors_with_limit() {
         let tmp = temp_dir("view-image");
         let path = tmp.path().join("big.png");
-        std::fs::write(&path, vec![0u8; DEFAULT_MAX_IMAGE_BYTES as usize + 1]).unwrap();
+        std::fs::write(
+            &path,
+            vec![0u8; DEFAULT_MAX_IMAGE_BASE64_BYTES as usize + 1],
+        )
+        .unwrap();
 
         let result = view(&path.to_string_lossy());
         assert!(result.is_error);

@@ -11,7 +11,7 @@
 //! Limits are measured on the **base64 payload actually uploaded**, not the
 //! file on disk: base64 inflates by 4/3, and providers cap the encoded image
 //! and the whole request. The per-image cap is the model's
-//! (`max_image_bytes`); the per-message budget below is myco's own and does
+//! (`max_image_base64_bytes`); the per-message budget below is myco's own and does
 //! not vary by model. Per-message budgets alone cannot keep a session under
 //! the request cap — images accumulate in history — so the drivers also
 //! preflight the composed request (`generative_model::MAX_REQUEST_BYTES`).
@@ -28,7 +28,7 @@ use crate::generative_model::Content;
 /// conversation it is appended to.
 ///
 /// Deliberately not per-model: it bounds a *message*, not an image. A model
-/// configured above this still gets its full `max_image_bytes` through
+/// configured above this still gets its full `max_image_base64_bytes` through
 /// `view_image` (one image, one tool result) — only batching many `@path`
 /// mentions into a single message is held to this budget.
 pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
@@ -40,8 +40,11 @@ pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// non-image file fails the whole message so the user can fix it and resubmit —
 /// nothing is silently dropped.
 ///
-/// `max_image_bytes` is the driving model's per-image cap.
-pub fn expand_image_attachments(input: &str, max_image_bytes: u64) -> Result<Vec<Content>, String> {
+/// `max_image_base64_bytes` is the driving model's per-image cap.
+pub fn expand_image_attachments(
+    input: &str,
+    max_image_base64_bytes: u64,
+) -> Result<Vec<Content>, String> {
     let mut content = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     let mut encoded_total: u64 = 0;
@@ -64,7 +67,7 @@ pub fn expand_image_attachments(input: &str, max_image_bytes: u64) -> Result<Vec
         let expanded = expand_home(path);
         // `read_image_data_url` caps each image; this budget caps the message,
         // measured on the same `data:` URL the request will carry.
-        let source = read_image_data_url(&expanded, &format!("@{path}"), max_image_bytes)?;
+        let source = read_image_data_url(&expanded, &format!("@{path}"), max_image_base64_bytes)?;
         encoded_total += source.len() as u64;
         if encoded_total > MAX_MESSAGE_ATTACHMENT_BYTES {
             return Err(format!(
@@ -96,7 +99,7 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::image::DEFAULT_MAX_IMAGE_BYTES;
+    use crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::test_support::temp_dir;
     use base64::Engine as _;
     use std::fs;
@@ -108,7 +111,8 @@ mod tests {
     #[test]
     fn plain_text_passes_through() {
         let parsed =
-            expand_image_attachments("just words, no files", DEFAULT_MAX_IMAGE_BYTES).unwrap();
+            expand_image_attachments("just words, no files", DEFAULT_MAX_IMAGE_BASE64_BYTES)
+                .unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(matches!(
             &parsed[0],
@@ -123,7 +127,7 @@ mod tests {
         fs::write(&path, PNG).unwrap();
         let input = format!("what is wrong in @{}?", path.display());
 
-        let parsed = expand_image_attachments(&input, DEFAULT_MAX_IMAGE_BYTES).unwrap();
+        let parsed = expand_image_attachments(&input, DEFAULT_MAX_IMAGE_BASE64_BYTES).unwrap();
         assert_eq!(parsed.len(), 2);
         match &parsed[0] {
             Content::Image { source } => {
@@ -150,7 +154,7 @@ mod tests {
 
         let parsed = expand_image_attachments(
             &format!("look at @{}.", path.display()),
-            DEFAULT_MAX_IMAGE_BYTES,
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
         )
         .unwrap();
         assert_eq!(parsed.len(), 2);
@@ -164,9 +168,11 @@ mod tests {
         let path = dir.path().join("photo.JPG");
         fs::write(&path, JPEG).unwrap();
 
-        let parsed =
-            expand_image_attachments(&format!("@{}", path.display()), DEFAULT_MAX_IMAGE_BYTES)
-                .unwrap();
+        let parsed = expand_image_attachments(
+            &format!("@{}", path.display()),
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap();
         match &parsed[0] {
             Content::Image { source } => {
                 assert!(source.starts_with("data:image/jpeg;base64,"), "{source}");
@@ -177,16 +183,21 @@ mod tests {
 
     #[test]
     fn non_image_at_tokens_are_ordinary_text() {
-        let parsed =
-            expand_image_attachments("ping @alice about @notes.txt", DEFAULT_MAX_IMAGE_BYTES)
-                .unwrap();
+        let parsed = expand_image_attachments(
+            "ping @alice about @notes.txt",
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[test]
     fn missing_file_fails_the_message_naming_the_path() {
-        let err = expand_image_attachments("see @definitely-missing.png", DEFAULT_MAX_IMAGE_BYTES)
-            .unwrap_err();
+        let err = expand_image_attachments(
+            "see @definitely-missing.png",
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap_err();
         assert!(err.contains("@definitely-missing.png"), "{err}");
     }
 
@@ -206,7 +217,7 @@ mod tests {
             input.push_str(&format!("@{} ", path.display()));
         }
 
-        let err = expand_image_attachments(&input, DEFAULT_MAX_IMAGE_BYTES).unwrap_err();
+        let err = expand_image_attachments(&input, DEFAULT_MAX_IMAGE_BASE64_BYTES).unwrap_err();
         assert!(err.contains("per-message limit is 20.0 MiB"), "{err}");
     }
 
@@ -237,9 +248,11 @@ mod tests {
         let path = dir.path().join("notes.png");
         fs::write(&path, b"just text").unwrap();
 
-        let err =
-            expand_image_attachments(&format!("@{}", path.display()), DEFAULT_MAX_IMAGE_BYTES)
-                .unwrap_err();
+        let err = expand_image_attachments(
+            &format!("@{}", path.display()),
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap_err();
         assert!(
             err.contains("is not a png, jpeg, gif, or webp image"),
             "{err}"
@@ -253,9 +266,11 @@ mod tests {
         fs::write(&path, PNG).unwrap();
         let p = path.display();
 
-        let parsed =
-            expand_image_attachments(&format!("@{p} and again @{p}"), DEFAULT_MAX_IMAGE_BYTES)
-                .unwrap();
+        let parsed = expand_image_attachments(
+            &format!("@{p} and again @{p}"),
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap();
         assert_eq!(parsed.len(), 2); // one image + the text
     }
 }
