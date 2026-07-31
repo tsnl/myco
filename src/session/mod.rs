@@ -15,7 +15,7 @@ mod console_log;
 mod lock;
 mod search;
 
-pub use attach::{MAX_IMAGE_BYTES, MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
+pub use attach::{MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
 pub use compact::{CompactOutcome, compact_session, link_compact_pair, select_tail};
 pub use console_log::ConsoleLog;
 pub use lock::{SessionLockError, SessionWriteLock};

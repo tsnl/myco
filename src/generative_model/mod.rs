@@ -137,6 +137,12 @@ pub struct ModelSpec {
     pub thinking: ThinkingMode,
     /// Context window for UX (`USER n/m`) and auto-compact heuristics.
     pub context_window_tokens: u64,
+    /// Largest image this model accepts, measured on the base64 payload.
+    /// Enforced locally by `view_image` and by REPL `@path` attachments so an
+    /// oversized image fails with a clear message instead of a provider 400.
+    /// Always concrete: config resolution applies the `max_image_base64_bytes`
+    /// entry or its default, and callers downstream take this value.
+    pub max_image_base64_bytes: u64,
 }
 
 impl std::fmt::Display for ModelSpec {
@@ -195,6 +201,14 @@ impl ModelCatalog {
     /// Key exists (regardless of whether its credential resolved).
     pub fn contains(&self, key: &str) -> bool {
         self.entries.contains_key(key)
+    }
+
+    /// Spec for `key`, ignoring credential state. For settings that must be
+    /// read while merely *configuring* a run (the image cap host workers are
+    /// spawned with) rather than using the model — [`Self::get`] is still the
+    /// gate for that.
+    pub fn spec(&self, key: &str) -> Option<&ModelSpec> {
+        self.entries.get(key).map(|entry| &entry.spec)
     }
 
     pub fn keys(&self) -> Vec<&str> {
@@ -858,6 +872,7 @@ mod tests {
             protocol,
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
+            max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
         }
     }
 

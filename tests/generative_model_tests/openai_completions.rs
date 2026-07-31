@@ -40,6 +40,7 @@ fn stub_model(base_url: &str, tools: Vec<ToolSpec>) -> std::sync::Arc<dyn Genera
             protocol: Protocol::OpenAICompletions,
             thinking: ThinkingMode::None,
             context_window_tokens: 4096,
+            max_image_base64_bytes: myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
         },
         tools,
         system_prompt: "Answer in one word.".into(),

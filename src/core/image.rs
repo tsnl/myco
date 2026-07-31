@@ -1,23 +1,25 @@
 //! Image file policy shared by REPL `@path` attachments and the `view_image`
-//! tool: the per-image size cap, magic-number type detection, and
-//! file → `data:` URL reading.
+//! tool: magic-number type detection and file → `data:` URL reading, under a
+//! size cap the caller supplies.
+//!
+//! The cap itself is not decided here. It belongs to the model, so it is
+//! resolved once in [`crate::config`] and passed down; this layer only
+//! enforces the number it is handed.
 
 use std::path::Path;
 
 use base64::Engine as _;
 
-/// Per-image size limit (matches the Anthropic API's 5 MB per-image cap; a
-/// clear local error beats a confusing provider 400).
-///
-/// Measured on the **base64 payload**, not the file on disk: images travel as
-/// `data:` URLs, and base64 inflates by 4/3, so a 5 MiB file is already a
-/// 6.7 MiB upload. Checking the file size instead understates every image by a
-/// third and lets rejects through to the provider.
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
-
 /// Size of `bytes` once base64-encoded — what a request actually carries.
 pub fn base64_len(bytes: u64) -> u64 {
     bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// Render a byte count as MiB for user-facing limits and sizes. One decimal
+/// throughout: a configured cap is an arbitrary number of bytes, and integer
+/// MiB would round `3_500_000` down to a "3 MiB" limit that rejects at 3.3.
+pub fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Media types the model APIs accept. `infer` recognizes far more formats
@@ -41,24 +43,29 @@ pub fn looks_like_image_path(path: &str) -> bool {
         })
 }
 
-/// Read an image file and encode it as a `data:` URL, enforcing
-/// [`MAX_IMAGE_BYTES`].
+/// Read an image file and encode it as a `data:` URL, rejecting anything whose
+/// base64 payload exceeds `max_base64_bytes` — the driving model's resolved
+/// cap, never a default invented here.
 ///
 /// The media type comes from the file's magic number, not its name: a `.png`
 /// that is really a JPEG would otherwise reach the provider tagged
 /// `image/png` and be rejected by a decoder we cannot see. `label` is how the
 /// path appears in error messages (the REPL uses `@path`, `view_image` quotes
 /// it).
-pub fn read_image_data_url(path: &Path, label: &str) -> Result<String, String> {
+pub fn read_image_data_url(
+    path: &Path,
+    label: &str,
+    max_base64_bytes: u64,
+) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
     let encoded = base64_len(meta.len());
-    if encoded > MAX_IMAGE_BYTES {
+    if encoded > max_base64_bytes {
         return Err(format!(
-            "image {label} is {:.1} MiB ({:.1} MiB encoded for upload); the limit is {} MiB. \
+            "image {label} is {} ({} encoded for upload); the limit is {}. \
              Resize or re-compress it and resubmit",
-            meta.len() as f64 / (1024.0 * 1024.0),
-            encoded as f64 / (1024.0 * 1024.0),
-            MAX_IMAGE_BYTES / (1024 * 1024),
+            mib(meta.len()),
+            mib(encoded),
+            mib(max_base64_bytes),
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
@@ -74,6 +81,10 @@ pub fn read_image_data_url(path: &Path, label: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::test_support::{TempDir, temp_dir};
+
+    /// Stand-in for a resolved model cap. This layer has no default of its
+    /// own — the number is always the caller's — so the tests pick one.
+    const CAP: u64 = 5 * 1024 * 1024;
 
     /// Smallest byte strings `infer`'s matchers accept, per format.
     const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
@@ -107,7 +118,7 @@ mod tests {
             ("d.webp", WEBP, "image/webp"),
         ] {
             let path = write(&dir, name, bytes);
-            let url = read_image_data_url(&path, name).unwrap();
+            let url = read_image_data_url(&path, name, CAP).unwrap();
             assert!(url.starts_with(&format!("data:{want};base64,")), "{url}");
         }
     }
@@ -118,7 +129,7 @@ mod tests {
     fn mislabeled_extension_uses_the_real_media_type() {
         let dir = temp_dir("image");
         let path = write(&dir, "actually-a-jpeg.png", JPEG);
-        let url = read_image_data_url(&path, "@actually-a-jpeg.png").unwrap();
+        let url = read_image_data_url(&path, "@actually-a-jpeg.png", CAP).unwrap();
         assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
     }
 
@@ -126,7 +137,7 @@ mod tests {
     fn round_trips_the_bytes() {
         let dir = temp_dir("image");
         let path = write(&dir, "a.png", PNG);
-        let url = read_image_data_url(&path, "a.png").unwrap();
+        let url = read_image_data_url(&path, "a.png", CAP).unwrap();
         let b64 = url.strip_prefix("data:image/png;base64,").unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -145,7 +156,7 @@ mod tests {
             ("empty.png", &b""[..]),
         ] {
             let path = write(&dir, name, bytes);
-            let err = read_image_data_url(&path, name).unwrap_err();
+            let err = read_image_data_url(&path, name, CAP).unwrap_err();
             assert!(
                 err.contains("is not a png, jpeg, gif, or webp image"),
                 "{err}"
@@ -158,9 +169,26 @@ mod tests {
     #[test]
     fn oversized_image_errors_with_limit() {
         let dir = temp_dir("image");
-        let path = write(&dir, "big.png", &vec![0u8; MAX_IMAGE_BYTES as usize + 1]);
-        let err = read_image_data_url(&path, "@big.png").unwrap_err();
-        assert!(err.contains("the limit is 5 MiB"), "{err}");
+        let path = write(&dir, "big.png", &vec![0u8; CAP as usize + 1]);
+        let err = read_image_data_url(&path, "@big.png", CAP).unwrap_err();
+        assert!(err.contains("the limit is 5.0 MiB"), "{err}");
+    }
+
+    /// The cap is the caller's, not a constant: the same file passes under a
+    /// model configured for larger images and fails under a smaller one.
+    #[test]
+    fn limit_comes_from_the_caller() {
+        let dir = temp_dir("image");
+        // 4 MiB file → ~5.3 MiB encoded: over the 5 MiB default, under 8 MiB.
+        let mut bytes = vec![0u8; 4 * 1024 * 1024];
+        bytes[..PNG.len()].copy_from_slice(PNG);
+        let path = write(&dir, "shot.png", &bytes);
+
+        let url = read_image_data_url(&path, "@shot.png", 8 * 1024 * 1024).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+
+        let err = read_image_data_url(&path, "@shot.png", 1024 * 1024).unwrap_err();
+        assert!(err.contains("the limit is 1.0 MiB"), "{err}");
     }
 
     /// The cap is on the uploaded payload, not the file: base64 inflates by
@@ -173,14 +201,14 @@ mod tests {
 
         let dir = temp_dir("image");
         let path = write(&dir, "shot.png", &vec![0u8; 4 * 1024 * 1024]);
-        let err = read_image_data_url(&path, "@shot.png").unwrap_err();
+        let err = read_image_data_url(&path, "@shot.png", CAP).unwrap_err();
         assert!(err.contains("5.3 MiB encoded"), "{err}");
     }
 
     #[test]
     fn missing_file_errors_naming_the_label() {
-        let err =
-            read_image_data_url(Path::new("/definitely/missing.png"), "@missing.png").unwrap_err();
+        let err = read_image_data_url(Path::new("/definitely/missing.png"), "@missing.png", CAP)
+            .unwrap_err();
         assert!(err.contains("@missing.png"), "{err}");
     }
 }
