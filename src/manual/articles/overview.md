@@ -70,6 +70,16 @@ gateway = "xai"
 context_window = 500_000
 ```
 
+- The config is validated at startup, before any model call. Myco ships no
+  models, so an **empty catalog is an error**: it names the config file and
+  prints an entry to paste. Unknown top-level keys are rejected (a typo'd
+  `model` would otherwise be silently ignored), as are unknown fields inside
+  `[gateways.*]` / `[models.*]`, an empty `base_url`, an unknown `gateway`
+  reference, and a `thinking` mode the protocol does not support. Every config
+  error names the file it came from.
+- A config path **you** name (`--config`, `$MYCO_CONFIG`) must exist — a typo
+  there is an error, not an empty catalog. The defaulted `~/.myco/config.toml`
+  may be absent (that is a first run).
 - Remote hosts come from `~/.ssh/config`: each concrete `Host` alias attaches as
   `ssh -o BatchMode=yes <alias> myco --mode host`. `Include` directives are
   followed. Put user / port / identity / `ProxyJump` in `~/.ssh/config`;
