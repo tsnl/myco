@@ -1,43 +1,36 @@
 # Myco overview
 
-**myco** is a coding agent CLI: one conversation can drive tools on your laptop and on remote
-machines over SSH. Tools run on **hosts** (local or remote); for nested agents, myco drives
-itself as an ordinary command (see below).
+**myco** is a coding agent: one conversation can drive tools on your laptop and on remote
+machines over SSH. Tools run on **hosts** (local or remote). One session runtime, two
+frontends: the interactive CLI (default) and a multiplayer web server (`--mode serve`).
 
 ## Architecture (one sentence)
 
 **Agents orchestrate; hosts run tools on machines.** The **local** host is always enabled
 **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
-`myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
+`myco` binary runs the CLI (default), the web server (`--mode serve`), and the remote host
+runtime (`--mode host`).
 
 ```
-myco (interactive) / Agent
-  └── Harness (routing, config, root-configured services)
-        ├── HostController "local"   → in-process HostWorker (always on)
-        └── HostController "…"       → ssh … myco --mode host (lazy remote)
-              └── bash, str_replace_based_edit_tool, view_image (per host)
+myco (CLI) / myco --mode serve (web)
+  └── Supervisor (session runtime: live sessions, queued turns, events)
+        └── Agent (per live session)
+              └── Harness (routing, config, root-configured services)
+                    ├── HostController "local"   → in-process HostWorker (always on)
+                    └── HostController "…"       → ssh … myco --mode host (lazy remote)
+                          └── bash, str_replace_based_edit_tool, view_image (per host)
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
   **local** host worker (standard tools plus root-only services such as `session_meta`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor,
   `view_image`) over NDJSON via SSH.
-- **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
-  session **on the local host**, passing `--parent-session <its own session id>` (myco stamps
-  that id in a `# Session` block on the first user message of every session, so an agent needs
-  no lookup; `session_meta` get still reports it), writes one
-  prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
-  auto-off when piped). For a single self-contained task, print mode is the one-shot form:
-  `myco -p "<task>" --parent-session <id>` runs one turn, streams the answer to stdout, and
-  exits (`session=<id>` on stderr). Nesting locally shares config, keys, network, and the session store by
-  construction; the child reaches remotes through its own host pool, its session is hidden
-  (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
-  supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
-  supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
-  completed tool round) so forks start from the freshest replayable snapshot — never between a
-  tool call and its result. A fork inherits the supervisor's stamped first message and stamps its
-  own id on the first message it adds, so the newest `# Session` block is the running session's.
-  Remotes stay config/key-free hands.
+- **Nested agents:** the `subagent` tool runs one full turn of a hidden child session per
+  call and returns its answer plus `session: <id>` for follow-ups; `fork: true` seeds the
+  child with your saved conversation (checkpointed mid-turn, so forks start from the freshest
+  replayable snapshot). Children share config, keys, and the session store by construction and
+  reach remotes through the same host pool. In serve mode the equivalent HTTP surface is
+  `$MYCO_API` (see `api.md`). Remotes stay config/key-free hands.
 
 ## Config & paths
 
@@ -224,11 +217,11 @@ agent to keep the soul an index over these files — a dated one-line distillati
 plus a pointer per entry, pruned on every revision — so recall does not depend on
 the agent remembering to look.
 
-## Product limits (V1)
+## Product limits
 
 - No heartbeat: remote liveness is next tool error; local is always in-process.
-- No mid-flight cancel over the host pipe yet; Ctrl-C cancels the agent turn locally.
-- You cannot invoke slash-commands; tell the user which to run.
+- No mid-flight cancel over the host pipe yet; cancellation lands at the agent turn.
+- You cannot invoke CLI slash-commands or press GUI buttons; tell the user which to use.
 - Conversation resume ≠ restored bash sessions or editor state.
-- Bash sessions die when the host process exits (CLI exit, host crash, SSH drop). Local in-process
-  sessions die with the agent process.
+- Bash sessions die when the host process exits (server/CLI exit, host crash, SSH drop). Local
+  in-process sessions die with the agent process.

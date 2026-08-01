@@ -1,7 +1,10 @@
-//! Minimal Yew client for the myco API server. Deliberately unstyled and
-//! small: a session browser at `/` and one conversation per URL at
-//! `/session/<id>`. Live output arrives over SSE; a slow poll reconciles the
-//! transcript as a fallback.
+//! Minimal Yew client for the myco API server: a session browser at `/` and
+//! one conversation per URL at `/session/<id>`. Live output arrives over SSE;
+//! a slow poll reconciles the transcript as a fallback.
+//!
+//! The visual identity is the terminal's: monospace, dark, USER/ASSISTANT
+//! section rules — the web page renders (approximately) what the CLI prints,
+//! with no further chrome.
 
 use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
@@ -113,6 +116,23 @@ fn browser() -> Html {
 // ---------------------------------------------------------------------------
 // Conversation (one URL per session)
 // ---------------------------------------------------------------------------
+
+/// One transcript entry, in the terminal's visual language.
+fn render_entry(e: &api::Entry) -> Html {
+    match e.role.as_str() {
+        "user" => html! {
+            <div>
+                <hr class="rule" />
+                <div class="role role-user">{ "USER" }</div>
+                <pre>{ &e.text }</pre>
+            </div>
+        },
+        "thinking" => html! { <pre class="role-thinking">{ &e.text }</pre> },
+        "tool_use" => html! { <pre class="role-tool">{ format!("● {}", e.text) }</pre> },
+        "tool_result" => html! { <pre class="dim">{ &e.text }</pre> },
+        _ => html! { <pre class="role-assistant">{ &e.text }</pre> },
+    }
+}
 
 #[derive(Properties, PartialEq)]
 struct ConversationProps {
@@ -268,20 +288,12 @@ fn conversation(props: &ConversationProps) -> Html {
                { if *busy { html!{ <em>{ "(agent working…)" }</em> } } else { html!{} } }
             </p>
             <div>
-                { for entries.iter().map(|e| html! {
-                    <div>
-                        <b>{ format!("{}: ", e.role) }</b>
-                        <pre style="white-space: pre-wrap; display: inline;">{ &e.text }</pre>
-                    </div>
-                }) }
+                { for entries.iter().map(render_entry) }
                 { if let Some(e) = &*error { html! {
-                    <div style="color: red;"><b>{ "turn failed: " }</b>{ e }</div>
+                    <div class="err"><hr class="rule" /><b>{ "ERROR " }</b><pre>{ e }</pre></div>
                 } } else { html!{} } }
                 { if !streaming.is_empty() { html! {
-                    <div>
-                        <b>{ "assistant (streaming): " }</b>
-                        <pre style="white-space: pre-wrap; display: inline;">{ &*streaming }</pre>
-                    </div>
+                    <div><pre class="dim">{ &*streaming }</pre></div>
                 } } else { html!{} } }
             </div>
             <textarea ref={input} rows="4" cols="100" placeholder="message (Enter does not send)"></textarea>

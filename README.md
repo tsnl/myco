@@ -1,9 +1,11 @@
 # `myco`
 
-A minimalist coding agent that works across your machines over SSH — now a
-**server**: `myco` runs an API on localhost, drives multiple concurrent agent
-sessions, and serves a minimal web GUI. (v2 rewrite; the v1 CLI lives in the
-`main` branch's history and on crates.io ≤ 0.3.x.)
+A minimalist coding agent that works across your machines over SSH. One
+session runtime, two frontends: the interactive **CLI** (default — now
+async: your prompt stays live, input queues while the agent works, output
+streams above it) and a **multiplayer web server** (`myco --mode serve`), a
+parallel experiment serving the same runtime over HTTP for the Yew GUI and
+scripts.
 
 ## Why use it?
 
@@ -13,8 +15,9 @@ sessions, and serves a minimal web GUI. (v2 rewrite; the v1 CLI lives in the
 - **Real computer use.** Bash (including multi-turn sessions) and a surgical
   file editor on each host; search and browsing compose from the tools already
   on your machines (`rg`, `curl`, `ck`, …) via bash.
-- **Concurrent sessions.** Each conversation is a URL; agents run in parallel
-  server-side, and input queues while a turn is running.
+- **Async everywhere.** Input queues while a turn runs — in the CLI and the
+  web alike. In serve mode each conversation is a URL and agents run in
+  parallel server-side.
 - **Sessions you can resume.** Titles, scratchpads, links, and full history
   live under `~/.myco/` — reopen any session by URL, or from another client.
 - **Nested agents as a tool.** The root-only `subagent` tool runs one full
@@ -28,9 +31,14 @@ sessions, and serves a minimal web GUI. (v2 rewrite; the v1 CLI lives in the
 ## Run
 
 ```bash
-cargo run -p myco            # API server on http://127.0.0.1:7773/api
-trunk serve                  # web GUI on http://127.0.0.1:8080 (proxies /api)
+cargo run -p myco                          # interactive CLI (async)
+cargo run -p myco -- -p "explain src/"     # one-shot print mode
+cargo run -p myco -- --mode serve          # API server on http://127.0.0.1:7773/api
+trunk serve                                # web GUI on :8080 (proxies /api)
 ```
+
+The web GUI keeps the terminal's visual identity: monospace, dark, USER
+rules — minimal chrome by design.
 
 `trunk serve` needs [trunk](https://trunkrs.dev) and the wasm target
 (`rustup target add wasm32-unknown-unknown`). The `Trunk.toml` at the repo
@@ -53,9 +61,9 @@ fork?}`) · `GET /api/sessions/<id>` · `POST /api/sessions/<id>/messages`
 
 ## Workspace
 
-- `myco` — the **root crate**: server binary (Rocket, `/api`), meta lib,
-  the `subagent` tool, and `--mode host` (the per-machine worker remotes
-  run); the workspace lives in `crates/`
+- `myco` — the **root crate**: the session runtime (`supervisor`), the CLI,
+  the web server (Rocket, `/api`), the `subagent` tool, and `--mode host`
+  (the per-machine worker remotes run); the workspace lives in `crates/`
 - `myco-gui` — minimal Yew web client (one URL per conversation)
 - `myco-api` — wire types shared by server and clients
 - `myco-agent`, `myco-session`, `myco-machines`, `myco-models`,
