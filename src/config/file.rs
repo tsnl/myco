@@ -17,6 +17,7 @@ use crate::generative_model::{Protocol, ThinkingMode};
 /// here — myco ships no built-in models. Catalog *resolution* (auth, overlay,
 /// validation) lives in [`crate::config::Config`].
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Default model **key** for the interactive CLI (`--model` overrides).
     /// Optional when exactly one `[models]` entry exists.
@@ -191,11 +192,20 @@ pub fn parse_file_config_str(text: &str) -> Result<FileConfig, String> {
         .map_err(|e| format!("invalid config TOML: {e}"))
 }
 
-/// Load the on-disk knobs/model config from `path`. Missing file →
-/// [`FileConfig::default`]. Path defaulting (`--config` → `$MYCO_CONFIG` →
-/// `~/.myco/config.toml`) lives in [`crate::config::Config`].
-pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
+/// Load the on-disk knobs/model config from `path`. Path defaulting
+/// (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`) lives in
+/// [`crate::config::Config`].
+///
+/// `required` is set when the user named the path themselves (`--config` or
+/// `$MYCO_CONFIG`): a typo there is an error, not an empty catalog, because
+/// the alternative reports a perfectly good config file as having no models.
+/// The defaulted `~/.myco/config.toml` stays optional — a first run has none,
+/// and its absence is reported once, with instructions, by catalog resolution.
+pub fn load_file_config(path: &Path, required: bool) -> Result<FileConfig, String> {
     if !path.exists() {
+        if required {
+            return Err(format!("no such config file: {}", path.display()));
+        }
         return Ok(FileConfig::default());
     }
     let text = std::fs::read_to_string(path)
@@ -367,6 +377,40 @@ context_window = 32768
         )
         .unwrap_err();
         assert!(err.contains("context_window"), "{err}");
+    }
+
+    /// A typo'd top-level key used to parse fine and then do nothing, so
+    /// `modle = "opus"` surfaced as "no model selected" with the real cause
+    /// invisible. Entry tables were already strict; this closes the gap.
+    #[test]
+    fn unknown_top_level_fields_are_rejected() {
+        let err =
+            parse_file_config_str(&format!("modle = \"m\"\n{}", model_toml("m", &[]))).unwrap_err();
+        assert!(err.contains("modle"), "{err}");
+
+        let err = parse_file_config_str("attach_timeout_sec = 5").unwrap_err();
+        assert!(err.contains("attach_timeout_sec"), "{err}");
+
+        // The removed section keeps its own migration message rather than
+        // degrading to a generic unknown-field error.
+        let err = parse_file_config_str("[[remote_hosts]]\nname = \"devbox\"\n").unwrap_err();
+        assert!(err.contains("no longer supported"), "{err}");
+    }
+
+    /// A path the user typed (`--config`, `$MYCO_CONFIG`) is a claim that the
+    /// file exists; the defaulted `~/.myco/config.toml` is not. Reporting a
+    /// typo'd path as an empty catalog sends people to fix a good file.
+    #[test]
+    fn missing_config_file_errors_only_when_the_user_named_it() {
+        let missing = std::path::PathBuf::from("/nonexistent/myco-test/config.toml");
+
+        let loaded = load_file_config(&missing, false).unwrap();
+        assert!(loaded.models.is_empty());
+        assert_eq!(loaded.model, None);
+
+        let err = load_file_config(&missing, true).unwrap_err();
+        assert!(err.contains("no such config file"), "{err}");
+        assert!(err.contains("myco-test"), "{err}");
     }
 
     #[test]

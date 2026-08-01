@@ -115,6 +115,10 @@ attachments. No console mirror is written in print mode.
   `{ source = "none" }` (omit for no auth). A model names its gateway plus
   `api_id` (wire id) and a required `context_window`.
 - Credentials that fail to look up error at model *use*, naming the source.
+- Everything else about the config is checked at startup: an empty catalog is
+  an error carrying an example to paste, unknown keys are rejected, and a
+  config path you named with `--config` / `$MYCO_CONFIG` must exist. Config
+  errors name the file they came from.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
