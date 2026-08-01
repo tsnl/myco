@@ -96,23 +96,32 @@ impl HostController {
     }
 
     /// Convenience: standard bash + editor worker named `"local"`.
-    pub fn local_in_process() -> Arc<Self> {
-        Self::in_process("local", Arc::new(HostWorker::standard("local")))
+    pub fn local_in_process(max_image_base64_bytes: u64) -> Arc<Self> {
+        Self::in_process(
+            "local",
+            Arc::new(HostWorker::standard("local", max_image_base64_bytes)),
+        )
     }
 
     /// Create a remote/subprocess controller. The worker is **not** started until
     /// the first [`call`].
-    pub fn new(config: HostConfig) -> Arc<Self> {
-        Self::with_timeout(config, 10)
+    pub fn new(config: HostConfig, max_image_base64_bytes: u64) -> Arc<Self> {
+        Self::with_timeout(config, 10, max_image_base64_bytes)
     }
 
-    /// Like [`new`] with an explicit connect timeout (`0` disables it).
-    pub fn with_timeout(config: HostConfig, connect_timeout_secs: u64) -> Arc<Self> {
+    /// Like [`new`] with an explicit connect timeout (`0` disables it) and the
+    /// image cap the remote is spawned with — advertised before connecting, so
+    /// it must match the `--max-image-base64-bytes` in `config.command`.
+    pub fn with_timeout(
+        config: HostConfig,
+        connect_timeout_secs: u64,
+        max_image_base64_bytes: u64,
+    ) -> Arc<Self> {
         let name = config.name.clone();
         Arc::new(Self {
             name,
             next_id: AtomicU64::new(1),
-            tools: HostWorker::standard_tool_specs(),
+            tools: HostWorker::standard_tool_specs(max_image_base64_bytes),
             backend: Backend::Subprocess {
                 config,
                 conn: Mutex::new(None),
@@ -596,6 +605,10 @@ async fn run_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hosts under test serve the standard catalog at the resolved default;
+    /// these tests are about routing and connection state, not the cap.
+    const TEST_IMAGE_CAP: u64 = crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::generative_model::ToolUse;
     use crate::test_support::text_parts;
     use serde_json::json;
@@ -604,10 +617,13 @@ mod tests {
     /// Subprocess host whose worker is `bash -c <script>` (scripted hellos,
     /// deliberate deaths — no real myco binary needed).
     fn scripted_host(name: &str, script: String) -> Arc<HostController> {
-        HostController::new(HostConfig {
-            name: name.into(),
-            command: vec!["bash".into(), "-c".into(), script],
-        })
+        HostController::new(
+            HostConfig {
+                name: name.into(),
+                command: vec!["bash".into(), "-c".into(), script],
+            },
+            TEST_IMAGE_CAP,
+        )
     }
 
     /// One `hello_ok` NDJSON line claiming `version`.
@@ -629,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_local_host_is_always_connected() {
-        let ctl = HostController::local_in_process();
+        let ctl = HostController::local_in_process(TEST_IMAGE_CAP);
 
         assert!(ctl.is_in_process());
         assert!(ctl.is_connected());
@@ -654,7 +670,7 @@ mod tests {
     /// cannot produce that — whichever ran first would find no sibling mark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_calls_pipeline_in_process() {
-        let ctl = HostController::local_in_process();
+        let ctl = HostController::local_in_process(TEST_IMAGE_CAP);
         let tmp = crate::test_support::temp_dir("host-concurrent");
         let dir = tmp.path().display();
 
@@ -701,7 +717,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_midcall_does_not_wedge_next_call_in_process() {
-        let ctl = HostController::local_in_process();
+        let ctl = HostController::local_in_process(TEST_IMAGE_CAP);
 
         let cancel = CancelToken::new();
         // Cancel from the same task after a short delay — more reliable than a
@@ -797,10 +813,13 @@ mod tests {
     #[tokio::test]
     async fn subprocess_host_still_lazy_connects() {
         // Still supported for remotes / tests that force a local subprocess.
-        let ctl = HostController::new(HostConfig {
-            name: "sub".into(),
-            command: crate::harness::default_local_host_command(),
-        });
+        let ctl = HostController::new(
+            HostConfig {
+                name: "sub".into(),
+                command: crate::harness::default_local_host_command(),
+            },
+            TEST_IMAGE_CAP,
+        );
 
         assert!(!ctl.is_connected());
         let result = bash_call(&ctl, "printf 'via-sub\\n'").await;

@@ -37,33 +37,38 @@ impl HostWorker {
     }
 
     /// Standard host catalog (same on every host / remote binary).
-    pub fn standard(name: impl Into<String>) -> Self {
-        Self::new(name, Self::standard_services())
+    ///
+    /// `max_image_base64_bytes` is the driving model's image cap: it bounds what
+    /// `view_image` will read and is quoted in the tool's description, so a
+    /// remote worker must be spawned with the same value the agent side
+    /// resolved (`--max-image-base64-bytes`).
+    pub fn standard(name: impl Into<String>, max_image_base64_bytes: u64) -> Self {
+        Self::new(name, Self::standard_services(max_image_base64_bytes))
     }
 
     /// Standard service list for building an extended local worker: the
     /// dispatchers behind [`Self::standard_tool_specs`].
-    pub fn standard_services() -> Vec<Arc<dyn ToolService>> {
+    pub fn standard_services(max_image_base64_bytes: u64) -> Vec<Arc<dyn ToolService>> {
         vec![
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
-            Arc::new(ViewImageService::new()) as Arc<dyn ToolService>,
+            Arc::new(ViewImageService::new(max_image_base64_bytes)) as Arc<dyn ToolService>,
         ]
     }
 
-    /// Tool catalog advertised by [`Self::standard`] — pure static data, no
-    /// services constructed.
+    /// Tool catalog advertised by [`Self::standard`] — pure data, no services
+    /// constructed.
     ///
     /// Used by the harness for routing and by lazy
     /// [`crate::host::HostController`]s to advertise tools before any
     /// connection exists. Concatenates the same per-service `specs()` the
     /// live services serve; a test pins this against a real worker so the
     /// two can never drift.
-    pub fn standard_tool_specs() -> Vec<generative_model::ToolSpec> {
+    pub fn standard_tool_specs(max_image_base64_bytes: u64) -> Vec<generative_model::ToolSpec> {
         [
             BashService::specs(),
             TextEditorService::specs(),
-            ViewImageService::specs(),
+            ViewImageService::specs(max_image_base64_bytes),
         ]
         .into_iter()
         .flatten()
@@ -255,12 +260,20 @@ mod tests {
     /// tools: [`HostWorker::standard_tool_specs`] is what routing trusts
     /// before any worker exists, so it must never drift from what workers
     /// actually serve.
+    ///
+    /// Checked at a non-default cap, which also pins that the configured
+    /// limit reaches both paths: routing advertises what the worker serves,
+    /// including the size `view_image` tells the model about.
     #[test]
     fn standard_catalog_matches_standard_worker() {
-        let catalog =
-            serde_json::to_value(HostWorker::standard_tool_specs()).expect("catalog json");
+        let cap = 9 * 1024 * 1024;
+        let catalog = serde_json::to_value(HostWorker::standard_tool_specs(cap)).expect("catalog");
         let advertised =
-            serde_json::to_value(HostWorker::standard("x").tool_specs()).expect("advertised json");
+            serde_json::to_value(HostWorker::standard("x", cap).tool_specs()).expect("advertised");
         assert_eq!(catalog, advertised);
+        assert!(
+            serde_json::to_string(&catalog).unwrap().contains("9.0 MiB"),
+            "configured cap should reach the advertised view_image description"
+        );
     }
 }

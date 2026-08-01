@@ -17,32 +17,43 @@ use super::{HarnessConfig, HostConfig};
 
 impl HarnessConfig {
     /// Host pool from concrete `Host` aliases in `~/.ssh/config` plus the
-    /// resolved connect timeout ([`crate::config::Config`] applies the
-    /// default). The reserved name `local` is skipped (always in-process,
-    /// never SSH).
-    pub fn from_ssh_aliases(ssh_aliases: Vec<String>, attach_timeout_secs: u64) -> Self {
+    /// resolved connect timeout and image cap ([`crate::config::Config`]
+    /// applies the defaults). The reserved name `local` is skipped (always
+    /// in-process, never SSH).
+    pub fn from_ssh_aliases(
+        ssh_aliases: Vec<String>,
+        attach_timeout_secs: u64,
+        max_image_base64_bytes: u64,
+    ) -> Self {
         let remote_hosts = ssh_aliases
             .into_iter()
             .filter(|a| a != "local")
             .map(|alias| HostConfig {
-                command: ssh_spawn_command(&alias),
+                command: ssh_spawn_command(&alias, max_image_base64_bytes),
                 name: alias,
             })
             .collect();
         Self {
             remote_hosts,
             attach_timeout_secs,
+            max_image_base64_bytes,
         }
     }
 }
 
-/// Argv for one remote: `ssh -o BatchMode=yes <alias> myco --mode host --name <alias>`.
+/// Argv for one remote: `ssh -o BatchMode=yes <alias> myco --mode host --name
+/// <alias> --max-image-base64-bytes <n>`.
 ///
 /// BatchMode is required because the NDJSON pipe is not a TTY — OpenSSH must
 /// never prompt there. Everything else about the connection comes from
 /// `~/.ssh/config` for the alias. The remote `myco` must be on the PATH used
 /// by non-interactive SSH.
-pub fn ssh_spawn_command(alias: &str) -> Vec<String> {
+///
+/// The image cap rides the argv rather than the NDJSON handshake because a
+/// worker serves exactly one controller, whose model is fixed at startup: the
+/// remote can be fully configured before it serves its first call. Version
+/// skew cannot strand the flag — connect already fails loud on it.
+pub fn ssh_spawn_command(alias: &str, max_image_base64_bytes: u64) -> Vec<String> {
     vec![
         "ssh".into(),
         "-o".into(),
@@ -53,6 +64,8 @@ pub fn ssh_spawn_command(alias: &str) -> Vec<String> {
         "host".into(),
         "--name".into(),
         alias.into(),
+        "--max-image-base64-bytes".into(),
+        max_image_base64_bytes.to_string(),
     ]
 }
 
@@ -262,7 +275,26 @@ mod tests {
     }
 
     fn harness_from(ssh_config: &str, attach_timeout_secs: u64) -> HarnessConfig {
-        HarnessConfig::from_ssh_aliases(aliases_from(ssh_config), attach_timeout_secs)
+        HarnessConfig::from_ssh_aliases(
+            aliases_from(ssh_config),
+            attach_timeout_secs,
+            crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+    }
+
+    /// A remote enforces the *agent side's* model cap, so the resolved value
+    /// has to reach the spawn argv — a remote left on the default would accept
+    /// images the model rejects (or reject ones it would take).
+    #[test]
+    fn configured_image_cap_reaches_the_remote_argv() {
+        let cfg = HarnessConfig::from_ssh_aliases(vec!["devbox".into()], 10, 12 * 1024 * 1024);
+        assert_eq!(cfg.max_image_base64_bytes, 12 * 1024 * 1024);
+        let argv = &cfg.remote_hosts[0].command;
+        let flag = argv
+            .iter()
+            .position(|a| a == "--max-image-base64-bytes")
+            .unwrap();
+        assert_eq!(argv[flag + 1], "12582912");
     }
 
     #[test]
@@ -300,7 +332,9 @@ Host gpu bastion
                 "--mode",
                 "host",
                 "--name",
-                "devbox"
+                "devbox",
+                "--max-image-base64-bytes",
+                "5242880"
             ]
         );
     }

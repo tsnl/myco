@@ -117,6 +117,13 @@ struct Args {
     #[arg(long, default_value = "local")]
     name: String,
 
+    /// Largest image `view_image` will read, in bytes of the base64 payload.
+    /// Only used with `--mode host`: the agent side passes its model's
+    /// `max_image_base64_bytes` when it spawns a remote, so every host in a session
+    /// enforces the same cap. Interactive runs take it from config.
+    #[arg(long, default_value_t = myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES)]
+    max_image_base64_bytes: u64,
+
     /// Model key from the config.toml [models] catalog.
     /// Default: `model` from config.toml, else the sole configured model.
     #[arg(long)]
@@ -224,7 +231,10 @@ fn run_session_browser(args: Args) {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name).serve_stdio().await {
+    if let Err(e) = HostWorker::standard(args.name, args.max_image_base64_bytes)
+        .serve_stdio()
+        .await
+    {
         eprintln!("myco host error: {e}");
         std::process::exit(1);
     }
@@ -244,19 +254,6 @@ async fn run_print(args: Args) {
             std::process::exit(2);
         }
     };
-    // `@path.png` mentions attach images, same contract as the REPL; a bad
-    // path is a usage error before any config/model work.
-    let mut content = match print_turn_content(arg.as_deref(), prompt.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("myco: {e}");
-            std::process::exit(2);
-        }
-    };
-    if let Some(note) = attachment_note(&content) {
-        eprintln!("{note}");
-    }
-
     let (boot, sink) = boot(&args, |_, preflight, _| {
         // Preflight problems go to stderr so stdout stays pipeable.
         if preflight.has_problems() {
@@ -272,8 +269,27 @@ async fn run_print(args: Args) {
         // Bound, not dropped: the guard must outlive the turn.
         session_lock: _session_lock,
         mut agent,
+        catalog_model,
         ..
     } = boot;
+
+    // `@path.png` mentions attach images, same contract as the REPL. After
+    // boot, not before: the per-image cap is the resolved model's, so this
+    // cannot run until the catalog says which model the turn will use.
+    let mut content = match print_turn_content(
+        arg.as_deref(),
+        prompt.clone(),
+        catalog_model.spec.max_image_base64_bytes,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("myco: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(note) = attachment_note(&content) {
+        eprintln!("{note}");
+    }
 
     if needs_session_stamp(agent.history(), args.fork) {
         let (id, started_at) = active_session.with(|s| (s.id.clone(), s.created_at));
@@ -373,11 +389,16 @@ fn assemble_print_prompt(arg: Option<String>, piped: Option<String>) -> Result<S
 /// full prompt text. Piped stdin is data — it is never parsed for
 /// attachments, so `git diff | myco -p "review"` cannot fail on a `@x.png`
 /// that happens to appear in the diff.
-fn print_turn_content(arg: Option<&str>, prompt: String) -> Result<Vec<Content>, String> {
-    let mut content: Vec<Content> = expand_image_attachments(arg.unwrap_or(""))?
-        .into_iter()
-        .filter(|c| matches!(c, Content::Image { .. }))
-        .collect();
+fn print_turn_content(
+    arg: Option<&str>,
+    prompt: String,
+    max_image_base64_bytes: u64,
+) -> Result<Vec<Content>, String> {
+    let mut content: Vec<Content> =
+        expand_image_attachments(arg.unwrap_or(""), max_image_base64_bytes)?
+            .into_iter()
+            .filter(|c| matches!(c, Content::Image { .. }))
+            .collect();
     content.push(Content::Text { text: prompt });
     Ok(content)
 }
@@ -667,14 +688,10 @@ async fn run_interactive(args: Args) {
 
     load_readline_history(&mut editor, &active_session);
 
-    let session_label = active_session.with(|s| match &s.title {
-        Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
-        _ => s.id.clone(),
-    });
     // Startup chrome: headed banner block (rule, MYCO, model/session, key
     // hints). Hosts via /hosts, effort via /effort, config path via
     // attach-failure hints.
-    ui.startup_banner(&catalog_model.spec.key, &session_label);
+    ui.startup_banner(&catalog_model.spec.key, &session_label(&active_session));
     // Preflight problems (missing executables, ssh-agent) open one WARNING
     // block after the banner, before the first USER block; happy path silent.
     if preflight.has_problems() {
@@ -715,9 +732,10 @@ async fn run_interactive(args: Args) {
     if let Err(e) = save_readline_history(&mut repl.editor, &repl.session) {
         eprintln!("warning: could not save history on exit: {e}");
     }
-    // Only announce a session id if we actually wrote one (non-empty history).
+    // Only announce a session id if we actually wrote one (non-empty history);
+    // a note under the USER header the quit was typed at.
     if !repl.agent.history().is_empty() || repl.session.snapshot().json_path().exists() {
-        ui.line(&format!("session={}", repl.session.id()));
+        ui.note(&format!("session={}", repl.session.id()));
     }
 }
 
@@ -816,6 +834,15 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
         EventHandler::Conditional(Box::new(CtrlLHandler { flag: ctrl_l })),
     );
     editor
+}
+
+/// `<id>` or `<id> "<title>"` — the `Session:` line of the startup banner,
+/// shared by startup and the fresh-session banner `/new` prints.
+fn session_label(session: &ActiveSession) -> String {
+    session.with(|s| match &s.title {
+        Some(t) if !t.is_empty() => format!("{} \"{t}\"", s.id),
+        _ => s.id.clone(),
+    })
 }
 
 fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
@@ -930,9 +957,12 @@ impl ReplSession {
             if let Some(cmd) = parse_meta(&input) {
                 if matches!(cmd, MetaCommand::Compact) {
                     self.run_compact().await;
-                    continue;
+                } else {
+                    self.handle_meta(cmd);
                 }
-                self.handle_meta(cmd);
+                // Same gap every finished turn ends with: block, blank line,
+                // next USER rule.
+                self.ui.blank_line();
                 continue;
             }
 
@@ -1040,7 +1070,10 @@ impl ReplSession {
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
         // the user can fix the path and resubmit — nothing is silently dropped.
-        let mut content = match expand_image_attachments(&input) {
+        let mut content = match expand_image_attachments(
+            &input,
+            self.catalog_model.spec.max_image_base64_bytes,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 self.ui.error_section(&e);
@@ -1048,9 +1081,10 @@ impl ReplSession {
                 return;
             }
         };
-        // Same note, same position as replay: directly under the wrapped input.
+        // Same note, same position as replay: directly under the wrapped
+        // input, inside the open USER section.
         if let Some(note) = attachment_note(&content) {
-            self.ui.line(&note);
+            self.ui.note(&note);
         }
         if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
             eprintln!("warning: could not auto-title session: {e}");
@@ -1124,20 +1158,21 @@ impl ReplSession {
             self.session
                 .persist_messages(self.agent.history(), self.agent.last_usage(), true)
         {
-            eprintln!("compact: failed to persist current session: {e}");
+            self.ui
+                .error_section(&format!("compact: failed to persist current session: {e}"));
             return;
         }
         let predecessor = self.session.snapshot();
         if predecessor.messages.is_empty() {
-            eprintln!("compact: session is empty");
+            self.ui.error_section("compact: session is empty");
             return;
         }
 
-        // Progress line, not chrome: the COMPACTED banner replaces it on
-        // success, and it survives on screen (and in the mirror) when the
-        // worker fails.
+        // Progress note under the USER header, not chrome: the COMPACTED
+        // banner replaces it on success, and it survives on screen (and in
+        // the mirror) when the worker fails.
         self.ui
-            .line(&format!("compacting session={} …", predecessor.id));
+            .note(&format!("compacting session={} …", predecessor.id));
 
         // Ctrl-C during compaction cancels the worker turn like any user turn.
         let cancel = self.turn_cancel.arm();
@@ -1154,11 +1189,11 @@ impl ReplSession {
         let (successor, outcome) = match result {
             Ok(v) => v,
             Err(CompactWorkerError::Cancelled) => {
-                self.ui.line("compact: cancelled (session unchanged)");
+                self.ui.note("compact: cancelled (session unchanged)");
                 return;
             }
             Err(CompactWorkerError::Failed(reason)) => {
-                eprintln!("compact: {reason}");
+                self.ui.error_section(&format!("compact: {reason}"));
                 return;
             }
         };
@@ -1168,7 +1203,7 @@ impl ReplSession {
             eprintln!("warning: could not save history: {e}");
         }
         if let Err(msg) = self.relock_session(&successor.id) {
-            eprintln!("compact: {msg}");
+            self.ui.error_section(&format!("compact: {msg}"));
             return;
         }
         self.session.replace(successor.clone());
@@ -1201,6 +1236,9 @@ enum MetaCommand<'a> {
     Effort(Option<&'a str>),
     Title(Option<&'a str>),
     Compact,
+    /// Input that starts like a command (`/…` or `:…`) but names none —
+    /// reported as an ERROR section, never sent to the model.
+    Unknown(&'a str),
 }
 
 fn is_exit_command(input: &str) -> bool {
@@ -1210,6 +1248,8 @@ fn is_exit_command(input: &str) -> bool {
     )
 }
 
+/// Parse only — no printing. Rendering happens in `handle_meta`, which is what
+/// keeps every command response under a headed block.
 fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     let input = input.trim();
     let (head, rest) = match input.split_once(char::is_whitespace) {
@@ -1230,10 +1270,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
         (Some("effort"), arg) => Some(MetaCommand::Effort(arg.filter(|s| !s.is_empty()))),
         (Some("title"), arg) => Some(MetaCommand::Title(arg)),
         (Some("compact"), _) => Some(MetaCommand::Compact),
-        _ if head.starts_with('/') || head.starts_with(':') => {
-            eprintln!("Unknown command: {head}  (try /help)");
-            Some(MetaCommand::Help)
-        }
+        _ if head.starts_with('/') || head.starts_with(':') => Some(MetaCommand::Unknown(head)),
         _ => None,
     }
 }
@@ -1242,6 +1279,9 @@ impl ReplSession {
     fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
         match cmd {
             MetaCommand::Help => print_help(&self.ui),
+            MetaCommand::Unknown(head) => self
+                .ui
+                .error_section(&format!("Unknown command: {head}  (try /help)")),
             MetaCommand::Session => {
                 let _ = self.session.persist_messages(
                     self.agent.history(),
@@ -1249,22 +1289,25 @@ impl ReplSession {
                     false,
                 );
                 self.ui
-                    .text(&format_session_detail(&self.session.snapshot()));
+                    .myco_section(&format_session_detail(&self.session.snapshot()));
             }
             MetaCommand::Sessions => match list_sessions(0) {
                 Ok(list) => {
                     let shown = RECENT_SESSION_LIMIT.min(list.len());
-                    print_session_list(&list[..shown], &self.ui);
+                    let mut body = format_session_list(&list[..shown]);
                     if list.len() > shown {
-                        self.ui.line(&format!(
-                            "  … {} more — bare /resume opens the session browser",
+                        body.push_str(&format!(
+                            "  … {} more — bare /resume opens the session browser\n",
                             list.len() - shown
                         ));
                     }
+                    self.ui.myco_section(&body);
                 }
-                Err(e) => eprintln!("Failed to list sessions: {e}"),
+                Err(e) => self
+                    .ui
+                    .error_section(&format!("Failed to list sessions: {e}")),
             },
-            MetaCommand::Hosts => print_host_status(&self.harness, &self.ui),
+            MetaCommand::Hosts => self.ui.myco_section(&format_host_status(&self.harness)),
             MetaCommand::New => {
                 self.save_before_switch();
                 // A nested run stays nested across /new: carry kind + parent lineage.
@@ -1273,45 +1316,48 @@ impl ReplSession {
                 fresh.kind = snapshot.kind;
                 fresh.parent_session_id = snapshot.parent_session_id.clone();
                 if let Err(msg) = self.relock_session(&fresh.id) {
-                    eprintln!("new session failed: {msg}");
+                    self.ui.error_section(&format!("new session failed: {msg}"));
                     return;
                 }
                 self.session.replace(fresh);
                 self.agent.set_history(Vec::new());
                 self.agent.set_last_usage(None);
                 load_readline_history(&mut self.editor, &self.session);
-                // Fresh canvas for a fresh session (same clear as Ctrl-L, empty history).
-                clear_and_reprint(&self.agent, &self.ui);
-                self.ui.line(&format!("new session={}", self.session.id()));
+                // Fresh canvas for a fresh session: the same clear + banner
+                // open as startup, so the new screen begins under a banner
+                // (the Session: line carries the fresh id).
+                clear_screen();
+                self.ui
+                    .startup_banner(&self.catalog_model.spec.key, &session_label(&self.session));
             }
             MetaCommand::Resume(arg) => {
                 self.save_before_switch();
                 match resolve_resume_session(arg) {
                     Ok(loaded) => {
                         if let Err(msg) = self.relock_session(&loaded.id) {
-                            eprintln!("resume failed: {msg}");
+                            self.ui.error_section(&format!("resume failed: {msg}"));
                             return;
                         }
                         self.install_session(&loaded);
-                        self.ui.line(&format!(
+                        self.ui.myco_section(&format!(
                             "resumed session={}  messages={}",
                             self.session.id(),
                             self.agent.history().len()
                         ));
                         self.ui.replay_history(self.agent.history());
                     }
-                    Err(e) if e == RESUME_CANCELLED => self.ui.line("resume cancelled"),
-                    Err(e) => eprintln!("resume failed: {e}"),
+                    Err(e) if e == RESUME_CANCELLED => self.ui.note("resume cancelled"),
+                    Err(e) => self.ui.error_section(&format!("resume failed: {e}")),
                 }
             }
             MetaCommand::Effort(arg) => match arg {
                 None => self
                     .ui
-                    .line(&format!("effort={}  (low|medium|high|max)", self.effort)),
+                    .myco_section(&format!("effort={}  (low|medium|high|max)", self.effort)),
                 Some(s) => match s.parse::<Effort>() {
                     Ok(next) if next == self.effort => self
                         .ui
-                        .line(&format!("effort={}  (unchanged)", self.effort)),
+                        .myco_section(&format!("effort={}  (unchanged)", self.effort)),
                     Ok(next) => {
                         self.effort = next;
                         let model = build_model(
@@ -1325,17 +1371,17 @@ impl ReplSession {
                         self.agent.set_context_window_tokens(
                             self.catalog_model.spec.context_window_tokens,
                         );
-                        self.ui.line(&format!("effort={}", self.effort));
+                        self.ui.myco_section(&format!("effort={}", self.effort));
                     }
-                    Err(e) => eprintln!("{e}"),
+                    Err(e) => self.ui.error_section(&e),
                 },
             },
             MetaCommand::Title(arg) => match arg {
                 None => {
                     let snap = self.session.snapshot();
                     match snap.title.as_deref() {
-                        Some(t) if !t.is_empty() => self.ui.line(&format!("title={t:?}")),
-                        _ => self.ui.line("title=(none)"),
+                        Some(t) if !t.is_empty() => self.ui.myco_section(&format!("title={t:?}")),
+                        _ => self.ui.myco_section("title=(none)"),
                     }
                 }
                 Some(t) if t.trim().is_empty() => {
@@ -1344,9 +1390,10 @@ impl ReplSession {
                         s.touch();
                         s.save()
                     }) {
-                        eprintln!("failed to clear title: {e}");
+                        self.ui
+                            .error_section(&format!("failed to clear title: {e}"));
                     } else {
-                        self.ui.line("title=(none)");
+                        self.ui.myco_section("title=(none)");
                     }
                 }
                 Some(t) => {
@@ -1355,9 +1402,9 @@ impl ReplSession {
                         s.touch();
                         s.save()
                     }) {
-                        eprintln!("failed to set title: {e}");
+                        self.ui.error_section(&format!("failed to set title: {e}"));
                     } else if let Some(title) = self.session.snapshot().title {
-                        self.ui.line(&format!("title={title:?}"));
+                        self.ui.myco_section(&format!("title={title:?}"));
                     }
                 }
             },
@@ -1428,23 +1475,23 @@ fn print_cli_help(topic: &str) {
     }
 }
 
-/// `/help`: the `cli` manual article — the same content as `myco --help cli`
-/// and the `manual` host tool, so REPL help cannot drift from the docs.
+/// `/help`: the `cli` manual article under a MYCO section — the same content
+/// as `myco --help cli` and the `manual` host tool, so REPL help cannot drift
+/// from the docs.
 fn print_help(ui: &TuiProducer) {
     let article = myco::manual::format_article("cli").expect("`cli` article is embedded");
-    ui.line(article.trim_end());
+    ui.myco_section(article.trim_end());
 }
 
-fn print_host_status(harness: &Harness, ui: &TuiProducer) {
+fn format_host_status(harness: &Harness) -> String {
     let statuses = harness.host_status();
     if statuses.is_empty() {
-        ui.line("hosts: (none)");
-        return;
+        return "hosts: (none)".into();
     }
-    ui.line(&format!(
-        "hosts: default=local  ({} total; local always in-process)",
+    let mut body = format!(
+        "hosts: default=local  ({} total; local always in-process)\n",
         statuses.len()
-    ));
+    );
     for s in statuses {
         // Local: always ok/in-process. Remotes: idle until first tool use; ok while
         // connected; DOWN after connect error.
@@ -1466,13 +1513,14 @@ fn print_host_status(harness: &Harness, ui: &TuiProducer) {
             format!("  cmd={}", s.command.join(" "))
         };
         match &s.error {
-            Some(err) => ui.line(&format!(
-                "  [{state}] {}  tools={tools}{cmd}  err={err}",
+            Some(err) => body.push_str(&format!(
+                "  [{state}] {}  tools={tools}{cmd}  err={err}\n",
                 s.name
             )),
-            None => ui.line(&format!("  [{state}] {}  tools={tools}{cmd}", s.name)),
+            None => body.push_str(&format!("  [{state}] {}  tools={tools}{cmd}\n", s.name)),
         }
     }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,14 +1599,16 @@ fn resolve_resume_session(id_or_prefix: Option<&str>) -> Result<Session, String>
     }
 }
 
-fn print_session_list(list: &[SessionListEntry], ui: &TuiProducer) {
+fn format_session_list(list: &[SessionListEntry]) -> String {
     if list.is_empty() {
-        ui.line("(no sessions)");
-        return;
+        return "(no sessions)".into();
     }
+    let mut body = String::new();
     for (i, s) in list.iter().enumerate() {
-        ui.line(&format_session_list_line(i + 1, s));
+        body.push_str(&format_session_list_line(i + 1, s));
+        body.push('\n');
     }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,6 +1766,7 @@ impl EventSink for PrintEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use myco::generative_model::{Content, Message, ToolResult, ToolUse, TurnEndReason};
     use myco::uuid_simple_hex;
     use serde_json::json;
@@ -1802,6 +1853,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_meta_reports_unknown_commands_instead_of_printing() {
+        assert!(matches!(parse_meta("/help"), Some(MetaCommand::Help)));
+        assert!(matches!(parse_meta("help"), Some(MetaCommand::Help)));
+        assert!(matches!(
+            parse_meta(":sessions"),
+            Some(MetaCommand::Sessions)
+        ));
+        // A typo'd command surfaces as Unknown (→ ERROR section in
+        // handle_meta) and is never sent to the model.
+        assert!(matches!(
+            parse_meta("/hlep"),
+            Some(MetaCommand::Unknown("/hlep"))
+        ));
+        assert!(matches!(
+            parse_meta(":wq"),
+            Some(MetaCommand::Unknown(":wq"))
+        ));
+        assert!(matches!(
+            parse_meta("/bogus with args"),
+            Some(MetaCommand::Unknown("/bogus"))
+        ));
+        // Plain prose is not a command — it goes to the model.
+        assert!(parse_meta("hello world").is_none());
+    }
+
+    #[test]
     fn effort_parses_aliases() {
         assert_eq!("low".parse::<Effort>().unwrap(), Effort::Low);
         assert_eq!("MED".parse::<Effort>().unwrap(), Effort::Medium);
@@ -1858,10 +1935,22 @@ mod tests {
         // A (missing) image path in the piped-stdin portion of the prompt must
         // not attach or error; the same path in the -p argument must error.
         let prompt = "diff mentions @no-such-file.png\n\nreview this".to_string();
-        let content = print_turn_content(Some("review this"), prompt.clone()).unwrap();
+        let content = print_turn_content(
+            Some("review this"),
+            prompt.clone(),
+            DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .unwrap();
         assert_eq!(content.len(), 1);
         assert!(matches!(&content[0], Content::Text { text } if *text == prompt));
-        assert!(print_turn_content(Some("look at @no-such-file.png"), prompt).is_err());
+        assert!(
+            print_turn_content(
+                Some("look at @no-such-file.png"),
+                prompt,
+                DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1876,7 +1965,8 @@ mod tests {
         fs::write(&img, [0x89, 0x50, 0x4E, 0x47]).unwrap();
 
         let arg = format!("what is this? @{}", img.display());
-        let content = print_turn_content(Some(&arg), arg.clone()).unwrap();
+        let content =
+            print_turn_content(Some(&arg), arg.clone(), DEFAULT_MAX_IMAGE_BASE64_BYTES).unwrap();
         assert_eq!(content.len(), 2);
         assert!(matches!(&content[0], Content::Image { .. }));
         assert!(matches!(&content[1], Content::Text { text } if *text == arg));

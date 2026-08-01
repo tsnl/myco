@@ -35,10 +35,14 @@ printed. A bad path or a file that is not really an image opens an ERROR
 section before the model is called; nothing is silently dropped.
 
 Size limits are measured on the **base64 payload uploaded**, which is 4/3 of the
-file on disk: 5 MiB per image (so ~3.75 MiB on disk, and the same cap applies to
-`view_image`) and 20 MiB of attachments per message. myco does not re-encode
-images — an oversized file is rejected with both sizes named, so downscale it
-and resubmit.
+file on disk: per image, the running model's `max_image_base64_bytes` (config.toml
+`[models.KEY]`, default 5 MiB — so ~3.75 MiB on disk; `view_image` enforces the
+same cap on every host, and an image over it fails that tool use); and 20 MiB of
+attachments per message, which is myco's own budget and does not vary by model.
+A model configured above 20 MiB still gets its full per-image cap through
+`view_image` — only batching many `@path` mentions into one message is held to
+the message budget. myco does not re-encode images — an oversized file is
+rejected with both sizes named, so downscale it and resubmit.
 
 Images stay in the conversation, so a session accumulates them and can cross the
 provider's **whole-request** cap (Anthropic: 32 MB) turns after the attachment
@@ -74,6 +78,14 @@ session, `/help` and newline hints). Startup preflight problems
 print as one WARNING block after it — missing expected executables (`bash`,
 `tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
 configured) and ssh-agent issues; hosts via `/hosts`.
+
+Every block the REPL prints is headed. Meta-command output (`/help`,
+`/hosts`, `/session`, `/sessions`, `/effort`, `/title`, the `/resume`
+acknowledgement) opens a `MYCO` section — thin rule + bold header, the
+banner family's mid-screen voice. Command failures (an unknown `/command`,
+`/resume` or `/compact` errors) open an ERROR section; an unknown command is
+never sent to the model. `/new` clears the screen and opens the fresh
+session under the same startup banner.
 
 ### Print mode (`myco -p`)
 

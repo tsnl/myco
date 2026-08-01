@@ -69,13 +69,25 @@ pub struct HarnessConfig {
     pub remote_hosts: Vec<HostConfig>,
     /// Per-remote connect timeout in seconds on first tool use (`0` disables it).
     pub attach_timeout_secs: u64,
+    /// Image cap every host in this pool enforces — the driving model's
+    /// resolved `max_image_base64_bytes`. Remotes carry it in their spawn argv;
+    /// the local in-process worker is built with it directly. Never defaulted
+    /// here: [`crate::config`] resolves it and hands it down.
+    pub max_image_base64_bytes: u64,
 }
 
+/// Local-only pool with stand-in knobs — **test fixture only**. Every real run
+/// builds its pool through [`HarnessConfig::from_ssh_aliases`] with values
+/// resolved by [`crate::config`], which is where the actual defaults live
+/// (`DEFAULT_ATTACH_TIMEOUT_SECS`, `DEFAULT_MAX_IMAGE_BASE64_BYTES`). Config
+/// sits above the harness, so those constants are deliberately not reached for
+/// from here.
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             remote_hosts: Vec::new(),
             attach_timeout_secs: 10,
+            max_image_base64_bytes: 5 * 1024 * 1024,
         }
     }
 }
@@ -164,7 +176,7 @@ impl Harness {
             }
         }
 
-        let mut harness = Self::local_harness(root_services);
+        let mut harness = Self::local_harness(root_services, config.max_image_base64_bytes);
         let connect_timeout = config.attach_timeout_secs;
         for host_cfg in config.remote_hosts {
             harness
@@ -173,7 +185,11 @@ impl Harness {
             let name = host_cfg.name.clone();
             harness.hosts.insert(
                 name,
-                HostController::with_timeout(host_cfg, connect_timeout),
+                HostController::with_timeout(
+                    host_cfg,
+                    connect_timeout,
+                    config.max_image_base64_bytes,
+                ),
             );
         }
 
@@ -188,21 +204,27 @@ impl Harness {
     /// In-process harness for unit tests: local host only, with the given services
     /// (plus the standard catalog).
     pub fn local_with_services(extra: Vec<Arc<dyn ToolService>>) -> Arc<Self> {
-        Arc::new(Self::local_harness(extra))
+        Arc::new(Self::local_harness(
+            extra,
+            HarnessConfig::default().max_image_base64_bytes,
+        ))
     }
 
     /// Local-only harness: the always-on in-process worker (standard catalog
     /// plus `root_services`) and the advertised tool specs — routing `host`
     /// injected for multi-host tools, root-only schemas kept verbatim.
     /// [`Self::attach_with_root_services`] adds remotes on top.
-    fn local_harness(root_services: Vec<Arc<dyn ToolService>>) -> Self {
+    fn local_harness(
+        root_services: Vec<Arc<dyn ToolService>>,
+        max_image_base64_bytes: u64,
+    ) -> Self {
         let mut host_tool_names = std::collections::HashSet::new();
         let mut root_only_tool_names = std::collections::HashSet::new();
         let mut tool_specs = Vec::new();
         let mut seen_tools = HashMap::<String, ()>::new();
 
         // Standard catalog (every host, including remotes) — inject routing `host`.
-        for spec in crate::host::HostWorker::standard_tool_specs() {
+        for spec in crate::host::HostWorker::standard_tool_specs(max_image_base64_bytes) {
             host_tool_names.insert(spec.name.clone());
             if seen_tools.insert(spec.name.clone(), ()).is_none() {
                 tool_specs.push(inject_host_field(spec));
@@ -222,7 +244,7 @@ impl Harness {
         }
 
         let mut local_services: Vec<Arc<dyn ToolService>> =
-            crate::host::HostWorker::standard_services();
+            crate::host::HostWorker::standard_services(max_image_base64_bytes);
         local_services.extend(root_services);
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
@@ -516,10 +538,12 @@ mod tests {
 
     #[test]
     fn standard_catalog_is_bash_editor_view_image_only() {
-        let names: Vec<_> = crate::host::HostWorker::standard_tool_specs()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let names: Vec<_> = crate::host::HostWorker::standard_tool_specs(
+            crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        )
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
         assert!(
             !names.iter().any(|n| n.starts_with("web_")),
             "remotes must not advertise web_* tools: {names:?}"
@@ -542,7 +566,9 @@ mod tests {
     /// has to be root-only, like `session_meta`.
     #[test]
     fn standard_tools_do_not_declare_their_own_host_property() {
-        for spec in crate::host::HostWorker::standard_tool_specs() {
+        for spec in crate::host::HostWorker::standard_tool_specs(
+            crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        ) {
             let declares_host = spec
                 .input_schema
                 .get("properties")
@@ -658,6 +684,7 @@ mod tests {
                 subprocess_host("a", program.clone()),
                 subprocess_host("b", program),
             ],
+            ..Default::default()
         };
         let harness = Harness::attach(cfg).await.expect("attach");
         assert_eq!(harness.default_host(), "local");
@@ -694,6 +721,7 @@ mod tests {
                 name: "ghost".into(),
                 command: vec!["/nonexistent/myco-please-fail".into()],
             }],
+            ..Default::default()
         };
         let harness = Harness::attach(cfg)
             .await
