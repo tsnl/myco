@@ -11,6 +11,7 @@ keywords = ["agent", "server", "ssh", "coding"]
 categories = ["development-tools"]
 
 [dependencies]
+async-trait = { workspace = true }
 myco-core = { workspace = true }
 myco-prompts = { workspace = true }
 myco-models = { workspace = true }
@@ -32,6 +33,7 @@ dotenvy = { workspace = true }
 tokio-util = { workspace = true }
 dirs = { workspace = true }
 schemars = { workspace = true }
+reqwest = { workspace = true }
 rustyline = "15"
 unicode-width = "0.2"
 
@@ -71,6 +73,7 @@ myco-agent = { path = "crates/myco-agent", version = "0.4.0-dev" }
 myco-test-support = { path = "crates/myco-test-support", version = "0.4.0-dev" }
 myco-api = { path = "crates/myco-api", version = "0.4.0-dev" }
 
+async-trait = "0.1"
 atomic-write-file = "0.3.0"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

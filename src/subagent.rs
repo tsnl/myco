@@ -5,7 +5,7 @@
 //! parent.
 //!
 //! One call = one full child turn: create (or continue) a hidden child
-//! session through the [`Supervisor`], queue the prompt, wait on the child's
+//! session through the [`Server`], queue the prompt, wait on the child's
 //! completed-turn counter, and return the child's final answer plus its
 //! session id for follow-ups. The parent's cancel token cancels the child's
 //! turn on the way down.
@@ -16,7 +16,7 @@ use myco_core::Async;
 use myco_machines::tool_services::{HostDispatchContext, ToolService, tool_input_schema};
 use myco_models::{self as generative_model, ToolResult, ToolUse};
 
-use crate::supervisor::{Supervisor, last_answer};
+use crate::server::{Server, last_answer};
 
 const TOOL_DESCRIPTION: &str = r#"
 Delegate to a nested agent: one call runs one full turn of a hidden child
@@ -48,15 +48,15 @@ struct Input {
 }
 
 /// Root-only [`ToolService`] wired per parent session (knows its parent id).
-/// Holds the [`Supervisor`] weakly: the server owns the supervisor, tools
+/// Holds the [`Server`] weakly: the server owns the supervisor, tools
 /// must not keep it alive.
 pub struct SubagentTool {
-    supervisor: Weak<Supervisor>,
+    supervisor: Weak<Server>,
     parent_id: String,
 }
 
 impl SubagentTool {
-    pub(crate) fn new(supervisor: Weak<Supervisor>, parent_id: String) -> Self {
+    pub(crate) fn new(supervisor: Weak<Server>, parent_id: String) -> Self {
         Self {
             supervisor,
             parent_id,
@@ -88,7 +88,7 @@ impl SubagentTool {
         let start = *turns.borrow();
         child
             .tx
-            .send(crate::supervisor::Cmd::User(input.prompt))
+            .send(crate::server::Cmd::User(input.prompt))
             .map_err(|_| "child agent task gone".to_string())?;
 
         // Wait for the child's turn, staying cancellable: cancelling the
