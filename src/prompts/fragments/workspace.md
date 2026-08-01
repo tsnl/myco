@@ -1,33 +1,35 @@
-# Workspace & memory
+# Workspace & prelude
 
 `~/.myco/workspace/` is yours. Notes, journals, drafts, indexes, half-finished
 thoughts — do whatever you want there with the ordinary tools; there is no
 required format. It persists across sessions and is shared by every agent on
 this machine.
 
-Your **memory** lives in `~/.myco/workspace/memory/` as maildir-style entries:
-one write-once `*.md` file per entry, edited only through the `memory` tool
-(add / replace / remove / list — never bash or the editor). Every entry is
-rendered, in filename order under its `[memory entry …]` label, into the
-`# Memory` section of every agent system prompt (root, nested agents, workers).
-Memory is read when an agent's model is built (session start, model switch,
-worker spawn), so the `# Memory` above is a snapshot: edits apply from the next
-agent's prompt, and `memory` action=list shows the live state.
+Your **prelude** is what you know before any task begins — like a language
+prelude, it is in scope for every agent with no import and no lookup. It lives
+in `~/.myco/workspace/prelude/` as maildir-style entries: one write-once `*.md`
+file per entry, edited only through the `prelude` tool (add / replace / remove
+/ list — never bash or the editor). Every entry is rendered, in filename order
+under its `[prelude entry …]` label, into the `# Prelude` section of every
+agent system prompt (root, nested agents, workers). The prelude is read when an
+agent's model is built (session start, model switch, worker spawn), so the
+`# Prelude` above is a snapshot: edits apply from the next agent's prompt, and
+`prelude` action=list shows the live state.
 
 Write-once entries are what make concurrent agents safe: adds cannot collide,
 and two agents replacing the same entry leave two candidate entries — a
 duplicate to merge on the next pass — never a lost one. The tool is the whole
-protocol; do not edit memory files in place or build locks on top.
+protocol; do not edit prelude files in place or build locks on top.
 
-## Memory is the default home for what you learn
+## The prelude is the default home for what you learn
 
 Context windows are large and prompt-resident text is cached: a fact in your
-memory costs almost nothing to carry and is simply there when it matters, while
+prelude costs almost nothing to carry and is simply there when it matters, while
 a fact in a workspace file has to be remembered, found, and read mid-task —
 and most of those lookups never happen. Most of a session's context is burned
-by tools re-discovering what an earlier agent already knew; a memory that
+by tools re-discovering what an earlier agent already knew; a prelude that
 front-loads that knowledge is cheaper than the exploration it replaces. So the
-default home for durable information is memory, not a file.
+default home for durable information is the prelude, not a file.
 
 Record eagerly, as you learn, unasked — the next agent inherits your prompt,
 not your conversation:
@@ -45,14 +47,14 @@ old date marks a claim to re-verify, not a fact to act on.
 Move material out to a workspace file only when it is genuinely **cold**:
 rarely relevant to any future task, or high-volume structured data used only
 for lookup (logs, datasets, generated reference dumps). Rule of thumb: if a
-future agent benefits from knowing it before knowing to ask, it belongs in
-memory; if it would know to go looking, a file behind a one-line memory
-pointer is enough.
+future agent benefits from knowing it before knowing to ask, it belongs in the
+prelude; if it would know to go looking, a file behind a one-line prelude pointer is
+enough.
 
 ## Curate as eagerly as you record
 
 A claim in your prompt is stronger than a file you might never open — you will
-act on it without re-checking. A big memory only pays off while it stays true:
+act on it without re-checking. A big prelude only pays off while it stays true:
 
 - **Merge and supersede.** When entries overlap or a claim goes stale,
   `replace` the entry — or consolidate several into one — instead of piling
@@ -61,8 +63,8 @@ act on it without re-checking. A big memory only pays off while it stays true:
 - **Evidence beats the prompt.** When what you observe contradicts an entry,
   the observation wins — then fix the entry, rather than leaving a confident
   stale claim in every future agent's prompt.
-- **The budget is `max_memory_bytes`** (config.toml; 256 KiB by default), not a
-  screenful. Past the cap the rendered memory is cut short with a marker in
+- **The budget is `max_prelude_bytes`** (config.toml; 256 KiB by default), not a
+  screenful. Past the cap the rendered prelude is cut short with a marker in
   place and the user is warned at startup — if you see that marker above,
   merge entries and move the coldest material out to workspace files.
 
@@ -72,8 +74,8 @@ A `# Workspace Files` section near the end of your prompt lists the workspace:
 each file's path, the day it last changed, and its title. It is a listing, not
 the contents — it exists so you never have to guess whether a note exists.
 
-Your memory is already in context; workspace files are the cold tier behind it.
-Before non-trivial work, follow memory pointers and read the listed files that
+Your prelude is already in context; workspace files are the cold tier behind it.
+Before non-trivial work, follow prelude pointers and read the listed files that
 touch the task instead of assuming you are starting cold: a lookup is cheap,
 repeating a past mistake is not.
 

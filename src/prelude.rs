@@ -1,8 +1,11 @@
-//! The agent memory: maildir-style entries under `~/.myco/workspace/memory/`.
+//! The agent prelude: maildir-style entries under `~/.myco/workspace/prelude/`.
+//!
+//! Named like a language prelude — knowledge in scope for every agent before
+//! any work, no import, no lookup — not a Rust re-export module.
 //!
 //! One write-once `*.md` file per entry. Every visible entry is rendered into
-//! each agent system prompt ([`crate::prompts`]); the root-only `memory` tool
-//! ([`crate::tool_services::MemoryTool`]) is the edit path. The storage rules
+//! each agent system prompt ([`crate::prompts`]); the root-only `prelude` tool
+//! ([`crate::tool_services::PreludeTool`]) is the edit path. The storage rules
 //! that keep concurrent agents safe on a weakly consistent filesystem live
 //! here: entries are written under a hidden temp name and renamed into place,
 //! never edited in place. Names are unique, so concurrent adds cannot
@@ -11,16 +14,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// One memory entry: filename (its id) and trimmed text.
+/// One prelude entry: filename (its id) and trimmed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryEntry {
+pub struct PreludeEntry {
     pub name: String,
     pub text: String,
 }
 
-/// The memory directory, respecting `MYCO_HOME`.
+/// The prelude directory, respecting `MYCO_HOME`.
 pub fn dir() -> Result<PathBuf, String> {
-    Ok(crate::core::myco_home()?.join("workspace").join("memory"))
+    Ok(crate::core::myco_home()?.join("workspace").join("prelude"))
 }
 
 /// Whether `name` is a legal entry id: a plain visible `*.md` filename.
@@ -34,11 +37,11 @@ pub fn is_entry_name(name: &str) -> bool {
 
 /// All visible entries in filename order — the render order. Hidden names,
 /// non-`*.md` files, and whitespace-only entries are skipped.
-pub fn entries(dir: &Path) -> Vec<MemoryEntry> {
+pub fn entries(dir: &Path) -> Vec<PreludeEntry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<MemoryEntry> = read
+    let mut out: Vec<PreludeEntry> = read
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
@@ -49,23 +52,23 @@ pub fn entries(dir: &Path) -> Vec<MemoryEntry> {
                 .ok()?
                 .trim()
                 .to_string();
-            (!text.is_empty()).then_some(MemoryEntry { name, text })
+            (!text.is_empty()).then_some(PreludeEntry { name, text })
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
-/// The memory as it reads in a prompt (and in `memory` action=list): each entry
-/// under a `[memory entry <name>]` label, so agents can `replace`/`remove` by
+/// The prelude as it reads in a prompt (and in `prelude` action=list): each entry
+/// under a `[prelude entry <name>]` label, so agents can `replace`/`remove` by
 /// the id they see. Empty string when there are no entries.
-pub fn rendered_body(entries: &[MemoryEntry]) -> String {
+pub fn rendered_body(entries: &[PreludeEntry]) -> String {
     let mut out = String::new();
     for entry in entries {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&format!("[memory entry {}]\n{}", entry.name, entry.text));
+        out.push_str(&format!("[prelude entry {}]\n{}", entry.name, entry.text));
     }
     out
 }
@@ -99,7 +102,7 @@ pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
             }
         };
     }
-    Err("could not pick a fresh memory entry name".into())
+    Err("could not pick a fresh prelude entry name".into())
 }
 
 /// Remove entry `name`. `Ok(false)` when it is already gone — a concurrent
@@ -107,7 +110,7 @@ pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
 pub fn remove_entry(dir: &Path, name: &str) -> Result<bool, String> {
     if !is_entry_name(name) {
         return Err(format!(
-            "{name:?} is not a memory entry id (a plain `*.md` filename, as listed)"
+            "{name:?} is not a prelude entry id (a plain `*.md` filename, as listed)"
         ));
     }
     match std::fs::remove_file(dir.join(name)) {
@@ -123,7 +126,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("myco-memory-store-{tag}-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("myco-prelude-store-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -144,8 +147,8 @@ mod tests {
         );
         assert_eq!(
             rendered_body(&entries),
-            "[memory entry 20260101T000000Z-aaaa.md]\nfirst\n\n\
-             [memory entry 20260102T000000Z-bbbb.md]\nsecond"
+            "[prelude entry 20260101T000000Z-aaaa.md]\nfirst\n\n\
+             [prelude entry 20260102T000000Z-bbbb.md]\nsecond"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

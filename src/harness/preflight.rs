@@ -4,8 +4,8 @@
 //! verifies that the external programs myco spawns (declared in
 //! [`crate::external_command`]) actually resolve on the agent machine. Results
 //! fold into one WARNING block with the ssh-agent preflight
-//! ([`SshAgentPreflightReport`]) and the memory size check
-//! ([`crate::prompts::memory_truncation`]) — one section after the banner,
+//! ([`SshAgentPreflightReport`]) and the prelude size check
+//! ([`crate::prompts::prelude_truncation`]) — one section after the banner,
 //! silent when everything resolves. Remote hosts are not probed here; they
 //! report missing programs as tool errors at call time.
 //!
@@ -18,7 +18,7 @@ use std::io::Write;
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
-use crate::prompts::{MemoryTruncation, memory_truncation};
+use crate::prompts::{PreludeTruncation, prelude_truncation};
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
@@ -78,14 +78,14 @@ fn missing_executables(
 }
 
 /// Everything startup does before the first prompt: export the manual, check
-/// the memory size cap and the expected executables, then ssh-agent identities.
+/// the prelude size cap and the expected executables, then ssh-agent identities.
 #[derive(Debug, Default, Clone)]
 pub struct StartupPreflight {
     /// Why the manual export failed, when it did. Agents are told in their
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
-    /// Set when the newest memory version does not fit under `max_memory_bytes`.
-    pub memory: Option<MemoryTruncation>,
+    /// Set when the newest prelude version does not fit under `max_prelude_bytes`.
+    pub prelude: Option<PreludeTruncation>,
     pub executables: ExecutableCheckReport,
     pub ssh: SshAgentPreflightReport,
 }
@@ -95,9 +95,9 @@ impl StartupPreflight {
     /// at its directory). Then the executable check; the ssh-agent preflight
     /// runs only when the OpenSSH tools it spawns actually resolve —
     /// otherwise every step would fail with spawn errors the
-    /// missing-executable lines already explain. `max_memory_bytes` is the
+    /// missing-executable lines already explain. `max_prelude_bytes` is the
     /// resolved config cap the prompts will use.
-    pub fn run(hosts: &[HostConfig], max_memory_bytes: usize) -> Self {
+    pub fn run(hosts: &[HostConfig], max_prelude_bytes: usize) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
             SshAgentPreflightReport::default()
@@ -106,7 +106,7 @@ impl StartupPreflight {
         };
         Self {
             manual: export_manual().err(),
-            memory: memory_truncation(max_memory_bytes),
+            prelude: prelude_truncation(max_prelude_bytes),
             executables,
             ssh,
         }
@@ -114,23 +114,23 @@ impl StartupPreflight {
 
     pub fn has_problems(&self) -> bool {
         self.manual.is_some()
-            || self.memory.is_some()
+            || self.prelude.is_some()
             || !self.executables.is_clean()
             || self.ssh.has_problems()
     }
 
-    /// Every preflight problem as plain body lines — manual, memory, executables,
+    /// Every preflight problem as plain body lines — manual, prelude, executables,
     /// ssh-agent, in that order, with no rule or header. Empty when
     /// [`Self::has_problems`] is false.
     ///
     /// Order is by how invisible the problem is otherwise: a missing manual
-    /// export or a cut memory never announces itself again (the agent simply
+    /// export or a cut prelude never announces itself again (the agent simply
     /// runs without those bytes), while missing executables and ssh keys
     /// resurface at the tool call that needs them.
     pub fn warning_body(&self) -> String {
         let mut out = Vec::new();
         let _ = write_manual_body(self.manual.as_deref(), &mut out);
-        let _ = write_memory_body(self.memory.as_ref(), &mut out);
+        let _ = write_prelude_body(self.prelude.as_ref(), &mut out);
         let _ = self.executables.write_body(&mut out);
         let _ = self.ssh.write_body(&mut out);
         String::from_utf8(out).unwrap_or_default()
@@ -155,19 +155,22 @@ fn write_manual_body(failure: Option<&str>, out: &mut impl Write) -> std::io::Re
     )
 }
 
-/// Memory lines only (no rule/header); writes nothing when the memory fits.
-fn write_memory_body(cut: Option<&MemoryTruncation>, out: &mut impl Write) -> std::io::Result<()> {
+/// Prelude lines only (no rule/header); writes nothing when the prelude fits.
+fn write_prelude_body(
+    cut: Option<&PreludeTruncation>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     let Some(cut) = cut else { return Ok(()) };
-    writeln!(out, "memory ({} entries): {}", cut.entries, cut.describe())?;
+    writeln!(out, "prelude ({} entries): {}", cut.entries, cut.describe())?;
     writeln!(
         out,
-        "every agent prompt from now on carries only the first {} of the rendered memory",
+        "every agent prompt from now on carries only the first {} of the rendered prelude",
         cut.human_limit()
     )?;
     writeln!(
         out,
-        "hint: merge or remove memory entries (`memory` tool), move cold material to \
-         workspace files, or raise `max_memory_bytes` in config.toml"
+        "hint: merge or remove prelude entries (`prelude` tool), move cold material to \
+         workspace files, or raise `max_prelude_bytes` in config.toml"
     )
 }
 
@@ -180,13 +183,13 @@ mod tests {
     use super::*;
 
     fn preflight(
-        memory: Option<MemoryTruncation>,
+        prelude: Option<PreludeTruncation>,
         missing: Vec<&'static ExternalCommand>,
         ssh: SshAgentPreflightReport,
     ) -> StartupPreflight {
         StartupPreflight {
             manual: None,
-            memory,
+            prelude,
             executables: ExecutableCheckReport { missing },
             ssh,
         }
@@ -285,13 +288,13 @@ mod tests {
         assert!(!out.contains("note:"), "{out}");
     }
 
-    // The exact truncation strings ("memory truncated at 256 KiB of 293 KiB")
-    // are `memory_truncation`'s claim, pinned in `crate::prompts` tests; here
+    // The exact truncation strings ("prelude truncated at 256 KiB of 293 KiB")
+    // are `prelude_truncation`'s claim, pinned in `crate::prompts` tests; here
     // only the block's shape and ordering are at stake.
     #[test]
-    fn truncated_memory_warns_first_and_counts_entries() {
+    fn truncated_prelude_warns_first_and_counts_entries() {
         let pf = preflight(
-            Some(MemoryTruncation {
+            Some(PreludeTruncation {
                 entries: 17,
                 bytes: 300_000,
                 limit: 256 * 1024,
@@ -303,27 +306,27 @@ mod tests {
         let out = rendered(&pf);
         assert!(
             out.contains(
-                "memory (17 entries): memory truncated at 256 KiB of 293 KiB (max_memory_bytes)"
+                "prelude (17 entries): prelude truncated at 256 KiB of 293 KiB (max_prelude_bytes)"
             ),
             "{out}"
         );
         assert!(out.contains("only the first 256 KiB"), "{out}");
-        assert!(out.contains("merge or remove memory entries"), "{out}");
+        assert!(out.contains("merge or remove prelude entries"), "{out}");
         assert!(
-            out.contains("raise `max_memory_bytes` in config.toml"),
+            out.contains("raise `max_prelude_bytes` in config.toml"),
             "{out}"
         );
-        // The memory leads the block; the other checks follow it.
-        let memory_at = out.find("memory (17 entries)").unwrap();
+        // The prelude leads the block; the other checks follow it.
+        let prelude_at = out.find("prelude (17 entries)").unwrap();
         let exec_at = out.find("missing executable tmux").unwrap();
-        assert!(memory_at < exec_at, "{out}");
+        assert!(prelude_at < exec_at, "{out}");
     }
 
     #[test]
-    fn a_truncated_memory_alone_is_enough_to_report() {
-        // Nothing else wrong: the memory alone still opens a WARNING block.
+    fn a_truncated_prelude_alone_is_enough_to_report() {
+        // Nothing else wrong: the prelude alone still opens a WARNING block.
         let pf = preflight(
-            Some(MemoryTruncation {
+            Some(PreludeTruncation {
                 entries: 2,
                 bytes: 4096,
                 limit: 2048,
@@ -333,7 +336,7 @@ mod tests {
         );
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert!(out.contains("memory (2 entries):"), "{out}");
+        assert!(out.contains("prelude (2 entries):"), "{out}");
         assert!(!out.contains("missing executable"), "{out}");
     }
 
@@ -343,7 +346,7 @@ mod tests {
     fn failed_manual_export_warns_first_and_names_the_path() {
         let pf = StartupPreflight {
             manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
-            memory: None,
+            prelude: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(false, |e| e.name != "tmux"),
             },

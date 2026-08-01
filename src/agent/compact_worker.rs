@@ -70,7 +70,7 @@ pub async fn run_compact_worker(
     predecessor: &Session,
     catalog_model: &CatalogModel,
     harness: Arc<Harness>,
-    max_memory_bytes: usize,
+    max_prelude_bytes: usize,
     cancel: CancelToken,
 ) -> Result<(Session, CompactOutcome), CompactWorkerError> {
     let worker_id = uuid::Uuid::new_v4();
@@ -101,7 +101,7 @@ pub async fn run_compact_worker(
             "You are a myco compaction worker. Follow the user instruction exactly. \
              Prefer session_history over bash for reading sessions."
                 .to_string(),
-            prompts::agent_prompt_epilogue(max_memory_bytes),
+            prompts::agent_prompt_epilogue(max_prelude_bytes),
             prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n\n"),

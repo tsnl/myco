@@ -7,7 +7,7 @@
 //! ProxyJump, …) stay in ssh config where OpenSSH reads them natively — myco
 //! only adds `BatchMode=yes`. The **local** host is always available
 //! in-process and is never configured. Knobs (`attach_timeout_secs`,
-//! `max_memory_bytes`) come from `~/.myco/config.toml`
+//! `max_prelude_bytes`) come from `~/.myco/config.toml`
 //! ([`crate::config::file`]), resolved in [`crate::config::Config`].
 
 use std::collections::HashSet;
