@@ -1,7 +1,10 @@
 //! Minimal Yew client for the myco API server. Deliberately unstyled and
 //! small: a session browser at `/` and one conversation per URL at
-//! `/session/<id>`, polling the transcript while open.
+//! `/session/<id>`. Live output arrives over SSE; a slow poll reconciles the
+//! transcript as a fallback.
 
+use futures::StreamExt;
+use gloo_net::eventsource::futures::EventSource;
 use gloo_net::http::Request;
 use myco_api as api;
 use wasm_bindgen_futures::spawn_local;
@@ -31,6 +34,11 @@ fn app() -> Html {
             }} />
         </BrowserRouter>
     }
+}
+
+async fn fetch_poll(id: &str) -> Option<api::Poll> {
+    let url = format!("/api/sessions/{id}/poll?since=0");
+    Request::get(&url).send().await.ok()?.json().await.ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -115,9 +123,73 @@ struct ConversationProps {
 fn conversation(props: &ConversationProps) -> Html {
     let entries = use_state(Vec::<api::Entry>::new);
     let busy = use_state(|| false);
+    // Text streamed since the last transcript refresh (SSE deltas).
+    let streaming = use_state(String::new);
     let input = use_node_ref();
 
-    // Poll the whole transcript every 1.5s while mounted.
+    // SSE: live deltas; TurnStarted/TurnFinished trigger a transcript refresh.
+    {
+        let entries = entries.clone();
+        let busy = busy.clone();
+        let streaming = streaming.clone();
+        let id = props.id.clone();
+        use_effect_with(id, move |id| {
+            let id = id.clone();
+            let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+            let alive2 = alive.clone();
+            spawn_local(async move {
+                // Initial transcript.
+                if let Some(p) = fetch_poll(&id).await {
+                    entries.set(p.entries);
+                    busy.set(p.busy);
+                }
+                if let Ok(mut es) = EventSource::new(&format!("/api/sessions/{id}/events"))
+                    && let Ok(mut stream) = es.subscribe("message")
+                {
+                    while alive2.get() {
+                        let Some(Ok((_, msg))) = stream.next().await else {
+                            break;
+                        };
+                        let Some(data) = msg.data().as_string() else {
+                            continue;
+                        };
+                        let Ok(ev) = serde_json::from_str::<api::StreamEvent>(&data) else {
+                            continue;
+                        };
+                        match ev {
+                            api::StreamEvent::TurnStarted => {
+                                busy.set(true);
+                                streaming.set(String::new());
+                                if let Some(p) = fetch_poll(&id).await {
+                                    entries.set(p.entries);
+                                }
+                            }
+                            api::StreamEvent::TextDelta { text } => {
+                                streaming.set(format!("{}{}", *streaming, text));
+                            }
+                            api::StreamEvent::ThinkingDelta { text } => {
+                                streaming.set(format!("{}{}", *streaming, text));
+                            }
+                            api::StreamEvent::ToolStarted { name, .. } => {
+                                streaming.set(format!("{}\n[tool: {name}]\n", *streaming));
+                            }
+                            api::StreamEvent::TurnFinished => {
+                                streaming.set(String::new());
+                                if let Some(p) = fetch_poll(&id).await {
+                                    entries.set(p.entries);
+                                    busy.set(p.busy);
+                                }
+                            }
+                        }
+                    }
+                    // Dropping `es` closes the connection.
+                }
+            });
+            move || alive.set(false)
+        });
+    }
+
+    // Slow reconciliation poll: covers SSE hiccups and other writers.
     {
         let entries = entries.clone();
         let busy = busy.clone();
@@ -128,14 +200,11 @@ fn conversation(props: &ConversationProps) -> Html {
             let alive2 = alive.clone();
             spawn_local(async move {
                 while alive2.get() {
-                    let url = format!("/api/sessions/{id}/poll?since=0");
-                    if let Ok(resp) = Request::get(&url).send().await
-                        && let Ok(p) = resp.json::<api::Poll>().await
-                    {
+                    gloo_timers::future::TimeoutFuture::new(5_000).await;
+                    if let Some(p) = fetch_poll(&id).await {
                         entries.set(p.entries);
                         busy.set(p.busy);
                     }
-                    gloo_timers::future::TimeoutFuture::new(1_500).await;
                 }
             });
             move || alive.set(false)
@@ -191,6 +260,12 @@ fn conversation(props: &ConversationProps) -> Html {
                         <pre style="white-space: pre-wrap; display: inline;">{ &e.text }</pre>
                     </div>
                 }) }
+                { if !streaming.is_empty() { html! {
+                    <div>
+                        <b>{ "assistant (streaming): " }</b>
+                        <pre style="white-space: pre-wrap; display: inline;">{ &*streaming }</pre>
+                    </div>
+                } } else { html!{} } }
             </div>
             <textarea ref={input} rows="4" cols="100" placeholder="message (Enter does not send)"></textarea>
             <br />

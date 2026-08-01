@@ -1,3 +1,42 @@
+[package]
+name = "myco"
+description = "Multi-host coding agent: API server driving concurrent agents across SSH remotes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/tsnl/myco"
+homepage = "https://github.com/tsnl/myco"
+readme = "README.md"
+keywords = ["agent", "server", "ssh", "coding"]
+categories = ["development-tools"]
+
+[dependencies]
+myco-core = { workspace = true }
+myco-prompts = { workspace = true }
+myco-models = { workspace = true }
+myco-config = { workspace = true }
+myco-session = { workspace = true }
+myco-machines = { workspace = true }
+myco-agent = { workspace = true }
+myco-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+rocket = { workspace = true }
+clap = { workspace = true }
+dotenvy = { workspace = true }
+tokio-util = { workspace = true }
+dirs = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+myco-test-support = { workspace = true }
+tempfile = "3"
+
 [workspace]
 resolver = "3"
 members = [
@@ -10,7 +49,6 @@ members = [
     "crates/myco-agent",
     "crates/myco-test-support",
     "crates/myco-api",
-    "crates/myco",
     "crates/myco-gui",
 ]
 

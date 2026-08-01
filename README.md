@@ -17,8 +17,13 @@ sessions, and serves a minimal web GUI. (v2 rewrite; the v1 CLI lives in the
   server-side, and input queues while a turn is running.
 - **Sessions you can resume.** Titles, scratchpads, links, and full history
   live under `~/.myco/` — reopen any session by URL, or from another client.
-- **Nested agents over the API.** An agent delegates by POSTing to its own
-  server (`$MYCO_API`): hidden child sessions, optional context forks.
+- **Nested agents as a tool.** The root-only `subagent` tool runs one full
+  turn of a hidden child session per call — no curl, works behind strict
+  firewalls, optional context forks. The same surface exists as HTTP
+  (`$MYCO_API`) for scripts.
+- **Live streaming.** Each session exposes an SSE feed
+  (`/api/sessions/<id>/events`) of text/thinking deltas and tool starts;
+  the GUI streams it and reconciles with a slow poll.
 
 ## Run
 
@@ -42,13 +47,15 @@ non-interactive SSH.
 `GET /api/sessions` · `POST /api/sessions` (`{model?, parent_session?,
 fork?}`) · `GET /api/sessions/<id>` · `POST /api/sessions/<id>/messages`
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
-`POST /api/sessions/<id>/cancel` · `DELETE /api/sessions/<id>/live` ·
-`GET /api/models`. Wire types live in `crates/myco-api`.
+`GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
+`DELETE /api/sessions/<id>/live` · `GET /api/models`. Wire types live in
+`crates/myco-api`.
 
 ## Workspace
 
-- `myco` — the server binary (Rocket, `/api`) and meta lib; also
-  `--mode host`, the per-machine worker remotes run
+- `myco` — the **root crate**: server binary (Rocket, `/api`), meta lib,
+  the `subagent` tool, and `--mode host` (the per-machine worker remotes
+  run); the workspace lives in `crates/`
 - `myco-gui` — minimal Yew web client (one URL per conversation)
 - `myco-api` — wire types shared by server and clients
 - `myco-agent`, `myco-session`, `myco-machines`, `myco-models`,

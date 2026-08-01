@@ -63,54 +63,31 @@ Quick map (details in the manual):
 # Nested Agents
 
 Context is precious. For ephemeral, task-specific context — and for complex, multi-step tasks —
-delegate to a nested agent through the myco API: the server you are running under drives nested
-agents as ordinary HTTP calls from bash.
+delegate to a nested agent with the `subagent` tool: one call runs one full turn of a hidden
+child session and returns its final answer.
 
-Nest **on the local host only**. The brain stays on this machine — model access, config, keys, and
-the session store are shared by construction — and a nested agent reaches remote machines through
-the same host pool as you. Remote hosts stay hands, not brains: they need only `myco` on PATH plus
-SSH, never config or keys.
+Nesting happens **on the local host only** (the tool is root-only by construction) and entirely
+server-side, so it works even when machines sit behind strict firewalls. The brain stays on this
+machine — model access, config, keys, and the session store are shared — and a nested agent
+reaches remote machines through the same host pool as you. Remote hosts stay hands, not brains:
+they need only `myco` on PATH plus SSH, never config or keys.
 
-Recipe (the API base URL is exported as `$MYCO_API` in local bash sessions):
-1. Read your own session id off the newest `# Session` block in this conversation (`session_meta`
-   action=get reports it too).
-2. Create the child:
-   `curl -s -X POST $MYCO_API/sessions -H 'content-type: application/json' -d '{"parent_session": "<your-session-id>"}'`
-   (add `"model": "<key>"` to pick a model, `"fork": true` to seed it with a copy of your saved
-   conversation). The response's `id` is the child session.
-3. Send one self-contained prompt per turn:
-   `curl -s -X POST $MYCO_API/sessions/<id>/messages -H 'content-type: application/json' -d '{"text": "..."}'`
-4. Wait for the turn: poll `curl -s "$MYCO_API/sessions/<id>/poll?since=<n>"` until `busy` is
-   false (sleep a few seconds between polls); new transcript entries arrive in `entries`, and
-   `total` is the next `since`.
-Ask for terse summaries. The child's session is hidden (`kind: subagent`, parented to yours) in
-the shared `~/.myco/session/` store — read it later via `session_meta` get-by-id or `list` with
-`include_hidden: true`.
+Usage: call `subagent` with a self-contained prompt per turn; `model: <key>` picks a model.
+Context forking: add `fork: true` to seed a fresh child with a copy of your saved conversation
+instead of a blank context. Fork when the task needs what you already know (decisions so far,
+investigation, the user's intent); start blank when the task is self-contained — a fork begins at
+your context size and has less headroom. Launch forks on your own model (the catalog key stamped
+at the end of this prompt): a same-model fork's first request re-reads your cached prompt prefix
+at cache rates. The result starts
+with `session: <id>` — pass that id back as `session_id` to continue the same child with
+follow-up turns. Ask for terse summaries. Children are hidden (`kind: subagent`, parented to
+yours automatically — your own session id is on the newest `# Session` block in this
+conversation) in the shared `~/.myco/session/` store — read them later via `session_meta` get-by-id or
+`list` with `include_hidden: true`.
 
-Interrupting a child: `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The
-child cancels its in-flight turn, returns to its prompt, and stays writable — use it when a child
-runs long or goes down the wrong path, and keep driving the same session. `close` remains the way
-to end it.
-
-One-shot delegation: for a single self-contained task, skip the live session — a plain one-shot
-`bash` run of `myco -p "<task>" --parent-session <your-session-id>` does one turn and exits.
-Stdout is the answer text alone (no headers to parse; process exit is the turn boundary) and
-stderr ends with `session=<id>` for later reads. `-p` composes with `--fork` and `--model`.
-Prefer a live session for real back-and-forth: `myco -p "…" --resume <child-id>` can append
-follow-up turns, but each pays full process startup. Inside a **live** bash session, append
-`</dev/null` — with a prompt argument `-p` still drains piped stdin as context, and a live
-session's open stdin never EOFs (one-shot `bash` runs are safe; their stdin is null).
-
-Context forking: add `--fork` to seed the child with your session's saved conversation instead of
-a blank context. Fork when the task needs what you already know (decisions so far, investigation,
-the user's intent); start blank when the task is self-contained — a fork begins at your context
-size and has less headroom. Launch forks on your own model (`--model` with the catalog key stamped
-at the end of this prompt): a same-model fork's first request re-reads your cached prompt prefix at
-a fraction of full input cost, while a different model is legal but starts cold (pass `--effort`
-too if yours was changed from the default). Your session file is checkpointed mid-turn after each
-user message and completed tool round, so a fork sees the current user request and finished tool
-rounds — never tool calls still in flight, its own launch included; put anything newer in the first
-prompt line you write to it.
+The same surface is plain HTTP for scripts: the server exports `$MYCO_API`; POST
+`$MYCO_API/sessions` (`{parent_session, fork?, model?}`) and `$MYCO_API/sessions/<id>/messages`
+(`{text}`), then poll `$MYCO_API/sessions/<id>/poll?since=<n>` until `busy` is false.
 
 ---
 "#,
@@ -174,7 +151,7 @@ fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -
         .to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut block = format!(
         "{SESSION_STAMP_HEADING}\n\n- Session id: `{session_id}` — this conversation from here \
-         on. Spawn nested myco agents with `--parent-session {session_id}`; `session_meta` \
+         on. Nested agents (the `subagent` tool) are parented to it automatically; `session_meta` \
          action=get has the rest of this session's metadata.\n- Started: {started} — when this \
          session began, not the current time; run `date` for that.\n"
     );
@@ -690,7 +667,7 @@ mod tests {
     #[test]
     fn fork_recipe_and_model_stamp_are_documented() {
         // The epilogue points at the stamp; the stamp names the key and flag.
-        for needle in ["Context forking", "--fork", "at the end of this prompt"] {
+        for needle in ["Context forking", "fork: true", "at the end of this prompt"] {
             assert!(
                 DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
                 "missing: {needle}"
@@ -714,7 +691,7 @@ mod tests {
         let stamp = stamp_with(id, started_at, Some(Path::new("/home/user/myco")));
 
         assert!(stamp.contains(&format!("`{id}`")), "{stamp}");
-        assert!(stamp.contains(&format!("--parent-session {id}")), "{stamp}");
+        assert!(stamp.contains("`subagent`"), "{stamp}");
         assert!(stamp.contains("`/home/user/myco`"), "{stamp}");
         assert!(is_session_stamp(&stamp), "{stamp}");
         assert!(!is_session_stamp("please compact the session"));
