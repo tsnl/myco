@@ -79,6 +79,14 @@ print as one WARNING block after it — missing expected executables (`bash`,
 `tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
 configured) and ssh-agent issues; hosts via `/hosts`.
 
+Every block the REPL prints is headed. Meta-command output (`/help`,
+`/hosts`, `/session`, `/sessions`, `/effort`, `/title`, the `/resume`
+acknowledgement) opens a `MYCO` section — thin rule + bold header, the
+banner family's mid-screen voice. Command failures (an unknown `/command`,
+`/resume` or `/compact` errors) open an ERROR section; an unknown command is
+never sent to the model. `/new` clears the screen and opens the fresh
+session under the same startup banner.
+
 ### Print mode (`myco -p`)
 
 `myco -p "PROMPT"` runs one non-interactive turn and exits: answer text
