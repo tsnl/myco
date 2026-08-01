@@ -75,8 +75,6 @@ pub(super) fn validate_finish<'a>(
     Ok(())
 }
 
-/// A generate stream that failed before any request was sent (e.g. the
-/// history cannot be converted for this provider).
 pub(super) fn error_stream(e: GenerateError) -> AsyncStream<Result<MessagePart, GenerateError>> {
     Box::pin(futures::stream::once(async move { Err(e) }))
 }

@@ -431,14 +431,12 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
 /// answering it.
 ///
 /// History stores the id each provider minted, but providers disagree about
-/// what an id may look like: Anthropic enforces `^[a-zA-Z0-9_-]+$`, OpenAI
-/// caps the length at 40, Mistral-style OpenAI-compatible backends demand
-/// exactly nine alphanumerics — and some gateways mint ids (`functions.bash:0`)
-/// that violate all of it. Echoing stored ids therefore wedges a session the
-/// moment it resumes on a different provider: the whole history is resent
-/// every turn, so one foreign id fails every future request. Drivers send
-/// these minted ids instead — nine alphanumerics satisfy every dialect at
-/// once — and never put a stored id on the wire.
+/// what an id may look like ([`mint_tool_id`] lists the dialects), and some
+/// gateways mint ids (`functions.bash:0`) no other provider accepts. Echoing
+/// stored ids therefore wedges a session the moment it resumes on a different
+/// provider: the whole history is resent every turn, so one foreign id fails
+/// every future request. Drivers send these minted ids instead and never put
+/// a stored id on the wire.
 ///
 /// Ids derive from (message index, ordinal), so history growth never changes
 /// the ids of earlier messages and the request prefix stays byte-identical
@@ -476,9 +474,13 @@ pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, Gener
     Ok(out)
 }
 
-/// Nine alphanumeric chars — the strictest id dialect any target provider
-/// enforces: `t`, then message index and tool ordinal as four base36 digits
-/// each.
+/// Nine alphanumeric chars: `t`, then message index and tool ordinal as four
+/// base36 digits each — the intersection of every id dialect the drivers
+/// target:
+/// - Anthropic Messages: must match `^[a-zA-Z0-9_-]+$`
+/// - OpenAI: at most 40 chars
+/// - Mistral-style OpenAI-compatible backends: exactly nine alphanumerics
+///   (the binding constraint — it fixes both the length and the charset)
 fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     const CAP: usize = 36 * 36 * 36 * 36;
     // A history long enough to overflow four digits (1.6M messages) exceeds
