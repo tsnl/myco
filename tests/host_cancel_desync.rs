@@ -25,7 +25,6 @@ async fn cancel_midcall_then_next_call_succeeds() {
     let mut call = std::pin::pin!(client.call(
         uuid::Uuid::nil(),
         ToolUse {
-            id: "slow".into(),
             name: "bash".into(),
             input: json!({
                 "command": "sleep 120; echo done-slow",
@@ -50,7 +49,6 @@ async fn cancel_midcall_then_next_call_succeeds() {
         client.call(
             uuid::Uuid::nil(),
             ToolUse {
-                id: "next".into(),
                 name: "bash".into(),
                 input: json!({"command": "echo hello-after-cancel"}),
             },
@@ -71,7 +69,6 @@ async fn cancel_midcall_then_next_call_succeeds() {
         .call(
             uuid::Uuid::nil(),
             ToolUse {
-                id: "again".into(),
                 name: "bash".into(),
                 input: json!({"command": "echo second-ok"}),
             },
@@ -90,7 +87,6 @@ async fn drop_midcall_then_next_call_succeeds() {
     let slow = client.call(
         uuid::Uuid::nil(),
         ToolUse {
-            id: "slow".into(),
             name: "bash".into(),
             input: json!({"command": "sleep 2; echo done-slow"}),
         },
@@ -106,7 +102,6 @@ async fn drop_midcall_then_next_call_succeeds() {
         client.call(
             uuid::Uuid::nil(),
             ToolUse {
-                id: "next".into(),
                 name: "bash".into(),
                 input: json!({"command": "echo after-drop"}),
             },

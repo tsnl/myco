@@ -21,7 +21,8 @@ Actions:
 - stats: message count, rough char size, role breakdown, path, hidden/kind/parent.
 - range: messages [start, end) with truncated previews (max_chars per message body,
   default {DEFAULT_MAX_CHARS}, hard max {HARD_MAX_CHARS}).
-- expand: full text for one message index (or a tool_use / tool_result body by tool id).
+- expand: full text for one message index (or a single tool_use / tool_result body via
+  tool_ordinal, its zero-based position within the message).
 - search: case-insensitive substring over text + tool names; returns matching indices.
 - write_summary: write markdown summary next to the session file (`{{id}}.summary.md`).
   Used by compaction workers; prefer this over free-form filesystem writes.
@@ -103,7 +104,7 @@ impl SessionHistoryTool {
                 Ok(format_expand(
                     &session,
                     index,
-                    input.tool_use_id.as_deref(),
+                    input.tool_ordinal,
                     max_chars,
                 )?)
             }
@@ -207,7 +208,7 @@ fn format_range(session: &Session, start: usize, end: usize, max_chars: usize) -
 fn format_expand(
     session: &Session,
     index: usize,
-    tool_use_id: Option<&str>,
+    tool_ordinal: Option<usize>,
     max_chars: usize,
 ) -> Result<String, String> {
     let msg = session.messages.get(index).ok_or_else(|| {
@@ -216,8 +217,8 @@ fn format_expand(
             session.messages.len()
         )
     })?;
-    if let Some(tid) = tool_use_id {
-        return expand_tool(msg, tid, max_chars);
+    if let Some(ordinal) = tool_ordinal {
+        return expand_tool(msg, ordinal, max_chars);
     }
     Ok(format!(
         "[{index}] {}\n{}\n",
@@ -226,41 +227,37 @@ fn format_expand(
     ))
 }
 
-fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<String, String> {
+fn expand_tool(msg: &Message, ordinal: usize, max_chars: usize) -> Result<String, String> {
     match msg {
         Message::AssistantMessage { tool_uses, .. } => {
-            for t in tool_uses {
-                if t.id == tool_use_id {
-                    let body = serde_json::to_string_pretty(&t.input).unwrap_or_default();
-                    return Ok(format!(
-                        "tool_use id={} name={}\n{}\n",
-                        t.id,
-                        t.name,
-                        truncate(&body, max_chars)
-                    ));
-                }
-            }
-            Err(format!(
-                "tool_use_id {tool_use_id:?} not in this assistant message"
+            let Some(t) = tool_uses.get(ordinal) else {
+                return Err(format!(
+                    "tool_ordinal {ordinal} out of range ({} tool calls in this assistant message)",
+                    tool_uses.len()
+                ));
+            };
+            let body = serde_json::to_string_pretty(&t.input).unwrap_or_default();
+            Ok(format!(
+                "tool_use [{ordinal}] name={}\n{}\n",
+                t.name,
+                truncate(&body, max_chars)
             ))
         }
         Message::ToolResults { tool_use_results } => {
-            for r in tool_use_results {
-                if r.id == tool_use_id {
-                    let body = content_text(&r.content);
-                    return Ok(format!(
-                        "tool_result id={} is_error={}\n{}\n",
-                        r.id,
-                        r.is_error,
-                        truncate(&body, max_chars)
-                    ));
-                }
-            }
-            Err(format!(
-                "tool_use_id {tool_use_id:?} not in this tool_results message"
+            let Some(r) = tool_use_results.get(ordinal) else {
+                return Err(format!(
+                    "tool_ordinal {ordinal} out of range ({} results in this tool_results message)",
+                    tool_use_results.len()
+                ));
+            };
+            let body = content_text(&r.content);
+            Ok(format!(
+                "tool_result [{ordinal}] is_error={}\n{}\n",
+                r.is_error,
+                truncate(&body, max_chars)
             ))
         }
-        _ => Err("tool_use_id expand requires an assistant or tool_results message".into()),
+        _ => Err("tool_ordinal expand requires an assistant or tool_results message".into()),
     }
 }
 
@@ -309,10 +306,9 @@ fn preview_message(msg: &Message, max_chars: usize) -> String {
                 if !s.is_empty() {
                     s.push('\n');
                 }
-                for t in tool_uses {
+                for (j, t) in tool_uses.iter().enumerate() {
                     s.push_str(&format!(
-                        "tool_use id={} name={} input={}\n",
-                        t.id,
+                        "tool_use [{j}] name={} input={}\n",
                         t.name,
                         truncate(&t.input.to_string(), 200)
                     ));
@@ -322,10 +318,9 @@ fn preview_message(msg: &Message, max_chars: usize) -> String {
         }
         Message::ToolResults { tool_use_results } => {
             let mut s = String::new();
-            for r in tool_use_results {
+            for (j, r) in tool_use_results.iter().enumerate() {
                 s.push_str(&format!(
-                    "tool_result id={} is_error={} {}\n",
-                    r.id,
+                    "tool_result [{j}] is_error={} {}\n",
                     r.is_error,
                     truncate(&content_text(&r.content), 400)
                 ));
@@ -377,8 +372,10 @@ struct Input {
     end: Option<usize>,
     #[serde(default)]
     index: Option<usize>,
+    /// Zero-based position of one tool_use / tool_result inside the message at
+    /// `index` (expand only). History carries no tool ids; position is the key.
     #[serde(default)]
-    tool_use_id: Option<String>,
+    tool_ordinal: Option<usize>,
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]

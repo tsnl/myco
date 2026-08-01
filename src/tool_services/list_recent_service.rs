@@ -201,7 +201,6 @@ mod tests {
         let list = tool
             .dispatch_tool_use(
                 ToolUse {
-                    id: "t1".into(),
                     name: "list_recent".into(),
                     input: json!({}),
                 },

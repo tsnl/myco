@@ -110,7 +110,6 @@ impl GenerativeModel for ScriptedModel {
         for (i, tu) in output.tool_uses.iter().enumerate() {
             parts.push(MessagePart::ToolUseStart(ToolUseStart {
                 index: i,
-                id: tu.id.clone(),
                 name: tu.name.clone(),
             }));
             parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
@@ -145,18 +144,12 @@ pub(crate) fn assistant(text: &str) -> Message {
     }
 }
 
-pub(crate) fn assistant_tool(
-    text: Option<&str>,
-    id: &str,
-    name: &str,
-    input: serde_json::Value,
-) -> Message {
+pub(crate) fn assistant_tool(text: Option<&str>, name: &str, input: serde_json::Value) -> Message {
     Message::AssistantMessage {
         content: text
             .map(|t| vec![Content::Text { text: t.into() }])
             .unwrap_or_default(),
         tool_uses: vec![ToolUse {
-            id: id.into(),
             name: name.into(),
             input,
         }],
@@ -164,12 +157,9 @@ pub(crate) fn assistant_tool(
     }
 }
 
-pub(crate) fn tool_results(results: &[(&str, &str)]) -> Message {
+pub(crate) fn tool_results(results: &[&str]) -> Message {
     Message::ToolResults {
-        tool_use_results: results
-            .iter()
-            .map(|(id, text)| ToolResult::text(*text).with_id(*id))
-            .collect(),
+        tool_use_results: results.iter().map(|text| ToolResult::text(*text)).collect(),
     }
 }
 
@@ -195,13 +185,8 @@ pub(crate) fn thinking_msg(parts: &[&str]) -> Message {
 pub(crate) fn tool_loop() -> Vec<Message> {
     vec![
         user("hello"),
-        assistant_tool(
-            Some("hi there"),
-            "t1",
-            "bash",
-            json!({"command": "echo hi"}),
-        ),
-        tool_results(&[("t1", "hi\n")]),
+        assistant_tool(Some("hi there"), "bash", json!({"command": "echo hi"})),
+        tool_results(&["hi\n"]),
         assistant("done"),
     ]
 }
@@ -310,14 +295,13 @@ pub(crate) fn expect_thinking_delta(part: &MessagePart, index: usize, text: &str
 }
 
 #[track_caller]
-pub(crate) fn expect_tool_start(part: &MessagePart, index: usize, id: &str, name: &str) {
+pub(crate) fn expect_tool_start(part: &MessagePart, index: usize, name: &str) {
     match part {
         MessagePart::ToolUseStart(ToolUseStart {
             index: i,
-            id: got_id,
             name: got_name,
-        }) if *i == index && got_id == id && got_name == name => {}
-        other => panic!("expected tool start {index}/{id}/{name}, got {other:?}"),
+        }) if *i == index && got_name == name => {}
+        other => panic!("expected tool start {index}/{name}, got {other:?}"),
     }
 }
 

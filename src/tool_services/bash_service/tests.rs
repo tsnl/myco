@@ -5,7 +5,6 @@ use serde_json::json;
 
 fn tool_use_json(value: serde_json::Value) -> generative_model::ToolUse {
     generative_model::ToolUse {
-        id: "test".into(),
         name: "bash".into(),
         input: value,
     }
@@ -140,7 +139,6 @@ async fn empty_input_dispatch_returns_error_result() {
     ] {
         let result = dispatch_json(harness(), value.clone()).await;
         assert!(result.is_error, "value={value} expected error: {result:?}");
-        assert_eq!(result.id, "test");
         let text = result_text(&result);
         assert!(
             text.contains("empty bash input"),

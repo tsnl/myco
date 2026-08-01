@@ -87,12 +87,10 @@ impl HostWorker {
         tool_use: ToolUse,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        let id = tool_use.id.clone();
         let Some(service) = self.tool_to_service.get(&tool_use.name).cloned() else {
-            return generative_model::ToolResult::err(format!("unknown tool '{}'", tool_use.name))
-                .with_id(id);
+            return generative_model::ToolResult::err(format!("unknown tool '{}'", tool_use.name));
         };
-        service.dispatch_tool_use(tool_use, ctx).await.with_id(id)
+        service.dispatch_tool_use(tool_use, ctx).await
     }
 
     pub fn notify_agent_finished(&self, agent_id: uuid::Uuid) {

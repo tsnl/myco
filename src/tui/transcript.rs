@@ -528,12 +528,10 @@ mod tests {
                 ],
                 tool_uses: vec![
                     ToolUse {
-                        id: "1".into(),
                         name: "bash".into(),
                         input: json!({"command": "echo 1"}),
                     },
                     ToolUse {
-                        id: "2".into(),
                         name: "bash".into(),
                         input: json!({"command": "echo 2"}),
                     },

@@ -83,7 +83,6 @@ impl GenerativeModel for ScriptedModel {
         for (i, tu) in output.tool_uses.iter().enumerate() {
             parts.push(MessagePart::ToolUseStart(ToolUseStart {
                 index: i,
-                id: tu.id.clone(),
                 name: tu.name.clone(),
             }));
             parts.push(MessagePart::ToolUseDelta(ToolUseDelta {

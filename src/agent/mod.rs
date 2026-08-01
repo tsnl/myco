@@ -367,7 +367,6 @@ impl Agent {
             context: self.context.clone(),
         });
 
-        let id = tool_use.id.clone();
         let work =
             self.harness
                 .clone()
@@ -389,7 +388,7 @@ impl Agent {
             _ = cancel.cancelled() => {
                 match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
                     Ok(result) => result,
-                    Err(_) => ToolResult::err("cancelled").with_id(id),
+                    Err(_) => ToolResult::err("cancelled"),
                 }
             }
             result = &mut work => result,
@@ -513,11 +512,14 @@ mod tests {
                 self.starts
                     .lock()
                     .unwrap()
-                    .push((tool_use.id.clone(), started));
+                    .push((tool_use.name.clone(), started));
                 tokio::time::sleep(self.delay).await;
                 let ended = Instant::now();
-                self.ends.lock().unwrap().push((tool_use.id.clone(), ended));
-                ToolResult::text(format!("done:{}", tool_use.id))
+                self.ends
+                    .lock()
+                    .unwrap()
+                    .push((tool_use.name.clone(), ended));
+                ToolResult::text(format!("done:{}", tool_use.name))
             })
         }
     }
@@ -553,12 +555,10 @@ mod tests {
                 content: vec![],
                 tool_uses: vec![
                     ToolUse {
-                        id: "call_slow".into(),
                         name: "slow_a".into(),
                         input: json!({}),
                     },
                     ToolUse {
-                        id: "call_fast".into(),
                         name: "slow_b".into(),
                         input: json!({}),
                     },
@@ -603,8 +603,8 @@ mod tests {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 2);
                 // Order matches the original tool_uses list, not completion order.
-                assert_eq!(tool_use_results[0].id, "call_slow");
-                assert_eq!(tool_use_results[1].id, "call_fast");
+                assert_eq!(result_text(&tool_use_results[0]), "done:slow_a");
+                assert_eq!(result_text(&tool_use_results[1]), "done:slow_b");
                 assert!(!tool_use_results[0].is_error);
                 assert!(!tool_use_results[1].is_error);
             }
@@ -648,7 +648,6 @@ mod tests {
             GenerateOutput {
                 content: vec![],
                 tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
                     name: "slow_a".into(),
                     input: json!({}),
                 }],
@@ -702,7 +701,6 @@ mod tests {
             GenerateOutput {
                 content: vec![],
                 tool_uses: vec![ToolUse {
-                    id: "call_1".into(),
                     name: "fast".into(),
                     input: json!({}),
                 }],
@@ -835,7 +833,6 @@ mod tests {
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![],
             tool_uses: vec![ToolUse {
-                id: "call_slow".into(),
                 name: "slow_a".into(),
                 input: json!({}),
             }],
@@ -902,7 +899,6 @@ mod tests {
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![],
             tool_uses: vec![ToolUse {
-                id: "call_1".into(),
                 name: "slow_a".into(),
                 input: json!({}),
             }],
@@ -938,7 +934,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_uses.len(), 1);
-                assert_eq!(tool_uses[0].id, "call_1");
+                assert_eq!(tool_uses[0].name, "slow_a");
                 assert_eq!(*turn_end_reason, Some(TurnEndReason::ToolUse));
             }
             other => panic!("expected assistant tool_use, got {other:?}"),
@@ -946,7 +942,6 @@ mod tests {
         match &history[2] {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 1);
-                assert_eq!(tool_use_results[0].id, "call_1");
                 assert!(!tool_use_results[0].is_error);
             }
             other => panic!("expected ToolResults, got {other:?}"),
@@ -1018,7 +1013,6 @@ mod tests {
                     text: "let me check".into(),
                 }],
                 tool_uses: vec![ToolUse {
-                    id: "toolu_truncated".into(),
                     name: "bash".into(),
                     input: serde_json::json!({}),
                 }],
@@ -1046,7 +1040,6 @@ mod tests {
         match &agent.history()[2] {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 1);
-                assert_eq!(tool_use_results[0].id, "toolu_truncated");
                 assert!(tool_use_results[0].is_error);
                 let text = result_text(&tool_use_results[0]);
                 assert!(text.contains("empty bash input"), "text={text}");
@@ -1131,8 +1124,8 @@ mod tests {
             user("first"),
             assistant("ok"),
             user("second"),
-            assistant_tool(None, "call_1", "noop", json!({})),
-            tool_results(&[("call_1", "done")]),
+            assistant_tool(None, "noop", json!({})),
+            tool_results(&["done"]),
         ]);
 
         let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
@@ -1153,8 +1146,8 @@ mod tests {
         // proves the agent leaves behind).
         let snapshot = vec![
             user("mid turn"),
-            assistant_tool(None, "call_mid", "slow_a", json!({})),
-            tool_results(&[("call_mid", "done:call_mid")]),
+            assistant_tool(None, "slow_a", json!({})),
+            tool_results(&["done:slow_a"]),
         ];
 
         // "Resume": new agent, same well-formed history, model only needs EndTurn.

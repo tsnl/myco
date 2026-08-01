@@ -292,12 +292,10 @@ impl Harness {
         cancel: CancelToken,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
-            let id = tool_use.id.clone();
             let name = tool_use.name.clone();
 
             if !self.host_tool_names.contains(&name) {
-                return generative_model::ToolResult::err(format!("unknown tool '{name}'"))
-                    .with_id(id);
+                return generative_model::ToolResult::err(format!("unknown tool '{name}'"));
             }
 
             // Root-only tools always run on the in-process local worker. Their schemas
@@ -308,7 +306,7 @@ impl Harness {
             } else {
                 match resolve_host_for_call(&tool_use, &self.default_host) {
                     Ok(h) => h,
-                    Err(e) => return generative_model::ToolResult::err(e).with_id(id),
+                    Err(e) => return generative_model::ToolResult::err(e),
                 }
             };
 
@@ -322,8 +320,7 @@ impl Harness {
                 return generative_model::ToolResult::err(format!(
                     "unknown host {host_name:?} (known: [{known}]; default={})",
                     self.default_host
-                ))
-                .with_id(id);
+                ));
             };
 
             client.call(agent_id, tool_use, cancel).await
@@ -434,7 +431,6 @@ mod tests {
             .clone()
             .dispatch_tool_use(
                 ToolUse {
-                    id: "t".into(),
                     name: name.into(),
                     input,
                 },
@@ -469,21 +465,18 @@ mod tests {
     #[test]
     fn resolve_host_defaults_and_overrides() {
         let tu = ToolUse {
-            id: "1".into(),
             name: "bash".into(),
             input: json!({"command": "echo"}),
         };
         assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "local");
 
         let tu = ToolUse {
-            id: "1".into(),
             name: "bash".into(),
             input: json!({"command": "echo", "host": "devbox"}),
         };
         assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "devbox");
 
         let tu = ToolUse {
-            id: "1".into(),
             name: "bash".into(),
             input: json!({"host": "  "}),
         };
@@ -493,7 +486,6 @@ mod tests {
     #[test]
     fn strip_host_removes_only_routing_field() {
         let mut tu = ToolUse {
-            id: "1".into(),
             name: "bash".into(),
             input: json!({"command": "echo", "host": "devbox", "timeout_ms": 500}),
         };

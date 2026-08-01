@@ -133,7 +133,6 @@ async fn wire_tool_call_streamed_across_chunks() {
     assert!(matches!(output.turn_end_reason, TurnEndReason::ToolUse));
     match output.tool_uses.as_slice() {
         [tool_use] => {
-            assert_eq!(tool_use.id, "call_1");
             assert_eq!(tool_use.name, "bash");
             assert_eq!(tool_use.input, serde_json::json!({"command": "ls"}));
         }

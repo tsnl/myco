@@ -528,7 +528,6 @@ mod tests {
     ) -> generative_model::ToolResult {
         futures::executor::block_on(harness.dispatch_tool_use(
             generative_model::ToolUse {
-                id: "test".into(),
                 name: "str_replace_based_edit_tool".into(),
                 input,
             },

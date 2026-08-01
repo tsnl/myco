@@ -186,12 +186,10 @@ impl HostController {
     ) -> ToolResult {
         match &self.backend {
             Backend::InProcess { worker } => {
-                let tool_id = tool_use.id.clone();
                 let worker = Arc::clone(worker);
                 worker
                     .dispatch_tool_use(tool_use, HostDispatchContext { agent_id, cancel })
                     .await
-                    .with_id(tool_id)
             }
             Backend::Subprocess { .. } => self.call_subprocess(agent_id, tool_use, cancel).await,
         }
@@ -204,7 +202,6 @@ impl HostController {
         cancel: CancelToken,
     ) -> ToolResult {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-        let tool_id = tool_use.id.clone();
 
         let request = Request::ToolCall {
             id: id.clone(),
@@ -215,7 +212,7 @@ impl HostController {
         let rx = match self.submit(&id, &request).await {
             Ok(rx) => rx,
             Err(e) => {
-                return ToolResult::err(format!("host {:?}: {e}", self.name)).with_id(tool_id);
+                return ToolResult::err(format!("host {:?}: {e}", self.name));
             }
         };
 
@@ -223,7 +220,7 @@ impl HostController {
             biased;
             _ = cancel.cancelled() => {
                 self.abandon(&id).await;
-                return ToolResult::err("cancelled").with_id(tool_id);
+                return ToolResult::err("cancelled");
             }
             r = rx => r,
         };
@@ -232,20 +229,12 @@ impl HostController {
         // its id, so a delivered response is always this call's ToolResult or
         // Error — never another call's reply and never a hello.
         match reply {
-            Ok(Response::ToolResult { result, .. }) => {
-                let mut result = result;
-                if result.id.is_empty() {
-                    result.id = tool_id;
-                }
-                result
-            }
+            Ok(Response::ToolResult { result, .. }) => result,
             Ok(Response::Error { message, .. }) => {
-                ToolResult::err(format!("host {:?}: {message}", self.name)).with_id(tool_id)
+                ToolResult::err(format!("host {:?}: {message}", self.name))
             }
             Ok(Response::HelloOk { .. }) => unreachable!("hello is consumed during connect"),
-            Err(_closed) => {
-                ToolResult::err(format!("host {:?}: connection closed", self.name)).with_id(tool_id)
-            }
+            Err(_closed) => ToolResult::err(format!("host {:?}: connection closed", self.name)),
         }
     }
 
@@ -626,11 +615,10 @@ mod tests {
         format!("{{\"type\":\"hello_ok\",\"version\":\"{version}\"}}")
     }
 
-    async fn bash_call(ctl: &HostController, id: &str, command: &str) -> ToolResult {
+    async fn bash_call(ctl: &HostController, command: &str) -> ToolResult {
         ctl.call(
             uuid::Uuid::nil(),
             ToolUse {
-                id: id.into(),
                 name: "bash".into(),
                 input: json!({"command": command}),
             },
@@ -650,7 +638,7 @@ mod tests {
             "expected bash tool from standard catalog"
         );
 
-        let result = bash_call(&ctl, "t1", "printf 'hello-host\\n'").await;
+        let result = bash_call(&ctl, "printf 'hello-host\\n'").await;
         assert!(!result.is_error, "{result:?}");
         assert!(
             text_parts(&result).join("").contains("hello-host"),
@@ -682,8 +670,8 @@ mod tests {
         let (script_a, script_b) = (script("a", "b", "AAA"), script("b", "a", "BBB"));
 
         let t0 = Instant::now();
-        let a = bash_call(&ctl, "a", &script_a);
-        let b = bash_call(&ctl, "b", &script_b);
+        let a = bash_call(&ctl, &script_a);
+        let b = bash_call(&ctl, &script_b);
 
         let (ra, rb) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(a, b) })
             .await
@@ -721,7 +709,6 @@ mod tests {
         let mut call = std::pin::pin!(ctl.call(
             uuid::Uuid::nil(),
             ToolUse {
-                id: "slow".into(),
                 name: "bash".into(),
                 // Long enough that cancel always races before natural exit.
                 // Explicit timeout so we never lean on the 60s default.
@@ -752,7 +739,7 @@ mod tests {
         // Next call must not hang: cancel cleanup must free the host path.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            bash_call(&ctl, "next", "echo hello-after-cancel"),
+            bash_call(&ctl, "echo hello-after-cancel"),
         )
         .await
         .expect("next call timed out");
@@ -778,7 +765,7 @@ mod tests {
                 hello_line("0.0.1")
             ),
         );
-        let result = tokio::time::timeout(Duration::from_secs(5), bash_call(&ctl, "t", "true"))
+        let result = tokio::time::timeout(Duration::from_secs(5), bash_call(&ctl, "true"))
             .await
             .expect("skewed connect must fail fast");
         assert!(result.is_error, "{result:?}");
@@ -800,12 +787,9 @@ mod tests {
         );
 
         for attempt in 0..2 {
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                bash_call(&ctl, &format!("t{attempt}"), "echo hi"),
-            )
-            .await
-            .expect("call against dead host must fail fast, not hang");
+            let result = tokio::time::timeout(Duration::from_secs(5), bash_call(&ctl, "echo hi"))
+                .await
+                .expect("call against dead host must fail fast, not hang");
             assert!(result.is_error, "attempt {attempt}: {result:?}");
         }
     }
@@ -819,7 +803,7 @@ mod tests {
         });
 
         assert!(!ctl.is_connected());
-        let result = bash_call(&ctl, "t1", "printf 'via-sub\\n'").await;
+        let result = bash_call(&ctl, "printf 'via-sub\\n'").await;
         assert!(!result.is_error, "{result:?}");
         assert!(
             text_parts(&result).join("").contains("via-sub"),

@@ -349,16 +349,18 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
 }
 
+/// A tool call in an assistant turn. Carries no id: a call is identified by
+/// its position (message index + ordinal), and the `j`-th entry of the next
+/// message's `tool_use_results` answers it. Providers that need ids on the
+/// wire get minted ones ([`wire_tool_ids`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolUse {
-    pub id: String,
     pub name: String,
     pub input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
-    pub id: String,
     pub content: Vec<Content>,
     pub is_error: bool,
 }
@@ -366,7 +368,6 @@ pub struct ToolResult {
 impl ToolResult {
     pub fn ok(content: Vec<Content>) -> Self {
         Self {
-            id: String::new(),
             content,
             is_error: false,
         }
@@ -374,7 +375,6 @@ impl ToolResult {
 
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            id: String::new(),
             content: vec![Content::Text { text: text.into() }],
             is_error: false,
         }
@@ -382,15 +382,9 @@ impl ToolResult {
 
     pub fn err(text: impl Into<String>) -> Self {
         Self {
-            id: String::new(),
             content: vec![Content::Text { text: text.into() }],
             is_error: true,
         }
-    }
-
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
     }
 }
 
@@ -425,27 +419,26 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
         .collect()
 }
 
-/// Provider-neutral wire ids for every tool call in `input`: `out[i][j]` is
-/// the id a driver sends for the `j`-th tool_use of the assistant message at
-/// index `i`, and equally for the `j`-th result of the `ToolResults` message
-/// answering it.
+/// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
+/// sends for the `j`-th tool_use of the assistant message at index `i`, and
+/// equally for the `j`-th result of the `ToolResults` message answering it.
 ///
-/// History stores the id each provider minted, but providers disagree about
-/// what an id may look like ([`mint_tool_id`] lists the dialects), and some
-/// gateways mint ids (`functions.bash:0`) no other provider accepts. Echoing
-/// stored ids therefore wedges a session the moment it resumes on a different
-/// provider: the whole history is resent every turn, so one foreign id fails
-/// every future request. Drivers send these minted ids instead and never put
-/// a stored id on the wire.
+/// History carries no tool ids — a call and its result pair positionally:
+/// `tool_use_results[j]` answers `tool_uses[j]` of the immediately preceding
+/// assistant message, the order the agent loop writes and compaction
+/// preserves (tails start at a user message and never split a pair).
+/// Providers, however, require an id on the wire to make that same pairing
+/// inside one request, and each has its own dialect ([`mint_tool_id`]) — so
+/// drivers mint one per position here. Provider-minted ids from responses are
+/// discarded at ingestion; storing and echoing them is what used to wedge a
+/// session the moment it resumed on a different provider.
 ///
 /// Ids derive from (message index, ordinal), so history growth never changes
 /// the ids of earlier messages and the request prefix stays byte-identical
-/// across turns for provider prompt caching. Pairing is positional:
-/// `tool_use_results[j]` answers `tool_uses[j]` of the immediately preceding
-/// assistant message — the order the agent loop writes and compaction
-/// preserves (tails start at a user message and never split a pair). A
-/// history that breaks it fails here, before any request is sent: guessing
-/// the pairing would corrupt the conversation silently.
+/// across turns for provider prompt caching. A history whose result count
+/// disagrees with the preceding assistant's tool calls fails here, before any
+/// request is sent: guessing the pairing would corrupt the conversation
+/// silently.
 pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, GenerateError> {
     let mut out: Vec<Vec<String>> = Vec::with_capacity(input.len());
     for (i, message) in input.iter().enumerate() {
@@ -566,7 +559,6 @@ pub enum ContentDelta {
 #[derive(Debug, Clone)]
 pub struct ToolUseStart {
     pub index: usize,
-    pub id: String,
     pub name: String,
 }
 
@@ -603,7 +595,6 @@ impl GenerateOutput {
         mut on_part: impl FnMut(&MessagePart),
     ) -> Result<Self, GenerateError> {
         struct IncompleteToolUse {
-            id: String,
             name: String,
             input_json: String,
         }
@@ -622,7 +613,6 @@ impl GenerateOutput {
                     })?
                 };
                 Ok(ToolUse {
-                    id: self.id,
                     name: self.name,
                     input,
                 })
@@ -671,12 +661,11 @@ impl GenerateOutput {
                     ensure_slot(&mut content, index, block);
                 }
                 MessagePart::ContentDelta(delta) => apply_content_delta(&mut content, delta)?,
-                MessagePart::ToolUseStart(ToolUseStart { index, id, name }) => {
+                MessagePart::ToolUseStart(ToolUseStart { index, name }) => {
                     ensure_slot(
                         &mut tool_uses,
                         index,
                         IncompleteToolUse {
-                            id,
                             name,
                             input_json: String::new(),
                         },
@@ -839,14 +828,13 @@ mod tests {
         }
     }
 
-    /// A tool_result must carry the same wire id as the tool_use it answers,
-    /// no matter what ids the originating provider stored in history.
+    /// A tool_result must carry the same wire id as the tool_use it answers.
     #[test]
     fn wire_ids_pair_results_with_uses_positionally() {
         let input = [
             user("hi"),
-            assistant_tool(None, "functions.bash:0", "bash", serde_json::json!({})),
-            tool_results(&[("functions.bash:0", "ok")]),
+            assistant_tool(None, "bash", serde_json::json!({})),
+            tool_results(&["ok"]),
         ];
         let ids = wire_tool_ids(&input).unwrap();
         assert!(ids[0].is_empty());
@@ -860,13 +848,13 @@ mod tests {
     fn wire_ids_stable_as_history_grows() {
         let mut input = vec![
             user("hi"),
-            assistant_tool(None, "a", "bash", serde_json::json!({})),
-            tool_results(&[("a", "ok")]),
+            assistant_tool(None, "bash", serde_json::json!({})),
+            tool_results(&["ok"]),
         ];
         let before = wire_tool_ids(&input).unwrap();
         input.push(user("more"));
-        input.push(assistant_tool(None, "b", "bash", serde_json::json!({})));
-        input.push(tool_results(&[("b", "ok")]));
+        input.push(assistant_tool(None, "bash", serde_json::json!({})));
+        input.push(tool_results(&["ok"]));
         let after = wire_tool_ids(&input).unwrap();
         assert_eq!(before[..], after[..3]);
         assert_ne!(after[1], after[4], "distinct calls must get distinct ids");
@@ -877,12 +865,12 @@ mod tests {
     /// request is sent, instead of silently mispairing.
     #[test]
     fn wire_ids_fail_loud_on_broken_pairing() {
-        let orphaned = [user("hi"), tool_results(&[("a", "ok")])];
+        let orphaned = [user("hi"), tool_results(&["ok"])];
         assert!(wire_tool_ids(&orphaned).is_err());
 
         let miscounted = [
-            assistant_tool(None, "a", "bash", serde_json::json!({})),
-            tool_results(&[("a", "ok"), ("b", "ok")]),
+            assistant_tool(None, "bash", serde_json::json!({})),
+            tool_results(&["ok", "ok"]),
         ];
         assert!(wire_tool_ids(&miscounted).is_err());
     }
@@ -1142,7 +1130,6 @@ mod tests {
             Message::AssistantMessage {
                 content: vec![Content::Text { text: "ok".into() }],
                 tool_uses: vec![ToolUse {
-                    id: "t1".into(),
                     name: "bash".into(),
                     input: serde_json::json!({"command": "true"}),
                 }],
@@ -1150,7 +1137,6 @@ mod tests {
             },
             Message::ToolResults {
                 tool_use_results: vec![ToolResult {
-                    id: "t1".into(),
                     content: vec![Content::Text {
                         text: "done".into(),
                     }],

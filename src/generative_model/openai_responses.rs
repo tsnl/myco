@@ -274,18 +274,15 @@ impl StreamAccumulator {
                         redacted: false,
                     }));
                 }
-                ResponsesOutputItem::FunctionCall {
-                    call_id,
-                    name,
-                    arguments,
-                } => {
-                    // An id-less or nameless call is poison: it would flow into
-                    // persisted history and 400 on every later request (resume
-                    // included). Fail loud like the arguments-without-item path.
-                    let (Some(call_id), Some(name)) = (call_id, name) else {
+                ResponsesOutputItem::FunctionCall { name, arguments } => {
+                    // A nameless call cannot be dispatched or resent. Fail
+                    // loud like the arguments-without-item path. (The
+                    // provider's call_id is discarded: history stores no tool
+                    // ids; requests carry minted positional ids.)
+                    let Some(name) = name else {
                         return Err(GenerateError::MalformedResponseError(format!(
                             "OpenAI Responses: function_call output_item.added for \
-                             output_index={output_index} is missing call_id or name"
+                             output_index={output_index} is missing name"
                         )));
                     };
                     let tool_index = self.slots.open_tool_use(output_index);
@@ -293,7 +290,6 @@ impl StreamAccumulator {
                     self.saw_tool_call = true;
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
-                        id: call_id,
                         name,
                     }));
                 }
@@ -610,8 +606,6 @@ enum ResponsesOutputItem {
     #[serde(rename = "function_call")]
     FunctionCall {
         #[serde(default)]
-        call_id: Option<String>,
-        #[serde(default)]
         name: Option<String>,
         #[serde(default)]
         arguments: Option<String>,
@@ -654,13 +648,8 @@ mod tests {
     fn convert_user_and_tool_results() {
         let input = [
             user("hi"),
-            assistant_tool(
-                None,
-                "call_1",
-                "bash",
-                serde_json::json!({"command": "echo hi"}),
-            ),
-            tool_results(&[("call_1", "hi\n")]),
+            assistant_tool(None, "bash", serde_json::json!({"command": "echo hi"})),
+            tool_results(&["hi\n"]),
         ];
         let items = convert_messages(&input).unwrap();
         assert_eq!(items.len(), 3);
@@ -670,15 +659,15 @@ mod tests {
                 if role == "user"
                     && *content == ResponsesMessageContent::Text("hi".into())
         ));
-        // The wire carries the minted positional id, not the stored one; the
-        // output names the same call.
+        // The wire carries a minted positional id; the output names the same
+        // call.
         let call_id = match &items[1] {
             ResponsesInputItem::FunctionCall { call_id, name, .. } if name == "bash" => {
                 call_id.clone()
             }
             other => panic!("expected function_call, got {other:?}"),
         };
-        assert_ne!(call_id, "call_1");
+        assert!(!call_id.is_empty());
         assert!(matches!(
             &items[2],
             ResponsesInputItem::FunctionCallOutput {
@@ -695,10 +684,9 @@ mod tests {
     #[test]
     fn tool_result_image_becomes_output_parts() {
         let input = [
-            assistant_tool(None, "call_1", "view_image", serde_json::json!({})),
+            assistant_tool(None, "view_image", serde_json::json!({})),
             Message::ToolResults {
                 tool_use_results: vec![ToolResult {
-                    id: "call_1".into(),
                     content: vec![
                         Content::Text { text: "ok".into() },
                         Content::Image {
@@ -723,10 +711,9 @@ mod tests {
     #[test]
     fn image_only_tool_result_has_no_empty_text_part() {
         let input = [
-            assistant_tool(None, "call_1", "view_image", serde_json::json!({})),
+            assistant_tool(None, "view_image", serde_json::json!({})),
             Message::ToolResults {
                 tool_use_results: vec![ToolResult {
-                    id: "call_1".into(),
                     content: vec![Content::Image {
                         source: "data:image/png;base64,AAAA".into(),
                     }],
@@ -739,22 +726,20 @@ mod tests {
         assert_eq!(json[1]["output"][0]["type"], "input_image");
     }
 
-    /// A function_call item without call_id/name must fail the stream, not
-    /// flow an empty id into persisted history (which would 400 every later
-    /// request, resume included).
+    /// A function_call item without a name must fail the stream: a nameless
+    /// call can be neither dispatched nor resent.
     #[test]
-    fn function_call_without_call_id_fails_loud() {
+    fn function_call_without_name_fails_loud() {
         let mut acc = StreamAccumulator::default();
         let err = acc
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 0,
                 item: ResponsesOutputItem::FunctionCall {
-                    call_id: None,
-                    name: Some("bash".into()),
+                    name: None,
                     arguments: None,
                 },
             })
-            .expect_err("missing call_id must be malformed");
+            .expect_err("missing name must be malformed");
         assert!(
             matches!(err, GenerateError::MalformedResponseError(_)),
             "{err:?}"
@@ -903,13 +888,12 @@ mod tests {
             .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
                 output_index: 1,
                 item: ResponsesOutputItem::FunctionCall {
-                    call_id: Some("call_1".into()),
                     name: Some("get_weather".into()),
                     arguments: Some(String::new()),
                 },
             })
             .unwrap();
-        expect_tool_start(&items[0], 0, "call_1", "get_weather");
+        expect_tool_start(&items[0], 0, "get_weather");
 
         let items = acc
             .handle_event(ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {

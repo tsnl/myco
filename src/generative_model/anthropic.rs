@@ -361,13 +361,12 @@ impl StreamAccumulator {
                         redacted: true,
                     }));
                 }
-                AnthropicStreamContentBlock::ToolUse { id, name, input } => {
+                AnthropicStreamContentBlock::ToolUse { name, input } => {
                     // Input arrives via input_json_delta; starter object is usually empty.
                     let _ = input;
                     let tool_index = self.slots.open_tool_use(index);
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
-                        id,
                         name,
                     }));
                 }
@@ -534,7 +533,6 @@ enum AnthropicStreamContentBlock {
     },
     #[serde(rename = "tool_use")]
     ToolUse {
-        id: String,
         name: String,
         #[serde(default)]
         input: serde_json::Value,
@@ -906,12 +904,10 @@ mod tests {
                 content: vec![],
                 tool_uses: vec![
                     ToolUse {
-                        id: "a".into(),
                         name: "x".into(),
                         input: serde_json::Value::Null,
                     },
                     ToolUse {
-                        id: "b".into(),
                         name: "x".into(),
                         input: serde_json::Value::Null,
                     },
@@ -921,12 +917,10 @@ mod tests {
             Message::ToolResults {
                 tool_use_results: vec![
                     ToolResult {
-                        id: "a".into(),
                         content: vec![Content::Text { text: "ra".into() }],
                         is_error: false,
                     },
                     ToolResult {
-                        id: "b".into(),
                         content: vec![Content::Text { text: "rb".into() }],
                         is_error: false,
                     },
@@ -955,10 +949,9 @@ mod tests {
     #[test]
     fn tool_result_image_serializes_as_nested_image_block() {
         let input = [
-            assistant_tool(None, "toolu_1", "view_image", serde_json::json!({})),
+            assistant_tool(None, "view_image", serde_json::json!({})),
             Message::ToolResults {
                 tool_use_results: vec![ToolResult {
-                    id: "toolu_1".into(),
                     content: vec![Content::Image {
                         source: "data:image/png;base64,AAAA".into(),
                     }],
@@ -1140,8 +1133,8 @@ mod tests {
     #[test]
     fn test_convert_messages_merges_consecutive_user() {
         let input = [
-            assistant_tool(None, "toolu_1", "bash", serde_json::json!({})),
-            tool_results(&[("toolu_1", "ok")]),
+            assistant_tool(None, "bash", serde_json::json!({})),
+            tool_results(&["ok"]),
             user("hi"),
         ];
         let msgs = convert_messages(&input).unwrap();
@@ -1156,16 +1149,15 @@ mod tests {
         assert!(matches!(msgs[1].content[1], AnthropicContent::Text { .. }));
     }
 
-    /// Resuming a session started on another provider: history carries ids
-    /// Anthropic's `^[a-zA-Z0-9_-]+$` rejects. Minted wire ids must be legal,
-    /// keep the `tool_use` and its `tool_result` naming each other, and never
-    /// leak the stored id onto the wire.
+    /// History carries no tool ids, but the wire must: minted ids have to be
+    /// legal under Anthropic's `^[a-zA-Z0-9_-]+$` and keep the `tool_use` and
+    /// its `tool_result` naming each other.
     #[test]
-    fn foreign_history_ids_never_reach_the_wire() {
+    fn wire_carries_legal_minted_ids_that_pair_up() {
         let input = [
             user("hello"),
-            assistant_tool(None, "functions.bash:0", "bash", serde_json::json!({})),
-            tool_results(&[("functions.bash:0", "ok")]),
+            assistant_tool(None, "bash", serde_json::json!({})),
+            tool_results(&["ok"]),
         ];
         let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
 
@@ -1174,7 +1166,6 @@ mod tests {
             is_legal_anthropic_id(tool_use_id),
             "tool_use id {tool_use_id:?} violates ^[a-zA-Z0-9_-]+$"
         );
-        assert_ne!(tool_use_id, "functions.bash:0");
         assert_eq!(tool_use_id, json[2]["content"][0]["tool_use_id"]);
     }
 
@@ -1273,14 +1264,13 @@ mod tests {
             .handle_event(AnthropicStreamEvent::ContentBlockStart {
                 index: 1,
                 content_block: AnthropicStreamContentBlock::ToolUse {
-                    id: "toolu_1".into(),
                     name: "get_weather".into(),
                     input: serde_json::json!({}),
                 },
             })
             .unwrap();
         // Remapped tool index: tool uses get their own index space.
-        expect_tool_start(&items[0], 0, "toolu_1", "get_weather");
+        expect_tool_start(&items[0], 0, "get_weather");
 
         let items = acc
             .handle_event(AnthropicStreamEvent::ContentBlockDelta {

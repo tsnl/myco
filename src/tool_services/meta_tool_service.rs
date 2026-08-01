@@ -391,7 +391,6 @@ mod tests {
             .clone()
             .dispatch_tool_use(
                 generative_model::ToolUse {
-                    id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({
                         "action": "set_title",
@@ -407,7 +406,6 @@ mod tests {
         let got = tool
             .dispatch_tool_use(
                 generative_model::ToolUse {
-                    id: "t2".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "get"}),
                 },
@@ -470,7 +468,6 @@ mod tests {
         let tool = Arc::new(tool);
         let ctx = || HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new());
         let call = |input: serde_json::Value| generative_model::ToolUse {
-            id: "t".into(),
             name: "session_meta".into(),
             input,
         };
@@ -548,7 +545,6 @@ mod tests {
         let got = tool
             .dispatch_tool_use(
                 generative_model::ToolUse {
-                    id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "executable_path"}),
                 },
@@ -571,7 +567,6 @@ mod tests {
         let got = Arc::new(tool)
             .dispatch_tool_use(
                 generative_model::ToolUse {
-                    id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "pid"}),
                 },

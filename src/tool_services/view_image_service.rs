@@ -103,7 +103,6 @@ mod tests {
     fn view(path: &str) -> ToolResult {
         futures::executor::block_on(Arc::new(ViewImageService::new()).dispatch_tool_use(
             ToolUse {
-                id: "t1".into(),
                 name: "view_image".into(),
                 input: json!({ "path": path }),
             },

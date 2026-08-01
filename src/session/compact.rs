@@ -201,7 +201,7 @@ mod tests {
     }
 
     fn assistant_tools() -> Message {
-        assistant_tool(None, "t1", "bash", json!({"command": "echo hi"}))
+        assistant_tool(None, "bash", json!({"command": "echo hi"}))
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
             assistant("old a"),
             user("mid"),
             assistant_tools(),
-            tool_results(&[("t1", "hi\n")]),
+            tool_results(&["hi\n"]),
             assistant("mid a"),
             user("new"),
             assistant("new a"),

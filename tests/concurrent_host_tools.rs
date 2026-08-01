@@ -12,9 +12,8 @@ use myco::{Agent, NullEventSink};
 use serde_json::json;
 use test_utils::{ScriptedModel, tool_text};
 
-fn bash_tool(id: &str, command: &str) -> ToolUse {
+fn bash_tool(command: &str) -> ToolUse {
     ToolUse {
-        id: id.into(),
         name: "bash".into(),
         input: json!({"command": command, "timeout_ms": 5000}),
     }
@@ -50,9 +49,9 @@ async fn agent_concurrent_host_bash_tools_complete() {
         scripted_turn(
             "",
             vec![
-                bash_tool("t1", "sleep 0.2; echo ONE"),
-                bash_tool("t2", "sleep 0.2; echo TWO"),
-                bash_tool("t3", "printf THREE"),
+                bash_tool("sleep 0.2; echo ONE"),
+                bash_tool("sleep 0.2; echo TWO"),
+                bash_tool("printf THREE"),
             ],
         ),
         scripted_turn("done", vec![]),
@@ -82,13 +81,8 @@ async fn agent_concurrent_host_bash_tools_complete() {
     match &history[2] {
         Message::ToolResults { tool_use_results } => {
             assert_eq!(tool_use_results.len(), 3);
-            for (i, id) in ["t1", "t2", "t3"].iter().enumerate() {
-                assert_eq!(tool_use_results[i].id, *id);
-                assert!(
-                    !tool_use_results[i].is_error,
-                    "tool {id} error: {:?}",
-                    tool_use_results[i]
-                );
+            for (i, result) in tool_use_results.iter().enumerate() {
+                assert!(!result.is_error, "tool {i} error: {result:?}");
             }
             let texts: Vec<String> = tool_use_results.iter().map(tool_text).collect();
             assert!(texts[0].contains("ONE"), "{}", texts[0]);
@@ -112,9 +106,8 @@ async fn agent_concurrent_bash_and_editor_complete() {
         scripted_turn(
             "",
             vec![
-                bash_tool("b1", "echo from-bash"),
+                bash_tool("echo from-bash"),
                 ToolUse {
-                    id: "e1".into(),
                     name: "str_replace_based_edit_tool".into(),
                     input: json!({
                         "command": "create",

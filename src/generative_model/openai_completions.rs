@@ -355,23 +355,24 @@ impl StreamAccumulator {
         let index = match self.slots.get(slot) {
             Some(Slot::ToolUse { index }) => index,
             _ => {
-                let id = call.id.unwrap_or_default();
                 let name = call
                     .function
                     .as_ref()
                     .and_then(|f| f.name.clone())
                     .unwrap_or_default();
-                if id.is_empty() || name.is_empty() {
-                    // Without both we would produce a tool result the provider
-                    // cannot match back to its call. Fail loud instead.
+                if name.is_empty() {
+                    // A nameless call cannot be dispatched or resent. Fail
+                    // loud instead. (The provider's call id is discarded:
+                    // history stores no tool ids; requests carry minted
+                    // positional ids.)
                     return Err(GenerateError::MalformedResponseError(format!(
                         "OpenAI Chat Completions: tool call at index {slot} started \
-                         without an id and name (id={id:?}, name={name:?})"
+                         without a name"
                     )));
                 }
                 let index = self.slots.open_tool_use(slot);
                 self.saw_tool_call = true;
-                out.push(MessagePart::ToolUseStart(ToolUseStart { index, id, name }));
+                out.push(MessagePart::ToolUseStart(ToolUseStart { index, name }));
                 index
             }
         };
@@ -546,8 +547,6 @@ struct ChatToolCallDelta {
     #[serde(default)]
     index: Option<usize>,
     #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
     function: Option<ChatToolCallFunctionDelta>,
 }
 
@@ -590,19 +589,18 @@ mod tests {
         let input = [
             assistant_tool(
                 Some("checking"),
-                "call_1",
                 "bash",
                 serde_json::json!({"command": "echo hi"}),
             ),
-            tool_results(&[("call_1", "hi\n")]),
+            tool_results(&["hi\n"]),
         ];
         let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
         assert_eq!(json[0]["role"], "assistant");
         assert_eq!(json[0]["content"], "checking");
-        // The wire carries the minted positional id, not the stored one; the
-        // tool reply names the same call.
+        // The wire carries a minted positional id; the tool reply names the
+        // same call.
         let call_id = json[0]["tool_calls"][0]["id"].as_str().unwrap();
-        assert_ne!(call_id, "call_1");
+        assert!(!call_id.is_empty());
         assert_eq!(json[0]["tool_calls"][0]["type"], "function");
         assert_eq!(json[0]["tool_calls"][0]["function"]["name"], "bash");
         assert_eq!(
@@ -623,7 +621,6 @@ mod tests {
                 redacted: false,
             }],
             tool_uses: vec![ToolUse {
-                id: "call_1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({}),
             }],
@@ -655,12 +652,10 @@ mod tests {
                 content: vec![],
                 tool_uses: vec![
                     ToolUse {
-                        id: "call_1".into(),
                         name: "view_image".into(),
                         input: serde_json::json!({}),
                     },
                     ToolUse {
-                        id: "call_2".into(),
                         name: "bash".into(),
                         input: serde_json::json!({}),
                     },
@@ -670,14 +665,12 @@ mod tests {
             Message::ToolResults {
                 tool_use_results: vec![
                     ToolResult {
-                        id: "call_1".into(),
                         content: vec![Content::Image {
                             source: "data:image/png;base64,AAAA".into(),
                         }],
                         is_error: false,
                     },
                     ToolResult {
-                        id: "call_2".into(),
                         content: vec![Content::Text { text: "ok".into() }],
                         is_error: false,
                     },
@@ -790,7 +783,7 @@ mod tests {
                 }]}}]
             })))
             .unwrap();
-        expect_tool_start(&items[0], 0, "call_1", "get_weather");
+        expect_tool_start(&items[0], 0, "get_weather");
         assert_eq!(items.len(), 1, "empty arguments must not emit a delta");
 
         for fragment in [r#"{"city""#, r#":"SF"}"#] {
@@ -828,11 +821,11 @@ mod tests {
         let starts: Vec<_> = items
             .iter()
             .filter_map(|p| match p {
-                MessagePart::ToolUseStart(start) => Some((start.index, start.id.as_str())),
+                MessagePart::ToolUseStart(start) => Some((start.index, start.name.as_str())),
                 _ => None,
             })
             .collect();
-        assert_eq!(starts, [(0, "call_1"), (1, "call_2")]);
+        assert_eq!(starts, [(0, "bash"), (1, "manual")]);
     }
 
     #[test]
@@ -872,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_without_id_or_name_is_malformed() {
+    fn tool_call_without_name_is_malformed() {
         let mut acc = StreamAccumulator::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -883,7 +876,7 @@ mod tests {
             .unwrap_err();
         match err {
             GenerateError::MalformedResponseError(msg) => {
-                assert!(msg.contains("without an id and name"), "{msg}");
+                assert!(msg.contains("without a name"), "{msg}");
             }
             other => panic!("expected MalformedResponseError, got {other:?}"),
         }
