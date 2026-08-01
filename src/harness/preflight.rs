@@ -84,8 +84,12 @@ pub struct StartupPreflight {
     /// Why the manual export failed, when it did. Agents are told in their
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
-    /// Set when the newest prelude version does not fit under `max_prelude_bytes`.
+    /// Set when the rendered prelude does not fit under `max_prelude_bytes`.
     pub prelude: Option<PreludeTruncation>,
+    /// Set when the prelude directory exists but could not be read, so this
+    /// session's agents run with an empty prelude (see
+    /// [`crate::prelude::read_failure`]).
+    pub prelude_unreadable: Option<String>,
     pub executables: ExecutableCheckReport,
     pub ssh: SshAgentPreflightReport,
 }
@@ -107,6 +111,10 @@ impl StartupPreflight {
         Self {
             manual: export_manual().err(),
             prelude: prelude_truncation(max_prelude_bytes),
+            prelude_unreadable: crate::prelude::dir()
+                .ok()
+                .as_deref()
+                .and_then(crate::prelude::read_failure),
             executables,
             ssh,
         }
@@ -115,6 +123,7 @@ impl StartupPreflight {
     pub fn has_problems(&self) -> bool {
         self.manual.is_some()
             || self.prelude.is_some()
+            || self.prelude_unreadable.is_some()
             || !self.executables.is_clean()
             || self.ssh.has_problems()
     }
@@ -130,6 +139,7 @@ impl StartupPreflight {
     pub fn warning_body(&self) -> String {
         let mut out = Vec::new();
         let _ = write_manual_body(self.manual.as_deref(), &mut out);
+        let _ = write_prelude_unreadable_body(self.prelude_unreadable.as_deref(), &mut out);
         let _ = write_prelude_body(self.prelude.as_ref(), &mut out);
         let _ = self.executables.write_body(&mut out);
         let _ = self.ssh.write_body(&mut out);
@@ -152,6 +162,23 @@ fn write_manual_body(failure: Option<&str>, out: &mut impl Write) -> std::io::Re
     writeln!(
         out,
         "agents cannot read the runtime docs this session; `myco --help <id>` still works"
+    )
+}
+
+/// Unreadable-prelude lines only (no rule/header); writes nothing when the
+/// directory reads, or is simply absent.
+fn write_prelude_unreadable_body(
+    failure: Option<&str>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    writeln!(out, "prelude directory unreadable: {failure}")?;
+    writeln!(
+        out,
+        "every agent this session runs with an empty prelude; `prelude` action=list \
+         will look empty too, so do not curate against it until this is fixed"
     )
 }
 
@@ -188,10 +215,10 @@ mod tests {
         ssh: SshAgentPreflightReport,
     ) -> StartupPreflight {
         StartupPreflight {
-            manual: None,
             prelude,
             executables: ExecutableCheckReport { missing },
             ssh,
+            ..Default::default()
         }
     }
 
@@ -340,17 +367,37 @@ mod tests {
         assert!(!out.contains("missing executable"), "{out}");
     }
 
+    /// An unreadable prelude directory is invisible from inside the prompt —
+    /// the agent just runs without it — so startup has to say so, and has to
+    /// warn the agent off curating against a `list` that looks empty.
+    #[test]
+    fn unreadable_prelude_directory_is_reported() {
+        let pf = StartupPreflight {
+            prelude_unreadable: Some("/home/u/.myco/workspace/prelude: permission denied".into()),
+            ..Default::default()
+        };
+        assert!(pf.has_problems());
+        let out = rendered(&pf);
+        assert!(
+            out.contains(
+                "prelude directory unreadable: /home/u/.myco/workspace/prelude: permission denied"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("runs with an empty prelude"), "{out}");
+        assert!(out.contains("do not curate against it"), "{out}");
+    }
+
     /// The prompt tells agents to read the exported files, so a failed export
     /// has to reach the user — nothing else this session will mention it.
     #[test]
     fn failed_manual_export_warns_first_and_names_the_path() {
         let pf = StartupPreflight {
             manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
-            prelude: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(false, |e| e.name != "tmux"),
             },
-            ssh: SshAgentPreflightReport::default(),
+            ..Default::default()
         };
         assert!(pf.has_problems());
         let out = rendered(&pf);

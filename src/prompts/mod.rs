@@ -330,10 +330,15 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 ///
 /// Blocks are ordered least to most volatile, because every agent's prompt
 /// carries them as a prefix: the manual path changes only when the binary
-/// does, the prelude only on a deliberate `prelude`-tool edit, project guidance
-/// only when the repo's own file does, while any new workspace file rewrites
-/// the listing. Keeping the churniest block last leaves the longest shared
-/// prefix for same-model forks to hit in the prompt cache.
+/// does, project guidance only when the repo's own file does, the prelude on
+/// every `prelude`-tool edit — which the workspace fragment asks agents to
+/// make eagerly, as they learn — while any new workspace file rewrites the
+/// listing. Keeping the churniest blocks last leaves the longest shared prefix
+/// for same-model forks to hit in the prompt cache.
+///
+/// Hence the prelude sits *after* project guidance: recording a finding must
+/// not invalidate the cached guidance block (up to `MAX_GUIDANCE_BYTES`) for
+/// every agent that follows.
 fn epilogue_with(
     home: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
@@ -344,16 +349,6 @@ fn epilogue_with(
         prompt.push_str(&manual_section(&crate::manual::dir(home)));
     }
     let workspace = home.map(|home| home.join("workspace"));
-    let prelude = workspace
-        .as_deref()
-        .and_then(|ws| capped_prelude(&ws.join("prelude"), max_prelude_bytes));
-    if let Some((prelude, _)) = prelude {
-        prompt.push_str(&format!(
-            "\n---\n\n# Prelude\n\n(entries under `~/.myco/workspace/prelude/`, a snapshot from when \
-             this agent's model was built — edit with the `prelude` tool; action=list shows the \
-             live state)\n\n{prelude}\n"
-        ));
-    }
     if let Some((name, mut guidance)) = cwd.as_deref().and_then(project_guidance) {
         cap_bytes(
             &mut guidance,
@@ -362,6 +357,16 @@ fn epilogue_with(
         );
         prompt.push_str(&format!(
             "\n---\n\n# Project guidance ({name})\n\n{guidance}\n"
+        ));
+    }
+    let prelude = workspace
+        .as_deref()
+        .and_then(|ws| capped_prelude(&ws.join("prelude"), max_prelude_bytes));
+    if let Some((prelude, _)) = prelude {
+        prompt.push_str(&format!(
+            "\n---\n\n# Prelude\n\n(entries under `~/.myco/workspace/prelude/`, a snapshot from when \
+             this agent's model was built — edit with the `prelude` tool; action=list shows the \
+             live state)\n\n{prelude}\n"
         ));
     }
     if let Some(listing) = workspace.as_deref().and_then(workspace_listing) {
@@ -907,11 +912,17 @@ mod tests {
         );
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
-        // Churniest block last: a new workspace file must not invalidate the
-        // prelude's or the guidance's share of the cached prefix. Anchor on the
-        // `---` delimiter — the fragment names both headings in its own prose.
+        // Least volatile first, so a write to one block never invalidates a
+        // steadier block's share of the cached prefix: guidance (changes with
+        // the repo file) before the prelude (changes on every eager recording)
+        // before the listing (changes on any workspace write). Anchor on the
+        // `---` delimiter — the fragment names the headings in its own prose.
         let block_at = |heading: &str| prompt.find(&format!("\n---\n\n{heading}")).unwrap();
         let listing_at = block_at("# Workspace Files\n");
+        assert!(
+            block_at("# Project guidance (") < block_at("# Prelude\n"),
+            "{prompt}"
+        );
         assert!(block_at("# Prelude\n") < listing_at, "{prompt}");
         assert!(block_at("# Project guidance (") < listing_at, "{prompt}");
 

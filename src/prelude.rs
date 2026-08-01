@@ -7,9 +7,9 @@
 //! each agent system prompt ([`crate::prompts`]); the root-only `prelude` tool
 //! ([`crate::tool_services::PreludeTool`]) is the edit path. The storage rules
 //! that keep concurrent agents safe on a weakly consistent filesystem live
-//! here: entries are written under a hidden temp name and renamed into place,
-//! never edited in place. Names are unique, so concurrent adds cannot
-//! collide, and two agents replacing the same entry leave two candidate
+//! here: entries are written under a hidden temp name claimed exclusively and
+//! renamed into place, never edited in place. Two agents adding at once get
+//! distinct entries, and two replacing the same entry leave two candidate
 //! entries (a duplicate to merge later) — never a lost one.
 
 use std::path::{Path, PathBuf};
@@ -35,8 +35,27 @@ pub fn is_entry_name(name: &str) -> bool {
         && !name.contains(['/', '\\'])
 }
 
+/// Why the prelude directory could not be read, when the failure is real.
+///
+/// A missing directory is the ordinary "nothing recorded yet" case and reads
+/// as `None`. Anything else — permissions, a broken mount, IO — means
+/// [`entries`] renders empty and every agent silently runs without the
+/// knowledge it is supposed to carry, which nothing downstream would ever
+/// mention. Startup calls this to warn instead
+/// ([`crate::harness::StartupPreflight`]).
+pub fn read_failure(dir: &Path) -> Option<String> {
+    match std::fs::read_dir(dir) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("{}: {e}", dir.display())),
+    }
+}
+
 /// All visible entries in filename order — the render order. Hidden names,
 /// non-`*.md` files, and whitespace-only entries are skipped.
+///
+/// Infallible by design: a prompt must still build when the directory is
+/// unreadable. [`read_failure`] is how that case reaches the user.
 pub fn entries(dir: &Path) -> Vec<PreludeEntry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -77,32 +96,55 @@ pub fn rendered_body(entries: &[PreludeEntry]) -> String {
 /// UTC timestamp plus random hex, so concurrent adds land side by side, and
 /// the write goes through a hidden temp name so a concurrently rendering
 /// process never sees a partial entry.
+///
+/// The temp name is claimed with `create_new`, which is what makes the
+/// uniqueness real rather than probabilistic: two processes that mint the same
+/// name in the same second both try to create the same temp file, exactly one
+/// wins, and the loser retries under a fresh name instead of silently
+/// overwriting the winner's bytes and dropping an entry.
 pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let body = format!("{}\n", text.trim_end());
-    // 4 random hex per attempt: a same-second collision is one in 65536, and
-    // an existing name is skipped, so the retry cap is unreachable in practice.
     for _ in 0..8 {
         let name = format!(
             "{}-{}.md",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
             &crate::core::uuid_simple_hex(uuid::Uuid::new_v4())[..4]
         );
-        let path = dir.join(&name);
-        if path.exists() {
+        if dir.join(&name).exists() {
             continue;
         }
-        let tmp = dir.join(format!(".tmp-{name}"));
-        std::fs::write(&tmp, &body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        return match std::fs::rename(&tmp, &path) {
-            Ok(()) => Ok(name),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(format!("rename {} into place: {e}", tmp.display()))
-            }
-        };
+        if write_entry(dir, &name, &body)? {
+            return Ok(name);
+        }
     }
     Err("could not pick a fresh prelude entry name".into())
+}
+
+/// Write `body` as entry `name`: claim a hidden temp exclusively, fill it,
+/// rename it into place. `Ok(false)` means another process already holds that
+/// temp name and the caller should retry under a fresh one — overwriting it
+/// would destroy bytes a concurrent add is mid-way through writing, and one of
+/// the two entries would vanish at rename time.
+fn write_entry(dir: &Path, name: &str, body: &str) -> Result<bool, String> {
+    let tmp = dir.join(format!(".tmp-{name}"));
+    let mut file = match std::fs::File::create_new(&tmp) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(format!("create {}: {e}", tmp.display())),
+    };
+    if let Err(e) = std::io::Write::write_all(&mut file, body.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    drop(file);
+    match std::fs::rename(&tmp, dir.join(name)) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("rename {} into place: {e}", tmp.display()))
+        }
+    }
 }
 
 /// Remove entry `name`. `Ok(false)` when it is already gone — a concurrent
@@ -170,6 +212,83 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that is merely absent is the ordinary empty case; one that
+    /// exists but cannot be read has to be distinguishable, since `entries`
+    /// renders both as "no prelude".
+    #[test]
+    fn read_failure_separates_absent_from_unreadable() {
+        let dir = temp_dir("read-failure");
+        assert_eq!(read_failure(&dir.join("nope")), None);
+        assert_eq!(read_failure(&dir), None);
+
+        // A file where the directory should be: readable path, unreadable as
+        // a directory — the same shape as a permissions or mount failure,
+        // without needing to drop privileges in a test.
+        let not_a_dir = dir.join("occupied");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        assert!(entries(&not_a_dir).is_empty());
+        let failure = read_failure(&not_a_dir).expect("a non-directory should report a failure");
+        assert!(failure.contains("occupied"), "{failure}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two adds that mint the same name must not both write the same temp
+    /// file: the loser reports "not mine" so the caller retries, instead of
+    /// overwriting bytes the winner is mid-write and losing an entry at
+    /// rename time.
+    #[test]
+    fn a_claimed_temp_name_is_refused_not_overwritten() {
+        let dir = temp_dir("temp-claim");
+        let name = "20260801T120000Z-abcd.md";
+        let tmp = dir.join(format!(".tmp-{name}"));
+        std::fs::write(&tmp, "another process is mid-write").unwrap();
+
+        assert_eq!(write_entry(&dir, name, "loser\n"), Ok(false));
+        // The winner's in-flight bytes are intact and nothing was published.
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            "another process is mid-write"
+        );
+        assert!(!dir.join(name).exists());
+
+        // With the temp free, the same name writes and publishes normally.
+        std::fs::remove_file(&tmp).unwrap();
+        assert_eq!(write_entry(&dir, name, "winner\n"), Ok(true));
+        assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), "winner\n");
+        assert!(
+            !tmp.exists(),
+            "temp should be renamed away, not left behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end-to-end property the write-once scheme exists for: agents adding
+    /// at the same moment all keep their entry.
+    #[test]
+    fn concurrent_adds_all_survive() {
+        let dir = temp_dir("concurrent-add");
+        const WRITERS: usize = 16;
+
+        std::thread::scope(|scope| {
+            for i in 0..WRITERS {
+                let dir = &dir;
+                scope.spawn(move || add_entry(dir, &format!("entry {i}")).unwrap());
+            }
+        });
+
+        let found = entries(&dir);
+        assert_eq!(found.len(), WRITERS, "{found:?}");
+        let mut texts: Vec<&str> = found.iter().map(|e| e.text.as_str()).collect();
+        texts.sort();
+        let mut want: Vec<String> = (0..WRITERS).map(|i| format!("entry {i}")).collect();
+        want.sort();
+        assert_eq!(texts, want);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
