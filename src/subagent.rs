@@ -88,7 +88,7 @@ impl SubagentTool {
         let start = *turns.borrow();
         child
             .tx
-            .send(input.prompt)
+            .send(crate::server::Cmd::User(input.prompt))
             .map_err(|_| "child agent task gone".to_string())?;
 
         // Wait for the child's turn, staying cancellable: cancelling the

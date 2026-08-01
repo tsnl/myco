@@ -24,7 +24,7 @@ use rocket::serde::json::Json;
 use rocket::{State, delete, get, post, routes};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
-use myco_agent::{Agent, AgentEvent, EventSink};
+use myco_agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
 use myco_config::Config;
 use myco_machines::harness::{Harness, StartupPreflight};
 use myco_machines::tool_services::{
@@ -32,6 +32,7 @@ use myco_machines::tool_services::{
 };
 use myco_models::{
     BackendConfig, CatalogModel, Content, Effort, GenerativeModel, GenerativeModelConfig, Message,
+    Recovery,
 };
 use myco_session::{
     ActiveSession, Session, SessionWriteLock, expand_image_attachments, list_sessions,
@@ -52,35 +53,120 @@ const SESSION_LIST_LIMIT: usize = 200;
 /// block the agent.
 const EVENT_BUFFER: usize = 1024;
 
+/// Auto-compact when a turn ends with the context this full. A failed compact
+/// re-triggers after the next turn — visibly, via `TurnFailed`.
+const AUTO_COMPACT_FRACTION: f64 = 0.85;
+
 // ---------------------------------------------------------------------------
 // Supervisor
 // ---------------------------------------------------------------------------
+
+/// What a [`ModelFactory`] is building a model for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPurpose {
+    /// The session's own agent.
+    Agent,
+    /// A compaction worker summarizing the named session.
+    Compactor,
+}
+
+/// The seam between the server and model construction: tests inject scripted
+/// models here; production uses [`Supervisor::new`]'s real factory.
+pub type ModelFactory = Box<
+    dyn Fn(
+            ModelPurpose,
+            &str,
+            &CatalogModel,
+            &Harness,
+            usize,
+        ) -> Result<Arc<dyn GenerativeModel>, String>
+        + Send
+        + Sync,
+>;
 
 /// Owns the live-session table. Shared by the HTTP routes and the `subagent`
 /// tool (which spawns children through it).
 pub struct Supervisor {
     config: Config,
     live: Mutex<HashMap<String, Arc<Live>>>,
+    model_factory: ModelFactory,
+}
+
+impl Supervisor {
+    pub fn new(config: Config) -> Arc<Self> {
+        Self::with_model_factory(config, Box::new(default_model_factory))
+    }
+
+    /// Test/embedder constructor: models come from `factory` instead of the
+    /// provider backends.
+    pub fn with_model_factory(config: Config, factory: ModelFactory) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            live: Mutex::new(HashMap::new()),
+            model_factory: factory,
+        })
+    }
+}
+
+fn default_model_factory(
+    purpose: ModelPurpose,
+    _session_id: &str,
+    catalog_model: &CatalogModel,
+    harness: &Harness,
+    max_soul_bytes: usize,
+) -> Result<Arc<dyn GenerativeModel>, String> {
+    match purpose {
+        ModelPurpose::Agent => build_model(catalog_model, harness, max_soul_bytes),
+        ModelPurpose::Compactor => myco_models::new(GenerativeModelConfig {
+            model: catalog_model.spec.clone(),
+            tools: harness.tool_specs(),
+            system_prompt: myco_agent::compactor_system_prompt(catalog_model, max_soul_bytes),
+            backend_config: catalog_model.backend.clone(),
+        })
+        .map_err(|e| format!("failed to create compactor model: {e}")),
+    }
+}
+
+/// One queued unit of work for a session's agent task.
+pub(crate) enum Cmd {
+    /// One user turn.
+    User(String),
+    /// Compact into a successor session (also queued automatically when a
+    /// turn ends with the context nearly full).
+    Compact,
 }
 
 /// One resident conversation: its agent task's input queue and shared handles.
 pub(crate) struct Live {
     pub(crate) session: ActiveSession,
-    pub(crate) tx: mpsc::UnboundedSender<String>,
+    pub(crate) tx: mpsc::UnboundedSender<Cmd>,
     busy: Arc<AtomicBool>,
     cancel: Mutex<CancelToken>,
     /// Completed-turn counter; `subagent` waits on it.
     pub(crate) turns: watch::Receiver<u64>,
     /// SSE feed (see [`BroadcastSink`]).
     events: broadcast::Sender<api::StreamEvent>,
-    /// Held for the lifetime of the live session; `None` when flock is
-    /// unavailable on this filesystem.
-    _lock: Option<SessionWriteLock>,
+    /// Why the most recent turn produced nothing; cleared at turn start.
+    last_error: std::sync::Mutex<Option<String>>,
+    /// Held for the lifetime of the live session; swapped on compaction;
+    /// `None` when flock is unavailable on this filesystem.
+    lock: std::sync::Mutex<Option<SessionWriteLock>>,
 }
 
 impl Live {
     pub(crate) async fn cancel_turn(&self) {
         self.cancel.lock().await.cancel();
+    }
+
+    fn set_error(&self, msg: Option<String>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+    }
+
+    fn error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -143,7 +229,13 @@ impl Supervisor {
         let (events, _) = broadcast::channel::<api::StreamEvent>(EVENT_BUFFER);
         let sink = Arc::new(BroadcastSink { tx: events.clone() }) as Arc<dyn EventSink>;
 
-        let model = build_model(catalog_model, &harness, self.config.max_soul_bytes)?;
+        let model = (self.model_factory)(
+            ModelPurpose::Agent,
+            &id,
+            catalog_model,
+            &harness,
+            self.config.max_soul_bytes,
+        )?;
         let mut agent = Agent::new(model, harness.clone(), sink);
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
         let restored = active.snapshot();
@@ -151,7 +243,7 @@ impl Supervisor {
         agent.set_last_usage(restored.last_usage);
         wire_checkpoint(&mut agent, &active);
 
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
         let (turn_tx, turns) = watch::channel(0u64);
         let busy = Arc::new(AtomicBool::new(false));
         let handle = Arc::new(Live {
@@ -161,21 +253,23 @@ impl Supervisor {
             cancel: Mutex::new(CancelToken::new()),
             turns,
             events: events.clone(),
-            _lock: lock,
+            last_error: std::sync::Mutex::new(None),
+            lock: std::sync::Mutex::new(lock),
         });
         live.insert(id.clone(), handle.clone());
 
-        let max_image_bytes = catalog_model.spec.max_image_base64_bytes;
-        tokio::spawn(run_agent_task(
+        tokio::spawn(run_agent_task(AgentTask {
+            supervisor: Arc::downgrade(self),
             agent,
             active,
             rx,
             busy,
-            handle.clone(),
+            handle: handle.clone(),
             turn_tx,
             events,
-            max_image_bytes,
-        ));
+            catalog_model: catalog_model.clone(),
+            harness,
+        }));
         Ok(handle)
     }
 
@@ -259,70 +353,227 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
         .merge(("address", "127.0.0.1"))
         .merge(("port", port));
 
-    rocket::custom(figment)
-        .manage(Arc::new(Supervisor {
-            config,
-            live: Mutex::new(HashMap::new()),
-        }))
-        .mount(
-            "/api",
-            routes![
-                list,
-                create,
-                detail,
-                post_message,
-                poll,
-                events,
-                cancel,
-                archive,
-                models
-            ],
-        )
+    rocket(Supervisor::new(config), figment)
         .launch()
         .await
         .map_err(|e| format!("rocket: {e}"))?;
     Ok(())
 }
 
-/// The per-session agent task: pop queued user messages, run one turn each.
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_task(
-    mut agent: Agent,
+/// The Rocket instance serving `/api` for `sup` — separated from [`serve`] so
+/// tests drive it with `rocket::local` clients.
+pub fn rocket(
+    sup: Arc<Supervisor>,
+    figment: rocket::figment::Figment,
+) -> rocket::Rocket<rocket::Build> {
+    rocket::custom(figment).manage(sup).mount(
+        "/api",
+        routes![
+            list,
+            create,
+            detail,
+            post_message,
+            poll,
+            events,
+            cancel,
+            compact,
+            archive,
+            models
+        ],
+    )
+}
+
+/// Everything a session's agent task owns.
+struct AgentTask {
+    supervisor: std::sync::Weak<Supervisor>,
+    agent: Agent,
     active: ActiveSession,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    rx: mpsc::UnboundedReceiver<Cmd>,
     busy: Arc<AtomicBool>,
     handle: Arc<Live>,
     turn_tx: watch::Sender<u64>,
     events: broadcast::Sender<api::StreamEvent>,
-    max_image_bytes: u64,
-) {
-    while let Some(text) = rx.recv().await {
-        busy.store(true, Ordering::Relaxed);
-        let _ = events.send(api::StreamEvent::TurnStarted);
-        let _ = active.maybe_auto_title_from_user_text(&text);
+    catalog_model: CatalogModel,
+    harness: Arc<Harness>,
+}
+
+/// The per-session agent task: pop queued commands, run one turn each.
+async fn run_agent_task(mut t: AgentTask) {
+    while let Some(cmd) = t.rx.recv().await {
+        t.busy.store(true, Ordering::Relaxed);
+        t.handle.set_error(None);
+        let _ = t.events.send(api::StreamEvent::TurnStarted);
 
         // Fresh token per turn so one cancel doesn't poison the next turn.
         let cancel = CancelToken::new();
-        *handle.cancel.lock().await = cancel.clone();
+        *t.handle.cancel.lock().await = cancel.clone();
 
-        // `@path` image mentions expand exactly like the v1 CLI.
-        let content = match expand_image_attachments(&text, max_image_bytes) {
-            Ok(content) => content,
-            Err(_) => vec![Content::Text { text: text.clone() }],
-        };
+        match cmd {
+            Cmd::User(text) => run_user_turn(&mut t, text, cancel).await,
+            Cmd::Compact => run_compact(&mut t, cancel).await,
+        }
 
-        if let Err(e) = agent.interact(content, cancel).await {
-            eprintln!("[{}] agent turn error: {e}", active.id());
-        }
-        if let Err(e) = active.persist_messages(agent.history(), agent.last_usage(), true) {
-            eprintln!("[{}] session save failed: {e}", active.id());
-        }
-        busy.store(false, Ordering::Relaxed);
-        turn_tx.send_modify(|n| *n += 1);
+        t.busy.store(false, Ordering::Relaxed);
+        t.turn_tx.send_modify(|n| *n += 1);
         // Belt and braces: the Agent emits TurnFinished on clean turns; this
         // covers errored ones so clients always get their refetch trigger.
-        let _ = events.send(api::StreamEvent::TurnFinished);
+        let _ = t.events.send(api::StreamEvent::TurnFinished);
     }
+}
+
+async fn run_user_turn(t: &mut AgentTask, text: String, cancel: CancelToken) {
+    let _ = t.active.maybe_auto_title_from_user_text(&text);
+
+    // `@path` image mentions expand exactly like the v1 CLI.
+    let max_image_bytes = t.catalog_model.spec.max_image_base64_bytes;
+    let mut content = match expand_image_attachments(&text, max_image_bytes) {
+        Ok(content) => content,
+        Err(_) => vec![Content::Text { text: text.clone() }],
+    };
+
+    // One retry for provider blips; other failures surface immediately.
+    let mut retried = false;
+    let error = loop {
+        match t.agent.interact(content.clone(), cancel.clone()).await {
+            Ok(_) => break None,
+            Err(myco_agent::AgentInteractionError::Cancelled) => {
+                break Some("(turn cancelled)".to_string());
+            }
+            Err(e) => match e.recovery() {
+                Recovery::Retry if !retried && !cancel.is_cancelled() => {
+                    // Take the user turn back out so the retry resubmits it.
+                    if let Some(dropped) = t.agent.rewind_last_user_turn() {
+                        content = dropped;
+                    }
+                    retried = true;
+                    continue;
+                }
+                Recovery::OmitLastMessage => {
+                    // Too-large request: every later turn resends it, so drop
+                    // it rather than leave the session unable to continue.
+                    t.agent.rewind_last_user_turn();
+                    break Some(format!(
+                        "{e}
+
+The last message was removed from the conversation so the                          session can continue."
+                    ));
+                }
+                _ => break Some(e.to_string()),
+            },
+        }
+    };
+
+    if let Some(msg) = error {
+        eprintln!("[{}] agent turn error: {msg}", t.active.id());
+        t.handle.set_error(Some(msg.clone()));
+        let _ = t.events.send(api::StreamEvent::TurnFailed { message: msg });
+    }
+    if let Err(e) = t
+        .active
+        .persist_messages(t.agent.history(), t.agent.last_usage(), true)
+    {
+        eprintln!("[{}] session save failed: {e}", t.active.id());
+    }
+
+    // Auto-compact: queue it when the context is nearly full, so the next
+    // thing this task does is shrink the session.
+    if let Some(usage) = t.agent.last_usage() {
+        let window = t.agent.context_window_tokens();
+        if window > 0 && usage.context_tokens() as f64 >= window as f64 * AUTO_COMPACT_FRACTION {
+            let _ = t.handle.tx.send(Cmd::Compact);
+        }
+    }
+}
+
+/// `Cmd::Compact`: run the worker, then swap this task's session, history,
+/// lock, and live-table entry over to the successor (the v1 `/compact`
+/// lifecycle, server-side).
+async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
+    let fail = |t: &AgentTask, msg: String| {
+        eprintln!("[{}] compact: {msg}", t.active.id());
+        t.handle.set_error(Some(format!("compact: {msg}")));
+        let _ = t.events.send(api::StreamEvent::TurnFailed {
+            message: format!("compact: {msg}"),
+        });
+    };
+
+    let Some(sup) = t.supervisor.upgrade() else {
+        return;
+    };
+    if let Err(e) = t
+        .active
+        .persist_messages(t.agent.history(), t.agent.last_usage(), true)
+    {
+        fail(t, format!("failed to persist current session: {e}"));
+        return;
+    }
+    let predecessor = t.active.snapshot();
+    if predecessor.messages.is_empty() {
+        fail(t, "session is empty".into());
+        return;
+    }
+
+    let model = match (sup.model_factory)(
+        ModelPurpose::Compactor,
+        &predecessor.id,
+        &t.catalog_model,
+        &t.harness,
+        sup.config.max_soul_bytes,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            fail(t, e);
+            return;
+        }
+    };
+    let (successor, outcome) = match run_compact_worker(
+        &predecessor,
+        &t.catalog_model,
+        t.harness.clone(),
+        model,
+        cancel,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(CompactWorkerError::Cancelled) => {
+            fail(t, "cancelled (session unchanged)".into());
+            return;
+        }
+        Err(CompactWorkerError::Failed(reason)) => {
+            fail(t, reason);
+            return;
+        }
+    };
+
+    // Relock under the successor's id, then switch this task over.
+    let new_lock = match SessionWriteLock::acquire(&successor.id) {
+        Ok(lock) => Some(lock),
+        Err(myco_session::SessionLockError::Busy { path }) => {
+            fail(
+                t,
+                format!("successor is locked elsewhere ({})", path.display()),
+            );
+            return;
+        }
+        Err(myco_session::SessionLockError::Unavailable(_)) => None,
+    };
+    t.active.replace(successor.clone());
+    t.agent.set_history(successor.messages.clone());
+    t.agent.set_last_usage(successor.last_usage);
+    *t.handle.lock.lock().unwrap_or_else(|e| e.into_inner()) = new_lock;
+
+    // Re-key the live table: the conversation now answers to the new id.
+    {
+        let mut live = sup.live.lock().await;
+        if let Some(entry) = live.remove(&outcome.predecessor_id) {
+            live.insert(outcome.successor_id.clone(), entry);
+        }
+    }
+    let _ = t.events.send(api::StreamEvent::Compacted {
+        predecessor: outcome.predecessor_id,
+        successor: outcome.successor_id,
+    });
 }
 
 /// Persist agent history at replayable mid-turn boundaries (after the user
@@ -557,7 +808,7 @@ async fn post_message(
         Ok(l) => l,
         Err(e) => return err(rocket::http::Status::Conflict, e),
     };
-    if live.tx.send(req.text.clone()).is_err() {
+    if live.tx.send(Cmd::User(req.text.clone())).is_err() {
         return err(rocket::http::Status::InternalServerError, "agent task gone");
     }
     let snapshot = live.session.snapshot();
@@ -565,6 +816,7 @@ async fn post_message(
         busy: true,
         total: render_entries(&snapshot.messages).len(),
         entries: Vec::new(),
+        last_error: None,
     }))
 }
 
@@ -582,12 +834,17 @@ async fn poll(
         },
     };
     let (_, busy) = sup.live_flags(&session.id).await;
+    let last_error = match sup.get_live(&session.id).await {
+        Some(l) => l.error(),
+        None => None,
+    };
     let all = render_entries(&session.messages);
     let since = since.unwrap_or(0).min(all.len());
     Ok(Json(api::Poll {
         busy,
         total: all.len(),
         entries: all[since..].to_vec(),
+        last_error,
     }))
 }
 
@@ -626,10 +883,30 @@ async fn cancel(sup: &State<Arc<Supervisor>>, id: &str) -> ApiResult<api::Poll> 
                 busy: l.busy.load(Ordering::Relaxed),
                 total: render_entries(&snapshot.messages).len(),
                 entries: Vec::new(),
+                last_error: l.error(),
             }))
         }
         None => err(rocket::http::Status::NotFound, "session not live"),
     }
+}
+
+/// Queue a compaction: the agent task summarizes the session into a
+/// successor (new id — watch for `StreamEvent::Compacted`).
+#[post("/sessions/<id>/compact")]
+async fn compact(sup: &State<Arc<Supervisor>>, id: &str) -> ApiResult<api::Poll> {
+    let live = match sup.ensure_live(id, None).await {
+        Ok(l) => l,
+        Err(e) => return err(rocket::http::Status::Conflict, e),
+    };
+    if live.tx.send(Cmd::Compact).is_err() {
+        return err(rocket::http::Status::InternalServerError, "agent task gone");
+    }
+    Ok(Json(api::Poll {
+        busy: true,
+        total: 0,
+        entries: Vec::new(),
+        last_error: None,
+    }))
 }
 
 /// Retire the live agent task (the session stays on disk and resumable).
@@ -643,6 +920,7 @@ async fn archive(sup: &State<Arc<Supervisor>>, id: &str) -> ApiResult<api::Poll>
                 busy: false,
                 total: 0,
                 entries: Vec::new(),
+                last_error: None,
             }))
         }
         None => err(rocket::http::Status::NotFound, "session not live"),

@@ -14,7 +14,9 @@
 use std::sync::Arc;
 
 mod compact_worker;
-pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
+pub use compact_worker::{
+    CompactWorkerError, compact_subagent_prompt, compactor_system_prompt, run_compact_worker,
+};
 
 use futures::future;
 

@@ -32,7 +32,7 @@ a host worker (local in-process or remote).
 
 **Runtime docs are markdown files on disk** — see *Manual* below for the directory this build
 exported them to. Read and search them with the tools you already have (`rg`, the editor);
-`index.md` names the articles: `overview.md`, `cli.md`, `harness-ops.md`.
+`index.md` names the articles: `overview.md`, `api.md`, `harness-ops.md`.
 
 Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
