@@ -56,6 +56,37 @@ pub struct GatewayEntry {
     /// Credential (see [`AuthEntry`]). Absent → no auth header.
     #[serde(default)]
     pub auth: Option<AuthEntry>,
+    /// `[gateways.NAME.retry]`: transient-failure retry for this endpoint.
+    /// Absent → [`crate::generative_model::RetryPolicy::default`].
+    #[serde(default)]
+    pub retry: Option<RetryEntry>,
+}
+
+/// `[gateways.NAME.retry]` / `[models.KEY.retry]`: how a driver retries a
+/// request that failed before any of the response streamed.
+///
+/// Per *endpoint*, not per model, because what is being tuned is one gateway's
+/// tolerance for connection blips and its rate-limit behaviour. A model entry
+/// may still set it — that is the only way for a gateway-less (inline) model to
+/// configure retry, and it follows the same override rule as `auth`.
+///
+/// Every field is optional; each unset one falls back to the corresponding
+/// [`crate::generative_model::RetryPolicy`] default.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryEntry {
+    /// Total attempts including the first. `1` disables retry entirely.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Wait before the second attempt; doubles (or `backoff_multiplier`s) after.
+    #[serde(default)]
+    pub initial_backoff_ms: Option<u64>,
+    /// Ceiling on any single wait, including one a provider's `Retry-After` asks for.
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
+    /// Growth factor between successive waits.
+    #[serde(default)]
+    pub backoff_multiplier: Option<f64>,
 }
 
 /// `[models.KEY]`: one catalog entry. `gateway` pulls `protocol` / `base_url`
@@ -100,6 +131,10 @@ pub struct ModelEntry {
     /// one that never truncates never reaches it.
     #[serde(default)]
     pub max_truncated_resumes: Option<u32>,
+    /// Retry override for a model served without a gateway, or one whose
+    /// gateway policy does not suit it. Absent → the gateway's.
+    #[serde(default)]
+    pub retry: Option<RetryEntry>,
 }
 
 /// The `auth` value on a gateway or model entry.

@@ -38,13 +38,14 @@ use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
     AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
-    OpenAIBackendConfig, Protocol, ThinkingMode,
+    OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
 };
 use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
 pub mod file;
 pub use file::{
-    AuthEntry, FileConfig, GatewayEntry, ModelEntry, load_file_config, parse_file_config_str,
+    AuthEntry, FileConfig, GatewayEntry, ModelEntry, RetryEntry, load_file_config,
+    parse_file_config_str,
 };
 
 /// Default per-generate output token cap when a model entry sets none.
@@ -499,11 +500,13 @@ fn resolve_catalog(
                 .unwrap_or(DEFAULT_MAX_TRUNCATED_RESUMES),
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)));
         let backend = match protocol {
             Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
                 anthropic_base_url: base_url,
                 anthropic_auth_token: token,
                 max_tokens_per_generate: max_output,
+                retry,
                 ..Default::default()
             }),
             // Both OpenAI dialects take the same settings; the variant only
@@ -513,6 +516,7 @@ fn resolve_catalog(
                     base_url,
                     auth_token: token,
                     max_output_tokens: Some(max_output),
+                    retry,
                     ..Default::default()
                 };
                 match protocol {
@@ -533,6 +537,28 @@ fn resolve_catalog(
     }
 
     Ok(ModelCatalog::new(entries))
+}
+
+/// Overlay a [`RetryEntry`] onto [`RetryPolicy::default`] field by field, so
+/// setting one knob does not silently reset the others.
+///
+/// `max_attempts` is clamped to at least 1: `0` reads as "do not retry", not
+/// "never send the request".
+fn resolve_retry(entry: Option<RetryEntry>) -> RetryPolicy {
+    let base = RetryPolicy::default();
+    let Some(entry) = entry else { return base };
+    RetryPolicy {
+        max_attempts: entry.max_attempts.unwrap_or(base.max_attempts).max(1),
+        initial_backoff: entry
+            .initial_backoff_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(base.initial_backoff),
+        max_backoff: entry
+            .max_backoff_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(base.max_backoff),
+        backoff_multiplier: entry.backoff_multiplier.unwrap_or(base.backoff_multiplier),
+    }
 }
 
 /// `--model` → config file `model` → sole catalog entry. The chosen key must
@@ -969,6 +995,12 @@ protocol = "anthropic-messages"
 base_url = "https://api.anthropic.com"
 auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
 
+[gateways.anthropic.retry]
+max_attempts = 5
+initial_backoff_ms = 500
+max_backoff_ms = 60_000
+backoff_multiplier = 2.0
+
 [models."grok-4.5-build"]
 gateway = "xai"
 context_window = 500_000
@@ -1076,6 +1108,84 @@ context_window = 1000
         let err = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
         assert!(err.contains("model `x`"), "{err}");
         assert!(err.contains("base_url is empty"), "{err}");
+    }
+
+    /// Retry follows `auth`'s override rule — the model's table replaces the
+    /// gateway's outright — while each *unset field* falls back to the built-in
+    /// default rather than to the gateway.
+    #[test]
+    fn retry_overlays_defaults_and_a_model_table_replaces_the_gateways() {
+        let toml_text = r#"
+model = "inherits"
+
+[gateways.g]
+protocol = "openai-responses"
+base_url = "https://h"
+
+[gateways.g.retry]
+max_attempts = 7
+initial_backoff_ms = 250
+
+[models.inherits]
+gateway = "g"
+context_window = 1000
+
+[models.overrides]
+gateway = "g"
+context_window = 1000
+
+[models.overrides.retry]
+max_attempts = 2
+
+[models.bare]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        let retry_of = |key: &str| match &cfg.models.get(key).unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => b.retry,
+            other => panic!("unexpected backend {other:?}"),
+        };
+        let default = crate::generative_model::RetryPolicy::default();
+
+        // Gateway values apply; fields it left unset keep their defaults.
+        let inherits = retry_of("inherits");
+        assert_eq!(inherits.max_attempts, 7);
+        assert_eq!(
+            inherits.initial_backoff,
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(inherits.max_backoff, default.max_backoff);
+        assert_eq!(inherits.backoff_multiplier, default.backoff_multiplier);
+
+        // The model's own table wins wholesale: the gateway's 250ms is gone,
+        // and the unset field falls back to the default, not to the gateway.
+        let overrides = retry_of("overrides");
+        assert_eq!(overrides.max_attempts, 2);
+        assert_eq!(overrides.initial_backoff, default.initial_backoff);
+
+        // Configured nowhere → the built-in policy.
+        assert_eq!(retry_of("bare"), default);
+    }
+
+    /// `max_attempts = 0` reads as "do not retry", not "never send".
+    #[test]
+    fn zero_retry_attempts_still_sends_once() {
+        let toml_text = r#"
+[models.x]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+
+[models.x.retry]
+max_attempts = 0
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        match &cfg.models.get("x").unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => assert_eq!(b.retry.max_attempts, 1),
+            other => panic!("unexpected backend {other:?}"),
+        }
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct AnthropicBackendConfig {
     pub anthropic_auth_token: String,
     pub max_tokens_per_generate: usize,
     pub debug_dump_api_requests: bool,
+    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
+    #[serde(default)]
+    pub retry: RetryPolicy,
     /// When set, enables Anthropic extended thinking at this effort level.
     ///
     /// The request shape follows the model's [`ThinkingMode`]: `adaptive` sends
@@ -39,6 +42,7 @@ impl Default for AnthropicBackendConfig {
             anthropic_auth_token: String::new(),
             max_tokens_per_generate: 8192,
             debug_dump_api_requests: false,
+            retry: RetryPolicy::default(),
             effort: Some(Effort::DEFAULT),
         }
     }
@@ -145,6 +149,7 @@ impl GenerativeModel for AnthropicGenerativeModel {
             StreamAccumulator::default(),
             "Anthropic",
             self.backend.debug_dump_api_requests,
+            self.backend.retry,
         )
     }
 }
