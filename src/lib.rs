@@ -6,6 +6,7 @@ pub mod generative_model;
 pub mod harness;
 pub mod host;
 pub mod manual;
+pub mod prelude;
 pub mod prompts;
 pub mod session;
 pub mod session_browser;
@@ -33,5 +34,6 @@ pub use session::{
     SessionLink, SessionListEntry, compact_session, link_compact_pair, select_tail,
 };
 pub use tool_services::{
-    HostDispatchContext, ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
+    HostDispatchContext, ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool,
+    ToolService,
 };

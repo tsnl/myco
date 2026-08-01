@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// myco's data root: `$MYCO_HOME` when set to a non-empty value, else
-/// `~/.myco`. Sessions, the soul, the exported manual and the config all hang
+/// `~/.myco`. Sessions, the prelude, the exported manual and the config all hang
 /// off this.
 ///
 /// `$MYCO_HOME` is what tests point at a scratch directory, so nothing that

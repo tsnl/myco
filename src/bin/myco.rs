@@ -25,8 +25,8 @@ use myco::tui::{
 };
 use myco::{
     Agent, AgentEvent, ColorMode, Config, ConfigUserSettings, EventSink, Harness,
-    ListRecentService, SessionHistoryTool, SessionKind, SessionMetaTool, StartupPreflight,
-    TraceContext, WrapMode, prompts,
+    ListRecentService, PreludeTool, SessionHistoryTool, SessionKind, SessionMetaTool,
+    StartupPreflight, TraceContext, WrapMode, prompts,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -591,12 +591,14 @@ async fn boot<S: EventSink + 'static>(
     // OpenSSH tools when remotes are configured), then unlock SSH identities
     // via the existing ssh-agent before attach — remote hosts use
     // `ssh -o BatchMode=yes` (NDJSON pipe is not a TTY), so OpenSSH must never
-    // need to prompt on the host pipe. Also checks whether the soul the agent
-    // is about to run with fits under `max_soul_bytes`. Problems are reported
+    // need to prompt on the host pipe. Also checks whether the prelude the agent
+    // is about to run with fits under `max_prelude_bytes`. Problems are reported
     // by the caller (interactive: WARNING block after the banner; print:
     // stderr), not here.
-    let preflight =
-        StartupPreflight::run(&app_config.harness.remote_hosts, app_config.max_soul_bytes);
+    let preflight = StartupPreflight::run(
+        &app_config.harness.remote_hosts,
+        app_config.max_prelude_bytes,
+    );
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));
@@ -614,10 +616,12 @@ async fn boot<S: EventSink + 'static>(
         Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;
     let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
+    let prelude_tool =
+        Arc::new(PreludeTool::new(app_config.max_prelude_bytes)) as Arc<dyn myco::ToolService>;
     let harness = attach_harness_or_exit(
         &app_config,
         &preflight,
-        vec![session_tool, history_tool, list_recent_tool],
+        vec![session_tool, history_tool, list_recent_tool, prelude_tool],
     )
     .await;
 
@@ -626,7 +630,7 @@ async fn boot<S: EventSink + 'static>(
         &harness,
         args.debug_dump_api_requests,
         args.effort,
-        app_config.max_soul_bytes,
+        app_config.max_prelude_bytes,
     );
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
@@ -718,7 +722,7 @@ async fn run_interactive(args: Args) {
         wrap,
         wrap_max: app_config.wrap_max,
         repaint: app_config.repaint_enabled,
-        max_soul_bytes: app_config.max_soul_bytes,
+        max_prelude_bytes: app_config.max_prelude_bytes,
         ui: ui.clone(),
         turn_cancel: TurnCancel::default(),
         forked: args.fork,
@@ -744,7 +748,7 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
-    max_soul_bytes: usize,
+    max_prelude_bytes: usize,
 ) -> Arc<dyn generative_model::GenerativeModel> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
@@ -768,7 +772,7 @@ fn build_model(
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
-            prompts::agent_prompt_epilogue(max_soul_bytes),
+            prompts::agent_prompt_epilogue(max_prelude_bytes),
             prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
@@ -875,7 +879,7 @@ struct ReplSession {
     wrap: Option<usize>,
     wrap_max: Option<usize>,
     repaint: bool,
-    max_soul_bytes: usize,
+    max_prelude_bytes: usize,
     ui: Arc<TuiProducer>,
     turn_cancel: TurnCancel,
     /// This run started as a context fork, whose inherited first message
@@ -1180,7 +1184,7 @@ impl ReplSession {
             &predecessor,
             &self.catalog_model,
             self.harness.clone(),
-            self.max_soul_bytes,
+            self.max_prelude_bytes,
             cancel,
         )
         .await;
@@ -1365,7 +1369,7 @@ impl ReplSession {
                             &self.harness,
                             self.debug_dump_api_requests,
                             self.effort,
-                            self.max_soul_bytes,
+                            self.max_prelude_bytes,
                         );
                         self.agent.set_model(model);
                         self.agent.set_context_window_tokens(

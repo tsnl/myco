@@ -1,7 +1,7 @@
 //! On-disk config file shape (`~/.myco/config.toml`).
 //!
 //! Parse only: the model catalog (`[gateways]` / `[models]`, default `model`)
-//! and scalar knobs (`attach_timeout_secs`, `max_soul_bytes`). Scalar knobs parse as `Option`
+//! and scalar knobs (`attach_timeout_secs`, `max_prelude_bytes`). Scalar knobs parse as `Option`
 //! so "unset" stays distinguishable from "explicitly set"; every default is
 //! applied once, at resolve time in [`crate::config::Config`]. Remote hosts
 //! are not configured here — they come from `Host` aliases in `~/.ssh/config`
@@ -35,13 +35,12 @@ pub struct FileConfig {
     /// resolve. (Config key kept as `attach_timeout_secs`.)
     #[serde(default)]
     pub attach_timeout_secs: Option<u64>,
-    /// Cap on the soul text appended to every agent system prompt
-    /// (`workspace/soul/`, newest version). A longer version is cut to this
-    /// many bytes with a marker, and startup warns loudly that it happened.
-    /// `None` = unset; [`crate::prompts::DEFAULT_MAX_SOUL_BYTES`] applies at
-    /// resolve.
+    /// Cap on the rendered prelude (`workspace/prelude/` entries) appended to every
+    /// agent system prompt. A longer prelude is cut to this many bytes with a
+    /// marker, and startup warns loudly that it happened. `None` = unset;
+    /// [`crate::prompts::DEFAULT_MAX_PRELUDE_BYTES`] applies at resolve.
     #[serde(default)]
-    pub max_soul_bytes: Option<usize>,
+    pub max_prelude_bytes: Option<usize>,
 }
 
 /// `[gateways.NAME]`: one place models are served from.
@@ -227,11 +226,11 @@ mod tests {
     fn scalar_knobs_parse_as_set_or_unset() {
         assert_eq!(parse_file_config_str("").unwrap().attach_timeout_secs, None);
         assert_eq!(FileConfig::default().attach_timeout_secs, None);
-        assert_eq!(parse_file_config_str("").unwrap().max_soul_bytes, None);
+        assert_eq!(parse_file_config_str("").unwrap().max_prelude_bytes, None);
         assert_eq!(
-            parse_file_config_str("max_soul_bytes = 4096")
+            parse_file_config_str("max_prelude_bytes = 4096")
                 .unwrap()
-                .max_soul_bytes,
+                .max_prelude_bytes,
             Some(4096)
         );
         assert_eq!(
