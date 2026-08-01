@@ -1,0 +1,11 @@
+# `trunk serve` from the repo root: builds the Yew GUI and reverse-proxies
+# /api to a running `myco` server (`myco` in another terminal, port 7773).
+[build]
+target = "crates/myco-gui/index.html"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+[[proxy]]
+backend = "http://127.0.0.1:7773/api"
