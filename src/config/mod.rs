@@ -5,8 +5,8 @@
 //! config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), and
 //! produces fully resolved settings — the **model catalog**, the host pool
 //! (remote hosts from `~/.ssh/config` `Host` aliases), the default model key
-//! (`--model` → config file `model` → sole catalog entry), the soul size cap
-//! (`max_soul_bytes`), and the color decision for stdout rendering. Downstream
+//! (`--model` → config file `model` → sole catalog entry), the memory size cap
+//! (`max_memory_bytes`), and the color decision for stdout rendering. Downstream
 //! code reads the resolved fields; nothing else reads these environment
 //! variables or files.
 //!
@@ -255,11 +255,11 @@ pub struct Config {
     /// Always present in the catalog; credential presence is still checked at
     /// use time via [`ModelCatalog::get`].
     pub model: String,
-    /// Cap on the soul appended to every agent system prompt (config file
-    /// `max_soul_bytes`, default [`crate::prompts::DEFAULT_MAX_SOUL_BYTES`]).
+    /// Cap on the memory appended to every agent system prompt (config file
+    /// `max_memory_bytes`, default [`crate::prompts::DEFAULT_MAX_MEMORY_BYTES`]).
     /// Passed to [`crate::prompts::agent_prompt_epilogue`] at every model
-    /// build, and checked at startup so a cut soul is warned about.
-    pub max_soul_bytes: usize,
+    /// build, and checked at startup so a cut memory is warned about.
+    pub max_memory_bytes: usize,
 }
 
 impl Config {
@@ -304,9 +304,9 @@ impl Config {
         let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
 
-        let max_soul_bytes = file
-            .max_soul_bytes
-            .unwrap_or(crate::prompts::DEFAULT_MAX_SOUL_BYTES);
+        let max_memory_bytes = file
+            .max_memory_bytes
+            .unwrap_or(crate::prompts::DEFAULT_MAX_MEMORY_BYTES);
         // Host workers enforce the image cap where the file is read, so they
         // are spawned with the cap of the model this process will run — fixed
         // for the process, since the model is chosen once at startup.
@@ -332,7 +332,7 @@ impl Config {
             harness,
             models,
             model,
-            max_soul_bytes,
+            max_memory_bytes,
         })
     }
 }
@@ -1077,7 +1077,7 @@ context_window = 32_768
     }
 
     #[test]
-    fn max_soul_bytes_comes_from_the_config_file() {
+    fn max_memory_bytes_comes_from_the_config_file() {
         let resolve = |extra_toml: &str| {
             resolve_toml(
                 format!("{extra_toml}\n{}", model_toml("m", &[])),
@@ -1085,14 +1085,14 @@ context_window = 32_768
                 env_of(&[]),
             )
             .unwrap()
-            .max_soul_bytes
+            .max_memory_bytes
         };
         // Unset → the prompts default, so an untouched config.toml keeps the
         // 256 KiB backstop.
-        assert_eq!(resolve(""), crate::prompts::DEFAULT_MAX_SOUL_BYTES);
-        assert_eq!(resolve("max_soul_bytes = 4096"), 4096);
+        assert_eq!(resolve(""), crate::prompts::DEFAULT_MAX_MEMORY_BYTES);
+        assert_eq!(resolve("max_memory_bytes = 4096"), 4096);
         // TOML underscore separators are the shape the example config uses.
-        assert_eq!(resolve("max_soul_bytes = 131_072"), 131_072);
+        assert_eq!(resolve("max_memory_bytes = 131_072"), 131_072);
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! The agent soul: maildir-style entries under `~/.myco/workspace/soul/`.
+//! The agent memory: maildir-style entries under `~/.myco/workspace/memory/`.
 //!
 //! One write-once `*.md` file per entry. Every visible entry is rendered into
-//! each agent system prompt ([`crate::prompts`]); the root-only `soul` tool
-//! ([`crate::tool_services::SoulTool`]) is the edit path. The storage rules
+//! each agent system prompt ([`crate::prompts`]); the root-only `memory` tool
+//! ([`crate::tool_services::MemoryTool`]) is the edit path. The storage rules
 //! that keep concurrent agents safe on a weakly consistent filesystem live
 //! here: entries are written under a hidden temp name and renamed into place,
 //! never edited in place. Names are unique, so concurrent adds cannot
@@ -11,16 +11,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// One soul entry: filename (its id) and trimmed text.
+/// One memory entry: filename (its id) and trimmed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoulEntry {
+pub struct MemoryEntry {
     pub name: String,
     pub text: String,
 }
 
-/// The soul directory, respecting `MYCO_HOME`.
+/// The memory directory, respecting `MYCO_HOME`.
 pub fn dir() -> Result<PathBuf, String> {
-    Ok(crate::core::myco_home()?.join("workspace").join("soul"))
+    Ok(crate::core::myco_home()?.join("workspace").join("memory"))
 }
 
 /// Whether `name` is a legal entry id: a plain visible `*.md` filename.
@@ -34,11 +34,11 @@ pub fn is_entry_name(name: &str) -> bool {
 
 /// All visible entries in filename order — the render order. Hidden names,
 /// non-`*.md` files, and whitespace-only entries are skipped.
-pub fn entries(dir: &Path) -> Vec<SoulEntry> {
+pub fn entries(dir: &Path) -> Vec<MemoryEntry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<SoulEntry> = read
+    let mut out: Vec<MemoryEntry> = read
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
@@ -49,23 +49,23 @@ pub fn entries(dir: &Path) -> Vec<SoulEntry> {
                 .ok()?
                 .trim()
                 .to_string();
-            (!text.is_empty()).then_some(SoulEntry { name, text })
+            (!text.is_empty()).then_some(MemoryEntry { name, text })
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
-/// The soul as it reads in a prompt (and in `soul` action=list): each entry
-/// under a `[soul entry <name>]` label, so agents can `replace`/`remove` by
+/// The memory as it reads in a prompt (and in `memory` action=list): each entry
+/// under a `[memory entry <name>]` label, so agents can `replace`/`remove` by
 /// the id they see. Empty string when there are no entries.
-pub fn rendered_body(entries: &[SoulEntry]) -> String {
+pub fn rendered_body(entries: &[MemoryEntry]) -> String {
     let mut out = String::new();
     for entry in entries {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&format!("[soul entry {}]\n{}", entry.name, entry.text));
+        out.push_str(&format!("[memory entry {}]\n{}", entry.name, entry.text));
     }
     out
 }
@@ -99,7 +99,7 @@ pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
             }
         };
     }
-    Err("could not pick a fresh soul entry name".into())
+    Err("could not pick a fresh memory entry name".into())
 }
 
 /// Remove entry `name`. `Ok(false)` when it is already gone — a concurrent
@@ -107,7 +107,7 @@ pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
 pub fn remove_entry(dir: &Path, name: &str) -> Result<bool, String> {
     if !is_entry_name(name) {
         return Err(format!(
-            "{name:?} is not a soul entry id (a plain `*.md` filename, as listed)"
+            "{name:?} is not a memory entry id (a plain `*.md` filename, as listed)"
         ));
     }
     match std::fs::remove_file(dir.join(name)) {
@@ -123,7 +123,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("myco-soul-store-{tag}-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("myco-memory-store-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -144,8 +144,8 @@ mod tests {
         );
         assert_eq!(
             rendered_body(&entries),
-            "[soul entry 20260101T000000Z-aaaa.md]\nfirst\n\n\
-             [soul entry 20260102T000000Z-bbbb.md]\nsecond"
+            "[memory entry 20260101T000000Z-aaaa.md]\nfirst\n\n\
+             [memory entry 20260102T000000Z-bbbb.md]\nsecond"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

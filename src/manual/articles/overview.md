@@ -44,11 +44,11 @@ myco (interactive) / Agent
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_memory_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul entries (edited via the root-only `soul` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
+| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/memory/` holds write-once memory entries (edited via the root-only `memory` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
 Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
 top-level keys must come before the tables, per TOML):
@@ -57,8 +57,8 @@ top-level keys must come before the tables, per TOML):
 model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
-# Cap on the rendered soul appended to every agent system prompt (default 262144).
-max_soul_bytes = 262_144
+# Cap on the rendered memory appended to every agent system prompt (default 262144).
+max_memory_bytes = 262_144
 
 [gateways.xai]
 protocol = "openai-responses"
@@ -195,13 +195,13 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 `~/.myco/workspace/` is the agents' own directory — free-form files maintained with
 the ordinary tools (no required format), persistent across sessions and shared by
-every agent on the machine. `workspace/soul/` is the one special place: it holds
-the agent's soul as maildir-style entries — one write-once `*.md` file each, never
+every agent on the machine. `workspace/memory/` is the one special place: it holds
+the agent's memory as maildir-style entries — one write-once `*.md` file each, never
 edited in place. Every visible entry is rendered, in filename order under a
-`[soul entry <name>]` label, into the `# Soul` section of every agent system
+`[memory entry <name>]` label, into the `# Memory` section of every agent system
 prompt, read at model build time (session start, model switch, worker spawn).
 
-The root-only `soul` tool (local in-process worker, like `session_meta`) is the
+The root-only `memory` tool (local in-process worker, like `session_meta`) is the
 edit path: `add` a new entry, `replace` an entry (the replacement lands as a new
 file before the old id is dropped), `remove` one, or `list` the live state. The
 write-once discipline is what makes concurrent agents safe, even on a weakly
@@ -210,21 +210,21 @@ two agents replacing the same entry leave two candidate entries — a duplicate 
 next curation pass merges — never a lost one. No locks, no in-place edits.
 Distinct from the per-session `session_meta` scratchpad.
 
-The prompt fragment makes the soul the *default* home for durable information —
+The prompt fragment makes memory the *default* home for durable information —
 agents record findings eagerly and reserve workspace files for cold material
 (rarely relevant, or high-volume lookup-only data). Prompt-resident text is
-cached, so a big soul is cheaper than the mid-task exploration it replaces. A
-rendered soul longer than `max_soul_bytes` (config.toml; default 262144 = 256 KiB)
+cached, so a big memory is cheaper than the mid-task exploration it replaces. A
+rendered memory longer than `max_memory_bytes` (config.toml; default 262144 = 256 KiB)
 is cut to that many bytes with a marker in the prompt, and startup opens a WARNING
-naming the entry count and both sizes — a soul silently losing its tail is
+naming the entry count and both sizes — a memory silently losing its tail is
 otherwise invisible. Merge or remove entries, or raise the knob.
 
 The rest of the workspace is listed, not quoted: a `# Workspace Files` section
 gives each visible file's path (relative to `workspace/`), the UTC day it last
 changed, and its title (first markdown heading, else first non-empty line). Hidden
-names, symlinks, `soul/` itself, and binary titles are skipped; the walk and the
+names, symlinks, `memory/` itself, and binary titles are skipped; the walk and the
 rendered block are bounded (4 levels, 200 files, 8 KiB) with a marker when files
-are left out. The prompt's appended blocks run least to most volatile — soul,
+are left out. The prompt's appended blocks run least to most volatile — memory,
 then project guidance, then this listing — and the listing uses days rather than
 timestamps and path order rather than recency, so ordinary workspace writes leave
 the shared prompt prefix intact for same-model forks.

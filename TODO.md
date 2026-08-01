@@ -100,7 +100,7 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 
 - [x] **`AGENTS.md` support** — `AGENTS.md` (or `CLAUDE.md`) from the launch directory
       is appended to the system prompt at model build time, same lifecycle and cap as
-      the soul. Re-read on cwd / project change remains open (prompt stability vs
+      the memory. Re-read on cwd / project change remains open (prompt stability vs
       freshness trade-off).
 - [ ] **Layered config** — `~/.myco` + repo `.myco/` / instruction files:
       model defaults, permissions, hooks paths, ignore globs — not only host pool.
@@ -108,19 +108,23 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - Directory convention (user + project); load as prompt/procedures or slash-skills.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
 - [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
-      ordinary tools; `workspace/soul/` holds maildir-style write-once soul
+      ordinary tools; `workspace/memory/` holds maildir-style write-once memory
       **entries**, all rendered into every agent system prompt at model build
       time, followed by a bounded `# Workspace Files` listing (path, UTC day,
-      title) of everything else there. The soul is the *default* home for
+      title) of everything else there. Memory is the *default* home for
       durable information (record eagerly; workspace files are the cold tier
       for rarely-used or high-volume lookup data) — in-context beats scattered
       files on 500K+ windows, and the block is prompt-cached. Edits go through
-      the root-only `soul` tool (add/replace/remove/list): write-once entries
+      the root-only `memory` tool (add/replace/remove/list): write-once entries
       make concurrent agents safe (adds never collide; racing replaces leave a
-      duplicate to merge, never a loss). Unlike the earlier rejected `memory`
-      tool there is no search — the soul is in-prompt by construction.
+      duplicate to merge, never a loss). Not a return of the earlier rejected
+      memory abstraction (structured UUID-keyed entries + dedicated semantic
+      search): there is no search — memory is in-prompt by construction.
+      (Formerly named "soul", after OpenClaw; renamed since a curated entry
+      store is memory, and models carry strong training priors for using
+      `memory`-named tools well.)
 - [ ] **Workspace recall follow-up** — a second appended fragment (e.g. newest
-      snapshot in `workspace/pin/`) if working-set churn starts forcing soul
+      snapshot in `workspace/pin/`) if working-set churn starts forcing memory
       revisions often enough to cost forks their cached prompt prefix. Deferred
       until there is evidence: one prompt-resident memory beats two. Past the
       listing, recall is `rg` over `~/.myco/workspace/` like any other tree —
@@ -198,7 +202,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
 - [x] (REMOVED) **`lynx_tui_browser`** — the dedicated browser tool is gone; web
       browsing composes from bash (`lynx -dump`, `curl`, …) where installed, with
-      per-system guidance in the workspace/soul. No separate web_fetch/web_search tools.
+      per-system guidance in the workspace/memory. No separate web_fetch/web_search tools.
 - [x] (REJECTED) **Servo / AccessKit browser backend** — superseded by the same
       doctrine: browsing is not a myco tool; anything heavier than bash-composed
       browsing belongs in a dedicated external program.
