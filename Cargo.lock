@@ -1629,6 +1629,7 @@ dependencies = [
 name = "myco"
 version = "0.4.0-dev"
 dependencies = [
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -1643,6 +1644,7 @@ dependencies = [
  "myco-prompts",
  "myco-session",
  "myco-test-support",
+ "reqwest",
  "rocket",
  "rustyline",
  "schemars",
@@ -1682,6 +1684,8 @@ dependencies = [
 name = "myco-api"
 version = "0.4.0-dev"
 dependencies = [
+ "async-trait",
+ "futures",
  "serde",
 ]
 

@@ -12,10 +12,11 @@ pub use myco_prompts as prompts;
 pub use myco_session as session;
 
 pub mod cli;
+pub mod client;
 pub mod server;
 pub mod subagent;
-pub mod supervisor;
 pub mod tui;
+pub mod web;
 
 // Flat conveniences (v1 `myco::X` surface, minus the TUI).
 pub use myco_agent::{

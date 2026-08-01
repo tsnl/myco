@@ -80,9 +80,62 @@ pub struct Models {
     pub default_model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    NotFound,
+    Conflict,
+    BadRequest,
+    #[default]
+    Internal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+    #[serde(default)]
+    pub kind: ErrorKind,
+}
+
+impl ApiError {
+    pub fn new(kind: ErrorKind, error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            kind,
+        }
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// A session's live event feed, frontend-agnostic.
+pub type EventStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
+
+/// The myco interface: one async contract, two implementations — the server
+/// object does the work in-process, the HTTP client speaks to a remote one.
+/// Holders of `dyn MycoApi` cannot tell the difference.
+#[async_trait::async_trait]
+pub trait MycoApi: Send + Sync {
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ApiError>;
+    async fn create_session(&self, req: CreateSession) -> Result<SessionSummary, ApiError>;
+    async fn session_detail(&self, id: &str) -> Result<SessionDetail, ApiError>;
+    /// Queue one user turn (input queues while a turn runs).
+    async fn post_message(&self, id: &str, req: PostMessage) -> Result<Poll, ApiError>;
+    async fn poll(&self, id: &str, since: usize) -> Result<Poll, ApiError>;
+    /// Subscribe to the live feed; makes the session resident.
+    async fn events(&self, id: &str) -> Result<EventStream, ApiError>;
+    async fn cancel(&self, id: &str) -> Result<Poll, ApiError>;
+    /// Summarize into a successor session (new id; watch for `Compacted`).
+    async fn compact(&self, id: &str) -> Result<Poll, ApiError>;
+    /// Retire the live agent task (the session stays on disk, resumable).
+    async fn retire(&self, id: &str) -> Result<Poll, ApiError>;
+    async fn models(&self) -> Result<Models, ApiError>;
 }
 
 /// One SSE event on `/api/sessions/<id>/events` — a live projection of the

@@ -1,5 +1,5 @@
 //! The interactive CLI, rebuilt on the session runtime: `myco` spawns a
-//! [`Supervisor`] in-process, attaches one live session, and drives it
+//! [`Server`] in-process, attaches one live session, and drives it
 //! through the same queue and event feed the web server uses.
 //!
 //! The v1 REPL was synchronous — one turn at a time, the prompt gone while
@@ -18,7 +18,7 @@ use myco_config::{Config, ConfigUserSettings};
 use myco_machines::harness::StartupPreflight;
 use myco_session::{Session, format_session_detail, format_session_list_line, list_sessions};
 
-use crate::supervisor::{Cmd, Live, SessionEvent, Supervisor, last_answer};
+use crate::server::{Cmd, Live, Server, SessionEvent, last_answer};
 use crate::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer, TuiSink, encode_ansi};
 use myco_session::ConsoleLog;
 
@@ -64,7 +64,7 @@ pub async fn run(opts: CliOptions) {
     };
     let preflight = StartupPreflight::run(&config.harness.remote_hosts, config.max_soul_bytes);
     let default_model = config.model.clone();
-    let sup = Supervisor::new(config);
+    let sup = Server::new(config);
 
     // Initial session: resume, nested child, or fresh.
     let initial = match (&opts.resume, &opts.parent_session) {
@@ -262,7 +262,7 @@ enum InputEvent {
     Eof,
 }
 
-async fn boot_fresh(sup: &Arc<Supervisor>, fresh: Session) -> Arc<Live> {
+async fn boot_fresh(sup: &Arc<Server>, fresh: Session) -> Arc<Live> {
     let id = fresh.id.clone();
     match sup.ensure_live(&id, Some(fresh)).await {
         Ok(l) => l,
@@ -288,7 +288,7 @@ fn make_producer(
 
 fn banner(
     producer: &Arc<TuiProducer>,
-    sup: &Arc<Supervisor>,
+    sup: &Arc<Server>,
     live: &Arc<Live>,
     preflight: &StartupPreflight,
 ) {
@@ -301,7 +301,7 @@ fn banner(
 }
 
 /// Print the USER header (context fill, running tools) and queue the turn.
-fn submit(sup: &Arc<Supervisor>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line: &str) {
+fn submit(sup: &Arc<Server>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line: &str) {
     let snapshot = live.session.snapshot();
     let max = sup
         .config()

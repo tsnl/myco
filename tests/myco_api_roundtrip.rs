@@ -1,0 +1,160 @@
+//! The [`MycoApi`] contract, exercised against the in-process [`Server`]
+//! through `dyn MycoApi` only — the same calls `HttpClient` makes over HTTP.
+//! Models are scripted via the factory seam; no provider, no network.
+//!
+//! Sole test binary for the process-global `MYCO_HOME` override (the tests
+//! serialize on `temp_home`'s lock).
+
+use std::sync::Arc;
+
+use myco::server::Server;
+use myco_api::{CreateSession, MycoApi, PostMessage};
+use myco_models::{Content, GenerateError, GenerateOutput, GenerativeModel, TurnEndReason};
+use myco_test_support::ScriptedModel;
+
+const CONFIG_TOML: &str = r#"
+model = "fake"
+
+[gateways.g]
+protocol = "openai-completions"
+base_url = "http://127.0.0.1:9/v1"
+auth = "dummy"
+
+[models.fake]
+gateway = "g"
+context_window = 100000
+"#;
+
+fn test_config() -> myco::config::Config {
+    myco::config::Config::resolve_with(
+        Default::default(),
+        |_| None,
+        |_| myco::config::parse_file_config_str(CONFIG_TOML),
+        || Ok(Vec::new()),
+        |_| Err("no auth files in tests".into()),
+    )
+    .expect("test config resolves")
+}
+
+fn scripted_server(
+    make: impl Fn() -> Arc<dyn GenerativeModel> + Send + Sync + 'static,
+) -> Arc<Server> {
+    Server::with_model_factory(test_config(), Box::new(move |_, _, _, _, _| Ok(make())))
+}
+
+/// Poll until the queued turn lands (idle + condition), bounded.
+async fn poll_until(
+    server: &dyn MycoApi,
+    id: &str,
+    pred: impl Fn(&myco_api::Poll) -> bool,
+) -> myco_api::Poll {
+    for _ in 0..200 {
+        let p = server.poll(id, 0).await.expect("poll");
+        if !p.busy && pred(&p) {
+            return p;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("turn never settled");
+}
+
+#[tokio::test]
+async fn a_turn_round_trips_through_the_trait() {
+    let _home = myco_test_support::temp_home("api-roundtrip");
+    let server = scripted_server(|| {
+        let turn = |text: &str| GenerateOutput {
+            content: vec![Content::Text { text: text.into() }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        };
+        ScriptedModel::new(vec![
+            turn("scripted answer"),
+            turn("second answer"),
+            turn("third answer"),
+        ])
+    });
+    let server: &dyn MycoApi = server.as_ref();
+
+    let s = server
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    assert!(s.live);
+
+    server
+        .post_message(
+            &s.id,
+            PostMessage {
+                text: "hello".into(),
+            },
+        )
+        .await
+        .expect("post");
+
+    let p = poll_until(server, &s.id, |p| {
+        p.entries.iter().any(|e| e.role == "assistant")
+    })
+    .await;
+    assert!(p.last_error.is_none(), "{:?}", p.last_error);
+    let roles: Vec<&str> = p.entries.iter().map(|e| e.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant"], "{:?}", p.entries);
+    assert_eq!(p.entries[1].text, "scripted answer");
+
+    // Queued input: two more messages posted back-to-back both run.
+    for text in ["second", "third"] {
+        server
+            .post_message(&s.id, PostMessage { text: text.into() })
+            .await
+            .expect("post");
+    }
+    let p = poll_until(server, &s.id, |p| {
+        p.entries.iter().filter(|e| e.role == "assistant").count() == 3
+    })
+    .await;
+    assert_eq!(p.entries.iter().filter(|e| e.role == "user").count(), 3);
+    assert_eq!(p.entries.last().unwrap().text, "third answer");
+
+    // The session is listed, and retiring it works through the trait too.
+    let listed = server.list_sessions().await.expect("list");
+    assert!(listed.iter().any(|e| e.id == s.id));
+    server.retire(&s.id).await.expect("retire");
+    let listed = server.list_sessions().await.expect("list");
+    let entry = listed.iter().find(|e| e.id == s.id).expect("still on disk");
+    assert!(!entry.live, "retired session must not be live");
+}
+
+#[tokio::test]
+async fn a_failing_turn_surfaces_on_last_error() {
+    let _home = myco_test_support::temp_home("api-fail");
+    let server = scripted_server(|| {
+        ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError(
+            "provider down (scripted)".into(),
+        ))
+    });
+    let server: &dyn MycoApi = server.as_ref();
+
+    let s = server
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    server
+        .post_message(&s.id, PostMessage { text: "hi".into() })
+        .await
+        .expect("post");
+
+    let p = poll_until(server, &s.id, |p| p.last_error.is_some()).await;
+    let err = p.last_error.expect("failed turn reports why");
+    assert!(err.contains("provider down"), "{err}");
+    // The user's message survives; no phantom assistant reply.
+    assert!(p.entries.iter().any(|e| e.role == "user"));
+    assert!(!p.entries.iter().any(|e| e.role == "assistant"));
+}

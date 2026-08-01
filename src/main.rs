@@ -94,7 +94,7 @@ async fn main() {
                 "myco server: http://127.0.0.1:{}/api (model: {})",
                 args.port, config.model
             );
-            if let Err(e) = myco::server::serve(config, args.port).await {
+            if let Err(e) = myco::web::serve(config, args.port).await {
                 eprintln!("myco server error: {e}");
                 std::process::exit(1);
             }
