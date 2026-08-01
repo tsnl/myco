@@ -839,7 +839,6 @@ mod tests {
     fn tool_at(p: &TuiProducer, depth: usize, name: &str, input: serde_json::Value) {
         p.emit(AgentEvent::ToolStarted {
             tool_use: ToolUse {
-                id: "t1".into(),
                 name: name.into(),
                 input,
             },

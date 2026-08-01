@@ -1337,7 +1337,7 @@ mod tests {
                     matches!(&content[1], Content::Thinking { redacted, signature, .. } if *redacted && signature.is_none())
                 );
                 assert_eq!(tool_uses.len(), 1);
-                assert_eq!(tool_uses[0].id, "toolu_01");
+                assert_eq!(tool_uses[0].name, "bash");
                 assert_eq!(tool_uses[0].input["command"], "echo hi");
                 assert_eq!(*turn_end_reason, Some(TurnEndReason::ToolUse));
             }
@@ -1376,6 +1376,26 @@ mod tests {
             reserialized, FIXTURE,
             "session serialization drifted from the v2 fixture"
         );
+    }
+
+    /// Sessions written before tool ids were cut carry `"id"` fields on
+    /// tool_uses / tool_use_results. They must still load (ids ignored), and
+    /// the next save silently drops them — same file version, narrower shape.
+    #[test]
+    fn v2_files_with_tool_ids_still_load_and_shed_them_on_save() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2_all_variants.json");
+        let mut v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        v["messages"][1]["AssistantMessage"]["tool_uses"][0]["id"] = "toolu_01".into();
+        v["messages"][2]["ToolResults"]["tool_use_results"][0]["id"] = "toolu_01".into();
+        let session: Session = serde_json::from_value(v).expect("old-shape v2 file must load");
+        match &session.messages[1] {
+            Message::AssistantMessage { tool_uses, .. } => {
+                assert_eq!(tool_uses[0].name, "bash");
+            }
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        let rewritten = serde_json::to_string(&session).unwrap();
+        assert!(!rewritten.contains("toolu_01"), "ids must be shed on save");
     }
 
     /// Unreadable files must be reported as skipped, not dropped on the floor:

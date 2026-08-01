@@ -75,6 +75,10 @@ pub(super) fn validate_finish<'a>(
     Ok(())
 }
 
+pub(super) fn error_stream(e: GenerateError) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    Box::pin(futures::stream::once(async move { Err(e) }))
+}
+
 /// Send `request` in a spawned task and bridge its SSE stream into the
 /// [`GenerativeModel::generate`] stream shape. Dropping the returned stream
 /// cancels generation: the task's channel sends fail, it returns, and the HTTP

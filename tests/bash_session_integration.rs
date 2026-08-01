@@ -18,11 +18,10 @@ mod test_utils;
 use test_utils::{ScriptedModel, format_transcript, tool_text};
 
 /// A scripted turn holding one bash tool call.
-fn bash_turn(id: &str, input: serde_json::Value) -> GenerateOutput {
+fn bash_turn(input: serde_json::Value) -> GenerateOutput {
     GenerateOutput {
         content: vec![],
         tool_uses: vec![ToolUse {
-            id: id.into(),
             name: "bash".into(),
             input,
         }],
@@ -42,7 +41,7 @@ fn turn_end(text: &str) -> GenerateOutput {
 
 /// Scripted multi-turn interactive shell: start → echo a marker → close →
 /// final answer. Asserts wall-clock bounds, transcript shape, tool-result
-/// id/order correlation, and stable `format_transcript` markers.
+/// order correlation, and stable `format_transcript` markers.
 #[tokio::test]
 async fn scripted_multi_turn_bash_session_transcript() {
     let session_id = format!("itest-{}", uuid::Uuid::new_v4().as_simple());
@@ -55,30 +54,21 @@ async fn scripted_multi_turn_bash_session_transcript() {
     // One generate() per agent loop iteration. The agent keeps calling generate
     // until it sees EndTurn, so we script every tool-use step plus a finale.
     let model = ScriptedModel::new(vec![
-        bash_turn(
-            "t_start",
-            json!({
+        bash_turn(json!({
                 "action": "start",
                 "session_id": session_id,
                 "command": "bash --noprofile --norc",
                 "idle_ms": 200,
                 "timeout_ms": 1000,
-            }),
-        ),
-        bash_turn(
-            "t_echo",
-            json!({
+        })),
+        bash_turn(json!({
                 "action": "write",
                 "session_id": session_id,
                 "stdin": "echo marker-from-shell\n",
                 "idle_ms": 300,
                 "timeout_ms": 1000,
-            }),
-        ),
-        bash_turn(
-            "t_close",
-            json!({"action": "close", "session_id": session_id}),
-        ),
+        })),
+        bash_turn(json!({"action": "close", "session_id": session_id})),
         turn_end("multi-turn bash session ok"),
     ]);
 
@@ -138,40 +128,34 @@ async fn scripted_multi_turn_bash_session_transcript() {
         other => panic!("history[0] should be user message: {other:?}"),
     }
 
-    // Tool results come back correlated by id, in scripted order, all ok.
-    let mut results: Vec<(&str, String, bool)> = Vec::new();
+    // Tool results pair with their calls by position, in scripted order, all ok.
+    let mut results: Vec<(String, bool)> = Vec::new();
     for msg in history {
         if let Message::ToolResults { tool_use_results } = msg {
             for tr in tool_use_results {
-                results.push((tr.id.as_str(), tool_text(tr), tr.is_error));
+                results.push((tool_text(tr), tr.is_error));
             }
         }
     }
-    let ids: Vec<&str> = results.iter().map(|(id, _, _)| *id).collect();
-    assert_eq!(
-        ids,
-        ["t_start", "t_echo", "t_close"],
-        "transcript:\n{transcript}"
-    );
-    for (id, text, is_error) in &results {
-        assert!(!*is_error, "{id} failed: {text}");
+    assert_eq!(results.len(), 3, "transcript:\n{transcript}");
+    for (i, (text, is_error)) in results.iter().enumerate() {
+        assert!(!*is_error, "step {i} failed: {text}");
     }
     assert!(
-        results[0].1.contains(&session_id),
+        results[0].0.contains(&session_id),
         "start should echo session_id; got: {}",
-        results[0].1
+        results[0].0
     );
     // The real shell's output must land in the recorded tool result.
     assert!(
-        results[1].1.contains("marker-from-shell"),
+        results[1].0.contains("marker-from-shell"),
         "echo output should reach the transcript; got: {}",
-        results[1].1
+        results[1].0
     );
 
     // Transcript string itself is the inspectable artifact — pin a few stable markers.
-    assert!(transcript.contains("tool_use id=t_start name=bash"));
-    assert!(transcript.contains("tool_use id=t_echo name=bash"));
-    assert!(transcript.contains("tool_result id=t_echo is_error=false"));
+    assert!(transcript.contains("tool_use name=bash"));
+    assert!(transcript.contains("tool_result is_error=false"));
     assert!(transcript.contains("marker-from-shell"));
     assert!(transcript.contains("multi-turn bash session ok"));
     assert!(transcript.contains("turn_end_reason: EndTurn"));

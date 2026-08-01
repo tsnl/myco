@@ -63,14 +63,11 @@ fn format_content(c: &Content) -> String {
 }
 
 fn format_tool_use(tu: &ToolUse) -> String {
-    format!(
-        "tool_use id={} name={} input={}\n",
-        tu.id, tu.name, tu.input
-    )
+    format!("tool_use name={} input={}\n", tu.name, tu.input)
 }
 
 fn format_tool_result(tr: &ToolResult) -> String {
-    let mut s = format!("tool_result id={} is_error={}\n", tr.id, tr.is_error);
+    let mut s = format!("tool_result is_error={}\n", tr.is_error);
     for c in &tr.content {
         for line in format_content(c).lines() {
             s.push_str(&format!("  {line}\n"));

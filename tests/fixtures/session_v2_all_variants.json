@@ -46,7 +46,6 @@
         ],
         "tool_uses": [
           {
-            "id": "toolu_01",
             "name": "bash",
             "input": {
               "command": "echo hi",
@@ -61,7 +60,6 @@
       "ToolResults": {
         "tool_use_results": [
           {
-            "id": "toolu_01",
             "content": [
               {
                 "Text": {
@@ -72,7 +70,6 @@
             "is_error": false
           },
           {
-            "id": "toolu_02",
             "content": [
               {
                 "Text": {

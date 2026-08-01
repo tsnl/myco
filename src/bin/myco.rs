@@ -1784,7 +1784,6 @@ mod tests {
                     text: "hi there".into(),
                 }],
                 tool_uses: vec![ToolUse {
-                    id: "toolu_1".into(),
                     name: "bash".into(),
                     input: json!({"command": "echo hi"}),
                 }],
@@ -1792,7 +1791,6 @@ mod tests {
             },
             Message::ToolResults {
                 tool_use_results: vec![ToolResult {
-                    id: "toolu_1".into(),
                     content: vec![Content::Text {
                         text: "hi\n".into(),
                     }],

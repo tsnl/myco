@@ -95,7 +95,10 @@ impl OpenAICompletionsGenerativeModel {
 
 impl GenerativeModel for OpenAICompletionsGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(&self.system_prompt, input);
+        let messages = match convert_messages(&self.system_prompt, input) {
+            Ok(messages) => messages,
+            Err(e) => return driver_core::error_stream(e),
+        };
         driver_core::spawn_generate(
             self.completion_request(&messages),
             StreamAccumulator::default(),
@@ -109,7 +112,13 @@ impl GenerativeModel for OpenAICompletionsGenerativeModel {
 // Message conversion → Chat Completions `messages` list
 //
 
-fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> {
+fn convert_messages(
+    system_prompt: &str,
+    input: &[Message],
+) -> Result<Vec<ChatMessage>, GenerateError> {
+    // Minted per-position ids go on the wire, never stored provider ids
+    // (see [`wire_tool_ids`]).
+    let wire_ids = wire_tool_ids(input)?;
     let mut out = Vec::new();
 
     if !system_prompt.is_empty() {
@@ -121,7 +130,7 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
         });
     }
 
-    for message in input {
+    for (i, message) in input.iter().enumerate() {
         match message {
             Message::UserMessage { content } => {
                 out.push(ChatMessage {
@@ -136,7 +145,7 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
                 // intervening message, so images from the whole round are
                 // gathered into one user message after them.
                 let mut images = Vec::new();
-                for result in tool_use_results {
+                for (j, result) in tool_use_results.iter().enumerate() {
                     let mut text = tool_result_text(result);
                     let result_images = images_of(&result.content);
                     if text.is_empty() && !result_images.is_empty() {
@@ -147,7 +156,7 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
                         role: "tool",
                         content: Some(ChatContent::Text(text)),
                         tool_calls: None,
-                        tool_call_id: Some(result.id.clone()),
+                        tool_call_id: Some(wire_ids[i][j].clone()),
                     });
                 }
                 if !images.is_empty() {
@@ -179,8 +188,9 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
                 let text = text_of(content);
                 let tool_calls: Vec<ChatToolCall> = tool_uses
                     .iter()
-                    .map(|tool_use| ChatToolCall {
-                        id: tool_use.id.clone(),
+                    .enumerate()
+                    .map(|(j, tool_use)| ChatToolCall {
+                        id: wire_ids[i][j].clone(),
                         type_: "function",
                         function: ChatToolCallFunction {
                             name: tool_use.name.clone(),
@@ -201,7 +211,7 @@ fn convert_messages(system_prompt: &str, input: &[Message]) -> Vec<ChatMessage> 
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// User message content: plain string when text-only, `text` / `image_url`
@@ -345,23 +355,24 @@ impl StreamAccumulator {
         let index = match self.slots.get(slot) {
             Some(Slot::ToolUse { index }) => index,
             _ => {
-                let id = call.id.unwrap_or_default();
                 let name = call
                     .function
                     .as_ref()
                     .and_then(|f| f.name.clone())
                     .unwrap_or_default();
-                if id.is_empty() || name.is_empty() {
-                    // Without both we would produce a tool result the provider
-                    // cannot match back to its call. Fail loud instead.
+                if name.is_empty() {
+                    // A nameless call cannot be dispatched or resent. Fail
+                    // loud instead. (The provider's call id is discarded:
+                    // history stores no tool ids; requests carry minted
+                    // positional ids.)
                     return Err(GenerateError::MalformedResponseError(format!(
                         "OpenAI Chat Completions: tool call at index {slot} started \
-                         without an id and name (id={id:?}, name={name:?})"
+                         without a name"
                     )));
                 }
                 let index = self.slots.open_tool_use(slot);
                 self.saw_tool_call = true;
-                out.push(MessagePart::ToolUseStart(ToolUseStart { index, id, name }));
+                out.push(MessagePart::ToolUseStart(ToolUseStart { index, name }));
                 index
             }
         };
@@ -536,8 +547,6 @@ struct ChatToolCallDelta {
     #[serde(default)]
     index: Option<usize>,
     #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
     function: Option<ChatToolCallFunctionDelta>,
 }
 
@@ -567,7 +576,7 @@ mod tests {
 
     #[test]
     fn system_prompt_leads_the_message_list() {
-        let messages = convert_messages("be helpful", &[user("hi")]);
+        let messages = convert_messages("be helpful", &[user("hi")]).unwrap();
         let json = serde_json::to_value(&messages).unwrap();
         assert_eq!(json[0]["role"], "system");
         assert_eq!(json[0]["content"], "be helpful");
@@ -580,16 +589,18 @@ mod tests {
         let input = [
             assistant_tool(
                 Some("checking"),
-                "call_1",
                 "bash",
                 serde_json::json!({"command": "echo hi"}),
             ),
-            tool_results(&[("call_1", "hi\n")]),
+            tool_results(&["hi\n"]),
         ];
-        let json = serde_json::to_value(convert_messages("", &input)).unwrap();
+        let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
         assert_eq!(json[0]["role"], "assistant");
         assert_eq!(json[0]["content"], "checking");
-        assert_eq!(json[0]["tool_calls"][0]["id"], "call_1");
+        // The wire carries a minted positional id; the tool reply names the
+        // same call.
+        let call_id = json[0]["tool_calls"][0]["id"].as_str().unwrap();
+        assert!(!call_id.is_empty());
         assert_eq!(json[0]["tool_calls"][0]["type"], "function");
         assert_eq!(json[0]["tool_calls"][0]["function"]["name"], "bash");
         assert_eq!(
@@ -597,7 +608,7 @@ mod tests {
             r#"{"command":"echo hi"}"#
         );
         assert_eq!(json[1]["role"], "tool");
-        assert_eq!(json[1]["tool_call_id"], "call_1");
+        assert_eq!(json[1]["tool_call_id"], call_id);
         assert_eq!(json[1]["content"], "hi\n");
     }
 
@@ -610,15 +621,14 @@ mod tests {
                 redacted: false,
             }],
             tool_uses: vec![ToolUse {
-                id: "call_1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({}),
             }],
             turn_end_reason: Some(TurnEndReason::ToolUse),
         }];
-        let json = serde_json::to_value(convert_messages("", &input)).unwrap();
+        let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
         assert!(json[0].get("content").is_none(), "{json}");
-        assert_eq!(json[0]["tool_calls"][0]["id"], "call_1");
+        assert!(json[0]["tool_calls"][0]["id"].is_string());
     }
 
     #[test]
@@ -632,41 +642,56 @@ mod tests {
             tool_uses: vec![],
             turn_end_reason: Some(TurnEndReason::EndTurn),
         }];
-        assert!(convert_messages("", &input).is_empty());
+        assert!(convert_messages("", &input).unwrap().is_empty());
     }
 
     #[test]
     fn tool_result_images_follow_as_a_user_message() {
-        let input = [Message::ToolResults {
-            tool_use_results: vec![
-                ToolResult {
-                    id: "call_1".into(),
-                    content: vec![Content::Image {
-                        source: "data:image/png;base64,AAAA".into(),
-                    }],
-                    is_error: false,
-                },
-                ToolResult {
-                    id: "call_2".into(),
-                    content: vec![Content::Text { text: "ok".into() }],
-                    is_error: false,
-                },
-            ],
-        }];
-        let json = serde_json::to_value(convert_messages("", &input)).unwrap();
+        let input = [
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![
+                    ToolUse {
+                        name: "view_image".into(),
+                        input: serde_json::json!({}),
+                    },
+                    ToolUse {
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+                turn_end_reason: Some(TurnEndReason::ToolUse),
+            },
+            Message::ToolResults {
+                tool_use_results: vec![
+                    ToolResult {
+                        content: vec![Content::Image {
+                            source: "data:image/png;base64,AAAA".into(),
+                        }],
+                        is_error: false,
+                    },
+                    ToolResult {
+                        content: vec![Content::Text { text: "ok".into() }],
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+        let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
         // Both tool replies stay adjacent to their call, images after them.
-        assert_eq!(json[0]["role"], "tool");
-        assert_eq!(json[0]["tool_call_id"], "call_1");
-        assert_eq!(json[0]["content"], "[image attached below]");
         assert_eq!(json[1]["role"], "tool");
-        assert_eq!(json[1]["content"], "ok");
-        assert_eq!(json[2]["role"], "user");
-        assert_eq!(json[2]["content"][0]["type"], "image_url");
+        assert_eq!(json[1]["tool_call_id"], json[0]["tool_calls"][0]["id"]);
+        assert_eq!(json[1]["content"], "[image attached below]");
+        assert_eq!(json[2]["role"], "tool");
+        assert_eq!(json[2]["tool_call_id"], json[0]["tool_calls"][1]["id"]);
+        assert_eq!(json[2]["content"], "ok");
+        assert_eq!(json[3]["role"], "user");
+        assert_eq!(json[3]["content"][0]["type"], "image_url");
         assert_eq!(
-            json[2]["content"][0]["image_url"]["url"],
+            json[3]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AAAA"
         );
-        assert_eq!(json[2]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(json[3]["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -681,7 +706,7 @@ mod tests {
                 },
             ],
         }];
-        let json = serde_json::to_value(convert_messages("", &input)).unwrap();
+        let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
         assert_eq!(json[0]["content"][0]["type"], "image_url");
         assert_eq!(
             json[0]["content"][0]["image_url"]["url"],
@@ -758,7 +783,7 @@ mod tests {
                 }]}}]
             })))
             .unwrap();
-        expect_tool_start(&items[0], 0, "call_1", "get_weather");
+        expect_tool_start(&items[0], 0, "get_weather");
         assert_eq!(items.len(), 1, "empty arguments must not emit a delta");
 
         for fragment in [r#"{"city""#, r#":"SF"}"#] {
@@ -796,11 +821,11 @@ mod tests {
         let starts: Vec<_> = items
             .iter()
             .filter_map(|p| match p {
-                MessagePart::ToolUseStart(start) => Some((start.index, start.id.as_str())),
+                MessagePart::ToolUseStart(start) => Some((start.index, start.name.as_str())),
                 _ => None,
             })
             .collect();
-        assert_eq!(starts, [(0, "call_1"), (1, "call_2")]);
+        assert_eq!(starts, [(0, "bash"), (1, "manual")]);
     }
 
     #[test]
@@ -840,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_without_id_or_name_is_malformed() {
+    fn tool_call_without_name_is_malformed() {
         let mut acc = StreamAccumulator::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -851,7 +876,7 @@ mod tests {
             .unwrap_err();
         match err {
             GenerateError::MalformedResponseError(msg) => {
-                assert!(msg.contains("without an id and name"), "{msg}");
+                assert!(msg.contains("without a name"), "{msg}");
             }
             other => panic!("expected MalformedResponseError, got {other:?}"),
         }

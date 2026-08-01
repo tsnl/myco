@@ -24,7 +24,6 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
     let model = ScriptedModel::new(vec![GenerateOutput {
         content: vec![],
         tool_uses: vec![ToolUse {
-            id: "call_exec".into(),
             name: "bash".into(),
             input: serde_json::json!({
                 // `bash -c 'sleep <tag>'` puts the sleep in a grandchild of

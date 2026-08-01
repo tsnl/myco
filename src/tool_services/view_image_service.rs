@@ -118,7 +118,6 @@ mod tests {
         futures::executor::block_on(
             Arc::new(ViewImageService::new(max_image_base64_bytes)).dispatch_tool_use(
                 ToolUse {
-                    id: "t1".into(),
                     name: "view_image".into(),
                     input: json!({ "path": path }),
                 },

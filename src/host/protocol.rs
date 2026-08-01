@@ -97,7 +97,6 @@ mod tests {
             id: "1".into(),
             agent_id: uuid::Uuid::nil(),
             tool_use: ToolUse {
-                id: "toolu_1".into(),
                 name: "bash".into(),
                 input: json!({"command": "echo hi"}),
             },
@@ -118,7 +117,7 @@ mod tests {
     fn response_tool_result_roundtrip() {
         let msg = Response::ToolResult {
             id: "1".into(),
-            result: ToolResult::text("hi").with_id("toolu_1"),
+            result: ToolResult::text("hi"),
         };
         let line = String::from_utf8(msg.encode().unwrap()).unwrap();
         let back = Response::decode(&line).unwrap();
