@@ -115,6 +115,14 @@ pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send +
 /// and records a synthetic cancelled result.
 const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The user turn sent to resume a reply that `max_tokens` cut off mid-text.
+///
+/// A plain "Continue" invites the model to acknowledge the instruction or start
+/// the thought over; naming the requirement keeps the seam invisible in the
+/// finished answer.
+const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
+     and do not acknowledge this message.";
+
 pub struct Agent {
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
@@ -126,6 +134,9 @@ pub struct Agent {
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
+    /// Consecutive `max_tokens` resumes allowed within one turn, from the
+    /// active model's `max_truncated_resumes`.
+    max_truncated_resumes: u32,
     checkpoint: Option<HistoryCheckpoint>,
 }
 
@@ -152,6 +163,7 @@ impl Agent {
             history: Vec::new(),
             last_usage: None,
             context_window_tokens: 200_000,
+            max_truncated_resumes: crate::config::DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
         }
     }
@@ -216,6 +228,12 @@ impl Agent {
         self.context_window_tokens
     }
 
+    /// Set how many consecutive `max_tokens` truncations one turn resumes
+    /// through (the active model's `max_truncated_resumes`; `0` never resumes).
+    pub fn set_max_truncated_resumes(&mut self, resumes: u32) {
+        self.max_truncated_resumes = resumes;
+    }
+
     /// Last observed prompt/context token usage (from the provider), if any.
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.last_usage
@@ -248,6 +266,8 @@ impl Agent {
         // tool round-trip); each new report's input side already covers the
         // whole prompt, so it replaces rather than adds.
         let mut turn_output: u64 = 0;
+        // Consecutive `max_tokens` stops, capped by MAX_TRUNCATED_RESUMES.
+        let mut truncations: u32 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -308,7 +328,8 @@ impl Agent {
             // tool_use nothing responds to makes the whole history unsendable
             // (every later request resends it), which strands the session on the
             // provider's "tool_use without tool_result" error.
-            if !tool_uses.is_empty() {
+            let answered_tool_calls = !tool_uses.is_empty();
+            if answered_tool_calls {
                 // Dispatch every tool use in this turn concurrently. join_all preserves
                 // input order so tool_results[i] matches tool_uses[i]; events may
                 // interleave freely while tools run. Each tool races against cancel so
@@ -330,9 +351,39 @@ impl Agent {
                 }
             }
 
-            // `tool_use` is the only stop that continues the turn; everything
+            // Consecutive-truncation guard; any clean stop clears it.
+            if matches!(reason, TurnEndReason::MaxTokens) {
+                truncations += 1;
+            } else {
+                truncations = 0;
+            }
+
+            // A `max_tokens` stop resumes rather than ending the turn: without
+            // this an overnight run stops mid-task, holding tool results nobody
+            // read or a sentence that breaks off mid-word.
+            let resume_truncated = matches!(reason, TurnEndReason::MaxTokens)
+                && truncations <= self.max_truncated_resumes;
+
+            // How it resumes depends on what the truncated turn left behind. A
+            // turn that carried tool calls already ends on their results, so the
+            // next request is an ordinary continuation. Truncated *text* ends on
+            // the assistant's own cut-off message, and re-sending that is the
+            // prefill shape current Anthropic models reject outright — so ask
+            // for the rest in a user turn, the one continuation every provider
+            // accepts. It is a real message: the provider is sent it, and the
+            // transcript shows it.
+            if resume_truncated && !answered_tool_calls {
+                self.history.push(Message::UserMessage {
+                    content: vec![Content::Text {
+                        text: CONTINUE_PROMPT.to_string(),
+                    }],
+                });
+                self.emit_checkpoint();
+            }
+
+            // `tool_use` is the other stop that continues the turn; everything
             // else hands control back with whatever the model managed to say.
-            if !matches!(reason, TurnEndReason::ToolUse) {
+            if !matches!(reason, TurnEndReason::ToolUse) && !resume_truncated {
                 self.sink.emit(AgentEvent::TurnFinished {
                     context: self.context.clone(),
                 });
@@ -1002,9 +1053,10 @@ mod tests {
     /// reject any later request carrying a tool_use with no matching tool_result:
     /// leaving it unanswered fails the very next user message, and every one
     /// after it. Here the truncated call reaches the real bash tool, which
-    /// rejects the empty input — an error result, but a well-formed turn.
+    /// rejects the empty input — an error result, but a well-formed turn, which
+    /// the agent then resumes from without waiting for a new user message.
     #[tokio::test]
-    async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use() {
+    async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use_and_resumes() {
         // The standard local services include the real bash tool.
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![
@@ -1027,16 +1079,21 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent
+        let reply = agent
             .interact(
                 vec![Content::Text { text: "hi".into() }],
                 crate::core::CancelToken::new(),
             )
             .await
-            .expect("turn should return the partial answer, not an error");
+            .expect("turn should resume through the truncation, not error");
 
-        // user + assistant(tool_use) + tool_results — the tool_use is answered.
-        assert_eq!(agent.history().len(), 3);
+        // The truncation is resumed inside the same turn, so the caller gets the
+        // continuation rather than the partial answer that preceded the tool call.
+        assert!(matches!(&reply[0], Content::Text { text } if text == "ok"));
+
+        // user + assistant(tool_use) + tool_results + assistant — the tool_use is
+        // answered, and the resumed generate appended its reply to the same turn.
+        assert_eq!(agent.history().len(), 4);
         match &agent.history()[2] {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 1);
@@ -1046,19 +1103,128 @@ mod tests {
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
+    }
 
-        // And the session continues: the next turn generates against a history
-        // the provider accepts, instead of failing on the dangling tool_use.
+    /// A `max_tokens` stop with no tool calls leaves history on the assistant's
+    /// cut-off message, which providers reject as a prefill. The turn resumes by
+    /// asking for the rest in a user turn — the one continuation every provider
+    /// accepts — so a truncated sentence finishes instead of dead-ending.
+    #[tokio::test]
+    async fn max_tokens_without_tool_calls_resumes_with_a_continue_turn() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "half a sen".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::MaxTokens,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "tence.".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let reply = agent
             .interact(
-                vec![Content::Text {
-                    text: "Continue".into(),
-                }],
+                vec![Content::Text { text: "hi".into() }],
                 crate::core::CancelToken::new(),
             )
             .await
-            .expect("follow-up turn should succeed");
-        assert!(matches!(&reply[0], Content::Text { text } if text == "ok"));
+            .expect("turn should resume through the truncation");
+
+        assert!(matches!(&reply[0], Content::Text { text } if text == "tence."));
+
+        // user + assistant(truncated) + user(continue) + assistant(rest).
+        assert_eq!(agent.history().len(), 4);
+        match &agent.history()[2] {
+            Message::UserMessage { content } => match content.as_slice() {
+                [Content::Text { text }] => assert_eq!(text, CONTINUE_PROMPT),
+                other => panic!("expected one text block, got {other:?}"),
+            },
+            other => panic!("expected the continuation user turn, got {other:?}"),
+        }
+    }
+
+    /// A model whose output cap is too low truncates every turn. Resuming is
+    /// capped so an unattended run stops instead of spending the night
+    /// re-truncating; the turn still ends cleanly rather than erroring.
+    #[tokio::test]
+    async fn consecutive_max_tokens_resumes_are_bounded() {
+        const CAP: u32 = 2;
+        let harness = Harness::local_with_services(vec![]);
+        let truncated_with_tool_call = || GenerateOutput {
+            content: vec![Content::Text {
+                text: "still going".into(),
+            }],
+            tool_uses: vec![ToolUse {
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }],
+            turn_end_reason: TurnEndReason::MaxTokens,
+            usage: None,
+        };
+        // One more script than the cap can consume, so the surplus proves the
+        // loop stopped on the cap rather than on an exhausted script list.
+        let scripts = (0..CAP + 2).map(|_| truncated_with_tool_call()).collect();
+        let model = ScriptedModel::new(scripts);
+        let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+        agent.set_max_truncated_resumes(CAP);
+        agent
+            .interact(
+                vec![Content::Text { text: "hi".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("turn should hand back once the cap is hit, not error");
+
+        // The initial generate plus CAP resumes.
+        assert_eq!(model.remaining() as u32, 1);
+    }
+
+    /// `max_truncated_resumes = 0` is the opt-out: the turn hands back the
+    /// partial answer, exactly as it did before resuming existed.
+    #[tokio::test]
+    async fn zero_max_truncated_resumes_hands_back_the_partial_answer() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "half a sen".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::MaxTokens,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "unused".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+        agent.set_max_truncated_resumes(0);
+        let reply = agent
+            .interact(
+                vec![Content::Text { text: "hi".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect("turn should hand back the partial answer");
+
+        assert!(matches!(&reply[0], Content::Text { text } if text == "half a sen"));
+        // user + assistant only: no continuation turn, no second generate.
+        assert_eq!(agent.history().len(), 2);
+        assert_eq!(model.remaining(), 1, "second script must stay unconsumed");
     }
 
     /// A turn that ends cleanly with no tool calls gains no ToolResults message.

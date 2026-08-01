@@ -143,6 +143,11 @@ pub struct ModelSpec {
     /// Always concrete: config resolution applies the `max_image_base64_bytes`
     /// entry or its default, and callers downstream take this value.
     pub max_image_base64_bytes: u64,
+    /// How many consecutive `max_tokens` truncations one turn resumes through
+    /// before handing control back (`0` never resumes). Resolved from the
+    /// model's `max_truncated_resumes` or its default; the agent takes this
+    /// value via [`crate::agent::Agent::set_max_truncated_resumes`].
+    pub max_truncated_resumes: u32,
 }
 
 impl std::fmt::Display for ModelSpec {
@@ -994,6 +999,7 @@ mod tests {
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
             max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            max_truncated_resumes: 3,
         }
     }
 

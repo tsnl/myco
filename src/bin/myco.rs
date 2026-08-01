@@ -634,6 +634,7 @@ async fn boot<S: EventSink + 'static>(
     );
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+    agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let restored = session.snapshot();
     agent.set_history(restored.messages.clone());
     agent.set_last_usage(restored.last_usage);
@@ -1374,6 +1375,9 @@ impl ReplSession {
                         self.agent.set_model(model);
                         self.agent.set_context_window_tokens(
                             self.catalog_model.spec.context_window_tokens,
+                        );
+                        self.agent.set_max_truncated_resumes(
+                            self.catalog_model.spec.max_truncated_resumes,
                         );
                         self.ui.myco_section(&format!("effort={}", self.effort));
                     }

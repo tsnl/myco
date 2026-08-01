@@ -157,6 +157,17 @@ clear message naming both sizes instead of a provider 400. Remote hosts are
 spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
 which keeps every host in a session on the same limit.
 
+`max_truncated_resumes` (default 3, `0` to opt out) caps how many consecutive
+`max_tokens` stops one turn resumes through before handing control back.
+Truncation is not a dead end: a turn cut off mid-tool-call already ends on the
+tool results, so it simply continues, and one cut off mid-sentence is continued
+by a user turn asking for the rest (the assistant's own cut-off message cannot be
+resent — that is the prefill shape current Anthropic models reject). Both count
+against the cap, which exists because a model whose output cap is too low for how
+much it writes would otherwise resume all night; any turn that ends for another
+reason clears the count. Per model because the right ceiling depends on that
+model's `max_output_tokens` versus how much it tends to write.
+
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:
 `{ source = "env", var_name = "…" }` reads the process environment (`dotenvy`

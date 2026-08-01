@@ -91,6 +91,15 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub max_image_base64_bytes: Option<u64>,
+    /// How many consecutive `max_tokens` truncations one turn resumes through
+    /// before handing control back (default
+    /// [`crate::config::DEFAULT_MAX_TRUNCATED_RESUMES`]; `0` never resumes).
+    ///
+    /// Per model because it is a function of this model's output cap versus how
+    /// much it tends to write: one that truncates every turn needs the ceiling,
+    /// one that never truncates never reaches it.
+    #[serde(default)]
+    pub max_truncated_resumes: Option<u32>,
 }
 
 /// The `auth` value on a gateway or model entry.

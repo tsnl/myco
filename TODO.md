@@ -93,8 +93,11 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - History breakpoints / strategic `cache_control` so the growing prefix is not fully uncached.
   - Surface cache hit metrics so prompts can be tuned.
   - Rejection reason: very infrequently used in practice, just let the agent read the session history.
-- [x] (REJECT) **Max-tokens continue** — `TurnEndReason::MaxTokens` exists; guided or automatic continue
-      instead of a dead end. See `/compact`
+- [x] **Max-tokens continue** — a `max_tokens` stop that carried tool calls now resumes in-turn
+      rather than dead-ending: the tool results are already the last message, so the resumed
+      request is an ordinary continuation. Capped at `MAX_TRUNCATED_RESUMES` consecutive
+      truncations. Truncated *text* still hands back — history would end on an assistant
+      message, which current Anthropic models reject as a prefill.
 
 ### Project brain
 
