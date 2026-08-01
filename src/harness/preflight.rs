@@ -90,8 +90,8 @@ pub struct StartupPreflight {
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
     /// Set when the rendered prelude is over `max_prelude_bytes`. **Fatal**:
-    /// nothing trims the prelude any more, so myco refuses to start rather
-    /// than run agents on a silently partial one ([`Self::fatal`]).
+    /// myco stops rather than run agents on a prelude it cannot carry whole
+    /// ([`Self::fatal`]).
     pub prelude_oversize: Option<PreludeOversize>,
     /// Set when the prelude directory exists but could not be read, so this
     /// session's agents run with an empty prelude (see

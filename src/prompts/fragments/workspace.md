@@ -66,10 +66,11 @@ act on it without re-checking. A big prelude only pays off while it stays true:
 - **The budget is `max_prelude_bytes`** (config.toml; 256 KiB by default), not
   a screenful — and it is a wall, not a suggestion. An `add` or `replace` that
   would cross it is refused outright, and myco refuses to start against a
-  prelude already over it. Nothing is ever trimmed on your behalf, so what you
-  see above is always the whole prelude. When a write is refused, merge
-  overlapping entries or move the coldest material out to a workspace file;
-  that is the work the refusal is asking for, not an error to route around.
+  prelude already over it — so the `# Prelude` above is always complete, and
+  you can act on it as the whole of what you know. When a write is refused,
+  merge overlapping entries or move the coldest material out to a workspace
+  file; that is the work the refusal is asking for, not an error to route
+  around.
 
 ## Finding what is already there
 

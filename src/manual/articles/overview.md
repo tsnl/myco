@@ -58,7 +58,7 @@ model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
 # Hard cap on the rendered prelude in every agent system prompt (default 262144):
-# oversized edits are refused and startup exits rather than trim it.
+# oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144
 
 [gateways.xai]
@@ -258,13 +258,13 @@ agents record findings eagerly and reserve workspace files for cold material
 cached, so a big prelude is cheaper than the mid-task exploration it replaces.
 
 `max_prelude_bytes` (config.toml; default 262144 = 256 KiB) bounds the rendered
-prelude, and it is an enforced invariant rather than a render-time clamp:
-the `prelude` tool refuses an `add`/`replace` that would cross it, and startup
-**exits** rather than run against a directory already over it, naming the sizes
-and the two fixes (prune entries by hand, or raise the knob). Nothing is ever
-trimmed on the way into a prompt — a silently shortened prelude is
-indistinguishable, from inside the prompt, from knowledge that was never
-recorded, which is exactly the failure the cap exists to prevent.
+prelude, and it is enforced at both ends rather than applied to the prompt: the
+`prelude` tool refuses an `add`/`replace` that would cross it, and startup
+**exits** against a directory already over it, naming the sizes and the two
+fixes (prune entries by hand, or raise the knob). A prompt therefore always
+carries the prelude whole — a shortened one is indistinguishable, from inside
+the prompt, from knowledge that was never recorded, which is exactly the
+failure the cap exists to prevent.
 
 The rest of the workspace is listed, not quoted: a `# Workspace Files` section
 gives each visible file's path (relative to `workspace/`), the UTC day it last

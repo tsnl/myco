@@ -197,11 +197,11 @@ pub fn is_session_stamp(text: &str) -> bool {
 /// runaway-growth backstop, not a target: 256 KiB is roughly 64K tokens on
 /// models with 500K+ windows, and the whole block is prompt-cached.
 ///
-/// It is an **invariant, not a clamp**: the `prelude` tool refuses an edit
-/// that would exceed it, and startup refuses to run against a prelude already
-/// over it ([`prelude_oversize`]). Nothing trims the prelude on the way into a
-/// prompt — a silently shortened prelude reads, from inside the prompt, like
-/// knowledge that was never recorded.
+/// It is an **enforced invariant**: the `prelude` tool refuses an edit that
+/// would exceed it, and startup refuses to run against a prelude already over
+/// it ([`prelude_oversize`]). Both gates exist because the prompt cannot carry
+/// a partial prelude honestly — a shortened one reads, from inside the prompt,
+/// like knowledge that was never recorded.
 pub const DEFAULT_MAX_PRELUDE_BYTES: usize = 256 * 1024;
 
 /// Backstop for injected project guidance (`AGENTS.md` / `CLAUDE.md`).
@@ -211,11 +211,10 @@ const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
 
 /// A rendered prelude that does not fit under the `max_prelude_bytes` cap.
 ///
-/// Startup refuses to run in this state rather than trimming: the prelude is
-/// what every agent treats as known-without-checking, so quietly dropping its
-/// tail would have agents act on a partial picture with no way to notice. The
-/// only fixes are the user's — prune entries or raise the cap — so myco stops
-/// and says which.
+/// Startup refuses to run in this state: the prelude is what every agent
+/// treats as known-without-checking, so shortening it to fit would have agents
+/// act on a partial picture with no way to notice. The only fixes are the
+/// user's — prune entries or raise the cap — so myco stops and says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreludeOversize {
     /// How many entries the prelude held on disk.
@@ -302,12 +301,12 @@ fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
 /// The prelude as it goes into a prompt: every entry, whole. `None` when
 /// there is nothing recorded.
 ///
-/// Deliberately uncapped. The cap is enforced where it can still be acted on
-/// — the `prelude` tool refuses an oversized edit, startup refuses an
-/// oversized directory — so by the time a prompt is built the invariant holds.
-/// The one way past both gates is another process growing the prelude
-/// mid-session, and rendering that in full is the honest failure: the next
-/// startup reports it, whereas a silent trim would not.
+/// Renders whatever is on disk. `max_prelude_bytes` is enforced where it can
+/// still be acted on — the `prelude` tool refuses an oversized edit, startup
+/// refuses an oversized directory — so by the time a prompt is built the
+/// invariant holds. The one way past both gates is another process growing the
+/// prelude mid-session; rendering that in full keeps the failure visible, and
+/// the next startup reports it.
 fn rendered_prelude(dir: &std::path::Path) -> Option<String> {
     let entries = crate::prelude::entries(dir);
     (!entries.is_empty()).then(|| crate::prelude::rendered_body(&entries))
