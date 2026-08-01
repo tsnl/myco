@@ -1,6 +1,7 @@
-//! The `myco` binary: an API server by default (`myco` → Rocket on
-//! localhost:7773 serving `/api` for myco-gui and scripts), plus the worker
-//! mode remotes depend on (`ssh <alias> myco --mode host`).
+//! The `myco` binary. Default mode is the interactive CLI (async: input
+//! queues while turns run). `--mode serve` runs the multiplayer web server —
+//! the parallel experiment — over the same session runtime. `--mode host` is
+//! the worker remotes run (`ssh <alias> myco --mode host`).
 
 use clap::{Parser, ValueEnum};
 use myco::config::{Config, ConfigUserSettings, DEFAULT_MAX_IMAGE_BASE64_BYTES};
@@ -8,20 +9,41 @@ use myco::host::HostWorker;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
-    /// Serve the API on localhost (default).
-    Server,
+    /// Interactive CLI (default).
+    Cli,
+    /// Serve the web API + GUI on localhost.
+    Serve,
     /// Serve OS tools over stdin/stdout NDJSON (spawned as `ssh <alias> myco
     /// --mode host`; never run by hand).
     Host,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "myco", version, about = "myco API server / host worker")]
+#[command(name = "myco", version, about = "myco: multi-host coding agent")]
 struct Args {
-    #[arg(long, value_enum, default_value_t = Mode::Server)]
+    #[arg(long, value_enum, default_value_t = Mode::Cli)]
     mode: Mode,
 
-    /// Server port for `--mode server`.
+    /// Print mode: run one agent turn, print the answer to stdout, exit.
+    /// The session is saved like any other (`session=<id>` on stderr).
+    #[arg(short = 'p', long = "print", value_name = "PROMPT")]
+    print: Option<String>,
+
+    /// Resume a session by id (or prefix). Without a value: the most recent.
+    #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+
+    /// Create this session as a hidden child of the given session (nested
+    /// agents; combine with --fork to copy the parent's conversation).
+    #[arg(long, value_name = "ID")]
+    parent_session: Option<String>,
+
+    /// With --parent-session: seed the child with the parent's saved
+    /// conversation (context fork).
+    #[arg(long)]
+    fork: bool,
+
+    /// Server port for `--mode serve`.
     #[arg(long, default_value_t = 7773)]
     port: u16,
 
@@ -29,7 +51,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
 
-    /// Default model key override (config file `model` otherwise).
+    /// Model key from the config.toml [models] catalog.
     #[arg(long)]
     model: Option<String>,
 
@@ -57,7 +79,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Mode::Server => {
+        Mode::Serve => {
             let config = match Config::resolve(ConfigUserSettings {
                 config_path: args.config,
                 model: args.model,
@@ -76,6 +98,19 @@ async fn main() {
                 eprintln!("myco server error: {e}");
                 std::process::exit(1);
             }
+        }
+        Mode::Cli => {
+            myco::cli::run(myco::cli::CliOptions {
+                config_path: args.config,
+                model: args.model,
+                resume: args
+                    .resume
+                    .map(|id| if id.is_empty() { None } else { Some(id) }),
+                parent_session: args.parent_session,
+                fork: args.fork,
+                print: args.print,
+            })
+            .await;
         }
     }
 }

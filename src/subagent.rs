@@ -16,7 +16,7 @@ use myco_core::Async;
 use myco_machines::tool_services::{HostDispatchContext, ToolService, tool_input_schema};
 use myco_models::{self as generative_model, ToolResult, ToolUse};
 
-use crate::server::{Supervisor, last_answer};
+use crate::supervisor::{Supervisor, last_answer};
 
 const TOOL_DESCRIPTION: &str = r#"
 Delegate to a nested agent: one call runs one full turn of a hidden child
@@ -88,7 +88,7 @@ impl SubagentTool {
         let start = *turns.borrow();
         child
             .tx
-            .send(crate::server::Cmd::User(input.prompt))
+            .send(crate::supervisor::Cmd::User(input.prompt))
             .map_err(|_| "child agent task gone".to_string())?;
 
         // Wait for the child's turn, staying cancellable: cancelling the

@@ -32,6 +32,8 @@ dotenvy = { workspace = true }
 tokio-util = { workspace = true }
 dirs = { workspace = true }
 schemars = { workspace = true }
+rustyline = "15"
+unicode-width = "0.2"
 
 [dev-dependencies]
 myco-test-support = { workspace = true }

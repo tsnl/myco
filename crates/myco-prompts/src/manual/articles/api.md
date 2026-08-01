@@ -1,13 +1,18 @@
 # Driving myco (API, GUI, nested agents)
 
-myco runs as a **server**: `myco` serves an HTTP API on `http://127.0.0.1:7773/api`
-(`--port` to change) and the web GUI connects to it. There is no interactive
-terminal UI; users talk to you through a client, and programs — including you —
-drive the same API.
+myco has one session runtime and two frontends. `myco` (default) is the
+interactive CLI: it runs the runtime in-process, and the user's prompt stays
+live while you work — their input queues as your next turns. `myco --mode
+serve` is the multiplayer web experiment: the same runtime behind an HTTP API
+on `http://127.0.0.1:7773/api` (`--port` to change) with the web GUI on top.
+Everything below applies to serve mode; in CLI mode the same operations are
+in-process (nested agents included — the `subagent` tool works identically in
+both).
 
 ## The API
 
-The base URL is exported as `$MYCO_API` in every local bash session.
+In serve mode the base URL is exported as `$MYCO_API` in every local bash
+session (absent in CLI mode — use the `subagent` tool there).
 
 | Endpoint | Meaning |
 |----------|---------|
@@ -58,7 +63,9 @@ fork vs blank.
 
 ## What users see
 
-The GUI is one URL per conversation: transcripts, live streaming output, a
-send box, cancel. There are no slash-commands anymore; anything a user asks
-about "commands" maps to API calls or to asking you (titles and scratchpads
-are yours via `session_meta`).
+CLI: the v1 terminal experience, now async — output streams above a live
+prompt; typed lines queue while you work; Ctrl-C cancels the running turn;
+`/new /resume <id> /sessions /session /title /compact /hosts /exit`. Web GUI:
+one URL per conversation, styled like the terminal — transcripts, live
+streaming, send, cancel. Users cannot press your tools in either frontend;
+titles and scratchpads are also yours via `session_meta`.

@@ -206,16 +206,13 @@ mod tests {
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "tmux", "fzf"]);
+        assert_eq!(names, ["bash"]);
 
         let names: Vec<_> = missing_executables(true, |_| false)
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(
-            names,
-            ["bash", "tmux", "fzf", "ssh", "ssh-add", "ssh-keygen"]
-        );
+        assert_eq!(names, ["bash", "ssh", "ssh-add", "ssh-keygen"]);
     }
 
     #[test]
@@ -230,15 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_tmux_reports_the_purpose_and_an_install_hint() {
+    fn a_missing_executable_reports_the_purpose_and_an_install_hint() {
         let pf = preflight(
             None,
-            missing_executables(false, |e| e.name != "tmux"),
+            missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport::default(),
         );
         let out = rendered(&pf);
         assert!(
-            out.contains("missing executable tmux: bare /resume cannot open the session browser"),
+            out.contains("missing executable bash: the bash tool cannot run commands"),
             "{out}"
         );
         assert!(
@@ -273,14 +270,14 @@ mod tests {
         // leak into a WARNING block opened for missing executables.
         let pf = preflight(
             None,
-            missing_executables(false, |e| e.name != "tmux"),
+            missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
                 ..Default::default()
             },
         );
         let out = rendered(&pf);
-        assert!(out.contains("missing executable tmux"), "{out}");
+        assert!(out.contains("missing executable bash"), "{out}");
         assert!(!out.contains("note:"), "{out}");
     }
 
@@ -295,7 +292,7 @@ mod tests {
                 bytes: 132_000,
                 limit: 64 * 1024,
             }),
-            missing_executables(false, |e| e.name != "tmux"),
+            missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport::default(),
         );
         assert!(pf.has_problems());
@@ -311,7 +308,7 @@ mod tests {
         );
         // The soul leads the block; the other checks follow it.
         let soul_at = out.find("soul/20260722T0215").unwrap();
-        let exec_at = out.find("missing executable tmux").unwrap();
+        let exec_at = out.find("missing executable bash").unwrap();
         assert!(soul_at < exec_at, "{out}");
     }
 
@@ -341,7 +338,7 @@ mod tests {
             manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
             soul: None,
             executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "tmux"),
+                missing: missing_executables(false, |e| e.name != "bash"),
             },
             ssh: SshAgentPreflightReport::default(),
         };
@@ -353,7 +350,7 @@ mod tests {
         );
         assert!(out.contains("`myco --help <id>` still works"), "{out}");
         let manual_at = out.find("manual export failed").unwrap();
-        let exec_at = out.find("missing executable tmux").unwrap();
+        let exec_at = out.find("missing executable bash").unwrap();
         assert!(manual_at < exec_at, "{out}");
     }
 

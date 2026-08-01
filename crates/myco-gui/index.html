@@ -3,6 +3,40 @@
   <head>
     <meta charset="utf-8" />
     <title>myco</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        background: #101010; color: #d8d8d8;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 14px; line-height: 1.45;
+        max-width: 84ch; margin: 0 auto; padding: 1rem;
+      }
+      a { color: #7ab7ff; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+      ul { list-style: none; padding: 0; margin: 0.5rem 0; }
+      li { margin: 0.1rem 0; }
+      h1 { font-size: 1rem; letter-spacing: 0.3em; }
+      button {
+        background: #101010; color: #d8d8d8; font: inherit;
+        border: 1px solid #444; padding: 0.15rem 0.7rem; cursor: pointer;
+      }
+      button:hover { border-color: #888; }
+      textarea {
+        width: 100%; background: #161616; color: #d8d8d8; font: inherit;
+        border: 1px solid #444; padding: 0.4rem; resize: vertical;
+      }
+      .rule-user { color: #6fc26f; }
+      .rule { border: 0; border-top: 1px solid #333; margin: 0.6rem 0 0.3rem; }
+      .role { font-weight: bold; }
+      .role-user { color: #6fc26f; }
+      .role-assistant { color: #d8d8d8; }
+      .role-thinking { color: #777; font-style: italic; }
+      .role-tool { color: #b09be5; }
+      .err { color: #e07a7a; }
+      .dim { color: #777; }
+    </style>
   </head>
   <body></body>
 </html>
