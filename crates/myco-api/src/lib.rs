@@ -80,3 +80,15 @@ pub struct Models {
 pub struct ApiError {
     pub error: String,
 }
+
+/// One SSE event on `/api/sessions/<id>/events` — a live projection of the
+/// agent's event stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    TurnStarted,
+    TextDelta { text: String },
+    ThinkingDelta { text: String },
+    ToolStarted { name: String, input: String },
+    TurnFinished,
+}
