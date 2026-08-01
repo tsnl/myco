@@ -205,6 +205,13 @@ pub struct ModelSpec {
     /// model's `max_truncated_resumes` or its default; the agent takes this
     /// value via [`crate::agent::Agent::set_max_truncated_resumes`].
     pub max_truncated_resumes: u32,
+    /// Prompt size at which the REPL compacts without being asked. `None` =
+    /// no auto-compaction (the default; `/compact` still works).
+    ///
+    /// Resolved from the model's `auto_compact_at` *fraction* against
+    /// `context_window_tokens` so the comparison downstream is a plain token
+    /// count, and the fraction is validated once, at startup.
+    pub auto_compact_at_tokens: Option<u64>,
 }
 
 impl std::fmt::Display for ModelSpec {
@@ -1095,6 +1102,7 @@ mod tests {
             context_window_tokens: 1_000_000,
             max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
             max_truncated_resumes: 3,
+            auto_compact_at_tokens: None,
         }
     }
 

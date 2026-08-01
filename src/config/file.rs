@@ -131,6 +131,15 @@ pub struct ModelEntry {
     /// one that never truncates never reaches it.
     #[serde(default)]
     pub max_truncated_resumes: Option<u32>,
+    /// Compact automatically once the prompt reaches this fraction of
+    /// `context_window` (e.g. `0.8`). Absent → no auto-compaction.
+    ///
+    /// Per model because the trigger is a share of *this* model's context
+    /// window. Resolution turns it into a concrete token count
+    /// ([`crate::generative_model::ModelSpec::auto_compact_at_tokens`]);
+    /// must be greater than 0 and less than 1.
+    #[serde(default)]
+    pub auto_compact_at: Option<f64>,
     /// Retry override for a model served without a gateway, or one whose
     /// gateway policy does not suit it. Absent → the gateway's.
     #[serde(default)]

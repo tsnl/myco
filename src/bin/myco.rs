@@ -728,6 +728,7 @@ async fn run_interactive(args: Args) {
         turn_cancel: TurnCancel::default(),
         forked: args.fork,
         session_lock,
+        auto_compact_failed: false,
     };
     repl.run_repl().await;
 
@@ -891,6 +892,10 @@ struct ReplSession {
     /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
     /// unavailable on this filesystem.
     session_lock: Option<SessionWriteLock>,
+    /// Set when an *automatic* compaction fails, to stop every later turn
+    /// paying for a worker run that just failed. `/compact` still works, and a
+    /// session switch (`/new`, `/resume`) clears it with the rest of the state.
+    auto_compact_failed: bool,
 }
 
 impl ReplSession {
@@ -1147,6 +1152,10 @@ impl ReplSession {
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
+
+        // After persisting, so a compaction that switches sessions inherits a
+        // saved predecessor.
+        self.maybe_auto_compact().await;
     }
 }
 
@@ -1158,19 +1167,21 @@ impl ReplSession {
     /// `/compact`: run the worker lifecycle (see
     /// [`myco::session::run_compact_worker`]) and switch the live REPL to the
     /// successor it built.
-    async fn run_compact(&mut self) {
+    /// Returns whether the successor was installed, so an automatic caller can
+    /// stop retrying a compaction that is failing every time.
+    async fn run_compact(&mut self) -> bool {
         if let Err(e) =
             self.session
                 .persist_messages(self.agent.history(), self.agent.last_usage(), true)
         {
             self.ui
                 .error_section(&format!("compact: failed to persist current session: {e}"));
-            return;
+            return false;
         }
         let predecessor = self.session.snapshot();
         if predecessor.messages.is_empty() {
             self.ui.error_section("compact: session is empty");
-            return;
+            return false;
         }
 
         // Progress note under the USER header, not chrome: the COMPACTED
@@ -1195,11 +1206,11 @@ impl ReplSession {
             Ok(v) => v,
             Err(CompactWorkerError::Cancelled) => {
                 self.ui.note("compact: cancelled (session unchanged)");
-                return;
+                return false;
             }
             Err(CompactWorkerError::Failed(reason)) => {
                 self.ui.error_section(&format!("compact: {reason}"));
-                return;
+                return false;
             }
         };
 
@@ -1209,7 +1220,7 @@ impl ReplSession {
         }
         if let Err(msg) = self.relock_session(&successor.id) {
             self.ui.error_section(&format!("compact: {msg}"));
-            return;
+            return false;
         }
         self.session.replace(successor.clone());
         self.agent.set_history(successor.messages.clone());
@@ -1223,6 +1234,45 @@ impl ReplSession {
         // successor's summary + tail.
         clear_screen();
         self.ui.compacted_banner(&outcome);
+        true
+    }
+
+    /// Compact without being asked once the prompt reaches the model's
+    /// `auto_compact_at` share of its context window.
+    ///
+    /// Checked *after* a turn, against `last_usage`: that is the provider's own
+    /// count for the request just sent, so the trigger uses a measured prompt
+    /// size rather than a guess at the next one. The successor starts from a
+    /// summary, so its usage falls far below the threshold and this cannot
+    /// re-fire on the following turn.
+    async fn maybe_auto_compact(&mut self) {
+        let Some(threshold) = self.catalog_model.spec.auto_compact_at_tokens else {
+            return;
+        };
+        if self.auto_compact_failed {
+            return;
+        }
+        // No usage means nothing measured to act on: a resumed session before
+        // its first turn, or a turn that failed before the provider reported.
+        let Some(usage) = self.agent.last_usage() else {
+            return;
+        };
+        let used = usage.context_tokens();
+        if used < threshold {
+            return;
+        }
+
+        self.ui.note(&format!(
+            "auto-compacting: prompt reached {used} tokens of {} (threshold {threshold}) …",
+            self.agent.context_window_tokens()
+        ));
+        if !self.run_compact().await {
+            self.auto_compact_failed = true;
+            self.ui.note(
+                "auto-compact disabled for this session after the failure above; \
+                 run /compact to retry",
+            );
+        }
     }
 }
 
