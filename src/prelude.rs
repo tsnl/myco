@@ -102,7 +102,19 @@ pub fn rendered_body(entries: &[PreludeEntry]) -> String {
 /// name in the same second both try to create the same temp file, exactly one
 /// wins, and the loser retries under a fresh name instead of silently
 /// overwriting the winner's bytes and dropping an entry.
-pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
+///
+/// Refuses to write at all if the resulting prelude would render past
+/// `max_bytes`, so the cap holds by construction instead of being trimmed back
+/// at prompt-build time. `superseding` names an entry the caller is about to
+/// remove (the `replace` path), whose bytes are therefore not counted against
+/// the budget — otherwise swapping an entry for one the same size could be
+/// refused.
+pub fn add_entry(
+    dir: &Path,
+    text: &str,
+    max_bytes: usize,
+    superseding: Option<&str>,
+) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let body = format!("{}\n", text.trim_end());
     for _ in 0..8 {
@@ -114,11 +126,37 @@ pub fn add_entry(dir: &Path, text: &str) -> Result<String, String> {
         if dir.join(&name).exists() {
             continue;
         }
+        // Every candidate name is the same length, so a retry cannot change
+        // this verdict — checking inside the loop just keeps it next to the
+        // name it is measuring.
+        let projected = projected_bytes(dir, &name, text, superseding);
+        if projected > max_bytes {
+            return Err(format!(
+                "refusing to write: the prelude would render at {projected} bytes, over the \
+                 {max_bytes} byte max_prelude_bytes cap. Merge overlapping entries or remove \
+                 dead ones (action=list), move cold material to a workspace file, or raise \
+                 max_prelude_bytes in config.toml"
+            ));
+        }
         if write_entry(dir, &name, &body)? {
             return Ok(name);
         }
     }
     Err("could not pick a fresh prelude entry name".into())
+}
+
+/// Rendered size of the prelude if `text` landed as entry `name` and
+/// `superseding` were dropped.
+fn projected_bytes(dir: &Path, name: &str, text: &str, superseding: Option<&str>) -> usize {
+    let mut projected: Vec<PreludeEntry> = entries(dir)
+        .into_iter()
+        .filter(|e| Some(e.name.as_str()) != superseding)
+        .collect();
+    projected.push(PreludeEntry {
+        name: name.to_string(),
+        text: text.trim().to_string(),
+    });
+    rendered_body(&projected).len()
 }
 
 /// Write `body` as entry `name`: claim a hidden temp exclusively, fill it,
@@ -166,6 +204,9 @@ pub fn remove_entry(dir: &Path, name: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
 
+    /// For tests about storage mechanics rather than the size cap.
+    const NO_CAP: usize = usize::MAX;
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("myco-prelude-store-{tag}-{}", uuid::Uuid::new_v4()));
@@ -199,7 +240,7 @@ mod tests {
     #[test]
     fn add_creates_a_visible_entry_and_leaves_no_temp_behind() {
         let dir = temp_dir("add");
-        let name = add_entry(&dir, "  a fact  \n\n").unwrap();
+        let name = add_entry(&dir, "  a fact  \n\n", NO_CAP, None).unwrap();
         assert!(is_entry_name(&name), "{name}");
         assert_eq!(
             std::fs::read_to_string(dir.join(&name)).unwrap(),
@@ -268,6 +309,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The cap holds by refusal, not by trimming: an add that would cross it
+    /// writes nothing at all, and says what to do about it.
+    #[test]
+    fn an_add_over_the_cap_is_refused_and_writes_nothing() {
+        let dir = temp_dir("cap-refusal");
+        let first = add_entry(&dir, "the first fact", NO_CAP, None).unwrap();
+        let used = rendered_body(&entries(&dir)).len();
+
+        let err = add_entry(&dir, "the second fact", used + 10, None)
+            .expect_err("an entry past the cap must be refused");
+        assert!(err.contains("refusing to write"), "{err}");
+        assert!(err.contains("max_prelude_bytes"), "{err}");
+        // Nothing landed, and no temp file was left behind either.
+        assert_eq!(
+            entries(&dir).iter().map(|e| &e.name).collect::<Vec<_>>(),
+            vec![&first]
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with('.')),
+            "a refused add must not leave a temp file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `replace` discounts the entry it is about to drop, so swapping an entry
+    /// for one of similar size is not refused just because the two coexist for
+    /// an instant.
+    #[test]
+    fn replace_measures_against_the_entry_it_supersedes() {
+        let dir = temp_dir("cap-replace");
+        let old = add_entry(&dir, "some fact, first draft", NO_CAP, None).unwrap();
+        let exactly_enough = rendered_body(&entries(&dir)).len();
+
+        // Same-size rewrite with no headroom at all: allowed, because `old` is
+        // discounted; refused if it were counted twice.
+        let new = add_entry(
+            &dir,
+            "some fact, later draft",
+            exactly_enough,
+            Some(old.as_str()),
+        )
+        .expect("a same-size replacement should fit");
+        remove_entry(&dir, &old).unwrap();
+
+        let live = entries(&dir);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].name, new);
+        assert_eq!(live[0].text, "some fact, later draft");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The end-to-end property the write-once scheme exists for: agents adding
     /// at the same moment all keep their entry.
     #[test]
@@ -278,7 +375,7 @@ mod tests {
         std::thread::scope(|scope| {
             for i in 0..WRITERS {
                 let dir = &dir;
-                scope.spawn(move || add_entry(dir, &format!("entry {i}")).unwrap());
+                scope.spawn(move || add_entry(dir, &format!("entry {i}"), NO_CAP, None).unwrap());
             }
         });
 
@@ -296,7 +393,7 @@ mod tests {
     #[test]
     fn remove_distinguishes_gone_from_failure() {
         let dir = temp_dir("remove");
-        let name = add_entry(&dir, "ephemeral").unwrap();
+        let name = add_entry(&dir, "ephemeral", NO_CAP, None).unwrap();
         assert_eq!(remove_entry(&dir, &name), Ok(true));
         // Already gone reads as a concurrent supersede, not an error.
         assert_eq!(remove_entry(&dir, &name), Ok(false));
