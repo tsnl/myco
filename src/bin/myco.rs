@@ -594,18 +594,13 @@ async fn boot<S: EventSink + 'static>(
     // need to prompt on the host pipe. Also checks the prelude the agent is
     // about to run with. Warnings are reported by the caller (interactive:
     // WARNING block after the banner; print: stderr), not here.
-    let preflight = StartupPreflight::run(
-        &app_config.harness.remote_hosts,
-        app_config.max_prelude_bytes,
-    );
-    // A fatal finding is the caller's business only in the sense that it never
-    // reaches one: an oversized prelude has no in-session repair (the tool
-    // refuses to grow it further, and trimming it in the prompt is exactly
-    // what this design rejects), so stop before a session exists to confuse.
-    if let Some(fatal) = preflight.fatal() {
+    // Fatal checks first: they end the process, so run them before anything
+    // that would leave a half-built session behind.
+    if let Some(fatal) = myco::harness::fatal_startup_check(app_config.max_prelude_bytes) {
         eprintln!("myco: {fatal}");
         std::process::exit(1);
     }
+    let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));

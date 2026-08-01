@@ -4,15 +4,14 @@
 //! verifies that the external programs myco spawns (declared in
 //! [`crate::external_command`]) actually resolve on the agent machine. Results
 //! fold into one WARNING block with the ssh-agent preflight
-//! ([`SshAgentPreflightReport`]) and the prelude checks
-//! ([`crate::prompts::prelude_oversize`], [`crate::prelude::read_failure`]) —
-//! one section after the banner, silent when everything resolves. Remote hosts
-//! are not probed here; they report missing programs as tool errors at call
-//! time.
+//! ([`SshAgentPreflightReport`]) and the prelude read check
+//! ([`crate::prelude::read_failure`]) — one section after the banner, silent
+//! when everything resolves. Remote hosts are not probed here; they report
+//! missing programs as tool errors at call time.
 //!
-//! One finding is fatal rather than a warning: an oversized prelude
-//! ([`StartupPreflight::prelude_oversize`]). The caller is expected to report
-//! it and exit — see [`StartupPreflight::fatal`].
+//! Checks that *stop* startup are a separate pass, [`fatal_startup_check`],
+//! which the caller runs first and exits on. Keeping the two apart is what
+//! lets this type mean exactly one thing: problems a session can run through.
 //!
 //! Reporting stops at plain text ([`StartupPreflight::warning_body`]); the
 //! caller owns the WARNING block around it, because the interactive REPL and
@@ -23,7 +22,7 @@ use std::io::Write;
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
-use crate::prompts::{PreludeOversize, prelude_oversize};
+use crate::prompts::prelude_oversize;
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
@@ -89,10 +88,6 @@ pub struct StartupPreflight {
     /// Why the manual export failed, when it did. Agents are told in their
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
-    /// Set when the rendered prelude is over `max_prelude_bytes`. **Fatal**:
-    /// myco stops rather than run agents on a prelude it cannot carry whole
-    /// ([`Self::fatal`]).
-    pub prelude_oversize: Option<PreludeOversize>,
     /// Set when the prelude directory exists but could not be read, so this
     /// session's agents run with an empty prelude (see
     /// [`crate::prelude::read_failure`]).
@@ -106,9 +101,8 @@ impl StartupPreflight {
     /// at its directory). Then the executable check; the ssh-agent preflight
     /// runs only when the OpenSSH tools it spawns actually resolve —
     /// otherwise every step would fail with spawn errors the
-    /// missing-executable lines already explain. `max_prelude_bytes` is the
-    /// resolved config cap the prompts will use.
-    pub fn run(hosts: &[HostConfig], max_prelude_bytes: usize) -> Self {
+    /// missing-executable lines already explain.
+    pub fn run(hosts: &[HostConfig]) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
             SshAgentPreflightReport::default()
@@ -117,7 +111,6 @@ impl StartupPreflight {
         };
         Self {
             manual: export_manual().err(),
-            prelude_oversize: prelude_oversize(max_prelude_bytes),
             prelude_unreadable: crate::prelude::dir()
                 .ok()
                 .as_deref()
@@ -134,33 +127,10 @@ impl StartupPreflight {
             || self.ssh.has_problems()
     }
 
-    /// The message for a fatal finding, or `None` when startup may proceed.
-    ///
-    /// Written to stand on its own: the caller exits straight after printing
-    /// it, so there is no agent to delegate the repair to and no session in
-    /// which to ask. It therefore names the directory, both sizes, and the two
-    /// fixes available from a shell.
-    pub fn fatal(&self) -> Option<String> {
-        let over = self.prelude_oversize.as_ref()?;
-        let dir = crate::prelude::dir()
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|_| "~/.myco/workspace/prelude".into());
-        Some(format!(
-            "{}\n\
-             refusing to start: agents would run on a prelude too big to carry, and trimming \
-             it would hide the missing part from them.\n\
-             fix by hand in {dir} — merge overlapping entries or delete dead ones (each is a \
-             plain `*.md` file; `ls -S` lists the biggest first) — or raise max_prelude_bytes \
-             in config.toml above {} bytes.",
-            over.describe(),
-            over.bytes,
-        ))
-    }
-
     /// Every survivable preflight problem as plain body lines — manual,
     /// prelude, executables, ssh-agent, in that order, with no rule or header.
     /// Empty when [`Self::has_problems`] is false. Fatal findings are not
-    /// here; they go through [`Self::fatal`] and end the process.
+    /// here; they go through [`fatal_startup_check`] and end the process.
     ///
     /// Order is by how invisible the problem is otherwise: a missing manual
     /// export or an unreadable prelude never announces itself again (the agent
@@ -174,6 +144,34 @@ impl StartupPreflight {
         let _ = self.ssh.write_body(&mut out);
         String::from_utf8(out).unwrap_or_default()
     }
+}
+
+/// The checks that stop startup, as a message to print before exiting, or
+/// `None` when myco may run.
+///
+/// Separate from [`StartupPreflight`] because the two have different
+/// consequences and different audiences: a warning is read by whoever is
+/// around, while this is the last thing the process says. It therefore has to
+/// carry the whole repair — there is no agent to delegate to and no session in
+/// which to ask.
+///
+/// Today the only such check is an oversized prelude: nothing shortens the
+/// prelude to fit, so a prompt could not carry it honestly.
+pub fn fatal_startup_check(max_prelude_bytes: usize) -> Option<String> {
+    let over = prelude_oversize(max_prelude_bytes)?;
+    let dir = crate::prelude::dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "~/.myco/workspace/prelude".into());
+    Some(format!(
+        "{}\n\
+         refusing to start: agents would run on a prelude too big to carry, and trimming it \
+         would hide the missing part from them.\n\
+         fix by hand in {dir} — merge overlapping entries or delete dead ones (each is a \
+         plain `*.md` file; `ls -S` lists the biggest first) — or raise max_prelude_bytes in \
+         config.toml above {} bytes.",
+        over.describe(),
+        over.bytes,
+    ))
 }
 
 /// Copy the manual articles to `<myco home>/manual/<version>/<commit>/` for
@@ -319,50 +317,30 @@ mod tests {
         assert!(!out.contains("note:"), "{out}");
     }
 
-    /// An oversized prelude is fatal, not a warning: it never reaches the
-    /// WARNING block, and the message has to carry the whole repair, since
-    /// the caller exits before any session or agent exists.
+    /// The fatal pass is a different channel from the warning block: an
+    /// oversized prelude stops startup and never shows up as a survivable
+    /// warning. The message has to carry the whole repair, since the process
+    /// exits before any session or agent exists.
     #[test]
     fn an_oversized_prelude_is_fatal_and_self_contained() {
-        let pf = StartupPreflight {
-            prelude_oversize: Some(PreludeOversize {
-                entries: 17,
-                bytes: 300_000,
-                limit: 256 * 1024,
-            }),
-            ..Default::default()
-        };
-        let fatal = pf.fatal().expect("an oversized prelude must be fatal");
+        let home = crate::test_support::temp_home("preflight-fatal");
+        let dir = home.path().join("workspace").join("prelude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20260101T0000-aaaa.md"), "x".repeat(4096)).unwrap();
+
+        let fatal = fatal_startup_check(2048).expect("an oversized prelude must be fatal");
         assert!(
-            fatal.contains(
-                "prelude is 293 KiB across 17 entries, over the 256 KiB \
-                            max_prelude_bytes cap"
-            ),
+            fatal.contains("over the 2 KiB max_prelude_bytes cap"),
             "{fatal}"
         );
         assert!(fatal.contains("refusing to start"), "{fatal}");
-        // Both repairs, and enough detail to act without an agent's help.
-        assert!(fatal.contains("prelude"), "{fatal}");
+        // Both repairs, and enough detail to act on without an agent's help.
         assert!(fatal.contains("raise max_prelude_bytes"), "{fatal}");
-        assert!(fatal.contains("300000 bytes"), "{fatal}");
+        assert!(fatal.contains(&dir.display().to_string()), "{fatal}");
 
-        // Fatal is a separate channel from the warning block; a prelude that
-        // stops startup must not also be reported as a survivable warning.
-        assert!(!pf.has_problems());
-        assert_eq!(rendered(&pf), "");
-    }
-
-    /// A prelude within the cap leaves startup alone.
-    #[test]
-    fn a_prelude_within_the_cap_is_not_fatal() {
-        assert_eq!(
-            preflight(
-                missing_executables(true, |_| true),
-                SshAgentPreflightReport::default()
-            )
-            .fatal(),
-            None
-        );
+        // Room to spare: nothing fatal, and the warning report never mentions
+        // the prelude size either way.
+        assert_eq!(fatal_startup_check(64 * 1024), None);
     }
 
     /// An unreadable prelude directory is invisible from inside the prompt —

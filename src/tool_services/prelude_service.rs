@@ -139,29 +139,17 @@ impl PreludeTool {
         }
     }
 
-    /// One line of live totals, plus a loud second line once the rendered
-    /// prelude no longer fits — the agent holding the pen is the one who can
-    /// merge entries, so it hears about cap pressure immediately.
+    /// One line of live totals, so an agent curating can see how much room is
+    /// left before an edit would be refused.
     fn status(&self, dir: &Path) -> String {
         let entries = prelude::entries(dir);
         let bytes = prelude::rendered_body(&entries).len();
-        let mut out = format!(
+        format!(
             "prelude: {} entr{}, {bytes} bytes rendered of {} max_prelude_bytes\n",
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" },
             self.max_prelude_bytes,
-        );
-        if bytes > self.max_prelude_bytes {
-            // Only reachable when something outside this tool grew the
-            // directory: adds that would cross the cap are refused. Startup
-            // will not run against it, so say so before the next launch fails.
-            out.push_str(
-                "WARNING: over max_prelude_bytes — myco will refuse to start until this is \
-                 under the cap; merge entries, move cold material to workspace files, or \
-                 raise max_prelude_bytes in config.toml\n",
-            );
-        }
-        out
+        )
     }
 }
 
