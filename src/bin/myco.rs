@@ -261,17 +261,24 @@ async fn run_print(args: Args) {
             let _ = write_warning_section(&mut warn, &preflight.warning_body(), Palette::plain());
             let _ = std::io::stderr().write_all(&warn);
         }
-        Arc::new(PrintEventSink::default())
+        // Same reason: a warning must never land on stdout, which is the
+        // answer text and nothing else.
+        let warn: WarningSink = Arc::new(|message: &str| eprintln!("warning: {message}"));
+        (Arc::new(PrintEventSink::default()), warn)
     })
     .await;
     let Boot {
         session: active_session,
         // Bound, not dropped: the guard must outlive the turn.
         session_lock: _session_lock,
+        lock_warning,
         mut agent,
         catalog_model,
         ..
     } = boot;
+    if let Some(message) = &lock_warning {
+        eprintln!("warning: {message}");
+    }
 
     // `@path.png` mentions attach images, same contract as the REPL. After
     // boot, not before: the per-image cap is the resolved model's, so this
@@ -527,36 +534,47 @@ async fn attach_harness_or_exit(
         })
 }
 
+/// How a mode reports a problem that is not part of the conversation — a
+/// failed save, a lock it could not take. Print mode writes stderr, keeping
+/// stdout pipe-clean; the REPL opens a headed WARNING block, which is also
+/// what carries the text into the console mirror.
+type WarningSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Take the write lock for a session that is about to go live.
 ///
 /// `Err` means another myco process holds it: both would rewrite the whole
 /// document every turn, so the loser's turns vanish. `Unavailable` is not fatal
-/// — a filesystem without `flock` must not stop myco from running — so it warns
-/// and returns `None`, and the caller proceeds unlocked.
-fn lock_session_or_report(session_id: &str) -> Result<Option<SessionWriteLock>, String> {
+/// — a filesystem without `flock` must not stop myco from running — so it comes
+/// back as `(None, Some(warning))` and the caller proceeds unlocked.
+///
+/// The warning is returned rather than printed because the two callers render
+/// it differently: `boot` takes the lock before the UI exists (same reason
+/// [`StartupPreflight::warning_body`] hands back text instead of a block),
+/// while a live REPL switch has a UI to open a section on.
+fn lock_session(session_id: &str) -> Result<(Option<SessionWriteLock>, Option<String>), String> {
     match SessionWriteLock::acquire(session_id) {
-        Ok(lock) => Ok(Some(lock)),
+        Ok(lock) => Ok((Some(lock), None)),
         Err(SessionLockError::Busy { path }) => Err(format!(
             "session {session_id} is already open in another myco process.\n\
              hint: use that window, start a fresh session, or `--fork` it into a child \
              (lock: {})",
             path.display()
         )),
-        Err(e @ SessionLockError::Unavailable(_)) => {
-            eprintln!("warning: {e}; continuing without a single-writer guard");
-            Ok(None)
-        }
+        Err(e @ SessionLockError::Unavailable(_)) => Ok((
+            None,
+            Some(format!("{e}; continuing without a single-writer guard")),
+        )),
     }
 }
 
 /// Persist agent history at replayable mid-turn boundaries (after the user
 /// message, after each completed tool round) so context forks and crash
 /// recovery see the freshest well-formed snapshot.
-fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
+fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession, warn: WarningSink) {
     let checkpoint_session = active_session.clone();
     agent.set_checkpoint(Box::new(move |messages, last_usage| {
         if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
-            eprintln!("warning: mid-turn session save failed: {e}");
+            warn(&format!("mid-turn session save failed: {e}"));
         }
     }));
 }
@@ -573,6 +591,9 @@ struct Boot {
     /// Single-writer guard on the session, held for as long as it is live.
     /// `None` when locking is unavailable on this filesystem.
     session_lock: Option<SessionWriteLock>,
+    /// Set when the guard could not be taken: rendered by the mode once it
+    /// has somewhere to render it (see [`lock_session`]).
+    lock_warning: Option<String>,
     harness: Arc<Harness>,
     agent: Agent,
 }
@@ -583,7 +604,7 @@ struct Boot {
 /// handle is returned alongside [`Boot`] for mode-side use.
 async fn boot<S: EventSink + 'static>(
     args: &Args,
-    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
+    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> (Arc<S>, WarningSink),
 ) -> (Boot, Arc<S>) {
     let (app_config, catalog_model) = resolve_app_config_or_exit(args);
 
@@ -602,15 +623,17 @@ async fn boot<S: EventSink + 'static>(
 
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));
-    // Before the sink, whose console mirror already writes to this session.
-    let session_lock = match lock_session_or_report(&session.id()) {
-        Ok(lock) => lock,
+    // Before the sink, whose console mirror already writes to this session —
+    // so an unavailable lock is carried out as text and rendered by the mode
+    // once its UI exists, alongside the preflight warning.
+    let (session_lock, lock_warning) = match lock_session(&session.id()) {
+        Ok(pair) => pair,
         Err(msg) => {
             eprintln!("myco: {msg}");
             std::process::exit(1);
         }
     };
-    let sink = make_sink(&app_config, &preflight, &session);
+    let (sink, warn) = make_sink(&app_config, &preflight, &session);
 
     let session_tool =
         Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;
@@ -639,7 +662,7 @@ async fn boot<S: EventSink + 'static>(
     agent.set_last_usage(restored.last_usage);
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
-    wire_checkpoint(&mut agent, &session);
+    wire_checkpoint(&mut agent, &session, warn);
 
     (
         Boot {
@@ -648,6 +671,7 @@ async fn boot<S: EventSink + 'static>(
             preflight,
             session,
             session_lock,
+            lock_warning,
             harness,
             agent,
         },
@@ -664,7 +688,7 @@ async fn run_interactive(args: Args) {
         // it automatically. The agent can read it to see exactly what the user
         // saw, including live-only WARNING/ERROR sections and meta-command
         // output.
-        Arc::new(TuiProducer::new(
+        let ui = Arc::new(TuiProducer::new(
             Arc::new(StdoutTuiSink {
                 colors: config.colors_enabled,
             }),
@@ -674,7 +698,16 @@ async fn run_interactive(args: Args) {
             ))),
             config.colors_enabled,
             effective_wrap_width(config.wrap_max),
-        ))
+        ));
+        // Persistence failures are the loudest thing myco can have to say and
+        // used to be its quietest: raw stderr interleaved with the streamed
+        // transcript and never reached the mirror. Route them through the same
+        // headed-block path as everything else the REPL prints.
+        let warn: WarningSink = {
+            let ui = ui.clone();
+            Arc::new(move |message: &str| ui.warning_section(message))
+        };
+        (ui, warn)
     })
     .await;
     let Boot {
@@ -683,6 +716,7 @@ async fn run_interactive(args: Args) {
         preflight,
         session: active_session,
         session_lock,
+        lock_warning,
         harness,
         agent,
     } = boot;
@@ -690,7 +724,7 @@ async fn run_interactive(args: Args) {
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
 
-    load_readline_history(&mut editor, &active_session);
+    let history_warning = load_readline_history(&mut editor, &active_session);
 
     // Startup chrome: headed banner block (rule, MYCO, model/session, key
     // hints). Hosts via /hosts, effort via /effort, config path via
@@ -700,6 +734,14 @@ async fn run_interactive(args: Args) {
     // block after the banner, before the first USER block; happy path silent.
     if preflight.has_problems() {
         ui.warning_section(&preflight.warning_body());
+    }
+    // Same slot for the other two startup problems, so nothing lands above the
+    // banner: the single-writer guard, and this session's readline history.
+    if let Some(message) = &lock_warning {
+        ui.warning_section(message);
+    }
+    if let Some(message) = &history_warning {
+        ui.note(&format!("warning: {message}"));
     }
     // Blank line closes the startup chrome before the first USER rule
     // (or the resumed-history replay).
@@ -731,10 +773,10 @@ async fn run_interactive(args: Args) {
     repl.run_repl().await;
 
     if let Err(e) = persist_session(&repl.agent, &repl.session, /*force*/ true) {
-        eprintln!("warning: could not save session on exit: {e}");
+        ui.warning_section(&format!("could not save session on exit: {e}"));
     }
     if let Err(e) = save_readline_history(&mut repl.editor, &repl.session) {
-        eprintln!("warning: could not save history on exit: {e}");
+        ui.note(&format!("warning: could not save history on exit: {e}"));
     }
     // Only announce a session id if we actually wrote one (non-empty history);
     // a note under the USER header the quit was typed at.
@@ -1069,7 +1111,8 @@ impl ReplSession {
     async fn run_user_turn(&mut self, input: String) {
         let _ = self.editor.add_history_entry(&input);
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
+            self.ui
+                .note(&format!("warning: could not save history: {e}"));
         }
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
@@ -1091,7 +1134,8 @@ impl ReplSession {
             self.ui.note(&note);
         }
         if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
-            eprintln!("warning: could not auto-title session: {e}");
+            self.ui
+                .note(&format!("warning: could not auto-title session: {e}"));
         }
         // The session id rides the conversation, not the system prompt (see
         // `prompts::session_stamp`). `/new` empties the history, so a session
@@ -1140,11 +1184,21 @@ impl ReplSession {
         self.turn_cancel.disarm();
 
         // Persist whatever history the agent has, including failed/cancelled turns.
+        let mut reported = false;
         if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ true) {
-            eprintln!("warning: could not save session: {e}");
+            self.ui
+                .warning_section(&format!("could not save session: {e}"));
+            reported = true;
         }
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
+            self.ui
+                .note(&format!("warning: could not save history: {e}"));
+            reported = true;
+        }
+        // The turn already closed its own gap, so anything printed here has to
+        // restore the block / blank line / next USER rule rhythm.
+        if reported {
+            self.ui.blank_line();
         }
     }
 }
@@ -1204,7 +1258,8 @@ impl ReplSession {
 
         // Switch live REPL to successor.
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
+            self.ui
+                .note(&format!("warning: could not save history: {e}"));
         }
         if let Err(msg) = self.relock_session(&successor.id) {
             self.ui.error_section(&format!("compact: {msg}"));
@@ -1213,7 +1268,7 @@ impl ReplSession {
         self.session.replace(successor.clone());
         self.agent.set_history(successor.messages.clone());
         self.agent.set_last_usage(successor.last_usage);
-        load_readline_history(&mut self.editor, &self.session);
+        self.load_history();
 
         // Compaction starts over: wipe the screen the predecessor filled and
         // hand the successor a COMPACTED banner instead of a replayed
@@ -1326,7 +1381,7 @@ impl ReplSession {
                 self.session.replace(fresh);
                 self.agent.set_history(Vec::new());
                 self.agent.set_last_usage(None);
-                load_readline_history(&mut self.editor, &self.session);
+                self.load_history();
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
                 // (the Session: line carries the fresh id).
@@ -1420,10 +1475,12 @@ impl ReplSession {
 
     fn save_before_switch(&mut self) {
         if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ false) {
-            eprintln!("warning: could not save current session: {e}");
+            self.ui
+                .warning_section(&format!("could not save current session: {e}"));
         }
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
+            self.ui
+                .note(&format!("warning: could not save history: {e}"));
         }
     }
 
@@ -1442,8 +1499,20 @@ impl ReplSession {
         {
             return Ok(());
         }
-        self.session_lock = lock_session_or_report(next_id)?;
+        let (lock, warning) = lock_session(next_id)?;
+        self.session_lock = lock;
+        if let Some(message) = warning {
+            self.ui.warning_section(&message);
+        }
         Ok(())
+    }
+
+    /// Swap in the live session's readline history, reporting a load failure
+    /// instead of dropping it. Every session switch goes through here.
+    fn load_history(&mut self) {
+        if let Some(message) = load_readline_history(&mut self.editor, &self.session) {
+            self.ui.note(&format!("warning: {message}"));
+        }
     }
 
     /// Make `loaded` the live session: swap it into the shared handle, reset
@@ -1452,7 +1521,7 @@ impl ReplSession {
         self.session.replace(loaded.clone());
         self.agent.set_history(loaded.messages.clone());
         self.agent.set_last_usage(loaded.last_usage);
-        load_readline_history(&mut self.editor, &self.session);
+        self.load_history();
     }
 }
 
@@ -1565,13 +1634,16 @@ fn save_readline_history(
 /// the session file). Clearing first makes startup and the live-session
 /// switches (`/new`, `/resume`, `/compact`) one path — on a fresh editor the
 /// clear is a no-op.
-fn load_readline_history(editor: &mut Editor<ReplHelper, DefaultHistory>, session: &ActiveSession) {
+#[must_use = "a failed history load is reported to the user, not dropped"]
+fn load_readline_history(
+    editor: &mut Editor<ReplHelper, DefaultHistory>,
+    session: &ActiveSession,
+) -> Option<String> {
     let history_path = session.with(|s| s.history_path());
     editor.clear_history().ok();
-    if let Err(e) = editor.load_history(&history_path)
-        && history_path.exists()
-    {
-        eprintln!("warning: could not load readline history: {e}");
+    match editor.load_history(&history_path) {
+        Err(e) if history_path.exists() => Some(format!("could not load readline history: {e}")),
+        _ => None,
     }
 }
 

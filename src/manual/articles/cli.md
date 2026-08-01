@@ -85,7 +85,12 @@ acknowledgement) opens a `MYCO` section — thin rule + bold header, the
 banner family's mid-screen voice. Command failures (an unknown `/command`,
 `/resume` or `/compact` errors) open an ERROR section; an unknown command is
 never sent to the model. `/new` clears the screen and opens the fresh
-session under the same startup banner.
+session under the same startup banner. Problems that are not the answer to
+anything you typed open a WARNING section: a session that could not be
+saved, and a single-writer lock that could not be taken. Smaller losses
+(readline history, an auto-title) are a one-line note inside the open
+section. These go through the block system rather than raw stderr, so they
+reach the mirror below like everything else.
 
 ### Print mode (`myco -p`)
 
@@ -169,7 +174,8 @@ shows its command, uptime, and idle time; remote hosts are not queried for this.
 When stdout is a TTY, the interactive CLI mirrors everything it prints — the
 startup banner, preflight WARNING, USER headers + submitted input, the streamed
 ASSISTANT section, the `/compact` progress line + COMPACTED banner, live
-ERROR / `(cancelled)` notices, and meta-command output (`/hosts`, `/session`,
+ERROR / WARNING / `(cancelled)` notices (including failed saves and an
+unavailable session lock), and meta-command output (`/hosts`, `/session`,
 …) — to a plain-text, ANSI-free file beside the session JSON:
 `~/.myco/session/<shard>/<id>.console` (shown as `console:` in `/session`
 and `session_meta` get). It is append-only and accumulates across runs of the
