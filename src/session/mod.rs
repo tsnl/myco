@@ -622,8 +622,10 @@ fn load_most_recent_session() -> Result<Session, String> {
     // Path breaks mtime ties for determinism on coarse-mtime filesystems.
     candidates.sort();
     for (_, path) in candidates.iter().rev() {
+        // `load` already rejects unreadable and wrong-version files, so this
+        // only has to add the visibility half.
         if let Ok(session) = Session::load(path)
-            && session.is_visible()
+            && !session.is_hidden()
         {
             return Ok(session);
         }
@@ -1544,15 +1546,11 @@ mod tests {
         );
     }
 
-    /// No kind/parent fields on disk — serde defaults to user (visible).
     #[test]
     fn bare_resume_picks_newest_mtime_and_skips_corrupt_files() {
-        let _guard = myco_home_lock();
-        let dir = temp_session_root();
-        // SAFETY: test-only env override; held under myco_home_lock.
-        unsafe {
-            std::env::set_var("MYCO_HOME", &dir);
-        }
+        // Takes the myco-home lock, points MYCO_HOME at a temp dir, and undoes
+        // both on drop — including when the test panics.
+        let _home = temp_home("session-bare-resume");
 
         let older = Session::new("claude-haiku-4-5");
         older.save().unwrap();
@@ -1561,7 +1559,10 @@ mod tests {
 
         // Force distinct mtimes regardless of filesystem timestamp granularity.
         let base = std::time::SystemTime::now();
-        set_mtime(&older.json_path(), base - Duration::from_secs(60));
+        set_mtime(
+            &older.json_path(),
+            base - std::time::Duration::from_secs(60),
+        );
         set_mtime(&newer.json_path(), base);
 
         let resumed = resolve_and_load_session(None).unwrap();
@@ -1571,16 +1572,12 @@ mod tests {
         let corrupt = session_file_path("ffeeddccbbaa00112233445566778899", "json");
         fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
         fs::write(&corrupt, b"{not json").unwrap();
-        set_mtime(&corrupt, base + Duration::from_secs(60));
+        set_mtime(&corrupt, base + std::time::Duration::from_secs(60));
         let resumed = resolve_and_load_session(None).unwrap();
         assert_eq!(resumed.id, newer.id);
-
-        let _ = fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
-        }
     }
 
+    /// No kind/parent fields on disk — serde defaults to user (visible).
     #[test]
     fn old_session_json_defaults_kind_user() {
         let s = load_legacy_v2();
