@@ -1,0 +1,30 @@
+[package]
+name = "myco-session"
+description = "myco: session store - persistence, resume, compaction, search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+myco-core = { workspace = true }
+myco-config = { workspace = true }
+myco-models = { workspace = true }
+myco-prompts = { workspace = true }
+atomic-write-file = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+myco-test-support = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

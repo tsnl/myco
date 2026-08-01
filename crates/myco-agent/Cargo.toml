@@ -1,0 +1,27 @@
+[package]
+name = "myco-agent"
+description = "myco: the agent loop (interact, tool dispatch, compaction worker)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+myco-core = { workspace = true }
+myco-config = { workspace = true }
+myco-models = { workspace = true }
+myco-session = { workspace = true }
+myco-machines = { workspace = true }
+myco-prompts = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+myco-test-support = { workspace = true }
+tempfile = "3"

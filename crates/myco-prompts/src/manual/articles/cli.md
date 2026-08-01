@@ -1,0 +1,171 @@
+# User-facing CLI
+
+You cannot press these yourself — tell the user which command to run.
+
+| Command | Meaning |
+|---------|---------|
+| `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
+| `/session` | Current session metadata (title, links, scratchpad, path) |
+| `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
+| `/resume [id]` | Load conversation memory (no id: session browser, see below) |
+| `/new` | Fresh session (saves current) |
+| `/title [text]` | Show or set session title |
+| `/compact` | Compact into successor session (summary + recent tail) |
+| `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
+| `/help` | Full help |
+| Alt-Enter / Ctrl-J | Multiline input |
+| Enter | Submit |
+| Ctrl-C | Cancel line at prompt; cancel in-flight turn while running |
+| Ctrl-L | Clear scrollback and reprint the conversation (empty prompt only) |
+| Ctrl-D / `/exit` | Save and quit |
+
+Shift-Enter does **not** insert a newline in most terminals: they transmit it as
+plain Enter, so it submits the message. If the user reports this, tell them to
+use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
+which reports key modifiers.)
+
+Mentioning `@<path>` in a message attaches that file as image input (extensions
+png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the
+file's magic number, so a mislabeled file is caught here rather than by the
+provider; whitespace-delimited, so paths with spaces are unsupported; `~/`
+expands). The text is sent exactly as typed — the `@` mentions stay in it — and
+a `[N image(s) attached]` note prints directly under the wrapped input,
+identical live and in replay (`/resume`, Ctrl-L); the image bytes are never
+printed. A bad path or a file that is not really an image opens an ERROR
+section before the model is called; nothing is silently dropped.
+
+Size limits are measured on the **base64 payload uploaded**, which is 4/3 of the
+file on disk: per image, the running model's `max_image_base64_bytes` (config.toml
+`[models.KEY]`, default 5 MiB — so ~3.75 MiB on disk; `view_image` enforces the
+same cap on every host, and an image over it fails that tool use); and 20 MiB of
+attachments per message, which is myco's own budget and does not vary by model.
+A model configured above 20 MiB still gets its full per-image cap through
+`view_image` — only batching many `@path` mentions into one message is held to
+the message budget. myco does not re-encode images — an oversized file is
+rejected with both sizes named, so downscale it and resubmit.
+
+Images stay in the conversation, so a session accumulates them and can cross the
+provider's **whole-request** cap (Anthropic: 32 MB) turns after the attachment
+was sent. myco checks each composed request against a 30 MiB ceiling before
+uploading it, and maps the provider's own 413 to the same failure. That failure
+is not retryable — every later turn resends the same history — so myco **rewinds
+the last user message out of the conversation** and says so in the ERROR
+section. The session continues; re-send the message with a smaller image, or
+`/compact` (or `/new`) to shed history.
+
+### Session browser
+
+Bare `/resume` opens an fzf picker over visible sessions (fuzzy search on
+titles/metadata, transcript preview from the `{id}.console` mirror). Inside
+tmux it runs as a `display-popup` executing `myco --mode session-browser`;
+outside tmux fzf runs in the current terminal. `tmux` and `fzf` are expected
+on PATH (the startup preflight warns when missing); `/resume <id|prefix>`
+always works without them.
+
+`myco --mode session-browser` also runs standalone: it prints the picked
+session id to stdout (`--out FILE` writes it to a file instead; empty/absent
+file means cancelled), e.g. `myco --resume "$(myco --mode session-browser)"`.
+
+Content search: `--search QUERY` ranks sessions by match instead of recency.
+The corpus per session is title, first user message, scratchpad, and the
+console-transcript tail — plain case-insensitive keyword matching, rebuilt per
+call (nothing persists, nothing is indexed). fzf's own typing filters display
+labels only. The `session_meta` tool's `list` action takes the same `query`,
+so the agent can find past sessions by content.
+
+Startup banner is a small headed block (full-block rule, `MYCO`, model +
+session, `/help` and newline hints). Startup preflight problems
+print as one WARNING block after it — missing expected executables (`bash`,
+`tmux`, `fzf`; `ssh`/`ssh-add`/`ssh-keygen` when remotes are
+configured) and ssh-agent issues; hosts via `/hosts`.
+
+### Print mode (`myco -p`)
+
+`myco -p "PROMPT"` runs one non-interactive turn and exits: answer text
+streams to stdout verbatim (no sections, colors, or wrap — thinking and tool
+activity are not rendered); everything else — preflight WARNING,
+`session=<id>`, errors — goes to stderr, so stdout is pipe-clean. Bare `-p`
+takes the prompt from piped stdin; with both, stdin is prepended as context
+(`git diff | myco -p "review this"`). The session persists like an
+interactive run — continue with `--resume <id>` interactively, or
+`-p … --resume <id>` for one more non-interactive turn. `--parent-session` /
+`--fork` compose with `-p` for one-shot nested agents (the session is created
+hidden and parented, exactly as in the live-session recipe). `@path` image
+mentions in the PROMPT argument attach images exactly as in the REPL
+(attachment note on stderr); piped stdin is data and is never parsed for
+attachments. No console mirror is written in print mode.
+
+### Models & config (quick)
+
+- Models come from the `[gateways]` / `[models]` catalog in
+  `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
+  catalog key; default is config.toml `model`, or the sole configured entry.
+- A gateway holds `protocol` (`anthropic-messages` | `openai-responses` |
+  `openai-completions`),
+  `base_url`, and `auth` — the token itself as a string, or a source table:
+  `{ source = "env", var_name = "…" }` / `{ source = "file", path = "…" }` /
+  `{ source = "none" }` (omit for no auth). A model names its gateway plus
+  `api_id` (wire id) and a required `context_window`.
+- Credentials that fail to look up error at model *use*, naming the source.
+- `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
+- Section headers / thinking / tool names are colored when stdout is a TTY;
+  `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
+- Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
+  when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
+  delimiters *removed* (the styling conveys them), `#` headers keep their
+  markers, and both `[text](url)` and a bare `http(s)://` URL become a
+  clickable OSC 8 hyperlink (over `text`, or over the URL itself), shown
+  underlined blue browser-style — terminals render OSC 8 spans unstyled, so
+  the decoration is what makes links visible before hover.
+  `--wrap auto|off|COLS` sets a width *cap* (auto = 80); the effective width
+  is min(cap, terminal width), re-measured every prompt — after a resize the
+  dialog is cleared and reprinted at the new width (same as Ctrl-L). Fenced
+  code blocks and 4-space-indented lines are never wrapped or styled.
+  With styling off (`--color never`, `NO_COLOR`, non-TTY) rendering is exact
+  identity — delimiters and link syntax print verbatim — so `myco | tee` and
+  the console mirror stay byte-faithful.
+- On submit, the typed input echo is replaced with a word-wrapped copy
+  (wrap-only, exactly as typed — the edit line is the one region the CLI
+  repaints). Replay (`/resume`, Ctrl-L) wraps user turns the same way.
+- `TERM=dumb` disables the cursor repaints (input re-echo, resize reflow)
+  while plain wrapping stays on. Piped output gets neither: colors can be
+  forced into a pipe (`--color always` — escapes are strippable downstream),
+  wrap cannot (hard newlines would permanently alter the content).
+
+Thinking/reasoning is always requested (default effort=`high`). The UI shows a `Thinking: …`
+summary inside a unified ASSISTANT section; it is stored in session history for resume/Ctrl-L
+but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
+ERROR section (live only; not stored in session history).
+
+`/compact` starts over rather than appending: it clears the screen (scrollback included) and
+prints a **COMPACTED** banner — the same `█` rule + bold title as the startup banner — listing
+the successor session, the predecessor it came from, how many tail messages were kept, and the
+summary path. Nothing is lost: both sessions are on disk, the console mirror keeps the whole
+run, and Ctrl-L reprints the successor's summary + kept tail.
+
+Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,
+compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`
+(no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
+`⚙`-prefixed line shows its usage — `⚙ last turn: input 63.8k (58k cached) · output 1.4k` —
+where input is the prompt of the turn's final request (≈ the live context) and output is
+summed across all of the turn's requests (one per tool round-trip). Below it, one
+`●`-prefixed line per still-running tool (live bash session on the in-process local host)
+shows its command, uptime, and idle time; remote hosts are not queried for this.
+
+### Console mirror (`{id}.console`)
+
+When stdout is a TTY, the interactive CLI mirrors everything it prints — the
+startup banner, preflight WARNING, USER headers + submitted input, the streamed
+ASSISTANT section, the `/compact` progress line + COMPACTED banner, live
+ERROR / `(cancelled)` notices, and meta-command output (`/hosts`, `/session`,
+…) — to a plain-text, ANSI-free file beside the session JSON:
+`~/.myco/session/<shard>/<id>.console` (shown as `console:` in `/session`
+and `session_meta` get). It is append-only and accumulates across runs of the
+same session.
+
+Read it (with your file tools) to see **exactly what the user saw**, in order —
+including the live-only WARNING / ERROR sections that never reach the message
+history. Useful for questions like "what was that warning at startup?" or "what
+did the last error say?". One limit: cursor repaints (input re-echo, resize
+reflow, the Ctrl-L / `/resume` transcript reprint) are not mirrored, so the
+file is the logical transcript, not a screen snapshot.

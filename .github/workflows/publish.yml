@@ -27,14 +27,6 @@ on:
         required: false
         default: ""
         type: string
-      rollback_mode:
-        description: "If the publish fails: force-push the bump away (needs force-push permission on the branch) or push a revert commit"
-        required: false
-        default: "force-push"
-        type: choice
-        options:
-          - force-push
-          - revert
   # Fallback for agent sessions that can push but cannot POST /dispatches
   # (e.g. the Claude Code GitHub integration gets 403 there): committing
   # .github/publish-request.json to a claude/* branch runs the same job with
@@ -71,14 +63,12 @@ jobs:
             branch="${{ github.event.inputs.branch }}"
             bump_type="${{ github.event.inputs.bump_type }}"
             dry_run="${{ github.event.inputs.dry_run }}"
-            rollback_mode="${{ github.event.inputs.rollback_mode }}"
             printf '%s\n' "$DISPATCH_NOTES" > "$RUNNER_TEMP/notes.md"
           else
             req=.github/publish-request.json
             branch="$(jq -er .branch "$req")"
             bump_type="$(jq -er .bump_type "$req")"
             dry_run="$(jq -er .dry_run "$req")"
-            rollback_mode="$(jq -r '.rollback_mode // "force-push"' "$req")"
             notes_path="$(jq -er .notes_path "$req")"
             cp "$notes_path" "$RUNNER_TEMP/notes.md"
           fi
@@ -88,15 +78,11 @@ jobs:
           case "$dry_run" in true|false) ;; *)
             echo "::error::dry_run must be 'true' or 'false' (got '$dry_run')"; exit 1 ;;
           esac
-          case "$rollback_mode" in force-push|revert) ;; *)
-            echo "::error::rollback_mode must be force-push|revert (got '$rollback_mode')"; exit 1 ;;
-          esac
           [ -n "$branch" ] || { echo "::error::branch must be non-empty"; exit 1; }
           {
             echo "branch=$branch"
             echo "bump_type=$bump_type"
             echo "dry_run=$dry_run"
-            echo "rollback_mode=$rollback_mode"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v5
@@ -108,12 +94,14 @@ jobs:
 
       - name: Semver bump and cargo publish
         id: publish
-        uses: tsnl/semver-bump-and-cargo-publish@v1
+        # v1.0.4: waits for checks on the publish branch HEAD (not the trigger
+        # commit), which the push-triggered fallback above depends on. Pinned
+        # by SHA; safe to move back to @v1 once that tag includes this commit.
+        uses: tsnl/semver-bump-and-cargo-publish@d5a83f38ef1c7d2d4949a98e0425a466efa70c92
         with:
           branch: ${{ steps.params.outputs.branch }}
           bump_type: ${{ steps.params.outputs.bump_type }}
           dry_run: ${{ steps.params.outputs.dry_run }}
-          rollback_mode: ${{ steps.params.outputs.rollback_mode }}
           cargo_registry_token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           pat_token: ${{ secrets.PAT_TOKEN }}
           # Match GitHub Actions check-run *names* (job names), not branch-protection

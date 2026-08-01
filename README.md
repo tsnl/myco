@@ -1,76 +1,64 @@
 # `myco`
 
-[![Crates.io](https://img.shields.io/crates/v/myco.svg)](https://crates.io/crates/myco)
-[![CI](https://github.com/tsnl/myco/actions/workflows/ci.yml/badge.svg)](https://github.com/tsnl/myco/actions/workflows/ci.yml)
-
-A minimalist coding agent that works across your machines over SSH.
-
-Run `myco` on your laptop. It edits files, runs shells, and searches code on
-the local machine **and** on every concrete `Host` alias in your
-`~/.ssh/config` — one session, many hosts, no setup beyond SSH itself.
+A minimalist coding agent that works across your machines over SSH — now a
+**server**: `myco` runs an API on localhost, drives multiple concurrent agent
+sessions, and serves a minimal web GUI. (v2 rewrite; the v1 CLI lives in the
+`main` branch's history and on crates.io ≤ 0.3.x.)
 
 ## Why use it?
 
-- **One agent, many machines.** Point tools at `local` or any `Host` alias from
-  your ssh config (`devbox`, GPU box, CI host). Remotes attach over SSH on
-  demand; you stay in a single conversation.
+- **One brain, many machines.** Every tool call names its host: `local` or any
+  concrete `Host` alias from `~/.ssh/config`. Remotes attach over SSH on
+  demand and need only `myco` on PATH — no config, no keys.
 - **Real computer use.** Bash (including multi-turn sessions) and a surgical
   file editor on each host; search and browsing compose from the tools already
-  on your machines (`rg`, `curl`, `lynx`, `ck` for semantic search, …) via bash.
-- **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
-  conversation history live under `~/.myco/` — pick up later with `/resume`.
-- **Nested agents for long work.** myco drives itself: start `myco` in a bash
-  session to spin off focused agents so the main thread stays small and cheap.
-- **Project guidance is injected.** `AGENTS.md` / `CLAUDE.md` in your launch
-  directory is read at session start so the agent knows how _you_ work.
-- **Coming later:** multiplayer (multiple humans in the same agent workspace).
+  on your machines (`rg`, `curl`, `ck`, …) via bash.
+- **Concurrent sessions.** Each conversation is a URL; agents run in parallel
+  server-side, and input queues while a turn is running.
+- **Sessions you can resume.** Titles, scratchpads, links, and full history
+  live under `~/.myco/` — reopen any session by URL, or from another client.
+- **Nested agents over the API.** An agent delegates by POSTing to its own
+  server (`$MYCO_API`): hidden child sessions, optional context forks.
 
-## Install
-
-```bash
-cargo install myco
-```
-
-Needs stable Rust and `ssh`, `uv`, `bash`, `tmux`, `fzf` on `PATH`
-(`git`, `gh`, `curl` recommended; `ck` — `cargo install ck-search` — for
-semantic code search).
-
-## Use
+## Run
 
 ```bash
-myco    # runs the default model from your config.toml; --model <key> to switch
-myco -p "explain src/host/protocol.rs"   # print mode: one turn, answer on stdout, exit
-git diff | myco -p "review this"  # piped stdin becomes context for the prompt
+cargo run -p myco            # API server on http://127.0.0.1:7773/api
+trunk serve                  # web GUI on http://127.0.0.1:8080 (proxies /api)
 ```
 
-`-p/--print` runs one non-interactive turn: the answer streams to stdout
-(raw, pipe-friendly), everything else prints to stderr, and the session is
-saved like any other (`session=<id>` on stderr) — continue it with
-`--resume <id>`. Bare `-p` takes the prompt from piped stdin.
+`trunk serve` needs [trunk](https://trunkrs.dev) and the wasm target
+(`rustup target add wasm32-unknown-unknown`). The `Trunk.toml` at the repo
+root builds `crates/myco-gui` and reverse-proxies `/api` to the server.
 
-Configure your models first: myco ships none built in. `~/.myco/config.toml`
-holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
-Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
-pass to `--model`). The `auth` value is the token itself or a source such as
-`{ source = "env", var_name = "XAI_API_KEY" }` (`.env` in the cwd is loaded
-at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the
-[overview article](src/manual/articles/overview.md) — also available as
-`myco --help overview` once installed. Set a default model with
-`model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript
-sections are colored when stdout is a TTY (`--color auto|always|never`;
-`NO_COLOR` / `CLICOLOR_FORCE` honored), and prose is word-wrapped with light
-markdown styling (`--wrap auto|off|COLS` caps the width at min(cap, terminal
-width), default 80; resizes reflow the transcript at the next prompt; never
-inside code blocks, never when piped).
+Configure models first in `~/.myco/config.toml` (`[gateways.*]` +
+`[models.*]`; `myco --model <key>` / `--config <path>` to override). Remotes
+just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
+remote only needs your key in `ssh-agent` and `myco` on the PATH used by
+non-interactive SSH.
 
-Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
-so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by
-non-interactive SSH. Runtime details: `myco --help overview`.
+## API
+
+`GET /api/sessions` · `POST /api/sessions` (`{model?, parent_session?,
+fork?}`) · `GET /api/sessions/<id>` · `POST /api/sessions/<id>/messages`
+(`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
+`POST /api/sessions/<id>/cancel` · `DELETE /api/sessions/<id>/live` ·
+`GET /api/models`. Wire types live in `crates/myco-api`.
+
+## Workspace
+
+- `myco` — the server binary (Rocket, `/api`) and meta lib; also
+  `--mode host`, the per-machine worker remotes run
+- `myco-gui` — minimal Yew web client (one URL per conversation)
+- `myco-api` — wire types shared by server and clients
+- `myco-agent`, `myco-session`, `myco-machines`, `myco-models`,
+  `myco-config`, `myco-prompts`, `myco-core` — the server's pillars
+- `myco-test-support` — shared test fixtures
 
 ## Develop
 
 ```bash
-cargo test --locked --lib
-cargo run --locked --bin myco
+cargo test --locked
+cargo run --locked -p myco
 bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre-commit
 ```

@@ -82,18 +82,9 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [x] **Compaction (manual)** — `/compact` runs a hidden compact-worker agent over the
       session (`session_history` tool), writes `{id}.summary.md`, and seeds a linked
       successor session with the summary + a well-formed recent tail. Ctrl-C cancels it.
-- [x] **Auto-compact** when approaching the context limit — per-model
-      `auto_compact_at` fraction of `context_window`, checked after each turn against
-      the provider's reported prompt size. Runs the same worker as `/compact` and
-      switches the REPL to the successor. Unset = off; a failed automatic run disables
-      itself for the session rather than repeating every turn.
+- [ ] **Auto-compact** when approaching the context limit (threshold config).
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
-- [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`
-      (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `backoff_multiplier`),
-      applied in the drivers ahead of the stream, honouring `Retry-After`. Only
-      pre-stream failures (connection, 408, 429, 5xx) retry; deterministic statuses and
-      mid-stream failures still surface immediately.
 - [ ] **Token + cost tracking**
   - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
     and session totals.
@@ -102,18 +93,14 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - History breakpoints / strategic `cache_control` so the growing prefix is not fully uncached.
   - Surface cache hit metrics so prompts can be tuned.
   - Rejection reason: very infrequently used in practice, just let the agent read the session history.
-- [x] **Max-tokens continue** — a `max_tokens` stop resumes in-turn rather than dead-ending.
-      A turn that carried tool calls already ends on their results, so the resumed request is
-      an ordinary continuation; truncated *text* is resumed by a user turn asking for the rest,
-      because history would otherwise end on the assistant's cut-off message, which current
-      Anthropic models reject as a prefill. Capped by the per-model `max_truncated_resumes`
-      (default 3, `0` opts out); any stop for another reason clears the count.
+- [x] (REJECT) **Max-tokens continue** — `TurnEndReason::MaxTokens` exists; guided or automatic continue
+      instead of a dead end. See `/compact`
 
 ### Project brain
 
 - [x] **`AGENTS.md` support** — `AGENTS.md` (or `CLAUDE.md`) from the launch directory
       is appended to the system prompt at model build time, same lifecycle and cap as
-      the prelude. Re-read on cwd / project change remains open (prompt stability vs
+      the soul. Re-read on cwd / project change remains open (prompt stability vs
       freshness trade-off).
 - [ ] **Layered config** — `~/.myco` + repo `.myco/` / instruction files:
       model defaults, permissions, hooks paths, ignore globs — not only host pool.
@@ -121,24 +108,15 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - Directory convention (user + project); load as prompt/procedures or slash-skills.
   - Import path for Claude/OpenCode-style skills so switching cost drops.
 - [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
-      ordinary tools; `workspace/prelude/` holds maildir-style write-once prelude
-      **entries**, all rendered into every agent system prompt at model build
-      time, followed by a bounded `# Workspace Files` listing (path, UTC day,
-      title) of everything else there. The prelude is the *default* home for
-      durable information (record eagerly; workspace files are the cold tier
-      for rarely-used or high-volume lookup data) — in-context beats scattered
-      files on 500K+ windows, and the block is prompt-cached. Edits go through
-      the root-only `prelude` tool (add/replace/remove/list): write-once entries
-      make concurrent agents safe (adds never collide; racing replaces leave a
-      duplicate to merge, never a loss). Unlike the earlier rejected `memory`
-      tool there is no search — the prelude is in-prompt by construction.
-      Named for the contract, like a language prelude: in scope for every
-      agent before any work, no import, no lookup. (Formerly "soul", after
-      OpenClaw — wrong fit once the store became a curated bag of entries;
-      "memory" was considered and dropped for colliding with "conversation
-      memory" and the rejected memory tool above.)
+      ordinary tools; `workspace/soul/` holds maildir-style write-once soul
+      snapshots, and the newest is appended verbatim to every agent system
+      prompt at model build time, followed by a bounded `# Workspace Files`
+      listing (path, UTC day, title) of everything else there. Replaced the
+      earlier root-only `memory` tool (structured UUID-keyed entries +
+      dedicated search) — (REJECT) that abstraction: plain files the agent
+      organizes itself cover the same need.
 - [ ] **Workspace recall follow-up** — a second appended fragment (e.g. newest
-      snapshot in `workspace/pin/`) if working-set churn starts forcing prelude
+      snapshot in `workspace/pin/`) if working-set churn starts forcing soul
       revisions often enough to cost forks their cached prompt prefix. Deferred
       until there is evidence: one prompt-resident memory beats two. Past the
       listing, recall is `rg` over `~/.myco/workspace/` like any other tree —
@@ -216,7 +194,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 - [ ] **Background jobs** — long tests/builds without blocking the main turn; notify on done.
 - [x] (REMOVED) **`lynx_tui_browser`** — the dedicated browser tool is gone; web
       browsing composes from bash (`lynx -dump`, `curl`, …) where installed, with
-      per-system guidance in the workspace/prelude. No separate web_fetch/web_search tools.
+      per-system guidance in the workspace/soul. No separate web_fetch/web_search tools.
 - [x] (REJECTED) **Servo / AccessKit browser backend** — superseded by the same
       doctrine: browsing is not a myco tool; anything heavier than bash-composed
       browsing belongs in a dedicated external program.
