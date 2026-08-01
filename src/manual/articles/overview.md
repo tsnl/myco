@@ -224,10 +224,13 @@ gives each visible file's path (relative to `workspace/`), the UTC day it last
 changed, and its title (first markdown heading, else first non-empty line). Hidden
 names, symlinks, `prelude/` itself, and binary titles are skipped; the walk and the
 rendered block are bounded (4 levels, 200 files, 8 KiB) with a marker when files
-are left out. The prompt's appended blocks run least to most volatile — prelude,
-then project guidance, then this listing — and the listing uses days rather than
-timestamps and path order rather than recency, so ordinary workspace writes leave
-the shared prompt prefix intact for same-model forks.
+are left out. The prompt's appended blocks run least to most volatile — project
+guidance, then the prelude, then this listing. Guidance leads because it changes
+only when the repo's own file does, while agents are asked to record into the
+prelude eagerly; ordering it that way keeps a recorded finding from invalidating
+the cached guidance block for every agent that follows. The listing likewise uses
+days rather than timestamps and path order rather than recency, so ordinary
+workspace writes leave the shared prompt prefix intact for same-model forks.
 
 ## Product limits (V1)
 
