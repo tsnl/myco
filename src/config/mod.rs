@@ -53,6 +53,15 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 /// Default per-remote connect timeout (seconds) when the config file sets none.
 pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 
+/// Default cap on consecutive `max_tokens` resumes within one turn when a model
+/// entry sets no `max_truncated_resumes`.
+///
+/// A model whose output cap is too low for how much it writes truncates *every*
+/// turn; without a ceiling an unattended run would resume forever, spending
+/// tokens to re-truncate. Three is enough to carry a turn that overruns once or
+/// twice without letting a misconfigured cap run all night.
+pub const DEFAULT_MAX_TRUNCATED_RESUMES: u32 = 3;
+
 /// Default per-image cap when a model entry sets no `max_image_base64_bytes`
 /// (matches the Anthropic API's 5 MB per-image cap; a clear local error beats
 /// a confusing provider 400).
@@ -434,6 +443,9 @@ fn resolve_catalog(
             max_image_base64_bytes: entry
                 .max_image_base64_bytes
                 .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
+            max_truncated_resumes: entry
+                .max_truncated_resumes
+                .unwrap_or(DEFAULT_MAX_TRUNCATED_RESUMES),
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let backend = match protocol {
