@@ -136,7 +136,10 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let messages = convert_messages(input);
+        let messages = match convert_messages(input) {
+            Ok(messages) => messages,
+            Err(e) => return driver_core::error_stream(e),
+        };
         driver_core::spawn_generate(
             self.message_request(&messages),
             StreamAccumulator::default(),
@@ -159,49 +162,16 @@ struct MessageRun {
     content: Vec<AnthropicContent>,
 }
 
-/// Rewrite a stored tool id into one Anthropic accepts.
-///
-/// Anthropic validates tool ids against `^[a-zA-Z0-9_-]+$`. Other providers do
-/// not: OpenAI-compatible gateways mint ids like `functions.bash:0`, and a
-/// session started on one of them carries those ids in its history forever. The
-/// whole history is resent on every turn, so resuming such a session on an
-/// Anthropic model 400s on the first request and every request after it — the
-/// session is wedged, not merely one turn.
-///
-/// Legal ids must pass through byte-identical: rewriting them would move the
-/// cached prefix on every Anthropic-native session. The rewrite is a pure
-/// function of the id, which is what keeps a `tool_use` and its `tool_result`
-/// pointing at each other without threading a map through the conversion.
-fn anthropic_tool_id(id: &str) -> String {
-    fn legal(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_' || c == '-'
-    }
-
-    if !id.is_empty() && id.chars().all(legal) {
-        return id.to_string();
-    }
-
-    // Substitution alone collides — `a.b` and `a:b` both fold to `a_b` — and two
-    // tool_use blocks sharing an id is the same 400 wearing a different hat. The
-    // hash separates them; the substituted stem keeps debug dumps readable.
-    let stem: String = id.chars().map(|c| if legal(c) { c } else { '_' }).collect();
-    format!("{stem}_{:016x}", fnv1a(id))
-}
-
-/// FNV-1a. Dependency-free and stable across runs; not security-relevant.
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// Merge consecutive same-role turns into role-alternating runs. Anthropic
 /// requires alternating user/assistant roles, and tool-result blocks must lead
 /// the user turn they answer.
-fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
+///
+/// `wire_ids[i][j]` supplies the id for the `j`-th tool_use / tool_result of
+/// `input[i]` ([`wire_tool_ids`]); stored provider ids never reach the wire.
+fn merge_same_role_turns(input: &[Message], wire_ids: &[Vec<String>]) -> Box<[MessageRun]> {
     let mut runs: Vec<MessageRun> = Vec::new();
 
-    for message in input {
+    for (i, message) in input.iter().enumerate() {
         let (role, content): (_, Vec<AnthropicContent>) = match message {
             Message::UserMessage { content } => (
                 AnthropicRole::User,
@@ -211,8 +181,9 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                 AnthropicRole::User,
                 tool_use_results
                     .iter()
-                    .map(|result| AnthropicContent::ToolResult {
-                        tool_use_id: anthropic_tool_id(&result.id),
+                    .enumerate()
+                    .map(|(j, result)| AnthropicContent::ToolResult {
+                        tool_use_id: wire_ids[i][j].clone(),
                         content: result
                             .content
                             .iter()
@@ -232,9 +203,9 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
                 // Thinking may be stored in history for resume/UI; never echo it back to the API.
                 let mut blocks: Vec<AnthropicContent> =
                     content.iter().cloned().filter_map(answer_block).collect();
-                for tool_use in tool_uses {
+                for (j, tool_use) in tool_uses.iter().enumerate() {
                     blocks.push(AnthropicContent::ToolUse {
-                        id: anthropic_tool_id(&tool_use.id),
+                        id: wire_ids[i][j].clone(),
                         name: tool_use.name.clone(),
                         input: tool_use.input.clone(),
                         cache_control: None,
@@ -277,16 +248,18 @@ fn merge_same_role_turns(input: &[Message]) -> Box<[MessageRun]> {
     runs.into_boxed_slice()
 }
 
-fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
+fn convert_messages(input: &[Message]) -> Result<Vec<AnthropicMessage>, GenerateError> {
     // Merge into role-alternating runs, then emit one message per run — rolling
     // cache breakpoints onto the final block of the last two. Marking a block
     // caches the whole prefix up to it, and two breakpoints (rather than one)
     // keep the previous turn's write inside Anthropic's 20-block lookback as the
     // conversation grows — the recommended multi-turn pattern:
     // <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
-    let runs = merge_same_role_turns(input);
+    let wire_ids = wire_tool_ids(input)?;
+    let runs = merge_same_role_turns(input, &wire_ids);
     let count = runs.len();
-    runs.into_vec()
+    Ok(runs
+        .into_vec()
         .into_iter()
         .enumerate()
         .map(|(i, MessageRun { role, mut content })| {
@@ -297,7 +270,7 @@ fn convert_messages(input: &[Message]) -> Vec<AnthropicMessage> {
             }
             AnthropicMessage { role, content }
         })
-        .collect()
+        .collect())
 }
 
 //
@@ -918,7 +891,7 @@ mod tests {
     #[test]
     fn cache_breakpoints_mark_last_two_messages() {
         let input = [user("one"), assistant("two"), user("three")];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
         // The final two messages carry a breakpoint on their last block.
         assert_eq!(json[2]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(json[1]["content"][0]["cache_control"]["type"], "ephemeral");
@@ -931,11 +904,18 @@ mod tests {
         let input = [
             Message::AssistantMessage {
                 content: vec![],
-                tool_uses: vec![ToolUse {
-                    id: "a".into(),
-                    name: "x".into(),
-                    input: serde_json::Value::Null,
-                }],
+                tool_uses: vec![
+                    ToolUse {
+                        id: "a".into(),
+                        name: "x".into(),
+                        input: serde_json::Value::Null,
+                    },
+                    ToolUse {
+                        id: "b".into(),
+                        name: "x".into(),
+                        input: serde_json::Value::Null,
+                    },
+                ],
                 turn_end_reason: None,
             },
             Message::ToolResults {
@@ -953,7 +933,7 @@ mod tests {
                 ],
             },
         ];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
         // Last message has two tool_result blocks; only the final one is marked.
         assert_eq!(json[1]["content"][1]["cache_control"]["type"], "ephemeral");
         assert!(json[1]["content"][0].get("cache_control").is_none());
@@ -967,36 +947,39 @@ mod tests {
 
     #[test]
     fn convert_messages_empty_is_noop() {
-        assert!(convert_messages(&[]).is_empty());
+        assert!(convert_messages(&[]).unwrap().is_empty());
     }
 
     /// An image inside a tool result (e.g. `view_image`) must reach the API as
     /// a nested image block, not be dropped or stringified.
     #[test]
     fn tool_result_image_serializes_as_nested_image_block() {
-        let input = [Message::ToolResults {
-            tool_use_results: vec![ToolResult {
-                id: "toolu_1".into(),
-                content: vec![Content::Image {
-                    source: "data:image/png;base64,AAAA".into(),
+        let input = [
+            assistant_tool(None, "toolu_1", "view_image", serde_json::json!({})),
+            Message::ToolResults {
+                tool_use_results: vec![ToolResult {
+                    id: "toolu_1".into(),
+                    content: vec![Content::Image {
+                        source: "data:image/png;base64,AAAA".into(),
+                    }],
+                    is_error: false,
                 }],
-                is_error: false,
-            }],
-        }];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
-        assert_eq!(json[0]["role"], "user");
-        assert_eq!(json[0]["content"][0]["type"], "tool_result");
-        assert_eq!(json[0]["content"][0]["content"][0]["type"], "image");
+            },
+        ];
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
+        assert_eq!(json[1]["role"], "user");
+        assert_eq!(json[1]["content"][0]["type"], "tool_result");
+        assert_eq!(json[1]["content"][0]["content"][0]["type"], "image");
         assert_eq!(
-            json[0]["content"][0]["content"][0]["source"]["type"],
+            json[1]["content"][0]["content"][0]["source"]["type"],
             "base64"
         );
         assert_eq!(
-            json[0]["content"][0]["content"][0]["source"]["media_type"],
+            json[1]["content"][0]["content"][0]["source"]["media_type"],
             "image/png"
         );
         assert_eq!(
-            json[0]["content"][0]["content"][0]["source"]["data"],
+            json[1]["content"][0]["content"][0]["source"]["data"],
             "AAAA"
         );
     }
@@ -1156,63 +1139,43 @@ mod tests {
 
     #[test]
     fn test_convert_messages_merges_consecutive_user() {
-        let input = [user("hi"), tool_results(&[("toolu_1", "ok")])];
-        let msgs = convert_messages(&input);
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0].role, AnthropicRole::User));
-        assert_eq!(msgs[0].content.len(), 2);
+        let input = [
+            assistant_tool(None, "toolu_1", "bash", serde_json::json!({})),
+            tool_results(&[("toolu_1", "ok")]),
+            user("hi"),
+        ];
+        let msgs = convert_messages(&input).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[1].role, AnthropicRole::User));
+        assert_eq!(msgs[1].content.len(), 2);
         // tool_result blocks must come first in a user message.
         assert!(matches!(
-            msgs[0].content[0],
+            msgs[1].content[0],
             AnthropicContent::ToolResult { .. }
         ));
-        assert!(matches!(msgs[0].content[1], AnthropicContent::Text { .. }));
+        assert!(matches!(msgs[1].content[1], AnthropicContent::Text { .. }));
     }
 
-    /// Resuming a session started on another provider: its tool ids may break
-    /// Anthropic's pattern, and rewriting them is only correct if the
-    /// `tool_use` and its `tool_result` still name each other.
+    /// Resuming a session started on another provider: history carries ids
+    /// Anthropic's `^[a-zA-Z0-9_-]+$` rejects. Minted wire ids must be legal,
+    /// keep the `tool_use` and its `tool_result` naming each other, and never
+    /// leak the stored id onto the wire.
     #[test]
-    fn foreign_tool_ids_are_rewritten_and_still_pair_up() {
+    fn foreign_history_ids_never_reach_the_wire() {
         let input = [
             user("hello"),
             assistant_tool(None, "functions.bash:0", "bash", serde_json::json!({})),
             tool_results(&[("functions.bash:0", "ok")]),
         ];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
 
         let tool_use_id = json[1]["content"][0]["id"].as_str().unwrap();
         assert!(
             is_legal_anthropic_id(tool_use_id),
-            "tool_use id {tool_use_id:?} still violates ^[a-zA-Z0-9_-]+$"
+            "tool_use id {tool_use_id:?} violates ^[a-zA-Z0-9_-]+$"
         );
+        assert_ne!(tool_use_id, "functions.bash:0");
         assert_eq!(tool_use_id, json[2]["content"][0]["tool_use_id"]);
-    }
-
-    /// A legal id must survive byte-identical: rewriting one would move the
-    /// cache breakpoint's prefix on every Anthropic-native session.
-    #[test]
-    fn legal_tool_ids_pass_through_unchanged() {
-        for id in [
-            "toolu_01A09q90qw90lq917835lq9",
-            "call_re9tQypxSAaAheStLjOqkkeP",
-        ] {
-            assert_eq!(anthropic_tool_id(id), id);
-        }
-    }
-
-    #[test]
-    fn rewritten_tool_ids_are_legal_and_stay_distinct() {
-        let ids = ["", "a.b", "a:b", "call_x|fc_y", "функция"];
-        let rewritten: Vec<String> = ids.iter().map(|id| anthropic_tool_id(id)).collect();
-
-        for id in &rewritten {
-            assert!(is_legal_anthropic_id(id), "rewrote to illegal id {id:?}");
-        }
-        // Substitution alone folds `a.b` and `a:b` together; duplicate tool_use
-        // ids are rejected just as hard as illegal ones.
-        let unique: std::collections::HashSet<&String> = rewritten.iter().collect();
-        assert_eq!(unique.len(), rewritten.len(), "collision in {rewritten:?}");
     }
 
     #[test]

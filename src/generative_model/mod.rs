@@ -425,6 +425,75 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
         .collect()
 }
 
+/// Provider-neutral wire ids for every tool call in `input`: `out[i][j]` is
+/// the id a driver sends for the `j`-th tool_use of the assistant message at
+/// index `i`, and equally for the `j`-th result of the `ToolResults` message
+/// answering it.
+///
+/// History stores the id each provider minted, but providers disagree about
+/// what an id may look like: Anthropic enforces `^[a-zA-Z0-9_-]+$`, OpenAI
+/// caps the length at 40, Mistral-style OpenAI-compatible backends demand
+/// exactly nine alphanumerics — and some gateways mint ids (`functions.bash:0`)
+/// that violate all of it. Echoing stored ids therefore wedges a session the
+/// moment it resumes on a different provider: the whole history is resent
+/// every turn, so one foreign id fails every future request. Drivers send
+/// these minted ids instead — nine alphanumerics satisfy every dialect at
+/// once — and never put a stored id on the wire.
+///
+/// Ids derive from (message index, ordinal), so history growth never changes
+/// the ids of earlier messages and the request prefix stays byte-identical
+/// across turns for provider prompt caching. Pairing is positional:
+/// `tool_use_results[j]` answers `tool_uses[j]` of the immediately preceding
+/// assistant message — the order the agent loop writes and compaction
+/// preserves (tails start at a user message and never split a pair). A
+/// history that breaks it fails here, before any request is sent: guessing
+/// the pairing would corrupt the conversation silently.
+pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, GenerateError> {
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(input.len());
+    for (i, message) in input.iter().enumerate() {
+        let ids = match message {
+            Message::UserMessage { .. } => Vec::new(),
+            Message::AssistantMessage { tool_uses, .. } => {
+                (0..tool_uses.len()).map(|j| mint_tool_id(i, j)).collect()
+            }
+            Message::ToolResults { tool_use_results } => {
+                let preceding_uses = match i.checked_sub(1).map(|p| &input[p]) {
+                    Some(Message::AssistantMessage { tool_uses, .. }) => tool_uses.len(),
+                    _ => 0,
+                };
+                if preceding_uses != tool_use_results.len() {
+                    return Err(GenerateError::ExecutionError(format!(
+                        "history is malformed: message {i} carries {} tool results but the \
+                         message before it has {preceding_uses} tool calls",
+                        tool_use_results.len()
+                    )));
+                }
+                out[i - 1].clone()
+            }
+        };
+        out.push(ids);
+    }
+    Ok(out)
+}
+
+/// Nine alphanumeric chars — the strictest id dialect any target provider
+/// enforces: `t`, then message index and tool ordinal as four base36 digits
+/// each.
+fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
+    const CAP: usize = 36 * 36 * 36 * 36;
+    // A history long enough to overflow four digits (1.6M messages) exceeds
+    // the request size cap long before it gets here.
+    assert!(message_index < CAP && ordinal < CAP);
+    let mut id = String::with_capacity(9);
+    id.push('t');
+    for n in [message_index, ordinal] {
+        for place in [36 * 36 * 36, 36 * 36, 36, 1] {
+            id.push(char::from_digit(((n / place) % 36) as u32, 36).unwrap());
+        }
+    }
+    id
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
     MessageStart,
@@ -753,6 +822,68 @@ pub enum ModelCreationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assistant_tool, tool_results, user};
+
+    /// Every minted id must satisfy the strictest provider dialect at once:
+    /// exactly nine chars, alphanumeric only (covers Anthropic's
+    /// `^[a-zA-Z0-9_-]+$`, OpenAI's 40-char cap, and Mistral-style
+    /// nine-alphanumeric backends).
+    #[test]
+    fn wire_ids_are_nine_alphanumerics() {
+        for (i, j) in [(0, 0), (1, 3), (255, 7), (46_655, 12)] {
+            let id = mint_tool_id(i, j);
+            assert_eq!(id.len(), 9, "{id:?}");
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id:?}");
+        }
+    }
+
+    /// A tool_result must carry the same wire id as the tool_use it answers,
+    /// no matter what ids the originating provider stored in history.
+    #[test]
+    fn wire_ids_pair_results_with_uses_positionally() {
+        let input = [
+            user("hi"),
+            assistant_tool(None, "functions.bash:0", "bash", serde_json::json!({})),
+            tool_results(&[("functions.bash:0", "ok")]),
+        ];
+        let ids = wire_tool_ids(&input).unwrap();
+        assert!(ids[0].is_empty());
+        assert_eq!(ids[1].len(), 1);
+        assert_eq!(ids[1], ids[2]);
+    }
+
+    /// Appending messages must not change earlier ids: the request prefix has
+    /// to stay byte-identical across turns or provider prompt caching breaks.
+    #[test]
+    fn wire_ids_stable_as_history_grows() {
+        let mut input = vec![
+            user("hi"),
+            assistant_tool(None, "a", "bash", serde_json::json!({})),
+            tool_results(&[("a", "ok")]),
+        ];
+        let before = wire_tool_ids(&input).unwrap();
+        input.push(user("more"));
+        input.push(assistant_tool(None, "b", "bash", serde_json::json!({})));
+        input.push(tool_results(&[("b", "ok")]));
+        let after = wire_tool_ids(&input).unwrap();
+        assert_eq!(before[..], after[..3]);
+        assert_ne!(after[1], after[4], "distinct calls must get distinct ids");
+    }
+
+    /// Positional pairing must refuse to guess: a results message whose count
+    /// disagrees with the preceding assistant's tool calls fails before any
+    /// request is sent, instead of silently mispairing.
+    #[test]
+    fn wire_ids_fail_loud_on_broken_pairing() {
+        let orphaned = [user("hi"), tool_results(&[("a", "ok")])];
+        assert!(wire_tool_ids(&orphaned).is_err());
+
+        let miscounted = [
+            assistant_tool(None, "a", "bash", serde_json::json!({})),
+            tool_results(&[("a", "ok"), ("b", "ok")]),
+        ];
+        assert!(wire_tool_ids(&miscounted).is_err());
+    }
 
     #[tokio::test]
     async fn accumulate_thinking_then_text() {
