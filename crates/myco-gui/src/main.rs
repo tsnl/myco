@@ -123,15 +123,19 @@ struct ConversationProps {
 fn conversation(props: &ConversationProps) -> Html {
     let entries = use_state(Vec::<api::Entry>::new);
     let busy = use_state(|| false);
+    let error = use_state(|| Option::<String>::None);
     // Text streamed since the last transcript refresh (SSE deltas).
     let streaming = use_state(String::new);
     let input = use_node_ref();
+    let navigator = use_navigator().unwrap();
 
     // SSE: live deltas; TurnStarted/TurnFinished trigger a transcript refresh.
     {
         let entries = entries.clone();
         let busy = busy.clone();
+        let error = error.clone();
         let streaming = streaming.clone();
+        let navigator = navigator.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -159,10 +163,18 @@ fn conversation(props: &ConversationProps) -> Html {
                         match ev {
                             api::StreamEvent::TurnStarted => {
                                 busy.set(true);
+                                error.set(None);
                                 streaming.set(String::new());
                                 if let Some(p) = fetch_poll(&id).await {
                                     entries.set(p.entries);
                                 }
+                            }
+                            api::StreamEvent::TurnFailed { message } => {
+                                error.set(Some(message));
+                            }
+                            api::StreamEvent::Compacted { successor, .. } => {
+                                navigator.push(&Route::Session { id: successor });
+                                break;
                             }
                             api::StreamEvent::TextDelta { text } => {
                                 streaming.set(format!("{}{}", *streaming, text));
@@ -193,6 +205,7 @@ fn conversation(props: &ConversationProps) -> Html {
     {
         let entries = entries.clone();
         let busy = busy.clone();
+        let error = error.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -204,6 +217,7 @@ fn conversation(props: &ConversationProps) -> Html {
                     if let Some(p) = fetch_poll(&id).await {
                         entries.set(p.entries);
                         busy.set(p.busy);
+                        error.set(p.last_error);
                     }
                 }
             });
@@ -260,6 +274,9 @@ fn conversation(props: &ConversationProps) -> Html {
                         <pre style="white-space: pre-wrap; display: inline;">{ &e.text }</pre>
                     </div>
                 }) }
+                { if let Some(e) = &*error { html! {
+                    <div style="color: red;"><b>{ "turn failed: " }</b>{ e }</div>
+                } } else { html!{} } }
                 { if !streaming.is_empty() { html! {
                     <div>
                         <b>{ "assistant (streaming): " }</b>

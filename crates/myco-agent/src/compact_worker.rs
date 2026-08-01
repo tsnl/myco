@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use myco_core::{CancelToken, uuid_simple_hex};
 use myco_machines::harness::Harness;
-use myco_models::{self as generative_model, CatalogModel, Content, GenerativeModelConfig};
+use myco_models::{self as generative_model, CatalogModel, Content};
 use myco_prompts as prompts;
 use myco_session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
 
@@ -66,11 +66,25 @@ pub enum CompactWorkerError {
 /// via `session_history`), read the summary back, then build and link the
 /// successor. Pure orchestration — the caller owns all UI (progress, error
 /// display) and installing the successor into the live REPL.
+/// System prompt for the compaction worker; the default server model factory
+/// builds the worker model with it. Kept beside the worker so the prompt and
+/// the lifecycle stay in one file.
+pub fn compactor_system_prompt(catalog_model: &CatalogModel, max_soul_bytes: usize) -> String {
+    [
+        "You are a myco compaction worker. Follow the user instruction exactly. \
+         Prefer session_history over bash for reading sessions."
+            .to_string(),
+        prompts::agent_prompt_epilogue(max_soul_bytes),
+        prompts::model_stamp(&catalog_model.spec.key),
+    ]
+    .join("\n\n")
+}
+
 pub async fn run_compact_worker(
     predecessor: &Session,
     catalog_model: &CatalogModel,
     harness: Arc<Harness>,
-    max_soul_bytes: usize,
+    model: Arc<dyn generative_model::GenerativeModel>,
     cancel: CancelToken,
 ) -> Result<(Session, CompactOutcome), CompactWorkerError> {
     let worker_id = uuid::Uuid::new_v4();
@@ -93,27 +107,6 @@ pub async fn run_compact_worker(
     // writes one cannot have stale text compacted in (see `read_fresh_summary`).
     let summary_path = predecessor.summary_path();
     let summary_before = std::fs::read_to_string(&summary_path).ok();
-
-    let model = match generative_model::new(GenerativeModelConfig {
-        model: catalog_model.spec.clone(),
-        tools: harness.tool_specs(),
-        system_prompt: [
-            "You are a myco compaction worker. Follow the user instruction exactly. \
-             Prefer session_history over bash for reading sessions."
-                .to_string(),
-            prompts::agent_prompt_epilogue(max_soul_bytes),
-            prompts::model_stamp(&catalog_model.spec.key),
-        ]
-        .join("\n\n"),
-        backend_config: catalog_model.backend.clone(),
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(CompactWorkerError::Failed(format!(
-                "failed to create model: {e:?}"
-            )));
-        }
-    };
 
     let sink = Arc::new(NullEventSink);
     let mut worker = Agent::with_context(

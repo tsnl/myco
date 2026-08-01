@@ -31,10 +31,10 @@ pub const ARTICLES: &[Article] = &[
         body: include_str!("articles/overview.md"),
     },
     Article {
-        id: "cli",
-        title: "User-facing CLI",
-        summary: "Slash-commands and keybindings the agent cannot press",
-        body: include_str!("articles/cli.md"),
+        id: "api",
+        title: "Driving myco",
+        summary: "The HTTP API, GUI, turn/compaction lifecycle, nested agents",
+        body: include_str!("articles/api.md"),
     },
     Article {
         id: "harness-ops",
@@ -138,7 +138,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), ARTICLES.len(), "duplicate article ids");
-        assert_eq!(ids, ["cli", "harness-ops", "overview"]); // sorted unique
+        assert_eq!(ids, ["api", "harness-ops", "overview"]); // sorted unique
         for a in ARTICLES {
             assert!(!a.body.trim().is_empty(), "empty body: {}", a.id);
             assert!(!a.title.is_empty());
@@ -196,7 +196,7 @@ mod tests {
     fn export_is_a_no_op_when_the_files_already_match() {
         let home = tempdir();
         let dir = export(&home).unwrap();
-        let article = dir.join("cli.md");
+        let article = dir.join("api.md");
         let before = std::fs::metadata(&article).unwrap().modified().unwrap();
 
         export(&home).unwrap();

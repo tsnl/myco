@@ -49,6 +49,10 @@ pub struct Poll {
     /// Total entries currently renderable; poll again with this as `since`.
     pub total: usize,
     pub entries: Vec<Entry>,
+    /// Why the most recent turn produced nothing, if it failed; cleared when
+    /// the next turn starts.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,8 +91,25 @@ pub struct ApiError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TurnStarted,
-    TextDelta { text: String },
-    ThinkingDelta { text: String },
-    ToolStarted { name: String, input: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
+    ToolStarted {
+        name: String,
+        input: String,
+    },
     TurnFinished,
+    /// The turn ended without a reply (provider error, cancellation); the
+    /// message is also on `Poll::last_error` until the next turn starts.
+    TurnFailed {
+        message: String,
+    },
+    /// Compaction replaced this session with a successor — follow the new id.
+    Compacted {
+        predecessor: String,
+        successor: String,
+    },
 }
