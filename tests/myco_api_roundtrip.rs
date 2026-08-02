@@ -158,3 +158,78 @@ async fn a_failing_turn_surfaces_on_last_error() {
     assert!(p.entries.iter().any(|e| e.role == "user"));
     assert!(!p.entries.iter().any(|e| e.role == "assistant"));
 }
+
+/// Streaming is the contract, not a nicety: a turn must publish text deltas on
+/// the live feed *before* it finishes, so a client can render as it goes.
+#[tokio::test]
+async fn a_turn_streams_deltas_before_it_finishes() {
+    let _home = myco_test_support::temp_home("api-stream");
+    let server = scripted_server(|| {
+        ScriptedModel::new(vec![GenerateOutput {
+            content: vec![
+                Content::Thinking {
+                    text: "pondering".into(),
+                    signature: None,
+                    redacted: false,
+                },
+                Content::Text {
+                    text: "# Heading\n\nstreamed **body**".into(),
+                },
+            ],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }])
+    });
+    let server: &dyn MycoApi = server.as_ref();
+
+    let s = server
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+
+    // Subscribe first: the feed must carry the turn we are about to start.
+    let mut stream = server.events(&s.id).await.expect("events");
+    server
+        .post_message(&s.id, PostMessage { text: "go".into() })
+        .await
+        .expect("post");
+
+    let mut text = String::new();
+    let mut thinking = String::new();
+    let mut started = false;
+    let collect = async {
+        use futures::StreamExt;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                myco_api::StreamEvent::TurnStarted => started = true,
+                myco_api::StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                myco_api::StreamEvent::ThinkingDelta { text: t } => thinking.push_str(&t),
+                myco_api::StreamEvent::TurnFinished => break,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+        .await
+        .expect("the feed produced a complete turn");
+
+    assert!(started, "the feed announces the turn start");
+    assert_eq!(thinking, "pondering");
+    assert_eq!(text, "# Heading\n\nstreamed **body**");
+
+    // And the same content is in the transcript afterwards.
+    let p = poll_until(server, &s.id, |p| {
+        p.entries.iter().any(|e| e.role == "assistant")
+    })
+    .await;
+    assert!(
+        p.entries
+            .iter()
+            .any(|e| e.text.contains("streamed **body**"))
+    );
+}

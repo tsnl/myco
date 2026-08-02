@@ -8,11 +8,13 @@ repository.workspace = true
 
 [dependencies]
 myco-api = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 yew = { version = "0.21", features = ["csr"] }
 yew-router = "0.18"
 gloo-net = { version = "0.6", features = ["eventsource"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlTextAreaElement"] }
+web-sys = { version = "0.3", features = ["Element", "HtmlInputElement", "HtmlTextAreaElement"] }
 futures = { workspace = true }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
