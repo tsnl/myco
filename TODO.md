@@ -98,11 +98,12 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
   - History breakpoints / strategic `cache_control` so the growing prefix is not fully uncached.
   - Surface cache hit metrics so prompts can be tuned.
   - Rejection reason: very infrequently used in practice, just let the agent read the session history.
-- [x] **Max-tokens continue** — a `max_tokens` stop that carried tool calls now resumes in-turn
-      rather than dead-ending: the tool results are already the last message, so the resumed
-      request is an ordinary continuation. Capped at `MAX_TRUNCATED_RESUMES` consecutive
-      truncations. Truncated *text* still hands back — history would end on an assistant
-      message, which current Anthropic models reject as a prefill.
+- [x] **Max-tokens continue** — a `max_tokens` stop resumes in-turn rather than dead-ending.
+      A turn that carried tool calls already ends on their results, so the resumed request is
+      an ordinary continuation; truncated *text* is resumed by a user turn asking for the rest,
+      because history would otherwise end on the assistant's cut-off message, which current
+      Anthropic models reject as a prefill. Capped by the per-model `max_truncated_resumes`
+      (default 3, `0` opts out); any stop for another reason clears the count.
 
 ### Project brain
 
