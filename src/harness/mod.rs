@@ -22,7 +22,9 @@ pub use config::{
 pub use crate::host::{HostConfig, HostController};
 
 mod preflight;
-pub use preflight::{ExecutableCheckReport, StartupPreflight, check_expected_executables};
+pub use preflight::{
+    ExecutableCheckReport, StartupPreflight, check_expected_executables, fatal_startup_check,
+};
 
 mod ssh;
 pub use ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};

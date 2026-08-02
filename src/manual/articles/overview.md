@@ -57,7 +57,8 @@ top-level keys must come before the tables, per TOML):
 model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
-# Cap on the rendered prelude appended to every agent system prompt (default 262144).
+# Hard cap on the rendered prelude in every agent system prompt (default 262144):
+# oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144
 
 [gateways.xai]
@@ -265,11 +266,16 @@ Distinct from the per-session `session_meta` scratchpad.
 The prompt fragment makes the prelude the *default* home for durable information —
 agents record findings eagerly and reserve workspace files for cold material
 (rarely relevant, or high-volume lookup-only data). Prompt-resident text is
-cached, so a big prelude is cheaper than the mid-task exploration it replaces. A
-rendered prelude longer than `max_prelude_bytes` (config.toml; default 262144 = 256 KiB)
-is cut to that many bytes with a marker in the prompt, and startup opens a WARNING
-naming the entry count and both sizes — a prelude silently losing its tail is
-otherwise invisible. Merge or remove entries, or raise the knob.
+cached, so a big prelude is cheaper than the mid-task exploration it replaces.
+
+`max_prelude_bytes` (config.toml; default 262144 = 256 KiB) bounds the rendered
+prelude, and it is enforced at both ends rather than applied to the prompt: the
+`prelude` tool refuses an `add`/`replace` that would cross it, and startup
+**exits** against a directory already over it, naming the sizes and the two
+fixes (prune entries by hand, or raise the knob). A prompt therefore always
+carries the prelude whole — a shortened one is indistinguishable, from inside
+the prompt, from knowledge that was never recorded, which is exactly the
+failure the cap exists to prevent.
 
 The rest of the workspace is listed, not quoted: a `# Workspace Files` section
 gives each visible file's path (relative to `workspace/`), the UTC day it last

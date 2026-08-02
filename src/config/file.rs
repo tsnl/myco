@@ -36,9 +36,10 @@ pub struct FileConfig {
     /// resolve. (Config key kept as `attach_timeout_secs`.)
     #[serde(default)]
     pub attach_timeout_secs: Option<u64>,
-    /// Cap on the rendered prelude (`workspace/prelude/` entries) appended to every
-    /// agent system prompt. A longer prelude is cut to this many bytes with a
-    /// marker, and startup warns loudly that it happened. `None` = unset;
+    /// Cap on the rendered prelude (`workspace/prelude/` entries) appended to
+    /// every agent system prompt. Enforced, not clamped: the `prelude` tool
+    /// refuses an edit that would cross it and startup exits against a prelude
+    /// already over it. `None` = unset;
     /// [`crate::prompts::DEFAULT_MAX_PRELUDE_BYTES`] applies at resolve.
     #[serde(default)]
     pub max_prelude_bytes: Option<usize>,

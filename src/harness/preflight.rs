@@ -4,10 +4,14 @@
 //! verifies that the external programs myco spawns (declared in
 //! [`crate::external_command`]) actually resolve on the agent machine. Results
 //! fold into one WARNING block with the ssh-agent preflight
-//! ([`SshAgentPreflightReport`]) and the prelude size check
-//! ([`crate::prompts::prelude_truncation`]) — one section after the banner,
-//! silent when everything resolves. Remote hosts are not probed here; they
-//! report missing programs as tool errors at call time.
+//! ([`SshAgentPreflightReport`]) and the prelude read check
+//! ([`crate::prelude::read_failure`]) — one section after the banner, silent
+//! when everything resolves. Remote hosts are not probed here; they report
+//! missing programs as tool errors at call time.
+//!
+//! Checks that *stop* startup are a separate pass, [`fatal_startup_check`],
+//! which the caller runs first and exits on. Keeping the two apart is what
+//! lets this type mean exactly one thing: problems a session can run through.
 //!
 //! Reporting stops at plain text ([`StartupPreflight::warning_body`]); the
 //! caller owns the WARNING block around it, because the interactive REPL and
@@ -18,7 +22,7 @@ use std::io::Write;
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
-use crate::prompts::{PreludeTruncation, prelude_truncation};
+use crate::prompts::prelude_oversize;
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
@@ -84,8 +88,6 @@ pub struct StartupPreflight {
     /// Why the manual export failed, when it did. Agents are told in their
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
-    /// Set when the rendered prelude does not fit under `max_prelude_bytes`.
-    pub prelude: Option<PreludeTruncation>,
     /// Set when the prelude directory exists but could not be read, so this
     /// session's agents run with an empty prelude (see
     /// [`crate::prelude::read_failure`]).
@@ -99,9 +101,8 @@ impl StartupPreflight {
     /// at its directory). Then the executable check; the ssh-agent preflight
     /// runs only when the OpenSSH tools it spawns actually resolve —
     /// otherwise every step would fail with spawn errors the
-    /// missing-executable lines already explain. `max_prelude_bytes` is the
-    /// resolved config cap the prompts will use.
-    pub fn run(hosts: &[HostConfig], max_prelude_bytes: usize) -> Self {
+    /// missing-executable lines already explain.
+    pub fn run(hosts: &[HostConfig]) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
             SshAgentPreflightReport::default()
@@ -110,7 +111,6 @@ impl StartupPreflight {
         };
         Self {
             manual: export_manual().err(),
-            prelude: prelude_truncation(max_prelude_bytes),
             prelude_unreadable: crate::prelude::dir()
                 .ok()
                 .as_deref()
@@ -122,29 +122,56 @@ impl StartupPreflight {
 
     pub fn has_problems(&self) -> bool {
         self.manual.is_some()
-            || self.prelude.is_some()
             || self.prelude_unreadable.is_some()
             || !self.executables.is_clean()
             || self.ssh.has_problems()
     }
 
-    /// Every preflight problem as plain body lines — manual, prelude, executables,
-    /// ssh-agent, in that order, with no rule or header. Empty when
-    /// [`Self::has_problems`] is false.
+    /// Every survivable preflight problem as plain body lines — manual,
+    /// prelude, executables, ssh-agent, in that order, with no rule or header.
+    /// Empty when [`Self::has_problems`] is false. Fatal findings are not
+    /// here; they go through [`fatal_startup_check`] and end the process.
     ///
     /// Order is by how invisible the problem is otherwise: a missing manual
-    /// export or a cut prelude never announces itself again (the agent simply
-    /// runs without those bytes), while missing executables and ssh keys
-    /// resurface at the tool call that needs them.
+    /// export or an unreadable prelude never announces itself again (the agent
+    /// simply runs without those bytes), while missing executables and ssh
+    /// keys resurface at the tool call that needs them.
     pub fn warning_body(&self) -> String {
         let mut out = Vec::new();
         let _ = write_manual_body(self.manual.as_deref(), &mut out);
         let _ = write_prelude_unreadable_body(self.prelude_unreadable.as_deref(), &mut out);
-        let _ = write_prelude_body(self.prelude.as_ref(), &mut out);
         let _ = self.executables.write_body(&mut out);
         let _ = self.ssh.write_body(&mut out);
         String::from_utf8(out).unwrap_or_default()
     }
+}
+
+/// The checks that stop startup, as a message to print before exiting, or
+/// `None` when myco may run.
+///
+/// Separate from [`StartupPreflight`] because the two have different
+/// consequences and different audiences: a warning is read by whoever is
+/// around, while this is the last thing the process says. It therefore has to
+/// carry the whole repair — there is no agent to delegate to and no session in
+/// which to ask.
+///
+/// Today the only such check is an oversized prelude: nothing shortens the
+/// prelude to fit, so a prompt could not carry it honestly.
+pub fn fatal_startup_check(max_prelude_bytes: usize) -> Option<String> {
+    let over = prelude_oversize(max_prelude_bytes)?;
+    let dir = crate::prelude::dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "~/.myco/workspace/prelude".into());
+    Some(format!(
+        "{}\n\
+         refusing to start: agents would run on a prelude too big to carry, and trimming it \
+         would hide the missing part from them.\n\
+         fix by hand in {dir} — merge overlapping entries or delete dead ones (each is a \
+         plain `*.md` file; `ls -S` lists the biggest first) — or raise max_prelude_bytes in \
+         config.toml above {} bytes.",
+        over.describe(),
+        over.bytes,
+    ))
 }
 
 /// Copy the manual articles to `<myco home>/manual/<version>/<commit>/` for
@@ -182,25 +209,6 @@ fn write_prelude_unreadable_body(
     )
 }
 
-/// Prelude lines only (no rule/header); writes nothing when the prelude fits.
-fn write_prelude_body(
-    cut: Option<&PreludeTruncation>,
-    out: &mut impl Write,
-) -> std::io::Result<()> {
-    let Some(cut) = cut else { return Ok(()) };
-    writeln!(out, "prelude ({} entries): {}", cut.entries, cut.describe())?;
-    writeln!(
-        out,
-        "every agent prompt from now on carries only the first {} of the rendered prelude",
-        cut.human_limit()
-    )?;
-    writeln!(
-        out,
-        "hint: merge or remove prelude entries (`prelude` tool), move cold material to \
-         workspace files, or raise `max_prelude_bytes` in config.toml"
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -210,12 +218,10 @@ mod tests {
     use super::*;
 
     fn preflight(
-        prelude: Option<PreludeTruncation>,
         missing: Vec<&'static ExternalCommand>,
         ssh: SshAgentPreflightReport,
     ) -> StartupPreflight {
         StartupPreflight {
-            prelude,
             executables: ExecutableCheckReport { missing },
             ssh,
             ..Default::default()
@@ -252,7 +258,6 @@ mod tests {
     #[test]
     fn silent_when_everything_resolves() {
         let pf = preflight(
-            None,
             missing_executables(true, |_| true),
             SshAgentPreflightReport::default(),
         );
@@ -263,7 +268,6 @@ mod tests {
     #[test]
     fn missing_tmux_reports_the_purpose_and_an_install_hint() {
         let pf = preflight(
-            None,
             missing_executables(false, |e| e.name != "tmux"),
             SshAgentPreflightReport::default(),
         );
@@ -283,7 +287,6 @@ mod tests {
     #[test]
     fn executables_are_reported_before_ssh_agent() {
         let pf = preflight(
-            None,
             missing_executables(true, |e| e.name != "ssh"),
             SshAgentPreflightReport {
                 had_ssh_hosts: true,
@@ -303,7 +306,6 @@ mod tests {
         // A clean-but-noted ssh report (e.g. "no SSH-backed hosts") must not
         // leak into a WARNING block opened for missing executables.
         let pf = preflight(
-            None,
             missing_executables(false, |e| e.name != "tmux"),
             SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
@@ -315,56 +317,30 @@ mod tests {
         assert!(!out.contains("note:"), "{out}");
     }
 
-    // The exact truncation strings ("prelude truncated at 256 KiB of 293 KiB")
-    // are `prelude_truncation`'s claim, pinned in `crate::prompts` tests; here
-    // only the block's shape and ordering are at stake.
+    /// The fatal pass is a different channel from the warning block: an
+    /// oversized prelude stops startup and never shows up as a survivable
+    /// warning. The message has to carry the whole repair, since the process
+    /// exits before any session or agent exists.
     #[test]
-    fn truncated_prelude_warns_first_and_counts_entries() {
-        let pf = preflight(
-            Some(PreludeTruncation {
-                entries: 17,
-                bytes: 300_000,
-                limit: 256 * 1024,
-            }),
-            missing_executables(false, |e| e.name != "tmux"),
-            SshAgentPreflightReport::default(),
-        );
-        assert!(pf.has_problems());
-        let out = rendered(&pf);
-        assert!(
-            out.contains(
-                "prelude (17 entries): prelude truncated at 256 KiB of 293 KiB (max_prelude_bytes)"
-            ),
-            "{out}"
-        );
-        assert!(out.contains("only the first 256 KiB"), "{out}");
-        assert!(out.contains("merge or remove prelude entries"), "{out}");
-        assert!(
-            out.contains("raise `max_prelude_bytes` in config.toml"),
-            "{out}"
-        );
-        // The prelude leads the block; the other checks follow it.
-        let prelude_at = out.find("prelude (17 entries)").unwrap();
-        let exec_at = out.find("missing executable tmux").unwrap();
-        assert!(prelude_at < exec_at, "{out}");
-    }
+    fn an_oversized_prelude_is_fatal_and_self_contained() {
+        let home = crate::test_support::temp_home("preflight-fatal");
+        let dir = home.path().join("workspace").join("prelude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20260101T0000-aaaa.md"), "x".repeat(4096)).unwrap();
 
-    #[test]
-    fn a_truncated_prelude_alone_is_enough_to_report() {
-        // Nothing else wrong: the prelude alone still opens a WARNING block.
-        let pf = preflight(
-            Some(PreludeTruncation {
-                entries: 2,
-                bytes: 4096,
-                limit: 2048,
-            }),
-            missing_executables(true, |_| true),
-            SshAgentPreflightReport::default(),
+        let fatal = fatal_startup_check(2048).expect("an oversized prelude must be fatal");
+        assert!(
+            fatal.contains("over the 2 KiB max_prelude_bytes cap"),
+            "{fatal}"
         );
-        assert!(pf.has_problems());
-        let out = rendered(&pf);
-        assert!(out.contains("prelude (2 entries):"), "{out}");
-        assert!(!out.contains("missing executable"), "{out}");
+        assert!(fatal.contains("refusing to start"), "{fatal}");
+        // Both repairs, and enough detail to act on without an agent's help.
+        assert!(fatal.contains("raise max_prelude_bytes"), "{fatal}");
+        assert!(fatal.contains(&dir.display().to_string()), "{fatal}");
+
+        // Room to spare: nothing fatal, and the warning report never mentions
+        // the prelude size either way.
+        assert_eq!(fatal_startup_check(64 * 1024), None);
     }
 
     /// An unreadable prelude directory is invisible from inside the prompt —

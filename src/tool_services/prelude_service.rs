@@ -86,7 +86,7 @@ impl PreludeTool {
         match input.action {
             ActionKind::Add => {
                 let text = required_text(input.text, "add")?;
-                let name = prelude::add_entry(&dir, &text)?;
+                let name = prelude::add_entry(&dir, &text, self.max_prelude_bytes, None)?;
                 Ok(format!("added prelude/{name}\n{}", self.status(&dir)))
             }
             ActionKind::Replace => {
@@ -98,8 +98,11 @@ impl PreludeTool {
                     ));
                 }
                 // Replacement lands before the old entry goes, so a crash or
-                // race between the two steps duplicates — never loses.
-                let name = prelude::add_entry(&dir, &text)?;
+                // race between the two steps duplicates — never loses. The
+                // budget is measured with `id` already discounted, so an
+                // in-place-sized rewrite is never refused for lack of room.
+                let name =
+                    prelude::add_entry(&dir, &text, self.max_prelude_bytes, Some(id.as_str()))?;
                 let note = match prelude::remove_entry(&dir, &id)? {
                     true => String::new(),
                     false => format!(
@@ -136,25 +139,17 @@ impl PreludeTool {
         }
     }
 
-    /// One line of live totals, plus a loud second line once the rendered
-    /// prelude no longer fits — the agent holding the pen is the one who can
-    /// merge entries, so it hears about cap pressure immediately.
+    /// One line of live totals, so an agent curating can see how much room is
+    /// left before an edit would be refused.
     fn status(&self, dir: &Path) -> String {
         let entries = prelude::entries(dir);
         let bytes = prelude::rendered_body(&entries).len();
-        let mut out = format!(
+        format!(
             "prelude: {} entr{}, {bytes} bytes rendered of {} max_prelude_bytes\n",
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" },
             self.max_prelude_bytes,
-        );
-        if bytes > self.max_prelude_bytes {
-            out.push_str(
-                "WARNING: over max_prelude_bytes — future prompts truncate the tail; merge \
-                 entries and move cold material to workspace files\n",
-            );
-        }
-        out
+        )
     }
 }
 
@@ -346,12 +341,12 @@ mod tests {
     }
 
     /// Null-filled or missing fields must error instead of writing junk
-    /// entries, and cap pressure is reported while the agent can still act.
+    /// entries.
     #[tokio::test]
-    async fn guards_and_cap_warning() {
+    async fn null_and_missing_fields_error() {
         let _home = temp_home("prelude-tool-guards");
 
-        let tool = Arc::new(PreludeTool::new(64));
+        let tool = Arc::new(PreludeTool::new(64 * 1024));
 
         for input in [
             serde_json::json!({"action": "add"}),
@@ -363,18 +358,31 @@ mod tests {
             let r = call(&tool, input.clone()).await;
             assert!(r.is_error, "{input} should error: {r:?}");
         }
+    }
 
-        // Over the cap: the result warns immediately, while the agent that
-        // wrote the entry can still merge or move material out.
+    /// The cap is enforced at the edit: an add that would cross it fails the
+    /// tool call and leaves the prelude alone, rather than landing and being
+    /// trimmed out of the prompt later.
+    #[tokio::test]
+    async fn an_add_over_the_cap_fails_the_tool_call() {
+        let _home = temp_home("prelude-tool-cap");
+
+        let tool = Arc::new(PreludeTool::new(64));
         let big = call(
             &tool,
             serde_json::json!({"action": "add", "text": "y".repeat(200)}),
         )
         .await;
-        assert!(!big.is_error, "{big:?}");
+        assert!(big.is_error, "{big:?}");
+        let text = result_text(&big);
+        assert!(text.contains("refusing to write"), "{text}");
+        assert!(text.contains("max_prelude_bytes"), "{text}");
+
+        // Nothing landed, so the agent's next `list` is not misleading.
+        let listed = call(&tool, serde_json::json!({"action": "list"})).await;
         assert!(
-            result_text(&big).contains("WARNING: over max_prelude_bytes"),
-            "{big:?}"
+            result_text(&listed).contains("(no prelude entries)"),
+            "{listed:?}"
         );
     }
 }

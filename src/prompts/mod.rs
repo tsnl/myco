@@ -195,9 +195,13 @@ pub fn is_session_stamp(text: &str) -> bool {
 /// The prelude is the default home for durable information (the workspace
 /// fragment tells agents to front-load it), so the cap is a generous
 /// runaway-growth backstop, not a target: 256 KiB is roughly 64K tokens on
-/// models with 500K+ windows, and the whole block is prompt-cached. The
-/// truncation marker tells the agent to merge entries, and startup warns the
-/// user ([`prelude_truncation`]).
+/// models with 500K+ windows, and the whole block is prompt-cached.
+///
+/// It is an **enforced invariant**: the `prelude` tool refuses an edit that
+/// would exceed it, and startup refuses to run against a prelude already over
+/// it ([`prelude_oversize`]). Both gates exist because the prompt cannot carry
+/// a partial prelude honestly — a shortened one reads, from inside the prompt,
+/// like knowledge that was never recorded.
 pub const DEFAULT_MAX_PRELUDE_BYTES: usize = 256 * 1024;
 
 /// Backstop for injected project guidance (`AGENTS.md` / `CLAUDE.md`).
@@ -205,27 +209,30 @@ pub const DEFAULT_MAX_PRELUDE_BYTES: usize = 256 * 1024;
 /// the two together would surprise anyone who resizes it for the prelude.
 const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
 
-/// A rendered prelude that did not fit under the `max_prelude_bytes` cap. Losing
-/// the tail of the prelude is silent from inside the prompt, so this is surfaced
-/// two ways: a marker in the prompt itself and a startup WARNING for the user.
+/// A rendered prelude that does not fit under the `max_prelude_bytes` cap.
+///
+/// Startup refuses to run in this state: the prelude is what every agent
+/// treats as known-without-checking, so shortening it to fit would have agents
+/// act on a partial picture with no way to notice. The only fixes are the
+/// user's — prune entries or raise the cap — so myco stops and says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreludeTruncation {
+pub struct PreludeOversize {
     /// How many entries the prelude held on disk.
     pub entries: usize,
     /// Size of the full rendered prelude body.
     pub bytes: usize,
-    /// The `max_prelude_bytes` cap it was cut to.
+    /// The `max_prelude_bytes` cap it exceeded.
     pub limit: usize,
 }
 
-impl PreludeTruncation {
-    /// One line naming the cut, shared by the in-prompt marker and the
-    /// startup warning so both report the same numbers.
+impl PreludeOversize {
+    /// One line naming the overrun, in the sizes a human reads.
     pub fn describe(&self) -> String {
         format!(
-            "prelude truncated at {} of {} (max_prelude_bytes)",
+            "prelude is {} across {} entries, over the {} max_prelude_bytes cap",
+            human_bytes(self.bytes),
+            self.entries,
             self.human_limit(),
-            human_bytes(self.bytes)
         )
     }
 
@@ -254,20 +261,26 @@ fn human_bytes(n: usize) -> String {
 /// workspace, when present. Read at model build time — session start, model
 /// switch, each worker spawn — so a running agent's prompt never changes
 /// mid-conversation and the cached conversation prefix stays valid.
-pub fn agent_prompt_epilogue(max_prelude_bytes: usize) -> String {
-    epilogue_with(
-        crate::core::myco_home().ok(),
-        std::env::current_dir().ok(),
-        max_prelude_bytes,
-    )
+pub fn agent_prompt_epilogue() -> String {
+    epilogue_with(crate::core::myco_home().ok(), std::env::current_dir().ok())
 }
 
-/// Whether the prelude the next agent prompt will carry is cut short by the
-/// `max_prelude_bytes` cap. Startup calls this to warn before the first turn;
-/// `None` means the prelude fits (or there is none).
-pub fn prelude_truncation(max_prelude_bytes: usize) -> Option<PreludeTruncation> {
-    let dir = crate::prelude::dir().ok()?;
-    capped_prelude(&dir, max_prelude_bytes)?.1
+/// Whether the prelude on disk is over the `max_prelude_bytes` cap. Startup
+/// calls this and refuses to run when it is `Some`; `None` means the prelude
+/// fits (or there is none).
+pub fn prelude_oversize(max_prelude_bytes: usize) -> Option<PreludeOversize> {
+    oversize_at(&crate::prelude::dir().ok()?, max_prelude_bytes)
+}
+
+/// [`prelude_oversize`] against an explicit directory.
+fn oversize_at(dir: &std::path::Path, max_bytes: usize) -> Option<PreludeOversize> {
+    let entries = crate::prelude::entries(dir);
+    let bytes = crate::prelude::rendered_body(&entries).len();
+    (bytes > max_bytes).then_some(PreludeOversize {
+        entries: entries.len(),
+        bytes,
+        limit: max_bytes,
+    })
 }
 
 /// Project guidance for the launch directory: `AGENTS.md` (preferred) or
@@ -285,29 +298,18 @@ fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
     None
 }
 
-/// The prelude as it goes into a prompt: every entry's rendered body cut to
-/// `max_bytes` (on a char boundary, with a marker naming the cut), and the
-/// truncation record when the entries on disk did not fit.
-fn capped_prelude(
-    dir: &std::path::Path,
-    max_bytes: usize,
-) -> Option<(String, Option<PreludeTruncation>)> {
+/// The prelude as it goes into a prompt: every entry, whole. `None` when
+/// there is nothing recorded.
+///
+/// Renders whatever is on disk. `max_prelude_bytes` is enforced where it can
+/// still be acted on — the `prelude` tool refuses an oversized edit, startup
+/// refuses an oversized directory — so by the time a prompt is built the
+/// invariant holds. The one way past both gates is another process growing the
+/// prelude mid-session; rendering that in full keeps the failure visible, and
+/// the next startup reports it.
+fn rendered_prelude(dir: &std::path::Path) -> Option<String> {
     let entries = crate::prelude::entries(dir);
-    if entries.is_empty() {
-        return None;
-    }
-    let mut body = crate::prelude::rendered_body(&entries);
-    let cut = PreludeTruncation {
-        entries: entries.len(),
-        bytes: body.len(),
-        limit: max_bytes,
-    };
-    let marker = format!(
-        "\n\n[{} — merge entries with the `prelude` tool; move cold material to workspace files]",
-        cut.describe()
-    );
-    let truncated = cap_bytes(&mut body, max_bytes, &marker);
-    Some((body, truncated.then_some(cut)))
+    (!entries.is_empty()).then(|| crate::prelude::rendered_body(&entries))
 }
 
 /// Truncate to `max` bytes on a char boundary, appending `marker` when cut.
@@ -339,11 +341,7 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 /// Hence the prelude sits *after* project guidance: recording a finding must
 /// not invalidate the cached guidance block (up to `MAX_GUIDANCE_BYTES`) for
 /// every agent that follows.
-fn epilogue_with(
-    home: Option<std::path::PathBuf>,
-    cwd: Option<std::path::PathBuf>,
-    max_prelude_bytes: usize,
-) -> String {
+fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
     if let Some(home) = home.as_deref() {
         prompt.push_str(&manual_section(&crate::manual::dir(home)));
@@ -361,8 +359,8 @@ fn epilogue_with(
     }
     let prelude = workspace
         .as_deref()
-        .and_then(|ws| capped_prelude(&ws.join("prelude"), max_prelude_bytes));
-    if let Some((prelude, _)) = prelude {
+        .and_then(|ws| rendered_prelude(&ws.join("prelude")));
+    if let Some(prelude) = prelude {
         prompt.push_str(&format!(
             "\n---\n\n# Prelude\n\n(entries under `~/.myco/workspace/prelude/`, a snapshot from when \
              this agent's model was built — edit with the `prelude` tool; action=list shows the \
@@ -615,7 +613,7 @@ mod tests {
     fn project_guidance_is_appended_from_cwd() {
         let cwd = temp_dir("guidance");
         let dir = cwd.path().to_path_buf();
-        let epilogue = || epilogue_with(None, Some(dir.clone()), DEFAULT_MAX_PRELUDE_BYTES);
+        let epilogue = || epilogue_with(None, Some(dir.clone()));
 
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
@@ -645,14 +643,14 @@ mod tests {
     fn manual_path_in_the_prompt_follows_myco_home() {
         let home =
             std::env::temp_dir().join(format!("myco-manual-prompt-{}", uuid::Uuid::new_v4()));
-        let prompt = epilogue_with(Some(home.clone()), None, DEFAULT_MAX_PRELUDE_BYTES);
+        let prompt = epilogue_with(Some(home.clone()), None);
         let dir = crate::manual::dir(&home);
         assert!(prompt.contains("# Manual"), "{prompt}");
         assert!(prompt.contains(&dir.display().to_string()), "{prompt}");
         assert!(prompt.contains("index.md"), "{prompt}");
 
         // No home to resolve: no path claimed rather than a guessed one.
-        let blind = epilogue_with(None, None, DEFAULT_MAX_PRELUDE_BYTES);
+        let blind = epilogue_with(None, None);
         assert!(!blind.contains("# Manual"), "{blind}");
     }
 
@@ -735,7 +733,7 @@ mod tests {
         // guessing at one.
         assert!(!stamp_with(id, started_at, None).contains("Launch directory"));
 
-        let prompt = epilogue_with(None, None, DEFAULT_MAX_PRELUDE_BYTES);
+        let prompt = epilogue_with(None, None);
         assert!(!prompt.contains(id), "{prompt}");
         // The epilogue points agents at the stamp instead of a tool call.
         assert!(prompt.contains("newest `# Session` block"), "{prompt}");
@@ -746,7 +744,7 @@ mod tests {
         let home = prelude_home("prelude");
         let dir = home.path().to_path_buf();
         let prelude_dir = dir.join("workspace").join("prelude");
-        let epilogue = || epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_PRELUDE_BYTES);
+        let epilogue = || epilogue_with(Some(dir.clone()), None);
 
         // No entries: the epilogue plus the unconditional Manual block, and
         // nothing else.
@@ -809,77 +807,74 @@ mod tests {
         }
         assert_eq!(epilogue(), base);
 
-        // An oversized prelude is truncated with a visible marker, keeping the
-        // prompt bounded no matter what got written.
-        std::fs::write(
-            prelude_dir.join("20290101T0000-dddd.md"),
-            "x".repeat(DEFAULT_MAX_PRELUDE_BYTES * 2),
-        )
-        .unwrap();
+        // Rendering never trims, whatever is on disk: the cap is enforced at
+        // the edit and at startup, so a prompt built here carries every byte
+        // rather than a silently shortened prelude.
+        let huge = "x".repeat(DEFAULT_MAX_PRELUDE_BYTES * 2);
+        std::fs::write(prelude_dir.join("20290101T0000-dddd.md"), &huge).unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("[prelude truncated at 256 KiB"), "{prompt}");
-        // `base` (not the bare const): since #98 the epilogue also carries the
-        // unconditional Manual block naming the exported directory.
-        assert!(prompt.len() < base.len() + DEFAULT_MAX_PRELUDE_BYTES + 400);
+        assert!(
+            prompt.contains(&huge),
+            "oversized entry should render whole"
+        );
+        assert!(!prompt.contains("truncated"), "nothing should be trimmed");
     }
 
+    /// The cap is a startup gate, not a render-time clamp: `prelude_oversize`
+    /// reports what is on disk, and the configured limit is what it is
+    /// measured against.
     #[test]
-    fn the_cap_is_configurable_and_reports_what_it_cut() {
+    fn the_cap_is_configurable_and_reports_the_overrun() {
         let home = prelude_home("prelude-cap");
         let prelude_dir = home.path().join("workspace").join("prelude");
-        // Multi-byte body: the cut must land on a char boundary, never mid-char.
         let body = "é".repeat(1000);
         std::fs::write(prelude_dir.join("20260101T0000-aaaa.md"), &body).unwrap();
         // 38 bytes of `[prelude entry …]\n` label precede the 2000-byte body.
         let rendered_len = 38 + 2000;
 
-        // A cap above the rendered size leaves the prelude verbatim and unreported.
-        let (text, cut) = capped_prelude(&prelude_dir, DEFAULT_MAX_PRELUDE_BYTES).unwrap();
-        assert_eq!(
-            text,
-            format!("[prelude entry 20260101T0000-aaaa.md]\n{body}")
-        );
-        assert_eq!(cut, None);
+        // A cap above the rendered size: nothing to report.
+        assert_eq!(oversize_at(&prelude_dir, DEFAULT_MAX_PRELUDE_BYTES), None);
+        // Exactly at the cap is still fine — only past it is a problem.
+        assert_eq!(oversize_at(&prelude_dir, rendered_len), None);
 
         // A tighter cap from config.toml applies instead of the default.
-        let (text, cut) = capped_prelude(&prelude_dir, 503).unwrap();
-        let cut = cut.expect("503 < rendered size should truncate");
-        assert_eq!((cut.entries, cut.bytes, cut.limit), (1, rendered_len, 503));
-        // 503 is mid-`é`, so the text is cut back to 502 plus the marker.
-        assert!(
-            text.starts_with(&format!(
-                "[prelude entry 20260101T0000-aaaa.md]\n{}",
-                "é".repeat(232)
-            )),
-            "{text}"
+        let over = oversize_at(&prelude_dir, 503).expect("503 < rendered size is over the cap");
+        assert_eq!(
+            (over.entries, over.bytes, over.limit),
+            (1, rendered_len, 503)
         );
         assert!(
-            text.contains("[prelude truncated at 503 B of 2 KiB"),
-            "{text}"
+            over.describe()
+                .contains("prelude is 2 KiB across 1 entries, over the 503 B max_prelude_bytes"),
+            "{}",
+            over.describe()
         );
-        assert!(
-            text.contains("merge entries with the `prelude` tool"),
-            "{text}"
+
+        // Rendering is unaffected by the cap: the body comes back whole.
+        let rendered = rendered_prelude(&prelude_dir).expect("entries render");
+        assert_eq!(
+            rendered,
+            format!("[prelude entry 20260101T0000-aaaa.md]\n{body}")
         );
     }
 
+    /// The two injected user-supplied blocks are bounded independently, and
+    /// only one of them is bounded by trimming: `AGENTS.md` is not something
+    /// myco can refuse to start over, so it is cut with a marker, while the
+    /// prelude renders whole and is policed at the edit and at startup.
     #[test]
-    fn lowering_the_prelude_cap_leaves_project_guidance_alone() {
-        // `max_prelude_bytes` is named for the prelude; shrinking it to shorten a
-        // prelude must not silently start cutting AGENTS.md too.
+    fn project_guidance_is_capped_by_trimming_and_the_prelude_is_not() {
         let home = prelude_home("both");
         let dir = home.path().to_path_buf();
         let prelude_dir = dir.join("workspace").join("prelude");
-        std::fs::write(prelude_dir.join("20260101T0000-aaaa.md"), "s".repeat(4000)).unwrap();
-        std::fs::write(dir.join("AGENTS.md"), "g".repeat(4000)).unwrap();
+        let long_entry = "s".repeat(MAX_GUIDANCE_BYTES * 2);
+        std::fs::write(prelude_dir.join("20260101T0000-aaaa.md"), &long_entry).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "g".repeat(MAX_GUIDANCE_BYTES * 2)).unwrap();
 
-        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()), 1024);
-        assert!(
-            prompt.contains("[prelude truncated at 1 KiB of 3.9 KiB"),
-            "{prompt}"
-        );
-        assert!(!prompt.contains("[project guidance truncated"), "{prompt}");
-        assert!(prompt.contains(&"g".repeat(4000)), "{prompt}");
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()));
+        assert!(prompt.contains("[project guidance truncated"), "{prompt}");
+        assert!(prompt.contains(&long_entry), "prelude should render whole");
+        assert!(!prompt.contains("[prelude truncated"), "{}", prompt.len());
     }
 
     #[test]
@@ -905,11 +900,7 @@ mod tests {
         std::fs::write(workspace.join("index.bin"), b"\x00\x01binary_token\n").unwrap();
         std::fs::write(dir.join("AGENTS.md"), "agents_guidance_token\n").unwrap();
 
-        let prompt = epilogue_with(
-            Some(dir.clone()),
-            Some(dir.clone()),
-            DEFAULT_MAX_PRELUDE_BYTES,
-        );
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()));
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
         // Least volatile first, so a write to one block never invalidates a
@@ -972,11 +963,7 @@ mod tests {
             std::fs::write(workspace.join(format!("n-{i:03}.md")), "# t\n").unwrap();
         }
 
-        let prompt = epilogue_with(
-            Some(home.path().to_path_buf()),
-            None,
-            DEFAULT_MAX_PRELUDE_BYTES,
-        );
+        let prompt = epilogue_with(Some(home.path().to_path_buf()), None);
         assert!(
             prompt.contains(&format!("[at least {overflow} more file(s) not listed")),
             "{prompt}"
