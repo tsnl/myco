@@ -18,6 +18,9 @@ pub struct OpenAIBackendConfig {
     pub auth_token: String,
     pub max_output_tokens: Option<usize>,
     pub debug_dump_api_requests: bool,
+    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
+    #[serde(default)]
+    pub retry: RetryPolicy,
     /// When set, request provider reasoning at this effort.
     ///
     /// Sent as `reasoning.effort` (Responses) or `reasoning_effort` (Chat
@@ -35,6 +38,7 @@ impl Default for OpenAIBackendConfig {
             auth_token: String::new(),
             max_output_tokens: Some(8192),
             debug_dump_api_requests: false,
+            retry: RetryPolicy::default(),
             effort: Some(Effort::DEFAULT),
         }
     }

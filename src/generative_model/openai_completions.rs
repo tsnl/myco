@@ -104,6 +104,7 @@ impl GenerativeModel for OpenAICompletionsGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Chat Completions",
             self.backend.debug_dump_api_requests,
+            self.backend.retry,
         )
     }
 }

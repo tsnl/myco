@@ -85,6 +85,11 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [ ] **Auto-compact** when approaching the context limit (threshold config).
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
+- [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`
+      (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `backoff_multiplier`),
+      applied in the drivers ahead of the stream, honouring `Retry-After`. Only
+      pre-stream failures (connection, 408, 429, 5xx) retry; deterministic statuses and
+      mid-stream failures still surface immediately.
 - [ ] **Token + cost tracking**
   - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
     and session totals.

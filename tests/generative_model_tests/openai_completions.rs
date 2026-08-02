@@ -1,7 +1,7 @@
 use super::*;
 use myco::generative_model::{
     BackendConfig, GenerateError, GenerativeModelConfig, ModelSpec, OpenAIBackendConfig, Protocol,
-    ThinkingMode, ToolSpec,
+    RetryPolicy, ThinkingMode, ToolSpec,
 };
 
 use crate::test_utils::StubHttpServer;
@@ -52,6 +52,50 @@ fn stub_model(base_url: &str, tools: Vec<ToolSpec>) -> std::sync::Arc<dyn Genera
         }),
     })
     .expect("create stub-backed model")
+}
+
+/// [`stub_model`] with an explicit retry policy. The sub-millisecond backoff
+/// keeps retry tests instant while still exercising the real wait path.
+fn stub_model_with_retry(
+    base_url: &str,
+    retry: RetryPolicy,
+) -> std::sync::Arc<dyn GenerativeModel> {
+    myco::generative_model::new(GenerativeModelConfig {
+        model: ModelSpec {
+            key: "local".into(),
+            api_id: "test-model".into(),
+            protocol: Protocol::OpenAICompletions,
+            thinking: ThinkingMode::None,
+            context_window_tokens: 4096,
+            max_image_base64_bytes: myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            max_truncated_resumes: 3,
+        },
+        tools: Vec::new(),
+        system_prompt: "Answer in one word.".into(),
+        backend_config: BackendConfig::OpenAICompletions(OpenAIBackendConfig {
+            base_url: format!("{base_url}/v1"),
+            max_output_tokens: Some(32),
+            retry,
+            ..Default::default()
+        }),
+    })
+    .expect("create stub-backed model")
+}
+
+fn fast_retry(max_attempts: u32) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        initial_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(5),
+        backoff_multiplier: 2.0,
+    }
+}
+
+fn ok_sse_response() -> Vec<u8> {
+    StubHttpServer::sse_response(vec![
+        serde_json::json!({"choices": [{"index": 0, "delta": {"content": "OK"}}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+    ])
 }
 
 fn user_turn(text: &str) -> Vec<Message> {
@@ -166,4 +210,88 @@ async fn wire_http_error_body_reaches_the_caller() {
         }
         other => panic!("expected ExecutionError, got {other:?}"),
     }
+}
+
+//
+// Retry. Overnight runs die on a single provider blip without these, so the
+// wire behaviour — how many attempts actually leave the client, and for which
+// statuses — is worth pinning against a real socket.
+//
+
+/// A 503 then a 529 (Anthropic's overloaded) then success: the caller sees only
+/// the successful turn, and three requests reached the server.
+#[tokio::test]
+async fn wire_retries_transient_statuses_then_succeeds() {
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":"service unavailable"}"#),
+        StubHttpServer::status_response(529, r#"{"error":{"type":"overloaded_error"}}"#),
+        ok_sse_response(),
+    ])
+    .await;
+
+    let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
+    let output = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+        .await
+        .expect("third attempt succeeds");
+
+    match output.content.as_slice() {
+        [Content::Text { text }] => assert_eq!(text, "OK"),
+        other => panic!("expected one text block, got {other:?}"),
+    }
+    assert_eq!(server.connections(), 3, "two retries then the success");
+}
+
+/// A deterministic status is never retried: resending a malformed request only
+/// delays the error the user needs to see.
+#[tokio::test]
+async fn wire_does_not_retry_a_client_error() {
+    let server = StubHttpServer::sequence(vec![StubHttpServer::status_response(
+        400,
+        r#"{"error":"bad request"}"#,
+    )])
+    .await;
+
+    let model = stub_model_with_retry(&server.base_url(), fast_retry(5));
+    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+        .await
+        .expect_err("HTTP 400 is an error");
+
+    assert_eq!(server.connections(), 1, "400 must not be retried");
+}
+
+/// Retry is bounded: a provider that is down stays down, and the turn has to
+/// end with the error rather than looping.
+#[tokio::test]
+async fn wire_gives_up_after_max_attempts() {
+    let down = || StubHttpServer::status_response(503, r#"{"error":"down"}"#);
+    let server = StubHttpServer::sequence(vec![down(), down(), down(), down()]).await;
+
+    let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
+    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+        .await
+        .expect_err("all attempts fail");
+
+    match error {
+        GenerateError::ExecutionError(message) => assert!(message.contains("503"), "{message}"),
+        other => panic!("expected ExecutionError, got {other:?}"),
+    }
+    // Exactly max_attempts — the fourth canned response is never collected.
+    assert_eq!(server.connections(), 3);
+}
+
+/// `max_attempts = 1` is the opt-out.
+#[tokio::test]
+async fn wire_retry_can_be_disabled() {
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":"down"}"#),
+        ok_sse_response(),
+    ])
+    .await;
+
+    let model = stub_model_with_retry(&server.base_url(), fast_retry(1));
+    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+        .await
+        .expect_err("no retry, so the 503 surfaces");
+
+    assert_eq!(server.connections(), 1);
 }

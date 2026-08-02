@@ -112,6 +112,12 @@ auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 protocol = "openai-completions"        # requests go to {base_url}/chat/completions
 base_url = "http://localhost:11434/v1"
 
+[gateways.anthropic.retry]             # optional; per gateway
+max_attempts = 5                       # total tries, including the first
+initial_backoff_ms = 500
+max_backoff_ms = 60_000
+backoff_multiplier = 2.0
+
 [models.claude-opus-4-8]
 gateway = "anthropic"
 context_window = 1_000_000             # required on every model
@@ -167,6 +173,20 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
+**Retry** is per gateway — what is being tuned is one endpoint's tolerance for
+blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
+`max_attempts` (default 3, counting the first; `1` disables), `initial_backoff_ms`
+(500), `max_backoff_ms` (30 000), `backoff_multiplier` (2.0). Each unset field
+keeps its default, so setting one knob does not reset the others. A model entry
+may carry its own `[models.KEY.retry]` — the only way for a gateway-less model to
+configure retry — and, like `auth`, it replaces the gateway's table rather than
+merging with it. Only failures that happen *before* any of the response has
+streamed are retried (connection errors, 408, 429, and 5xx including Anthropic's
+529); a 400, a 401 or a 413 fails the same way however often it is sent, so it
+surfaces immediately. A failure mid-stream is never retried either, because the
+already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
+is honoured when it asks for longer than the computed backoff, still bounded by
+`max_backoff_ms`.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

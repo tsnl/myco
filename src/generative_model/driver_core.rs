@@ -88,6 +88,7 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     acc: A,
     provider: &'static str,
     debug_dump_api_requests: bool,
+    retry: RetryPolicy,
 ) -> AsyncStream<Result<MessagePart, GenerateError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
 
@@ -107,11 +108,15 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
                 }
                 check_request_size(body.len(), provider)?;
             }
-            let response = client
-                .execute(request)
-                .await
-                .map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-            let response = check_status(response, provider).await?;
+            let response = send_with_retry(
+                &client,
+                request,
+                provider,
+                retry,
+                &tx,
+                debug_dump_api_requests,
+            )
+            .await?;
             drive_sse_stream(response, &tx, acc, provider).await
         }
         .await;
@@ -125,26 +130,118 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     }))
 }
 
-/// Map a non-success HTTP status to an error carrying the response body
-/// (providers put the actionable detail in a JSON body, not the status line).
-/// A size rejection keeps its own variant so the caller rewinds rather than
-/// retrying a request that can only fail again.
-async fn check_status(
-    response: reqwest::Response,
+/// How one send attempt ended.
+enum Attempt {
+    Ok(reqwest::Response),
+    /// Might succeed if sent again; carries the provider's `Retry-After` when
+    /// it named one.
+    Transient(GenerateError, Option<std::time::Duration>),
+    /// Deterministic — the identical request fails the identical way.
+    Fatal(GenerateError),
+}
+
+/// Send, retrying transient failures per `retry`.
+///
+/// Retry lives here, ahead of [`drive_sse_stream`], because this is the last
+/// point at which nothing has reached the consumer yet. A failure *during* the
+/// stream cannot be retried: parts already emitted would be replayed as
+/// duplicates, so those still surface to the agent as a turn-ending error.
+async fn send_with_retry(
+    client: &reqwest::Client,
+    request: reqwest::Request,
     provider: &str,
+    retry: RetryPolicy,
+    tx: &tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
+    debug: bool,
 ) -> Result<reqwest::Response, GenerateError> {
+    let mut attempt: u32 = 1;
+    loop {
+        // A body reqwest cannot clone cannot be replayed either; send the
+        // original and report whatever it gives.
+        let Some(this_attempt) = request.try_clone() else {
+            return match attempt_send(client, request, provider).await {
+                Attempt::Ok(response) => Ok(response),
+                Attempt::Transient(e, _) | Attempt::Fatal(e) => Err(e),
+            };
+        };
+
+        let (error, retry_after) = match attempt_send(client, this_attempt, provider).await {
+            Attempt::Ok(response) => return Ok(response),
+            Attempt::Fatal(e) => return Err(e),
+            Attempt::Transient(e, retry_after) => (e, retry_after),
+        };
+
+        if attempt >= retry.max_attempts {
+            return Err(error);
+        }
+        let wait = retry.backoff(attempt + 1, retry_after);
+        if debug {
+            eprintln!(
+                "{provider}: attempt {attempt}/{} failed ({error}); retrying in {wait:?}",
+                retry.max_attempts
+            );
+        }
+        // Ctrl-C during a long backoff drops the consumer; notice that instead
+        // of sleeping the wait out before the turn can end.
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tx.closed() => return Err(error),
+        }
+        attempt += 1;
+    }
+}
+
+/// One send. A non-success status is mapped to an error carrying the response
+/// body (providers put the actionable detail in a JSON body, not the status
+/// line); a size rejection keeps its own variant so the caller rewinds rather
+/// than resending a request that can only fail again.
+async fn attempt_send(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    provider: &str,
+) -> Attempt {
+    let response = match client.execute(request).await {
+        Ok(response) => response,
+        // Transport-level: DNS, connect, TLS, idle timeout. Nothing about the
+        // request is known to be at fault, so another attempt is worthwhile.
+        Err(e) => return Attempt::Transient(GenerateError::ExecutionError(format!("{e:?}")), None),
+    };
     if response.status().is_success() {
-        return Ok(response);
+        return Attempt::Ok(response);
     }
     let status = response.status();
+    let retry_after = parse_retry_after(response.headers());
     let body = response
         .text()
         .await
         .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-    Err(http_error(
+    let error = http_error(
         status,
         format!("{provider} API returned HTTP {status}: {body}"),
-    ))
+    );
+    if is_transient_status(status) {
+        Attempt::Transient(error, retry_after)
+    } else {
+        Attempt::Fatal(error)
+    }
+}
+
+/// Statuses worth another attempt: the provider is rate-limiting, overloaded
+/// (Anthropic's 529 lands in 5xx), or briefly broken. Everything else — 400
+/// malformed, 401 auth, 413 too large — fails identically however often it is
+/// sent, and retrying only delays the error the user needs to see.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// `Retry-After` in delta-seconds. The HTTP-date form is deliberately not
+/// parsed: providers send seconds, and falling back to the computed backoff is
+/// better than acting on a misread date.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    Some(std::time::Duration::from_secs(raw.trim().parse().ok()?))
 }
 
 async fn drive_sse_stream<A: SseAccumulator>(
