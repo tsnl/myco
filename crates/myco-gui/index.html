@@ -2,40 +2,111 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>myco</title>
     <style>
-      :root { color-scheme: dark; }
+      :root {
+        color-scheme: dark;
+        /* Terminal palette, darkest to lightest. */
+        --bg: #101010;
+        --bg-raised: #161616;
+        --line: #333;
+        --line-soft: #2c2c2c;
+        --fg: #d8d8d8;
+        --fg-dim: #777;
+        --user: #6fc26f;
+        --tool: #b09be5;
+        --err: #e07a7a;
+        --link: #7ab7ff;
+        /* Only the transcript scrolls: no page-level bounce or overscroll. */
+        height: 100svh;
+        overflow: hidden;
+        overscroll-behavior: none;
+      }
       * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body {
-        background: #101010; color: #d8d8d8;
+        margin: 0;
+        background: var(--bg); color: var(--fg);
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
         font-size: 14px; line-height: 1.45;
-        max-width: 84ch; margin: 0 auto; padding: 1rem;
+        overflow: hidden;
       }
-      a { color: #7ab7ff; text-decoration: none; }
+      a { color: var(--link); text-decoration: none; }
       a:hover { text-decoration: underline; }
       pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
-      ul { list-style: none; padding: 0; margin: 0.5rem 0; }
-      li { margin: 0.1rem 0; }
-      h1 { font-size: 1rem; letter-spacing: 0.3em; }
+      h1 { font-size: 1rem; letter-spacing: 0.3em; margin: 0 0 0.5rem; }
       button {
-        background: #101010; color: #d8d8d8; font: inherit;
+        background: #101010; color: var(--fg); font: inherit;
         border: 1px solid #444; padding: 0.15rem 0.7rem; cursor: pointer;
       }
       button:hover { border-color: #888; }
-      textarea {
-        width: 100%; background: #161616; color: #d8d8d8; font: inherit;
-        border: 1px solid #444; padding: 0.4rem; resize: vertical;
+
+      /* Terminal layout: a scrolling transcript with the prompt pinned below. */
+      .app { display: flex; flex-direction: column; height: 100dvh; min-height: 0; }
+      .topbar {
+        flex: none; padding: 0.5rem 1rem; border-bottom: 1px solid var(--line);
       }
-      .rule-user { color: #6fc26f; }
-      .rule { border: 0; border-top: 1px solid #333; margin: 0.6rem 0 0.3rem; }
+      .pane {
+        /* flex child: `min-height: 0` is what makes this scroll instead of
+           growing and pushing the composer off-screen. */
+        flex: 1 1 auto; min-height: 0;
+        overflow-y: auto; overflow-x: hidden;
+        padding: 0.5rem 1rem 1rem;
+      }
+      .pane > * { max-width: 84ch; }
+      .composer {
+        flex: none; border-top: 1px solid var(--line); padding: 0.5rem 1rem;
+        display: flex; gap: 0.5rem; align-items: flex-start;
+      }
+      .composer textarea {
+        flex: 1 1 auto; max-width: 84ch; background: var(--bg-raised); color: #d8d8d8;
+        font: inherit; border: 1px solid #444; padding: 0.4rem; resize: vertical;
+      }
+      .actions { display: flex; flex-direction: column; gap: 0.3rem; }
+
+      /* Session browser */
+      .browser { padding: 1rem; max-width: 84ch; margin: 0 auto; }
+      .browser ul { list-style: none; padding: 0; margin: 0.5rem 0; }
+      .browser li { margin: 0.1rem 0; }
+
+      /* Transcript roles — the terminal's palette */
+      .rule { border: 0; border-top: 1px solid var(--line); margin: 0.8rem 0 0.3rem; }
       .role { font-weight: bold; }
-      .role-user { color: #6fc26f; }
+      .role-user { color: var(--user); }
       .role-assistant { color: #d8d8d8; }
-      .role-thinking { color: #777; font-style: italic; }
-      .role-tool { color: #b09be5; }
-      .err { color: #e07a7a; }
-      .dim { color: #777; }
+      .role-thinking { color: var(--fg-dim); font-style: italic; }
+      .role-tool { color: var(--tool); }
+      .err { color: var(--err); }
+      .dim { color: var(--fg-dim); }
+
+      /* Rendered markdown, kept flat and terminal-ish */
+      .md > *:first-child { margin-top: 0; }
+      .md > *:last-child { margin-bottom: 0; }
+      .md p, .md ul, .md ol, .md blockquote, .md pre { margin: 0.4rem 0; }
+      .md h1, .md h2, .md h3, .md h4 {
+        font-size: 1rem; margin: 0.8rem 0 0.3rem; color: #fff;
+      }
+      .md h1::before { content: "# "; color: #666; }
+      .md h2::before { content: "## "; color: #666; }
+      .md h3::before { content: "### "; color: #666; }
+      .md code {
+        background: #1c1c1c; border: 1px solid var(--line-soft); padding: 0 0.2em;
+      }
+      .md pre {
+        background: var(--bg-raised); border: 1px solid var(--line-soft); padding: 0.5rem;
+        overflow-x: auto;
+      }
+      .md pre code { background: none; border: 0; padding: 0; }
+      .md blockquote {
+        border-left: 2px solid #444; margin-left: 0; padding-left: 0.8rem;
+        color: #aaa;
+      }
+      .md ul, .md ol { padding-left: 1.4rem; }
+      .md table { border-collapse: collapse; }
+      .md th, .md td { border: 1px solid #333; padding: 0.1rem 0.5rem; }
+      .md a { color: var(--link); }
+      .md img { max-width: 100%; }
     </style>
   </head>
   <body></body>
