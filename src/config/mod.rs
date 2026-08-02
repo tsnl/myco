@@ -486,6 +486,22 @@ fn resolve_catalog(
             },
         };
 
+        // A fraction of *this* model's window, turned into a token count once
+        // here so the REPL compares plain numbers and a bad value is caught at
+        // startup rather than hours into an unattended run.
+        let auto_compact_at_tokens = match entry.auto_compact_at {
+            None => None,
+            Some(fraction) if fraction > 0.0 && fraction < 1.0 => {
+                Some((entry.context_window as f64 * fraction) as u64)
+            }
+            Some(fraction) => {
+                return Err(format!(
+                    "model `{key}`: auto_compact_at must be greater than 0 and less than 1 \
+                     (got {fraction})"
+                ));
+            }
+        };
+
         let spec = ModelSpec {
             key: key.clone(),
             api_id: entry.api_id.clone().unwrap_or_else(|| key.clone()),
@@ -498,6 +514,7 @@ fn resolve_catalog(
             max_truncated_resumes: entry
                 .max_truncated_resumes
                 .unwrap_or(DEFAULT_MAX_TRUNCATED_RESUMES),
+            auto_compact_at_tokens,
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)));
@@ -1008,6 +1025,7 @@ context_window = 500_000
 [models.claude-opus-4-8]
 gateway = "anthropic"
 context_window = 1_000_000
+auto_compact_at = 0.8
 
 [models.qwen-local]
 protocol = "openai-completions"
@@ -1024,6 +1042,13 @@ context_window = 32_768
         assert_eq!(cfg.model, "grok-4.5-build");
         assert!(cfg.models.get("grok-4.5-build").is_ok());
         assert!(cfg.models.get("qwen-local").is_ok());
+        assert_eq!(
+            cfg.models
+                .spec("claude-opus-4-8")
+                .unwrap()
+                .auto_compact_at_tokens,
+            Some(800_000)
+        );
         // Anthropic entries resolve but defer their missing credential.
         let err = cfg.models.get("claude-opus-4-8").unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
@@ -1185,6 +1210,52 @@ max_attempts = 0
         match &cfg.models.get("x").unwrap().backend {
             BackendConfig::OpenAIResponses(b) => assert_eq!(b.retry.max_attempts, 1),
             other => panic!("unexpected backend {other:?}"),
+        }
+    }
+
+    /// The fraction is resolved against *this* model's window, once, so the
+    /// REPL compares plain token counts.
+    #[test]
+    fn auto_compact_fraction_becomes_a_token_threshold() {
+        let toml_text = r#"
+model = "capped"
+
+[models.capped]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 200_000
+auto_compact_at = 0.8
+
+[models.stock]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 200_000
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.models.spec("capped").unwrap().auto_compact_at_tokens,
+            Some(160_000)
+        );
+        // Unset → no auto-compaction; `/compact` still works.
+        assert_eq!(
+            cfg.models.spec("stock").unwrap().auto_compact_at_tokens,
+            None
+        );
+    }
+
+    /// A fraction outside (0, 1) is caught at startup rather than hours into an
+    /// unattended run — 1.0 would only fire once the window is already full.
+    #[test]
+    fn auto_compact_fraction_out_of_range_is_a_resolve_error() {
+        for bad in ["0.0", "1.0", "1.5", "-0.2"] {
+            let toml_text = format!(
+                "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                 context_window = 1000\nauto_compact_at = {bad}\n"
+            );
+            let err =
+                resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+            assert!(err.contains("auto_compact_at"), "{bad}: {err}");
+            assert!(err.contains("model `x`"), "{bad}: {err}");
         }
     }
 

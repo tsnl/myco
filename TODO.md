@@ -82,7 +82,11 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [x] **Compaction (manual)** — `/compact` runs a hidden compact-worker agent over the
       session (`session_history` tool), writes `{id}.summary.md`, and seeds a linked
       successor session with the summary + a well-formed recent tail. Ctrl-C cancels it.
-- [ ] **Auto-compact** when approaching the context limit (threshold config).
+- [x] **Auto-compact** when approaching the context limit — per-model
+      `auto_compact_at` fraction of `context_window`, checked after each turn against
+      the provider's reported prompt size. Runs the same worker as `/compact` and
+      switches the REPL to the successor. Unset = off; a failed automatic run disables
+      itself for the session rather than repeating every turn.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`

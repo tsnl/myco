@@ -121,6 +121,7 @@ backoff_multiplier = 2.0
 [models.claude-opus-4-8]
 gateway = "anthropic"
 context_window = 1_000_000             # required on every model
+auto_compact_at = 0.8                  # compact at 80% of the window
 
 [models.claude-haiku-4-5]
 gateway = "anthropic"
@@ -173,6 +174,16 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
+**Auto-compaction** is per model, because the trigger is a share of *that*
+model's window: `auto_compact_at = 0.8` compacts as soon as a turn's prompt
+reaches 80% of `context_window`, running exactly what `/compact` runs and
+switching the REPL to the successor. It must be greater than 0 and less than 1;
+anything else is a startup error. Unset (the default) means no automatic
+compaction — `/compact` still works. The check runs after each turn against the
+provider's own reported prompt size, so it acts on a measured number rather than
+an estimate; if an automatic compaction fails, it is not retried for the rest of
+that session (the note says so, and `/compact` remains available).
+
 **Retry** is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
 `max_attempts` (default 3, counting the first; `1` disables), `initial_backoff_ms`
