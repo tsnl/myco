@@ -57,6 +57,8 @@ register yourself in `~/.myco/v2/server.toml`:
 [[users]]
 id = "ada"            # matched against $MYCO_USER, then $USER
 name = "Ada Lovelace" # optional; defaults to the id
+token = "…"           # optional; required to reach the HTTP API
+                      # generate one with: openssl rand -hex 32
 ```
 
 Both the CLI and the server refuse to start without a roster that names the
@@ -75,8 +77,16 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `POST /api/sessions/<id>/messages`
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
-`DELETE /api/sessions/<id>/live` · `GET /api/models`. Wire types live in
-`crates/myco-api`.
+`DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami`.
+Wire types live in `crates/myco-api`.
+
+Every route requires `Authorization: Bearer <token>` naming a roster user;
+the entries a request writes are attributed to that user, not to whoever
+started the server. (`GET /sessions/<id>/events` also accepts `?token=`,
+since `EventSource` cannot set headers.) `--mode serve` exports
+`$MYCO_API_TOKEN` alongside `$MYCO_API` so tools the agent spawns can reach
+the API as the local operator. In the web GUI you paste your token once and
+it is kept in `localStorage`.
 
 ## Workspace
 

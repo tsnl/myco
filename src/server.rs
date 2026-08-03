@@ -699,9 +699,11 @@ impl Server {
     }
 }
 
-#[async_trait::async_trait]
-impl MycoApi for Server {
-    async fn list_sessions(
+/// The API surface, minus identity. [`UserApi`] binds a caller to these and
+/// is what implements [`MycoApi`] — so no route can reach the runtime without
+/// naming who is asking.
+impl Server {
+    pub(crate) async fn list_sessions(
         &self,
         include_archived: bool,
     ) -> Result<Vec<api::SessionSummary>, ApiError> {
@@ -726,7 +728,7 @@ impl MycoApi for Server {
         Ok(out)
     }
 
-    async fn create_session(
+    pub(crate) async fn create_session(
         &self,
         req: api::CreateSession,
     ) -> Result<api::SessionSummary, ApiError> {
@@ -753,7 +755,7 @@ impl MycoApi for Server {
         Ok(summary_of(&live.session.snapshot(), true, false))
     }
 
-    async fn session_detail(&self, id: &str) -> Result<api::SessionDetail, ApiError> {
+    pub(crate) async fn session_detail(&self, id: &str) -> Result<api::SessionDetail, ApiError> {
         let session = self.load_or_snapshot(id).await?;
         let (live, busy) = self.live_flags(&session.id).await;
         Ok(api::SessionDetail {
@@ -762,7 +764,7 @@ impl MycoApi for Server {
         })
     }
 
-    async fn update_session(
+    pub(crate) async fn update_session(
         &self,
         id: &str,
         req: api::UpdateSession,
@@ -803,7 +805,12 @@ impl MycoApi for Server {
         Ok(summary_of(&session, live, busy))
     }
 
-    async fn post_message(&self, id: &str, req: api::PostMessage) -> Result<api::Poll, ApiError> {
+    pub(crate) async fn post_message(
+        &self,
+        author: &Author,
+        id: &str,
+        req: api::PostMessage,
+    ) -> Result<api::Poll, ApiError> {
         if req.text.trim().is_empty() {
             return Err(ApiError::new(ErrorKind::BadRequest, "empty message"));
         }
@@ -813,7 +820,7 @@ impl MycoApi for Server {
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
         live.tx
             .send(Cmd::User {
-                author: local_author(&self.config),
+                author: author.clone(),
                 text: req.text.clone(),
             })
             .map_err(|_| internal("agent task gone".into()))?;
@@ -826,7 +833,7 @@ impl MycoApi for Server {
         })
     }
 
-    async fn poll(&self, id: &str, since: usize) -> Result<api::Poll, ApiError> {
+    pub(crate) async fn poll(&self, id: &str, since: usize) -> Result<api::Poll, ApiError> {
         let session = self.load_or_snapshot(id).await?;
         let (_, busy) = self.live_flags(&session.id).await;
         let last_error = match self.get_live(&session.id).await {
@@ -843,7 +850,7 @@ impl MycoApi for Server {
         })
     }
 
-    async fn events(&self, id: &str) -> Result<api::EventStream, ApiError> {
+    pub(crate) async fn events(&self, id: &str) -> Result<api::EventStream, ApiError> {
         let live = self
             .ensure_live(id, None)
             .await
@@ -861,7 +868,7 @@ impl MycoApi for Server {
         Ok(Box::pin(stream))
     }
 
-    async fn cancel(&self, id: &str) -> Result<api::Poll, ApiError> {
+    pub(crate) async fn cancel(&self, id: &str) -> Result<api::Poll, ApiError> {
         let live = self
             .get_live(id)
             .await
@@ -876,7 +883,7 @@ impl MycoApi for Server {
         })
     }
 
-    async fn compact(&self, id: &str) -> Result<api::Poll, ApiError> {
+    pub(crate) async fn compact(&self, id: &str) -> Result<api::Poll, ApiError> {
         let live = self
             .ensure_live(id, None)
             .await
@@ -892,7 +899,7 @@ impl MycoApi for Server {
         })
     }
 
-    async fn retire(&self, id: &str) -> Result<api::Poll, ApiError> {
+    pub(crate) async fn retire(&self, id: &str) -> Result<api::Poll, ApiError> {
         match self.retire_live(id).await {
             Some(_) => Ok(api::Poll {
                 busy: false,
@@ -904,7 +911,7 @@ impl MycoApi for Server {
         }
     }
 
-    async fn models(&self) -> Result<api::Models, ApiError> {
+    pub(crate) async fn models(&self) -> Result<api::Models, ApiError> {
         Ok(api::Models {
             models: self
                 .config()
@@ -915,5 +922,116 @@ impl MycoApi for Server {
                 .collect(),
             default_model: self.config().model.clone(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserApi
+// ---------------------------------------------------------------------------
+
+/// [`Server`] bound to one caller: the [`MycoApi`] implementation frontends
+/// actually hold.
+///
+/// Identity lives on the handle rather than on each call, which is what lets
+/// the trait stay identical across the in-process server and `HttpClient`.
+/// The web adapter mints one per authenticated request; the CLI mints one for
+/// the roster's local user at startup.
+#[derive(Clone)]
+pub struct UserApi {
+    server: Arc<Server>,
+    author: Author,
+}
+
+impl UserApi {
+    pub fn author(&self) -> &Author {
+        &self.author
+    }
+
+    pub fn server(&self) -> &Arc<Server> {
+        &self.server
+    }
+}
+
+impl Server {
+    /// A handle acting as `author`.
+    pub fn as_user(self: &Arc<Self>, author: Author) -> UserApi {
+        UserApi {
+            server: self.clone(),
+            author,
+        }
+    }
+
+    /// A handle acting as the roster's local user — the CLI, and any
+    /// in-process caller that is simply this machine's operator.
+    pub fn as_local(self: &Arc<Self>) -> UserApi {
+        let author = local_author(&self.config);
+        self.as_user(author)
+    }
+}
+
+#[async_trait::async_trait]
+impl MycoApi for UserApi {
+    async fn list_sessions(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<api::SessionSummary>, ApiError> {
+        self.server.list_sessions(include_archived).await
+    }
+
+    async fn create_session(
+        &self,
+        req: api::CreateSession,
+    ) -> Result<api::SessionSummary, ApiError> {
+        self.server.create_session(req).await
+    }
+
+    async fn session_detail(&self, id: &str) -> Result<api::SessionDetail, ApiError> {
+        self.server.session_detail(id).await
+    }
+
+    async fn update_session(
+        &self,
+        id: &str,
+        req: api::UpdateSession,
+    ) -> Result<api::SessionSummary, ApiError> {
+        self.server.update_session(id, req).await
+    }
+
+    async fn post_message(&self, id: &str, req: api::PostMessage) -> Result<api::Poll, ApiError> {
+        self.server.post_message(&self.author, id, req).await
+    }
+
+    async fn poll(&self, id: &str, since: usize) -> Result<api::Poll, ApiError> {
+        self.server.poll(id, since).await
+    }
+
+    async fn events(&self, id: &str) -> Result<api::EventStream, ApiError> {
+        self.server.events(id).await
+    }
+
+    async fn cancel(&self, id: &str) -> Result<api::Poll, ApiError> {
+        self.server.cancel(id).await
+    }
+
+    async fn compact(&self, id: &str) -> Result<api::Poll, ApiError> {
+        self.server.compact(id).await
+    }
+
+    async fn retire(&self, id: &str) -> Result<api::Poll, ApiError> {
+        self.server.retire(id).await
+    }
+
+    async fn models(&self) -> Result<api::Models, ApiError> {
+        self.server.models().await
+    }
+
+    async fn whoami(&self) -> Result<api::Identity, ApiError> {
+        match &self.author {
+            Author::User { id, name } => Ok(api::Identity {
+                id: id.clone(),
+                name: name.clone(),
+            }),
+            other => Err(internal(format!("handle is not a user: {other:?}"))),
+        }
     }
 }

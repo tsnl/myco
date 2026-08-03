@@ -2,8 +2,8 @@
 //! through `dyn MycoApi` only — the same calls `HttpClient` makes over HTTP.
 //! Models are scripted via the factory seam; no provider, no network.
 //!
-//! Sole test binary for the process-global `MYCO_HOME` override (the tests
-//! serialize on `temp_home`'s lock).
+//! Like `web_auth`, these tests share the process-global `MYCO_HOME` override
+//! and serialize on `temp_home`'s lock.
 
 use std::sync::Arc;
 
@@ -79,7 +79,8 @@ async fn a_turn_round_trips_through_the_trait() {
             turn("third answer"),
         ])
     });
-    let server: &dyn MycoApi = server.as_ref();
+    let server = server.as_local();
+    let server: &dyn MycoApi = &server;
 
     let s = server
         .create_session(CreateSession {
@@ -153,7 +154,8 @@ async fn a_failing_turn_surfaces_on_last_error() {
             "provider down (scripted)".into(),
         ))
     });
-    let server: &dyn MycoApi = server.as_ref();
+    let server = server.as_local();
+    let server: &dyn MycoApi = &server;
 
     let s = server
         .create_session(CreateSession {
@@ -206,7 +208,8 @@ async fn a_turn_streams_deltas_before_it_finishes() {
             usage: None,
         }])
     });
-    let server: &dyn MycoApi = server.as_ref();
+    let server = server.as_local();
+    let server: &dyn MycoApi = &server;
 
     let s = server
         .create_session(CreateSession {
@@ -277,7 +280,8 @@ async fn an_abandoned_session_leaves_nothing_on_disk() {
             usage: None,
         }])
     });
-    let api: &dyn MycoApi = server.as_ref();
+    let api = server.as_local();
+    let api: &dyn MycoApi = &api;
 
     let count_sessions = || {
         // v2 keeps its whole world under `$MYCO_HOME/v2`.
@@ -346,7 +350,8 @@ async fn archiving_hides_a_session_without_losing_it() {
             usage: None,
         }])
     });
-    let api: &dyn MycoApi = server.as_ref();
+    let api = server.as_local();
+    let api: &dyn MycoApi = &api;
 
     let s = api
         .create_session(CreateSession {
