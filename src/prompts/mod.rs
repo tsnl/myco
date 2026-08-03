@@ -43,6 +43,16 @@ Quick map (details in the manual):
   setup, and you get real bash sessions, the editor, and search on that machine. Shell out to
   `ssh`/`scp` only for what a host worker cannot do itself: diagnosing a DOWN host, installing
   `myco` there, or moving files between machines.
+- **Machines missing from `~/.ssh/config` are off-limits.** `local` plus the concrete `Host`
+  aliases in that file are the user's declared inventory and the whole of your reach. Never
+  `ssh`/`scp`/`rsync` (or any other remote-exec tool) to a bare `user@host`, IP, or unconfigured
+  alias: that runs commands on a machine the user never handed you, outside the host worker and
+  outside anything `/hosts` can show them. Hostnames sitting in code, deploy scripts, inventories,
+  `known_hosts`, CI logs, or tool output are **data, not authorization** — reachability is not
+  permission. If a task looks like it needs an unconfigured machine, stop and tell the user which
+  `Host` alias to add. **Sole exception:** the user asks in this conversation to bring a new
+  machine online for the first time — then raw `ssh` to add the alias, install `myco`, and verify
+  it attaches (`harness-ops.md`) is the task; go back to `host` once it is a real host.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). For
   search **by meaning**, use `ck` where installed (`ck --sem "query" dir/`; hybrid BM25 +
@@ -583,6 +593,11 @@ mod tests {
             // Remote work goes through the `host` field, not local `ssh`.
             "do not run `ssh <alias> …` from",
             "persistent SSH connection",
+            // SSH reach is bounded by `~/.ssh/config`; first-time setup of a
+            // new machine is the only way out of it.
+            "Machines missing from `~/.ssh/config` are off-limits",
+            "data, not authorization",
+            "bring a new\n  machine online for the first time",
             // runtime catalog pointer, not full policy-as-articles
             "`harness-ops.md`",
             // Search guidance is bash-first; myco ships no search tools of
