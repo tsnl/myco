@@ -111,6 +111,42 @@
       .role-assistant { color: #d8d8d8; }
       .role-thinking { color: var(--fg-dim); font-style: italic; }
       .role-tool { color: var(--tool); }
+
+      /* Tool calls: each its own block, collapsed to a summary by default.
+         The header is the toggle; the whole card is one visual unit so a long
+         transcript reads as prose punctuated by calls, not as a wall. */
+      .tool-card {
+        border: 1px solid var(--line); border-radius: 6px;
+        background: var(--bg-raised);
+        margin: 0.5rem 0; overflow: hidden;
+      }
+      .tool-card-error { border-color: #5a3232; }
+      .tool-head {
+        display: flex; align-items: baseline; gap: 0.4rem;
+        padding: 0.3rem 0.6rem; cursor: pointer;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      .tool-head:hover { background: #1c1c1c; }
+      .tool-caret { color: var(--fg-dim); width: 1ch; }
+      .tool-name { color: var(--tool); font-weight: bold; }
+      /* Pushed right, revealed on hover: present when wanted, quiet otherwise. */
+      .tool-toggle {
+        margin-left: auto; color: var(--fg-dim); font-size: 0.85em;
+        opacity: 0; transition: opacity 0.1s;
+      }
+      .tool-head:hover .tool-toggle { opacity: 1; }
+      .tool-result {
+        border-top: 1px solid var(--line-soft);
+        padding: 0.3rem 0.6rem; max-height: 60vh; overflow: auto;
+      }
+      /* Code, wherever it appears: fenced blocks, tool arguments, results.
+         Wide content scrolls inside its own box so the page never does. */
+      pre.code {
+        margin: 0; padding: 0.4rem 0.6rem;
+        overflow-x: auto; white-space: pre; word-break: normal;
+      }
+      pre.code.json { background: none; border: 0; }
+      .md pre.code { background: #0d0d0d; border: 1px solid var(--line-soft); border-radius: 4px; }
       .err { color: var(--err); }
       .dim { color: var(--fg-dim); }
 

@@ -101,7 +101,7 @@ pub fn usage_line(u: TokenUsage) -> String {
 }
 
 /// Max chars for string values inside pretty-printed tool inputs (display only).
-pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
+pub use myco_api::{TOOL_DISPLAY_STRING_MAX, truncate_json_strings};
 
 /// ANSI styling and wrap width for transcript rendering. Disabled styling +
 /// no wrap → byte-identical plain output, so files, logs, and piped stdout
@@ -342,37 +342,6 @@ fn replay_paragraph(
 }
 
 /// Truncate a display string to `max_chars` (including a trailing `…` when shortened).
-fn truncate_display_string(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let trimmed: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{trimmed}…")
-}
-
-/// Deep-copy JSON, replacing long string values with truncated versions for display.
-pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => {
-            serde_json::Value::String(truncate_display_string(s, max_chars))
-        }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .map(|v| truncate_json_strings(v, max_chars))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                out.insert(k.clone(), truncate_json_strings(v, max_chars));
-            }
-            serde_json::Value::Object(out)
-        }
-        other => other.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
