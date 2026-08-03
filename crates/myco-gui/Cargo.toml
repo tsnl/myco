@@ -18,3 +18,4 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Element", "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Storage", "Window"] }
 futures = { workspace = true }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

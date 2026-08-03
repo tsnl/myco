@@ -43,7 +43,10 @@ trunk serve                                # web GUI on :8080 (proxies /api)
 ```
 
 The web GUI keeps the terminal's visual identity: monospace, dark, USER
-rules — minimal chrome by design.
+rules — minimal chrome by design. Tool calls render as collapsed cards
+(name, pretty-printed arguments with long strings elided, result folded in);
+click one, or the transcript-wide `verbose` toggle, to see the call exactly
+as the model made it. Code blocks are syntax-highlighted.
 
 `trunk serve` needs [trunk](https://trunkrs.dev) and the wasm target
 (`rustup target add wasm32-unknown-unknown`). The `Trunk.toml` at the repo

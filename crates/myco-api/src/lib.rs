@@ -219,14 +219,14 @@ pub enum TurnEndReason {
     Other(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolUse {
     pub id: String,
     pub name: String,
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub id: String,
     pub content: Vec<Content>,
@@ -264,7 +264,7 @@ impl ToolResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     Text {
         text: String,
@@ -432,6 +432,63 @@ impl Entry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Display policy
+//
+// How a tool call is *summarized* is a property of the conversation, not of
+// any one frontend: the terminal and the web client must agree, or the same
+// session reads differently depending on where you opened it.
+// ---------------------------------------------------------------------------
+
+/// Longest string kept intact when summarizing a tool call's arguments.
+pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
+
+/// Truncate to `max_chars`, marking the cut with an ellipsis.
+pub fn truncate_display_string(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let trimmed: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{trimmed}…")
+}
+
+/// Deep-copy JSON, replacing long string values with truncated versions for
+/// display. Structure is preserved exactly — only leaf strings shrink, so a
+/// summarized call still shows every argument it was given.
+pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(truncate_display_string(s, max_chars))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|v| truncate_json_strings(v, max_chars))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), truncate_json_strings(v, max_chars));
+            }
+            serde_json::Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Pretty-printed JSON arguments for a tool call. `summarize` applies
+/// [`truncate_json_strings`]; the verbose view passes `false` and gets the
+/// call exactly as the model made it.
+pub fn tool_input_json(input: &serde_json::Value, summarize: bool) -> String {
+    let value = if summarize {
+        truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX)
+    } else {
+        input.clone()
+    };
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
 /// Concatenated text of a content run, images noted rather than inlined.
 pub fn content_text(content: &[Content]) -> String {
     content
@@ -443,4 +500,44 @@ pub fn content_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn summarized_arguments_keep_every_key_and_cut_only_long_strings() {
+        let input = json!({
+            "command": "x".repeat(TOOL_DISPLAY_STRING_MAX + 40),
+            "timeout_ms": 5000,
+            "nested": { "short": "ok" },
+        });
+        let summary = tool_input_json(&input, true);
+        // Structure survives: a collapsed card still shows what was passed.
+        assert!(summary.contains("\"command\""), "{summary}");
+        assert!(summary.contains("\"timeout_ms\": 5000"), "{summary}");
+        assert!(summary.contains("\"short\": \"ok\""), "{summary}");
+        // The long value does not.
+        assert!(!summary.contains(&"x".repeat(TOOL_DISPLAY_STRING_MAX + 40)));
+        assert!(summary.contains('…'), "{summary}");
+        // Pretty-printed, not one line.
+        assert!(summary.contains('\n'), "{summary}");
+
+        // Verbose is the call exactly as made.
+        let full = tool_input_json(&input, false);
+        assert!(full.contains(&"x".repeat(TOOL_DISPLAY_STRING_MAX + 40)));
+        assert!(!full.contains('…'));
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        let s = "é".repeat(TOOL_DISPLAY_STRING_MAX + 5);
+        let cut = truncate_display_string(&s, TOOL_DISPLAY_STRING_MAX);
+        assert_eq!(cut.chars().count(), TOOL_DISPLAY_STRING_MAX);
+        assert!(cut.ends_with('…'));
+        // Short strings are returned untouched.
+        assert_eq!(truncate_display_string("ok", 10), "ok");
+    }
 }

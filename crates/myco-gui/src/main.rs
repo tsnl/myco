@@ -7,6 +7,7 @@
 //! with no further chrome.
 
 mod auth;
+mod highlight;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -225,16 +226,55 @@ async fn fetch_poll(id: &str) -> Result<api::Poll, Failure> {
 }
 
 /// Markdown → HTML, with raw HTML in the source neutralized (a model must
-/// not be able to inject markup into the page).
+/// not be able to inject markup into the page) and fenced code blocks
+/// syntax-highlighted.
+///
+/// The highlighter is the only thing allowed to emit markup here, and it
+/// escapes the code it is given — so the un-trusted text still cannot become
+/// tags, it just gets colored on the way through.
 fn markdown(src: &str) -> Html {
-    use pulldown_cmark::{Event, Parser};
-    let events = Parser::new(src).map(|e| match e {
-        Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
-        other => other,
-    });
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+    let mut events = Vec::new();
+    // `Some` while inside a fence: the language and the code collected so far.
+    let mut fence: Option<(String, String)> = None;
+    for ev in Parser::new(src) {
+        match ev {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let lang = match &kind {
+                    CodeBlockKind::Fenced(l) => l.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                fence = Some((lang, String::new()));
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, code)) = fence.take() {
+                    let body = highlight::highlight_to_html(&code, &lang);
+                    events.push(Event::Html(
+                        format!("<pre class=\"code\"><code>{body}</code></pre>").into(),
+                    ));
+                }
+            }
+            Event::Text(t) if fence.is_some() => {
+                if let Some((_, code)) = fence.as_mut() {
+                    code.push_str(&t);
+                }
+            }
+            Event::Html(t) | Event::InlineHtml(t) => events.push(Event::Text(t)),
+            other => events.push(other),
+        }
+    }
     let mut out = String::new();
-    pulldown_cmark::html::push_html(&mut out, events);
+    pulldown_cmark::html::push_html(&mut out, events.into_iter());
     Html::from_html_unchecked(AttrValue::from(format!("<div class=\"md\">{out}</div>")))
+}
+
+/// Pretty-printed, highlighted JSON in a `<pre>`.
+fn json_block(pretty: &str) -> Html {
+    let body = highlight::json_to_html(pretty);
+    Html::from_html_unchecked(AttrValue::from(format!(
+        "<pre class=\"code json\">{body}</pre>"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -425,11 +465,98 @@ fn draft() -> Html {
 // Conversation (one URL per session)
 // ---------------------------------------------------------------------------
 
+/// Lines of a collapsed tool result before it is cut off. Enough to see what
+/// happened, short enough that a 5,000-line build log does not bury the
+/// conversation.
+const RESULT_PREVIEW_LINES: usize = 8;
+
+#[derive(Properties, PartialEq)]
+struct ToolCardProps {
+    tool: api::ToolUse,
+    /// The matching result, once the tool has finished.
+    result: Option<api::ToolResult>,
+    /// The transcript-wide verbose setting. Flipping it re-seeds every card,
+    /// but a card the reader has opened by hand keeps its own state until
+    /// then.
+    verbose: bool,
+}
+
+/// One tool call as its own bordered block: name, pretty-printed arguments,
+/// and the result folded in underneath.
+///
+/// Collapsed, strings in the arguments are truncated and the result is capped
+/// — the same policy the CLI applies, shared from `myco_api` so the two
+/// frontends cannot drift. Expanded, nothing is elided.
+#[function_component(ToolCard)]
+fn tool_card(props: &ToolCardProps) -> Html {
+    let expanded = use_state(|| props.verbose);
+    {
+        let expanded = expanded.clone();
+        use_effect_with(props.verbose, move |v| expanded.set(*v));
+    }
+    let toggle = {
+        let expanded = expanded.clone();
+        Callback::from(move |_: MouseEvent| expanded.set(!*expanded))
+    };
+    let open = *expanded;
+
+    let args = api::tool_input_json(&props.tool.input, !open);
+    let is_error = props.result.as_ref().is_some_and(|r| r.is_error);
+
+    let result_body = props.result.as_ref().map(|r| {
+        let text = api::content_text(&r.content);
+        let total = text.lines().count();
+        let shown = if open || total <= RESULT_PREVIEW_LINES {
+            text.clone()
+        } else {
+            text.lines()
+                .take(RESULT_PREVIEW_LINES)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let hidden = total.saturating_sub(RESULT_PREVIEW_LINES);
+        html! {
+            <div class="tool-result">
+                <pre class={ if r.is_error { "err" } else { "dim" } }>{ shown }</pre>
+                { if !open && hidden > 0 { html! {
+                    <button class="linkish" onclick={toggle.clone()}>
+                        { format!("+{hidden} more lines") }
+                    </button>
+                } } else { html!{} } }
+            </div>
+        }
+    });
+
+    html! {
+        <div class={ classes!("tool-card", is_error.then_some("tool-card-error")) }>
+            <div class="tool-head" onclick={toggle.clone()}>
+                <span class="tool-caret">{ if open { "▾" } else { "▸" } }</span>
+                <span class="tool-name">{ &props.tool.name }</span>
+                { if props.result.is_none() { html! {
+                    <span class="dim">{ " · running" }</span>
+                } } else if is_error { html! {
+                    <span class="err">{ " · error" }</span>
+                } } else { html!{} } }
+                <span class="tool-toggle">{ if open { "collapse" } else { "expand" } }</span>
+            </div>
+            { json_block(&args) }
+            { result_body.unwrap_or_else(|| html!{}) }
+        </div>
+    }
+}
+
 /// One transcript entry, in the terminal's visual language. Prose is
-/// markdown-rendered (as the CLI styles it); raw tool output stays verbatim.
+/// markdown-rendered (as the CLI styles it); tool calls become cards.
 /// Entries carry their author, so a shared session reads as a conversation
 /// rather than an anonymous stream.
-fn render_entry(e: &api::Entry) -> Html {
+///
+/// `results` is the whole transcript's tool results indexed by id, so a call
+/// and its output render together even though they are separate entries.
+fn render_entry(
+    e: &api::Entry,
+    results: &std::collections::HashMap<String, api::ToolResult>,
+    verbose: bool,
+) -> Html {
     match &e.body {
         api::EntryBody::User { content } => html! {
             <div>
@@ -454,20 +581,34 @@ fn render_entry(e: &api::Entry) -> Html {
                     api::Content::Image { .. } => html! { <pre class="dim">{ "[image]" }</pre> },
                 }) }
                 { for tool_uses.iter().map(|t| html! {
-                    <pre class="role-tool">{ format!("● {}({})", t.name, t.input) }</pre>
+                    <ToolCard tool={t.clone()} result={results.get(&t.id).cloned()}
+                              {verbose} />
                 }) }
             </div>
         },
-        api::EntryBody::ToolResults { results } => html! {
-            <div>
-                { for results.iter().map(|r| html! {
-                    <pre class={ if r.is_error { "err" } else { "dim" } }>
-                        { api::content_text(&r.content) }
-                    </pre>
-                }) }
-            </div>
-        },
+        // Folded into the card of the call they answer.
+        api::EntryBody::ToolResults { .. } => html! {},
     }
+}
+
+/// The whole transcript. Results are indexed once for the pass, so a call
+/// and its output render together even though they are separate entries.
+fn render_transcript(entries: &[api::Entry], verbose: bool) -> Html {
+    let results = result_index(entries);
+    html! { for entries.iter().map(|e| render_entry(e, &results, verbose)) }
+}
+
+/// Index every tool result in the transcript by the call it answers.
+fn result_index(entries: &[api::Entry]) -> std::collections::HashMap<String, api::ToolResult> {
+    let mut out = std::collections::HashMap::new();
+    for e in entries {
+        if let api::EntryBody::ToolResults { results } = &e.body {
+            for r in results {
+                out.insert(r.id.clone(), r.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Properties, PartialEq)]
@@ -479,6 +620,7 @@ struct ConversationProps {
 fn conversation(props: &ConversationProps) -> Html {
     let who = use_context::<Session>();
     let entries = use_state(Vec::<api::Entry>::new);
+    let verbose = use_state(|| false);
     let busy = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     // Text streamed since the last transcript refresh. The buffer is a ref,
@@ -665,6 +807,11 @@ fn conversation(props: &ConversationProps) -> Html {
     let on_send = to_click(&send_now);
     let on_keydown = to_enter(&send_now);
 
+    let toggle_verbose = {
+        let verbose = verbose.clone();
+        Callback::from(move |_: MouseEvent| verbose.set(!*verbose))
+    };
+
     let on_cancel = {
         let id = props.id.clone();
         Callback::from(move |_: MouseEvent| {
@@ -682,12 +829,15 @@ fn conversation(props: &ConversationProps) -> Html {
                     <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
                     <span class="dim">{ format!(" {} ", props.id) }</span>
                     { if *busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                    <button class="linkish" onclick={toggle_verbose}>
+                        { if *verbose { "· concise" } else { "· verbose" } }
+                    </button>
                     { whoami_line(&who) }
                 </div>
             </div>
             <div class="pane" ref={pane} onscroll={on_scroll}>
                 <div class="column">
-                { for entries.iter().map(render_entry) }
+                { render_transcript(&entries, *verbose) }
                 { if !streaming.is_empty() {
                     html! { <div class="role-assistant">{ markdown(&streaming) }</div> }
                 } else { html!{} } }
