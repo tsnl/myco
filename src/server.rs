@@ -243,10 +243,10 @@ impl Server {
             .get(&model_key)
             .map_err(|e| format!("model {model_key:?}: {e}"))?;
 
+        // A session becomes durable when it has content, not when it is
+        // opened: the first turn's checkpoint writes the file. Opening one
+        // and walking away therefore leaves nothing on disk.
         let active = ActiveSession::new(session);
-        active
-            .with(|s| s.save())
-            .map_err(|e| format!("save: {e}"))?;
 
         let session_tool = Arc::new(SessionMetaTool::new(active.clone())) as Arc<dyn ToolService>;
         let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn ToolService>;

@@ -233,3 +233,70 @@ async fn a_turn_streams_deltas_before_it_finishes() {
             .any(|e| e.text.contains("streamed **body**"))
     );
 }
+
+/// A session becomes durable when it has content. Opening one and walking
+/// away must leave nothing behind — otherwise every stray "new session"
+/// click accretes an empty file in the store.
+#[tokio::test]
+async fn an_abandoned_session_leaves_nothing_on_disk() {
+    let home = myco_test_support::temp_home("api-empty");
+    let server = scripted_server(|| {
+        ScriptedModel::new(vec![GenerateOutput {
+            content: vec![Content::Text {
+                text: "written".into(),
+            }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }])
+    });
+    let api: &dyn MycoApi = server.as_ref();
+
+    let count_sessions = || {
+        let root = home.path().join("session");
+        let mut n = 0;
+        if let Ok(shards) = std::fs::read_dir(&root) {
+            for shard in shards.flatten() {
+                if let Ok(files) = std::fs::read_dir(shard.path()) {
+                    n += files
+                        .flatten()
+                        .filter(|f| f.path().extension().is_some_and(|e| e == "json"))
+                        .count();
+                }
+            }
+        }
+        n
+    };
+    assert_eq!(count_sessions(), 0, "store starts empty");
+
+    // Created but never used: nothing is written, and retiring it is clean.
+    let abandoned = api
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    assert_eq!(count_sessions(), 0, "an empty session is not persisted");
+    api.retire(&abandoned.id).await.expect("retire");
+    assert_eq!(count_sessions(), 0, "and leaves nothing behind");
+
+    // A session that receives a message does persist.
+    let used = api
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    api.post_message(&used.id, PostMessage { text: "hi".into() })
+        .await
+        .expect("post");
+    poll_until(api, &used.id, |p| {
+        p.entries.iter().any(|e| e.role == "assistant")
+    })
+    .await;
+    assert_eq!(count_sessions(), 1, "a used session is on disk");
+}

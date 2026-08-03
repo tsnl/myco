@@ -22,6 +22,10 @@ use yew_router::prelude::*;
 enum Route {
     #[at("/")]
     Browser,
+    /// A conversation that does not exist yet: the session is created by the
+    /// first message, so opening a new one and walking away costs nothing.
+    #[at("/new")]
+    Draft,
     #[at("/session/:id")]
     Session { id: String },
 }
@@ -36,6 +40,7 @@ fn app() -> Html {
         <BrowserRouter>
             <Switch<Route> render={|route| match route {
                 Route::Browser => html! { <Browser /> },
+                Route::Draft => html! { <Draft /> },
                 Route::Session { id } => html! { <Conversation {id} /> },
             }} />
         </BrowserRouter>
@@ -108,23 +113,7 @@ fn browser() -> Html {
 
     let on_new = {
         let navigator = navigator.clone();
-        Callback::from(move |_| {
-            let navigator = navigator.clone();
-            spawn_local(async move {
-                let req = Request::post("/api/sessions")
-                    .json(&api::CreateSession {
-                        model: None,
-                        parent_session: None,
-                        fork: false,
-                    })
-                    .unwrap();
-                if let Ok(resp) = req.send().await
-                    && let Ok(s) = resp.json::<api::SessionSummary>().await
-                {
-                    navigator.push(&Route::Session { id: s.id });
-                }
-            });
-        })
+        Callback::from(move |_| navigator.push(&Route::Draft))
     };
 
     html! {
@@ -150,6 +139,95 @@ fn browser() -> Html {
                     }
                 }) }
             </ul>
+            </div>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draft (a conversation before its first message)
+// ---------------------------------------------------------------------------
+
+#[function_component(Draft)]
+fn draft() -> Html {
+    let input = use_node_ref();
+    let error = use_state(|| Option::<String>::None);
+    let navigator = use_navigator().unwrap();
+
+    let on_send = {
+        let input = input.clone();
+        let error = error.clone();
+        let navigator = navigator.clone();
+        Callback::from(move |_| {
+            let Some(ta) = input.cast::<HtmlTextAreaElement>() else {
+                return;
+            };
+            let text = ta.value();
+            if text.trim().is_empty() {
+                return;
+            }
+            ta.set_value("");
+            let error = error.clone();
+            let navigator = navigator.clone();
+            spawn_local(async move {
+                // Create, then post, then hand the URL over to `Conversation`.
+                let created = Request::post("/api/sessions")
+                    .json(&api::CreateSession {
+                        model: None,
+                        parent_session: None,
+                        fork: false,
+                    })
+                    .expect("serialize create")
+                    .send()
+                    .await;
+                let summary = match created {
+                    Ok(resp) if resp.ok() => resp.json::<api::SessionSummary>().await.ok(),
+                    Ok(resp) => {
+                        error.set(Some(format!("new session: http {}", resp.status())));
+                        None
+                    }
+                    Err(e) => {
+                        error.set(Some(format!("new session: {e}")));
+                        None
+                    }
+                };
+                let Some(summary) = summary else { return };
+                let posted = Request::post(&format!("/api/sessions/{}/messages", summary.id))
+                    .json(&api::PostMessage { text })
+                    .expect("serialize message")
+                    .send()
+                    .await;
+                if let Err(e) = posted {
+                    error.set(Some(format!("send failed: {e}")));
+                    return;
+                }
+                navigator.replace(&Route::Session { id: summary.id });
+            });
+        })
+    };
+
+    html! {
+        <div class="app">
+            <div class="topbar">
+                <div class="column">
+                    <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
+                    <span class="dim">{ " new session" }</span>
+                </div>
+            </div>
+            <div class="pane">
+                <div class="column">
+                    { if let Some(e) = &*error { html! {
+                        <div class="err"><b>{ "ERROR" }</b><pre>{ e }</pre></div>
+                    } } else { html!{} } }
+                </div>
+            </div>
+            <div class="composer">
+                <div class="column">
+                    <textarea ref={input} rows="3" placeholder="message"></textarea>
+                    <div class="actions">
+                        <button onclick={on_send}>{ "send" }</button>
+                    </div>
+                </div>
             </div>
         </div>
     }
