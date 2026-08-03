@@ -60,15 +60,24 @@ register yourself in `~/.myco/v2/server.toml`:
 [[users]]
 id = "ada"            # matched against $MYCO_USER, then $USER
 name = "Ada Lovelace" # optional; defaults to the id
-token = "…"           # optional; required to reach the HTTP API
-                      # generate one with: openssl rand -hex 32
 ```
 
 Both the CLI and the server refuse to start without a roster that names the
 user they are running as — every session entry records its author, and a
 name nobody registered has no business in a shared transcript. Override the
-path with `--server-config` or `$MYCO_SERVER_CONFIG`. Remotes
-just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
+path with `--server-config` or `$MYCO_SERVER_CONFIG`.
+
+The roster says who *exists*; passwords are set separately, so a name in the
+file is not by itself access to the server:
+
+```bash
+myco auth list             # who exists, who can sign in, live sessions
+myco auth passwd ada       # prompts; ends ada's existing sessions
+myco auth disable ada      # refuse logins, keep the history attributed
+myco auth revoke ada       # end sessions without changing the password
+```
+
+Remotes just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
 remote only needs your key in `ssh-agent` and `myco` on the PATH used by
 non-interactive SSH.
 
@@ -83,13 +92,20 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami`.
 Wire types live in `crates/myco-api`.
 
-Every route requires `Authorization: Bearer <token>` naming a roster user;
-the entries a request writes are attributed to that user, not to whoever
+Sign in with the **OAuth 2.0 password grant** (RFC 6749 §4.3):
+`POST /api/auth/token` takes form-encoded
+`grant_type=password&username=&password=` and returns
+`{access_token, token_type, expires_in, user}`. Every other route requires
+`Authorization: Bearer <access_token>`; `POST /api/auth/logout` ends the
+session server-side. Tokens last 12 hours, are stored hashed, and live only
+in memory — a restart logs everyone out.
+
+Entries a request writes are attributed to the token's owner, not to whoever
 started the server. (`GET /sessions/<id>/events` also accepts `?token=`,
-since `EventSource` cannot set headers.) `--mode serve` exports
-`$MYCO_API_TOKEN` alongside `$MYCO_API` so tools the agent spawns can reach
-the API as the local operator. In the web GUI you paste your token once and
-it is kept in `localStorage`.
+since `EventSource` cannot set headers — a query token lands in request
+logs, so it is the weakest part of the surface.) `--mode serve` mints a
+token for the local operator and exports it as `$MYCO_API_TOKEN` alongside
+`$MYCO_API`, so tools the agent spawns reach the API as that user.
 
 ## Workspace
 
@@ -98,6 +114,7 @@ it is kept in `localStorage`.
   (the per-machine worker remotes run); the workspace lives in `crates/`
 - `myco-gui` — minimal Yew web client (one URL per conversation)
 - `myco-api` — wire types shared by server and clients
+- `myco-auth` — credentials, access tokens, and the store behind `myco auth`
 - `myco-agent`, `myco-session`, `myco-machines`, `myco-models`,
   `myco-config`, `myco-prompts`, `myco-core` — the server's pillars
 - `myco-test-support` — shared test fixtures

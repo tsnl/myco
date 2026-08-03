@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use myco_agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
 use myco_api::{Author, Entry, EntryBody};
+use myco_auth::AuthStore;
 use myco_config::Config;
 use myco_machines::harness::Harness;
 use myco_machines::tool_services::{
@@ -105,6 +106,9 @@ pub type ModelFactory = Box<
 /// tool (which spawns children through it).
 pub struct Server {
     config: Config,
+    /// Credentials and live access tokens. Seeded from the roster at
+    /// construction, mutated only through the admin interface.
+    auth: Arc<AuthStore>,
     live: Mutex<HashMap<String, Arc<Live>>>,
     model_factory: ModelFactory,
     /// Self-reference for agent tasks and per-session tools (set at
@@ -117,11 +121,46 @@ impl Server {
         Self::with_model_factory(config, Box::new(default_model_factory))
     }
 
+    /// Credentials and sessions.
+    pub fn auth(&self) -> &Arc<AuthStore> {
+        &self.auth
+    }
+
     /// Test/embedder constructor: models come from `factory` instead of the
     /// provider backends.
     pub fn with_model_factory(config: Config, factory: ModelFactory) -> Arc<Self> {
+        let opened =
+            AuthStore::default_path().and_then(|p| AuthStore::open(p).map_err(|e| e.to_string()));
+        let auth = match opened {
+            Ok(store) => store,
+            Err(e) => {
+                // A store we cannot read must not silently become an empty
+                // one that anybody could then be added to.
+                eprintln!("myco: cannot open the credential store: {e}");
+                std::process::exit(1);
+            }
+        };
+        Self::with_model_factory_and_auth(config, factory, Arc::new(auth))
+    }
+
+    /// Construct with an explicit credential store (tests use an in-memory
+    /// one so they never touch `$MYCO_HOME/v2/auth.json`).
+    pub fn with_model_factory_and_auth(
+        config: Config,
+        factory: ModelFactory,
+        auth: Arc<AuthStore>,
+    ) -> Arc<Self> {
+        // The roster declares who exists; the store holds what they know.
+        // Reconciling here means adding a name to `server.toml` is enough to
+        // make `myco auth passwd <id>` work, with no second registration step.
+        for user in config.roster.users() {
+            if auth.get(&user.id).is_none() {
+                let _ = auth.add_user(&user.id, user.display_name());
+            }
+        }
         Arc::new_cyclic(|me| Self {
             config,
+            auth,
             live: Mutex::new(HashMap::new()),
             model_factory: factory,
             me: me.clone(),

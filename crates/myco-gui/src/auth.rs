@@ -1,10 +1,15 @@
-//! Bearer-token auth for the browser client.
+//! Sign-in for the browser client.
 //!
-//! Every `/api` request carries `Authorization: Bearer <token>`; the server
-//! resolves it to a roster user and attributes whatever the request writes to
-//! them. The token lives in `localStorage` so a reload does not log you out,
-//! and in a thread-local so the fetch helpers can reach it without threading
-//! a context parameter through every component.
+//! [`login`] performs the OAuth 2.0 password grant against
+//! `POST /api/auth/token` and keeps the returned access token; every later
+//! `/api` request carries it as `Authorization: Bearer <token>`. The token
+//! lives in `localStorage` so a reload does not log you out, and in a
+//! thread-local so the fetch helpers can reach it without threading a context
+//! parameter through every component.
+//!
+//! Tokens expire server-side, so a 401 is routine rather than exceptional:
+//! it clears the stored token and surfaces as [`Failure::Unauthorized`], which
+//! the app turns back into the sign-in screen.
 //!
 //! `EventSource` cannot set headers, so the SSE URL carries `?token=`
 //! instead — see [`sse_url`].
@@ -168,4 +173,28 @@ pub async fn whoami() -> Result<api::Identity, Failure> {
         return Err(Failure::Unauthorized);
     }
     get("/api/whoami").await
+}
+
+/// The password grant. On success the token is stored and the caller gets the
+/// identity it speaks for.
+pub async fn login(username: &str, password: &str) -> Result<api::Identity, Failure> {
+    let body = format!(
+        "grant_type=password&username={}&password={}",
+        encode(username.trim()),
+        encode(password)
+    );
+    let req = Request::post("/api/auth/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .map_err(|e| Failure::Other(format!("sign in: {e}")))?;
+    let issued: api::AccessToken = decode("sign in", req.send().await).await?;
+    set_token(&issued.access_token);
+    Ok(issued.user)
+}
+
+/// End the session server-side, then locally. The local clear happens either
+/// way — a network failure must not leave the UI claiming to be signed in.
+pub async fn logout() {
+    let _: Result<api::Identity, _> = post("/api/auth/logout").await;
+    clear_token();
 }

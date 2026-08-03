@@ -82,6 +82,21 @@ pub struct Models {
     pub default_model: String,
 }
 
+/// A successful `POST /api/auth/token` — the OAuth 2.0 access-token response
+/// (RFC 6749 §5.1). Field names are the spec's, not ours: a stock OAuth2
+/// client must be able to read this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessToken {
+    pub access_token: String,
+    /// Always `"bearer"`; present because the spec requires it.
+    pub token_type: String,
+    /// Lifetime in seconds from issuance.
+    pub expires_in: i64,
+    /// Who the token speaks for. An extension to the spec, which permits
+    /// additional parameters — it saves the client an immediate `/whoami`.
+    pub user: Identity,
+}
+
 /// Who the caller is, as the server sees them. Every implementation of
 /// [`MycoApi`] is bound to exactly one identity — the in-process server to
 /// the roster's local user, an HTTP client to whoever its token belongs to —
