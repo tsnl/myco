@@ -1,11 +1,11 @@
 # Workspace & soul
 
-`~/.myco/workspace/` is yours. Notes, journals, drafts, indexes, half-finished
+`~/.myco/v2/workspace/` is yours. Notes, journals, drafts, indexes, half-finished
 thoughts — do whatever you want there with the ordinary tools; there is no
 required format and no dedicated tool. It persists across sessions and is
 shared by every agent on this machine.
 
-Your **soul** lives in `~/.myco/workspace/soul/` as complete snapshots, maildir
+Your **soul** lives in `~/.myco/v2/workspace/soul/` as complete snapshots, maildir
 style: one file per revision, write-once, never edited in place. The newest
 version — the lexicographically last non-hidden `*.md` filename — is appended
 verbatim to every agent system prompt (root, nested agents, workers) under a

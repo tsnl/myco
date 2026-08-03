@@ -208,6 +208,21 @@ pub async fn run(opts: CliOptions) {
                             producer.error_section(&e);
                         }
                     }
+                    Some(Meta::Archive(archived)) => {
+                        let done = live.session.with_mut(|s| {
+                            s.archived = archived;
+                            s.touch();
+                            s.save()
+                        });
+                        match done {
+                            Ok(()) => producer.line(if archived {
+                                "archived (hidden from /sessions)"
+                            } else {
+                                "unarchived"
+                            }),
+                            Err(e) => producer.error_section(&e),
+                        }
+                    }
                     Some(Meta::Compact) => {
                         producer.line("compacting…");
                         let _ = live.tx.send(Cmd::Compact);
@@ -381,6 +396,8 @@ enum Meta {
     Resume(String),
     Title(Option<String>),
     Compact,
+    /// `true` = archive, `false` = unarchive.
+    Archive(bool),
 }
 
 fn parse_meta(input: &str) -> Option<Meta> {
@@ -397,6 +414,8 @@ fn parse_meta(input: &str) -> Option<Meta> {
         ("sessions", _) => Some(Meta::Sessions),
         ("hosts", _) => Some(Meta::Hosts),
         ("compact", _) => Some(Meta::Compact),
+        ("archive", _) => Some(Meta::Archive(true)),
+        ("unarchive", _) => Some(Meta::Archive(false)),
         ("resume", Some(id)) if !id.is_empty() => Some(Meta::Resume(id.to_string())),
         ("resume", _) => Some(Meta::Help),
         ("title", t) => Some(Meta::Title(
@@ -408,7 +427,8 @@ fn parse_meta(input: &str) -> Option<Meta> {
 
 fn help(producer: &Arc<TuiProducer>) {
     producer.line(
-        "/new /resume <id> /sessions /session /title [text] /compact /hosts /exit — \
-         input queues while a turn runs; Ctrl-C cancels the running turn",
+        "/new /resume <id> /sessions /session /title [text] /archive /unarchive \
+         /compact /hosts /exit — input queues while a turn runs; Ctrl-C cancels \
+         the running turn",
     );
 }

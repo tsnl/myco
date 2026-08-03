@@ -19,6 +19,9 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub message_count: usize,
     pub snippet: String,
+    /// Filed away: still readable, but out of the default listing.
+    #[serde(default)]
+    pub archived: bool,
     /// Live in this server process (an agent task exists for it).
     pub live: bool,
     /// An agent turn is currently running.
@@ -53,6 +56,16 @@ pub struct Poll {
     /// the next turn starts.
     #[serde(default)]
     pub last_error: Option<String>,
+}
+
+/// `PATCH /sessions/<id>`: the session-metadata fields a client may set.
+/// Absent fields are left alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateSession {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,9 +135,17 @@ pub type EventStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent>
 /// Holders of `dyn MycoApi` cannot tell the difference.
 #[async_trait::async_trait]
 pub trait MycoApi: Send + Sync {
-    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ApiError>;
+    /// Sessions in the store, newest first. Archived sessions are excluded
+    /// unless `include_archived`.
+    async fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionSummary>, ApiError>;
     async fn create_session(&self, req: CreateSession) -> Result<SessionSummary, ApiError>;
     async fn session_detail(&self, id: &str) -> Result<SessionDetail, ApiError>;
+    /// Set session metadata (title, archived). Absent fields are unchanged.
+    async fn update_session(
+        &self,
+        id: &str,
+        req: UpdateSession,
+    ) -> Result<SessionSummary, ApiError>;
     /// Queue one user turn (input queues while a turn runs).
     async fn post_message(&self, id: &str, req: PostMessage) -> Result<Poll, ApiError>;
     async fn poll(&self, id: &str, since: usize) -> Result<Poll, ApiError>;

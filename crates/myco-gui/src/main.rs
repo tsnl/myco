@@ -113,20 +113,27 @@ fn markdown(src: &str) -> Html {
 #[function_component(Browser)]
 fn browser() -> Html {
     let sessions = use_state(Vec::<api::SessionSummary>::new);
+    let show_archived = use_state(|| false);
+    let reload = use_state(|| 0_u32);
     let navigator = use_navigator().unwrap();
 
     {
         let sessions = sessions.clone();
-        use_effect_with((), move |_| {
+        use_effect_with((*show_archived, *reload), move |(archived, _)| {
+            let archived = *archived;
             spawn_local(async move {
-                if let Ok(resp) = Request::get("/api/sessions").send().await
-                    && let Ok(list) = resp.json::<Vec<api::SessionSummary>>().await
-                {
+                let url = format!("/api/sessions?include_archived={archived}");
+                if let Ok(list) = fetch::<Vec<api::SessionSummary>>(&url).await {
                     sessions.set(list);
                 }
             });
         });
     }
+
+    let toggle_archived = {
+        let show_archived = show_archived.clone();
+        Callback::from(move |_: MouseEvent| show_archived.set(!*show_archived))
+    };
 
     let on_new = {
         let navigator = navigator.clone();
@@ -138,20 +145,48 @@ fn browser() -> Html {
             <div class="column">
             <h1>{ "myco" }</h1>
             <button onclick={on_new}>{ "new session" }</button>
+            { " " }
+            <button onclick={toggle_archived}>
+                { if *show_archived { "hide archived" } else { "show archived" } }
+            </button>
             <ul>
                 { for sessions.iter().map(|s| {
                     let title = s.title.clone().unwrap_or_else(|| s.snippet.clone());
                     let label = format!(
-                        "{} — {} [{}{}] {}",
+                        "{} — {} [{}{}{}] {}",
                         &s.id[..s.id.len().min(8)],
                         s.model,
                         if s.live { "live" } else { "idle" },
                         if s.busy { ", busy" } else { "" },
+                        if s.archived { ", archived" } else { "" },
                         title,
                     );
+                    let on_archive = {
+                        let id = s.id.clone();
+                        let archived = s.archived;
+                        let reload = reload.clone();
+                        Callback::from(move |_: MouseEvent| {
+                            let id = id.clone();
+                            let reload = reload.clone();
+                            spawn_local(async move {
+                                let req = Request::patch(&format!("/api/sessions/{id}"))
+                                    .json(&api::UpdateSession {
+                                        title: None,
+                                        archived: Some(!archived),
+                                    })
+                                    .expect("serialize update");
+                                let _ = req.send().await;
+                                reload.set(*reload + 1);
+                            });
+                        })
+                    };
                     html! {
                         <li>
                             <Link<Route> to={Route::Session { id: s.id.clone() }}>{ label }</Link<Route>>
+                            { " " }
+                            <button onclick={on_archive}>
+                                { if s.archived { "unarchive" } else { "archive" } }
+                            </button>
                         </li>
                     }
                 }) }

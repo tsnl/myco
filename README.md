@@ -19,7 +19,8 @@ scripts.
   web alike. In serve mode each conversation is a URL and agents run in
   parallel server-side.
 - **Sessions you can resume.** Titles, scratchpads, links, and full history
-  live under `~/.myco/` — reopen any session by URL, or from another client.
+  live under `~/.myco/v2/` — reopen any session by URL, or from another
+  client. Archive the ones you are done with; they stay readable.
 - **Nested agents as a tool.** The root-only `subagent` tool runs one full
   turn of a hidden child session per call — no curl, works behind strict
   firewalls, optional context forks. The same surface exists as HTTP
@@ -44,7 +45,7 @@ rules — minimal chrome by design.
 (`rustup target add wasm32-unknown-unknown`). The `Trunk.toml` at the repo
 root builds `crates/myco-gui` and reverse-proxies `/api` to the server.
 
-Configure models first in `~/.myco/config.toml` (`[gateways.*]` +
+Configure models first in `~/.myco/v2/config.toml` (`[gateways.*]` +
 `[models.*]`; `myco --model <key>` / `--config <path>` to override). Remotes
 just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
 remote only needs your key in `ssh-agent` and `myco` on the PATH used by
@@ -52,8 +53,10 @@ non-interactive SSH.
 
 ## API
 
-`GET /api/sessions` · `POST /api/sessions` (`{model?, parent_session?,
-fork?}`) · `GET /api/sessions/<id>` · `POST /api/sessions/<id>/messages`
+`GET /api/sessions?include_archived=` · `POST /api/sessions` (`{model?,
+parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
+`PATCH /api/sessions/<id>` (`{title?, archived?}`) ·
+`POST /api/sessions/<id>/messages`
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models`. Wire types live in

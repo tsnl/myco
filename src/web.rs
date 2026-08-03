@@ -8,7 +8,7 @@ use rocket::http::Status;
 use rocket::response::status::Custom;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
-use rocket::{State, delete, get, post, routes};
+use rocket::{State, delete, get, patch, post, routes};
 
 use futures::StreamExt;
 use myco_api::{ApiError, ErrorKind, MycoApi};
@@ -53,6 +53,7 @@ pub fn rocket(
             list,
             create,
             detail,
+            update,
             post_message,
             poll,
             events,
@@ -81,9 +82,16 @@ fn output<T>(r: Result<T, ApiError>) -> ApiResult<T> {
     }
 }
 
-#[get("/sessions")]
-async fn list(server: &State<Arc<Server>>) -> ApiResult<Vec<api::SessionSummary>> {
-    output(server.list_sessions().await)
+#[get("/sessions?<include_archived>")]
+async fn list(
+    server: &State<Arc<Server>>,
+    include_archived: Option<bool>,
+) -> ApiResult<Vec<api::SessionSummary>> {
+    output(
+        server
+            .list_sessions(include_archived.unwrap_or(false))
+            .await,
+    )
 }
 
 #[post("/sessions", data = "<req>")]
@@ -97,6 +105,16 @@ async fn create(
 #[get("/sessions/<id>")]
 async fn detail(server: &State<Arc<Server>>, id: &str) -> ApiResult<api::SessionDetail> {
     output(server.session_detail(id).await)
+}
+
+/// Set session metadata: title, archived.
+#[patch("/sessions/<id>", data = "<req>")]
+async fn update(
+    server: &State<Arc<Server>>,
+    id: &str,
+    req: Json<api::UpdateSession>,
+) -> ApiResult<api::SessionSummary> {
+    output(server.update_session(id, req.into_inner()).await)
 }
 
 #[post("/sessions/<id>/messages", data = "<req>")]

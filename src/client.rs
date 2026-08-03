@@ -61,8 +61,12 @@ fn transport(e: reqwest::Error) -> ApiError {
 
 #[async_trait::async_trait]
 impl MycoApi for HttpClient {
-    async fn list_sessions(&self) -> Result<Vec<api::SessionSummary>, ApiError> {
-        self.get("/sessions").await
+    async fn list_sessions(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<api::SessionSummary>, ApiError> {
+        self.get(&format!("/sessions?include_archived={include_archived}"))
+            .await
     }
 
     async fn create_session(
@@ -75,6 +79,19 @@ impl MycoApi for HttpClient {
 
     async fn session_detail(&self, id: &str) -> Result<api::SessionDetail, ApiError> {
         self.get(&format!("/sessions/{id}")).await
+    }
+
+    async fn update_session(
+        &self,
+        id: &str,
+        req: api::UpdateSession,
+    ) -> Result<api::SessionSummary, ApiError> {
+        self.send(
+            self.http
+                .patch(format!("{}/sessions/{id}", self.base))
+                .json(&req),
+        )
+        .await
     }
 
     async fn post_message(&self, id: &str, req: api::PostMessage) -> Result<api::Poll, ApiError> {

@@ -200,8 +200,7 @@ fn resolve_config_path(
     if let Some(p) = env("MYCO_CONFIG") {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(home.join(".myco").join("config.toml"))
+    Ok(myco_core::data_root()?.join("config.toml"))
 }
 
 /// Build the model catalog from `[gateways]` / `[models]`.
@@ -786,7 +785,12 @@ context_window = 32_768
             path_for(None, &[("MYCO_CONFIG", "/env/y.toml")]),
             PathBuf::from("/env/y.toml")
         );
-        assert!(path_for(None, &[]).ends_with(".myco/config.toml"));
+        // v2 keeps its config with the rest of its world, under `<home>/v2`.
+        assert!(
+            path_for(None, &[]).ends_with("v2/config.toml"),
+            "{:?}",
+            path_for(None, &[])
+        );
     }
 
     #[test]
