@@ -7,9 +7,9 @@
 //! startup error, not a guess. Inventing an identity from `$USER` would write
 //! a name nobody registered into a durable, shareable transcript.
 //!
-//! The roster is a closed list on purpose. It is not an authentication system
-//! (tokens and request guards are a separate concern); it is the answer to
-//! "which names may appear as an author in this store".
+//! The roster is a closed list on purpose: it is both the answer to "which
+//! names may appear as an author in this store" and the credential table the
+//! HTTP layer authenticates against ([`Roster::by_token`]).
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,10 @@ pub fn resolve_roster_path(
     Ok(myco_core::data_root()?.join("server.toml"))
 }
 
+/// Minimum token length. Not a strength calculation — a floor that stops a
+/// throwaway value like `"dev"` from becoming a permanent shared password.
+pub const MIN_TOKEN_LEN: usize = 16;
+
 /// One registered person. `id` is the stable handle stored in transcripts;
 /// `name` is what humans and the model see.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -39,6 +43,10 @@ pub struct RosterUser {
     /// Display name. Defaults to `id` when the file omits it.
     #[serde(default)]
     pub name: Option<String>,
+    /// Bearer token for HTTP access. A user without one can still drive the
+    /// in-process CLI; they simply cannot authenticate to the server.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 impl RosterUser {
@@ -77,6 +85,8 @@ pub const EXAMPLE_SERVER_TOML: &str = "\
 [[users]]
 id = \"ada\"            # matches $USER (or $MYCO_USER) for local runs
 name = \"Ada Lovelace\" # optional; defaults to the id
+token = \"…\"           # optional; required to reach the HTTP API
+                      # generate one with: openssl rand -hex 32
 ";
 
 impl Roster {
@@ -97,6 +107,21 @@ impl Roster {
 
     pub fn get(&self, id: &str) -> Option<&RosterUser> {
         self.users.iter().find(|u| u.id == id)
+    }
+
+    /// Authenticate a bearer token. Comparison is constant-time over every
+    /// registered token, so a caller cannot learn a prefix from response
+    /// timing, and an unknown token costs the same as a known one.
+    pub fn by_token(&self, presented: &str) -> Option<&RosterUser> {
+        let mut found = None;
+        for user in &self.users {
+            if let Some(token) = &user.token
+                && constant_time_eq(token.as_bytes(), presented.as_bytes())
+            {
+                found = Some(user);
+            }
+        }
+        found
     }
 
     /// Validate a parsed file and pick the local identity.
@@ -139,6 +164,30 @@ impl Roster {
                 ));
             }
         }
+        for (i, user) in users.iter().enumerate() {
+            let Some(token) = &user.token else { continue };
+            if token.len() < MIN_TOKEN_LEN {
+                return Err(format!(
+                    "{}: token for user {:?} is {} characters; tokens must be at least \
+                     {MIN_TOKEN_LEN}. Generate one with `openssl rand -hex 32`.",
+                    path.display(),
+                    user.id,
+                    token.len()
+                ));
+            }
+            if let Some(dup) = users[..i]
+                .iter()
+                .find(|u| u.token.as_deref() == Some(token.as_str()))
+            {
+                return Err(format!(
+                    "{}: users {:?} and {:?} share a token — a shared token cannot \
+                     attribute a request to either of them",
+                    path.display(),
+                    dup.id,
+                    user.id
+                ));
+            }
+        }
 
         let Some(who) = env("MYCO_USER")
             .or_else(|| env("USER"))
@@ -162,6 +211,19 @@ impl Roster {
 
         Ok(Self { path, users, local })
     }
+}
+
+/// Length-independent byte comparison. `a.len() != b.len()` returns early —
+/// token length is not the secret, the bytes are.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn id_list(users: &[RosterUser]) -> String {
@@ -279,6 +341,49 @@ id = "grace"
 
         let empty = roster("[[users]]\nid = \"\"\n", &[("USER", "")]).unwrap_err();
         assert!(empty.contains("empty id"), "{empty}");
+    }
+
+    const TOKEN_A: &str = "0123456789abcdef0123456789abcdef";
+    const TOKEN_B: &str = "fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn a_token_authenticates_exactly_one_user() {
+        let text = format!(
+            "[[users]]\nid = \"ada\"\ntoken = \"{TOKEN_A}\"\n\
+             [[users]]\nid = \"grace\"\ntoken = \"{TOKEN_B}\"\n"
+        );
+        let r = roster(&text, &[("USER", "ada")]).unwrap();
+        assert_eq!(r.by_token(TOKEN_A).unwrap().id, "ada");
+        assert_eq!(r.by_token(TOKEN_B).unwrap().id, "grace");
+        assert!(r.by_token("wrong").is_none());
+        // A prefix of a real token must not authenticate.
+        assert!(r.by_token(&TOKEN_A[..8]).is_none());
+    }
+
+    /// A user with no token is a CLI-only identity, not an open door: the
+    /// empty presented token must not match them.
+    #[test]
+    fn a_user_without_a_token_cannot_authenticate() {
+        let r = roster(TWO_USERS, &[("USER", "ada")]).unwrap();
+        assert!(r.by_token("").is_none());
+        assert!(r.local().token.is_none());
+    }
+
+    #[test]
+    fn short_and_shared_tokens_are_rejected() {
+        let short = roster(
+            "[[users]]\nid = \"ada\"\ntoken = \"dev\"\n",
+            &[("USER", "ada")],
+        )
+        .unwrap_err();
+        assert!(short.contains("at least"), "{short}");
+
+        let text = format!(
+            "[[users]]\nid = \"ada\"\ntoken = \"{TOKEN_A}\"\n\
+             [[users]]\nid = \"grace\"\ntoken = \"{TOKEN_A}\"\n"
+        );
+        let shared = roster(&text, &[("USER", "ada")]).unwrap_err();
+        assert!(shared.contains("share a token"), "{shared}");
     }
 
     #[test]

@@ -6,17 +6,34 @@
 //! section rules — the web page renders (approximately) what the CLI prints,
 //! with no further chrome.
 
+mod auth;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
-use gloo_net::http::Request;
 use myco_api as api;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlTextAreaElement;
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew_router::prelude::*;
+
+use auth::Failure;
+
+/// Who we are signed in as, and how to sign out. Provided by [`App`] once the
+/// token has been checked, so nothing below it renders un-authenticated.
+#[derive(Clone, PartialEq)]
+struct Session {
+    identity: api::Identity,
+    sign_out: Callback<()>,
+}
+
+fn sign_out_now(ctx: &Option<Session>) {
+    if let Some(s) = ctx {
+        s.sign_out.emit(());
+    }
+}
 
 #[derive(Clone, Routable, PartialEq)]
 enum Route {
@@ -36,36 +53,150 @@ fn main() {
 
 #[function_component(App)]
 fn app() -> Html {
+    // `None` = not signed in (or not checked yet); the router is not rendered
+    // until a token has actually been accepted by the server.
+    let identity = use_state(|| Option::<api::Identity>::None);
+    let checked = use_state(|| false);
+
+    {
+        let identity = identity.clone();
+        let checked = checked.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(who) = auth::whoami().await {
+                    identity.set(Some(who));
+                }
+                checked.set(true);
+            });
+        });
+    }
+
+    let on_signed_in = {
+        let identity = identity.clone();
+        Callback::from(move |who: api::Identity| identity.set(Some(who)))
+    };
+    let sign_out = {
+        let identity = identity.clone();
+        Callback::from(move |_: ()| {
+            auth::clear_token();
+            identity.set(None);
+        })
+    };
+
+    if !*checked {
+        return html! { <div class="app"><div class="pane"><div class="column">
+            <span class="dim">{ "…" }</span>
+        </div></div></div> };
+    }
+    let Some(who) = (*identity).clone() else {
+        return html! { <Login {on_signed_in} /> };
+    };
+    let session = Session {
+        identity: who,
+        sign_out,
+    };
+
     html! {
-        <BrowserRouter>
-            <Switch<Route> render={|route| match route {
-                Route::Browser => html! { <Browser /> },
-                Route::Draft => html! { <Draft /> },
-                Route::Session { id } => html! { <Conversation {id} /> },
-            }} />
-        </BrowserRouter>
+        <ContextProvider<Session> context={session}>
+            <BrowserRouter>
+                <Switch<Route> render={|route| match route {
+                    Route::Browser => html! { <Browser /> },
+                    Route::Draft => html! { <Draft /> },
+                    Route::Session { id } => html! { <Conversation {id} /> },
+                }} />
+            </BrowserRouter>
+        </ContextProvider<Session>>
     }
 }
 
-/// GET a JSON endpoint, carrying failures as text: a silently empty
-/// transcript is indistinguishable from a broken one, so nothing here
-/// swallows an error.
-async fn fetch<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-    let resp = Request::get(url)
-        .send()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !resp.ok() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<api::ApiError>(&body)
-            .map(|e| e.error)
-            .unwrap_or(body);
-        return Err(format!("GET {url}: http {status}: {detail}"));
+#[derive(Properties, PartialEq)]
+struct LoginProps {
+    on_signed_in: Callback<api::Identity>,
+}
+
+/// Token entry. Deliberately the whole page and nothing else: there is no
+/// anonymous view of this server to decorate.
+#[function_component(Login)]
+fn login(props: &LoginProps) -> Html {
+    let input = use_node_ref();
+    let error = use_state(|| Option::<String>::None);
+
+    let submit: Callback<()> = {
+        let input = input.clone();
+        let error = error.clone();
+        let on_signed_in = props.on_signed_in.clone();
+        Callback::from(move |_| {
+            let Some(el) = input.cast::<HtmlInputElement>() else {
+                return;
+            };
+            let value = el.value();
+            if value.trim().is_empty() {
+                return;
+            }
+            auth::set_token(&value);
+            let error = error.clone();
+            let on_signed_in = on_signed_in.clone();
+            spawn_local(async move {
+                match auth::whoami().await {
+                    Ok(who) => {
+                        error.set(None);
+                        on_signed_in.emit(who);
+                    }
+                    Err(Failure::Unauthorized) => {
+                        auth::clear_token();
+                        error.set(Some("that token is not in the roster".into()));
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        })
+    };
+    let on_click = to_click(&submit);
+    let on_keydown = {
+        let submit = submit.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" {
+                e.prevent_default();
+                submit.emit(());
+            }
+        })
+    };
+
+    html! {
+        <div class="app">
+            <div class="pane">
+                <div class="column">
+                    <h1>{ "myco" }</h1>
+                    <p class="dim">
+                        { "Paste the token for your entry in " }
+                        <code>{ "server.toml" }</code>{ "." }
+                    </p>
+                    <input ref={input} type="password" onkeydown={on_keydown}
+                           placeholder="token" />
+                    { " " }
+                    <button onclick={on_click}>{ "sign in" }</button>
+                    { if let Some(e) = &*error { html! {
+                        <div class="err"><pre>{ e }</pre></div>
+                    } } else { html!{} } }
+                </div>
+            </div>
+        </div>
     }
-    resp.json::<T>()
-        .await
-        .map_err(|e| format!("GET {url}: decode: {e}"))
+}
+
+/// `signed in as <name>`, with the sign-out affordance next to it.
+fn whoami_line(who: &Option<Session>) -> Html {
+    let Some(s) = who else { return html! {} };
+    let sign_out = {
+        let cb = s.sign_out.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+    html! {
+        <span class="dim">
+            { format!(" · {} ", s.identity.name) }
+            <button class="linkish" onclick={sign_out}>{ "sign out" }</button>
+        </span>
+    }
 }
 
 /// Click and Enter both mean "send": one action, two bindings. Enter submits
@@ -85,12 +216,12 @@ fn to_enter(send: &Callback<()>) -> Callback<KeyboardEvent> {
     })
 }
 
-async fn fetch_detail(id: &str) -> Result<api::SessionDetail, String> {
-    fetch(&format!("/api/sessions/{id}")).await
+async fn fetch_detail(id: &str) -> Result<api::SessionDetail, Failure> {
+    auth::get(&format!("/api/sessions/{id}")).await
 }
 
-async fn fetch_poll(id: &str) -> Result<api::Poll, String> {
-    fetch(&format!("/api/sessions/{id}/poll?since=0")).await
+async fn fetch_poll(id: &str) -> Result<api::Poll, Failure> {
+    auth::get(&format!("/api/sessions/{id}/poll?since=0")).await
 }
 
 /// Markdown → HTML, with raw HTML in the source neutralized (a model must
@@ -112,6 +243,7 @@ fn markdown(src: &str) -> Html {
 
 #[function_component(Browser)]
 fn browser() -> Html {
+    let who = use_context::<Session>();
     let sessions = use_state(Vec::<api::SessionSummary>::new);
     let show_archived = use_state(|| false);
     let reload = use_state(|| 0_u32);
@@ -119,12 +251,16 @@ fn browser() -> Html {
 
     {
         let sessions = sessions.clone();
+        let who = who.clone();
         use_effect_with((*show_archived, *reload), move |(archived, _)| {
             let archived = *archived;
+            let who = who.clone();
             spawn_local(async move {
                 let url = format!("/api/sessions?include_archived={archived}");
-                if let Ok(list) = fetch::<Vec<api::SessionSummary>>(&url).await {
-                    sessions.set(list);
+                match auth::get::<Vec<api::SessionSummary>>(&url).await {
+                    Ok(list) => sessions.set(list),
+                    Err(Failure::Unauthorized) => sign_out_now(&who),
+                    Err(_) => {}
                 }
             });
         });
@@ -144,6 +280,7 @@ fn browser() -> Html {
         <div class="browser">
             <div class="column">
             <h1>{ "myco" }</h1>
+            { whoami_line(&who) }
             <button onclick={on_new}>{ "new session" }</button>
             { " " }
             <button onclick={toggle_archived}>
@@ -169,13 +306,14 @@ fn browser() -> Html {
                             let id = id.clone();
                             let reload = reload.clone();
                             spawn_local(async move {
-                                let req = Request::patch(&format!("/api/sessions/{id}"))
-                                    .json(&api::UpdateSession {
+                                let _ = auth::patch_json::<api::SessionSummary, _>(
+                                    &format!("/api/sessions/{id}"),
+                                    &api::UpdateSession {
                                         title: None,
                                         archived: Some(!archived),
-                                    })
-                                    .expect("serialize update");
-                                let _ = req.send().await;
+                                    },
+                                )
+                                .await;
                                 reload.set(*reload + 1);
                             });
                         })
@@ -223,32 +361,27 @@ fn draft() -> Html {
             let navigator = navigator.clone();
             spawn_local(async move {
                 // Create, then post, then hand the URL over to `Conversation`.
-                let created = Request::post("/api/sessions")
-                    .json(&api::CreateSession {
+                let created = auth::post_json::<api::SessionSummary, _>(
+                    "/api/sessions",
+                    &api::CreateSession {
                         model: None,
                         parent_session: None,
                         fork: false,
-                    })
-                    .expect("serialize create")
-                    .send()
-                    .await;
+                    },
+                )
+                .await;
                 let summary = match created {
-                    Ok(resp) if resp.ok() => resp.json::<api::SessionSummary>().await.ok(),
-                    Ok(resp) => {
-                        error.set(Some(format!("new session: http {}", resp.status())));
-                        None
-                    }
+                    Ok(s) => s,
                     Err(e) => {
                         error.set(Some(format!("new session: {e}")));
-                        None
+                        return;
                     }
                 };
-                let Some(summary) = summary else { return };
-                let posted = Request::post(&format!("/api/sessions/{}/messages", summary.id))
-                    .json(&api::PostMessage { text })
-                    .expect("serialize message")
-                    .send()
-                    .await;
+                let posted = auth::post_json::<api::Poll, _>(
+                    &format!("/api/sessions/{}/messages", summary.id),
+                    &api::PostMessage { text },
+                )
+                .await;
                 if let Err(e) = posted {
                     error.set(Some(format!("send failed: {e}")));
                     return;
@@ -344,6 +477,7 @@ struct ConversationProps {
 
 #[function_component(Conversation)]
 fn conversation(props: &ConversationProps) -> Html {
+    let who = use_context::<Session>();
     let entries = use_state(Vec::<api::Entry>::new);
     let busy = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
@@ -378,10 +512,10 @@ fn conversation(props: &ConversationProps) -> Html {
                         entries.set(d.entries);
                         busy.set(d.summary.busy);
                     }
-                    Err(e) => error.set(Some(e)),
+                    Err(e) => error.set(Some(e.to_string())),
                 }
 
-                let es = match EventSource::new(&format!("/api/sessions/{id}/events")) {
+                let es = match EventSource::new(&auth::sse_url(&id)) {
                     Ok(es) => es,
                     Err(e) => {
                         error.set(Some(format!("event stream: {e}")));
@@ -438,7 +572,7 @@ fn conversation(props: &ConversationProps) -> Html {
                                         error.set(p.last_error);
                                     }
                                 }
-                                Err(e) => error.set(Some(e)),
+                                Err(e) => error.set(Some(e.to_string())),
                             }
                         }
                     }
@@ -516,15 +650,13 @@ fn conversation(props: &ConversationProps) -> Html {
             let id = id.clone();
             let error = error.clone();
             spawn_local(async move {
-                let req = Request::post(&format!("/api/sessions/{id}/messages"))
-                    .json(&api::PostMessage { text })
-                    .expect("serialize message");
-                match req.send().await {
-                    Ok(resp) if !resp.ok() => {
-                        error.set(Some(format!("send failed: http {}", resp.status())))
-                    }
-                    Err(e) => error.set(Some(format!("send failed: {e}"))),
-                    _ => {}
+                if let Err(e) = auth::post_json::<api::Poll, _>(
+                    &format!("/api/sessions/{id}/messages"),
+                    &api::PostMessage { text },
+                )
+                .await
+                {
+                    error.set(Some(format!("send failed: {e}")));
                 }
             });
         })
@@ -538,9 +670,7 @@ fn conversation(props: &ConversationProps) -> Html {
         Callback::from(move |_: MouseEvent| {
             let id = id.clone();
             spawn_local(async move {
-                let _ = Request::post(&format!("/api/sessions/{id}/cancel"))
-                    .send()
-                    .await;
+                let _ = auth::post::<api::Poll>(&format!("/api/sessions/{id}/cancel")).await;
             });
         })
     };
@@ -552,6 +682,7 @@ fn conversation(props: &ConversationProps) -> Html {
                     <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
                     <span class="dim">{ format!(" {} ", props.id) }</span>
                     { if *busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                    { whoami_line(&who) }
                 </div>
             </div>
             <div class="pane" ref={pane} onscroll={on_scroll}>

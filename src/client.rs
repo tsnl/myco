@@ -10,15 +10,32 @@ use myco_api as api;
 pub struct HttpClient {
     /// e.g. `http://127.0.0.1:7773/api` (no trailing slash).
     base: String,
+    /// Bearer token identifying this client; the server attributes every
+    /// entry it writes to whoever the token belongs to.
+    token: String,
     http: reqwest::Client,
 }
 
 impl HttpClient {
-    pub fn new(base: impl Into<String>) -> Self {
+    pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
+            token: token.into(),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// From `$MYCO_API` / `$MYCO_API_TOKEN`, as exported by `--mode serve`
+    /// into the environment tools run in.
+    pub fn from_env() -> Result<Self, String> {
+        let base = std::env::var("MYCO_API").map_err(|_| "MYCO_API is not set".to_string())?;
+        let token =
+            std::env::var("MYCO_API_TOKEN").map_err(|_| "MYCO_API_TOKEN is not set".to_string())?;
+        Ok(Self::new(base, token))
+    }
+
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.bearer_auth(&self.token)
     }
 
     async fn decode<T: serde::de::DeserializeOwned>(
@@ -38,20 +55,15 @@ impl HttpClient {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .send()
+        self.send(self.http.get(format!("{}{path}", self.base)))
             .await
-            .map_err(transport)?;
-        Self::decode(resp).await
     }
 
     async fn send<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, ApiError> {
-        Self::decode(req.send().await.map_err(transport)?).await
+        Self::decode(self.auth(req).send().await.map_err(transport)?).await
     }
 }
 
@@ -110,8 +122,7 @@ impl MycoApi for HttpClient {
 
     async fn events(&self, id: &str) -> Result<EventStream, ApiError> {
         let resp = self
-            .http
-            .get(format!("{}/sessions/{id}/events", self.base))
+            .auth(self.http.get(format!("{}/sessions/{id}/events", self.base)))
             .send()
             .await
             .map_err(transport)?;
@@ -172,5 +183,9 @@ impl MycoApi for HttpClient {
 
     async fn models(&self) -> Result<api::Models, ApiError> {
         self.get("/models").await
+    }
+
+    async fn whoami(&self) -> Result<api::Identity, ApiError> {
+        self.get("/whoami").await
     }
 }

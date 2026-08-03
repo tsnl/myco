@@ -82,12 +82,33 @@ pub struct Models {
     pub default_model: String,
 }
 
+/// Who the caller is, as the server sees them. Every implementation of
+/// [`MycoApi`] is bound to exactly one identity — the in-process server to
+/// the roster's local user, an HTTP client to whoever its token belongs to —
+/// so this is a property of the handle, not a parameter on each call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<Identity> for Author {
+    fn from(i: Identity) -> Author {
+        Author::User {
+            id: i.id,
+            name: i.name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     NotFound,
     Conflict,
     BadRequest,
+    /// No credential, or one the server does not recognize.
+    Unauthorized,
     #[default]
     Internal,
 }
@@ -146,6 +167,9 @@ pub trait MycoApi: Send + Sync {
     /// Retire the live agent task (the session stays on disk, resumable).
     async fn retire(&self, id: &str) -> Result<Poll, ApiError>;
     async fn models(&self) -> Result<Models, ApiError>;
+    /// The identity this handle acts as. Anything it writes is attributed
+    /// here, so a client can show the user who they are posting as.
+    async fn whoami(&self) -> Result<Identity, ApiError>;
 }
 
 /// One SSE event on `/api/sessions/<id>/events` — a live projection of the
