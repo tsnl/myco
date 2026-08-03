@@ -1,0 +1,23 @@
+[package]
+name = "myco-auth"
+description = "myco: user credentials, access tokens, and the admin surface over them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+myco-api = { workspace = true }
+myco-core = { workspace = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+rand = "0.9"
+base64 = "0.22"
+
+[dev-dependencies]
+myco-test-support = { workspace = true }

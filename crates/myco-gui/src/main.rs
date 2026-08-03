@@ -79,8 +79,11 @@ fn app() -> Html {
     let sign_out = {
         let identity = identity.clone();
         Callback::from(move |_: ()| {
-            auth::clear_token();
-            identity.set(None);
+            let identity = identity.clone();
+            spawn_local(async move {
+                auth::logout().await;
+                identity.set(None);
+            });
         })
     };
 
@@ -115,39 +118,55 @@ struct LoginProps {
     on_signed_in: Callback<api::Identity>,
 }
 
-/// Token entry. Deliberately the whole page and nothing else: there is no
-/// anonymous view of this server to decorate.
+/// Sign-in. Deliberately the whole page and nothing else: there is no
+/// anonymous view of this server to decorate, and no signup — accounts are
+/// created by an administrator with `myco auth`.
 #[function_component(Login)]
 fn login(props: &LoginProps) -> Html {
-    let input = use_node_ref();
+    let username = use_node_ref();
+    let password = use_node_ref();
     let error = use_state(|| Option::<String>::None);
+    let busy = use_state(|| false);
 
     let submit: Callback<()> = {
-        let input = input.clone();
+        let username = username.clone();
+        let password = password.clone();
         let error = error.clone();
+        let busy = busy.clone();
         let on_signed_in = props.on_signed_in.clone();
         Callback::from(move |_| {
-            let Some(el) = input.cast::<HtmlInputElement>() else {
+            let (Some(u), Some(p)) = (
+                username.cast::<HtmlInputElement>(),
+                password.cast::<HtmlInputElement>(),
+            ) else {
                 return;
             };
-            let value = el.value();
-            if value.trim().is_empty() {
+            let (u, p) = (u.value(), p.value());
+            if u.trim().is_empty() || p.is_empty() {
+                error.set(Some("username and password are required".into()));
                 return;
             }
-            auth::set_token(&value);
+            busy.set(true);
             let error = error.clone();
+            let busy = busy.clone();
             let on_signed_in = on_signed_in.clone();
             spawn_local(async move {
-                match auth::whoami().await {
+                match auth::login(&u, &p).await {
                     Ok(who) => {
                         error.set(None);
+                        busy.set(false);
                         on_signed_in.emit(who);
                     }
                     Err(Failure::Unauthorized) => {
-                        auth::clear_token();
-                        error.set(Some("that token is not in the roster".into()));
+                        busy.set(false);
+                        // The server does not say which half was wrong, and
+                        // neither do we.
+                        error.set(Some("incorrect username or password".into()));
                     }
-                    Err(e) => error.set(Some(e.to_string())),
+                    Err(e) => {
+                        busy.set(false);
+                        error.set(Some(e.to_string()));
+                    }
                 }
             });
         })
@@ -166,16 +185,21 @@ fn login(props: &LoginProps) -> Html {
     html! {
         <div class="app">
             <div class="pane">
-                <div class="column">
+                <div class="column login">
                     <h1>{ "myco" }</h1>
-                    <p class="dim">
-                        { "Paste the token for your entry in " }
-                        <code>{ "server.toml" }</code>{ "." }
-                    </p>
-                    <input ref={input} type="password" onkeydown={on_keydown}
-                           placeholder="token" />
-                    { " " }
-                    <button onclick={on_click}>{ "sign in" }</button>
+                    <div class="login-row">
+                        <input ref={username} type="text" autocomplete="username"
+                               onkeydown={on_keydown.clone()} placeholder="username" />
+                    </div>
+                    <div class="login-row">
+                        <input ref={password} type="password" autocomplete="current-password"
+                               onkeydown={on_keydown} placeholder="password" />
+                    </div>
+                    <div class="login-row">
+                        <button onclick={on_click} disabled={*busy}>
+                            { if *busy { "signing in…" } else { "sign in" } }
+                        </button>
+                    </div>
                     { if let Some(e) = &*error { html! {
                         <div class="err"><pre>{ e }</pre></div>
                     } } else { html!{} } }

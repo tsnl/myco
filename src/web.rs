@@ -9,12 +9,13 @@
 
 use std::sync::Arc;
 
+use rocket::form::{Form, FromForm};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
 use rocket::response::status::Custom;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
-use rocket::{Request, delete, get, patch, post, routes};
+use rocket::{Request, State, delete, get, patch, post, routes};
 
 use futures::StreamExt;
 use myco_api::{ApiError, ErrorKind, MycoApi};
@@ -33,26 +34,32 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
     }
 
     // Local bash sessions (and scripts nesting agents by hand) discover the
-    // API here. The token is the local user's, so a shell the agent spawns
-    // acts as the operator who started the server — not as someone new.
+    // API here.
     // SAFETY: called once at boot before shells are spawned.
     unsafe { std::env::set_var("MYCO_API", format!("http://127.0.0.1:{port}/api")) };
-    if let Some(token) = config.roster.local().token.clone() {
-        unsafe { std::env::set_var("MYCO_API_TOKEN", token) };
-    } else {
-        eprintln!(
-            "myco: {} has no token for {:?}, so $MYCO_API is unusable from tools — \
-             add one to reach the API from a shell",
-            config.roster.path.display(),
-            config.roster.local().id
-        );
-    }
 
     let figment = rocket::Config::figment()
         .merge(("address", "127.0.0.1"))
         .merge(("port", port));
 
-    rocket(Server::new(config), figment)
+    let server = Server::new(config);
+    // Tools the agent spawns act as the operator who started the server. The
+    // token is minted here rather than configured, so it is as short-lived as
+    // any other session and never sits in a file.
+    match server
+        .auth()
+        .issue_for(server.config().roster.local().id.as_str())
+    {
+        Some(issued) => unsafe {
+            std::env::set_var("MYCO_API_TOKEN", &issued.access_token);
+        },
+        None => eprintln!(
+            "myco: no credential store entry for {:?}, so $MYCO_API is unusable from tools",
+            server.config().roster.local().id
+        ),
+    }
+
+    rocket(server, figment)
         .launch()
         .await
         .map_err(|e| format!("rocket: {e}"))?;
@@ -79,7 +86,9 @@ pub fn rocket(
             compact,
             archive,
             models,
-            whoami
+            whoami,
+            auth_token,
+            auth_logout
         ],
     )
 }
@@ -131,11 +140,13 @@ impl<'r> FromRequest<'r> for Caller {
                 ),
             ));
         };
-        match server.config().roster.by_token(&presented) {
+        match server.auth().authenticate_token(&presented) {
             Some(user) => Outcome::Success(Caller(server.as_user(user.author()))),
             None => Outcome::Error((
                 Status::Unauthorized,
-                ApiError::new(ErrorKind::Unauthorized, "unknown token"),
+                // One message for unknown, expired, and revoked alike: the
+                // client's next step is the same in every case.
+                ApiError::new(ErrorKind::Unauthorized, "invalid or expired token"),
             )),
         }
     }
@@ -253,4 +264,54 @@ async fn models(caller: Caller) -> ApiResult<api::Models> {
 #[get("/whoami")]
 async fn whoami(caller: Caller) -> ApiResult<api::Identity> {
     output(caller.whoami().await)
+}
+
+/// OAuth 2.0 password grant (RFC 6749 §4.3): credentials in, bearer token out.
+///
+/// The request is `application/x-www-form-urlencoded` and the response uses
+/// the spec's field names, so a stock OAuth2 client works against it unchanged.
+#[post("/auth/token", data = "<form>")]
+async fn auth_token(
+    server: &State<Arc<Server>>,
+    form: Form<TokenRequest>,
+) -> ApiResult<api::AccessToken> {
+    // `grant_type` is required by the spec; refusing an unknown one keeps a
+    // future grant from silently being treated as this one.
+    if let Some(grant) = &form.grant_type
+        && grant != "password"
+    {
+        return output(Err(ApiError::new(
+            ErrorKind::BadRequest,
+            format!("unsupported grant_type: {grant}"),
+        )));
+    }
+    match server.auth().login(&form.username, &form.password) {
+        Ok(issued) => output(Ok(api::AccessToken {
+            access_token: issued.access_token,
+            token_type: "bearer".into(),
+            expires_in: issued.expires_in_seconds,
+            user: issued.user.identity(),
+        })),
+        Err(e) => output(Err(ApiError::new(ErrorKind::Unauthorized, e.to_string()))),
+    }
+}
+
+/// Drop the presented token. Signing out must actually end the session, not
+/// just forget it client-side.
+#[post("/auth/logout")]
+async fn auth_logout(server: &State<Arc<Server>>, caller: Caller) -> ApiResult<api::Identity> {
+    let who = caller.whoami().await;
+    if let Ok(id) = &who {
+        server.auth().revoke_all_for(&id.id);
+    }
+    output(who)
+}
+
+/// The `POST /auth/token` form body.
+#[derive(FromForm)]
+struct TokenRequest {
+    username: String,
+    password: String,
+    /// Spec-required, but tolerated when absent so `curl -d user -d pass` works.
+    grant_type: Option<String>,
 }

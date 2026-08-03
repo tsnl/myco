@@ -20,6 +20,7 @@ myco-session = { workspace = true }
 myco-machines = { workspace = true }
 myco-agent = { workspace = true }
 myco-api = { workspace = true }
+myco-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -36,6 +37,7 @@ schemars = { workspace = true }
 reqwest = { workspace = true }
 rustyline = "15"
 unicode-width = "0.2"
+libc = "0.2.189"
 
 [dev-dependencies]
 myco-test-support = { workspace = true }
@@ -53,6 +55,7 @@ members = [
     "crates/myco-agent",
     "crates/myco-test-support",
     "crates/myco-api",
+    "crates/myco-auth",
     "crates/myco-gui",
 ]
 
@@ -72,6 +75,7 @@ myco-machines = { path = "crates/myco-machines", version = "0.4.0-dev" }
 myco-agent = { path = "crates/myco-agent", version = "0.4.0-dev" }
 myco-test-support = { path = "crates/myco-test-support", version = "0.4.0-dev" }
 myco-api = { path = "crates/myco-api", version = "0.4.0-dev" }
+myco-auth = { path = "crates/myco-auth", version = "0.4.0-dev" }
 
 async-trait = "0.1"
 atomic-write-file = "0.3.0"

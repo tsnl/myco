@@ -11,6 +11,7 @@ pub use myco_models as generative_model;
 pub use myco_prompts as prompts;
 pub use myco_session as session;
 
+pub mod admin;
 pub mod cli;
 pub mod client;
 pub mod server;
