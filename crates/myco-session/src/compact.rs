@@ -1,7 +1,7 @@
 //! Session compaction: archive predecessor, seed successor with summary + tail.
 
 use crate::Session;
-use myco_models::{Content, Message};
+use myco_api::{Author, Content, Entry, EntryBody};
 use myco_prompts as prompts;
 
 /// How many trailing user-turns the successor keeps verbatim (well-formed).
@@ -26,7 +26,7 @@ pub fn compact_session(
     summary_markdown: &str,
     model: &str,
 ) -> Result<(Session, CompactOutcome), String> {
-    if predecessor.messages.is_empty() {
+    if predecessor.entries.is_empty() {
         return Err("cannot compact an empty session".into());
     }
     if summary_markdown.trim().is_empty() {
@@ -34,7 +34,7 @@ pub fn compact_session(
     }
 
     let tail = select_tail(
-        &predecessor.messages,
+        &predecessor.entries,
         TAIL_USER_TURNS,
         TAIL_TOOL_BODY_MAX_CHARS,
     );
@@ -56,19 +56,24 @@ pub fn compact_session(
         predecessor.summary_path().display()
     ));
 
-    // Compaction mints a new session id, so the successor's first message
-    // stamps its own — the resume block below names the predecessor.
-    let mut messages = vec![Message::UserMessage {
-        content: vec![
-            Content::Text {
-                text: prompts::session_stamp(&successor.id, successor.created_at),
-            },
-            Content::Text { text: resume },
-        ],
+    // Compaction mints a new session id, so the successor's first entry
+    // stamps its own — the resume block below names the predecessor. The
+    // runtime wrote it, so the runtime is its author.
+    let mut entries = vec![Entry {
+        author: Author::System,
+        at: successor.created_at,
+        body: EntryBody::User {
+            content: vec![
+                Content::Text {
+                    text: prompts::session_stamp(&successor.id, successor.created_at),
+                },
+                Content::Text { text: resume },
+            ],
+        },
     }];
-    messages.extend(tail.iter().cloned());
-    let tail_messages = messages.len().saturating_sub(1);
-    successor.messages = messages;
+    entries.extend(tail.iter().cloned());
+    let tail_messages = entries.len().saturating_sub(1);
+    successor.entries = entries;
 
     // Persist summary next to predecessor if not already present / overwrite with canonical.
     let summary_path = predecessor.summary_path();
@@ -100,15 +105,15 @@ pub fn link_compact_pair(predecessor: &mut Session, successor: &Session) -> Resu
 }
 
 /// Select the last `user_turns` well-formed user turns (user → … → assistant end).
-pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize) -> Vec<Message> {
-    if user_turns == 0 || messages.is_empty() {
+pub fn select_tail(entries: &[Entry], user_turns: usize, tool_body_max: usize) -> Vec<Entry> {
+    if user_turns == 0 || entries.is_empty() {
         return Vec::new();
     }
-    // Find start indices of UserMessage entries.
-    let user_idxs: Vec<usize> = messages
+    // Find start indices of user entries.
+    let user_idxs: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter_map(|(i, m)| matches!(m, Message::UserMessage { .. }).then_some(i))
+        .filter_map(|(i, e)| matches!(e.body, EntryBody::User { .. }).then_some(i))
         .collect();
     if user_idxs.is_empty() {
         return Vec::new();
@@ -116,27 +121,29 @@ pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize
     let start_user = user_idxs.len().saturating_sub(user_turns);
     let start = user_idxs[start_user];
 
-    // Extend backward if we would start mid tool loop (shouldn't for UserMessage start).
-    let slice = &messages[start..];
-    // Ensure we don't end mid tool_use without results: if last is Assistant with tool_uses
-    // and no following ToolResults, drop that incomplete assistant.
+    let slice = &entries[start..];
+    // Never end mid tool loop: an agent entry with unanswered tool calls would
+    // leave the successor's first request malformed.
     let mut end = slice.len();
-    if let Some(Message::AssistantMessage { tool_uses, .. }) = slice.last()
+    if let Some(Entry {
+        body: EntryBody::Agent { tool_uses, .. },
+        ..
+    }) = slice.last()
         && !tool_uses.is_empty()
     {
         end = end.saturating_sub(1);
     }
-    let mut out: Vec<Message> = slice[..end].to_vec();
-    for m in &mut out {
-        truncate_message_bodies(m, tool_body_max);
+    let mut out: Vec<Entry> = slice[..end].to_vec();
+    for e in &mut out {
+        truncate_entry_bodies(e, tool_body_max);
     }
     out
 }
 
-fn truncate_message_bodies(msg: &mut Message, max_chars: usize) {
-    match msg {
-        Message::ToolResults { tool_use_results } => {
-            for r in tool_use_results {
+fn truncate_entry_bodies(entry: &mut Entry, max_chars: usize) {
+    match &mut entry.body {
+        EntryBody::ToolResults { results } => {
+            for r in results {
                 for c in &mut r.content {
                     if let Content::Text { text } = c {
                         *text = truncate_chars(text, max_chars);
@@ -144,7 +151,7 @@ fn truncate_message_bodies(msg: &mut Message, max_chars: usize) {
                 }
             }
         }
-        Message::AssistantMessage { content, .. } | Message::UserMessage { content } => {
+        EntryBody::Agent { content, .. } | EntryBody::User { content } => {
             for c in content {
                 if let Content::Text { text } = c {
                     *text = truncate_chars(text, max_chars.max(8_000));
@@ -177,7 +184,7 @@ mod tests {
         let _home = temp_home("compact-link");
 
         let mut pred = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
-        pred.messages = vec![user("hello"), assistant("hi")];
+        pred.entries = vec![user("hello"), assistant("hi")];
         pred.save().unwrap();
 
         let successor = pred.fork_child("m");
@@ -200,7 +207,7 @@ mod tests {
         );
     }
 
-    fn assistant_tools() -> Message {
+    fn assistant_tools() -> Entry {
         assistant_tool(None, "t1", "bash", json!({"command": "echo hi"}))
     }
 
@@ -217,12 +224,12 @@ mod tests {
             assistant("new a"),
         ];
         let tail = select_tail(&messages, 2, 1000);
-        assert!(matches!(tail[0], Message::UserMessage { .. }));
+        assert!(matches!(tail[0].body, EntryBody::User { .. }));
         // mid + new = 2 user turns including tool loop
         assert!(tail.len() >= 5, "tail={tail:?}");
         assert!(matches!(
-            tail.last(),
-            Some(Message::AssistantMessage { .. })
+            tail.last().map(|e| &e.body),
+            Some(EntryBody::Agent { .. })
         ));
     }
 
@@ -231,7 +238,7 @@ mod tests {
         let messages = vec![user("u"), assistant_tools()];
         let tail = select_tail(&messages, 1, 1000);
         assert_eq!(tail.len(), 1);
-        assert!(matches!(tail[0], Message::UserMessage { .. }));
+        assert!(matches!(tail[0].body, EntryBody::User { .. }));
     }
 
     #[test]
@@ -239,7 +246,7 @@ mod tests {
         let _home = temp_home("compact");
 
         let mut pred = Session::new("claude-haiku-4-5");
-        pred.messages = vec![user("hello"), assistant("world")];
+        pred.entries = vec![user("hello"), assistant("world")];
         pred.title = Some("t".into());
         pred.save().unwrap();
 
@@ -247,11 +254,11 @@ mod tests {
             compact_session(&pred, "## Goal\nDo the thing\n", "claude-haiku-4-5").unwrap();
         assert_eq!(out.predecessor_id, pred.id);
         assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
-        assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
+        assert!(matches!(succ.entries[0].body, EntryBody::User { .. }));
         // Compaction mints a new id, so the successor's first message stamps
         // its own — an agent that compacts must not keep quoting the
         // predecessor's id as its session.
-        let Message::UserMessage { content } = &succ.messages[0] else {
+        let EntryBody::User { content } = &succ.entries[0].body else {
             unreachable!()
         };
         assert!(

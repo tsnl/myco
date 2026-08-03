@@ -29,14 +29,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use myco_agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
+use myco_api::{Author, Entry, EntryBody};
 use myco_config::Config;
 use myco_machines::harness::Harness;
 use myco_machines::tool_services::{
     ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
 };
 use myco_models::{
-    BackendConfig, CatalogModel, Content, Effort, GenerativeModel, GenerativeModelConfig, Message,
-    Recovery,
+    BackendConfig, CatalogModel, Content, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
 };
 use myco_session::{ActiveSession, Session, SessionWriteLock, expand_image_attachments};
 
@@ -150,8 +150,8 @@ fn default_model_factory(
 
 /// One queued unit of work for a session's agent task.
 pub enum Cmd {
-    /// One user turn.
-    User(String),
+    /// One user turn, attributed to whoever sent it.
+    User { author: Author, text: String },
     /// Compact into a successor session (also queued automatically when a
     /// turn ends with the context nearly full).
     Compact,
@@ -271,8 +271,9 @@ impl Server {
         )?;
         let mut agent = Agent::new(model, harness.clone(), sink);
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+        agent.set_model_key(catalog_model.spec.key.clone());
         let restored = active.snapshot();
-        agent.set_history(restored.messages.clone());
+        agent.set_history(restored.entries.clone());
         agent.set_last_usage(restored.last_usage);
         wire_checkpoint(&mut agent, &active);
 
@@ -393,7 +394,7 @@ async fn run_agent_task(mut t: AgentTask) {
         *t.handle.cancel.lock().await = cancel.clone();
 
         match cmd {
-            Cmd::User(text) => run_user_turn(&mut t, text, cancel).await,
+            Cmd::User { author, text } => run_user_turn(&mut t, author, text, cancel).await,
             Cmd::Compact => run_compact(&mut t, cancel).await,
         }
 
@@ -405,7 +406,7 @@ async fn run_agent_task(mut t: AgentTask) {
     }
 }
 
-async fn run_user_turn(t: &mut AgentTask, text: String, cancel: CancelToken) {
+async fn run_user_turn(t: &mut AgentTask, author: Author, text: String, cancel: CancelToken) {
     let _ = t.active.maybe_auto_title_from_user_text(&text);
 
     // `@path` image mentions expand exactly like the v1 CLI.
@@ -418,7 +419,11 @@ async fn run_user_turn(t: &mut AgentTask, text: String, cancel: CancelToken) {
     // One retry for provider blips; other failures surface immediately.
     let mut retried = false;
     let error = loop {
-        match t.agent.interact(content.clone(), cancel.clone()).await {
+        match t
+            .agent
+            .interact(author.clone(), content.clone(), cancel.clone())
+            .await
+        {
             Ok(_) => break None,
             Err(myco_agent::AgentInteractionError::Cancelled) => {
                 break Some("(turn cancelled)".to_string());
@@ -454,7 +459,7 @@ The last message was removed from the conversation so the                       
     }
     if let Err(e) = t
         .active
-        .persist_messages(t.agent.history(), t.agent.last_usage(), true)
+        .persist_entries(t.agent.history(), t.agent.last_usage(), true)
     {
         eprintln!("[{}] session save failed: {e}", t.active.id());
     }
@@ -486,13 +491,13 @@ async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
     };
     if let Err(e) = t
         .active
-        .persist_messages(t.agent.history(), t.agent.last_usage(), true)
+        .persist_entries(t.agent.history(), t.agent.last_usage(), true)
     {
         fail(t, format!("failed to persist current session: {e}"));
         return;
     }
     let predecessor = t.active.snapshot();
-    if predecessor.messages.is_empty() {
+    if predecessor.entries.is_empty() {
         fail(t, "session is empty".into());
         return;
     }
@@ -543,7 +548,7 @@ async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
         Err(myco_session::SessionLockError::Unavailable(_)) => None,
     };
     t.active.replace(successor.clone());
-    t.agent.set_history(successor.messages.clone());
+    t.agent.set_history(successor.entries.clone());
     t.agent.set_last_usage(successor.last_usage);
     *t.handle.lock.lock().unwrap_or_else(|e| e.into_inner()) = new_lock;
 
@@ -565,7 +570,7 @@ async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
 fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
     let checkpoint_session = active_session.clone();
     agent.set_checkpoint(Box::new(move |messages, last_usage| {
-        if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
+        if let Err(e) = checkpoint_session.persist_entries(messages, last_usage, false) {
             eprintln!("warning: mid-turn session save failed: {e}");
         }
     }));
@@ -597,10 +602,22 @@ fn build_model(
     .map_err(|e| format!("failed to create model: {e}"))
 }
 
-/// The final assistant prose of the last turn, for `subagent` results.
-pub fn last_answer(messages: &[Message]) -> Option<String> {
-    match messages.last()? {
-        Message::AssistantMessage { content, .. } => {
+/// The author for turns driven locally, before there is a user roster: the
+/// OS user, which is who the process is already trusted as.
+pub fn local_author() -> Author {
+    let name = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "local".to_string());
+    Author::User {
+        id: "local".to_string(),
+        name,
+    }
+}
+
+/// The final agent prose of the last turn, for `subagent` results.
+pub fn last_answer(entries: &[Entry]) -> Option<String> {
+    match &entries.last()?.body {
+        EntryBody::Agent { content, .. } => {
             let text: Vec<String> = content
                 .iter()
                 .filter_map(|c| match c {
@@ -657,69 +674,6 @@ fn internal(e: String) -> ApiError {
     ApiError::new(ErrorKind::Internal, e)
 }
 
-/// Lossy plaintext projection of the message history (see `myco_api::Entry`).
-pub fn render_entries(messages: &[Message]) -> Vec<api::Entry> {
-    let mut out = Vec::new();
-    let mut push = |role: &str, text: String| {
-        if !text.trim().is_empty() {
-            let index = out.len();
-            out.push(api::Entry {
-                index,
-                role: role.to_string(),
-                text,
-            });
-        }
-    };
-    for m in messages {
-        match m {
-            Message::UserMessage { content } => push("user", content_text(content)),
-            Message::AssistantMessage {
-                content, tool_uses, ..
-            } => {
-                for c in content {
-                    match c {
-                        Content::Thinking { text, .. } => push("thinking", text.clone()),
-                        Content::Text { text } => push("assistant", text.clone()),
-                        Content::Image { .. } => push("assistant", "[image]".into()),
-                    }
-                }
-                for t in tool_uses {
-                    push(
-                        "tool_use",
-                        format!(
-                            "{}({})",
-                            t.name,
-                            serde_json::to_string(&t.input).unwrap_or_default()
-                        ),
-                    );
-                }
-            }
-            Message::ToolResults { tool_use_results } => {
-                for r in tool_use_results {
-                    let prefix = if r.is_error { "error: " } else { "" };
-                    push(
-                        "tool_result",
-                        format!("{prefix}{}", content_text(&r.content)),
-                    );
-                }
-            }
-        }
-    }
-    out
-}
-
-fn content_text(content: &[Content]) -> String {
-    content
-        .iter()
-        .map(|c| match c {
-            Content::Text { text } => text.clone(),
-            Content::Image { .. } => "[image]".to_string(),
-            Content::Thinking { text, .. } => text.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
     api::SessionSummary {
         archived: s.archived,
@@ -728,7 +682,7 @@ fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
         model: s.model.clone(),
         created_at: s.created_at.to_rfc3339(),
         updated_at: s.updated_at.to_rfc3339(),
-        message_count: s.messages.len(),
+        message_count: s.entries.len(),
         snippet: String::new(),
         live,
         busy,
@@ -806,7 +760,7 @@ impl MycoApi for Server {
         let session = self.load_or_snapshot(id).await?;
         let (live, busy) = self.live_flags(&session.id).await;
         Ok(api::SessionDetail {
-            entries: render_entries(&session.messages),
+            entries: session.entries.clone(),
             summary: summary_of(&session, live, busy),
         })
     }
@@ -861,12 +815,15 @@ impl MycoApi for Server {
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
         live.tx
-            .send(Cmd::User(req.text.clone()))
+            .send(Cmd::User {
+                author: local_author(),
+                text: req.text.clone(),
+            })
             .map_err(|_| internal("agent task gone".into()))?;
         let snapshot = live.session.snapshot();
         Ok(api::Poll {
             busy: true,
-            total: render_entries(&snapshot.messages).len(),
+            total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: None,
         })
@@ -879,7 +836,7 @@ impl MycoApi for Server {
             Some(l) => l.error(),
             None => None,
         };
-        let all = render_entries(&session.messages);
+        let all = session.entries.clone();
         let since = since.min(all.len());
         Ok(api::Poll {
             busy,
@@ -916,7 +873,7 @@ impl MycoApi for Server {
         let snapshot = live.session.snapshot();
         Ok(api::Poll {
             busy: live.is_busy(),
-            total: render_entries(&snapshot.messages).len(),
+            total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: live.error(),
         })

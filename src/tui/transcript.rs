@@ -14,7 +14,9 @@
 use std::io::Write;
 
 use super::markdown::{MarkdownRenderer, render_block};
-use crate::generative_model::{Content, Message, TokenUsage};
+use myco_api::{Entry, EntryBody};
+
+use crate::generative_model::{Content, TokenUsage};
 use crate::tui::{
     SectionState, Style, TuiEvent, encode_ansi, encoded_ends_with_newline, section_open_events,
     styled_line, tool_invocation_events,
@@ -239,12 +241,12 @@ pub fn attachment_note(content: &[Content]) -> Option<String> {
 /// part of history and are not replayed. Storage keeps assistant content and
 /// tool_uses as separate lists (interleaving is lost), so replay renders
 /// content paragraphs first, then tool paragraphs, per message.
-pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
+pub fn history_events(entries: &[Entry], palette: Palette) -> Vec<TuiEvent> {
     let mut st = SectionState::new();
     let mut events = Vec::new();
-    for msg in messages {
-        match msg {
-            Message::UserMessage { content } => {
+    for entry in entries {
+        match &entry.body {
+            EntryBody::User { content } => {
                 let text = content
                     .iter()
                     .filter_map(|c| match c {
@@ -276,7 +278,7 @@ pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
                 // Next assistant turn opens a fresh ASSISTANT section.
                 st = SectionState::new();
             }
-            Message::AssistantMessage {
+            EntryBody::Agent {
                 content, tool_uses, ..
             } => {
                 for c in content {
@@ -313,7 +315,7 @@ pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
                     st.need_blank = true;
                 }
             }
-            Message::ToolResults { .. } => {}
+            EntryBody::ToolResults { .. } => {}
         }
     }
     events
@@ -374,13 +376,13 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, Message, ToolUse, TurnEndReason};
+    use crate::generative_model::{Content, ToolUse, TurnEndReason};
     use myco_test_support::{assistant, thinking, thinking_msg, tool_loop, user};
     use serde_json::json;
 
     /// Replay bytes as a terminal sees them: events, ANSI-encoded.
-    fn render_history(messages: &[Message], palette: Palette) -> String {
-        encode_ansi(&history_events(messages, palette), palette.enabled)
+    fn render_history(entries: &[Entry], palette: Palette) -> String {
+        encode_ansi(&history_events(entries, palette), palette.enabled)
     }
 
     fn render_compacted_banner(
@@ -519,14 +521,15 @@ mod tests {
     fn session_history_thinking_and_tools_in_assistant() {
         let messages = vec![
             user("q"),
-            Message::AssistantMessage {
-                content: vec![
+            Entry::agent(
+                "m",
+                vec![
                     thinking("step a\nstep b"),
                     Content::Text {
                         text: "answer".into(),
                     },
                 ],
-                tool_uses: vec![
+                vec![
                     ToolUse {
                         id: "1".into(),
                         name: "bash".into(),
@@ -538,8 +541,8 @@ mod tests {
                         input: json!({"command": "echo 2"}),
                     },
                 ],
-                turn_end_reason: Some(TurnEndReason::ToolUse),
-            },
+                Some(TurnEndReason::ToolUse),
+            ),
         ];
         let rendered = render_history(&messages, Palette::plain());
 
@@ -578,8 +581,9 @@ mod tests {
 
     #[test]
     fn user_images_replay_as_count_placeholder() {
-        let messages = vec![Message::UserMessage {
-            content: vec![
+        let messages = vec![Entry::user(
+            myco_api::Author::System,
+            vec![
                 Content::Image {
                     source: "data:image/png;base64,AAAA".into(),
                 },
@@ -587,7 +591,7 @@ mod tests {
                     text: "look at @shot.png".into(),
                 },
             ],
-        }];
+        )];
         let rendered = render_history(&messages, Palette::plain());
         assert!(rendered.contains("look at @shot.png\n[1 image attached]\n"));
         // The base64 payload never hits the terminal.
@@ -725,17 +729,18 @@ mod tests {
 
     #[test]
     fn thinking_blocks_are_replayed_from_history() {
-        let messages = vec![Message::AssistantMessage {
-            content: vec![
+        let messages = vec![Entry::agent(
+            "m",
+            vec![
                 thinking("secret-thought-aaa"),
                 thinking("secret-thought-bbb"),
                 Content::Text {
                     text: "done".into(),
                 },
             ],
-            tool_uses: vec![],
-            turn_end_reason: Some(TurnEndReason::EndTurn),
-        }];
+            vec![],
+            Some(TurnEndReason::EndTurn),
+        )];
         let rendered = render_history(&messages, Palette::plain());
         assert!(!rendered.contains("THINKING\n"));
         assert!(rendered.contains("Thinking: secret-thought-aaa\n"));

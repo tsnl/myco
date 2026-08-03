@@ -3,8 +3,9 @@
 use myco_models as generative_model;
 use std::sync::Arc;
 
+use myco_api::{Entry, EntryBody};
 use myco_core::Async;
-use myco_models::{self, Content, Message, ToolResult, ToolUse};
+use myco_models::{self, Content, ToolResult, ToolUse};
 use myco_session::Session;
 
 use super::{HostDispatchContext, ToolService};
@@ -86,7 +87,7 @@ impl SessionHistoryTool {
             ActionKind::Stats => Ok(format_stats(&session)),
             ActionKind::Range => {
                 let start = input.start.unwrap_or(0);
-                let end = input.end.unwrap_or(session.messages.len());
+                let end = input.end.unwrap_or(session.entries.len());
                 let max_chars = input
                     .max_chars
                     .unwrap_or(DEFAULT_MAX_CHARS)
@@ -140,13 +141,13 @@ fn format_stats(session: &Session) -> String {
     let mut assistants = 0usize;
     let mut tool_results = 0usize;
     let mut chars = 0usize;
-    for m in &session.messages {
-        match m {
-            Message::UserMessage { content } => {
+    for m in &session.entries {
+        match &m.body {
+            EntryBody::User { content } => {
                 users += 1;
                 chars += content_chars(content);
             }
-            Message::AssistantMessage {
+            EntryBody::Agent {
                 content, tool_uses, ..
             } => {
                 assistants += 1;
@@ -155,9 +156,9 @@ fn format_stats(session: &Session) -> String {
                     chars += t.name.len() + t.input.to_string().len();
                 }
             }
-            Message::ToolResults { tool_use_results } => {
+            EntryBody::ToolResults { results } => {
                 tool_results += 1;
-                for r in tool_use_results {
+                for r in results {
                     chars += content_chars(&r.content);
                 }
             }
@@ -171,7 +172,7 @@ fn format_stats(session: &Session) -> String {
         session.is_hidden(),
         session.kind,
         session.parent_session_id.as_deref().unwrap_or("(none)"),
-        session.messages.len(),
+        session.entries.len(),
         users,
         assistants,
         tool_results,
@@ -185,11 +186,11 @@ fn format_stats(session: &Session) -> String {
 const RANGE_TOTAL_CHARS: usize = 64_000;
 
 fn format_range(session: &Session, start: usize, end: usize, max_chars: usize) -> String {
-    let n = session.messages.len();
+    let n = session.entries.len();
     let start = start.min(n);
     let end = end.min(n).max(start);
     let mut out = format!("messages [{start}, {end}) of {n}  (max_chars={max_chars})\n");
-    for (i, msg) in session.messages[start..end].iter().enumerate() {
+    for (i, msg) in session.entries[start..end].iter().enumerate() {
         let idx = start + i;
         if out.len() >= RANGE_TOTAL_CHARS {
             out.push_str(&format!(
@@ -211,25 +212,25 @@ fn format_expand(
     tool_use_id: Option<&str>,
     max_chars: usize,
 ) -> Result<String, String> {
-    let msg = session.messages.get(index).ok_or_else(|| {
+    let entry = session.entries.get(index).ok_or_else(|| {
         format!(
-            "index {index} out of range ({} messages)",
-            session.messages.len()
+            "index {index} out of range ({} entries)",
+            session.entries.len()
         )
     })?;
     if let Some(tid) = tool_use_id {
-        return expand_tool(msg, tid, max_chars);
+        return expand_tool(entry, tid, max_chars);
     }
     Ok(format!(
         "[{index}] {}\n{}\n",
-        message_kind(msg),
-        preview_message(msg, max_chars)
+        message_kind(entry),
+        preview_message(entry, max_chars)
     ))
 }
 
-fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<String, String> {
-    match msg {
-        Message::AssistantMessage { tool_uses, .. } => {
+fn expand_tool(entry: &Entry, tool_use_id: &str, max_chars: usize) -> Result<String, String> {
+    match &entry.body {
+        EntryBody::Agent { tool_uses, .. } => {
             for t in tool_uses {
                 if t.id == tool_use_id {
                     let body = serde_json::to_string_pretty(&t.input).unwrap_or_default();
@@ -245,8 +246,8 @@ fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<Str
                 "tool_use_id {tool_use_id:?} not in this assistant message"
             ))
         }
-        Message::ToolResults { tool_use_results } => {
-            for r in tool_use_results {
+        EntryBody::ToolResults { results } => {
+            for r in results {
                 if r.id == tool_use_id {
                     let body = content_text(&r.content);
                     return Ok(format!(
@@ -268,7 +269,7 @@ fn expand_tool(msg: &Message, tool_use_id: &str, max_chars: usize) -> Result<Str
 fn format_search(session: &Session, query: &str, max_results: usize) -> String {
     let q = query.to_ascii_lowercase();
     let mut hits = Vec::new();
-    for (i, msg) in session.messages.iter().enumerate() {
+    for (i, msg) in session.entries.iter().enumerate() {
         let hay = preview_message(msg, HARD_MAX_CHARS).to_ascii_lowercase();
         if hay.contains(&q) {
             hits.push(i);
@@ -281,9 +282,9 @@ fn format_search(session: &Session, query: &str, max_results: usize) -> String {
     for i in hits {
         out.push_str(&format!(
             "  [{i}] {}  {}\n",
-            message_kind(&session.messages[i]),
+            message_kind(&session.entries[i]),
             truncate(
-                &preview_message(&session.messages[i], 120).replace('\n', " "),
+                &preview_message(&session.entries[i], 120).replace('\n', " "),
                 120
             )
         ));
@@ -291,18 +292,18 @@ fn format_search(session: &Session, query: &str, max_results: usize) -> String {
     out
 }
 
-fn message_kind(msg: &Message) -> &'static str {
-    match msg {
-        Message::UserMessage { .. } => "UserMessage",
-        Message::AssistantMessage { .. } => "AssistantMessage",
-        Message::ToolResults { .. } => "ToolResults",
+fn message_kind(entry: &Entry) -> &'static str {
+    match &entry.body {
+        EntryBody::User { .. } => "user",
+        EntryBody::Agent { .. } => "agent",
+        EntryBody::ToolResults { .. } => "tool_results",
     }
 }
 
-fn preview_message(msg: &Message, max_chars: usize) -> String {
-    match msg {
-        Message::UserMessage { content } => truncate(&content_text(content), max_chars),
-        Message::AssistantMessage {
+fn preview_message(entry: &Entry, max_chars: usize) -> String {
+    match &entry.body {
+        EntryBody::User { content } => truncate(&content_text(content), max_chars),
+        EntryBody::Agent {
             content, tool_uses, ..
         } => {
             let mut s = content_text(content);
@@ -321,9 +322,9 @@ fn preview_message(msg: &Message, max_chars: usize) -> String {
             }
             truncate(&s, max_chars)
         }
-        Message::ToolResults { tool_use_results } => {
+        EntryBody::ToolResults { results } => {
             let mut s = String::new();
-            for r in tool_use_results {
+            for r in results {
                 s.push_str(&format!(
                     "tool_result id={} is_error={} {}\n",
                     r.id,
@@ -422,16 +423,17 @@ mod tests {
     /// with an honest marker, not emit ~1 MB into the caller's context.
     #[test]
     fn range_stops_at_total_output_cap() {
-        use myco_models::{Content, Message};
+        use myco_models::Content;
         let mut session = myco_session::Session::new("test-model");
         for i in 0..200 {
-            session.messages.push(Message::UserMessage {
-                content: vec![Content::Text {
+            session.entries.push(myco_api::Entry::user(
+                myco_api::Author::System,
+                vec![Content::Text {
                     text: format!("msg {i}: {}", "x".repeat(2_000)),
                 }],
-            });
+            ));
         }
-        let out = format_range(&session, 0, session.messages.len(), 2_000);
+        let out = format_range(&session, 0, session.entries.len(), 2_000);
         assert!(
             out.len() < RANGE_TOTAL_CHARS + 4_000,
             "output should stop near the cap, got {} chars",

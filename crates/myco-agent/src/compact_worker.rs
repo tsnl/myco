@@ -119,13 +119,18 @@ pub async fn run_compact_worker(
         },
     );
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+    worker.set_model_key(catalog_model.spec.key.clone());
 
     let prompt = compact_subagent_prompt(&predecessor.id);
     let result = worker
-        .interact(vec![Content::Text { text: prompt }], cancel)
+        .interact(
+            myco_api::Author::System,
+            vec![Content::Text { text: prompt }],
+            cancel,
+        )
         .await;
 
-    worker_session.messages = worker.history().to_vec();
+    worker_session.entries = worker.history().to_vec();
     worker_session.touch();
     if let Err(e) = worker_session.save() {
         eprintln!("warning: could not save compact worker session: {e}");

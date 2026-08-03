@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use myco::server::Server;
-use myco_api::{CreateSession, MycoApi, PostMessage, UpdateSession};
+use myco_api::{CreateSession, EntryBody, MycoApi, PostMessage, UpdateSession};
 use myco_models::{Content, GenerateError, GenerateOutput, GenerativeModel, TurnEndReason};
 use myco_test_support::ScriptedModel;
 
@@ -97,13 +97,15 @@ async fn a_turn_round_trips_through_the_trait() {
         .expect("post");
 
     let p = poll_until(server, &s.id, |p| {
-        p.entries.iter().any(|e| e.role == "assistant")
+        p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::Agent { .. }))
     })
     .await;
     assert!(p.last_error.is_none(), "{:?}", p.last_error);
-    let roles: Vec<&str> = p.entries.iter().map(|e| e.role.as_str()).collect();
-    assert_eq!(roles, ["user", "assistant"], "{:?}", p.entries);
-    assert_eq!(p.entries[1].text, "scripted answer");
+    assert!(matches!(p.entries[0].body, EntryBody::User { .. }));
+    assert!(matches!(p.entries[1].body, EntryBody::Agent { .. }));
+    assert_eq!(p.entries[1].text(), "scripted answer");
 
     // Queued input: two more messages posted back-to-back both run.
     for text in ["second", "third"] {
@@ -113,11 +115,21 @@ async fn a_turn_round_trips_through_the_trait() {
             .expect("post");
     }
     let p = poll_until(server, &s.id, |p| {
-        p.entries.iter().filter(|e| e.role == "assistant").count() == 3
+        p.entries
+            .iter()
+            .filter(|e| matches!(e.body, EntryBody::Agent { .. }))
+            .count()
+            == 3
     })
     .await;
-    assert_eq!(p.entries.iter().filter(|e| e.role == "user").count(), 3);
-    assert_eq!(p.entries.last().unwrap().text, "third answer");
+    assert_eq!(
+        p.entries
+            .iter()
+            .filter(|e| matches!(e.body, EntryBody::User { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(p.entries.last().unwrap().text(), "third answer");
 
     // The session is listed, and retiring it works through the trait too.
     let listed = server.list_sessions(false).await.expect("list");
@@ -155,8 +167,16 @@ async fn a_failing_turn_surfaces_on_last_error() {
     let err = p.last_error.expect("failed turn reports why");
     assert!(err.contains("provider down"), "{err}");
     // The user's message survives; no phantom assistant reply.
-    assert!(p.entries.iter().any(|e| e.role == "user"));
-    assert!(!p.entries.iter().any(|e| e.role == "assistant"));
+    assert!(
+        p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::User { .. }))
+    );
+    assert!(
+        !p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::Agent { .. }))
+    );
 }
 
 /// Streaming is the contract, not a nicety: a turn must publish text deltas on
@@ -224,13 +244,15 @@ async fn a_turn_streams_deltas_before_it_finishes() {
 
     // And the same content is in the transcript afterwards.
     let p = poll_until(server, &s.id, |p| {
-        p.entries.iter().any(|e| e.role == "assistant")
+        p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::Agent { .. }))
     })
     .await;
     assert!(
         p.entries
             .iter()
-            .any(|e| e.text.contains("streamed **body**"))
+            .any(|e| e.text().contains("streamed **body**"))
     );
 }
 
@@ -296,7 +318,9 @@ async fn an_abandoned_session_leaves_nothing_on_disk() {
         .await
         .expect("post");
     poll_until(api, &used.id, |p| {
-        p.entries.iter().any(|e| e.role == "assistant")
+        p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::Agent { .. }))
     })
     .await;
     assert_eq!(count_sessions(), 1, "a used session is on disk");
@@ -331,7 +355,9 @@ async fn archiving_hides_a_session_without_losing_it() {
         .await
         .expect("post");
     poll_until(api, &s.id, |p| {
-        p.entries.iter().any(|e| e.role == "assistant")
+        p.entries
+            .iter()
+            .any(|e| matches!(e.body, EntryBody::Agent { .. }))
     })
     .await;
     assert!(
@@ -364,7 +390,7 @@ async fn archiving_hides_a_session_without_losing_it() {
         "archived is listed on request"
     );
     let detail = api.session_detail(&s.id).await.expect("still readable");
-    assert!(detail.entries.iter().any(|e| e.text == "kept"));
+    assert!(detail.entries.iter().any(|e| e.text() == "kept"));
 
     // And it comes back.
     api.update_session(

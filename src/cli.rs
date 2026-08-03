@@ -243,7 +243,7 @@ pub async fn run(opts: CliOptions) {
                             submitted = *live.turns.borrow();
                             producer = make_producer(&live, terminal.clone(), colors, wrap);
                             banner(&producer, &sup, &live, &preflight);
-                            producer.replay_history(&live.session.snapshot().messages);
+                            producer.replay_history(&live.session.snapshot().entries);
                             pump = spawn_pump(&live, &producer);
                         }
                         Err(e) => producer.error_section(&e),
@@ -326,13 +326,16 @@ fn submit(sup: &Arc<Server>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line
         .unwrap_or(0);
     let used = match snapshot.last_usage {
         Some(u) => Some(u.context_tokens()),
-        None if snapshot.messages.is_empty() => Some(0),
+        None if snapshot.entries.is_empty() => Some(0),
         None => None,
     };
     let running = live.harness().running_tool_summaries(uuid::Uuid::nil());
     producer.user_header(used, max, snapshot.last_usage, &running);
     producer.submitted_input(line);
-    let _ = live.tx.send(Cmd::User(line.to_string()));
+    let _ = live.tx.send(Cmd::User {
+        author: crate::server::local_author(),
+        text: line.to_string(),
+    });
 }
 
 /// Forward the session's event feed into the terminal renderer.
@@ -362,7 +365,14 @@ fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::Joi
 async fn run_print(live: Arc<Live>, prompt: String) {
     let mut turns = live.turns.clone();
     let start = *turns.borrow();
-    if live.tx.send(Cmd::User(prompt)).is_err() {
+    if live
+        .tx
+        .send(Cmd::User {
+            author: crate::server::local_author(),
+            text: prompt,
+        })
+        .is_err()
+    {
         eprintln!("myco: agent task gone");
         std::process::exit(1);
     }
@@ -380,7 +390,7 @@ async fn run_print(live: Arc<Live>, prompt: String) {
         eprintln!("myco: {err}");
         std::process::exit(1);
     }
-    match last_answer(&live.session.snapshot().messages) {
+    match last_answer(&live.session.snapshot().entries) {
         Some(text) => println!("{text}"),
         None => eprintln!("(no answer text)"),
     }

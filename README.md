@@ -21,6 +21,9 @@ scripts.
 - **Sessions you can resume.** Titles, scratchpads, links, and full history
   live under `~/.myco/v2/` — reopen any session by URL, or from another
   client. Archive the ones you are done with; they stay readable.
+- **Attributed history.** A session is a log of `Entry { author, at, body }`,
+  so every message names who wrote it — a person, the agent, or the system.
+  That is what makes a session shareable: the model sees the names too.
 - **Nested agents as a tool.** The root-only `subagent` tool runs one full
   turn of a hidden child session per call — no curl, works behind strict
   firewalls, optional context forks. The same surface exists as HTTP
@@ -64,7 +67,7 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 
 ## Workspace
 
-- `myco` — the **root crate**: the session runtime (`supervisor`), the CLI,
+- `myco` — the **root crate**: the session runtime (`server`), the CLI,
   the web server (Rocket, `/api`), the `subagent` tool, and `--mode host`
   (the per-machine worker remotes run); the workspace lives in `crates/`
 - `myco-gui` — minimal Yew web client (one URL per conversation)

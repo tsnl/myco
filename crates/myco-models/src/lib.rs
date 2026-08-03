@@ -7,6 +7,64 @@ use myco_core::*;
 mod anthropic;
 #[cfg(test)]
 pub(crate) mod test_support;
+/// The conversation vocabulary lives in `myco-api` — the session store and
+/// the wire own it, and this layer only projects it onto providers. Re-exported
+/// so `myco_models::Content` and friends keep resolving.
+/// Project session entries onto provider messages.
+///
+/// One entry becomes one message, so nothing is lost in either direction.
+/// The one addition is attribution: when a session has more than one human
+/// in it, each user entry is prefixed with the speaker's name, because a
+/// model reading a shared transcript needs to know who said what. Solo
+/// sessions are left exactly as typed.
+pub fn entries_to_messages(entries: &[myco_api::Entry]) -> Vec<Message> {
+    use myco_api::{Author, EntryBody};
+
+    let mut names = std::collections::BTreeSet::new();
+    for e in entries {
+        if let Author::User { name, .. } = &e.author {
+            names.insert(name.as_str());
+        }
+    }
+    let attribute = names.len() > 1;
+
+    entries
+        .iter()
+        .map(|e| match &e.body {
+            EntryBody::User { content } => {
+                let content = match (&e.author, attribute) {
+                    (Author::User { name, .. }, true) => {
+                        let mut out = Vec::with_capacity(content.len() + 1);
+                        out.push(Content::Text {
+                            text: format!("[{name}]"),
+                        });
+                        out.extend(content.iter().cloned());
+                        out
+                    }
+                    _ => content.clone(),
+                };
+                Message::UserMessage { content }
+            }
+            EntryBody::Agent {
+                content,
+                tool_uses,
+                turn_end,
+            } => Message::AssistantMessage {
+                content: content.clone(),
+                tool_uses: tool_uses.clone(),
+                turn_end_reason: turn_end.clone(),
+            },
+            EntryBody::ToolResults { results } => Message::ToolResults {
+                tool_use_results: results.clone(),
+            },
+        })
+        .collect()
+}
+
+pub use myco_api::{
+    Content, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content, content_text,
+};
+
 pub use anthropic::AnthropicBackendConfig;
 
 mod driver_core;
@@ -349,96 +407,12 @@ pub enum Message {
         turn_end_reason: Option<TurnEndReason>,
     },
 }
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TurnEndReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    /// Provider-specific / unknown stop reason (owned so sessions can serialize cleanly).
-    Other(String),
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolUse {
-    pub id: String,
-    pub name: String,
-    pub input: serde_json::Value,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolResult {
-    pub id: String,
-    pub content: Vec<Content>,
-    pub is_error: bool,
-}
-
-impl ToolResult {
-    pub fn ok(content: Vec<Content>) -> Self {
-        Self {
-            id: String::new(),
-            content,
-            is_error: false,
-        }
-    }
-
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            id: String::new(),
-            content: vec![Content::Text { text: text.into() }],
-            is_error: false,
-        }
-    }
-
-    pub fn err(text: impl Into<String>) -> Self {
-        Self {
-            id: String::new(),
-            content: vec![Content::Text { text: text.into() }],
-            is_error: true,
-        }
-    }
-
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum Content {
-    Text {
-        text: String,
-    },
-    Image {
-        source: String,
-    },
-    /// Model thinking *summary* (session history + live UI).
-    ///
-    /// Stored in agent/session history for resume, but **stripped when backends
-    /// compose the next API request** (not echoed as CoT). Prefer provider
-    /// summary channels over raw reasoning text.
-    Thinking {
-        text: String,
-        /// Opaque provider signature (Anthropic). Not re-sent on subsequent turns.
-        signature: Option<String>,
-        /// True for redacted/encrypted thinking placeholders with no plaintext.
-        redacted: bool,
-    },
-}
-
-/// Clone only answer blocks (`Text` / `Image`), dropping thinking.
-pub fn answer_content(content: &[Content]) -> Vec<Content> {
-    content
-        .iter()
-        .filter(|c| matches!(c, Content::Text { .. } | Content::Image { .. }))
-        .cloned()
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -451,39 +425,6 @@ pub enum MessagePart {
     TurnEndReason(TurnEndReason),
     /// Provider token usage for this generate call (may appear mid-stream or at end).
     Usage(TokenUsage),
-}
-
-/// Token counts for one generate call. `cached_input_tokens` is a subset of
-/// `input_tokens`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TokenUsage {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cached_input_tokens: u64,
-}
-
-impl TokenUsage {
-    /// Context occupied by the prompt = total input tokens (cached input is a
-    /// subset, already included).
-    pub fn context_tokens(self) -> u64 {
-        self.input_tokens
-    }
-
-    /// Fold a later usage report into this one, keeping known fields when the
-    /// later report omits them (providers split usage across stream events).
-    pub fn merge(self, next: TokenUsage) -> TokenUsage {
-        fn pick(prev: u64, next: u64) -> u64 {
-            if next != 0 { next } else { prev }
-        }
-        TokenUsage {
-            input_tokens: pick(self.input_tokens, next.input_tokens),
-            output_tokens: pick(self.output_tokens, next.output_tokens),
-            cached_input_tokens: pick(self.cached_input_tokens, next.cached_input_tokens),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

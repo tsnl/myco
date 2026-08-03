@@ -1,6 +1,6 @@
 //! Conversation session persistence and metadata.
 //!
-//! Sessions live under `~/.myco/session/{shard}/{id}.json` (plus a sibling
+//! Sessions live under `~/.myco/v2/session/{shard}/{id}.json` (plus a sibling
 //! `.history` for readline). Schema is intentionally breaking vs earlier WIP
 //! files: only [`SESSION_FILE_VERSION`] is accepted.
 //!
@@ -28,11 +28,15 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use myco_api::{Entry, EntryBody, TokenUsage};
 use myco_core::{atomically_write, data_root, uuid_simple_hex};
-use myco_models::{Message, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
-pub const SESSION_FILE_VERSION: u32 = 2;
+///
+/// v3 replaced the untyped `messages: Vec<Message>` log with attributed
+/// [`Entry`] records — the change that made sessions multiplayer. v2 files
+/// live under the pre-v2 `$MYCO_HOME` root and are never read from here.
+pub const SESSION_FILE_VERSION: u32 = 3;
 pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
@@ -80,7 +84,7 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model: String,
-    pub messages: Vec<Message>,
+    pub entries: Vec<Entry>,
     /// Short human label; agent/CLI maintained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -214,16 +218,16 @@ impl ActiveSession {
 
     /// Persist messages + last usage when either changed (or `force`). A `None`
     /// usage keeps the stored value rather than clearing it.
-    pub fn persist_messages(
+    pub fn persist_entries(
         &self,
-        messages: &[Message],
+        entries: &[Entry],
         last_usage: Option<TokenUsage>,
         force: bool,
     ) -> Result<(), String> {
         let mut session = self.lock();
         let usage_changed = last_usage.is_some() && last_usage != session.last_usage;
-        if force || messages.len() != session.messages.len() || usage_changed {
-            session.messages = messages.to_vec();
+        if force || entries.len() != session.entries.len() || usage_changed {
+            session.entries = entries.to_vec();
             if last_usage.is_some() {
                 session.last_usage = last_usage;
             }
@@ -269,7 +273,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             model: model.into(),
-            messages: Vec::new(),
+            entries: Vec::new(),
             title: None,
             links: Vec::new(),
             scratchpad: String::new(),
@@ -318,7 +322,7 @@ impl Session {
         let mut child = Self::new(model);
         child.kind = SessionKind::Subagent;
         child.parent_session_id = Some(self.id.clone());
-        child.messages = self.messages.clone();
+        child.entries = self.entries.clone();
         child.last_usage = self.last_usage;
         child
     }
@@ -354,16 +358,25 @@ impl Session {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let session: Session =
+        // Version first, on a probe that only reads `version`: an older file
+        // fails the *shape* too, and "missing field `entries`" would hide the
+        // real reason it was rejected.
+        #[derive(serde::Deserialize)]
+        struct VersionProbe {
+            version: u32,
+        }
+        let probe: VersionProbe =
             serde_json::from_slice(&data).map_err(|e| format!("parse {}: {e}", path.display()))?;
-        if session.version != SESSION_FILE_VERSION {
+        if probe.version != SESSION_FILE_VERSION {
             return Err(format!(
                 "unsupported session version {} in {} (expected {SESSION_FILE_VERSION}; \
                  old WIP sessions are not migrated)",
-                session.version,
+                probe.version,
                 path.display()
             ));
         }
+        let session: Session =
+            serde_json::from_slice(&data).map_err(|e| format!("parse {}: {e}", path.display()))?;
         if session.id.is_empty() {
             return Err(format!("session file {} has empty id", path.display()));
         }
@@ -599,14 +612,14 @@ pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, Str
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
     // Prefer full parse so version is enforced; fall back is not used for wrong version.
     let session = Session::load(path)?;
-    let snippet = first_user_text_from_messages(&session.messages).unwrap_or_default();
+    let snippet = first_user_text(&session.entries).unwrap_or_default();
     Ok(SessionListEntry {
         id: session.id,
         path: path.to_path_buf(),
         created_at: session.created_at,
         updated_at: session.updated_at,
         model: session.model,
-        message_count: session.messages.len(),
+        message_count: session.entries.len(),
         title: session.title,
         snippet,
         link_counts: LinkCounts::from_links(&session.links),
@@ -739,15 +752,13 @@ pub fn normalize_title(raw: &str) -> Result<String, String> {
 /// First user message as text, for session labels, snippets, and search. The
 /// session stamp myco prepends to that message is skipped — a label should read
 /// as what the user asked, not as myco's own payload.
-pub fn first_user_text_from_messages(messages: &[Message]) -> Option<String> {
-    for msg in messages {
-        if let Message::UserMessage { content } = msg {
+pub fn first_user_text(entries: &[Entry]) -> Option<String> {
+    for entry in entries {
+        if let EntryBody::User { content } = &entry.body {
             let text: String = content
                 .iter()
                 .filter_map(|c| match c {
-                    myco_models::Content::Text { text }
-                        if !myco_prompts::is_session_stamp(text) =>
-                    {
+                    myco_api::Content::Text { text } if !myco_prompts::is_session_stamp(text) => {
                         Some(text.as_str())
                     }
                     _ => None,
@@ -821,7 +832,7 @@ pub fn format_session_detail(session: &Session) -> String {
         ("created:   ", Some(session.created_at.to_rfc3339())),
         ("updated:   ", Some(session.updated_at.to_rfc3339())),
         ("model:     ", Some(session.model.clone())),
-        ("messages:  ", Some(session.messages.len().to_string())),
+        ("entries:   ", Some(session.entries.len().to_string())),
         ("kind:      ", Some(session.kind.to_string())),
         ("hidden:    ", Some(session.is_hidden().to_string())),
         ("parent:    ", session.parent_session_id.clone()),
@@ -1039,16 +1050,16 @@ pub fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myco_models::{Content, Message, TokenUsage};
+    use myco_api::{Content, TokenUsage};
     use myco_test_support::{temp_dir, temp_home, user};
 
-    /// Pre-`last_usage` / pre-`kind` v2 file: absent optional fields must default.
-    const LEGACY_V2_JSON: &[u8] = br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#;
+    /// Minimal v3 file: every optional field absent, so all must default.
+    const MINIMAL_JSON: &[u8] = br#"{"version":3,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","entries":[]}"#;
 
-    fn load_legacy_v2() -> Session {
-        let dir = temp_dir("session-legacy");
-        let path = dir.path().join("legacy.json");
-        fs::write(&path, LEGACY_V2_JSON).unwrap();
+    fn load_minimal() -> Session {
+        let dir = temp_dir("session-minimal");
+        let path = dir.path().join("minimal.json");
+        fs::write(&path, MINIMAL_JSON).unwrap();
         Session::load(&path).unwrap()
     }
 
@@ -1057,7 +1068,7 @@ mod tests {
         let _home = temp_home("session-save");
 
         let mut session = Session::new("claude-haiku-4-5");
-        session.messages.push(user("hello\nworld"));
+        session.entries.push(user("hello\nworld"));
         session.save().unwrap();
 
         // Minified: no newlines outside JSON string escapes, no indentation.
@@ -1066,7 +1077,7 @@ mod tests {
 
         let loaded = Session::load(&session.json_path()).unwrap();
         assert_eq!(loaded.id, session.id);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.entries.len(), 1);
     }
 
     #[test]
@@ -1149,7 +1160,7 @@ mod tests {
         let path = dir.path().join("sess.json");
 
         let mut session = Session::new("claude-opus-4-8");
-        session.messages = vec![user("hello")];
+        session.entries = vec![user("hello")];
         session.title = Some("hello session".into());
         session.links = vec![SessionLink::Worktree {
             host: "local".into(),
@@ -1167,15 +1178,16 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("hello session"));
         assert_eq!(loaded.scratchpad, "notes");
         assert_eq!(loaded.links.len(), 1);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.entries.len(), 1);
     }
 
     /// Session labels, snippets, and search read the first user message; the
     /// session stamp myco puts in front of it is not the user's words.
     #[test]
     fn first_user_text_skips_the_session_stamp() {
-        let messages = vec![Message::UserMessage {
-            content: vec![
+        let messages = vec![Entry::user(
+            myco_api::Author::System,
+            vec![
                 Content::Text {
                     text: myco_prompts::session_stamp(
                         "aa00bb11cc22dd33ee44ff5566778899",
@@ -1186,9 +1198,9 @@ mod tests {
                     text: "port the harness to windows".into(),
                 },
             ],
-        }];
+        )];
         assert_eq!(
-            first_user_text_from_messages(&messages).as_deref(),
+            first_user_text(&messages).as_deref(),
             Some("port the harness to windows")
         );
     }
@@ -1198,7 +1210,7 @@ mod tests {
         let mut parent = Session::new_with_id("modelkey", "aa00bb11cc22dd33ee44ff5566778899");
         parent.title = Some("parent title".into());
         parent.scratchpad = "parent notes".into();
-        parent.messages = vec![user("hi")];
+        parent.entries = vec![user("hi")];
         parent.last_usage = Some(TokenUsage {
             input_tokens: 100,
             output_tokens: 10,
@@ -1208,7 +1220,7 @@ mod tests {
         let child = parent.fork_child("othermodel");
         // Conversation + usage are inherited so the fork resumes the parent's
         // context (and its USER n/m headroom header) exactly.
-        assert_eq!(child.messages.len(), 1);
+        assert_eq!(child.entries.len(), 1);
         assert_eq!(child.last_usage, parent.last_usage);
         // Identity is fresh: new id, hidden subagent kind, parented; the
         // parent's metadata does not leak.
@@ -1223,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn last_usage_persists_and_old_sessions_default_none() {
+    fn last_usage_persists_and_minimal_sessions_default_none() {
         let dir = temp_dir("session-usage");
         let path = dir.path().join("with_usage.json");
         let mut session =
@@ -1239,11 +1251,11 @@ mod tests {
         assert_eq!(loaded.last_usage, session.last_usage);
         assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
 
-        assert!(load_legacy_v2().last_usage.is_none());
+        assert!(load_minimal().last_usage.is_none());
     }
 
     #[test]
-    fn persist_messages_records_usage_and_none_keeps_last() {
+    fn persist_entries_records_usage_and_none_keeps_last() {
         let _home = temp_home("session-persist");
 
         let usage = TokenUsage {
@@ -1255,7 +1267,7 @@ mod tests {
         let id = active.id();
 
         active
-            .persist_messages(&[user("hi")], Some(usage), true)
+            .persist_entries(&[user("hi")], Some(usage), true)
             .unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id).unwrap().last_usage,
@@ -1263,7 +1275,7 @@ mod tests {
         );
 
         active
-            .persist_messages(&[user("hi"), user("more")], None, true)
+            .persist_entries(&[user("hi"), user("more")], None, true)
             .unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id).unwrap().last_usage,
@@ -1272,27 +1284,29 @@ mod tests {
     }
 
     /// The on-disk schema is a contract, and it is spelled with Rust
-    /// identifiers: `Message`, `Content`, `ToolUse`, `ToolResult` and
-    /// `TurnEndReason` serialize externally tagged with no `serde(rename)`
-    /// pinning them. Renaming a variant or a field therefore compiles, keeps
-    /// `version: 2`, and makes every stored session unreadable — after which
+    /// identifiers: `Content`, `ToolUse`, `ToolResult` and `TurnEndReason`
+    /// serialize externally tagged with no `serde(rename)` pinning them, and
+    /// `Author`/`EntryBody` are internally tagged on their variant names.
+    /// Renaming a variant or a field therefore compiles, keeps `version: 3`,
+    /// and makes every stored session unreadable — after which
     /// `list_sessions_filtered` drops the files from listings.
     ///
-    /// This fixture is that contract written down: a v2 document covering every
+    /// This fixture is that contract written down: a v3 document covering every
     /// variant of every persisted type. It must keep loading, and it must
     /// re-serialize byte-for-byte. If this test fails, the disk format changed:
     /// either revert the rename or bump [`SESSION_FILE_VERSION`] deliberately
     /// and replace this fixture.
     #[test]
-    fn v2_golden_fixture_loads_and_reserializes_byte_identically() {
-        const FIXTURE: &str = include_str!("../tests/fixtures/session_v2_all_variants.json");
+    fn v3_golden_fixture_loads_and_reserializes_byte_identically() {
+        const FIXTURE: &str = include_str!("../tests/fixtures/session_v3_all_variants.json");
 
-        let session: Session = serde_json::from_str(FIXTURE).expect("fixture must parse as v2");
+        let session: Session = serde_json::from_str(FIXTURE).expect("fixture must parse as v3");
 
         assert_eq!(session.version, SESSION_FILE_VERSION);
         assert_eq!(session.id, "aabbccddeeff00112233445566778899");
         assert_eq!(session.model, "opus-catalog-key");
-        assert_eq!(session.title.as_deref(), Some("every v2 variant"));
+        assert_eq!(session.title.as_deref(), Some("every v3 variant"));
+        assert!(session.archived);
         assert_eq!(session.scratchpad, "scratch notes");
         assert_eq!(session.kind, SessionKind::Subagent);
         assert!(session.is_hidden());
@@ -1322,11 +1336,18 @@ mod tests {
             other => panic!("expected worktree link, got {other:?}"),
         }
 
-        // Every Message variant, and every Content variant inside them.
-        use myco_models::TurnEndReason;
-        assert_eq!(session.messages.len(), 6);
-        match &session.messages[0] {
-            Message::UserMessage { content } => {
+        // Every entry body, every author kind, and every Content variant.
+        use myco_api::{Author, TurnEndReason};
+        assert_eq!(session.entries.len(), 6);
+        assert!(
+            matches!(&session.entries[0].author, Author::User { id, name } if id == "u_ada" && name == "ada")
+        );
+        assert!(
+            matches!(&session.entries[1].author, Author::Agent { model } if model == "opus-catalog-key")
+        );
+        assert!(matches!(session.entries[5].author, Author::System));
+        match &session.entries[0].body {
+            EntryBody::User { content } => {
                 assert!(
                     matches!(&content[0], Content::Text { text } if text == "look at this shot")
                 );
@@ -1336,11 +1357,11 @@ mod tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
-        match &session.messages[1] {
-            Message::AssistantMessage {
+        match &session.entries[1].body {
+            EntryBody::Agent {
                 content,
                 tool_uses,
-                turn_end_reason,
+                turn_end,
             } => {
                 // Signed thinking and the redacted placeholder both survive.
                 match &content[0] {
@@ -1361,12 +1382,14 @@ mod tests {
                 assert_eq!(tool_uses.len(), 1);
                 assert_eq!(tool_uses[0].id, "toolu_01");
                 assert_eq!(tool_uses[0].input["command"], "echo hi");
-                assert_eq!(*turn_end_reason, Some(TurnEndReason::ToolUse));
+                assert_eq!(*turn_end, Some(TurnEndReason::ToolUse));
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
-        match &session.messages[2] {
-            Message::ToolResults { tool_use_results } => {
+        match &session.entries[2].body {
+            EntryBody::ToolResults {
+                results: tool_use_results,
+            } => {
                 assert_eq!(tool_use_results.len(), 2);
                 assert!(!tool_use_results[0].is_error);
                 assert!(tool_use_results[1].is_error);
@@ -1374,13 +1397,11 @@ mod tests {
             other => panic!("expected tool results, got {other:?}"),
         }
         // The remaining turn-end reasons, including the stringly-typed arm.
-        let reasons: Vec<_> = session.messages[3..]
+        let reasons: Vec<_> = session.entries[3..]
             .iter()
-            .map(|m| match m {
-                Message::AssistantMessage {
-                    turn_end_reason, ..
-                } => turn_end_reason.clone(),
-                other => panic!("expected assistant message, got {other:?}"),
+            .map(|m| match &m.body {
+                EntryBody::Agent { turn_end, .. } => turn_end.clone(),
+                other => panic!("expected agent entry, got {other:?}"),
             })
             .collect();
         assert_eq!(
@@ -1396,7 +1417,7 @@ mod tests {
         let reserialized = format!("{}\n", serde_json::to_string_pretty(&session).unwrap());
         assert_eq!(
             reserialized, FIXTURE,
-            "session serialization drifted from the v2 fixture"
+            "session serialization drifted from the v3 fixture"
         );
     }
 
@@ -1411,11 +1432,12 @@ mod tests {
         fs::create_dir_all(&shard).unwrap();
 
         let mut good = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
-        good.messages.push(Message::UserMessage {
-            content: vec![Content::Text {
+        good.entries.push(Entry::user(
+            myco_api::Author::System,
+            vec![Content::Text {
                 text: "readable".into(),
             }],
-        });
+        ));
         fs::write(
             shard.join(format!("{}.json", good.id)),
             serde_json::to_vec(&good).unwrap(),
@@ -1425,7 +1447,7 @@ mod tests {
         fs::write(shard.join("aabroken.json"), b"{ not json at all").unwrap();
         fs::write(
             shard.join("aalegacy.json"),
-            br#"{"version":1,"id":"aalegacy","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
+            br#"{"version":2,"id":"aalegacy","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
         )
         .unwrap();
 
@@ -1444,7 +1466,7 @@ mod tests {
         let path = dir.path().join("old.json");
         fs::write(
             &path,
-            br#"{"version":1,"id":"aa","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
+            br#"{"version":2,"id":"aa","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#,
         )
         .unwrap();
         let err = Session::load(&path).unwrap_err();
@@ -1478,7 +1500,7 @@ mod tests {
         let _home = temp_home("session-hidden");
 
         let mut visible = Session::new("claude-haiku-4-5");
-        visible.messages.push(user("visible"));
+        visible.entries.push(user("visible"));
         visible.save().unwrap();
 
         let mut hidden = Session::new_hidden(
@@ -1487,7 +1509,7 @@ mod tests {
             SessionKind::Subagent,
             Some(visible.id.clone()),
         );
-        hidden.messages.push(user("hidden subagent"));
+        hidden.entries.push(user("hidden subagent"));
         hidden.save().unwrap();
 
         let listed = list_sessions(0).unwrap();
@@ -1519,8 +1541,8 @@ mod tests {
 
     /// No kind/parent fields on disk — serde defaults to user (visible).
     #[test]
-    fn old_session_json_defaults_kind_user() {
-        let s = load_legacy_v2();
+    fn minimal_session_json_defaults_kind_user() {
+        let s = load_minimal();
         assert!(!s.is_hidden());
         assert_eq!(s.kind, SessionKind::User);
         assert!(s.parent_session_id.is_none());
