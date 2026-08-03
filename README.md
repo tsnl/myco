@@ -23,7 +23,8 @@ scripts.
   client. Archive the ones you are done with; they stay readable.
 - **Attributed history.** A session is a log of `Entry { author, at, body }`,
   so every message names who wrote it — a person, the agent, or the system.
-  That is what makes a session shareable: the model sees the names too.
+  Authors come from a roster you write down (`~/.myco/v2/server.toml`); myco
+  refuses to start without one rather than invent a name.
 - **Nested agents as a tool.** The root-only `subagent` tool runs one full
   turn of a hidden child session per call — no curl, works behind strict
   firewalls, optional context forks. The same surface exists as HTTP
@@ -49,7 +50,19 @@ rules — minimal chrome by design.
 root builds `crates/myco-gui` and reverse-proxies `/api` to the server.
 
 Configure models first in `~/.myco/v2/config.toml` (`[gateways.*]` +
-`[models.*]`; `myco --model <key>` / `--config <path>` to override). Remotes
+`[models.*]`; `myco --model <key>` / `--config <path>` to override), and
+register yourself in `~/.myco/v2/server.toml`:
+
+```toml
+[[users]]
+id = "ada"            # matched against $MYCO_USER, then $USER
+name = "Ada Lovelace" # optional; defaults to the id
+```
+
+Both the CLI and the server refuse to start without a roster that names the
+user they are running as — every session entry records its author, and a
+name nobody registered has no business in a shared transcript. Override the
+path with `--server-config` or `$MYCO_SERVER_CONFIG`. Remotes
 just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
 remote only needs your key in `ssh-agent` and `myco` on the PATH used by
 non-interactive SSH.

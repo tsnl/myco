@@ -25,11 +25,16 @@ gateway = "g"
 context_window = 100000
 "#;
 
+/// The identity gate is not what these tests are about: one registered user,
+/// selected by the injected `$USER`.
+const ROSTER_TOML: &str = "[[users]]\nid = \"tester\"\nname = \"Tester\"\n";
+
 fn test_config() -> myco::config::Config {
     myco::config::Config::resolve_with(
         Default::default(),
-        |_| None,
+        |k| (k == "USER").then(|| "tester".to_string()),
         |_| myco::config::parse_file_config_str(CONFIG_TOML),
+        |_| myco::config::parse_file_roster_str(ROSTER_TOML),
         || Ok(Vec::new()),
         |_| Err("no auth files in tests".into()),
     )

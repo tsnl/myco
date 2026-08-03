@@ -1700,6 +1700,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "futures",
+ "myco-api",
  "myco-core",
  "myco-models",
  "myco-prompts",
