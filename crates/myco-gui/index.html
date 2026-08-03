@@ -35,7 +35,8 @@
       a { color: var(--link); text-decoration: none; }
       a:hover { text-decoration: underline; }
       pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
-      h1 { font-size: 1rem; letter-spacing: 0.3em; margin: 0 0 0.5rem; }
+      h1, h2, h3, h4, h5, h6 { font-size: inherit; }
+      h1 { letter-spacing: 0.3em; margin: 0 0 0.5rem; }
       button {
         background: #101010; color: var(--fg); font: inherit;
         border: 1px solid #444; padding: 0.15rem 0.7rem; cursor: pointer;
@@ -54,7 +55,9 @@
         overflow-y: auto; overflow-x: hidden;
         padding: 0.5rem 1rem 1rem;
       }
-      .pane > * { max-width: 84ch; }
+      /* Every band shares one centered column, so the page reads as a
+         single centered transcript rather than a left-aligned wall. */
+      .column { width: 100%; max-width: 84ch; margin: 0 auto; }
       .composer {
         flex: none; border-top: 1px solid var(--line); padding: 0.5rem 1rem;
         display: flex; gap: 0.5rem; align-items: flex-start;
@@ -66,7 +69,7 @@
       .actions { display: flex; flex-direction: column; gap: 0.3rem; }
 
       /* Session browser */
-      .browser { padding: 1rem; max-width: 84ch; margin: 0 auto; }
+      .browser { padding: 1rem; }
       .browser ul { list-style: none; padding: 0; margin: 0.5rem 0; }
       .browser li { margin: 0.1rem 0; }
 
@@ -84,12 +87,18 @@
       .md > *:first-child { margin-top: 0; }
       .md > *:last-child { margin-bottom: 0; }
       .md p, .md ul, .md ol, .md blockquote, .md pre { margin: 0.4rem 0; }
-      .md h1, .md h2, .md h3, .md h4 {
-        font-size: 1rem; margin: 0.8rem 0 0.3rem; color: #fff;
+      /* Headings never grow: same size as body, distinguished by weight,
+         color, and the markdown marker itself. */
+      .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+        font-size: inherit; font-weight: bold;
+        margin: 0.8rem 0 0.3rem; color: #fff;
       }
-      .md h1::before { content: "# "; color: #666; }
-      .md h2::before { content: "## "; color: #666; }
-      .md h3::before { content: "### "; color: #666; }
+      .md h1::before { content: "# "; color: var(--fg-dim); font-weight: normal; }
+      .md h2::before { content: "## "; color: var(--fg-dim); font-weight: normal; }
+      .md h3::before { content: "### "; color: var(--fg-dim); font-weight: normal; }
+      .md h4::before { content: "#### "; color: var(--fg-dim); font-weight: normal; }
+      .md h5::before { content: "##### "; color: var(--fg-dim); font-weight: normal; }
+      .md h6::before { content: "###### "; color: var(--fg-dim); font-weight: normal; }
       .md code {
         background: #1c1c1c; border: 1px solid var(--line-soft); padding: 0 0.2em;
       }
