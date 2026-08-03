@@ -58,15 +58,32 @@
       /* Every band shares one centered column, so the page reads as a
          single centered transcript rather than a left-aligned wall. */
       .column { width: 100%; max-width: 84ch; margin: 0 auto; }
+      /* Input bar, after honk: the field fills the width, sits on a
+         transparent ground with a soft border, and lifts off the transcript
+         with a shadow. Enter submits, so the send button stays hidden. */
       .composer {
-        flex: none; border-top: 1px solid var(--line); padding: 0.5rem 1rem;
-        display: flex; gap: 0.5rem; align-items: flex-start;
+        flex: none; border-top: 1px solid var(--line);
+        padding: 0.5rem 1rem;
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.45);
+      }
+      .composer .column {
+        display: flex; flex-direction: row; align-items: stretch; gap: 0.5rem;
       }
       .composer textarea {
-        flex: 1 1 auto; max-width: 84ch; background: var(--bg-raised); color: #d8d8d8;
-        font: inherit; border: 1px solid #444; padding: 0.4rem; resize: vertical;
+        /* `min-width: 0` lets a flex item shrink below its intrinsic `cols`
+           width; without it the field keeps its 20-column default. */
+        flex: 1 1 auto; min-width: 0;
+        background: transparent; color: var(--fg); font: inherit;
+        border: 1px solid #3a3a3a; border-radius: 8px;
+        padding: 0.5rem 0.6rem; resize: none; outline: none;
       }
-      .actions { display: flex; flex-direction: column; gap: 0.3rem; }
+      .composer textarea::placeholder { color: var(--fg-dim); }
+      .composer textarea:focus {
+        border-color: var(--fg-dim);
+        box-shadow: 0 0 2px var(--fg);
+      }
+      .actions { display: flex; align-items: center; gap: 0.4rem; }
+      .actions .send { display: none; }
 
       /* Session browser */
       .browser { padding: 1rem; }
