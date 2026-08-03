@@ -140,7 +140,7 @@ impl StartupPreflight {
 /// Copy the manual articles to `<myco home>/manual/<version>/<commit>/` for
 /// this build, so agents can read and search them as ordinary files.
 fn export_manual() -> Result<(), String> {
-    myco_prompts::manual::export(&myco_core::myco_home()?).map(|_| ())
+    myco_prompts::manual::export(&myco_core::data_root()?).map(|_| ())
 }
 
 /// Manual-export lines only (no rule/header); writes nothing on success.

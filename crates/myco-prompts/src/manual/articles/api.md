@@ -16,9 +16,10 @@ session (absent in CLI mode — use the `subagent` tool there).
 
 | Endpoint | Meaning |
 |----------|---------|
-| `GET /sessions` | Recent visible sessions (id, title, model, live/busy) |
+| `GET /sessions?include_archived=` | Recent visible sessions (id, title, model, live/busy, archived). Archived ones are excluded unless asked for |
 | `POST /sessions` | Create: `{model?, parent_session?, fork?}` → summary with `id` |
 | `GET /sessions/<id>` | Metadata + full transcript entries |
+| `PATCH /sessions/<id>` | `{title?, archived?}` — set session metadata |
 | `POST /sessions/<id>/messages` | `{text}` — queue one user turn (input queues while a turn runs) |
 | `GET /sessions/<id>/poll?since=N` | `busy`, entries from `N`, `total` (next `since`), `last_error` |
 | `GET /sessions/<id>/events` | SSE: turn start/finish/fail, text/thinking deltas, tool starts, compaction |
@@ -65,7 +66,8 @@ fork vs blank.
 
 CLI: the v1 terminal experience, now async — output streams above a live
 prompt; typed lines queue while you work; Ctrl-C cancels the running turn;
-`/new /resume <id> /sessions /session /title /compact /hosts /exit`. Web GUI:
+`/new /resume <id> /sessions /session /title /archive /unarchive /compact
+/hosts /exit`. Web GUI:
 one URL per conversation, styled like the terminal — transcripts, live
 streaming, send, cancel. Users cannot press your tools in either frontend;
 titles and scratchpads are also yours via `session_meta`.

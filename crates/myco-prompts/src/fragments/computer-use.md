@@ -15,5 +15,5 @@ outside the current working directory except...
 - ephemeral files like `/tmp`
 - system-wide files like `~/.cache`
 - files you _must_ access to complete your task, with prior user permission
-- myco self-management paths (`~/.myco/…`, config, session logs) when diagnosing or configuring
+- myco self-management paths (`~/.myco/v2/…`, config, session logs) when diagnosing or configuring
   this app

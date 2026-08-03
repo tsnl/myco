@@ -155,6 +155,7 @@ mod tests {
             snippet: String::new(),
             link_counts: LinkCounts::default(),
             kind: SessionKind::User,
+            archived: false,
             parent_session_id: None,
         }
     }

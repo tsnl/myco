@@ -38,7 +38,7 @@ Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
   (`attach_timeout_secs`, `max_soul_bytes`).
-- Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
+- Sessions: `~/.myco/v2/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - **To act on a remote machine, set `host` on the tool call — do not run `ssh <alias> …` from
   local `bash`.** A host worker keeps one persistent SSH connection, so each call skips connection
@@ -82,7 +82,7 @@ at cache rates. The result starts
 with `session: <id>` — pass that id back as `session_id` to continue the same child with
 follow-up turns. Ask for terse summaries. Children are hidden (`kind: subagent`, parented to
 yours automatically — your own session id is on the newest `# Session` block in this
-conversation) in the shared `~/.myco/session/` store — read them later via `session_meta` get-by-id or
+conversation) in the shared `~/.myco/v2/session/` store — read them later via `session_meta` get-by-id or
 `list` with `include_hidden: true`.
 
 The same surface is plain HTTP for scripts: the server exports `$MYCO_API`; POST
@@ -228,7 +228,7 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// The epilogue plus the current soul (`~/.myco/workspace/soul/`, respecting
+/// The epilogue plus the current soul (`~/.myco/v2/workspace/soul/`, respecting
 /// `MYCO_HOME`, capped at `max_soul_bytes`), the launch directory's project
 /// guidance (`AGENTS.md` / `CLAUDE.md`), and a listing of the rest of the
 /// workspace, when present. Read at model build time — session start, model
@@ -236,7 +236,7 @@ fn human_bytes(n: usize) -> String {
 /// mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
     epilogue_with(
-        myco_core::myco_home().ok(),
+        myco_core::data_root().ok(),
         std::env::current_dir().ok(),
         max_soul_bytes,
     )
@@ -246,7 +246,7 @@ pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
 /// `max_soul_bytes` cap. Startup calls this to warn before the first turn;
 /// `None` means the soul fits (or there is none).
 pub fn soul_truncation(max_soul_bytes: usize) -> Option<SoulTruncation> {
-    let home = myco_core::myco_home().ok()?;
+    let home = myco_core::data_root().ok()?;
     let dir = home.join("workspace").join("soul");
     capped_soul(&dir, max_soul_bytes)?.2
 }
@@ -580,7 +580,7 @@ mod tests {
             // Free-form workspace policy: maildir-style soul versions, the
             // recall/record habit, and the consistency caution.
             "Workspace & soul",
-            "~/.myco/workspace/soul/",
+            "~/.myco/v2/workspace/soul/",
             "write-once, never edited in place",
             "weakly consistent",
         ] {

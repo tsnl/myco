@@ -143,6 +143,7 @@ mod tests {
             snippet: snippet.to_string(),
             link_counts: LinkCounts::default(),
             kind: SessionKind::User,
+            archived: false,
             parent_session_id: None,
         }
     }

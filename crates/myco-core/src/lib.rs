@@ -5,7 +5,7 @@ use std::pin::Pin;
 mod fs;
 pub mod image;
 
-pub use fs::{atomically_write, myco_home};
+pub use fs::{atomically_write, data_root, myco_home};
 
 pub type Async<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type AsyncStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;

@@ -8,6 +8,16 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// The v2 data root: `<myco_home>/v2`.
+///
+/// v2 shares nothing with v1 — sessions, workspace, soul, manual, and config
+/// all live under this directory, so a v1 install on the same machine keeps
+/// its own store and soul untouched. The formats are incompatible by design;
+/// there is no migration path and none is attempted.
+pub fn data_root() -> Result<PathBuf, String> {
+    Ok(myco_home()?.join("v2"))
+}
+
 /// myco's data root: `$MYCO_HOME` when set to a non-empty value, else
 /// `~/.myco`. Sessions, the soul, the exported manual and the config all hang
 /// off this.

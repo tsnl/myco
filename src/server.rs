@@ -722,6 +722,7 @@ fn content_text(content: &[Content]) -> String {
 
 fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
     api::SessionSummary {
+        archived: s.archived,
         id: s.id.clone(),
         title: s.title.clone(),
         model: s.model.clone(),
@@ -749,8 +750,12 @@ impl Server {
 
 #[async_trait::async_trait]
 impl MycoApi for Server {
-    async fn list_sessions(&self) -> Result<Vec<api::SessionSummary>, ApiError> {
-        let entries = myco_session::list_sessions(SESSION_LIST_LIMIT).map_err(internal)?;
+    async fn list_sessions(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<api::SessionSummary>, ApiError> {
+        let entries = myco_session::list_sessions_with(SESSION_LIST_LIMIT, false, include_archived)
+            .map_err(internal)?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let (live, busy) = self.live_flags(&e.id).await;
@@ -762,6 +767,7 @@ impl MycoApi for Server {
                 updated_at: e.updated_at.to_rfc3339(),
                 message_count: e.message_count,
                 snippet: e.snippet,
+                archived: e.archived,
                 live,
                 busy,
             });
@@ -803,6 +809,47 @@ impl MycoApi for Server {
             entries: render_entries(&session.messages),
             summary: summary_of(&session, live, busy),
         })
+    }
+
+    async fn update_session(
+        &self,
+        id: &str,
+        req: api::UpdateSession,
+    ) -> Result<api::SessionSummary, ApiError> {
+        // Edit the live copy when there is one, so a viewer sees it at once;
+        // otherwise edit on disk.
+        let session = match self.get_live(id).await {
+            Some(l) => {
+                l.session
+                    .with_mut(|s| {
+                        if let Some(title) = req.title.clone() {
+                            s.title = Some(title);
+                        }
+                        if let Some(archived) = req.archived {
+                            s.archived = archived;
+                        }
+                        s.touch();
+                        s.save()
+                    })
+                    .map_err(internal)?;
+                l.session.snapshot()
+            }
+            None => {
+                let mut s = Session::load_by_id_or_prefix(id)
+                    .map_err(|e| ApiError::new(ErrorKind::NotFound, e))?;
+                if let Some(title) = req.title.clone() {
+                    s.title = Some(title);
+                }
+                if let Some(archived) = req.archived {
+                    s.archived = archived;
+                }
+                s.touch();
+                s.save().map_err(internal)?;
+                s
+            }
+        };
+        let (live, busy) = self.live_flags(&session.id).await;
+        Ok(summary_of(&session, live, busy))
     }
 
     async fn post_message(&self, id: &str, req: api::PostMessage) -> Result<api::Poll, ApiError> {

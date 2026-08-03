@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use myco_core::{atomically_write, myco_home, uuid_simple_hex};
+use myco_core::{atomically_write, data_root, uuid_simple_hex};
 use myco_models::{Message, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
@@ -97,6 +97,10 @@ pub struct Session {
     /// [`SessionKind::is_user`] (only [`SessionKind::User`] is listed by default).
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
+    /// Filed away: kept in full, but out of the default listing. Distinct
+    /// from retiring a live agent task, which is a runtime concern.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
     /// Session this one was compacted from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_id: Option<String>,
@@ -147,6 +151,7 @@ pub struct SessionListEntry {
     pub snippet: String,
     pub link_counts: LinkCounts,
     pub kind: SessionKind,
+    pub archived: bool,
     pub parent_session_id: Option<String>,
 }
 
@@ -270,6 +275,7 @@ impl Session {
             scratchpad: String::new(),
             parent_session_id: None,
             kind: SessionKind::User,
+            archived: false,
             predecessor_id: None,
             successor_id: None,
             last_usage: None,
@@ -476,7 +482,7 @@ impl Session {
 // ---------------------------------------------------------------------------
 
 pub fn session_root() -> Result<PathBuf, String> {
-    Ok(myco_home()?.join("session"))
+    Ok(data_root()?.join("session"))
 }
 
 pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
@@ -503,6 +509,16 @@ pub fn list_sessions_filtered(
     limit: usize,
     include_hidden: bool,
 ) -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_with(limit, include_hidden, false)
+}
+
+/// Like [`list_sessions_filtered`], with archived sessions optionally folded
+/// back in. Archived sessions are never listed by default.
+pub fn list_sessions_with(
+    limit: usize,
+    include_hidden: bool,
+    include_archived: bool,
+) -> Result<Vec<SessionListEntry>, String> {
     let root = session_root()?;
     if !root.exists() {
         return Ok(Vec::new());
@@ -510,6 +526,9 @@ pub fn list_sessions_filtered(
 
     let (mut metas, skipped) = collect_session_entries(&root, include_hidden)?;
     warn_about_skipped_sessions(&skipped);
+    if !include_archived {
+        metas.retain(|m| !m.archived);
+    }
 
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
     if limit > 0 {
@@ -592,6 +611,7 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         snippet,
         link_counts: LinkCounts::from_links(&session.links),
         kind: session.kind,
+        archived: session.archived,
         parent_session_id: session.parent_session_id,
     })
 }

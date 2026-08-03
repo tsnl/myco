@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use myco::server::Server;
-use myco_api::{CreateSession, MycoApi, PostMessage};
+use myco_api::{CreateSession, MycoApi, PostMessage, UpdateSession};
 use myco_models::{Content, GenerateError, GenerateOutput, GenerativeModel, TurnEndReason};
 use myco_test_support::ScriptedModel;
 
@@ -120,10 +120,10 @@ async fn a_turn_round_trips_through_the_trait() {
     assert_eq!(p.entries.last().unwrap().text, "third answer");
 
     // The session is listed, and retiring it works through the trait too.
-    let listed = server.list_sessions().await.expect("list");
+    let listed = server.list_sessions(false).await.expect("list");
     assert!(listed.iter().any(|e| e.id == s.id));
     server.retire(&s.id).await.expect("retire");
-    let listed = server.list_sessions().await.expect("list");
+    let listed = server.list_sessions(false).await.expect("list");
     let entry = listed.iter().find(|e| e.id == s.id).expect("still on disk");
     assert!(!entry.live, "retired session must not be live");
 }
@@ -253,7 +253,8 @@ async fn an_abandoned_session_leaves_nothing_on_disk() {
     let api: &dyn MycoApi = server.as_ref();
 
     let count_sessions = || {
-        let root = home.path().join("session");
+        // v2 keeps its whole world under `$MYCO_HOME/v2`.
+        let root = home.path().join("v2").join("session");
         let mut n = 0;
         if let Ok(shards) = std::fs::read_dir(&root) {
             for shard in shards.flatten() {
@@ -299,4 +300,87 @@ async fn an_abandoned_session_leaves_nothing_on_disk() {
     })
     .await;
     assert_eq!(count_sessions(), 1, "a used session is on disk");
+}
+
+/// Archiving files a session away without losing it: gone from the default
+/// listing, still readable, still there when archived ones are asked for.
+#[tokio::test]
+async fn archiving_hides_a_session_without_losing_it() {
+    let _home = myco_test_support::temp_home("api-archive");
+    let server = scripted_server(|| {
+        ScriptedModel::new(vec![GenerateOutput {
+            content: vec![Content::Text {
+                text: "kept".into(),
+            }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }])
+    });
+    let api: &dyn MycoApi = server.as_ref();
+
+    let s = api
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    api.post_message(&s.id, PostMessage { text: "hi".into() })
+        .await
+        .expect("post");
+    poll_until(api, &s.id, |p| {
+        p.entries.iter().any(|e| e.role == "assistant")
+    })
+    .await;
+    assert!(
+        api.list_sessions(false)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.id == s.id)
+    );
+
+    let updated = api
+        .update_session(
+            &s.id,
+            UpdateSession {
+                title: Some("filed".into()),
+                archived: Some(true),
+            },
+        )
+        .await
+        .expect("archive");
+    assert!(updated.archived);
+    assert_eq!(updated.title.as_deref(), Some("filed"));
+
+    // Out of the default listing, present when asked for, still readable.
+    let plain = api.list_sessions(false).await.unwrap();
+    assert!(!plain.iter().any(|e| e.id == s.id), "archived is hidden");
+    let all = api.list_sessions(true).await.unwrap();
+    assert!(
+        all.iter().any(|e| e.id == s.id),
+        "archived is listed on request"
+    );
+    let detail = api.session_detail(&s.id).await.expect("still readable");
+    assert!(detail.entries.iter().any(|e| e.text == "kept"));
+
+    // And it comes back.
+    api.update_session(
+        &s.id,
+        UpdateSession {
+            title: None,
+            archived: Some(false),
+        },
+    )
+    .await
+    .expect("unarchive");
+    assert!(
+        api.list_sessions(false)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.id == s.id)
+    );
 }

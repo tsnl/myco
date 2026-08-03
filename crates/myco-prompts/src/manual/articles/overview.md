@@ -37,13 +37,13 @@ myco (CLI) / myco --mode serve (web)
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/v2/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_soul_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
+| `~/.myco/v2/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/soul/` holds write-once soul snapshots; the newest is appended verbatim to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
-Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
+Minimal config shape (`~/.myco/v2/config.toml` — hosts are **not** listed here;
 top-level keys must come before the tables, per TOML):
 
 ```toml
@@ -160,7 +160,7 @@ do not.
 
 All resolution happens in one startup step (`myco::config::Config`), which
 also loads the config file (`--config` → `$MYCO_CONFIG` →
-`~/.myco/config.toml`) and decides color output: sections are colored when
+`~/.myco/v2/config.toml`) and decides color output: sections are colored when
 stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 `CLICOLOR_FORCE` / `TERM=dumb`.
 
@@ -186,7 +186,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Agent workspace
 
-`~/.myco/workspace/` is the agents' own directory — free-form files maintained with
+`~/.myco/v2/workspace/` is the agents' own directory — free-form files maintained with
 the ordinary tools (no dedicated tool, no required format), persistent across
 sessions and shared by every agent on the machine. `workspace/soul/` is the one
 special place: it holds the agent's soul as maildir-style complete snapshots (one
