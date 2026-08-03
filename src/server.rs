@@ -602,16 +602,13 @@ fn build_model(
     .map_err(|e| format!("failed to create model: {e}"))
 }
 
-/// The author for turns driven locally, before there is a user roster: the
-/// OS user, which is who the process is already trusted as.
-pub fn local_author() -> Author {
-    let name = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "local".to_string());
-    Author::User {
-        id: "local".to_string(),
-        name,
-    }
+/// The author for turns this process drives locally.
+///
+/// Read off the roster resolved at startup, never derived here: `Config` has
+/// already refused to build if `server.toml` was missing or did not name us,
+/// which is what keeps an unregistered identity out of a stored session.
+pub fn local_author(config: &Config) -> Author {
+    config.roster.local_author()
 }
 
 /// The final agent prose of the last turn, for `subagent` results.
@@ -816,7 +813,7 @@ impl MycoApi for Server {
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
         live.tx
             .send(Cmd::User {
-                author: local_author(),
+                author: local_author(&self.config),
                 text: req.text.clone(),
             })
             .map_err(|_| internal("agent task gone".into()))?;

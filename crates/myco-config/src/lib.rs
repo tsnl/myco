@@ -42,10 +42,14 @@ use myco_models::{
 
 pub mod file;
 pub mod harness;
+pub mod roster;
 pub use file::{
     AuthEntry, FileConfig, GatewayEntry, ModelEntry, load_file_config, parse_file_config_str,
 };
 pub use harness::{HarnessConfig, HostConfig, load_ssh_host_aliases};
+pub use roster::{
+    EXAMPLE_SERVER_TOML, FileRoster, Roster, RosterUser, load_file_roster, parse_file_roster_str,
+};
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
@@ -100,6 +104,9 @@ pub struct ConfigUserSettings {
     /// Config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
     pub config_path: Option<PathBuf>,
+    /// Roster file override.
+    /// `None` → `$MYCO_SERVER_CONFIG` → `~/.myco/v2/server.toml`.
+    pub roster_path: Option<PathBuf>,
     /// Model key override (CLI `--model`).
     /// `None` → config file `model` → sole catalog entry.
     pub model: Option<String>,
@@ -113,6 +120,9 @@ pub struct Config {
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
     pub config_path: PathBuf,
+    /// Registered users, and which one this process runs as. Required: myco
+    /// attributes every session entry, and will not invent an author.
+    pub roster: Roster,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
     pub harness: HarnessConfig,
@@ -138,6 +148,7 @@ impl Config {
             settings,
             |k| std::env::var(k).ok(),
             load_file_config,
+            roster::load_file_roster,
             load_ssh_host_aliases,
             read_auth_file,
         )
@@ -149,17 +160,24 @@ impl Config {
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
         load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
+        load_roster: impl FnOnce(&Path) -> Result<FileRoster, String>,
         ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
         read_auth_file: impl Fn(&Path) -> Result<String, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
             config_path,
+            roster_path,
             model: model_override,
         } = settings;
 
         let config_path = resolve_config_path(config_path, &env)?;
         let file = load_file(&config_path)?;
+
+        // Identity before anything else: a session written by an unknown
+        // author is worse than a server that refused to start.
+        let roster_path = roster::resolve_roster_path(roster_path, &env)?;
+        let roster = Roster::resolve(roster_path.clone(), load_roster(&roster_path)?, &env)?;
 
         let models = resolve_catalog(&file, &env, &read_auth_file)?;
         let model = resolve_default_model(model_override, file.model.clone(), &models)?;
@@ -181,6 +199,7 @@ impl Config {
         );
         Ok(Self {
             config_path,
+            roster,
             harness,
             models,
             model,
@@ -419,6 +438,12 @@ context_window = 200_000
         })
     }
 
+    /// A one-user roster, so config tests exercise catalog resolution rather
+    /// than the identity gate (which `roster::tests` covers on its own).
+    fn test_roster(_: &Path) -> Result<FileRoster, String> {
+        parse_file_roster_str("[[users]]\nid = \"tester\"\n")
+    }
+
     fn resolve_toml_with_files(
         toml_text: impl Into<String>,
         settings: ConfigUserSettings,
@@ -428,8 +453,9 @@ context_window = 200_000
         let toml_text = toml_text.into();
         Config::resolve_with(
             settings,
-            env,
+            move |k| env(k).or_else(|| (k == "USER").then(|| "tester".to_string())),
             move |_| parse_file_config_str(&toml_text),
+            test_roster,
             || Ok(Vec::new()),
             read_auth_file,
         )
@@ -800,13 +826,14 @@ context_window = 32_768
                 config_path: Some(PathBuf::from("/tmp/h.toml")),
                 ..Default::default()
             },
-            env_of(&[]),
+            env_of(&[("USER", "tester")]),
             |p| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
                 let mut file = parse_file_config_str(&model_toml("m", &[]))?;
                 file.attach_timeout_secs = Some(42);
                 Ok(file)
             },
+            test_roster,
             || Ok(vec!["devbox".into()]),
             |_| Err("no files".into()),
         )

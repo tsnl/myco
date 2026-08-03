@@ -51,6 +51,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
 
+    /// User roster override (`$MYCO_SERVER_CONFIG` → `~/.myco/v2/server.toml`).
+    #[arg(long, value_name = "PATH")]
+    server_config: Option<std::path::PathBuf>,
+
     /// Model key from the config.toml [models] catalog.
     #[arg(long)]
     model: Option<String>,
@@ -82,6 +86,7 @@ async fn main() {
         Mode::Serve => {
             let config = match Config::resolve(ConfigUserSettings {
                 config_path: args.config,
+                roster_path: args.server_config,
                 model: args.model,
             }) {
                 Ok(c) => c,
@@ -102,6 +107,7 @@ async fn main() {
         Mode::Cli => {
             myco::cli::run(myco::cli::CliOptions {
                 config_path: args.config,
+                roster_path: args.server_config,
                 model: args.model,
                 resume: args
                     .resume

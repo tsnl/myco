@@ -26,6 +26,7 @@ const DEFAULT_WRAP_WIDTH: usize = 80;
 
 pub struct CliOptions {
     pub config_path: Option<std::path::PathBuf>,
+    pub roster_path: Option<std::path::PathBuf>,
     pub model: Option<String>,
     /// `Some(None)` = resume most recent; `Some(Some(id))` = resume that id.
     pub resume: Option<Option<String>>,
@@ -54,6 +55,7 @@ impl<P: ExternalPrinter + Send + Sync> TuiSink for PrinterSink<P> {
 pub async fn run(opts: CliOptions) {
     let config = match Config::resolve(ConfigUserSettings {
         config_path: opts.config_path.clone(),
+        roster_path: opts.roster_path.clone(),
         model: opts.model.clone(),
     }) {
         Ok(c) => c,
@@ -101,7 +103,7 @@ pub async fn run(opts: CliOptions) {
     };
 
     if let Some(prompt) = opts.print {
-        run_print(initial, prompt).await;
+        run_print(&sup, initial, prompt).await;
         return;
     }
 
@@ -333,7 +335,7 @@ fn submit(sup: &Arc<Server>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line
     producer.user_header(used, max, snapshot.last_usage, &running);
     producer.submitted_input(line);
     let _ = live.tx.send(Cmd::User {
-        author: crate::server::local_author(),
+        author: crate::server::local_author(sup.config()),
         text: line.to_string(),
     });
 }
@@ -362,13 +364,13 @@ fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::Joi
     })
 }
 
-async fn run_print(live: Arc<Live>, prompt: String) {
+async fn run_print(sup: &Arc<Server>, live: Arc<Live>, prompt: String) {
     let mut turns = live.turns.clone();
     let start = *turns.borrow();
     if live
         .tx
         .send(Cmd::User {
-            author: crate::server::local_author(),
+            author: crate::server::local_author(sup.config()),
             text: prompt,
         })
         .is_err()
