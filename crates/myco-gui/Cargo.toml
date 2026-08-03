@@ -15,6 +15,6 @@ yew-router = "0.18"
 gloo-net = { version = "0.6", features = ["eventsource"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Element", "HtmlInputElement", "HtmlTextAreaElement"] }
+web-sys = { version = "0.3", features = ["Element", "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent"] }
 futures = { workspace = true }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

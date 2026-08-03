@@ -68,6 +68,23 @@ async fn fetch<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
         .map_err(|e| format!("GET {url}: decode: {e}"))
 }
 
+/// Click and Enter both mean "send": one action, two bindings. Enter submits
+/// and Shift+Enter inserts a newline, as in the terminal.
+fn to_click(send: &Callback<()>) -> Callback<MouseEvent> {
+    let send = send.clone();
+    Callback::from(move |_: MouseEvent| send.emit(()))
+}
+
+fn to_enter(send: &Callback<()>) -> Callback<KeyboardEvent> {
+    let send = send.clone();
+    Callback::from(move |e: KeyboardEvent| {
+        if e.key() == "Enter" && !e.shift_key() {
+            e.prevent_default();
+            send.emit(());
+        }
+    })
+}
+
 async fn fetch_detail(id: &str) -> Result<api::SessionDetail, String> {
     fetch(&format!("/api/sessions/{id}")).await
 }
@@ -154,7 +171,7 @@ fn draft() -> Html {
     let error = use_state(|| Option::<String>::None);
     let navigator = use_navigator().unwrap();
 
-    let on_send = {
+    let send_now: Callback<()> = {
         let input = input.clone();
         let error = error.clone();
         let navigator = navigator.clone();
@@ -205,6 +222,8 @@ fn draft() -> Html {
             });
         })
     };
+    let on_send = to_click(&send_now);
+    let on_keydown = to_enter(&send_now);
 
     html! {
         <div class="app">
@@ -223,9 +242,10 @@ fn draft() -> Html {
             </div>
             <div class="composer">
                 <div class="column">
-                    <textarea ref={input} rows="3" placeholder="message"></textarea>
+                    <textarea ref={input} rows="3" onkeydown={on_keydown}
+                              placeholder="message (Enter to send, Shift+Enter for a newline)" />
                     <div class="actions">
-                        <button onclick={on_send}>{ "send" }</button>
+                        <button class="send" onclick={on_send}>{ "send" }</button>
                     </div>
                 </div>
             </div>
@@ -417,7 +437,7 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
-    let on_send = {
+    let send_now: Callback<()> = {
         let id = props.id.clone();
         let input = input.clone();
         let busy = busy.clone();
@@ -449,9 +469,12 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
+    let on_send = to_click(&send_now);
+    let on_keydown = to_enter(&send_now);
+
     let on_cancel = {
         let id = props.id.clone();
-        Callback::from(move |_| {
+        Callback::from(move |_: MouseEvent| {
             let id = id.clone();
             spawn_local(async move {
                 let _ = Request::post(&format!("/api/sessions/{id}/cancel"))
@@ -483,10 +506,13 @@ fn conversation(props: &ConversationProps) -> Html {
             </div>
             <div class="composer">
                 <div class="column">
-                    <textarea ref={input} rows="3" placeholder="message"></textarea>
+                    <textarea ref={input} rows="3" onkeydown={on_keydown}
+                              placeholder="message (Enter to send, Shift+Enter for a newline)" />
                     <div class="actions">
-                        <button onclick={on_send}>{ "send" }</button>
-                        <button onclick={on_cancel}>{ "cancel turn" }</button>
+                        <button class="send" onclick={on_send}>{ "send" }</button>
+                        { if *busy {
+                            html! { <button onclick={on_cancel}>{ "cancel" }</button> }
+                        } else { html!{} } }
                     </div>
                 </div>
             </div>
