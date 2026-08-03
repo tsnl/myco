@@ -1664,6 +1664,7 @@ version = "0.4.0-dev"
 dependencies = [
  "chrono",
  "futures",
+ "myco-api",
  "myco-config",
  "myco-core",
  "myco-machines",
@@ -1685,8 +1686,10 @@ name = "myco-api"
 version = "0.4.0-dev"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1755,6 +1758,7 @@ dependencies = [
  "dirs",
  "futures",
  "libc",
+ "myco-api",
  "myco-config",
  "myco-core",
  "myco-models",
@@ -1779,6 +1783,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "myco-api",
  "myco-config",
  "myco-core",
  "myco-prompts",
@@ -1821,9 +1826,9 @@ dependencies = [
  "dirs",
  "futures",
  "libc",
+ "myco-api",
  "myco-config",
  "myco-core",
- "myco-models",
  "myco-prompts",
  "myco-test-support",
  "serde",
@@ -1840,6 +1845,7 @@ version = "0.4.0-dev"
 dependencies = [
  "chrono",
  "futures",
+ "myco-api",
  "myco-core",
  "myco-models",
  "myco-session",

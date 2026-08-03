@@ -35,7 +35,7 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::{Message, TokenUsage};
+use crate::generative_model::TokenUsage;
 use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
@@ -505,9 +505,9 @@ impl TuiProducer {
     /// content from the run(s) that streamed it (`{id}.console` is opened for
     /// append). Used for `--resume`/`/resume` replay and the Ctrl-L / resize
     /// reprint.
-    pub fn replay_history(&self, messages: &[Message]) {
+    pub fn replay_history(&self, entries: &[myco_api::Entry]) {
         let wrap = self.with_state(|st| st.wrap);
-        let events = history_events(messages, self.palette(wrap));
+        let events = history_events(entries, self.palette(wrap));
         if !events.is_empty() {
             self.terminal.emit(&events);
         }
@@ -1076,11 +1076,12 @@ mod tests {
     #[test]
     fn replay_history_reaches_terminal_only() {
         let (producer, terminal, mirror) = producer(None);
-        producer.replay_history(&[Message::UserMessage {
-            content: vec![crate::generative_model::Content::Text {
+        producer.replay_history(&[myco_api::Entry::user(
+            myco_api::Author::System,
+            vec![myco_api::Content::Text {
                 text: "hello".into(),
             }],
-        }]);
+        )]);
         assert!(mirror.events().is_empty());
         let plain = encode_plain(&terminal.events());
         assert!(plain.contains("USER\n\nhello\n"), "{plain:?}");

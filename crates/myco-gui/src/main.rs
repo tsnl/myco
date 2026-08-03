@@ -293,21 +293,47 @@ fn draft() -> Html {
 // ---------------------------------------------------------------------------
 
 /// One transcript entry, in the terminal's visual language. Prose is
-/// markdown-rendered (as the CLI styles it); the user's own words and raw
-/// tool output stay verbatim, exactly as the terminal replays them.
+/// markdown-rendered (as the CLI styles it); raw tool output stays verbatim.
+/// Entries carry their author, so a shared session reads as a conversation
+/// rather than an anonymous stream.
 fn render_entry(e: &api::Entry) -> Html {
-    match e.role.as_str() {
-        "user" => html! {
+    match &e.body {
+        api::EntryBody::User { content } => html! {
             <div>
                 <hr class="rule" />
-                <div class="role role-user">{ "USER" }</div>
-                <pre>{ &e.text }</pre>
+                <div class="role role-user">{ e.author.name().to_uppercase() }</div>
+                <pre>{ api::content_text(content) }</pre>
             </div>
         },
-        "thinking" => html! { <div class="role-thinking">{ markdown(&e.text) }</div> },
-        "tool_use" => html! { <pre class="role-tool">{ format!("● {}", e.text) }</pre> },
-        "tool_result" => html! { <pre class="dim">{ &e.text }</pre> },
-        _ => html! { <div class="role-assistant">{ markdown(&e.text) }</div> },
+        api::EntryBody::Agent {
+            content, tool_uses, ..
+        } => html! {
+            <div>
+                { for content.iter().map(|c| match c {
+                    api::Content::Text { text } => html! {
+                        <div class="role-assistant">{ markdown(text) }</div>
+                    },
+                    api::Content::Thinking { text, redacted, .. } => html! {
+                        <div class="role-thinking">
+                            { markdown(if *redacted { "[redacted]" } else { text }) }
+                        </div>
+                    },
+                    api::Content::Image { .. } => html! { <pre class="dim">{ "[image]" }</pre> },
+                }) }
+                { for tool_uses.iter().map(|t| html! {
+                    <pre class="role-tool">{ format!("● {}({})", t.name, t.input) }</pre>
+                }) }
+            </div>
+        },
+        api::EntryBody::ToolResults { results } => html! {
+            <div>
+                { for results.iter().map(|r| html! {
+                    <pre class={ if r.is_error { "err" } else { "dim" } }>
+                        { api::content_text(&r.content) }
+                    </pre>
+                }) }
+            </div>
+        },
     }
 }
 

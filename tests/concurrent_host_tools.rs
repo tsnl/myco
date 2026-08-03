@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use myco::core::CancelToken;
-use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
+use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
 use myco::harness::{Harness, HarnessConfig};
 use myco::{Agent, NullEventSink};
+use myco_api::EntryBody;
 use serde_json::json;
 use test_utils::{ScriptedModel, tool_text};
 
@@ -63,6 +64,7 @@ async fn agent_concurrent_host_bash_tools_complete() {
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
         agent.interact(
+            myco_test_support::tester(),
             vec![Content::Text {
                 text: "run three".into(),
             }],
@@ -79,18 +81,14 @@ async fn agent_concurrent_host_bash_tools_complete() {
     // History: user, asst(tool_use), tool_results, asst(end)
     let history = agent.history();
     assert_eq!(history.len(), 4, "history: {history:?}");
-    match &history[2] {
-        Message::ToolResults { tool_use_results } => {
-            assert_eq!(tool_use_results.len(), 3);
+    match &history[2].body {
+        EntryBody::ToolResults { results } => {
+            assert_eq!(results.len(), 3);
             for (i, id) in ["t1", "t2", "t3"].iter().enumerate() {
-                assert_eq!(tool_use_results[i].id, *id);
-                assert!(
-                    !tool_use_results[i].is_error,
-                    "tool {id} error: {:?}",
-                    tool_use_results[i]
-                );
+                assert_eq!(results[i].id, *id);
+                assert!(!results[i].is_error, "tool {id} error: {:?}", results[i]);
             }
-            let texts: Vec<String> = tool_use_results.iter().map(tool_text).collect();
+            let texts: Vec<String> = results.iter().map(tool_text).collect();
             assert!(texts[0].contains("ONE"), "{}", texts[0]);
             assert!(texts[1].contains("TWO"), "{}", texts[1]);
             assert!(texts[2].contains("THREE"), "{}", texts[2]);
@@ -131,6 +129,7 @@ async fn agent_concurrent_bash_and_editor_complete() {
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
         agent.interact(
+            myco_test_support::tester(),
             vec![Content::Text {
                 text: "run both".into(),
             }],
@@ -143,11 +142,11 @@ async fn agent_concurrent_bash_and_editor_complete() {
     assert_eq!(reply.len(), 1);
 
     let history = agent.history();
-    match &history[2] {
-        Message::ToolResults { tool_use_results } => {
-            assert_eq!(tool_use_results.len(), 2);
-            assert!(!tool_use_results[0].is_error, "{:?}", tool_use_results[0]);
-            assert!(!tool_use_results[1].is_error, "{:?}", tool_use_results[1]);
+    match &history[2].body {
+        EntryBody::ToolResults { results } => {
+            assert_eq!(results.len(), 2);
+            assert!(!results[0].is_error, "{:?}", results[0]);
+            assert!(!results[1].is_error, "{:?}", results[1]);
         }
         other => panic!("expected ToolResults, got {other:?}"),
     }

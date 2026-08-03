@@ -20,12 +20,13 @@ pub use compact_worker::{
 
 use futures::future;
 
+use myco_api::{Author, Entry, EntryBody};
 use myco_core::CancelToken;
 use myco_machines::harness::Harness;
 use myco_models::{
     self as generative_model, self, Content, ContentDelta, GenerateError, GenerateOutput,
-    GenerativeModel, Message, MessagePart, Recovery, TokenUsage, ToolResult, ToolUse,
-    TurnEndReason, answer_content,
+    GenerativeModel, MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason,
+    answer_content,
 };
 use uuid::Uuid;
 
@@ -111,7 +112,7 @@ impl EventSink for NullEventSink {
 /// the conversation before the turn completes. Not called between an assistant
 /// tool_use message and its results — that prefix is rejected by providers, so
 /// it must never be the snapshot a context fork inherits.
-pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
+pub type HistoryCheckpoint = Box<dyn Fn(&[Entry], Option<TokenUsage>) + Send + Sync>;
 
 /// How long a cancelled tool dispatch may keep running to do its own
 /// cleanup (process-group kill, buffer drain) before the agent abandons it
@@ -123,7 +124,11 @@ pub struct Agent {
     harness: Arc<Harness>,
     sink: Arc<dyn EventSink>,
     context: TraceContext,
-    history: Vec<Message>,
+    /// The durable, attributed record. Provider messages are projected from
+    /// it per request; the entries are what the session stores.
+    history: Vec<Entry>,
+    /// Author stamped on entries this agent writes.
+    model_key: String,
     /// Last turn's usage: input = final request's prompt (context estimate for
     /// the next USER header), output = summed across that turn's generate calls.
     last_usage: Option<TokenUsage>,
@@ -153,6 +158,7 @@ impl Agent {
             sink,
             context,
             history: Vec::new(),
+            model_key: String::new(),
             last_usage: None,
             context_window_tokens: 200_000,
             checkpoint: None,
@@ -170,12 +176,17 @@ impl Agent {
         }
     }
 
-    pub fn history(&self) -> &[Message] {
+    pub fn history(&self) -> &[Entry] {
         &self.history
     }
 
+    /// The catalog key stamped as the author of this agent's entries.
+    pub fn set_model_key(&mut self, key: impl Into<String>) {
+        self.model_key = key.into();
+    }
+
     /// Replace the conversation history (e.g. when resuming a saved session).
-    pub fn set_history(&mut self, history: Vec<Message>) {
+    pub fn set_history(&mut self, history: Vec<Entry>) {
         self.history = history;
     }
 
@@ -198,14 +209,17 @@ impl Agent {
         let at = self
             .history
             .iter()
-            .rposition(|m| matches!(m, Message::UserMessage { .. }))?;
+            .rposition(|e| matches!(e.body, EntryBody::User { .. }))?;
         let mut dropped = self.history.split_off(at);
         // Usage described the request that just failed; it no longer describes
         // this history. Callers re-establish it on the next successful turn.
         self.last_usage = None;
         self.emit_checkpoint();
         match dropped.remove(0) {
-            Message::UserMessage { content } => Some(content),
+            Entry {
+                body: EntryBody::User { content },
+                ..
+            } => Some(content),
             other => unreachable!("rposition matched a user message, got {other:?}"),
         }
     }
@@ -237,14 +251,15 @@ impl Agent {
     ///
     /// Pass [`CancelToken::new`] when cancellation is not needed (tests, scripts).
     /// The CLI cancels the token on Ctrl-C while a turn is in flight.
+    /// Run one turn on behalf of `author`. Attribution is per turn, not per
+    /// agent: several people can post into the same session.
     pub async fn interact(
         &mut self,
+        author: Author,
         user_input: Vec<Content>,
         cancel: CancelToken,
     ) -> Result<Vec<Content>, AgentInteractionError> {
-        self.history.push(Message::UserMessage {
-            content: user_input,
-        });
+        self.history.push(Entry::user(author, user_input));
         self.emit_checkpoint();
 
         // Output tokens accumulate across this turn's generate calls (one per
@@ -257,7 +272,8 @@ impl Agent {
                 return self.finish_cancelled();
             }
 
-            let stream = self.model.generate(&self.history);
+            let messages = myco_models::entries_to_messages(&self.history);
+            let stream = self.model.generate(&messages);
             let sink = self.sink.clone();
             let context = self.context.clone();
             let output = match accumulate_generate(stream, sink, context, cancel.clone()).await {
@@ -283,11 +299,12 @@ impl Agent {
             // unchanged history would loop generate forever, and pushing an
             // empty ToolResults message is rejected by the API — fail loud.
             if matches!(reason, TurnEndReason::ToolUse) && output.tool_uses.is_empty() {
-                self.history.push(Message::AssistantMessage {
-                    content: output.content,
-                    tool_uses: vec![],
-                    turn_end_reason: Some(TurnEndReason::ToolUse),
-                });
+                self.history.push(Entry::agent(
+                    &self.model_key,
+                    output.content,
+                    vec![],
+                    Some(TurnEndReason::ToolUse),
+                ));
                 return self.finish_generate_error(GenerateError::MalformedResponseError(
                     "turn ended in tool_use but streamed zero tool uses".into(),
                 ));
@@ -299,11 +316,12 @@ impl Agent {
             let tool_uses = output.tool_uses;
             // Persist full content (including thinking summaries) for session
             // resume/UI. Backends strip thinking when composing the next request.
-            self.history.push(Message::AssistantMessage {
-                content: output.content,
-                tool_uses: tool_uses.clone(),
-                turn_end_reason: Some(reason.clone()),
-            });
+            self.history.push(Entry::agent(
+                &self.model_key,
+                output.content,
+                tool_uses.clone(),
+                Some(reason.clone()),
+            ));
 
             // Tool calls are answered whenever the turn carries them — the stop
             // reason does not decide this. `max_tokens` truncates a turn
@@ -323,7 +341,8 @@ impl Agent {
                 )
                 .await;
 
-                self.history.push(Message::ToolResults { tool_use_results });
+                self.history
+                    .push(Entry::tool_results(&self.model_key, tool_use_results));
                 self.emit_checkpoint();
 
                 // If cancel fired during tools, do not start another generate — the
@@ -477,7 +496,14 @@ mod tests {
     use futures::stream;
     use myco_core::Async;
     use myco_machines::tool_services::{HostDispatchContext, ToolService};
-    use myco_models::{GenerateError, MessagePart, ToolSpec};
+    use myco_models::{GenerateError, Message, MessagePart, ToolSpec};
+
+    fn test_author() -> Author {
+        Author::User {
+            id: "t".into(),
+            name: "tester".into(),
+        }
+    }
     use myco_test_support::{
         ScriptedModel, assistant, assistant_tool, result_text, tool_results, user,
     };
@@ -583,6 +609,7 @@ mod tests {
         let wall_start = Instant::now();
         let reply = agent
             .interact(
+                test_author(),
                 vec![Content::Text {
                     text: "run both".into(),
                 }],
@@ -603,7 +630,13 @@ mod tests {
         let history = agent.history();
         assert_eq!(history.len(), 4);
         match &history[2] {
-            Message::ToolResults { tool_use_results } => {
+            Entry {
+                body:
+                    EntryBody::ToolResults {
+                        results: tool_use_results,
+                    },
+                ..
+            } => {
                 assert_eq!(tool_use_results.len(), 2);
                 // Order matches the original tool_uses list, not completion order.
                 assert_eq!(tool_use_results[0].id, "call_slow");
@@ -668,7 +701,7 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let snapshots: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snapshots: Arc<Mutex<Vec<Vec<Entry>>>> = Arc::new(Mutex::new(Vec::new()));
         let record = snapshots.clone();
         agent.set_checkpoint(Box::new(move |history, _usage| {
             record.lock().unwrap().push(history.to_vec());
@@ -676,6 +709,7 @@ mod tests {
 
         agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "run".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -685,10 +719,13 @@ mod tests {
         let snapshots = snapshots.lock().unwrap();
         assert_eq!(snapshots.len(), 2, "{snapshots:?}");
         assert_eq!(snapshots[0].len(), 1);
-        assert!(matches!(snapshots[0][0], Message::UserMessage { .. }));
+        assert!(matches!(snapshots[0][0].body, EntryBody::User { .. }));
         assert_eq!(snapshots[1].len(), 3);
-        assert!(matches!(snapshots[1][1], Message::AssistantMessage { .. }));
-        assert!(matches!(snapshots[1][2], Message::ToolResults { .. }));
+        assert!(matches!(snapshots[1][1].body, EntryBody::Agent { .. }));
+        assert!(matches!(
+            snapshots[1][2].body,
+            EntryBody::ToolResults { .. }
+        ));
     }
 
     #[tokio::test]
@@ -733,6 +770,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "go".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -805,7 +843,11 @@ mod tests {
 
         let t0 = Instant::now();
         let err = agent
-            .interact(vec![Content::Text { text: "go".into() }], cancel)
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "go".into() }],
+                cancel,
+            )
             .await
             .expect_err("should cancel");
         let elapsed = t0.elapsed();
@@ -820,7 +862,7 @@ mod tests {
         );
         // User message kept; no incomplete assistant pushed.
         assert_eq!(agent.history().len(), 1);
-        assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
+        assert!(matches!(agent.history()[0].body, EntryBody::User { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -867,7 +909,11 @@ mod tests {
 
         let t0 = Instant::now();
         let err = agent
-            .interact(vec![Content::Text { text: "run".into() }], cancel)
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "run".into() }],
+                cancel,
+            )
             .await
             .expect_err("should cancel");
         let elapsed = t0.elapsed();
@@ -883,7 +929,13 @@ mod tests {
         let history = agent.history();
         assert_eq!(history.len(), 3);
         match &history[2] {
-            Message::ToolResults { tool_use_results } => {
+            Entry {
+                body:
+                    EntryBody::ToolResults {
+                        results: tool_use_results,
+                    },
+                ..
+            } => {
                 assert_eq!(tool_use_results.len(), 1);
                 assert!(tool_use_results[0].is_error);
                 let text = result_text(&tool_use_results[0]);
@@ -918,6 +970,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
+                test_author(),
                 vec![Content::Text {
                     text: "run tool then fail".into(),
                 }],
@@ -933,11 +986,11 @@ mod tests {
         // user + assistant(tool_use) + tool_results — no incomplete assistant.
         let history = agent.history();
         assert_eq!(history.len(), 3, "history={history:?}");
-        assert!(matches!(history[0], Message::UserMessage { .. }));
-        match &history[1] {
-            Message::AssistantMessage {
+        assert!(matches!(history[0].body, EntryBody::User { .. }));
+        match &history[1].body {
+            EntryBody::Agent {
                 tool_uses,
-                turn_end_reason,
+                turn_end: turn_end_reason,
                 ..
             } => {
                 assert_eq!(tool_uses.len(), 1);
@@ -947,7 +1000,13 @@ mod tests {
             other => panic!("expected assistant tool_use, got {other:?}"),
         }
         match &history[2] {
-            Message::ToolResults { tool_use_results } => {
+            Entry {
+                body:
+                    EntryBody::ToolResults {
+                        results: tool_use_results,
+                    },
+                ..
+            } => {
                 assert_eq!(tool_use_results.len(), 1);
                 assert_eq!(tool_use_results[0].id, "call_1");
                 assert!(!tool_use_results[0].is_error);
@@ -965,6 +1024,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "hi".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -972,7 +1032,7 @@ mod tests {
             .expect_err("generate should fail");
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         assert_eq!(agent.history().len(), 1);
-        assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
+        assert!(matches!(agent.history()[0].body, EntryBody::User { .. }));
     }
 
     /// A tool_use stop with zero streamed tool uses must fail loud, not loop
@@ -989,6 +1049,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "hi".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -997,10 +1058,7 @@ mod tests {
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         // History stays well-formed: user + assistant, no ToolResults message.
         assert_eq!(agent.history().len(), 2);
-        assert!(matches!(
-            agent.history()[1],
-            Message::AssistantMessage { .. }
-        ));
+        assert!(matches!(agent.history()[1].body, EntryBody::Agent { .. }));
     }
 
     /// `max_tokens` can cut a turn off mid-tool-call: the stop reason is not
@@ -1038,6 +1096,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "hi".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -1047,7 +1106,13 @@ mod tests {
         // user + assistant(tool_use) + tool_results — the tool_use is answered.
         assert_eq!(agent.history().len(), 3);
         match &agent.history()[2] {
-            Message::ToolResults { tool_use_results } => {
+            Entry {
+                body:
+                    EntryBody::ToolResults {
+                        results: tool_use_results,
+                    },
+                ..
+            } => {
                 assert_eq!(tool_use_results.len(), 1);
                 assert_eq!(tool_use_results[0].id, "toolu_truncated");
                 assert!(tool_use_results[0].is_error);
@@ -1061,6 +1126,7 @@ mod tests {
         // the provider accepts, instead of failing on the dangling tool_use.
         let reply = agent
             .interact(
+                test_author(),
                 vec![Content::Text {
                     text: "Continue".into(),
                 }],
@@ -1084,6 +1150,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         agent
             .interact(
+                test_author(),
                 vec![Content::Text { text: "hi".into() }],
                 myco_core::CancelToken::new(),
             )
@@ -1104,6 +1171,7 @@ mod tests {
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let err = agent
             .interact(
+                test_author(),
                 vec![Content::Image {
                     source: "data:image/png;base64,AAAA".into(),
                 }],
@@ -1143,8 +1211,8 @@ mod tests {
 
         let history = agent.history();
         assert_eq!(history.len(), 2);
-        assert!(matches!(history[0], Message::UserMessage { .. }));
-        assert!(matches!(history[1], Message::AssistantMessage { .. }));
+        assert!(matches!(history[0].body, EntryBody::User { .. }));
+        assert!(matches!(history[1].body, EntryBody::Agent { .. }));
     }
 
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.
@@ -1179,6 +1247,7 @@ mod tests {
         // checking the model can complete a new turn on top.
         let reply = resumed
             .interact(
+                test_author(),
                 vec![Content::Text {
                     text: "continue".into(),
                 }],
@@ -1195,10 +1264,10 @@ mod tests {
         let history = resumed.history();
         // prior 3 + new user + new assistant
         assert_eq!(history.len(), 5);
-        assert!(matches!(history[0], Message::UserMessage { .. }));
-        assert!(matches!(history[1], Message::AssistantMessage { .. }));
-        assert!(matches!(history[2], Message::ToolResults { .. }));
-        assert!(matches!(history[3], Message::UserMessage { .. }));
-        assert!(matches!(history[4], Message::AssistantMessage { .. }));
+        assert!(matches!(history[0].body, EntryBody::User { .. }));
+        assert!(matches!(history[1].body, EntryBody::Agent { .. }));
+        assert!(matches!(history[2].body, EntryBody::ToolResults { .. }));
+        assert!(matches!(history[3].body, EntryBody::User { .. }));
+        assert!(matches!(history[4].body, EntryBody::Agent { .. }));
     }
 }

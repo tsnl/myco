@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::stream;
 use serde_json::json;
 
+use myco_api::{Author, Entry};
 use myco_core::AsyncStream;
 use myco_models::{
     Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
@@ -131,46 +132,49 @@ impl GenerativeModel for ScriptedModel {
 // Message / conversation fixtures
 // ---------------------------------------------------------------------------
 
-pub fn user(text: &str) -> Message {
-    Message::UserMessage {
-        content: vec![Content::Text { text: text.into() }],
+/// A test speaker. Entries carry authorship, so fixtures need one.
+pub fn tester() -> Author {
+    Author::User {
+        id: "t".into(),
+        name: "tester".into(),
     }
 }
 
-pub fn assistant(text: &str) -> Message {
-    Message::AssistantMessage {
-        content: vec![Content::Text { text: text.into() }],
-        tool_uses: vec![],
-        turn_end_reason: Some(TurnEndReason::EndTurn),
-    }
+pub fn user(text: &str) -> Entry {
+    Entry::user(tester(), vec![Content::Text { text: text.into() }])
 }
 
-pub fn assistant_tool(
-    text: Option<&str>,
-    id: &str,
-    name: &str,
-    input: serde_json::Value,
-) -> Message {
-    Message::AssistantMessage {
-        content: text
-            .map(|t| vec![Content::Text { text: t.into() }])
+pub fn assistant(text: &str) -> Entry {
+    Entry::agent(
+        "test-model",
+        vec![Content::Text { text: text.into() }],
+        vec![],
+        Some(TurnEndReason::EndTurn),
+    )
+}
+
+pub fn assistant_tool(text: Option<&str>, id: &str, name: &str, input: serde_json::Value) -> Entry {
+    Entry::agent(
+        "test-model",
+        text.map(|t| vec![Content::Text { text: t.into() }])
             .unwrap_or_default(),
-        tool_uses: vec![ToolUse {
+        vec![ToolUse {
             id: id.into(),
             name: name.into(),
             input,
         }],
-        turn_end_reason: Some(TurnEndReason::ToolUse),
-    }
+        Some(TurnEndReason::ToolUse),
+    )
 }
 
-pub fn tool_results(results: &[(&str, &str)]) -> Message {
-    Message::ToolResults {
-        tool_use_results: results
+pub fn tool_results(results: &[(&str, &str)]) -> Entry {
+    Entry::tool_results(
+        "test-model",
+        results
             .iter()
             .map(|(id, text)| ToolResult::text(*text).with_id(*id))
             .collect(),
-    }
+    )
 }
 
 /// A thinking block as session history stores it (plaintext, unsigned).
@@ -182,17 +186,18 @@ pub fn thinking(text: &str) -> Content {
     }
 }
 
-pub fn thinking_msg(parts: &[&str]) -> Message {
-    Message::AssistantMessage {
-        content: parts.iter().map(|t| thinking(t)).collect(),
-        tool_uses: vec![],
-        turn_end_reason: Some(TurnEndReason::EndTurn),
-    }
+pub fn thinking_msg(parts: &[&str]) -> Entry {
+    Entry::agent(
+        "test-model",
+        parts.iter().map(|t| thinking(t)).collect(),
+        vec![],
+        Some(TurnEndReason::EndTurn),
+    )
 }
 
 /// Canonical complete tool loop: user → assistant tool call → tool result →
 /// final assistant answer.
-pub fn tool_loop() -> Vec<Message> {
+pub fn tool_loop() -> Vec<Entry> {
     vec![
         user("hello"),
         assistant_tool(

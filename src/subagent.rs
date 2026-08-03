@@ -86,9 +86,20 @@ impl SubagentTool {
 
         let mut turns = child.turns.clone();
         let start = *turns.borrow();
+        // The parent agent wrote this prompt; attribute it to the parent's
+        // model rather than to a person.
+        let parent_model = match sup.get_live(&self.parent_id).await {
+            Some(parent) => parent.session.snapshot().model,
+            None => child.session.snapshot().model,
+        };
         child
             .tx
-            .send(crate::server::Cmd::User(input.prompt))
+            .send(crate::server::Cmd::User {
+                author: myco_api::Author::Agent {
+                    model: parent_model,
+                },
+                text: input.prompt,
+            })
             .map_err(|_| "child agent task gone".to_string())?;
 
         // Wait for the child's turn, staying cancellable: cancelling the
@@ -111,7 +122,7 @@ impl SubagentTool {
         }
 
         let snapshot = child.session.snapshot();
-        let answer = last_answer(&snapshot.messages)
+        let answer = last_answer(&snapshot.entries)
             .unwrap_or_else(|| "(child turn produced no answer text)".to_string());
         Ok(format!("session: {child_id}\n\n{answer}"))
     }

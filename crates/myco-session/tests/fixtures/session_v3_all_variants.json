@@ -1,12 +1,19 @@
 {
-  "version": 2,
+  "version": 3,
   "id": "aabbccddeeff00112233445566778899",
   "created_at": "2025-10-09T08:53:20Z",
   "updated_at": "2025-10-09T08:54:50Z",
   "model": "opus-catalog-key",
-  "messages": [
+  "entries": [
     {
-      "UserMessage": {
+      "author": {
+        "kind": "user",
+        "id": "u_ada",
+        "name": "ada"
+      },
+      "at": "2025-10-09T08:53:20Z",
+      "body": {
+        "kind": "user",
         "content": [
           {
             "Text": {
@@ -22,7 +29,13 @@
       }
     },
     {
-      "AssistantMessage": {
+      "author": {
+        "kind": "agent",
+        "model": "opus-catalog-key"
+      },
+      "at": "2025-10-09T08:53:30Z",
+      "body": {
+        "kind": "agent",
         "content": [
           {
             "Thinking": {
@@ -54,12 +67,18 @@
             }
           }
         ],
-        "turn_end_reason": "ToolUse"
+        "turn_end": "ToolUse"
       }
     },
     {
-      "ToolResults": {
-        "tool_use_results": [
+      "author": {
+        "kind": "agent",
+        "model": "opus-catalog-key"
+      },
+      "at": "2025-10-09T08:53:40Z",
+      "body": {
+        "kind": "tool_results",
+        "results": [
           {
             "id": "toolu_01",
             "content": [
@@ -86,7 +105,13 @@
       }
     },
     {
-      "AssistantMessage": {
+      "author": {
+        "kind": "agent",
+        "model": "opus-catalog-key"
+      },
+      "at": "2025-10-09T08:54:00Z",
+      "body": {
+        "kind": "agent",
         "content": [
           {
             "Text": {
@@ -94,12 +119,17 @@
             }
           }
         ],
-        "tool_uses": [],
-        "turn_end_reason": "MaxTokens"
+        "turn_end": "MaxTokens"
       }
     },
     {
-      "AssistantMessage": {
+      "author": {
+        "kind": "agent",
+        "model": "opus-catalog-key"
+      },
+      "at": "2025-10-09T08:54:20Z",
+      "body": {
+        "kind": "agent",
         "content": [
           {
             "Text": {
@@ -107,14 +137,18 @@
             }
           }
         ],
-        "tool_uses": [],
-        "turn_end_reason": {
+        "turn_end": {
           "Other": "Anthropic::PauseTurn"
         }
       }
     },
     {
-      "AssistantMessage": {
+      "author": {
+        "kind": "system"
+      },
+      "at": "2025-10-09T08:54:40Z",
+      "body": {
+        "kind": "agent",
         "content": [
           {
             "Text": {
@@ -122,12 +156,11 @@
             }
           }
         ],
-        "tool_uses": [],
-        "turn_end_reason": "EndTurn"
+        "turn_end": "EndTurn"
       }
     }
   ],
-  "title": "every v2 variant",
+  "title": "every v3 variant",
   "links": [
     {
       "kind": "git_hub_pr",
@@ -147,6 +180,7 @@
   "scratchpad": "scratch notes",
   "parent_session_id": "00112233445566778899aabbccddeeff",
   "kind": "subagent",
+  "archived": true,
   "predecessor_id": "11223344556677889900aabbccddeeff",
   "successor_id": "22334455667788990011aabbccddeeff",
   "last_usage": {

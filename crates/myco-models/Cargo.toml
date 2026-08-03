@@ -14,6 +14,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+myco-api = { workspace = true }
 myco-core = { workspace = true }
 myco-prompts = { workspace = true }
 reqwest = { workspace = true }

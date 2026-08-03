@@ -9,9 +9,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
+use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
 use myco::harness::{Harness, HarnessConfig};
 use myco::{Agent, NullEventSink};
+use myco_api::EntryBody;
 use serde_json::json;
 
 mod test_utils;
@@ -87,6 +88,7 @@ async fn scripted_multi_turn_bash_session_transcript() {
     let t0 = Instant::now();
     let reply = agent
         .interact(
+            myco_test_support::tester(),
             vec![Content::Text {
                 text: "Drive an interactive shell across multiple turns.".into(),
             }],
@@ -131,18 +133,18 @@ async fn scripted_multi_turn_bash_session_transcript() {
         "unexpected history length; transcript:\n{transcript}"
     );
 
-    match &history[0] {
-        Message::UserMessage { content } => {
+    match &history[0].body {
+        EntryBody::User { content } => {
             assert!(matches!(&content[0], Content::Text { text } if text.contains("interactive")));
         }
-        other => panic!("history[0] should be user message: {other:?}"),
+        other => panic!("history[0] should be a user entry: {other:?}"),
     }
 
     // Tool results come back correlated by id, in scripted order, all ok.
     let mut results: Vec<(&str, String, bool)> = Vec::new();
-    for msg in history {
-        if let Message::ToolResults { tool_use_results } = msg {
-            for tr in tool_use_results {
+    for entry in history {
+        if let EntryBody::ToolResults { results: rs } = &entry.body {
+            for tr in rs {
                 results.push((tr.id.as_str(), tool_text(tr), tr.is_error));
             }
         }

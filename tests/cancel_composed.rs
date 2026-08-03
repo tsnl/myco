@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use myco::CancelToken;
 use myco::agent::{Agent, AgentInteractionError, NullEventSink};
-use myco::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
+use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
 use myco::harness::Harness;
+use myco_api::EntryBody;
 use test_utils::ScriptedModel;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -48,7 +49,11 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
 
     let t0 = Instant::now();
     let err = agent
-        .interact(vec![Content::Text { text: "run".into() }], cancel)
+        .interact(
+            myco_test_support::tester(),
+            vec![Content::Text { text: "run".into() }],
+            cancel,
+        )
         .await
         .expect_err("turn should be cancelled");
     let elapsed = t0.elapsed();
@@ -62,10 +67,10 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
     // with an error result recorded for the cancelled exec.
     let history = agent.history();
     assert_eq!(history.len(), 3, "{history:?}");
-    match &history[2] {
-        Message::ToolResults { tool_use_results } => {
-            assert_eq!(tool_use_results.len(), 1);
-            assert!(tool_use_results[0].is_error, "{tool_use_results:?}");
+    match &history[2].body {
+        EntryBody::ToolResults { results } => {
+            assert_eq!(results.len(), 1);
+            assert!(results[0].is_error, "{results:?}");
         }
         other => panic!("expected ToolResults, got {other:?}"),
     }
