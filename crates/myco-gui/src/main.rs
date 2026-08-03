@@ -129,6 +129,7 @@ fn browser() -> Html {
 
     html! {
         <div class="browser">
+            <div class="column">
             <h1>{ "myco" }</h1>
             <button onclick={on_new}>{ "new session" }</button>
             <ul>
@@ -149,6 +150,7 @@ fn browser() -> Html {
                     }
                 }) }
             </ul>
+            </div>
         </div>
     }
 }
@@ -384,11 +386,14 @@ fn conversation(props: &ConversationProps) -> Html {
     html! {
         <div class="app">
             <div class="topbar">
-                <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
-                <span class="dim">{ format!(" {} ", props.id) }</span>
-                { if *busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                <div class="column">
+                    <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
+                    <span class="dim">{ format!(" {} ", props.id) }</span>
+                    { if *busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                </div>
             </div>
             <div class="pane" ref={pane} onscroll={on_scroll}>
+                <div class="column">
                 { for entries.iter().map(render_entry) }
                 { if !streaming.is_empty() {
                     html! { <div class="role-assistant">{ markdown(&streaming) }</div> }
@@ -396,12 +401,15 @@ fn conversation(props: &ConversationProps) -> Html {
                 { if let Some(e) = &*error { html! {
                     <div class="err"><hr class="rule" /><b>{ "ERROR" }</b><pre>{ e }</pre></div>
                 } } else { html!{} } }
+                </div>
             </div>
             <div class="composer">
-                <textarea ref={input} rows="3" placeholder="message"></textarea>
-                <div class="actions">
-                    <button onclick={on_send}>{ "send" }</button>
-                    <button onclick={on_cancel}>{ "cancel turn" }</button>
+                <div class="column">
+                    <textarea ref={input} rows="3" placeholder="message"></textarea>
+                    <div class="actions">
+                        <button onclick={on_send}>{ "send" }</button>
+                        <button onclick={on_cancel}>{ "cancel turn" }</button>
+                    </div>
                 </div>
             </div>
         </div>
