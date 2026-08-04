@@ -18,7 +18,7 @@ use myco_config::{Config, ConfigUserSettings};
 use myco_machines::harness::StartupPreflight;
 use myco_session::{Session, format_session_detail, format_session_list_line, list_sessions};
 
-use crate::server::{Cmd, Live, Server, SessionEvent, last_answer};
+use crate::server::{Cmd, Live, Server, SessionEvent, entry_text, last_answer};
 use crate::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer, TuiSink, encode_ansi};
 use myco_session::ConsoleLog;
 
@@ -334,9 +334,14 @@ fn submit(sup: &Arc<Server>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line
     let running = live.harness().running_tool_summaries(uuid::Uuid::nil());
     producer.user_header(used, max, snapshot.last_usage, &running);
     producer.submitted_input(line);
+    // The CLI is a private line by construction: one operator at the keyboard,
+    // so every line is addressed to the agent.
     let _ = live.tx.send(Cmd::User {
-        author: crate::server::local_author(sup.config()),
-        text: line.to_string(),
+        entry: sup.compose(
+            crate::server::local_author(sup.config()),
+            line,
+            &snapshot.model,
+        ),
     });
 }
 
@@ -356,6 +361,14 @@ fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::Joi
                 }) => {
                     producer.line(&format!("COMPACTED {predecessor} → {successor}"));
                 }
+                // The operator's own line is already on screen (echoed at
+                // submit); anything else posted into this session is somebody
+                // joining, and belongs in the terminal.
+                Ok(SessionEvent::Message { entry, .. }) => {
+                    if let myco_api::Author::User { name, .. } = &entry.author {
+                        producer.line(&format!("{}: {}", name, entry_text(&entry)));
+                    }
+                }
                 Ok(SessionEvent::TurnStarted) | Ok(SessionEvent::TurnFinished) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -367,11 +380,11 @@ fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::Joi
 async fn run_print(sup: &Arc<Server>, live: Arc<Live>, prompt: String) {
     let mut turns = live.turns.clone();
     let start = *turns.borrow();
+    let model = live.session.snapshot().model;
     if live
         .tx
         .send(Cmd::User {
-            author: crate::server::local_author(sup.config()),
-            text: prompt,
+            entry: sup.compose(crate::server::local_author(sup.config()), &prompt, &model),
         })
         .is_err()
     {

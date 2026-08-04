@@ -56,6 +56,14 @@ You are a helpful assistant running in an agentic harness with unfettered comput
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Agent(AgentEvent),
+    /// A message was accepted into the session. Broadcast at post time, ahead
+    /// of the queue, so watchers see people talking to each other immediately
+    /// — including while the agent is mid-turn.
+    Message {
+        entry: Entry,
+        /// Whether this message is what wakes the agent.
+        wakes_agent: bool,
+    },
     TurnStarted,
     TurnFailed {
         message: String,
@@ -189,11 +197,46 @@ fn default_model_factory(
 
 /// One queued unit of work for a session's agent task.
 pub enum Cmd {
-    /// One user turn, attributed to whoever sent it.
-    User { author: Author, text: String },
+    /// A message addressed to the agent: record it and answer it.
+    User { entry: Entry },
+    /// A message between people: record it, do not answer it. Costs no turn
+    /// and does not mark the session busy, but the agent reads it as context
+    /// the next time it is spoken to.
+    Note { entry: Entry },
     /// Compact into a successor session (also queued automatically when a
     /// turn ends with the context nearly full).
     Compact,
+}
+
+/// Should this message wake the agent?
+///
+/// The rule is explicit address, with one carve-out: a session nobody else has
+/// posted in is a private line, and everything said there is said to the agent.
+/// The moment a second person joins, the room becomes a room — the agent
+/// answers when it is called (`@myco`, `@agent`, `@assistant`, or the model key
+/// it is running as) and otherwise listens.
+///
+/// Deliberately not a judgement call about intent. In a room, an agent that
+/// guesses wrong talks over people; one that waits to be named never does.
+fn wakes_agent(text: &str, snapshot: &Session, author: &Author) -> bool {
+    if api::mention::addresses_agent(text, &snapshot.model) {
+        return true;
+    }
+    !is_shared(snapshot, author)
+}
+
+/// Has anyone other than `author` posted here? Agent and system entries do not
+/// make a room — only other people do.
+fn is_shared(snapshot: &Session, author: &Author) -> bool {
+    let me = match author {
+        Author::User { id, .. } => id.as_str(),
+        // A non-human poster (subagent plumbing) never turns a session shared.
+        _ => return false,
+    };
+    snapshot.entries.iter().any(|e| {
+        matches!(&e.body, EntryBody::User { .. })
+            && matches!(&e.author, Author::User { id, .. } if id != me)
+    })
 }
 
 /// One resident conversation: its agent task's input queue and shared handles.
@@ -387,6 +430,27 @@ impl Server {
         &self.config
     }
 
+    /// Build the entry for a message, expanding `@path` image mentions under
+    /// the limits of the model that will read them.
+    ///
+    /// Composed once, by whoever accepts the message, so the record shown live
+    /// and the record written to disk are the same one — clients match them by
+    /// timestamp rather than guessing.
+    pub fn compose(&self, author: Author, text: &str, model_key: &str) -> Entry {
+        let max_image_bytes = self
+            .config
+            .models
+            .get(model_key)
+            .map(|m| m.spec.max_image_base64_bytes)
+            .unwrap_or(0);
+        let content = expand_image_attachments(text, max_image_bytes).unwrap_or_else(|_| {
+            vec![Content::Text {
+                text: text.to_string(),
+            }]
+        });
+        Entry::user(author, content)
+    }
+
     pub async fn live_flags(&self, id: &str) -> (bool, bool) {
         match self.live.lock().await.get(id) {
             Some(l) => (true, l.busy.load(Ordering::Relaxed)),
@@ -424,6 +488,14 @@ struct AgentTask {
 /// The per-session agent task: pop queued commands, run one turn each.
 async fn run_agent_task(mut t: AgentTask) {
     while let Some(cmd) = t.rx.recv().await {
+        // A note is bookkeeping, not work: it must not mark the session busy,
+        // must not bump the turn counter, and must not fire turn events — a
+        // client would read those as "the agent is answering me".
+        if let Cmd::Note { entry } = cmd {
+            run_note(&mut t, entry);
+            continue;
+        }
+
         t.busy.store(true, Ordering::Relaxed);
         t.handle.set_error(None);
         let _ = t.events.send(SessionEvent::TurnStarted);
@@ -433,8 +505,9 @@ async fn run_agent_task(mut t: AgentTask) {
         *t.handle.cancel.lock().await = cancel.clone();
 
         match cmd {
-            Cmd::User { author, text } => run_user_turn(&mut t, author, text, cancel).await,
+            Cmd::User { entry } => run_user_turn(&mut t, entry, cancel).await,
             Cmd::Compact => run_compact(&mut t, cancel).await,
+            Cmd::Note { .. } => unreachable!("notes are handled above"),
         }
 
         t.busy.store(false, Ordering::Relaxed);
@@ -445,24 +518,53 @@ async fn run_agent_task(mut t: AgentTask) {
     }
 }
 
-async fn run_user_turn(t: &mut AgentTask, author: Author, text: String, cancel: CancelToken) {
-    let _ = t.active.maybe_auto_title_from_user_text(&text);
+/// `Cmd::Note`: fold a person-to-person message into the history and persist,
+/// so a reload and a live view agree and the agent has the context next time
+/// it is addressed.
+fn run_note(t: &mut AgentTask, entry: Entry) {
+    let _ = t
+        .active
+        .maybe_auto_title_from_user_text(&entry_text(&entry));
+    t.agent.note(entry);
+    if let Err(e) = t
+        .active
+        .persist_entries(t.agent.history(), t.agent.last_usage(), true)
+    {
+        eprintln!("[{}] session save failed: {e}", t.active.id());
+    }
+}
 
-    // `@path` image mentions expand exactly like the v1 CLI.
-    let max_image_bytes = t.catalog_model.spec.max_image_base64_bytes;
-    let mut content = match expand_image_attachments(&text, max_image_bytes) {
-        Ok(content) => content,
-        Err(_) => vec![Content::Text { text: text.clone() }],
+/// The prose of an entry, for titling and logging.
+pub(crate) fn entry_text(entry: &Entry) -> String {
+    match &entry.body {
+        EntryBody::User { content } | EntryBody::Agent { content, .. } => {
+            api::content_text(content)
+        }
+        EntryBody::ToolResults { .. } => String::new(),
+    }
+}
+
+async fn run_user_turn(t: &mut AgentTask, entry: Entry, cancel: CancelToken) {
+    let text = entry_text(&entry);
+    let _ = t.active.maybe_auto_title_from_user_text(&text);
+    let author = entry.author.clone();
+    let mut content = match entry.body {
+        EntryBody::User { content } => content,
+        _ => vec![Content::Text { text: text.clone() }],
     };
+    let at = entry.at;
 
     // One retry for provider blips; other failures surface immediately.
     let mut retried = false;
     let error = loop {
-        match t
-            .agent
-            .interact(author.clone(), content.clone(), cancel.clone())
-            .await
-        {
+        let entry = Entry {
+            author: author.clone(),
+            at,
+            body: EntryBody::User {
+                content: content.clone(),
+            },
+        };
+        match t.agent.interact_entry(entry, cancel.clone()).await {
             Ok(_) => break None,
             Err(myco_agent::AgentInteractionError::Cancelled) => {
                 break Some("(turn cancelled)".to_string());
@@ -687,6 +789,9 @@ impl From<SessionEvent> for api::StreamEvent {
                 }
                 AgentEvent::TurnFinished { .. } => api::StreamEvent::TurnFinished,
             },
+            SessionEvent::Message { entry, wakes_agent } => {
+                api::StreamEvent::Message { entry, wakes_agent }
+            }
             SessionEvent::TurnStarted => api::StreamEvent::TurnStarted,
             SessionEvent::TurnFailed { message } => api::StreamEvent::TurnFailed { message },
             SessionEvent::TurnFinished => api::StreamEvent::TurnFinished,
@@ -857,15 +962,29 @@ impl Server {
             .ensure_live(id, None)
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
-        live.tx
-            .send(Cmd::User {
-                author: author.clone(),
-                text: req.text.clone(),
-            })
-            .map_err(|_| internal("agent task gone".into()))?;
         let snapshot = live.session.snapshot();
+
+        let entry = self.compose(author.clone(), &req.text, &snapshot.model);
+        let wakes_agent = wakes_agent(&req.text, &snapshot, author);
+
+        // Ahead of the queue, so a message shows up for everyone the instant it
+        // is accepted — even if the agent is three tool calls into someone
+        // else's turn and will not drain this command for a while.
+        let _ = live.events.send(SessionEvent::Message {
+            entry: entry.clone(),
+            wakes_agent,
+        });
+
+        let cmd = if wakes_agent {
+            Cmd::User { entry }
+        } else {
+            Cmd::Note { entry }
+        };
+        live.tx
+            .send(cmd)
+            .map_err(|_| internal("agent task gone".into()))?;
         Ok(api::Poll {
-            busy: true,
+            busy: wakes_agent,
             total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: None,

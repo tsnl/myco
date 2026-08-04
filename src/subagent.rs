@@ -95,10 +95,13 @@ impl SubagentTool {
         child
             .tx
             .send(crate::server::Cmd::User {
-                author: myco_api::Author::Agent {
-                    model: parent_model,
-                },
-                text: input.prompt,
+                entry: sup.compose(
+                    myco_api::Author::Agent {
+                        model: parent_model,
+                    },
+                    &input.prompt,
+                    &child.session.snapshot().model,
+                ),
             })
             .map_err(|_| "child agent task gone".to_string())?;
 
