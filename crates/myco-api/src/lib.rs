@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod mention;
+
 /// One session in the browser list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -193,6 +195,18 @@ pub trait MycoApi: Send + Sync {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TurnStarted,
+    /// Somebody posted. Emitted the moment the message is accepted, before any
+    /// agent turn it may trigger — so a room full of people see each other in
+    /// real time, and see each other *while* the agent is mid-answer.
+    ///
+    /// Carries the entry itself, so a client places it in the transcript on its
+    /// own terms instead of appending text to whatever was last on screen.
+    Message {
+        entry: Entry,
+        /// False when the message was not addressed to the agent, so no turn
+        /// follows this event. Clients use it to leave the composer idle.
+        wakes_agent: bool,
+    },
     TextDelta {
         text: String,
     },
@@ -515,6 +529,52 @@ pub fn content_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod stream_wire_tests {
+    use super::*;
+
+    /// `StreamEvent::Message` is the only event that carries a whole record
+    /// rather than a fragment: it is what lets a client place someone else's
+    /// message in the transcript instead of appending text to whatever was
+    /// last on screen. Its shape is therefore load-bearing.
+    #[test]
+    fn a_message_event_round_trips_with_its_entry_intact() {
+        let entry = Entry::user(
+            Author::User {
+                id: "grace".into(),
+                name: "Grace Hopper".into(),
+            },
+            vec![Content::Text {
+                text: "@ada did you see the build?".into(),
+            }],
+        );
+        let ev = StreamEvent::Message {
+            entry: entry.clone(),
+            wakes_agent: false,
+        };
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "message", "the SSE tag clients switch on");
+        assert_eq!(json["wakes_agent"], false);
+
+        let back: StreamEvent = serde_json::from_value(json).expect("deserialize");
+        let StreamEvent::Message { entry: got, .. } = back else {
+            panic!("expected a message event");
+        };
+        // The timestamp is the identity a client dedupes on, so it must
+        // survive the wire unchanged.
+        assert_eq!(got.at, entry.at);
+        assert_eq!(got.text(), "@ada did you see the build?");
+        match got.author {
+            Author::User { id, name } => {
+                assert_eq!(id, "grace");
+                assert_eq!(name, "Grace Hopper");
+            }
+            other => panic!("expected a user author, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

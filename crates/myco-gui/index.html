@@ -112,7 +112,17 @@
       .rule { border: 0; border-top: 1px solid var(--line); margin: 0.8rem 0 0.3rem; }
       .role { font-weight: bold; }
       .role-user { color: var(--user); }
+      /* The ASSISTANT header. The body below it stays unbold (.role-assistant),
+         so the name reads as a section rule rather than shouted prose. */
+      .role-assistant-name { color: var(--fg); }
       .role-assistant { color: #d8d8d8; }
+      /* @handles: visible in a wall of text, and unmissable when they are you. */
+      .mention { color: var(--tool); }
+      .mention-me {
+        color: var(--bg); background: var(--user);
+        border-radius: 3px; padding: 0 0.2em; font-weight: bold;
+      }
+      .hint { margin-left: 0.6rem; font-size: 0.85em; }
       .role-thinking { color: var(--fg-dim); font-style: italic; }
       .role-tool { color: var(--tool); }
 

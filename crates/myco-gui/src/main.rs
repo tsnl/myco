@@ -8,6 +8,7 @@
 
 mod auth;
 mod highlight;
+mod notify;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +16,8 @@ use std::rc::Rc;
 use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
 use myco_api as api;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
@@ -580,14 +583,11 @@ fn render_entry(
     e: &api::Entry,
     results: &std::collections::HashMap<String, api::ToolResult>,
     verbose: bool,
+    me: Option<&api::Identity>,
 ) -> Html {
     match &e.body {
         api::EntryBody::User { content } => html! {
-            <div>
-                <hr class="rule" />
-                <div class="role role-user">{ e.author.name().to_uppercase() }</div>
-                <pre>{ api::content_text(content) }</pre>
-            </div>
+            <div>{ render_prose(&api::content_text(content), me) }</div>
         },
         api::EntryBody::Agent {
             content, tool_uses, ..
@@ -615,11 +615,112 @@ fn render_entry(
     }
 }
 
-/// The whole transcript. Results are indexed once for the pass, so a call
-/// and its output render together even though they are separate entries.
-fn render_transcript(entries: &[api::Entry], verbose: bool) -> Html {
+/// A person's message, with `@handles` picked out so a room can see who is
+/// being spoken to — and so you can spot your own name in a wall of text.
+fn render_prose(text: &str, me: Option<&api::Identity>) -> Html {
+    let mut out: Vec<Html> = Vec::new();
+    let mut plain = String::new();
+    for token in text.split_inclusive(char::is_whitespace) {
+        let trimmed = token.trim_end();
+        let handle = trimmed.strip_prefix('@').map(str::to_lowercase);
+        let is_mention = handle
+            .as_deref()
+            .map(|h| !h.is_empty() && h.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+            .unwrap_or(false);
+        if !is_mention {
+            plain.push_str(token);
+            continue;
+        }
+        if !plain.is_empty() {
+            out.push(html! { { std::mem::take(&mut plain) } });
+        }
+        let handle = handle.unwrap_or_default();
+        let handle = handle.trim_end_matches('.');
+        let mine = me
+            .map(|i| api::mention::matches_user(handle, &i.id, &i.name))
+            .unwrap_or(false);
+        let class = if mine {
+            "mention mention-me"
+        } else {
+            "mention"
+        };
+        out.push(html! { <span {class}>{ trimmed }</span> });
+        out.push(html! { { token.strip_prefix(trimmed).unwrap_or("") } });
+    }
+    if !plain.is_empty() {
+        out.push(html! { { plain } });
+    }
+    html! { <pre>{ for out.into_iter() }</pre> }
+}
+
+/// Does this entry render anything of its own? Tool results are folded into
+/// the card of the call they answer, so they must not open a speaker block.
+fn is_visible(e: &api::Entry) -> bool {
+    !matches!(e.body, api::EntryBody::ToolResults { .. })
+}
+
+/// Who is speaking, as a grouping key. Agent entries all share one key so a
+/// turn of prose → tool → prose stays under a single header.
+fn speaker_key(a: &api::Author) -> String {
+    match a {
+        api::Author::User { id, .. } => format!("user:{id}"),
+        api::Author::Agent { .. } => "agent".into(),
+        api::Author::System => "system".into(),
+    }
+}
+
+/// The header that opens a speaker's block: a rule and a name, the way the
+/// CLI opens a section.
+fn speaker_header(a: &api::Author) -> Html {
+    let (class, label) = match a {
+        api::Author::User { name, .. } => ("role role-user", name.to_uppercase()),
+        api::Author::Agent { .. } => ("role role-assistant-name", "ASSISTANT".to_string()),
+        api::Author::System => ("role dim", "SYSTEM".to_string()),
+    };
+    html! {
+        <>
+            <hr class="rule" />
+            <div class={class}>{ label }</div>
+        </>
+    }
+}
+
+/// The whole transcript, grouped into speaker blocks.
+///
+/// A header opens whenever the speaker changes, not once per entry: one
+/// ASSISTANT rule for a whole agent turn however many tool rounds it takes,
+/// and one header for a run of messages from the same person. `streaming` is
+/// the text of the turn in flight, rendered through the same grouping so a
+/// reply is headed while it is still arriving.
+///
+/// Results are indexed once for the pass, so a call and its output render
+/// together even though they are separate entries.
+fn render_transcript(
+    entries: &[api::Entry],
+    streaming: &str,
+    verbose: bool,
+    me: Option<&api::Identity>,
+) -> Html {
     let results = result_index(entries);
-    html! { for entries.iter().map(|e| render_entry(e, &results, verbose)) }
+    let mut out: Vec<Html> = Vec::new();
+    let mut open: Option<String> = None;
+    for e in entries.iter().filter(|e| is_visible(e)) {
+        let key = speaker_key(&e.author);
+        if open.as_deref() != Some(key.as_str()) {
+            out.push(speaker_header(&e.author));
+            open = Some(key);
+        }
+        out.push(render_entry(e, &results, verbose, me));
+    }
+    if !streaming.is_empty() {
+        if open.as_deref() != Some("agent") {
+            out.push(speaker_header(&api::Author::Agent {
+                model: String::new(),
+            }));
+        }
+        out.push(html! { <div class="role-assistant">{ markdown(streaming) }</div> });
+    }
+    html! { for out.into_iter() }
 }
 
 /// Index every tool result in the transcript by the call it answers.
@@ -633,6 +734,76 @@ fn result_index(entries: &[api::Entry]) -> std::collections::HashMap<String, api
         }
     }
     out
+}
+
+/// Add a live-delivered entry, unless the transcript already has it.
+///
+/// Identity is the timestamp. The server composes an entry once, when it
+/// accepts the message, and that stamp survives to disk — so the copy pushed
+/// down the event feed and the copy a later poll returns are the same record,
+/// and the client can tell without the protocol carrying an id.
+fn merge(mut entries: Vec<api::Entry>, entry: api::Entry) -> Vec<api::Entry> {
+    if entries.iter().any(|e| e.at == entry.at) {
+        return entries;
+    }
+    entries.push(entry);
+    entries
+}
+
+/// Fold a poll response into what we already have on screen.
+///
+/// The server's copy wins, but a message we were told about over the feed and
+/// that has not been persisted yet must survive the poll — otherwise a
+/// message posted mid-turn appears, vanishes on the next tick, and comes back
+/// when the turn ends. Only entries newer than anything the server knows are
+/// kept, so one the server deliberately dropped does not live forever.
+fn reconcile(local: &[api::Entry], server: Vec<api::Entry>) -> Vec<api::Entry> {
+    let newest = server.iter().map(|e| e.at).max();
+    let pending: Vec<api::Entry> = local
+        .iter()
+        .filter(|e| newest.is_none_or(|n| e.at > n))
+        .filter(|e| !server.iter().any(|s| s.at == e.at))
+        .cloned()
+        .collect();
+    let mut out = server;
+    out.extend(pending);
+    out
+}
+
+/// Has anyone but me posted here? A session with a second person in it is a
+/// room, and the agent only answers when it is named — so the composer says so.
+fn is_shared(entries: &[api::Entry], me: Option<&api::Identity>) -> bool {
+    entries.iter().any(|e| match (&e.author, me) {
+        (api::Author::User { id, .. }, Some(i)) => *id != i.id,
+        (api::Author::User { .. }, None) => true,
+        _ => false,
+    })
+}
+
+/// Tell the reader a message landed: always a title badge while the tab is in
+/// the background, and a desktop notification when it names them.
+fn announce(entry: &api::Entry, me: Option<&api::Identity>, unread: &Rc<RefCell<u32>>) {
+    let api::EntryBody::User { content } = &entry.body else {
+        return;
+    };
+    let text = api::content_text(content);
+    let named = me
+        .map(|i| api::mention::addresses_user(&text, &i.id, &i.name))
+        .unwrap_or(false);
+    if notify::hidden() {
+        *unread.borrow_mut() += 1;
+        notify::set_unread(*unread.borrow());
+    }
+    if named || notify::hidden() {
+        let who = entry.author.name();
+        let title = if named {
+            format!("{who} mentioned you")
+        } else {
+            who.to_string()
+        };
+        // One notification per session, replaced as messages arrive.
+        notify::toast(&title, &text, "myco-session");
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -656,6 +827,40 @@ fn conversation(props: &ConversationProps) -> Html {
     let pane = use_node_ref();
     let at_bottom: Rc<RefCell<bool>> = use_mut_ref(|| true);
     let navigator = use_navigator().unwrap();
+    // Unread messages that arrived while this tab was in the background.
+    let unread: Rc<RefCell<u32>> = use_mut_ref(|| 0u32);
+    // Whether anyone but us has posted here; drives the addressing hint.
+    let shared = use_state(|| false);
+
+    // Ask once, on the way in, so the first message that names someone can
+    // actually reach them.
+    use_effect_with((), |_| notify::request_permission());
+
+    // Coming back to the tab is the acknowledgement: the messages are on
+    // screen, so the badge has done its job.
+    {
+        let unread = unread.clone();
+        use_effect_with((), move |_| {
+            let on_focus = Closure::<dyn Fn()>::new(move || {
+                *unread.borrow_mut() = 0;
+                notify::set_unread(0);
+            });
+            let win = web_sys::window();
+            if let Some(w) = &win {
+                let _ =
+                    w.add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref());
+            }
+            move || {
+                if let Some(w) = &win {
+                    let _ = w.remove_event_listener_with_callback(
+                        "focus",
+                        on_focus.as_ref().unchecked_ref(),
+                    );
+                }
+                notify::set_unread(0);
+            }
+        });
+    }
 
     // SSE: live deltas; turn boundaries refresh the transcript.
     {
@@ -665,6 +870,9 @@ fn conversation(props: &ConversationProps) -> Html {
         let streaming = streaming.clone();
         let stream_buf = stream_buf.clone();
         let navigator = navigator.clone();
+        let shared = shared.clone();
+        let unread = unread.clone();
+        let me = who.as_ref().map(|s| s.identity.clone());
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -675,6 +883,7 @@ fn conversation(props: &ConversationProps) -> Html {
                 // history whether or not the live feed ever connects.
                 match fetch_detail(&id).await {
                     Ok(d) => {
+                        shared.set(is_shared(&d.entries, me.as_ref()));
                         entries.set(d.entries);
                         busy.set(d.summary.busy);
                     }
@@ -708,13 +917,31 @@ fn conversation(props: &ConversationProps) -> Html {
                         streaming.set(stream_buf.borrow().clone());
                     };
                     match ev {
+                        // Somebody posted. Place it in the transcript on its
+                        // own terms, right now: it is a message from a person,
+                        // not a continuation of whatever the agent is saying,
+                        // and it must not wait for the turn in flight to end.
+                        api::StreamEvent::Message { entry, wakes_agent } => {
+                            let mine = matches!(
+                                (&entry.author, me.as_ref()),
+                                (api::Author::User { id, .. }, Some(i)) if *id == i.id
+                            );
+                            if !mine {
+                                shared.set(true);
+                                announce(&entry, me.as_ref(), &unread);
+                            }
+                            entries.set(merge((*entries).clone(), entry));
+                            if wakes_agent {
+                                busy.set(true);
+                            }
+                        }
                         api::StreamEvent::TurnStarted => {
                             busy.set(true);
                             error.set(None);
                             stream_buf.borrow_mut().clear();
                             streaming.set(String::new());
                             if let Ok(p) = fetch_poll(&id).await {
-                                entries.set(p.entries);
+                                entries.set(reconcile(&entries, p.entries));
                             }
                         }
                         api::StreamEvent::TextDelta { text }
@@ -732,7 +959,7 @@ fn conversation(props: &ConversationProps) -> Html {
                             streaming.set(String::new());
                             match fetch_poll(&id).await {
                                 Ok(p) => {
-                                    entries.set(p.entries);
+                                    entries.set(reconcile(&entries, p.entries));
                                     busy.set(p.busy);
                                     if p.last_error.is_some() {
                                         error.set(p.last_error);
@@ -763,7 +990,7 @@ fn conversation(props: &ConversationProps) -> Html {
                 while alive2.get() {
                     gloo_timers::future::TimeoutFuture::new(5_000).await;
                     if let Ok(p) = fetch_poll(&id).await {
-                        entries.set(p.entries);
+                        entries.set(reconcile(&entries, p.entries));
                         busy.set(p.busy);
                     }
                 }
@@ -812,17 +1039,22 @@ fn conversation(props: &ConversationProps) -> Html {
                 return;
             }
             ta.set_value("");
-            busy.set(true);
             let id = id.clone();
             let error = error.clone();
+            let busy = busy.clone();
             spawn_local(async move {
-                if let Err(e) = auth::post_json::<api::Poll, _>(
+                match auth::post_json::<api::Poll, _>(
                     &format!("/api/sessions/{id}/messages"),
                     &api::PostMessage { text },
                 )
                 .await
                 {
-                    error.set(Some(format!("send failed: {e}")));
+                    // The server decides whether this message wakes the agent;
+                    // it reports that as `busy`. Believing it — rather than
+                    // assuming a turn — keeps the composer honest when a
+                    // message was meant for the room, not the agent.
+                    Ok(p) => busy.set(p.busy),
+                    Err(e) => error.set(Some(format!("send failed: {e}"))),
                 }
             });
         })
@@ -861,10 +1093,8 @@ fn conversation(props: &ConversationProps) -> Html {
             </div>
             <div class="pane" ref={pane} onscroll={on_scroll}>
                 <div class="column">
-                { render_transcript(&entries, *verbose) }
-                { if !streaming.is_empty() {
-                    html! { <div class="role-assistant">{ markdown(&streaming) }</div> }
-                } else { html!{} } }
+                { render_transcript(&entries, &streaming, *verbose,
+                                    who.as_ref().map(|s| &s.identity)) }
                 { if let Some(e) = &*error { html! {
                     <div class="err"><hr class="rule" /><b>{ "ERROR" }</b><pre>{ e }</pre></div>
                 } } else { html!{} } }
@@ -873,12 +1103,22 @@ fn conversation(props: &ConversationProps) -> Html {
             <div class="composer">
                 <div class="column">
                     <textarea ref={input} rows="3" onkeydown={on_keydown}
-                              placeholder="message (Enter to send, Shift+Enter for a newline)" />
+                              placeholder={if *shared {
+                                  "message the room (@myco to ask the agent)"
+                              } else {
+                                  "message (Enter to send, Shift+Enter for a newline)"
+                              }} />
                     <div class="actions">
                         <button class="send" onclick={on_send}>{ "send" }</button>
                         { if *busy {
                             html! { <button onclick={on_cancel}>{ "cancel" }</button> }
                         } else { html!{} } }
+                        { if *shared { html! {
+                            <span class="dim hint">
+                                { "shared session · the agent replies when you say " }
+                                <span class="mention">{ "@myco" }</span>
+                            </span>
+                        } } else { html!{} } }
                     </div>
                 </div>
             </div>

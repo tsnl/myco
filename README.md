@@ -30,8 +30,17 @@ scripts.
   firewalls, optional context forks. The same surface exists as HTTP
   (`$MYCO_API`) for scripts.
 - **Live streaming.** Each session exposes an SSE feed
-  (`/api/sessions/<id>/events`) of text/thinking deltas and tool starts;
-  the GUI streams it and reconciles with a slow poll.
+  (`/api/sessions/<id>/events`) of text/thinking deltas, tool starts, and
+  whole messages; the GUI streams it and reconciles with a slow poll.
+- **Shared sessions the agent stays out of.** Several people can hold one
+  session. While you are the only person in it, everything you say is for
+  the agent — as before. Once someone else posts, the room has rules: the
+  agent answers when it is named (`@myco`, `@agent`, `@assistant`, or the
+  model key it is running as) and otherwise listens. A message between two
+  people is recorded, delivered to everyone watching, and read by the agent
+  as context the next time it is addressed — it just does not cost a turn.
+  Mentions are highlighted, and a message that names you raises a
+  notification.
 
 ## Run
 
@@ -77,6 +86,18 @@ myco auth disable ada      # refuse logins, keep the history attributed
 myco auth revoke ada       # end sessions without changing the password
 ```
 
+### Talking in a shared session
+
+Addressing is explicit, never inferred, so the rule is one you can see in the
+text you typed:
+
+```
+@ada did you see the build?      # to a person — the agent stays quiet
+@myco what do you make of it?    # to the agent — it answers
+what do you make of it?          # solo session: the agent answers
+                                 # shared session: nobody is summoned
+```
+
 Remotes just work: the harness spawns `ssh <alias> myco --mode host` lazily, so a
 remote only needs your key in `ssh-agent` and `myco` on the PATH used by
 non-interactive SSH.
@@ -91,6 +112,16 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami`.
 Wire types live in `crates/myco-api`.
+
+`POST /messages` answers with `busy`, which is the server's verdict on whether
+the message woke the agent — so a client knows not to wait for a reply that is
+not coming. The SSE feed carries the message itself as
+`{"type":"message", entry, wakes_agent}`, emitted the moment it is accepted and
+ahead of any turn it triggers. That event is what lets a client place someone
+else's message in the transcript as its own record, rather than appending text
+to whatever was last on screen, and it arrives even while the agent is mid-turn.
+The write follows when the session's task drains its queue, so a client should
+keep a delivered-but-unpersisted message on screen across a poll.
 
 Sign in with the **OAuth 2.0 password grant** (RFC 6749 §4.3):
 `POST /api/auth/token` takes form-encoded

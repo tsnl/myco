@@ -259,7 +259,29 @@ impl Agent {
         user_input: Vec<Content>,
         cancel: CancelToken,
     ) -> Result<Vec<Content>, AgentInteractionError> {
-        self.history.push(Entry::user(author, user_input));
+        self.interact_entry(Entry::user(author, user_input), cancel)
+            .await
+    }
+
+    /// Record a message without answering it.
+    ///
+    /// In a shared session most traffic is people talking to each other. Those
+    /// messages still belong in the history — the agent should know what was
+    /// said before it is next addressed — but they must not cost a turn.
+    pub fn note(&mut self, entry: Entry) {
+        self.history.push(entry);
+        self.emit_checkpoint();
+    }
+
+    /// [`interact`](Self::interact) for a caller that has already built the
+    /// entry. The entry's timestamp is preserved, so the record a client was
+    /// shown live and the record that lands on disk are the same one.
+    pub async fn interact_entry(
+        &mut self,
+        entry: Entry,
+        cancel: CancelToken,
+    ) -> Result<Vec<Content>, AgentInteractionError> {
+        self.history.push(entry);
         self.emit_checkpoint();
 
         // Output tokens accumulate across this turn's generate calls (one per
