@@ -47,7 +47,8 @@ rejected with both sizes named, so downscale it and resubmit.
 Images stay in the conversation, so a session accumulates them and can cross the
 provider's **whole-request** cap (Anthropic: 32 MB) turns after the attachment
 was sent. myco checks each composed request against a 30 MiB ceiling before
-uploading it, and maps the provider's own 413 to the same failure. That failure
+uploading it, and maps a provider's own size rejection — a 413, or a 400 whose
+body names or describes the size — to the same failure. That failure
 is not retryable — every later turn resends the same history — so myco **rewinds
 the last user message out of the conversation** and says so in the ERROR
 section. The session continues; re-send the message with a smaller image, or
