@@ -27,7 +27,7 @@ pub const ARTICLES: &[Article] = &[
     Article {
         id: "overview",
         title: "Myco overview",
-        summary: "Architecture, config paths, host routing, V1 product limits",
+        summary: "Architecture, config paths, host routing, the nested-agent recipe, V1 limits",
         body: include_str!("articles/overview.md"),
     },
     Article {

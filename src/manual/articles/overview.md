@@ -244,6 +244,53 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
   search tools of its own; project guidance (`AGENTS.md`/`CLAUDE.md`, skill
   packs) is read with the editor or `rg` like any other file.
 
+## Nested agents (the recipe)
+
+There is no subagent tool: a supervisor runs `myco` itself, on the **local host**, as an ordinary
+bash command. The system prompt carries the shape and the one hang that bites immediately; this is
+the working detail.
+
+**Live session** — for real back-and-forth:
+
+1. `bash` action=start with `command: "myco --parent-session <your-session-id>"` (add
+   `--model <key>` to pick a model, `--effort` if yours was changed from the default). Your own id
+   is on the newest `# Session` block in your conversation; `session_meta` action=get also reports
+   it.
+2. `write` one prompt per line, ending each `write` with `"\n"`. Each line is a self-contained turn
+   kept to a single line, and **only the trailing newline submits it**. Stdin passes through
+   unmodified, so a first turn written without `"\n"` is the classic hang: the child never sees a
+   complete line while you wait on `read`.
+3. `read` until the next `USER n/m` header — that is the turn boundary. Colors and wrapping switch
+   off automatically when piped.
+4. `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The child cancels its
+   in-flight turn, returns to its prompt, and stays writable — use it when a child runs long or
+   goes down the wrong path, and keep driving the same session.
+5. `close` when done. Ask for terse summaries: the point of nesting is to spend the child's
+   context instead of yours.
+
+**One-shot** — for a single self-contained task, skip the live session: `myco -p "<task>"
+--parent-session <id>` runs one turn and exits. Stdout is the answer text alone (no headers to
+parse; process exit is the boundary) and stderr ends with `session=<id>` for later reads. `-p`
+composes with `--fork` and `--model`. `myco -p "…" --resume <child-id>` appends follow-up turns,
+but each pays full process startup, so prefer a live session for real back-and-forth. Inside a
+**live** bash session, append `</dev/null`: with a prompt argument `-p` still drains piped stdin
+as context, and a live session's open stdin never EOFs. One-shot `bash` runs are safe — their
+stdin is null.
+
+**Context forking.** `--fork` seeds the child with your session's saved conversation instead of a
+blank context. Fork when the task needs what you already know (decisions so far, investigation,
+the user's intent); start blank when the task is self-contained — a fork begins at your context
+size and has less headroom. Launch forks on your own model (the catalog key stamped at the end of
+the system prompt): a same-model fork's first request re-reads your cached prompt prefix at a
+fraction of full input cost, while a different model is legal but starts cold. Your session file
+is checkpointed mid-turn after each user message and completed tool round, so a fork sees the
+current user request and finished tool rounds — never tool calls still in flight, its own launch
+included; put anything newer in the first prompt line you write to it.
+
+The child's session is hidden (`kind: subagent`, parented to yours) in the shared
+`~/.myco/session/` store — read it later via `session_meta` get-by-id, or `list` with
+`include_hidden: true`.
+
 ## Agent workspace
 
 `~/.myco/workspace/` is the agents' own directory — free-form files maintained with

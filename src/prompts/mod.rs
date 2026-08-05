@@ -54,12 +54,9 @@ Quick map (details in the manual):
   `ssh` to add the alias, install `myco`, and verify it attaches (`harness-ops.md`) is the task;
   go back to `host` once it is a real host.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
-- Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). For
-  search **by meaning**, use `ck` where installed (`ck --sem "query" dir/`; hybrid BM25 +
-  semantic, persistent per-folder index, `cargo install ck-search`) — probe with
-  `command -v ck`. Project guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs
-  (`.claude/skills`, `SKILL.md` folders) — read them with the editor or `rg` when the task
-  touches how this project works.
+- Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
+  guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs (`.claude/skills`, `SKILL.md`
+  folders) — read them with the editor or `rg` when the task touches how this project works.
 - You cannot run slash-commands (`/hosts`, `/session`, …); tell the user which to run.
 - Updating `myco` on **remote** hosts: compile **on the target** (see `harness-ops.md`).
   If developing myco, archive the local git tree; else download a source snapshot from
@@ -71,51 +68,22 @@ Quick map (details in the manual):
 # Nested Agents
 
 Context is precious. For ephemeral, task-specific context — and for complex, multi-step tasks —
-delegate to a nested agent: `myco` drives itself as an ordinary interactive command.
+delegate to a nested agent: `myco` drives itself as an ordinary command. A live `bash` session
+(`myco --parent-session <your-session-id>`, your id being on the newest `# Session` block in this
+conversation) gives real back-and-forth; `myco -p "<task>" --parent-session <id>` is a one-shot
+turn that answers on stdout and exits. `--fork` seeds the child with your conversation instead of
+a blank context, and `--model <key>` (the key stamped at the end of this prompt) keeps a fork on
+your model, where its first request re-reads your cached prompt prefix cheaply.
 
 Nest **on the local host only**. The brain stays on this machine — model access, config, keys, and
 the session store are shared by construction — and a nested agent reaches remote machines through
 its own host pool exactly as you do. Remote hosts stay hands, not brains: they need only `myco` on
-PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
-cleanly over one SSH connection per host with ControlMaster — see `harness-ops.md`.)
+PATH plus SSH, never config or keys.
 
-Recipe: read your own session id off the newest `# Session` block in this conversation — myco
-stamps one on the first user message of every session (`session_meta` action=get reports it too,
-with the rest of the metadata) — then `bash` action=start with
-`command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
-one prompt per line, ending each `write` with `"\n"` — each line is a self-contained turn kept to
-a single line, and only the trailing newline submits it. Stdin passes through unmodified, so a
-first turn written without `"\n"` is the classic hang: the child never sees a complete line while
-you wait on `read`. `read` until the next `USER n/m` header, which marks the turn boundary (colors
-and wrapping switch off automatically when piped). Ask for terse
-summaries; `close` the session when done. The child's session is hidden (`kind: subagent`,
-parented to yours) in the shared `~/.myco/session/` store — read it later via `session_meta`
-get-by-id or `list` with `include_hidden: true`.
-
-Interrupting a child: `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The
-child cancels its in-flight turn, returns to its prompt, and stays writable — use it when a child
-runs long or goes down the wrong path, and keep driving the same session. `close` remains the way
-to end it.
-
-One-shot delegation: for a single self-contained task, skip the live session — a plain one-shot
-`bash` run of `myco -p "<task>" --parent-session <your-session-id>` does one turn and exits.
-Stdout is the answer text alone (no headers to parse; process exit is the turn boundary) and
-stderr ends with `session=<id>` for later reads. `-p` composes with `--fork` and `--model`.
-Prefer a live session for real back-and-forth: `myco -p "…" --resume <child-id>` can append
-follow-up turns, but each pays full process startup. Inside a **live** bash session, append
-`</dev/null` — with a prompt argument `-p` still drains piped stdin as context, and a live
-session's open stdin never EOFs (one-shot `bash` runs are safe; their stdin is null).
-
-Context forking: add `--fork` to seed the child with your session's saved conversation instead of
-a blank context. Fork when the task needs what you already know (decisions so far, investigation,
-the user's intent); start blank when the task is self-contained — a fork begins at your context
-size and has less headroom. Launch forks on your own model (`--model` with the catalog key stamped
-at the end of this prompt): a same-model fork's first request re-reads your cached prompt prefix at
-a fraction of full input cost, while a different model is legal but starts cold (pass `--effort`
-too if yours was changed from the default). Your session file is checkpointed mid-turn after each
-user message and completed tool round, so a fork sees the current user request and finished tool
-rounds — never tool calls still in flight, its own launch included; put anything newer in the first
-prompt line you write to it.
+**Read `overview.md` § Nested agents before your first nest in a session** — driving a child over
+a pipe fails in ways you cannot see from outside, and one bites immediately: each prompt is a
+single self-contained line, and only the trailing newline submits it, so a `write` without `"\n"`
+leaves the child waiting for the rest of the line while you wait on `read`, forever.
 
 ---
 "#,
@@ -586,10 +554,13 @@ mod tests {
             "User authority & privileged operations",
             "force-merge",
             "manual",
-            // Nested-agent recipe: prompts are single-line, self-contained
-            // turns, submitted only by a trailing newline.
-            "self-contained turn",
-            r#"ending each `write` with `"\n"`"#,
+            // The nested-agent recipe lives in the manual; the prompt keeps
+            // the pointer and the hang that would otherwise cost a turn to
+            // diagnose — prompts are single-line, submitted by a trailing
+            // newline alone.
+            "`overview.md` § Nested agents",
+            "single self-contained line",
+            "only the trailing newline submits it",
             // Remote work goes through the `host` field, not local `ssh`.
             "do not run `ssh <alias> …` from",
             "persistent SSH connection",
@@ -600,9 +571,9 @@ mod tests {
             // runtime catalog pointer, not full policy-as-articles
             "`harness-ops.md`",
             // Search guidance is bash-first; myco ships no search tools of
-            // its own. Semantic search is the external `ck` companion.
+            // its own. Which searcher a machine has is prelude material, not
+            // policy, so no specific companion is named here.
             "`rg`",
-            "`ck`",
             // Free-form workspace policy: maildir-style prelude entries, the
             // record/curate habit, and the consistency caution.
             "Workspace & prelude",
@@ -697,7 +668,14 @@ mod tests {
     #[test]
     fn fork_recipe_and_model_stamp_are_documented() {
         // The epilogue points at the stamp; the stamp names the key and flag.
-        for needle in ["Context forking", "--fork", "at the end of this prompt"] {
+        // Why to fork (and the checkpoint semantics) moved to the manual; what
+        // survives here is the flag and the cache-alignment reason to pair it
+        // with the stamped model key.
+        for needle in [
+            "seeds the child with your conversation",
+            "--fork",
+            "at the end of this prompt",
+        ] {
             assert!(
                 DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
                 "missing: {needle}"
