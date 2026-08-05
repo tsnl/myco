@@ -183,6 +183,59 @@ impl ThinkingMode {
     }
 }
 
+/// When and how a driver re-sends a request the provider failed transiently.
+/// Resolved per gateway (a model's own `[models.KEY.retry]` table replaces it
+/// wholesale); consumed by `driver_core::send_with_retry` before anything has
+/// streamed to the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RetryPolicy {
+    /// Total attempts including the first. `1` disables retry.
+    pub max_attempts: u32,
+    pub initial_backoff: std::time::Duration,
+    /// Ceiling on one wait, applied to a provider's `Retry-After` too, so a
+    /// hostile or mistaken header cannot park an unattended run for hours.
+    pub max_backoff: std::time::Duration,
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Wait before `attempt` (1-based). Attempt 1 is the original send and
+    /// never waits; `retry_after` is the provider's ask, honoured when it
+    /// exceeds the computed backoff and still capped by [`Self::max_backoff`].
+    ///
+    /// No jitter: myco is one client per user, so there is no fleet to
+    /// de-synchronise, and a deterministic schedule is one less thing to
+    /// reason about when reading an overnight log.
+    pub fn backoff(
+        &self,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        if attempt <= 1 {
+            return std::time::Duration::ZERO;
+        }
+        let steps = attempt.saturating_sub(2);
+        let factor = self.backoff_multiplier.max(1.0).powi(steps.min(32) as i32);
+        let millis = (self.initial_backoff.as_millis() as f64 * factor).min(u64::MAX as f64);
+        let computed = std::time::Duration::from_millis(millis as u64);
+        retry_after
+            .unwrap_or(std::time::Duration::ZERO)
+            .max(computed)
+            .min(self.max_backoff)
+    }
+}
+
 /// A resolved model: everything the protocol drivers need, minus credentials
 /// (those live in [`BackendConfig`]). Built by `myco_config` from the
 /// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
@@ -963,6 +1016,44 @@ mod tests {
             "HTTP 500: overloaded".into(),
         );
         assert_eq!(unrelated.recovery(), Recovery::Retry);
+    }
+
+    /// Backoff doubles from `initial_backoff`, stops at `max_backoff`, and a
+    /// provider's `Retry-After` wins when it asks for longer — still under the
+    /// cap, so a mistaken header cannot park an unattended run for hours.
+    #[test]
+    fn retry_backoff_grows_caps_and_honours_retry_after() {
+        use std::time::Duration;
+        let policy = RetryPolicy {
+            max_attempts: 6,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(1000),
+            backoff_multiplier: 2.0,
+        };
+
+        // Attempt 1 is the original send; it never waits.
+        assert_eq!(policy.backoff(1, None), Duration::ZERO);
+        assert_eq!(policy.backoff(2, None), Duration::from_millis(100));
+        assert_eq!(policy.backoff(3, None), Duration::from_millis(200));
+        assert_eq!(policy.backoff(4, None), Duration::from_millis(400));
+        // Growth stops at the cap rather than running away.
+        assert_eq!(policy.backoff(9, None), Duration::from_millis(1000));
+
+        // A longer Retry-After wins over the computed wait...
+        assert_eq!(
+            policy.backoff(2, Some(Duration::from_millis(500))),
+            Duration::from_millis(500)
+        );
+        // ...but is still capped.
+        assert_eq!(
+            policy.backoff(2, Some(Duration::from_secs(3600))),
+            Duration::from_millis(1000)
+        );
+        // A shorter one does not shrink the backoff.
+        assert_eq!(
+            policy.backoff(3, Some(Duration::from_millis(1))),
+            Duration::from_millis(200)
+        );
     }
 
     /// Reading the body is how a size rejection is recognized, so an ordinary

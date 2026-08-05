@@ -94,6 +94,7 @@ impl GenerativeModel for OpenAIResponsesGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Responses",
             self.backend.debug_dump_api_requests,
+            self.backend.retry,
         )
     }
 }

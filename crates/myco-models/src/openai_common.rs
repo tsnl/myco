@@ -25,6 +25,9 @@ pub struct OpenAIBackendConfig {
     /// it on non-reasoning models, so those need `thinking = "none"` in the
     /// catalog. Defaults to [`Effort::DEFAULT`] so reasoning is always requested.
     pub effort: Option<Effort>,
+    /// Transient-failure retry, resolved from the catalog (see [`RetryPolicy`]).
+    #[serde(default)]
+    pub retry: RetryPolicy,
 }
 
 impl Default for OpenAIBackendConfig {
@@ -36,6 +39,7 @@ impl Default for OpenAIBackendConfig {
             max_output_tokens: Some(8192),
             debug_dump_api_requests: false,
             effort: Some(Effort::DEFAULT),
+            retry: RetryPolicy::default(),
         }
     }
 }

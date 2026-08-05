@@ -29,6 +29,9 @@ pub struct AnthropicBackendConfig {
     ///
     /// Defaults to [`Effort::DEFAULT`] so thinking is always on for interactive use.
     pub effort: Option<Effort>,
+    /// Transient-failure retry, resolved from the catalog (see [`RetryPolicy`]).
+    #[serde(default)]
+    pub retry: RetryPolicy,
 }
 
 impl Default for AnthropicBackendConfig {
@@ -40,6 +43,7 @@ impl Default for AnthropicBackendConfig {
             max_tokens_per_generate: 8192,
             debug_dump_api_requests: false,
             effort: Some(Effort::DEFAULT),
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -142,6 +146,7 @@ impl GenerativeModel for AnthropicGenerativeModel {
             StreamAccumulator::default(),
             "Anthropic",
             self.backend.debug_dump_api_requests,
+            self.backend.retry,
         )
     }
 }
