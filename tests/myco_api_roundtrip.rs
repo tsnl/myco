@@ -499,6 +499,7 @@ async fn archiving_hides_a_session_without_losing_it() {
             UpdateSession {
                 title: Some("filed".into()),
                 archived: Some(true),
+                ..Default::default()
             },
         )
         .await
@@ -521,8 +522,8 @@ async fn archiving_hides_a_session_without_losing_it() {
     api.update_session(
         &s.id,
         UpdateSession {
-            title: None,
             archived: Some(false),
+            ..Default::default()
         },
     )
     .await

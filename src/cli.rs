@@ -244,6 +244,56 @@ pub async fn run(opts: CliOptions) {
                             Err(e) => producer.error_section(&e),
                         }
                     }
+                    Some(Meta::Model(None)) => {
+                        let s = live.session.snapshot();
+                        let mut keys = sup.config().models.keys();
+                        keys.sort_unstable();
+                        producer.myco_section(&format!(
+                            "model: {}\navailable: {}  (/model <key> to switch)",
+                            s.model,
+                            keys.join(", ")
+                        ));
+                    }
+                    Some(Meta::Model(Some(key))) => {
+                        let req = myco_api::UpdateSession {
+                            model: Some(key),
+                            ..Default::default()
+                        };
+                        match sup.update_session(&live.session.id(), req).await {
+                            Ok(s) => {
+                                producer.note(&format!("model → {} (from the next turn)", s.model))
+                            }
+                            Err(e) => producer.error_section(&e.to_string()),
+                        }
+                    }
+                    Some(Meta::Effort(None)) => {
+                        let s = live.session.snapshot();
+                        producer.myco_section(&match s.effort {
+                            Some(e) => format!("effort: {e} (session override)"),
+                            None => "effort: model default \
+                                     (/effort low|medium|high|max to override)"
+                                .into(),
+                        });
+                    }
+                    Some(Meta::Effort(Some(level))) => {
+                        // `default`/`clear` drop the override; the wire spells
+                        // that as an empty string.
+                        let effort = match level.as_str() {
+                            "default" | "clear" => String::new(),
+                            _ => level,
+                        };
+                        let req = myco_api::UpdateSession {
+                            effort: Some(effort),
+                            ..Default::default()
+                        };
+                        match sup.update_session(&live.session.id(), req).await {
+                            Ok(s) => producer.note(&match s.effort {
+                                Some(e) => format!("effort → {e} (from the next turn)"),
+                                None => "effort → model default".into(),
+                            }),
+                            Err(e) => producer.error_section(&e.to_string()),
+                        }
+                    }
                     Some(Meta::Compact) => {
                         // Progress note under the current header: the
                         // COMPACTED banner replaces it on success, and it
@@ -446,6 +496,12 @@ enum Meta {
     Compact,
     /// `true` = archive, `false` = unarchive.
     Archive(bool),
+    /// `/model` shows the current model and the catalog; `/model <key>`
+    /// switches this session (applies from the next turn).
+    Model(Option<String>),
+    /// `/effort` shows; `/effort <level>` sets the session override;
+    /// `/effort default` clears it back to the model's configured effort.
+    Effort(Option<String>),
     /// Input that starts like a command (`/…`) but names none — reported as
     /// an ERROR section, never sent to the model.
     Unknown(String),
@@ -471,6 +527,12 @@ fn parse_meta(input: &str) -> Option<Meta> {
         ("unarchive", _) => Some(Meta::Archive(false)),
         ("resume", Some(id)) if !id.is_empty() => Some(Meta::Resume(id.to_string())),
         ("resume", _) => Some(Meta::Help),
+        ("model", k) => Some(Meta::Model(
+            k.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        )),
+        ("effort", e) => Some(Meta::Effort(
+            e.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        )),
         ("title", t) => Some(Meta::Title(
             t.map(|s| s.to_string()).filter(|s| !s.is_empty()),
         )),
@@ -481,8 +543,8 @@ fn parse_meta(input: &str) -> Option<Meta> {
 fn help(producer: &Arc<TuiProducer>) {
     producer.myco_section(
         "/new /resume <id> /sessions /session /title [text] /archive /unarchive \
-         /compact /hosts /exit — input queues while a turn runs; Ctrl-C cancels \
-         the running turn",
+         /model [key] /effort [low|medium|high|max|default] /compact /hosts \
+         /exit — input queues while a turn runs; Ctrl-C cancels the running turn",
     );
 }
 

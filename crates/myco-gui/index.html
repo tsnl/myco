@@ -114,6 +114,14 @@
       .actions .send { display: none; }
       .actions .spacer { flex: 1 1 auto; }
       .hint { margin-left: 0; }
+      /* Model / effort pickers (topbar and draft): quiet chrome, like the
+         linkish buttons beside them. */
+      select.picker {
+        background: #101010; color: var(--fg-dim); font: inherit;
+        font-size: 0.85em; border: 1px solid #333; padding: 0 0.2rem;
+        cursor: pointer;
+      }
+      select.picker:hover { color: var(--fg); border-color: #666; }
 
       /* The work rail: running tools and live shells, beside the transcript.
          Collapsible; when open it owns a fixed width and its own scroll. */

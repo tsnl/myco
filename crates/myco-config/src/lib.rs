@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use myco_models::{
-    AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
+    AnthropicBackendConfig, BackendConfig, CatalogModel, Effort, ModelCatalog, ModelSpec,
     OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
 };
 
@@ -385,12 +385,14 @@ fn resolve_catalog(
         // wholesale; the overlay onto defaults happens per field inside
         // `resolve_retry`.
         let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)));
+        let effort = Some(entry.effort.unwrap_or(Effort::DEFAULT));
         let backend = match protocol {
             Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
                 anthropic_base_url: base_url,
                 anthropic_auth_token: token,
                 max_tokens_per_generate: max_output,
                 retry,
+                effort,
                 ..Default::default()
             }),
             // Both OpenAI dialects take the same settings; the variant only
@@ -401,6 +403,7 @@ fn resolve_catalog(
                     auth_token: token,
                     max_output_tokens: Some(max_output),
                     retry,
+                    effort,
                     ..Default::default()
                 };
                 match protocol {
@@ -566,6 +569,34 @@ context_window = 100000
             cfg.models.get("stock").unwrap().spec.auto_compact_at_tokens,
             (100_000f64 * DEFAULT_AUTO_COMPACT_FRACTION) as u64
         );
+    }
+
+    /// A model entry's `effort` lands on its backend, and an unset entry gets
+    /// the built-in default — resolution decides, so runtimes never invent an
+    /// effort of their own.
+    #[test]
+    fn effort_resolves_onto_the_backend_with_a_default() {
+        let toml_text = r#"
+model = "gentle"
+
+[models.gentle]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+effort = "low"
+
+[models.stock]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 1000
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        let effort_of = |key: &str| match &cfg.models.get(key).unwrap().backend {
+            BackendConfig::OpenAIResponses(b) => b.effort,
+            other => panic!("unexpected backend {other:?}"),
+        };
+        assert_eq!(effort_of("gentle"), Some(Effort::Low));
+        assert_eq!(effort_of("stock"), Some(Effort::DEFAULT));
     }
 
     /// Out-of-range fractions are a startup error, not a surprise hours into

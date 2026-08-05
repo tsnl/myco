@@ -22,7 +22,7 @@ use myco_api as api;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{HtmlInputElement, HtmlTextAreaElement};
+use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -382,8 +382,8 @@ fn browser() -> Html {
                                 let _ = auth::patch_json::<api::SessionSummary, _>(
                                     &format!("/api/sessions/{id}"),
                                     &api::UpdateSession {
-                                        title: None,
                                         archived: Some(!archived),
+                                        ..Default::default()
                                     },
                                 )
                                 .await;
@@ -416,9 +416,24 @@ fn draft() -> Html {
     let input = use_node_ref();
     let error = use_state(|| Option::<String>::None);
     let navigator = use_navigator().unwrap();
+    // The catalog, so a session can start on a chosen model rather than being
+    // switched right after its first turn.
+    let models = use_state(|| Option::<api::Models>::None);
+    let picked = use_node_ref();
+    {
+        let models = models.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(m) = auth::get::<api::Models>("/api/models").await {
+                    models.set(Some(m));
+                }
+            });
+        });
+    }
 
     let send_now: Callback<()> = {
         let input = input.clone();
+        let picked = picked.clone();
         let error = error.clone();
         let navigator = navigator.clone();
         Callback::from(move |_| {
@@ -430,6 +445,11 @@ fn draft() -> Html {
                 return;
             }
             ta.set_value("");
+            // No picker rendered (catalog not loaded) → server default.
+            let model = picked
+                .cast::<HtmlSelectElement>()
+                .map(|s| s.value())
+                .filter(|v| !v.is_empty());
             let error = error.clone();
             let navigator = navigator.clone();
             spawn_local(async move {
@@ -437,7 +457,7 @@ fn draft() -> Html {
                 let created = auth::post_json::<api::SessionSummary, _>(
                     "/api/sessions",
                     &api::CreateSession {
-                        model: None,
+                        model,
                         parent_session: None,
                         fork: false,
                     },
@@ -486,6 +506,14 @@ fn draft() -> Html {
                     <textarea ref={input} rows="3" onkeydown={on_keydown}
                               placeholder="message (Enter to send, Shift+Enter for a newline)" />
                     <div class="actions">
+                        { if let Some(m) = &*models { html! {
+                            <select class="picker" ref={picked} title="model for this session">
+                                { for m.models.iter().map(|k| html! {
+                                    <option value={k.clone()} selected={*k == m.default_model}>{ k }</option>
+                                }) }
+                            </select>
+                        } } else { html!{} } }
+                        <span class="spacer"></span>
                         <button class="send" onclick={on_send}>{ "send" }</button>
                     </div>
                 </div>
@@ -1005,6 +1033,19 @@ fn conversation(props: &ConversationProps) -> Html {
     let panel: Rc<RefCell<PanelBuf>> = use_mut_ref(PanelBuf::default);
     let panel_rev = use_state(|| 0u64);
     let term_input = use_node_ref();
+    // The catalog, for the topbar model picker. One fetch; the catalog does
+    // not change while the page is open.
+    let models = use_state(Vec::<String>::new);
+    {
+        let models = models.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(m) = auth::get::<api::Models>("/api/models").await {
+                    models.set(m.models);
+                }
+            });
+        });
+    }
 
     // Ask once, on the way in, so the first message that names someone can
     // actually reach them.
@@ -1064,10 +1105,16 @@ fn conversation(props: &ConversationProps) -> Html {
                     // whether or not the feed comes up, and a window missed
                     // while disconnected heals.
                     match fetch_detail(&id).await {
-                        Ok(d) => dispatch.dispatch(ConvAction::Loaded {
-                            entries: d.entries,
-                            busy: d.summary.busy,
-                        }),
+                        Ok(d) => {
+                            dispatch.dispatch(ConvAction::Configured {
+                                model: d.summary.model,
+                                effort: d.summary.effort,
+                            });
+                            dispatch.dispatch(ConvAction::Loaded {
+                                entries: d.entries,
+                                busy: d.summary.busy,
+                            })
+                        }
                         Err(Failure::Unauthorized) => {
                             sign_out_now(&who);
                             return;
@@ -1357,6 +1404,53 @@ fn conversation(props: &ConversationProps) -> Html {
         Callback::from(move |_: MouseEvent| verbose.set(!*verbose))
     };
 
+    // Reconfigure the session from a topbar picker. The server validates,
+    // persists, and tells the (possibly running) agent task; the `Configured`
+    // dispatch adopts whatever it answered — the pickers show the server's
+    // truth, not the click.
+    let reconfigure = {
+        let id = props.id.clone();
+        let dispatch = conv.dispatcher();
+        move |req_of: fn(String) -> api::UpdateSession| {
+            let id = id.clone();
+            let dispatch = dispatch.clone();
+            Callback::from(move |e: Event| {
+                let Some(sel) = e.target_dyn_into::<HtmlSelectElement>() else {
+                    return;
+                };
+                let req = req_of(sel.value());
+                let id = id.clone();
+                let dispatch = dispatch.clone();
+                spawn_local(async move {
+                    match auth::patch_json::<api::SessionSummary, _>(
+                        &format!("/api/sessions/{id}"),
+                        &req,
+                    )
+                    .await
+                    {
+                        Ok(s) => dispatch.dispatch(ConvAction::Configured {
+                            model: s.model,
+                            effort: s.effort,
+                        }),
+                        Err(e) => {
+                            dispatch.dispatch(ConvAction::Failed(format!("reconfigure: {e}")))
+                        }
+                    }
+                });
+            })
+        }
+    };
+    let on_pick_model = reconfigure(|model| api::UpdateSession {
+        model: Some(model),
+        ..Default::default()
+    });
+    // The "default" option's value is the empty string — the wire's spelling
+    // for clearing the override.
+    let on_pick_effort = reconfigure(|effort| api::UpdateSession {
+        effort: Some(effort),
+        ..Default::default()
+    });
+
     let on_cancel = {
         let id = props.id.clone();
         Callback::from(move |_: MouseEvent| {
@@ -1566,6 +1660,27 @@ fn conversation(props: &ConversationProps) -> Html {
                     <button class="linkish" onclick={toggle_rail}>
                         { if *rail_open { "· hide work" } else { "· work" } }
                     </button>
+                    { " " }
+                    <select class="picker" onchange={on_pick_model} title="model (applies from the next turn)">
+                        { for models.iter().map(|m| html! {
+                            <option value={m.clone()} selected={*m == st.model}>{ m }</option>
+                        }) }
+                        // A session may run a key since removed from the
+                        // catalog; show it rather than silently selecting
+                        // something else.
+                        { if !st.model.is_empty() && !models.contains(&st.model) { html! {
+                            <option value={st.model.clone()} selected=true>{ &st.model }</option>
+                        } } else { html!{} } }
+                    </select>
+                    { " " }
+                    <select class="picker" onchange={on_pick_effort} title="reasoning effort (applies from the next turn)">
+                        <option value="" selected={st.effort.is_none()}>{ "effort: default" }</option>
+                        { for ["low", "medium", "high", "max"].iter().map(|e| html! {
+                            <option value={*e} selected={st.effort.as_deref() == Some(*e)}>
+                                { format!("effort: {e}") }
+                            </option>
+                        }) }
+                    </select>
                     { whoami_line(&who) }
                 </div>
             </div>

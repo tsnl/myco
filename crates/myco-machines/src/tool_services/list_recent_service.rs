@@ -158,6 +158,7 @@ mod tests {
             kind: SessionKind::User,
             archived: false,
             parent_session_id: None,
+            effort: None,
         }
     }
 

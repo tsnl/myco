@@ -115,6 +115,11 @@ pub struct Session {
     /// (absent in sessions written before usage tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<TokenUsage>,
+    /// Per-session reasoning-effort override (`"low"`…`"max"`); unset uses
+    /// the model's config. Stored as the wire string so the session file
+    /// never depends on the model layer's enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Structured association stored on a session.
@@ -157,6 +162,7 @@ pub struct SessionListEntry {
     pub kind: SessionKind,
     pub archived: bool,
     pub parent_session_id: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -283,6 +289,7 @@ impl Session {
             predecessor_id: None,
             successor_id: None,
             last_usage: None,
+            effort: None,
         }
     }
 
@@ -324,6 +331,7 @@ impl Session {
         child.parent_session_id = Some(self.id.clone());
         child.entries = self.entries.clone();
         child.last_usage = self.last_usage;
+        child.effort = self.effort.clone();
         child
     }
 
@@ -627,6 +635,7 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         kind: session.kind,
         archived: session.archived,
         parent_session_id: session.parent_session_id,
+        effort: session.effort,
     })
 }
 
@@ -1243,12 +1252,16 @@ mod tests {
             output_tokens: 10,
             cached_input_tokens: 50,
         });
+        parent.effort = Some("low".into());
 
         let child = parent.fork_child("othermodel");
         // Conversation + usage are inherited so the fork resumes the parent's
-        // context (and its USER n/m headroom header) exactly.
+        // context (and its USER n/m headroom header) exactly. The effort
+        // override rides along: the fork continues the parent's conversation
+        // and should think as hard as it did.
         assert_eq!(child.entries.len(), 1);
         assert_eq!(child.last_usage, parent.last_usage);
+        assert_eq!(child.effort.as_deref(), Some("low"));
         // Identity is fresh: new id, hidden subagent kind, parented; the
         // parent's metadata does not leak.
         assert_ne!(child.id, parent.id);

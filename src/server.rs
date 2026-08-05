@@ -212,6 +212,12 @@ pub enum Cmd {
         /// still works and re-arms the trigger on success.
         automatic: bool,
     },
+    /// The session document's model key or effort override changed
+    /// (`PATCH /sessions`); rebuild the agent's model to match. Carries
+    /// nothing: the session document is the source of truth. Queued like any
+    /// command, so a running turn finishes on the model it started with and
+    /// the change applies from the next turn onward.
+    Reconfigure,
 }
 
 /// A message the room has accepted but the history has not absorbed yet.
@@ -364,11 +370,8 @@ impl Server {
         };
 
         let model_key = session.model.clone();
-        let catalog_model = self
-            .config
-            .models
-            .get(&model_key)
-            .map_err(|e| format!("model {model_key:?}: {e}"))?;
+        let catalog_model =
+            catalog_model_with_effort(&self.config, &model_key, session.effort.as_deref())?;
 
         // A session becomes durable when it has content, not when it is
         // opened: the first turn's checkpoint writes the file. Opening one
@@ -397,7 +400,7 @@ impl Server {
         let (events, _) = broadcast::channel::<SessionEvent>(EVENT_BUFFER);
         let sink = Arc::new(BroadcastSink { tx: events.clone() }) as Arc<dyn EventSink>;
 
-        let model = (self.model_factory)(ModelPurpose::Agent, &id, catalog_model, &harness)?;
+        let model = (self.model_factory)(ModelPurpose::Agent, &id, &catalog_model, &harness)?;
         let mut agent = Agent::new(model, harness.clone(), sink);
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
         agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
@@ -569,6 +572,50 @@ async fn run_agent_task(mut t: AgentTask) {
             Cmd::Poke => drain_inbox(&mut t).await,
             Cmd::User { entry } => run_turn(&mut t, TurnWork::User(entry)).await,
             Cmd::Compact { automatic } => run_turn(&mut t, TurnWork::Compact { automatic }).await,
+            Cmd::Reconfigure => reconfigure(&mut t),
+        }
+    }
+}
+
+/// Rebuild the agent's model from the session document's current model key
+/// and effort override — the runtime half of a `PATCH /sessions` model or
+/// effort edit. Not a turn: no busy flag, no turn counter, no turn events.
+/// Failure (a catalog key removed since validation, a backend that will not
+/// build) leaves the old model driving and surfaces like a failed turn would.
+fn reconfigure(t: &mut AgentTask) {
+    let Some(sup) = t.supervisor.upgrade() else {
+        return;
+    };
+    let (model_key, effort) = t.active.with(|s| (s.model.clone(), s.effort.clone()));
+    let rebuilt = catalog_model_with_effort(sup.config(), &model_key, effort.as_deref()).and_then(
+        |catalog_model| {
+            let model = (sup.model_factory)(
+                ModelPurpose::Agent,
+                &t.active.id(),
+                &catalog_model,
+                &t.harness,
+            )?;
+            Ok((catalog_model, model))
+        },
+    );
+    match rebuilt {
+        Ok((catalog_model, model)) => {
+            t.agent.set_model(model);
+            t.agent.set_model_key(catalog_model.spec.key.clone());
+            t.agent
+                .set_context_window_tokens(catalog_model.spec.context_window_tokens);
+            t.agent
+                .set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
+            t.catalog_model = catalog_model;
+            // A model switch changes the auto-compact threshold; give the
+            // trigger a fresh chance rather than carrying the old latch.
+            t.auto_compact_failed = false;
+        }
+        Err(e) => {
+            let msg = format!("reconfigure: {e} (still on {:?})", t.catalog_model.spec.key);
+            eprintln!("[{}] {msg}", t.active.id());
+            t.handle.set_error(Some(msg.clone()));
+            let _ = t.events.send(SessionEvent::TurnFailed { message: msg });
         }
     }
 }
@@ -829,13 +876,6 @@ fn build_model(
     catalog_model: &CatalogModel,
     harness: &Harness,
 ) -> Result<Arc<dyn GenerativeModel>, String> {
-    let mut backend_config = catalog_model.backend.clone();
-    match &mut backend_config {
-        BackendConfig::Anthropic(c) => c.effort = Some(Effort::High),
-        BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
-            c.effort = Some(Effort::High)
-        }
-    }
     myco_models::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
@@ -845,9 +885,39 @@ fn build_model(
             myco_prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
-        backend_config,
+        backend_config: catalog_model.backend.clone(),
     })
     .map_err(|e| format!("failed to create model: {e}"))
+}
+
+/// Resolve `model_key` from the catalog with the session's effort override
+/// laid over the backend — what model factories actually build from.
+///
+/// `effort` is the stored wire string. An unparseable value (a hand-edited or
+/// future-version session file) falls back to the configured effort rather
+/// than refusing to open the session.
+fn catalog_model_with_effort(
+    config: &Config,
+    model_key: &str,
+    effort: Option<&str>,
+) -> Result<CatalogModel, String> {
+    let mut m = config
+        .models
+        .get(model_key)
+        .map_err(|e| format!("model {model_key:?}: {e}"))?
+        .clone();
+    if let Some(s) = effort {
+        match s.parse::<Effort>() {
+            Ok(effort) => match &mut m.backend {
+                BackendConfig::Anthropic(c) => c.effort = Some(effort),
+                BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
+                    c.effort = Some(effort)
+                }
+            },
+            Err(e) => eprintln!("warning: ignoring session effort override: {e}"),
+        }
+    }
+    Ok(m)
 }
 
 /// The author for turns this process drives locally.
@@ -963,6 +1033,7 @@ fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
         updated_at: s.updated_at.to_rfc3339(),
         message_count: s.entries.len(),
         snippet: String::new(),
+        effort: s.effort.clone(),
         live,
         busy,
     }
@@ -1003,6 +1074,7 @@ impl Server {
                 message_count: e.message_count,
                 snippet: e.snippet,
                 archived: e.archived,
+                effort: e.effort,
                 live,
                 busy,
             });
@@ -1051,35 +1123,62 @@ impl Server {
         id: &str,
         req: api::UpdateSession,
     ) -> Result<api::SessionSummary, ApiError> {
+        // Validate up front so a bad key or effort is a 400 with the session
+        // untouched — the agent task's rebuild should only ever see values
+        // that resolved here.
+        if let Some(model) = req.model.as_deref() {
+            self.config.models.get(model).map_err(|e| {
+                ApiError::new(ErrorKind::BadRequest, format!("model {model:?}: {e}"))
+            })?;
+        }
+        // `""` clears the override; anything else must parse. Stored
+        // canonically (`"MED"` → `"medium"`) so the document and the summary
+        // read the same as the wire.
+        let effort = match req.effort.as_deref() {
+            None => None,
+            Some("") => Some(None),
+            Some(s) => Some(Some(
+                s.parse::<Effort>()
+                    .map_err(|e| ApiError::new(ErrorKind::BadRequest, e))?
+                    .as_str()
+                    .to_string(),
+            )),
+        };
+        let apply = |s: &mut Session| {
+            if let Some(title) = req.title.clone() {
+                s.title = Some(title);
+            }
+            if let Some(archived) = req.archived {
+                s.archived = archived;
+            }
+            if let Some(model) = req.model.clone() {
+                s.model = model;
+            }
+            if let Some(effort) = effort.clone() {
+                s.effort = effort;
+            }
+            s.touch();
+            s.save()
+        };
+        let reconfigures = req.model.is_some() || effort.is_some();
+
         // Edit the live copy when there is one, so a viewer sees it at once;
         // otherwise edit on disk.
         let session = match self.get_live(id).await {
             Some(l) => {
-                l.session
-                    .with_mut(|s| {
-                        if let Some(title) = req.title.clone() {
-                            s.title = Some(title);
-                        }
-                        if let Some(archived) = req.archived {
-                            s.archived = archived;
-                        }
-                        s.touch();
-                        s.save()
-                    })
-                    .map_err(internal)?;
+                l.session.with_mut(apply).map_err(internal)?;
+                if reconfigures {
+                    // The document changed; tell the agent task to catch up.
+                    // Queued behind whatever is running, so the change lands
+                    // at the next turn boundary.
+                    let _ = l.tx.send(Cmd::Reconfigure);
+                }
                 l.session.snapshot()
             }
             None => {
                 let mut s = Session::load_by_id_or_prefix(id)
                     .map_err(|e| ApiError::new(ErrorKind::NotFound, e))?;
-                if let Some(title) = req.title.clone() {
-                    s.title = Some(title);
-                }
-                if let Some(archived) = req.archived {
-                    s.archived = archived;
-                }
-                s.touch();
-                s.save().map_err(internal)?;
+                apply(&mut s).map_err(internal)?;
                 s
             }
         };
