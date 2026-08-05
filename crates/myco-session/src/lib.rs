@@ -514,10 +514,11 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
 ///
 /// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`]) are skipped
 /// rather than failing the listing, but never silently: they are reported once
-/// per process via [`warn_about_skipped_sessions`]. A session that vanishes from
-/// `/sessions` without a word is indistinguishable from one that was never
-/// there, and bare `--resume` would quietly open an *older* session instead of
-/// the newest one.
+/// per process via [`warn_about_skipped_sessions`]. A session that vanishes
+/// from `/sessions` without a word is indistinguishable from one that was
+/// never there. (Bare resume does not come through here — it resolves by file
+/// mtime in [`resolve_and_load_session`] — so the listing's warning is about
+/// the listing.)
 pub fn list_sessions_filtered(
     limit: usize,
     include_hidden: bool,
@@ -633,15 +634,41 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
 pub fn resolve_and_load_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
     match id_or_prefix {
         Some(id) => Session::load_by_id_or_prefix(id),
-        None => {
-            let list = list_sessions(1)?;
-            let meta = list
-                .into_iter()
-                .next()
-                .ok_or_else(|| "no sessions found under ~/.myco/session".to_string())?;
-            Session::load(&meta.path)
+        None => load_most_recent_session(),
+    }
+}
+
+/// The newest resumable session, resolved by file mtime rather than by
+/// parsing every document to sort on `updated_at` — bare resume runs at
+/// startup, and a store with years of sessions should not pay a full-history
+/// parse per file to open one. Sound because every `touch()` is followed by
+/// an atomic `save()`, so mtime tracks `updated_at`; a corrupt, hidden, or
+/// archived newest file costs a `stat` and one parse, not the whole store.
+fn load_most_recent_session() -> Result<Session, String> {
+    let root = session_root()?;
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    if root.exists() {
+        for path in iter_session_json_files(&root)? {
+            let mtime = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            candidates.push((mtime, path));
         }
     }
+    // Path breaks mtime ties for determinism on coarse-mtime filesystems.
+    candidates.sort();
+    for (_, path) in candidates.iter().rev() {
+        // `load` already rejects unreadable and wrong-version files, so this
+        // only has to add the visibility half: hidden kinds and archived
+        // sessions are exactly what the listing path would have skipped.
+        if let Ok(session) = Session::load(path)
+            && !session.is_hidden()
+            && !session.archived
+        {
+            return Ok(session);
+        }
+    }
+    Err("no sessions found under ~/.myco/session".to_string())
 }
 
 pub fn resolve_session_id(id_or_prefix: &str) -> Result<String, String> {
@@ -1493,6 +1520,56 @@ mod tests {
         assert!(s.set_scratchpad(big).is_err());
         s.set_scratchpad("ok".into()).unwrap();
         assert_eq!(s.scratchpad, "ok");
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn bare_resume_picks_newest_mtime_and_skips_corrupt_files() {
+        let _home = temp_home("session-bare-resume");
+
+        let older = Session::new("claude-haiku-4-5");
+        older.save().unwrap();
+        let newer = Session::new("claude-haiku-4-5");
+        newer.save().unwrap();
+
+        // Force distinct mtimes regardless of filesystem timestamp granularity.
+        let base = std::time::SystemTime::now();
+        set_mtime(
+            &older.json_path(),
+            base - std::time::Duration::from_secs(60),
+        );
+        set_mtime(&newer.json_path(), base);
+
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, newer.id);
+
+        // A corrupt file with the newest mtime is skipped, not fatal.
+        let corrupt = session_file_path("ffeeddccbbaa00112233445566778899", "json");
+        fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        fs::write(&corrupt, b"{not json").unwrap();
+        set_mtime(&corrupt, base + std::time::Duration::from_secs(60));
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, newer.id);
+
+        // So is an archived session: bare resume opens what the listing
+        // would have shown, however fresh the archived file is.
+        let mut archived = Session::new("claude-haiku-4-5");
+        archived.archived = true;
+        archived.save().unwrap();
+        set_mtime(
+            &archived.json_path(),
+            base + std::time::Duration::from_secs(120),
+        );
+        let resumed = resolve_and_load_session(None).unwrap();
+        assert_eq!(resumed.id, newer.id);
     }
 
     #[test]
