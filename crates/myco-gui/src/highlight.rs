@@ -82,11 +82,6 @@ fn lookup<'a>(
         .or_else(|| syntaxes.find_syntax_by_extension(&alias))
 }
 
-/// Pretty-printed, highlighted JSON — the form every tool call is shown in.
-pub fn json_to_html(pretty: &str) -> String {
-    highlight_to_html(pretty, "json")
-}
-
 /// Minimal HTML escape for the un-highlightable fallback path. syntect
 /// escapes its own output; this covers the text that never reaches it.
 pub fn escape(s: &str) -> String {

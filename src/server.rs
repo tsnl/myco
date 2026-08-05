@@ -780,14 +780,10 @@ impl From<SessionEvent> for api::StreamEvent {
             SessionEvent::Agent(a) => match a {
                 AgentEvent::TextDelta { text, .. } => api::StreamEvent::TextDelta { text },
                 AgentEvent::ThinkingDelta { text, .. } => api::StreamEvent::ThinkingDelta { text },
-                AgentEvent::ToolStarted { tool_use, .. } => {
-                    let mut input = tool_use.input.to_string();
-                    input.truncate(200);
-                    api::StreamEvent::ToolStarted {
-                        name: tool_use.name,
-                        input,
-                    }
-                }
+                AgentEvent::ToolStarted { tool_use, .. } => api::StreamEvent::ToolStarted {
+                    name: tool_use.name,
+                    input: tool_use.input,
+                },
                 AgentEvent::TurnFinished { .. } => api::StreamEvent::TurnFinished,
             },
             SessionEvent::Message { entry, wakes_agent } => {

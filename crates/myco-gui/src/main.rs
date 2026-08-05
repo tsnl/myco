@@ -297,10 +297,13 @@ fn markdown(src: &str) -> Html {
 }
 
 /// Pretty-printed, highlighted JSON in a `<pre>`.
-fn json_block(pretty: &str) -> Html {
-    let body = highlight::json_to_html(pretty);
+/// A tool call's arguments, highlighted as YAML. Falls back to escaped plain
+/// text when the syntax set has no YAML, which is the highlighter's own
+/// contract — the arguments are readable either way.
+fn yaml_block(text: &str) -> Html {
+    let body = highlight::highlight_to_html(text, "yaml");
     Html::from_html_unchecked(AttrValue::from(format!(
-        "<pre class=\"code json\">{body}</pre>"
+        "<pre class=\"code yaml\">{body}</pre>"
     )))
 }
 
@@ -508,12 +511,50 @@ struct ToolCardProps {
     verbose: bool,
 }
 
-/// One tool call as its own bordered block: name, pretty-printed arguments,
-/// and the result folded in underneath.
+/// How a call is going, as one glance.
+#[derive(Clone, Copy, PartialEq)]
+enum ToolStatus {
+    Running,
+    Ok,
+    Failed,
+}
+
+impl ToolStatus {
+    fn of(result: Option<&api::ToolResult>) -> Self {
+        match result {
+            None => ToolStatus::Running,
+            Some(r) if r.is_error => ToolStatus::Failed,
+            Some(_) => ToolStatus::Ok,
+        }
+    }
+
+    fn disc_class(self) -> &'static str {
+        match self {
+            ToolStatus::Running => "tool-disc tool-disc-running",
+            ToolStatus::Ok => "tool-disc tool-disc-ok",
+            ToolStatus::Failed => "tool-disc tool-disc-failed",
+        }
+    }
+
+    /// Colour alone is not a label. The disc carries a title so the state is
+    /// readable to a screen reader and on hover.
+    fn title(self) -> &'static str {
+        match self {
+            ToolStatus::Running => "running",
+            ToolStatus::Ok => "completed successfully",
+            ToolStatus::Failed => "failed",
+        }
+    }
+}
+
+/// One tool call as its own bordered block: a status disc, the name, the
+/// arguments, and the result folded in underneath.
 ///
-/// Collapsed, strings in the arguments are truncated and the result is capped
-/// — the same policy the CLI applies, shared from `myco_api` so the two
-/// frontends cannot drift. Expanded, nothing is elided.
+/// The call and its output are collapsed on different terms, because they are
+/// read for different reasons. The arguments are *what was asked for* — short,
+/// and the thing you scan a transcript to find — so they are always shown in
+/// full. The output is *what came back*, which can be a 5,000-line build log,
+/// so it is capped until asked for. Only the result has a toggle.
 #[function_component(ToolCard)]
 fn tool_card(props: &ToolCardProps) -> Html {
     let expanded = use_state(|| props.verbose);
@@ -527,8 +568,11 @@ fn tool_card(props: &ToolCardProps) -> Html {
     };
     let open = *expanded;
 
-    let args = api::tool_input_json(&props.tool.input, !open);
-    let is_error = props.result.as_ref().is_some_and(|r| r.is_error);
+    // Always the whole call, never summarized: a truncated command is one you
+    // have to expand the card to trust.
+    let args = api::tool_input_yaml(&props.tool.input, api::TOOL_DISPLAY_WIDTH);
+    let status = ToolStatus::of(props.result.as_ref());
+    let is_error = status == ToolStatus::Failed;
 
     let result_body = props.result.as_ref().map(|r| {
         let text = api::content_text(&r.content);
@@ -554,19 +598,25 @@ fn tool_card(props: &ToolCardProps) -> Html {
         }
     });
 
+    // Nothing to fold away until output exists, and a long result is the only
+    // thing the toggle acts on.
+    let foldable = props
+        .result
+        .as_ref()
+        .is_some_and(|r| api::content_text(&r.content).lines().count() > RESULT_PREVIEW_LINES);
+
     html! {
         <div class={ classes!("tool-card", is_error.then_some("tool-card-error")) }>
             <div class="tool-head" onclick={toggle.clone()}>
-                <span class="tool-caret">{ if open { "▾" } else { "▸" } }</span>
+                <span class={status.disc_class()} title={status.title()}>{ "●" }</span>
                 <span class="tool-name">{ &props.tool.name }</span>
-                { if props.result.is_none() { html! {
-                    <span class="dim">{ " · running" }</span>
-                } } else if is_error { html! {
-                    <span class="err">{ " · error" }</span>
+                { if foldable { html! {
+                    <span class="tool-toggle">
+                        { if open { "collapse output" } else { "expand output" } }
+                    </span>
                 } } else { html!{} } }
-                <span class="tool-toggle">{ if open { "collapse" } else { "expand" } }</span>
             </div>
-            { json_block(&args) }
+            { yaml_block(&args) }
             { result_body.unwrap_or_else(|| html!{}) }
         </div>
     }
@@ -810,7 +860,10 @@ fn result_index(entries: &[api::Entry]) -> std::collections::HashMap<String, api
 enum StreamItem {
     Text(String),
     Thinking(String),
-    Tool { name: String, input: String },
+    Tool {
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 impl StreamItem {
@@ -835,8 +888,7 @@ impl StreamItem {
                     <ToolCard tool={api::ToolUse {
                         id: String::new(),
                         name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::Value::String(input.clone())),
+                        input: input.clone(),
                     }} result={None} {verbose} />
                 },
             },
@@ -848,7 +900,7 @@ impl StreamItem {
     fn size(&self) -> usize {
         match self {
             StreamItem::Text(t) | StreamItem::Thinking(t) => t.len(),
-            StreamItem::Tool { name, input } => name.len() + input.len(),
+            StreamItem::Tool { name, .. } => name.len(),
         }
     }
 }
