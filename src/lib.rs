@@ -16,10 +16,9 @@ pub mod cli;
 pub mod client;
 pub mod server;
 pub mod subagent;
-pub mod tui;
 pub mod web;
 
-// Flat conveniences (v1 `myco::X` surface, minus the TUI).
+// Flat conveniences (v1 `myco::X` surface).
 pub use myco_agent::{
     Agent, AgentEvent, AgentInteractionError, CompactWorkerError, EventSink, NullEventSink,
     TraceContext, compact_subagent_prompt, run_compact_worker,
@@ -27,16 +26,12 @@ pub use myco_agent::{
 pub use myco_config::{Config, ConfigUserSettings, load_file_config};
 pub use myco_core::{CancelToken, uuid_simple_hex};
 pub use myco_machines::harness::{
-    ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
-    SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
-    ensure_remote_ssh_identities, load_ssh_host_aliases, ssh_config_host_aliases,
+    Harness, HarnessConfig, HostConfig, HostController, HostStatus, default_ssh_config_path,
+    fatal_startup_check, load_ssh_host_aliases, prelude_warning, ssh_config_host_aliases,
 };
 pub use myco_machines::host::HostWorker;
-pub use myco_machines::tool_services::{
-    HostDispatchContext, ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
-};
-pub use myco_prompts::manual::Article as ManualArticle;
+pub use myco_machines::tool_services::{HostDispatchContext, SessionMetaTool, ToolService};
 pub use myco_session::{
-    ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
-    SessionLink, SessionListEntry, compact_session, link_compact_pair, select_tail,
+    ActiveSession, CompactOutcome, SESSION_FILE_VERSION, Session, SessionKind, SessionListEntry,
+    compact_session, link_compact_pair, select_tail,
 };

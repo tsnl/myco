@@ -9,7 +9,8 @@ use myco::host::HostWorker;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
-    /// Interactive CLI (default).
+    /// Thin client (default): `-p` runs one turn against the local server,
+    /// spawning `--mode serve` if none answers.
     Cli,
     /// Serve the web API + GUI on localhost.
     Serve,
@@ -37,26 +38,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Cli)]
     mode: Mode,
 
-    /// Print mode: run one agent turn, print the answer to stdout, exit.
-    /// The session is saved like any other (`session=<id>` on stderr).
+    /// Print mode: run one agent turn over the API, print the answer to
+    /// stdout, exit. The session is saved like any other (`session=<id>` on
+    /// stderr).
     #[arg(short = 'p', long = "print", value_name = "PROMPT")]
     print: Option<String>,
 
-    /// Resume a session by id (or prefix). Without a value: the most recent.
-    #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
-    resume: Option<String>,
-
-    /// Create this session as a hidden child of the given session (nested
-    /// agents; combine with --fork to copy the parent's conversation).
+    /// With -p: continue this session (id or prefix) instead of creating one.
     #[arg(long, value_name = "ID")]
-    parent_session: Option<String>,
+    session: Option<String>,
 
-    /// With --parent-session: seed the child with the parent's saved
-    /// conversation (context fork).
-    #[arg(long)]
-    fork: bool,
-
-    /// Server port for `--mode serve`.
+    /// Server port (`--mode serve` listens here; `-p` connects here).
     #[arg(long, default_value_t = 7773)]
     port: u16,
 
@@ -135,18 +127,23 @@ async fn main() {
             }
         }
         Mode::Cli => {
-            myco::cli::run(myco::cli::CliOptions {
-                config_path: args.config,
-                roster_path: args.server_config,
+            let Some(prompt) = args.print else {
+                eprintln!(
+                    "myco is a server with clients, not a terminal REPL.\n\
+                     - `myco --mode serve` then open the web GUI (`trunk serve`, :8080)\n\
+                     - `myco -p \"prompt\"` for a one-shot turn (spawns the server if needed)\n\
+                     - `clients/myco.py` or plain HTTP for scripts (see README, API section)"
+                );
+                std::process::exit(2);
+            };
+            let code = myco::cli::run_print(myco::cli::PrintOptions {
+                prompt,
                 model: args.model,
-                resume: args
-                    .resume
-                    .map(|id| if id.is_empty() { None } else { Some(id) }),
-                parent_session: args.parent_session,
-                fork: args.fork,
-                print: args.print,
+                session: args.session,
+                port: args.port,
             })
             .await;
+            std::process::exit(code);
         }
     }
 }

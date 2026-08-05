@@ -2,36 +2,19 @@
 //!
 //! Every executable myco launches by name is declared here as an
 //! [`ExternalCommand`]: how it resolves (env override → PATH → well-known
-//! dirs), why myco needs it, and when the startup preflight expects it
-//! ([`myco_machines::harness::StartupPreflight`]). Call sites spawn through
-//! [`ExternalCommand::command`] / [`ExternalCommand::tokio_command`], never
-//! `Command::new("literal")` — so a new external process cannot skip the
-//! registry or the preflight (enforced by the
-//! `every_literal_spawn_goes_through_the_registry` test).
+//! dirs). Call sites spawn through [`ExternalCommand::command`] /
+//! [`ExternalCommand::tokio_command`], never `Command::new("literal")` — so a
+//! new external process cannot skip the registry (enforced by the
+//! `every_literal_spawn_goes_through_the_registry` test). A missing program
+//! fails at the call that needs it, with the OS's own error.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-
-/// When the startup preflight expects the program on the agent machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartupCheck {
-    /// Every interactive session (standard local tools).
-    Always,
-    /// Only when SSH-backed remote hosts are configured.
-    WithSshRemotes,
-    /// Never warned about at startup (test-only or best-effort spawns).
-    Never,
-}
 
 /// One external program myco spawns by name.
 #[derive(Debug)]
 pub struct ExternalCommand {
     pub name: &'static str,
-    /// What breaks without it — printed on the startup WARNING line.
-    pub purpose: &'static str,
-    /// Short install pointer for the WARNING line.
-    pub install_hint: &'static str,
-    pub startup_check: StartupCheck,
     /// Env var consulted before PATH; must point at an existing file.
     env_override: Option<&'static str>,
     /// Install dirs probed after PATH (GUI-launched processes on macOS often
@@ -41,36 +24,24 @@ pub struct ExternalCommand {
 
 pub static BASH: ExternalCommand = ExternalCommand {
     name: "bash",
-    purpose: "the bash tool cannot run commands",
-    install_hint: "install bash",
-    startup_check: StartupCheck::Always,
     env_override: None,
     fallback_dirs: &[],
 };
 
 pub static SSH: ExternalCommand = ExternalCommand {
     name: "ssh",
-    purpose: "remote hosts cannot connect",
-    install_hint: "install the OpenSSH client",
-    startup_check: StartupCheck::WithSshRemotes,
     env_override: None,
     fallback_dirs: &[],
 };
 
 pub static SSH_ADD: ExternalCommand = ExternalCommand {
     name: "ssh-add",
-    purpose: "ssh-agent preflight and key unlock cannot run",
-    install_hint: "install the OpenSSH client",
-    startup_check: StartupCheck::WithSshRemotes,
     env_override: None,
     fallback_dirs: &[],
 };
 
 pub static SSH_KEYGEN: ExternalCommand = ExternalCommand {
     name: "ssh-keygen",
-    purpose: "identity fingerprinting for the agent preflight cannot run",
-    install_hint: "install the OpenSSH client",
-    startup_check: StartupCheck::WithSshRemotes,
     env_override: None,
     fallback_dirs: &[],
 };
@@ -78,26 +49,12 @@ pub static SSH_KEYGEN: ExternalCommand = ExternalCommand {
 /// Test-only process listing (bash session reap assertions).
 pub static PS: ExternalCommand = ExternalCommand {
     name: "ps",
-    purpose: "process diagnostics in tests",
-    install_hint: "install procps",
-    startup_check: StartupCheck::Never,
     env_override: None,
     fallback_dirs: &[],
 };
 
-/// Every registered program; the startup preflight iterates this.
+/// Every registered program (uniqueness pinned by test).
 pub static ALL: &[&ExternalCommand] = &[&BASH, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
-
-/// Registry entries the startup preflight expects, in `ALL` order.
-pub fn expected_at_startup(
-    with_ssh_remotes: bool,
-) -> impl Iterator<Item = &'static ExternalCommand> {
-    ALL.iter().copied().filter(move |c| match c.startup_check {
-        StartupCheck::Always => true,
-        StartupCheck::WithSshRemotes => with_ssh_remotes,
-        StartupCheck::Never => false,
-    })
-}
 
 impl ExternalCommand {
     /// Resolve the program: env override → PATH → fallback dirs. `None` means
@@ -117,10 +74,6 @@ impl ExternalCommand {
             .iter()
             .map(|d| Path::new(d).join(self.name))
             .find(|p| p.is_file())
-    }
-
-    pub fn is_installed(&self) -> bool {
-        self.resolve().is_some()
     }
 
     /// Spawnable program token: the resolved path, or the bare name when

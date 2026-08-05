@@ -161,22 +161,6 @@
     }
   ],
   "title": "every v3 variant",
-  "links": [
-    {
-      "kind": "git_hub_pr",
-      "url": "https://github.com/tsnl/myco/pull/1",
-      "repo": "tsnl/myco",
-      "number": 1,
-      "note": "pr note"
-    },
-    {
-      "kind": "worktree",
-      "host": "devbox",
-      "path": "/tmp/wt",
-      "branch": "feat/x",
-      "note": "wt note"
-    }
-  ],
   "scratchpad": "scratch notes",
   "parent_session_id": "00112233445566778899aabbccddeeff",
   "kind": "subagent",

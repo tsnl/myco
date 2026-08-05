@@ -8,7 +8,6 @@
 
 mod auth;
 mod highlight;
-mod notify;
 mod state;
 
 use std::cell::RefCell;
@@ -19,8 +18,6 @@ use state::{ConvAction, ConvState, StreamItem};
 use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
 use myco_api as api;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::prelude::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
@@ -971,32 +968,6 @@ fn stream_block(item: &StreamItem, verbose: bool) -> Block {
     }
 }
 
-/// Tell the reader a message landed: always a title badge while the tab is in
-/// the background, and a desktop notification when it names them.
-fn announce(entry: &api::Entry, me: Option<&api::Identity>, unread: &Rc<RefCell<u32>>) {
-    let api::EntryBody::User { content } = &entry.body else {
-        return;
-    };
-    let text = api::content_text(content);
-    let named = me
-        .map(|i| api::mention::addresses_user(&text, &i.id, &i.name))
-        .unwrap_or(false);
-    if notify::hidden() {
-        *unread.borrow_mut() += 1;
-        notify::set_unread(*unread.borrow());
-    }
-    if named || notify::hidden() {
-        let who = entry.author.name();
-        let title = if named {
-            format!("{who} mentioned you")
-        } else {
-            who.to_string()
-        };
-        // One notification per session, replaced as messages arrive.
-        notify::toast(&title, &text, "myco-session");
-    }
-}
-
 #[derive(Properties, PartialEq)]
 struct ConversationProps {
     id: String,
@@ -1087,8 +1058,6 @@ fn conversation(props: &ConversationProps) -> Html {
     let pane = use_node_ref();
     let at_bottom: Rc<RefCell<bool>> = use_mut_ref(|| true);
     let navigator = use_navigator().unwrap();
-    // Unread messages that arrived while this tab was in the background.
-    let unread: Rc<RefCell<u32>> = use_mut_ref(|| 0u32);
     // The work rail. State the poll task writes lives in refs (see
     // `PanelBuf`); the mirrored `use_state` copies exist only so render-time
     // reads and the toggle button stay ordinary Yew.
@@ -1114,36 +1083,6 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
-    // Ask once, on the way in, so the first message that names someone can
-    // actually reach them.
-    use_effect_with((), |_| notify::request_permission());
-
-    // Coming back to the tab is the acknowledgement: the messages are on
-    // screen, so the badge has done its job.
-    {
-        let unread = unread.clone();
-        use_effect_with((), move |_| {
-            let on_focus = Closure::<dyn Fn()>::new(move || {
-                *unread.borrow_mut() = 0;
-                notify::set_unread(0);
-            });
-            let win = web_sys::window();
-            if let Some(w) = &win {
-                let _ =
-                    w.add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref());
-            }
-            move || {
-                if let Some(w) = &win {
-                    let _ = w.remove_event_listener_with_callback(
-                        "focus",
-                        on_focus.as_ref().unchecked_ref(),
-                    );
-                }
-                notify::set_unread(0);
-            }
-        });
-    }
-
     // SSE: live deltas; turn boundaries refresh the transcript. The loop owns
     // reconnection — a dropped stream (server restart, proxy hiccup, laptop
     // lid) reloads the transcript and resubscribes, so one machine's blip no
@@ -1152,8 +1091,6 @@ fn conversation(props: &ConversationProps) -> Html {
         let dispatch = conv.dispatcher();
         let navigator = navigator.clone();
         let who = who.clone();
-        let me = me.clone();
-        let unread = unread.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -1222,13 +1159,6 @@ fn conversation(props: &ConversationProps) -> Html {
                             // agent is saying, and it must not wait for the
                             // turn in flight to end.
                             api::StreamEvent::Message { entry, wakes_agent } => {
-                                let mine = matches!(
-                                    (&entry.author, me.as_ref()),
-                                    (api::Author::User { id, .. }, Some(i)) if *id == i.id
-                                );
-                                if !mine {
-                                    announce(&entry, me.as_ref(), &unread);
-                                }
                                 dispatch.dispatch(ConvAction::Message { entry, wakes_agent });
                             }
                             api::StreamEvent::TurnStarted => {

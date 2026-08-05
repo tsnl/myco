@@ -1,11 +1,8 @@
 //! Shared system-prompt fragments for myco agents.
 //!
 //! Always-on agent policy (worktrees, computer-use, coding norms, user
-//! authority, the agent workspace) lives here. Longer runtime docs live in
-//! [`crate::manual`], exported to disk at startup, and pointed at from the
-//! `# Manual` section below.
+//! authority, the agent workspace) lives here.
 
-pub mod manual;
 pub mod prelude;
 
 use std::path::Path;
@@ -31,11 +28,7 @@ enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` o
 tools (`session_meta`, `prelude`) stay in the agent process; host tools (`bash`, editor) run on
 a host worker (local in-process or remote).
 
-**Runtime docs are markdown files on disk** — see *Manual* below for the directory this build
-exported them to. Read and search them with the tools you already have (`rg`, the editor);
-`index.md` names the articles: `overview.md`, `api.md`, `harness-ops.md`.
-
-Quick map (details in the manual):
+Quick map:
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
   (`attach_timeout_secs`, `max_prelude_bytes`).
@@ -336,9 +329,6 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 /// every agent that follows.
 fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
-    if let Some(home) = home.as_deref() {
-        prompt.push_str(&manual_section(&crate::manual::dir(home)));
-    }
     let workspace = home.map(|home| home.join("workspace"));
     if let Some((name, mut guidance)) = cwd.as_deref().and_then(project_guidance) {
         cap_bytes(
@@ -364,20 +354,6 @@ fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBu
         prompt.push_str(&listing);
     }
     prompt
-}
-
-/// Where startup exported this build's manual ([`crate::manual::export`]).
-/// The directory is named rather than quoted: the articles run to tens of
-/// kilobytes, and an agent that can `rg` them does not need them in context.
-fn manual_section(dir: &Path) -> String {
-    format!(
-        "\n---\n\n# Manual\n\nRuntime docs for this myco build: `{}` (`index.md` plus one file \
-         per article). Search them like any other files — `rg -n 'ControlMaster' {}`. They are \
-         this binary's own docs, refreshed at startup, so trust them over memory when host, \
-         install, or config behavior is unclear.\n",
-        dir.display(),
-        dir.display(),
-    )
 }
 
 /// Bounds on the workspace listing. A workspace can hold anything, so the
@@ -568,7 +544,6 @@ mod tests {
             "Think Before Coding",
             "User authority & privileged operations",
             "force-merge",
-            "manual",
             // Nested-agent recipe goes through the local API.
             "self-contained prompt",
             "$MYCO_API/sessions",
@@ -630,24 +605,6 @@ mod tests {
         );
         assert!(prompt.contains("agents_guidance_token"), "{prompt}");
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
-    }
-
-    /// The manual is not a tool any more, so the prompt has to carry the
-    /// resolved path — an agent told only `~/.myco` would guess wrong under
-    /// `MYCO_HOME`, and a stale build's directory is a different one.
-    #[test]
-    fn manual_path_in_the_prompt_follows_myco_home() {
-        let home =
-            std::env::temp_dir().join(format!("myco-manual-prompt-{}", uuid::Uuid::new_v4()));
-        let prompt = epilogue_with(Some(home.clone()), None);
-        let dir = crate::manual::dir(&home);
-        assert!(prompt.contains("# Manual"), "{prompt}");
-        assert!(prompt.contains(&dir.display().to_string()), "{prompt}");
-        assert!(prompt.contains("index.md"), "{prompt}");
-
-        // No home to resolve: no path claimed rather than a guessed one.
-        let blind = epilogue_with(None, None);
-        assert!(!blind.contains("# Manual"), "{blind}");
     }
 
     /// The prelude is prompt-resident and the *default* home for durable
@@ -742,12 +699,8 @@ mod tests {
         let prelude_dir = dir.join("workspace").join("prelude");
         let epilogue = || epilogue_with(Some(dir.clone()), None);
 
-        // No entries: the epilogue plus the unconditional Manual block, and
-        // nothing else.
-        let base = format!(
-            "{DEFAULT_AGENT_PROMPT_EPILOGUE}{}",
-            manual_section(&crate::manual::dir(&dir))
-        );
+        // No entries: the epilogue alone, nothing else appended.
+        let base = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
         assert_eq!(epilogue(), base);
 
         // One entry: rendered under the promised heading with its id label,

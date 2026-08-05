@@ -20,7 +20,7 @@ use rocket::{Request, State, delete, get, patch, post, routes};
 use futures::StreamExt;
 use myco_api::{ApiError, ErrorKind, MycoApi};
 use myco_config::Config;
-use myco_machines::harness::{StartupPreflight, fatal_startup_check};
+use myco_machines::harness::{fatal_startup_check, prelude_warning};
 
 use crate::server::{Server, UserApi};
 use myco_api as api;
@@ -34,9 +34,8 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
         eprintln!("myco: {fatal}");
         std::process::exit(1);
     }
-    let preflight = StartupPreflight::run(&config.harness.remote_hosts);
-    if preflight.has_problems() {
-        eprintln!("{}", preflight.warning_body());
+    if let Some(warning) = prelude_warning() {
+        eprintln!("{warning}");
     }
 
     // Local bash sessions (and scripts nesting agents by hand) discover the
@@ -49,16 +48,24 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
         .merge(("port", port));
 
     let server = Server::new(config);
-    // Tools the agent spawns act as the operator who started the server. The
-    // token is minted here rather than configured, so it is as short-lived as
-    // any other session and never sits in a file.
+    // Tools the agent spawns — and local CLIs / scripts (`myco -p`,
+    // clients/myco.py) — act as the operator who started the server. The
+    // token is minted at boot, exported into the tool environment, and
+    // mirrored to `$MYCO_HOME/v2/operator.token` (0600) so sibling processes
+    // on this machine can authenticate. It dies with the server: tokens live
+    // only in memory, so the file goes stale on restart and is rewritten.
     match server
         .auth()
         .issue_for(server.config().roster.local().id.as_str())
     {
-        Some(issued) => unsafe {
-            std::env::set_var("MYCO_API_TOKEN", &issued.access_token);
-        },
+        Some(issued) => {
+            unsafe {
+                std::env::set_var("MYCO_API_TOKEN", &issued.access_token);
+            }
+            if let Err(e) = write_operator_token(&issued.access_token) {
+                eprintln!("myco: could not write operator.token: {e}");
+            }
+        }
         None => eprintln!(
             "myco: no credential store entry for {:?}, so $MYCO_API is unusable from tools",
             server.config().roster.local().id
@@ -70,6 +77,23 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
         .await
         .map_err(|e| format!("rocket: {e}"))?;
     Ok(())
+}
+
+/// Path of the local operator's bearer token: `$MYCO_HOME/v2/operator.token`.
+pub fn operator_token_path() -> Result<std::path::PathBuf, String> {
+    Ok(myco_core::data_root()?.join("operator.token"))
+}
+
+/// Write the operator token where local clients can read it, `0600`.
+fn write_operator_token(token: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = operator_token_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, token).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())
 }
 
 /// The Rocket instance serving `/api` for `server` — separated from [`serve`]
