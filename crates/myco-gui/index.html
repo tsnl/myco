@@ -110,6 +110,23 @@
 
       /* Transcript roles — the terminal's palette */
       .rule { border: 0; border-top: 1px solid var(--line); margin: 0.8rem 0 0.3rem; }
+
+      /* Turns. The transcript is a sequence of these, one per stretch of
+         speech from one sender. There is no separator element between them:
+         the grouping is the structure, and the space plus a thin accent in
+         the sender's colour is what a reader parses. */
+      .turn {
+        margin: 0.9rem 0;
+        padding-left: 0.7rem;
+        border-left: 2px solid var(--line-soft);
+      }
+      .turn:first-child { margin-top: 0.2rem; }
+      .turn-user { border-left-color: var(--user); }
+      .turn-assistant { border-left-color: var(--line); }
+      .turn-tool { border-left-color: var(--tool); }
+      /* The heading sits tight against the turn it opens. */
+      .turn > .role { margin-bottom: 0.25rem; }
+
       .role { font-weight: bold; }
       .role-user { color: var(--user); }
       /* The ASSISTANT header. The body below it stays unbold (.role-assistant),
