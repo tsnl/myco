@@ -215,6 +215,11 @@ pub enum StreamEvent {
         text: String,
     },
     ToolStarted {
+        /// The provider's id for this call. It is the identity a client keys
+        /// the call's card on, so the running card and the finished one are
+        /// the same element rather than a removal and an insertion.
+        #[serde(default)]
+        id: String,
         name: String,
         /// The call's arguments, structured.
         ///
@@ -226,6 +231,16 @@ pub enum StreamEvent {
         /// problem, and it needs the structure to do it.
         input: serde_json::Value,
     },
+    /// The matching result for an earlier `ToolStarted` (`result.id` pairs
+    /// them). Emitted the moment the tool returns, mid-turn — a client
+    /// completes the running card in place instead of leaving it spinning
+    /// until the turn ends.
+    ToolFinished {
+        result: ToolResult,
+    },
+    /// Exactly one per turn, emitted only after the turn's entries are
+    /// persisted — a client that refetches on this event reads a transcript
+    /// that already contains the answer.
     TurnFinished,
     /// The turn ended without a reply (provider error, cancellation); the
     /// message is also on `Poll::last_error` until the next turn starts.

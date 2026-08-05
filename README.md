@@ -38,9 +38,13 @@ scripts.
   agent answers when it is named (`@myco`, `@agent`, `@assistant`, or the
   model key it is running as) and otherwise listens. A message between two
   people is recorded, delivered to everyone watching, and read by the agent
-  as context the next time it is addressed — it just does not cost a turn.
-  Mentions are highlighted, and a message that names you raises a
-  notification.
+  as context — it just does not cost a turn. Mentions are highlighted, and
+  a message that names you raises a notification.
+- **Mid-turn messages pre-empt.** A message that names the agent while it
+  is already working does not wait behind the whole turn: it is folded
+  into the turn in flight at the next safe boundary (a completed tool
+  round) and answered by it. Messages between people posted mid-turn ride
+  along the same way, so the history reads in the order the room spoke.
 
 ## Run
 
@@ -113,15 +117,20 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami`.
 Wire types live in `crates/myco-api`.
 
-`POST /messages` answers with `busy`, which is the server's verdict on whether
-the message woke the agent — so a client knows not to wait for a reply that is
-not coming. The SSE feed carries the message itself as
-`{"type":"message", entry, wakes_agent}`, emitted the moment it is accepted and
-ahead of any turn it triggers. That event is what lets a client place someone
-else's message in the transcript as its own record, rather than appending text
-to whatever was last on screen, and it arrives even while the agent is mid-turn.
-The write follows when the session's task drains its queue, so a client should
-keep a delivered-but-unpersisted message on screen across a poll.
+`POST /messages` answers with `busy`: whether a reply is coming or already
+underway — so a client knows not to wait for a reply that is not coming, and
+a note posted mid-turn does not read as the agent going idle. The SSE feed
+carries the message itself as `{"type":"message", entry, wakes_agent}`,
+emitted the moment it is accepted and ahead of any turn it triggers or joins.
+That event is what lets a client place someone else's message in the
+transcript as its own record, rather than appending text to whatever was last
+on screen, and it arrives even while the agent is mid-turn. The write follows
+when the running turn folds the message at its next boundary (or the
+session's task drains it), so a client should keep a
+delivered-but-unpersisted message on screen across a poll. Tool calls stream
+as `tool_started` (with the call's `id`) and complete mid-turn as
+`tool_finished`; `turn_finished` arrives exactly once per turn, after the
+turn is persisted, so one refetch on it reads the finished transcript.
 
 Sign in with the **OAuth 2.0 password grant** (RFC 6749 §4.3):
 `POST /api/auth/token` takes form-encoded

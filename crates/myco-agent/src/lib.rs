@@ -85,6 +85,13 @@ pub enum AgentEvent {
         tool_use: ToolUse,
         context: TraceContext,
     },
+    /// The matching result for an earlier `ToolStarted` (paired by
+    /// `result.id`), emitted the moment the dispatch returns — mid-turn, so a
+    /// live view can complete the call's card in place.
+    ToolFinished {
+        result: ToolResult,
+        context: TraceContext,
+    },
     TurnFinished {
         context: TraceContext,
     },
@@ -114,6 +121,22 @@ impl EventSink for NullEventSink {
 /// it must never be the snapshot a context fork inherits.
 pub type HistoryCheckpoint = Box<dyn Fn(&[Entry], Option<TokenUsage>) + Send + Sync>;
 
+/// Supplier of messages that arrived while a turn was running, drained at the
+/// same well-formed boundaries the checkpoint fires at (after the user push,
+/// after each completed tool round) — never between a tool_use and its
+/// results. Whatever it returns is folded into history in order, so the next
+/// generate call sees it: a message that addresses the agent mid-turn
+/// pre-empts the turn in flight instead of waiting behind it, and a message
+/// between people rides along as context.
+///
+/// Deliberately pull, not push: the agent owns its history exclusively while a
+/// turn runs, so arrivals queue outside and enter only where history is
+/// well-formed. A turn that reaches no further boundary (its last generate is
+/// already streaming) leaves the queue untouched — the caller runs those
+/// messages as their own turns afterwards, so nothing is folded where nothing
+/// would answer it.
+pub type PendingInput = Box<dyn Fn() -> Vec<Entry> + Send + Sync>;
+
 /// How long a cancelled tool dispatch may keep running to do its own
 /// cleanup (process-group kill, buffer drain) before the agent abandons it
 /// and records a synthetic cancelled result.
@@ -135,6 +158,7 @@ pub struct Agent {
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
     checkpoint: Option<HistoryCheckpoint>,
+    pending_input: Option<PendingInput>,
 }
 
 impl Agent {
@@ -162,6 +186,7 @@ impl Agent {
             last_usage: None,
             context_window_tokens: 200_000,
             checkpoint: None,
+            pending_input: None,
         }
     }
 
@@ -170,10 +195,31 @@ impl Agent {
         self.checkpoint = Some(checkpoint);
     }
 
+    /// Install the mid-turn arrival queue (see [`PendingInput`]).
+    pub fn set_pending_input(&mut self, pending: PendingInput) {
+        self.pending_input = Some(pending);
+    }
+
     fn emit_checkpoint(&self) {
         if let Some(checkpoint) = &self.checkpoint {
             checkpoint(&self.history, self.last_usage);
         }
+    }
+
+    /// Fold messages that arrived since the last boundary into history, in
+    /// arrival order, and checkpoint if anything landed. Called only where
+    /// history is well-formed and another generate is coming — the folded
+    /// messages are about to be read, not stranded.
+    fn fold_pending_input(&mut self) {
+        let Some(pending) = &self.pending_input else {
+            return;
+        };
+        let arrived = pending();
+        if arrived.is_empty() {
+            return;
+        }
+        self.history.extend(arrived);
+        self.emit_checkpoint();
     }
 
     pub fn history(&self) -> &[Entry] {
@@ -293,6 +339,10 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.finish_cancelled();
             }
+
+            // A boundary: history is well-formed and a generate follows, so
+            // messages that arrived since the last one are read, not stranded.
+            self.fold_pending_input();
 
             let messages = myco_models::entries_to_messages(&self.history);
             let stream = self.model.generate(&messages);
@@ -428,7 +478,7 @@ impl Agent {
         // expires; for subprocess hosts that only abandons this waiter —
         // the pipe demuxes by correlation id, so siblings are unaffected.
         let mut work = std::pin::pin!(work);
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
@@ -437,7 +487,12 @@ impl Agent {
                 }
             }
             result = &mut work => result,
-        }
+        };
+        self.sink.emit(AgentEvent::ToolFinished {
+            result: result.clone(),
+            context: self.context.clone(),
+        });
+        result
     }
 }
 
@@ -1235,6 +1290,181 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(matches!(history[0].body, EntryBody::User { .. }));
         assert!(matches!(history[1].body, EntryBody::Agent { .. }));
+    }
+
+    /// A message that arrives while tools run is folded at the next boundary —
+    /// after the ToolResults push, before the next generate — so the model
+    /// reads it in the same turn instead of it waiting behind the whole turn.
+    #[tokio::test]
+    async fn pending_input_arriving_mid_turn_folds_before_the_next_generate() {
+        let slow = Arc::new(SlowService {
+            name: "slow_a".into(),
+            delay: Duration::from_millis(1),
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "slow_a".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+
+        // Empty at the first boundary, one arrival at the second — the shape
+        // of a message posted while the tool was running.
+        let drained = Arc::new(Mutex::new(0usize));
+        let record = drained.clone();
+        agent.set_pending_input(Box::new(move || {
+            let mut n = record.lock().unwrap();
+            *n += 1;
+            if *n == 2 {
+                vec![user("mid-turn arrival")]
+            } else {
+                Vec::new()
+            }
+        }));
+
+        agent
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "run".into() }],
+                myco_core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        // user + assistant(tool_use) + tool_results + folded arrival + assistant(end)
+        let history = agent.history();
+        assert_eq!(history.len(), 5, "history={history:?}");
+        assert!(matches!(history[2].body, EntryBody::ToolResults { .. }));
+        match &history[3].body {
+            EntryBody::User { content } => {
+                assert!(matches!(&content[0], Content::Text { text } if text == "mid-turn arrival"))
+            }
+            other => panic!("expected the folded arrival, got {other:?}"),
+        }
+        assert!(matches!(history[4].body, EntryBody::Agent { .. }));
+    }
+
+    /// Pending input already queued when the turn starts is folded right after
+    /// the user push, so the very first generate reads it.
+    #[tokio::test]
+    async fn pending_input_queued_before_the_turn_folds_before_the_first_generate() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![Content::Text { text: "ok".into() }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let queue = Arc::new(Mutex::new(vec![user("already waiting")]));
+        let source = queue.clone();
+        agent.set_pending_input(Box::new(move || {
+            std::mem::take(&mut *source.lock().unwrap())
+        }));
+
+        agent
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "go".into() }],
+                myco_core::CancelToken::new(),
+            )
+            .await
+            .expect("interact");
+
+        // user + folded + assistant.
+        let history = agent.history();
+        assert_eq!(history.len(), 3, "history={history:?}");
+        assert!(matches!(history[0].body, EntryBody::User { .. }));
+        match &history[1].body {
+            EntryBody::User { content } => {
+                assert!(matches!(&content[0], Content::Text { text } if text == "already waiting"))
+            }
+            other => panic!("expected the folded arrival, got {other:?}"),
+        }
+    }
+
+    /// A cancel that ends the turn mid-tools must not consume pending input:
+    /// nothing would answer it, so it stays queued for the caller to run as
+    /// its own turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mid_tools_leaves_pending_input_unconsumed() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let slow = Arc::new(SlowService {
+            name: "slow_a".into(),
+            delay: Duration::from_secs(5),
+            starts: starts.clone(),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                id: "call_slow".into(),
+                name: "slow_a".into(),
+                input: json!({}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let queue = Arc::new(Mutex::new(Vec::<Entry>::new()));
+        let source = queue.clone();
+        agent.set_pending_input(Box::new(move || {
+            std::mem::take(&mut *source.lock().unwrap())
+        }));
+
+        let cancel = myco_core::CancelToken::new();
+        let cancel2 = cancel.clone();
+        let starts_bg = starts.clone();
+        let queue_bg = queue.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while starts_bg.lock().unwrap().is_empty() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The message lands while the tool is running, then the cancel.
+            queue_bg.lock().unwrap().push(user("posted mid-tool"));
+            cancel2.cancel();
+        });
+
+        let err = agent
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "run".into() }],
+                cancel,
+            )
+            .await
+            .expect_err("should cancel");
+        assert!(matches!(err, AgentInteractionError::Cancelled));
+
+        // Still queued, and not in history: the cancelled turn folded nothing.
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        assert!(
+            !agent
+                .history()
+                .iter()
+                .any(|e| e.text() == "posted mid-tool"),
+            "history={:?}",
+            agent.history()
+        );
     }
 
     /// Simulate crash after tools: persist history, new agent + model resumes and ends turn.
