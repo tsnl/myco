@@ -172,7 +172,7 @@ impl Config {
     pub fn resolve_with(
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
-        load_file: impl FnOnce(&Path) -> Result<FileConfig, String>,
+        load_file: impl FnOnce(&Path, bool) -> Result<FileConfig, String>,
         load_roster: impl FnOnce(&Path) -> Result<FileRoster, String>,
         ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
         read_auth_file: impl Fn(&Path) -> Result<String, String>,
@@ -184,16 +184,37 @@ impl Config {
             model: model_override,
         } = settings;
 
-        let config_path = resolve_config_path(config_path, &env)?;
-        let file = load_file(&config_path)?;
+        let (config_path, named_by_user) = resolve_config_path(config_path, &env)?;
+        // Every config error names its file: by the time one surfaces, "which
+        // file was that" is the first question. Roster errors stay unwrapped —
+        // they already name server.toml, a different file.
+        let with_path = |e: String| {
+            let path = config_path.display().to_string();
+            match e.contains(&path) {
+                true => e,
+                false => format!("{e}\nconfig: {path}"),
+            }
+        };
+        let file = load_file(&config_path, named_by_user).map_err(&with_path)?;
 
         // Identity before anything else: a session written by an unknown
         // author is worse than a server that refused to start.
         let roster_path = roster::resolve_roster_path(roster_path, &env)?;
         let roster = Roster::resolve(roster_path.clone(), load_roster(&roster_path)?, &env)?;
 
-        let models = resolve_catalog(&file, &env, &read_auth_file)?;
-        let model = resolve_default_model(model_override, file.model.clone(), &models)?;
+        let models = resolve_catalog(&file, &env, &read_auth_file).map_err(&with_path)?;
+        // An empty catalog is onboarding, not selection: fail here, with a
+        // pasteable example, before "no model selected" can mislead.
+        if models.is_empty() {
+            return Err(with_path(format!(
+                "no models configured — myco ships no built-in models.\n\n\
+                 Add at least one `[models]` entry to the config file below (create it if \
+                 it does not exist), for example:\n\n{EXAMPLE_CONFIG_TOML}\n\
+                 Full format (other protocols, auth sources, knobs): `myco --help overview`."
+            )));
+        }
+        let model = resolve_default_model(model_override, file.model.clone(), &models)
+            .map_err(&with_path)?;
 
         let max_prelude_bytes = file
             .max_prelude_bytes
@@ -221,18 +242,36 @@ impl Config {
     }
 }
 
-/// `--config` override → `$MYCO_CONFIG` → `~/.myco/config.toml`.
+/// A minimal working catalog, quoted into the empty-catalog startup error so
+/// a fresh install has something to paste and edit (the roster's
+/// [`EXAMPLE_SERVER_TOML`] is the same idea for identity).
+pub const EXAMPLE_CONFIG_TOML: &str = r#"    model = "sonnet"
+
+    [gateways.anthropic]
+    protocol = "anthropic-messages"
+    base_url = "https://api.anthropic.com"
+    auth = { source = "env", var_name = "ANTHROPIC_API_KEY" }
+
+    [models.sonnet]
+    gateway = "anthropic"
+    api_id = "claude-sonnet-4-5"
+    context_window = 200_000
+"#;
+
+/// `--config` override → `$MYCO_CONFIG` → `~/.myco/v2/config.toml`. The bool
+/// is whether the user *named* the path (the first two arms): a named file
+/// that does not exist is an error, the missing home default is not.
 fn resolve_config_path(
     override_path: Option<PathBuf>,
     env: &impl Fn(&str) -> Option<String>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, bool), String> {
     if let Some(p) = override_path {
-        return Ok(p);
+        return Ok((p, true));
     }
     if let Some(p) = env("MYCO_CONFIG") {
-        return Ok(PathBuf::from(p));
+        return Ok((PathBuf::from(p), true));
     }
-    Ok(myco_core::data_root()?.join("config.toml"))
+    Ok((myco_core::data_root()?.join("config.toml"), false))
 }
 
 /// Build the model catalog from `[gateways]` / `[models]`.
@@ -272,6 +311,12 @@ fn resolve_catalog(
             .ok_or_else(|| {
                 format!("model `{key}`: no base_url — set `base_url` or reference a `gateway`")
             })?;
+        if base_url.trim().is_empty() {
+            return Err(format!(
+                "model `{key}`: base_url is empty — give the gateway's URL, \
+                 e.g. `https://api.anthropic.com`"
+            ));
+        }
         // Model-level auth overrides the gateway's; absent everywhere → no
         // auth header (same as `{ source = "none" }`).
         let auth = entry
@@ -401,7 +446,9 @@ fn resolve_retry(entry: Option<RetryEntry>) -> RetryPolicy {
 }
 
 /// `--model` → config file `model` → sole catalog entry. The chosen key must
-/// exist in the catalog (credentials are checked later, at use).
+/// exist in the catalog (credentials are checked later, at use). The catalog
+/// is never empty here — `resolve_with` turned that into the onboarding error
+/// before selection could run.
 fn resolve_default_model(
     override_key: Option<String>,
     file_key: Option<String>,
@@ -409,12 +456,6 @@ fn resolve_default_model(
 ) -> Result<String, String> {
     if let Some(key) = override_key.or(file_key) {
         if !catalog.contains(&key) {
-            if catalog.is_empty() {
-                return Err(format!(
-                    "model {key:?} selected but no models are configured — define \
-                     [models] (and [gateways]) in config.toml"
-                ));
-            }
             return Err(format!(
                 "unknown model {key:?}; configured models: [{}]",
                 catalog.keys().join(", ")
@@ -423,11 +464,6 @@ fn resolve_default_model(
         return Ok(key);
     }
     match catalog.keys().as_slice() {
-        [] => Err(
-            "no models configured — define [models] (and [gateways]) in config.toml; \
-             see `myco --help overview` for the format"
-                .into(),
-        ),
         [only] => Ok(only.to_string()),
         keys => Err(format!(
             "no model selected — set `model = \"<key>\"` in config.toml or pass --model \
@@ -445,6 +481,62 @@ fn resolve_default_model(
 mod tests {
     use super::*;
     use file::model_toml;
+
+    /// An empty catalog fails at resolve with a pasteable example — the
+    /// onboarding moment, not a wall.
+    #[test]
+    fn empty_catalog_is_rejected_with_a_usable_example() {
+        let err = resolve_toml("", ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+        for needle in [
+            "no models configured",
+            "[gateways.",
+            "[models.",
+            "context_window",
+            "myco --help overview",
+            "config:",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+    }
+
+    /// Every config error names the file it came from: by the time one
+    /// surfaces, "which file was that" is the first question.
+    #[test]
+    fn config_errors_name_the_file_they_came_from() {
+        let path = PathBuf::from("/etc/myco/other.toml");
+        // A shape error and a selection error, both wrapped.
+        for toml_text in ["modle = \"x\"", &model_toml("a", &[])] {
+            let toml_text = format!("{toml_text}\n{}", model_toml("b", &[]));
+            let err = Config::resolve_with(
+                ConfigUserSettings {
+                    config_path: Some(path.clone()),
+                    ..Default::default()
+                },
+                env_of(&[("USER", "tester")]),
+                move |_, _| parse_file_config_str(&toml_text),
+                test_roster,
+                || Ok(Vec::new()),
+                |_| Err("no files".into()),
+            )
+            .unwrap_err();
+            assert!(err.contains("/etc/myco/other.toml"), "{err}");
+        }
+    }
+
+    /// `""` satisfies "base_url is set" but fails at the provider on every
+    /// turn; catch it at resolve instead.
+    #[test]
+    fn empty_base_url_is_a_resolve_error() {
+        let toml_text = r#"
+[models.x]
+protocol = "openai-responses"
+base_url = "   "
+context_window = 1000
+"#;
+        let err = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+        assert!(err.contains("model `x`"), "{err}");
+        assert!(err.contains("base_url is empty"), "{err}");
+    }
 
     /// The config fraction becomes a concrete token threshold at resolve, and
     /// an unset entry keeps the built-in default share — the assertion that
@@ -636,7 +728,7 @@ context_window = 200_000
         Config::resolve_with(
             settings,
             move |k| env(k).or_else(|| (k == "USER").then(|| "tester".to_string())),
-            move |_| parse_file_config_str(&toml_text),
+            move |_, _| parse_file_config_str(&toml_text),
             test_roster,
             || Ok(Vec::new()),
             read_auth_file,
@@ -987,15 +1079,15 @@ context_window = 32_768
                 Some(PathBuf::from("/tmp/x.toml")),
                 &[("MYCO_CONFIG", "/env/y.toml")]
             ),
-            PathBuf::from("/tmp/x.toml")
+            (PathBuf::from("/tmp/x.toml"), true)
         );
         assert_eq!(
             path_for(None, &[("MYCO_CONFIG", "/env/y.toml")]),
-            PathBuf::from("/env/y.toml")
+            (PathBuf::from("/env/y.toml"), true)
         );
         // v2 keeps its config with the rest of its world, under `<home>/v2`.
         assert!(
-            path_for(None, &[]).ends_with("v2/config.toml"),
+            path_for(None, &[]).0.ends_with("v2/config.toml"),
             "{:?}",
             path_for(None, &[])
         );
@@ -1009,8 +1101,9 @@ context_window = 32_768
                 ..Default::default()
             },
             env_of(&[("USER", "tester")]),
-            |p| {
+            |p, named| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
+                assert!(named, "--config paths are user-named");
                 let mut file = parse_file_config_str(&model_toml("m", &[]))?;
                 file.attach_timeout_secs = Some(42);
                 Ok(file)
