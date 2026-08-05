@@ -1828,5 +1828,25 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
     }
 }
 
+/// The display for a tool is looked up by the name the model calls, so the
+/// name here and the arm in `myco_api::tool_display` are one agreement in two
+/// places. Renaming the tool without moving the display would silently drop
+/// this service back to the generic rendering.
+#[cfg(test)]
+mod display_agreement {
+    #[test]
+    fn the_registered_name_is_the_one_the_shell_display_answers_to() {
+        let names: Vec<String> = super::BashService::specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "bash"),
+            "myco_api::tool_display::for_tool(\"bash\") lays out shell; this \
+             service must still be called that. Registered: {names:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;
