@@ -948,11 +948,36 @@ mod tests {
         );
         assert_eq!(named.recovery(), Recovery::OmitLastMessage);
 
+        // Others name no type and only describe the size in prose. Read as a
+        // generic failure this is resent unchanged on every later turn.
+        let described = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"HTTP 400: {"error":{"code":400,"message":"The message size (31271377 bytes) \
+               exceeds 30.000MB limit.","status":"FAILED_PRECONDITION"}}"#
+                .into(),
+        );
+        assert_eq!(described.recovery(), Recovery::OmitLastMessage);
+
         let unrelated = http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "HTTP 500: overloaded".into(),
         );
         assert_eq!(unrelated.recovery(), Recovery::Retry);
+    }
+
+    /// Reading the body is how a size rejection is recognized, so an ordinary
+    /// failure must not be mistaken for one: rewinding drops a user message,
+    /// which is destructive when the request was never too big.
+    #[test]
+    fn ordinary_failures_are_not_read_as_size_rejections() {
+        for body in [
+            r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
+            r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
+            r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
+        ] {
+            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
+            assert_eq!(err.recovery(), Recovery::Retry, "{body}");
+        }
     }
 
     #[test]
@@ -1072,15 +1097,32 @@ pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), Gener
     Ok(())
 }
 
-/// Map a provider HTTP status to the right error variant: 413 (and the
-/// occasional 400 that names the size) is a size failure, not a generic one.
+/// Map a provider HTTP status to the right error variant: a size rejection is
+/// not a generic failure.
+///
+/// 413 is unambiguous. Everything else has to be read out of the body, because
+/// providers disagree on how they report an oversized request: some name a
+/// machine-readable type (`request_too_large`), others return a 400 whose body
+/// only describes the size in prose. Getting this wrong is expensive — the
+/// identical body is resent on every later turn, so a size failure classified
+/// as [`Recovery::Retry`] never triggers the rewind and the session fails
+/// forever.
 pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
-    let too_large = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
-        || message.contains("request_too_large")
-        || message.contains("request too large");
-    if too_large {
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || describes_a_size_rejection(&message) {
         GenerateError::RequestTooLargeError(message)
     } else {
         GenerateError::ExecutionError(message)
     }
+}
+
+/// Does this provider error body say the request was too big?
+///
+/// Matching prose is unavoidable, so it is kept to phrasings only a size
+/// rejection produces: "too large" however the provider spells it, or a size
+/// that "exceeds" a stated limit.
+fn describes_a_size_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("too_large")
+        || message.contains("too large")
+        || (message.contains("size") && message.contains("exceeds"))
 }

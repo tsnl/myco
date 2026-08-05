@@ -38,8 +38,9 @@ retired. A session open in another myco process answers 409.
 - A turn that fails (provider error, cancel) produces no reply; the reason is
   on `poll.last_error` and the `turn_failed` SSE event until the next turn
   starts. Transient provider errors are retried once automatically. A request
-  too large for the provider drops the offending message so the session can
-  continue (the error says so).
+  too large for the provider — a 413, or a 400 whose body names or describes
+  the size — drops the offending message so the session can continue (the
+  error says so).
 - Compaction (manual via the endpoint, automatic when a turn ends with the
   context ~85% full) summarizes into a successor with a **new id** — follow
   the `compacted` SSE event to it. Predecessor and successor stay linked on
