@@ -258,6 +258,9 @@ pub struct ModelSpec {
     /// Always concrete: config resolution applies the `max_image_base64_bytes`
     /// entry or its default, and callers downstream take this value.
     pub max_image_base64_bytes: u64,
+    /// Queue an auto-compaction when a turn ends with the prompt at or past
+    /// this many tokens (resolved from the config fraction `auto_compact_at`).
+    pub auto_compact_at_tokens: u64,
 }
 
 impl std::fmt::Display for ModelSpec {
@@ -871,6 +874,7 @@ mod tests {
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
             max_image_base64_bytes: myco_config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            auto_compact_at_tokens: 170_000,
         }
     }
 

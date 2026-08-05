@@ -227,7 +227,7 @@ pub async fn run(opts: CliOptions) {
                     }
                     Some(Meta::Compact) => {
                         producer.line("compacting…");
-                        let _ = live.tx.send(Cmd::Compact);
+                        let _ = live.tx.send(Cmd::Compact { automatic: false });
                         submitted += 1;
                     }
                     Some(Meta::New) => {

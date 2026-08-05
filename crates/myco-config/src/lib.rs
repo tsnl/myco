@@ -72,6 +72,12 @@ pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 /// takes that resolved value from its caller.
 pub const DEFAULT_MAX_IMAGE_BASE64_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Default share of the context window at which a turn's end queues an
+/// auto-compaction, when a model entry sets no `auto_compact_at`. Resolution
+/// turns the fraction into a concrete `ModelSpec::auto_compact_at_tokens`;
+/// the fraction never leaves this crate.
+pub const DEFAULT_AUTO_COMPACT_FRACTION: f64 = 0.85;
+
 // ---------------------------------------------------------------------------
 // Auth resolution
 // ---------------------------------------------------------------------------
@@ -296,6 +302,19 @@ fn resolve_catalog(
             },
         };
 
+        // The fraction becomes a token count here, so downstream compares
+        // plain numbers and a bad value is a startup error rather than a
+        // surprise hours into an unattended run. 1.0 would only fire with the
+        // window already full, which is too late to be worth allowing.
+        let auto_compact_fraction = entry
+            .auto_compact_at
+            .unwrap_or(DEFAULT_AUTO_COMPACT_FRACTION);
+        if !(auto_compact_fraction > 0.0 && auto_compact_fraction < 1.0) {
+            return Err(format!(
+                "model `{key}`: auto_compact_at must be greater than 0 and less than 1 \
+                 (got {auto_compact_fraction})"
+            ));
+        }
         let spec = ModelSpec {
             key: key.clone(),
             api_id: entry.api_id.clone().unwrap_or_else(|| key.clone()),
@@ -305,6 +324,7 @@ fn resolve_catalog(
             max_image_base64_bytes: entry
                 .max_image_base64_bytes
                 .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
+            auto_compact_at_tokens: (entry.context_window as f64 * auto_compact_fraction) as u64,
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         // Like `auth`, the model's retry table replaces the gateway's
@@ -416,6 +436,52 @@ fn resolve_default_model(
 mod tests {
     use super::*;
     use file::model_toml;
+
+    /// The config fraction becomes a concrete token threshold at resolve, and
+    /// an unset entry keeps the built-in default share — the assertion that
+    /// stops the default behavior regressing silently.
+    #[test]
+    fn auto_compact_fraction_becomes_a_token_threshold() {
+        let toml_text = r#"
+model = "tuned"
+
+[models.tuned]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 200000
+auto_compact_at = 0.8
+
+[models.stock]
+protocol = "openai-responses"
+base_url = "https://h"
+context_window = 100000
+"#;
+        let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.models.get("tuned").unwrap().spec.auto_compact_at_tokens,
+            160_000
+        );
+        assert_eq!(
+            cfg.models.get("stock").unwrap().spec.auto_compact_at_tokens,
+            (100_000f64 * DEFAULT_AUTO_COMPACT_FRACTION) as u64
+        );
+    }
+
+    /// Out-of-range fractions are a startup error, not a surprise hours into
+    /// an unattended run. 1.0 would only fire with the window already full.
+    #[test]
+    fn auto_compact_fraction_out_of_range_is_a_resolve_error() {
+        for bad in ["0.0", "1.0", "1.5", "-0.2"] {
+            let toml_text = format!(
+                "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
+                 context_window = 1000\nauto_compact_at = {bad}\n"
+            );
+            let err =
+                resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).expect_err(bad);
+            assert!(err.contains("auto_compact_at"), "{err}");
+            assert!(err.contains("model `x`"), "{err}");
+        }
+    }
 
     /// A gateway's `[retry]` overlays the defaults per field, and a model's
     /// own `[retry]` replaces the gateway's wholesale — an unset field on the
