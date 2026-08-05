@@ -30,8 +30,18 @@ scripts.
   firewalls, optional context forks. The same surface exists as HTTP
   (`$MYCO_API`) for scripts.
 - **Live streaming.** Each session exposes an SSE feed
-  (`/api/sessions/<id>/events`) of text/thinking deltas, tool starts, and
-  whole messages; the GUI streams it and reconciles with a slow poll.
+  (`/api/sessions/<id>/events`) of text/thinking deltas, tool starts and
+  finishes, and whole messages; the GUI streams it and reconciles with a
+  slow poll.
+- **Shared terminals with a keyboard lock.** The GUI's work rail lists the
+  agent's live bash sessions (local host) next to whatever tool calls are in
+  flight. Open one and you watch its scrollback live; double-click to take
+  the keyboard and type into it yourself. The lock decides who may write —
+  shells start agent-held, the agent's writes fail politely while you hold
+  it, and both sides always read. Everything you type (and every keyboard
+  handoff) lands in the transcript as an attributed, non-waking message, so
+  the agent reads what you did at its next boundary instead of discovering
+  a mutated shell.
 - **Shared sessions the agent stays out of.** Several people can hold one
   session. While you are the only person in it, everything you say is for
   the agent — as before. Once someone else posts, the room has rules: the
@@ -114,7 +124,12 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `POST /api/sessions/<id>/messages`
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
-`DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami`.
+`DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami` ·
+`GET /api/sessions/<id>/shells` · `GET /api/sessions/<id>/shells/<shell>?from=N`
+(offset-addressed scrollback tail) ·
+`POST /api/sessions/<id>/shells/<shell>/input` (`{data}`, requires the user
+keyboard lock) · `POST /api/sessions/<id>/shells/<shell>/lock`
+(`{lock: "user"|"assistant"}`).
 Wire types live in `crates/myco-api`.
 
 `POST /messages` answers with `busy`: whether a reply is coming or already
