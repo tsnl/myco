@@ -572,49 +572,6 @@ fn tool_card(props: &ToolCardProps) -> Html {
     }
 }
 
-/// One transcript entry, in the terminal's visual language. Prose is
-/// markdown-rendered (as the CLI styles it); tool calls become cards.
-/// Entries carry their author, so a shared session reads as a conversation
-/// rather than an anonymous stream.
-///
-/// `results` is the whole transcript's tool results indexed by id, so a call
-/// and its output render together even though they are separate entries.
-fn render_entry(
-    e: &api::Entry,
-    results: &std::collections::HashMap<String, api::ToolResult>,
-    verbose: bool,
-    me: Option<&api::Identity>,
-) -> Html {
-    match &e.body {
-        api::EntryBody::User { content } => html! {
-            <div>{ render_prose(&api::content_text(content), me) }</div>
-        },
-        api::EntryBody::Agent {
-            content, tool_uses, ..
-        } => html! {
-            <div>
-                { for content.iter().map(|c| match c {
-                    api::Content::Text { text } => html! {
-                        <div class="role-assistant">{ markdown(text) }</div>
-                    },
-                    api::Content::Thinking { text, redacted, .. } => html! {
-                        <div class="role-thinking">
-                            { markdown(if *redacted { "[redacted]" } else { text }) }
-                        </div>
-                    },
-                    api::Content::Image { .. } => html! { <pre class="dim">{ "[image]" }</pre> },
-                }) }
-                { for tool_uses.iter().map(|t| html! {
-                    <ToolCard tool={t.clone()} result={results.get(&t.id).cloned()}
-                              {verbose} />
-                }) }
-            </div>
-        },
-        // Folded into the card of the call they answer.
-        api::EntryBody::ToolResults { .. } => html! {},
-    }
-}
-
 /// A person's message, with `@handles` picked out so a room can see who is
 /// being spoken to — and so you can spot your own name in a wall of text.
 fn render_prose(text: &str, me: Option<&api::Identity>) -> Html {
@@ -653,74 +610,180 @@ fn render_prose(text: &str, me: Option<&api::Identity>) -> Html {
     html! { <pre>{ for out.into_iter() }</pre> }
 }
 
-/// Does this entry render anything of its own? Tool results are folded into
-/// the card of the call they answer, so they must not open a speaker block.
-fn is_visible(e: &api::Entry) -> bool {
-    !matches!(e.body, api::EntryBody::ToolResults { .. })
+/// What kind of turn a block of the transcript belongs to.
+///
+/// Three, by sender — the coarse split a reader actually parses at a glance.
+/// Everything a model produced in one stretch is one assistant turn however
+/// many content blocks it arrived in; a burst of tool activity is one tool
+/// turn however many calls it contains.
+#[derive(Clone, PartialEq)]
+enum TurnKind {
+    /// A person. Carries the author so two people in a row stay two turns.
+    User {
+        id: String,
+        name: String,
+    },
+    Assistant,
+    Tool,
 }
 
-/// Who is speaking, as a grouping key. Agent entries all share one key so a
-/// turn of prose → tool → prose stays under a single header.
-fn speaker_key(a: &api::Author) -> String {
-    match a {
-        api::Author::User { id, .. } => format!("user:{id}"),
-        api::Author::Agent { .. } => "agent".into(),
-        api::Author::System => "system".into(),
+impl TurnKind {
+    /// Turns merge when this matches: consecutive entries from one sender are
+    /// one turn, and a change of sender starts the next.
+    fn key(&self) -> String {
+        match self {
+            TurnKind::User { id, .. } => format!("user:{id}"),
+            TurnKind::Assistant => "assistant".into(),
+            TurnKind::Tool => "tool".into(),
+        }
+    }
+
+    fn class(&self) -> &'static str {
+        match self {
+            TurnKind::User { .. } => "turn turn-user",
+            TurnKind::Assistant => "turn turn-assistant",
+            TurnKind::Tool => "turn turn-tool",
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            TurnKind::User { name, .. } => name.to_uppercase(),
+            TurnKind::Assistant => "ASSISTANT".into(),
+            TurnKind::Tool => "TOOL".into(),
+        }
+    }
+
+    fn label_class(&self) -> &'static str {
+        match self {
+            TurnKind::User { .. } => "role role-user",
+            TurnKind::Assistant => "role role-assistant-name",
+            TurnKind::Tool => "role role-tool",
+        }
     }
 }
 
-/// The header that opens a speaker's block: a rule and a name, the way the
-/// CLI opens a section.
-fn speaker_header(a: &api::Author) -> Html {
-    let (class, label) = match a {
-        api::Author::User { name, .. } => ("role role-user", name.to_uppercase()),
-        api::Author::Agent { .. } => ("role role-assistant-name", "ASSISTANT".to_string()),
-        api::Author::System => ("role dim", "SYSTEM".to_string()),
-    };
-    html! {
-        <>
-            <hr class="rule" />
-            <div class={class}>{ label }</div>
-        </>
+/// One renderable piece of the transcript, tagged with the turn it belongs to.
+///
+/// The intermediate that makes grouping possible: entries do not map onto
+/// turns one-to-one — a single agent entry can carry prose *and* tool calls,
+/// which are two different kinds of turn — so entries are flattened to blocks
+/// first and grouped second.
+struct Block {
+    kind: TurnKind,
+    body: Html,
+}
+
+/// The turn a person's message belongs to.
+fn user_turn(author: &api::Author) -> TurnKind {
+    match author {
+        api::Author::User { id, name } => TurnKind::User {
+            id: id.clone(),
+            name: name.clone(),
+        },
+        // System notes and anything else non-human read as the runtime
+        // speaking; group them together under one heading.
+        other => TurnKind::User {
+            id: "system".into(),
+            name: other.name().into(),
+        },
     }
 }
 
-/// The whole transcript, grouped into speaker blocks.
+/// Flatten one entry into the blocks it contributes.
 ///
-/// A header opens whenever the speaker changes, not once per entry: one
-/// ASSISTANT rule for a whole agent turn however many tool rounds it takes,
-/// and one header for a run of messages from the same person. `streaming` is
-/// the text of the turn in flight, rendered through the same grouping so a
-/// reply is headed while it is still arriving.
+/// `results` is the whole transcript's tool results indexed by id, so a call
+/// and its output render together even though they are separate entries.
+fn blocks_for_entry(
+    e: &api::Entry,
+    results: &std::collections::HashMap<String, api::ToolResult>,
+    verbose: bool,
+    me: Option<&api::Identity>,
+    out: &mut Vec<Block>,
+) {
+    match &e.body {
+        api::EntryBody::User { content } => out.push(Block {
+            kind: user_turn(&e.author),
+            body: render_prose(&api::content_text(content), me),
+        }),
+        api::EntryBody::Agent {
+            content, tool_uses, ..
+        } => {
+            for c in content {
+                let body = match c {
+                    api::Content::Text { text } => {
+                        html! { <div class="role-assistant">{ markdown(text) }</div> }
+                    }
+                    api::Content::Thinking { text, redacted, .. } => html! {
+                        <div class="role-thinking">
+                            { markdown(if *redacted { "[redacted]" } else { text }) }
+                        </div>
+                    },
+                    api::Content::Image { .. } => html! { <pre class="dim">{ "[image]" }</pre> },
+                };
+                out.push(Block {
+                    kind: TurnKind::Assistant,
+                    body,
+                });
+            }
+            for t in tool_uses {
+                out.push(Block {
+                    kind: TurnKind::Tool,
+                    body: html! {
+                        <ToolCard tool={t.clone()} result={results.get(&t.id).cloned()}
+                                  {verbose} />
+                    },
+                });
+            }
+        }
+        // Folded into the card of the call they answer.
+        api::EntryBody::ToolResults { .. } => {}
+    }
+}
+
+/// The whole transcript, grouped into turns.
 ///
-/// Results are indexed once for the pass, so a call and its output render
-/// together even though they are separate entries.
+/// A turn is a `<div>` around a run of blocks from one sender, headed once —
+/// so one ASSISTANT heading covers a whole answer however many tool rounds it
+/// took, and a run of messages from one person is headed once. There is no
+/// separator element between turns: the grouping is structural, and CSS gives
+/// it the space and the accent it needs.
+///
+/// `streaming` is the turn in flight, flattened into the same blocks as
+/// anything persisted, so a reply is headed and a tool call is a card while
+/// they are still arriving.
 fn render_transcript(
     entries: &[api::Entry],
-    streaming: &str,
+    streaming: &[StreamItem],
     verbose: bool,
     me: Option<&api::Identity>,
 ) -> Html {
     let results = result_index(entries);
-    let mut out: Vec<Html> = Vec::new();
-    let mut open: Option<String> = None;
-    for e in entries.iter().filter(|e| is_visible(e)) {
-        let key = speaker_key(&e.author);
-        if open.as_deref() != Some(key.as_str()) {
-            out.push(speaker_header(&e.author));
-            open = Some(key);
-        }
-        out.push(render_entry(e, &results, verbose, me));
+    let mut blocks: Vec<Block> = Vec::new();
+    for e in entries {
+        blocks_for_entry(e, &results, verbose, me, &mut blocks);
     }
-    if !streaming.is_empty() {
-        if open.as_deref() != Some("agent") {
-            out.push(speaker_header(&api::Author::Agent {
-                model: String::new(),
-            }));
-        }
-        out.push(html! { <div class="role-assistant">{ markdown(streaming) }</div> });
+    for item in streaming {
+        blocks.push(item.block(verbose));
     }
-    html! { for out.into_iter() }
+
+    // Fold the flat block list into turns.
+    let mut turns: Vec<(TurnKind, Vec<Html>)> = Vec::new();
+    for b in blocks {
+        match turns.last_mut() {
+            Some((kind, bodies)) if kind.key() == b.kind.key() => bodies.push(b.body),
+            _ => turns.push((b.kind, vec![b.body])),
+        }
+    }
+
+    html! {
+        { for turns.into_iter().map(|(kind, bodies)| html! {
+            <div class={kind.class()}>
+                <div class={kind.label_class()}>{ kind.label() }</div>
+                { for bodies.into_iter() }
+            </div>
+        }) }
+    }
 }
 
 /// Index every tool result in the transcript by the call it answers.
@@ -734,6 +797,71 @@ fn result_index(entries: &[api::Entry]) -> std::collections::HashMap<String, api
         }
     }
     out
+}
+
+/// One piece of the turn currently arriving.
+///
+/// The streaming buffer used to be a single `String`, which forced every kind
+/// of live event through the same channel — a tool start had to be written
+/// into the prose as `● bash` text, because a string cannot hold a widget.
+/// Modelling the buffer as a list of typed items instead lets a tool call
+/// stream as the same card it becomes once the turn is saved.
+#[derive(Clone, PartialEq)]
+enum StreamItem {
+    Text(String),
+    Thinking(String),
+    Tool { name: String, input: String },
+}
+
+impl StreamItem {
+    /// Render as a transcript block, so live output is grouped into turns by
+    /// exactly the same code that groups saved output.
+    fn block(&self, verbose: bool) -> Block {
+        match self {
+            StreamItem::Text(text) => Block {
+                kind: TurnKind::Assistant,
+                body: html! { <div class="role-assistant">{ markdown(text) }</div> },
+            },
+            StreamItem::Thinking(text) => Block {
+                kind: TurnKind::Assistant,
+                body: html! { <div class="role-thinking">{ markdown(text) }</div> },
+            },
+            StreamItem::Tool { name, input } => Block {
+                kind: TurnKind::Tool,
+                // No id yet — the card is keyed by nothing and has no result,
+                // so it renders in its "running" state until the turn ends and
+                // the saved entry replaces it.
+                body: html! {
+                    <ToolCard tool={api::ToolUse {
+                        id: String::new(),
+                        name: name.clone(),
+                        input: serde_json::from_str(input)
+                            .unwrap_or_else(|_| serde_json::Value::String(input.clone())),
+                    }} result={None} {verbose} />
+                },
+            },
+        }
+    }
+
+    /// Roughly how much has arrived; the scroll effect watches this so growing
+    /// text keeps the pane pinned to the bottom, not just new items.
+    fn size(&self) -> usize {
+        match self {
+            StreamItem::Text(t) | StreamItem::Thinking(t) => t.len(),
+            StreamItem::Tool { name, input } => name.len() + input.len(),
+        }
+    }
+}
+
+/// Append a delta to the buffer, extending the trailing item when it is the
+/// same kind and starting a new one otherwise — so prose either side of a tool
+/// call stays two blocks rather than merging across it.
+fn push_delta(buf: &mut Vec<StreamItem>, delta: StreamItem) {
+    match (buf.last_mut(), &delta) {
+        (Some(StreamItem::Text(prev)), StreamItem::Text(next)) => prev.push_str(next),
+        (Some(StreamItem::Thinking(prev)), StreamItem::Thinking(next)) => prev.push_str(next),
+        _ => buf.push(delta),
+    }
 }
 
 /// Add a live-delivered entry, unless the transcript already has it.
@@ -818,11 +946,12 @@ fn conversation(props: &ConversationProps) -> Html {
     let verbose = use_state(|| false);
     let busy = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
-    // Text streamed since the last transcript refresh. The buffer is a ref,
-    // not state: a task spawned once would otherwise keep reading the value
-    // captured at its render andeach delta would replace rather than append.
-    let stream_buf: Rc<RefCell<String>> = use_mut_ref(String::new);
-    let streaming = use_state(String::new);
+    // The turn streamed since the last transcript refresh. The buffer is a
+    // ref, not state: a task spawned once would otherwise keep reading the
+    // value captured at its render and each delta would replace rather than
+    // append.
+    let stream_buf: Rc<RefCell<Vec<StreamItem>>> = use_mut_ref(Vec::new);
+    let streaming = use_state(Vec::<StreamItem>::new);
     let input = use_node_ref();
     let pane = use_node_ref();
     let at_bottom: Rc<RefCell<bool>> = use_mut_ref(|| true);
@@ -912,8 +1041,8 @@ fn conversation(props: &ConversationProps) -> Html {
                     let Ok(ev) = serde_json::from_str::<api::StreamEvent>(&data) else {
                         continue;
                     };
-                    let push = |text: &str| {
-                        stream_buf.borrow_mut().push_str(text);
+                    let push = |item: StreamItem| {
+                        push_delta(&mut stream_buf.borrow_mut(), item);
                         streaming.set(stream_buf.borrow().clone());
                     };
                     match ev {
@@ -939,15 +1068,20 @@ fn conversation(props: &ConversationProps) -> Html {
                             busy.set(true);
                             error.set(None);
                             stream_buf.borrow_mut().clear();
-                            streaming.set(String::new());
+                            streaming.set(Vec::new());
                             if let Ok(p) = fetch_poll(&id).await {
                                 entries.set(reconcile(&entries, p.entries));
                             }
                         }
-                        api::StreamEvent::TextDelta { text }
-                        | api::StreamEvent::ThinkingDelta { text } => push(&text),
-                        api::StreamEvent::ToolStarted { name, .. } => {
-                            push(&format!("\n● {name}\n"))
+                        api::StreamEvent::TextDelta { text } => push(StreamItem::Text(text)),
+                        api::StreamEvent::ThinkingDelta { text } => {
+                            push(StreamItem::Thinking(text))
+                        }
+                        // A card from the moment the call starts, in its
+                        // running state — the same widget the saved entry
+                        // renders, rather than a bullet written into the prose.
+                        api::StreamEvent::ToolStarted { name, input } => {
+                            push(StreamItem::Tool { name, input })
                         }
                         api::StreamEvent::TurnFailed { message } => error.set(Some(message)),
                         api::StreamEvent::Compacted { successor, .. } => {
@@ -956,7 +1090,7 @@ fn conversation(props: &ConversationProps) -> Html {
                         }
                         api::StreamEvent::TurnFinished => {
                             stream_buf.borrow_mut().clear();
-                            streaming.set(String::new());
+                            streaming.set(Vec::new());
                             match fetch_poll(&id).await {
                                 Ok(p) => {
                                     entries.set(reconcile(&entries, p.entries));
@@ -978,9 +1112,18 @@ fn conversation(props: &ConversationProps) -> Html {
     }
 
     // Slow reconciliation poll: covers stream hiccups and other writers.
+    //
+    // It leaves the transcript alone while a turn is streaming. The agent
+    // checkpoints its history at every completed tool round, so a poll landing
+    // mid-turn returns entries covering output the buffer is still holding —
+    // adopting them would show the same prose, and the same tool card, twice.
+    // The turn boundaries already refresh the transcript and clear the buffer,
+    // which is the moment the two agree. Messages from other people do not
+    // depend on this: they arrive on the feed as their own event.
     {
         let entries = entries.clone();
         let busy = busy.clone();
+        let streaming = streaming.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -990,7 +1133,9 @@ fn conversation(props: &ConversationProps) -> Html {
                 while alive2.get() {
                     gloo_timers::future::TimeoutFuture::new(5_000).await;
                     if let Ok(p) = fetch_poll(&id).await {
-                        entries.set(reconcile(&entries, p.entries));
+                        if streaming.is_empty() {
+                            entries.set(reconcile(&entries, p.entries));
+                        }
                         busy.set(p.busy);
                     }
                 }
@@ -1004,7 +1149,8 @@ fn conversation(props: &ConversationProps) -> Html {
     {
         let pane = pane.clone();
         let at_bottom = at_bottom.clone();
-        use_effect_with((entries.len(), streaming.len()), move |_| {
+        let streamed: usize = streaming.iter().map(StreamItem::size).sum();
+        use_effect_with((entries.len(), streaming.len(), streamed), move |_| {
             if *at_bottom.borrow()
                 && let Some(el) = pane.cast::<web_sys::Element>()
             {
