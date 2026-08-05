@@ -98,7 +98,9 @@ takes the prompt from piped stdin; with both, stdin is prepended as context
 interactive run — continue with `--resume <id>` interactively, or
 `-p … --resume <id>` for one more non-interactive turn. `--parent-session` /
 `--fork` compose with `-p` for one-shot nested agents (the session is created
-hidden and parented, exactly as in the live-session recipe). `@path` image
+hidden and parented, exactly as in the live-session recipe); under `--fork` the
+PROMPT is the directive appended to the inherited conversation, and the turn
+opens with a `# Fork` block saying what was inherited. `@path` image
 mentions in the PROMPT argument attach images exactly as in the REPL
 (attachment note on stderr); piped stdin is data and is never parsed for
 attachments. No console mirror is written in print mode.

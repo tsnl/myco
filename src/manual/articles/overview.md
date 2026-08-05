@@ -33,11 +33,22 @@ myco (interactive) / Agent
   construction; the child reaches remotes through its own host pool, its session is hidden
   (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
   supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
-  supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
-  completed tool round) so forks start from the freshest replayable snapshot — never between a
-  tool call and its result. A fork inherits the supervisor's stamped first message and stamps its
-  own id on the first message it adds, so the newest `# Session` block is the running session's.
-  Remotes stay config/key-free hands.
+  supervisor's prompt cache. Remotes stay config/key-free hands.
+
+  A fork's contract is **the supervisor's conversation as last written to disk, plus the child's
+  directive appended**. Sessions are checkpointed at every replayable boundary (after each user
+  message and completed tool round), so a fork taken while the supervisor is mid-turn inherits
+  that turn's finished tool rounds — never a tool call still awaiting its result, a prefix
+  providers reject. That is the point rather than a side effect: a supervisor usually forks
+  partway through one long turn of its own, and those tool rounds are the context worth sharing.
+  There is no way to select a message to fork from; the fork point is a moment, not an index.
+
+  Because a fork can therefore inherit an *unfinished* turn, the child opens the first message it
+  adds with a `# Fork` block naming itself (the live session from there on), the session it forked
+  from, and where the inherited context stops — a completed turn, a completed tool round mid-turn,
+  or a request nothing has answered yet. The inherited messages are never edited, which is what
+  keeps the cached prefix byte-identical. A fresh session still gets the plain `# Session` block;
+  a fork gets `# Fork` in its place.
 
 ## Config & paths
 

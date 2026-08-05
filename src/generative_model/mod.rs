@@ -347,6 +347,54 @@ pub enum Message {
         turn_end_reason: Option<TurnEndReason>,
     },
 }
+
+/// Which kind of moment a conversation stops at.
+///
+/// Sessions are written at several different boundaries (after the user
+/// message, after each completed tool round, at turn end), and the stored
+/// history records *what* was said without recording *which* of those moments
+/// it was captured at. A context fork inherits that history and has to tell the
+/// child what it is holding — "a finished turn" and "someone else's turn, three
+/// tool rounds in" are very different mandates.
+///
+/// Derived from the messages rather than stored alongside them: it needs no
+/// session-file version bump, it reads correctly for sessions written by older
+/// builds, and it cannot drift out of agreement with the history it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryBoundary {
+    /// No conversation at all.
+    Empty,
+    /// Ends at a user message: the request has been made, nothing has answered
+    /// it yet.
+    TurnOpen,
+    /// Ends at a completed tool round, mid-turn: every tool call so far has its
+    /// results, and the turn is still going.
+    ToolRound,
+    /// Ends at an assistant message with nothing outstanding — a finished turn
+    /// (including one that ended in an error or a cancel).
+    TurnEnd,
+    /// Ends at an assistant message whose tool calls were never answered.
+    ///
+    /// Providers reject this prefix, so the checkpoint deliberately never fires
+    /// here ([`crate::agent::HistoryCheckpoint`]) and it should not reach disk.
+    /// Named rather than folded into [`Self::TurnEnd`] so that if one ever does,
+    /// it is reported instead of silently inherited.
+    DanglingToolUse,
+}
+
+/// Classify where `messages` stops ([`HistoryBoundary`]).
+pub fn history_boundary(messages: &[Message]) -> HistoryBoundary {
+    match messages.last() {
+        None => HistoryBoundary::Empty,
+        Some(Message::UserMessage { .. }) => HistoryBoundary::TurnOpen,
+        Some(Message::ToolResults { .. }) => HistoryBoundary::ToolRound,
+        Some(Message::AssistantMessage { tool_uses, .. }) if tool_uses.is_empty() => {
+            HistoryBoundary::TurnEnd
+        }
+        Some(Message::AssistantMessage { .. }) => HistoryBoundary::DanglingToolUse,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnEndReason {
     EndTurn,
@@ -827,7 +875,42 @@ pub enum ModelCreationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{assistant_tool, tool_results, user};
+    use crate::test_support::{assistant, assistant_tool, tool_results, user};
+
+    /// The three shapes a session can be written at are each distinguishable
+    /// from the messages alone — that is what lets a fork say what it inherited
+    /// without a stored field that could drift from the history.
+    #[test]
+    fn history_boundary_reads_the_shape_a_conversation_stops_at() {
+        assert_eq!(history_boundary(&[]), HistoryBoundary::Empty);
+        assert_eq!(history_boundary(&[user("hi")]), HistoryBoundary::TurnOpen);
+        assert_eq!(
+            history_boundary(&[
+                user("hi"),
+                assistant_tool(None, "bash", serde_json::json!({})),
+                tool_results(&["ok"]),
+            ]),
+            HistoryBoundary::ToolRound,
+        );
+        assert_eq!(
+            history_boundary(&[user("hi"), assistant("done")]),
+            HistoryBoundary::TurnEnd,
+        );
+    }
+
+    /// An assistant turn whose tool calls were never answered is the one prefix
+    /// providers reject, so it is reported rather than passed off as a finished
+    /// turn a fork could safely inherit.
+    #[test]
+    fn history_boundary_flags_unanswered_tool_calls() {
+        assert_eq!(
+            history_boundary(&[
+                user("hi"),
+                assistant_tool(None, "bash", serde_json::json!({})),
+            ]),
+            HistoryBoundary::DanglingToolUse,
+        );
+    }
 
     /// Every minted id must satisfy the strictest provider dialect at once:
     /// exactly nine chars, alphanumeric only (covers Anthropic's

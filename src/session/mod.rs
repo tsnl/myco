@@ -308,6 +308,26 @@ impl Session {
     /// conversation and usage. New id, `kind: subagent`, parented here; the
     /// parent's own metadata (title, links, scratchpad) stays with the parent.
     /// `model` records the child's catalog key.
+    ///
+    /// # What a fork inherits
+    ///
+    /// The fork point is **this session as last written to disk** — its whole
+    /// saved conversation, not a chosen prefix of it. Sessions checkpoint at
+    /// every replayable boundary (after the user message, after each completed
+    /// tool round), so a fork taken while the parent is mid-turn inherits that
+    /// turn's finished tool rounds; it is never taken between a tool call and
+    /// its result, a prefix providers reject.
+    ///
+    /// That is deliberate rather than incidental: the current turn's tool
+    /// rounds are usually the very context worth sharing, since a supervisor
+    /// typically forks partway through one long turn of its own. It does mean a
+    /// fork can inherit an *unfinished* turn, which is why the child opens with
+    /// [`crate::prompts::fork_stamp`] naming the boundary
+    /// ([`crate::generative_model::history_boundary`]).
+    ///
+    /// The child never edits what it inherits: its directive is appended as a
+    /// new message, leaving the inherited prefix byte-identical so a same-model
+    /// fork re-reads the parent's cached prompt prefix.
     pub fn fork_child(&self, model: impl Into<String>) -> Self {
         let mut child = Self::new(model);
         child.kind = SessionKind::Subagent;
@@ -726,7 +746,7 @@ pub fn first_user_text_from_messages(messages: &[Message]) -> Option<String> {
                 .iter()
                 .filter_map(|c| match c {
                     crate::generative_model::Content::Text { text }
-                        if !crate::prompts::is_session_stamp(text) =>
+                        if !crate::prompts::is_myco_stamp(text) =>
                     {
                         Some(text.as_str())
                     }

@@ -186,6 +186,17 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
       into the system prompt (identity-free otherwise) so supervisors launch
       same-model forks, and a same-model fork's first request re-reads the
       supervisor's cached prompt prefix instead of rebuilding context.
+  - Contract: the fork point is the parent's conversation **as last written to
+    disk**, and the child's directive is **appended** — inherited messages are
+    never edited, which is what keeps the cached prefix byte-identical. The
+    fork point is a moment, not an index; see the rejected entry below for why
+    there is no way to name a message to fork from.
+  - Because that snapshot can be an unfinished turn, the child opens the first
+    message it adds with a `# Fork` block naming itself, its parent, and which
+    boundary it inherited (`generative_model::history_boundary`, derived from
+    the messages rather than stored so it cannot drift). This replaced an
+    arrangement where a fork re-emitted `# Session` and the newest block
+    silently won.
 - [ ] **Remote nesting / gateway proxy** — running a whole agent *on* a remote
       (vs local brain + remote hands) would need config, keys, and gateway
       network there. If it is ever really needed, the principled fix is
@@ -208,6 +219,13 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
     `Recovery::OmitLastMessage` and the CLI calls
     `Agent::rewind_last_user_turn()` to unwedge the session. No `/rewind`
     command, no branching.
+  - Same rejection covers an **addressable fork point** (`--fork-at <message>`,
+    or truncating a fork to the last user message): both are branch-from-a-
+    chosen-point wearing a different hat, and truncation would strip exactly
+    the in-turn tool rounds a fork exists to carry. `--fork` stays a bool and
+    forks from the freshest replayable snapshot. Revisit only with evidence —
+    the honest prerequisite is log-structured session storage, since the
+    current whole-file snapshot keeps only the newest boundary.
 
 ---
 

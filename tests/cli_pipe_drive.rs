@@ -195,7 +195,8 @@ async fn fork_seeds_child_with_parent_conversation() {
 /// Every session tells the agent which session it is, in the conversation
 /// rather than the system prompt: the id is stamped on the first user message
 /// of a fresh session, and a context fork — which mints a new id but inherits
-/// the parent's stamped message — stamps its own on the first message it adds.
+/// the parent's stamped message — opens the first message it adds with a fork
+/// block naming itself, its parent, and what it inherited.
 ///
 /// Stamp *content* is owned by the prompts/bin unit tests; this test proves
 /// the end-to-end residue: the stamp lands in the stored session file, as
@@ -237,7 +238,7 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     assert!(!later.iter().any(|t| t.contains("# Session")), "{later:?}");
 
     // A context fork: the inherited message still names the parent, and the
-    // child stamps its own id on the turn it adds.
+    // child opens the turn it adds with a fork block of its own.
     let child_stdout = run_myco(
         &env,
         &["--parent-session", &parent_id, "--fork"],
@@ -255,6 +256,16 @@ async fn session_id_is_stamped_on_the_first_user_message() {
         .map(user_texts)
         .find(|texts| texts.iter().any(|t| t.contains("child-marker-beta")))
         .expect("the fork's own turn");
-    assert!(own[0].starts_with("# Session"), "{own:?}");
+    // A fork says what it is, rather than re-stamping `# Session` and leaving
+    // the child to work out that the newest of two blocks is the live one.
+    assert!(own[0].starts_with("# Fork"), "{own:?}");
+    assert!(!own[0].starts_with("# Session"), "{own:?}");
+    // It names the live session (itself), the session it inherited from, and
+    // what the inherited messages are. Which boundary is the unit tests' to
+    // pin down; that one is stated at all is this test's residue.
     assert!(own[0].contains(&child_id), "{own:?}");
+    assert!(own[0].contains(&parent_id), "{own:?}");
+    assert!(own[0].contains("Inherited context ends"), "{own:?}");
+    // The directive stays a block of its own — the fork appends, never edits.
+    assert!(own[1].contains("child-marker-beta"), "{own:?}");
 }

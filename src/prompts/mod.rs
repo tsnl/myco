@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 
+use crate::generative_model::HistoryBoundary;
+
 /// Epilogue appended to every agent system prompt.
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
     r#"
@@ -69,9 +71,10 @@ its own host pool exactly as you do. Remote hosts stay hands, not brains: they n
 PATH plus SSH, never config or keys. (Many myco processes sharing the same remotes multiplex
 cleanly over one SSH connection per host with ControlMaster — see `harness-ops.md`.)
 
-Recipe: read your own session id off the newest `# Session` block in this conversation — myco
-stamps one on the first user message of every session (`session_meta` action=get reports it too,
-with the rest of the metadata) — then `bash` action=start with
+Recipe: read your own session id off the `# Session` block in this conversation — myco stamps one
+on the first user message of every session, and a session that is itself a fork carries a `# Fork`
+block naming itself in place of it (`session_meta` action=get reports it either way, with the rest
+of the metadata) — then `bash` action=start with
 `command: "myco --parent-session <your-session-id>"` (add `--model <key>` to pick a model). `write`
 one prompt per line, ending each `write` with `"\n"` — each line is a self-contained turn kept to
 a single line, and only the trailing newline submits it. Stdin passes through unmodified, so a
@@ -105,7 +108,9 @@ a fraction of full input cost, while a different model is legal but starts cold 
 too if yours was changed from the default). Your session file is checkpointed mid-turn after each
 user message and completed tool round, so a fork sees the current user request and finished tool
 rounds — never tool calls still in flight, its own launch included; put anything newer in the first
-prompt line you write to it.
+prompt line you write to it. The child inherits that conversation unchanged and opens the first
+message it adds with a `# Fork` block naming itself, you, and where the inherited context stops, so
+it can tell your unfinished turn from its own task.
 
 ---
 "#,
@@ -146,13 +151,11 @@ const SESSION_STAMP_HEADING: &str = "# Session";
 ///
 /// It rides a message rather than the system prompt for the reason
 /// [`model_stamp`] documents: the prompt must stay byte-identical across an
-/// agent and its forks, and every field here is per-process. A fork inherits
-/// the parent's stamped first message, so it stamps its own onto the first
-/// message it adds — hence "from here on", and hence the newest block wins.
+/// agent and its forks, and every field here is per-process.
 ///
-/// `started_at` is the session's creation time, so the line is honest about
-/// being a start rather than a clock: a session open for days would otherwise
-/// carry a confidently wrong "now" in its prompt, and `date` is always right.
+/// Emitted only by a session opening its *own* conversation. A context fork
+/// starts life holding the parent's transcript, so it emits [`fork_stamp`]
+/// instead — same identity lines, plus what the inherited context is.
 pub fn session_stamp(session_id: &str, started_at: DateTime<Utc>) -> String {
     stamp_with(
         session_id,
@@ -164,23 +167,42 @@ pub fn session_stamp(session_id: &str, started_at: DateTime<Utc>) -> String {
 /// [`session_stamp`] against an explicit launch directory, so tests need no
 /// process-global cwd override.
 fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -> String {
+    let mut block = format!("{SESSION_STAMP_HEADING}\n\n{}", session_id_line(session_id));
+    block.push_str(&when_and_where(started_at, cwd));
+    block
+}
+
+/// The "this conversation from here on" line, shared by both stamps: whichever
+/// one a run emits, it is the one that names the running session.
+fn session_id_line(session_id: &str) -> String {
+    format!(
+        "- Session id: `{session_id}` — this conversation from here on. Spawn nested myco \
+         agents with `--parent-session {session_id}`; `session_meta` action=get has the rest \
+         of this session's metadata.\n"
+    )
+}
+
+/// Start time and launch directory, shared by both stamps.
+///
+/// `started_at` is the session's creation time, so the line is honest about
+/// being a start rather than a clock: a session open for days would otherwise
+/// carry a confidently wrong "now" in its prompt, and `date` is always right.
+fn when_and_where(started_at: DateTime<Utc>, cwd: Option<&Path>) -> String {
     let started = started_at
         .with_timezone(&Local)
         .to_rfc3339_opts(SecondsFormat::Secs, true);
-    let mut block = format!(
-        "{SESSION_STAMP_HEADING}\n\n- Session id: `{session_id}` — this conversation from here \
-         on. Spawn nested myco agents with `--parent-session {session_id}`; `session_meta` \
-         action=get has the rest of this session's metadata.\n- Started: {started} — when this \
-         session began, not the current time; run `date` for that.\n"
+    let mut lines = format!(
+        "- Started: {started} — when this session began, not the current time; run `date` \
+         for that.\n"
     );
     if let Some(cwd) = cwd {
-        block.push_str(&format!(
+        lines.push_str(&format!(
             "- Launch directory: `{}` — where myco was started, so `bash` on the local host \
              begins there unless a call passes `cwd`.\n",
             cwd.display()
         ));
     }
-    block
+    lines
 }
 
 /// Whether a user-message text block is a [`session_stamp`] rather than the
@@ -188,6 +210,100 @@ fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -
 /// message, and the stamp is myco's payload, not something anyone typed.
 pub fn is_session_stamp(text: &str) -> bool {
     text.starts_with(SESSION_STAMP_HEADING)
+}
+
+/// Heading of the block [`fork_stamp`] builds, and the marker that tells a
+/// stamp apart from something a user typed.
+const FORK_STAMP_HEADING: &str = "# Fork";
+
+/// What a context fork is holding, as a block for the **first message the fork
+/// adds** to its inherited conversation.
+///
+/// A fork boots with the parent's saved transcript already in history, which
+/// leaves the child two questions the transcript itself cannot answer: which
+/// session it now is (every id above this block is the parent's), and what the
+/// inherited messages *are* — a finished turn, or someone else's turn caught
+/// partway through. `boundary` answers the second, so the three shapes a fork
+/// can inherit ([`HistoryBoundary`]) each describe themselves in-band instead
+/// of the child inferring a mandate from where the parent happened to be.
+///
+/// This replaces the old arrangement where a fork re-emitted [`session_stamp`]
+/// and the newest `# Session` block silently won: the fork's own block now says
+/// what it is, so nothing depends on reading the transcript in order.
+pub fn fork_stamp(
+    session_id: &str,
+    parent_session_id: &str,
+    started_at: DateTime<Utc>,
+    boundary: HistoryBoundary,
+) -> String {
+    fork_stamp_with(
+        session_id,
+        parent_session_id,
+        started_at,
+        boundary,
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// [`fork_stamp`] against an explicit launch directory, so tests need no
+/// process-global cwd override.
+fn fork_stamp_with(
+    session_id: &str,
+    parent_session_id: &str,
+    started_at: DateTime<Utc>,
+    boundary: HistoryBoundary,
+    cwd: Option<&Path>,
+) -> String {
+    let mut block = format!(
+        "{FORK_STAMP_HEADING}\n\n{}- Forked from: `{parent_session_id}` — everything above this \
+         block is that session's saved conversation, inherited as context. It is not your own \
+         work, and any session id named in it is the parent's.\n- Inherited context ends {}\n",
+        session_id_line(session_id),
+        inherited_context_ends(boundary),
+    );
+    block.push_str(&when_and_where(started_at, cwd));
+    block.push_str("\nEverything below this block is your task.\n");
+    block
+}
+
+/// Prose for the boundary a fork inherited, completing the sentence
+/// "Inherited context ends …".
+fn inherited_context_ends(boundary: HistoryBoundary) -> &'static str {
+    match boundary {
+        HistoryBoundary::TurnEnd => {
+            "at a completed turn — the parent had finished answering and was idle when this fork \
+             was taken."
+        }
+        HistoryBoundary::ToolRound => {
+            "mid-turn, after a completed tool round — the parent was partway through answering, \
+             with every tool call it had made already answered. Those calls and their results \
+             are the parent's work, not yours; the request they were serving is the newest one \
+             above this block, and it was the parent's to finish, not yours."
+        }
+        HistoryBoundary::TurnOpen => {
+            "at the newest request above, with nothing yet answering it — the parent had only \
+             just received that message when this fork was taken. It was the parent's to \
+             answer, not yours."
+        }
+        HistoryBoundary::DanglingToolUse => {
+            "mid-turn, at tool calls that were never answered — an incomplete snapshot. Treat \
+             the inherited transcript as unreliable and re-establish anything you depend on."
+        }
+        HistoryBoundary::Empty => "nowhere — no conversation was inherited.",
+    }
+}
+
+/// Whether a user-message text block is a [`fork_stamp`] rather than the user's
+/// own words. Same reason as [`is_session_stamp`].
+pub fn is_fork_stamp(text: &str) -> bool {
+    text.starts_with(FORK_STAMP_HEADING)
+}
+
+/// Whether a user-message text block is any of myco's own stamps rather than
+/// something a user typed. Callers deriving a human label from a conversation
+/// (titles, list snippets) want this rather than either stamp alone.
+pub fn is_myco_stamp(text: &str) -> bool {
+    is_session_stamp(text) || is_fork_stamp(text)
 }
 
 /// Cap used when `config.toml` sets no `max_soul_bytes`.
@@ -739,7 +855,78 @@ mod tests {
         let prompt = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
         assert!(!prompt.contains(id), "{prompt}");
         // The epilogue points agents at the stamp instead of a tool call.
-        assert!(prompt.contains("newest `# Session` block"), "{prompt}");
+        assert!(prompt.contains("`# Session` block"), "{prompt}");
+    }
+
+    /// A fork's own block has to answer both questions the inherited transcript
+    /// cannot: which session is live now, and what the messages above it are.
+    #[test]
+    fn fork_stamp_names_the_child_the_parent_and_the_boundary() {
+        let child = "cafef00dcafef00dcafef00dcafef00d";
+        let parent = "0badf00d0badf00d0badf00d0badf00d";
+        let started_at = DateTime::parse_from_rfc3339("2026-07-29T14:02:11Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stamp = fork_stamp_with(
+            child,
+            parent,
+            started_at,
+            HistoryBoundary::ToolRound,
+            Some(Path::new("/home/user/myco")),
+        );
+
+        // The live session is the child, and it is the one to nest under.
+        assert!(stamp.contains(&format!("`{child}`")), "{stamp}");
+        assert!(
+            stamp.contains(&format!("--parent-session {child}")),
+            "{stamp}"
+        );
+        // The parent is named as the source of the inherited context, never as
+        // the session to spawn under.
+        assert!(stamp.contains(&format!("`{parent}`")), "{stamp}");
+        assert!(
+            !stamp.contains(&format!("--parent-session {parent}")),
+            "{stamp}"
+        );
+        assert!(stamp.contains("`/home/user/myco`"), "{stamp}");
+
+        // A fork is a `# Fork` block, and both stamps read as myco's payload
+        // rather than as something a user typed.
+        assert!(is_fork_stamp(&stamp), "{stamp}");
+        assert!(!is_session_stamp(&stamp), "{stamp}");
+        assert!(is_myco_stamp(&stamp), "{stamp}");
+        assert!(is_myco_stamp(&stamp_with(child, started_at, None)));
+        assert!(!is_myco_stamp("fork the session and carry on"));
+    }
+
+    /// Each boundary a fork can inherit describes itself differently — the
+    /// whole point of naming it, since the mandates differ.
+    #[test]
+    fn fork_stamp_describes_each_inherited_boundary_distinctly() {
+        let started_at = DateTime::parse_from_rfc3339("2026-07-29T14:02:11Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let render = |boundary| fork_stamp_with("child", "parent", started_at, boundary, None);
+
+        let mid = render(HistoryBoundary::ToolRound);
+        assert!(mid.contains("mid-turn"), "{mid}");
+        assert!(mid.contains("not yours"), "{mid}");
+
+        let done = render(HistoryBoundary::TurnEnd);
+        assert!(done.contains("completed turn"), "{done}");
+        assert!(!done.contains("mid-turn"), "{done}");
+
+        let open = render(HistoryBoundary::TurnOpen);
+        assert!(open.contains("nothing yet answering it"), "{open}");
+
+        let dangling = render(HistoryBoundary::DanglingToolUse);
+        assert!(dangling.contains("never answered"), "{dangling}");
+
+        // Every rendering says where the task is, so the directive appended
+        // below the block is never read as more inherited context.
+        for stamp in [&mid, &done, &open, &dangling] {
+            assert!(stamp.contains("below this block is your task"), "{stamp}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use myco::agent::{CompactWorkerError, run_compact_worker};
 use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
+    history_boundary,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -291,14 +292,8 @@ async fn run_print(args: Args) {
         eprintln!("{note}");
     }
 
-    if needs_session_stamp(agent.history(), args.fork) {
-        let (id, started_at) = active_session.with(|s| (s.id.clone(), s.created_at));
-        content.insert(
-            0,
-            Content::Text {
-                text: prompts::session_stamp(&id, started_at),
-            },
-        );
+    if let Some(stamp) = opening_stamp(agent.history(), &active_session, args.fork) {
+        content.insert(0, Content::Text { text: stamp });
     }
 
     if let Err(e) = active_session.maybe_auto_title_from_user_text(&prompt) {
@@ -403,13 +398,37 @@ fn print_turn_content(
     Ok(content)
 }
 
-/// Whether this run's first user message has to carry the session stamp
-/// ([`prompts::session_stamp`]). A fresh session has no history to carry it; a
-/// context fork inherits the *parent's* stamped first message, so the child
-/// stamps its own id onto the first message it adds. A resumed session already
-/// carries the stamp it was created with — same session, same id.
-fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    history.is_empty() || forked
+/// The stamp this run's first user message opens with, if any.
+///
+/// A fresh session names itself ([`prompts::session_stamp`]). A context fork
+/// boots holding the parent's transcript, so it names itself *and* what it
+/// inherited ([`prompts::fork_stamp`]) — the inherited messages already carry
+/// the parent's stamp, and a fork must not be left to infer which one is live.
+/// A resumed session adds nothing: it already carries the stamp it was created
+/// with, same session, same id.
+fn opening_stamp(history: &[Message], session: &ActiveSession, forked: bool) -> Option<String> {
+    let (id, parent, started_at) =
+        session.with(|s| (s.id.clone(), s.parent_session_id.clone(), s.created_at));
+    // A fork whose parent had saved nothing inherited nothing, which makes this
+    // a fresh session in every way that matters to the stamp.
+    if history.is_empty() {
+        return Some(prompts::session_stamp(&id, started_at));
+    }
+    if !forked {
+        return None;
+    }
+    match parent {
+        Some(parent) => Some(prompts::fork_stamp(
+            &id,
+            &parent,
+            started_at,
+            history_boundary(history),
+        )),
+        // `fork_child` always records a parent, so this is unreachable in
+        // practice; naming this session is the load-bearing half, so degrade to
+        // that rather than describing an inheritance with no source.
+        None => Some(prompts::session_stamp(&id, started_at)),
+    }
 }
 
 /// Read piped stdin fully; `None` when stdin is a TTY or effectively empty.
@@ -878,9 +897,9 @@ struct ReplSession {
     max_soul_bytes: usize,
     ui: Arc<TuiProducer>,
     turn_cancel: TurnCancel,
-    /// This run started as a context fork, whose inherited first message
-    /// carries the *parent's* session stamp — cleared once this session has
-    /// stamped its own id ([`needs_session_stamp`]).
+    /// This run started as a context fork, holding a conversation whose stamps
+    /// name the *parent* — cleared once this session has stamped its own id
+    /// and said what it inherited ([`opening_stamp`]).
     forked: bool,
     /// Single-writer guard on the live session, swapped whenever the REPL
     /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
@@ -1092,14 +1111,8 @@ impl ReplSession {
         // The session id rides the conversation, not the system prompt (see
         // `prompts::session_stamp`). `/new` empties the history, so a session
         // started mid-run stamps its own id on its first turn.
-        if needs_session_stamp(self.agent.history(), self.forked) {
-            let (id, started_at) = self.session.with(|s| (s.id.clone(), s.created_at));
-            content.insert(
-                0,
-                Content::Text {
-                    text: prompts::session_stamp(&id, started_at),
-                },
-            );
+        if let Some(stamp) = opening_stamp(self.agent.history(), &self.session, self.forked) {
+            content.insert(0, Content::Text { text: stamp });
         }
         self.forked = false;
 
@@ -1983,19 +1996,37 @@ mod tests {
         assert!(session.messages.is_empty());
     }
 
-    /// A session stamps its id on the first message of its own conversation:
-    /// once on a fresh session, again on the first message a context fork adds
-    /// (the inherited one names the parent), never on a resumed turn.
+    /// A session stamps the first message of its *own* conversation: a fresh
+    /// run names itself, a context fork names itself and what it inherited, and
+    /// a resumed run adds nothing (it already carries its stamp).
     #[test]
-    fn session_stamp_covers_fresh_and_forked_runs_only() {
-        let seeded = [Message::UserMessage {
+    fn opening_stamp_distinguishes_fresh_forked_and_resumed_runs() {
+        let mut parent = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
+        parent.messages = vec![Message::UserMessage {
             content: vec![Content::Text {
                 text: "inherited".into(),
             }],
         }];
-        assert!(needs_session_stamp(&[], /*forked*/ false));
-        assert!(needs_session_stamp(&seeded, /*forked*/ true));
-        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
+        let inherited = parent.messages.clone();
+
+        let fresh = ActiveSession::new(Session::new("m"));
+        let fresh_stamp = opening_stamp(&[], &fresh, /*forked*/ false).expect("a fresh stamp");
+        assert!(prompts::is_session_stamp(&fresh_stamp), "{fresh_stamp}");
+
+        let child = ActiveSession::new(parent.fork_child("m"));
+        let fork_stamp = opening_stamp(&inherited, &child, /*forked*/ true).expect("a fork stamp");
+        assert!(prompts::is_fork_stamp(&fork_stamp), "{fork_stamp}");
+        assert!(fork_stamp.contains(&parent.id), "{fork_stamp}");
+        assert!(fork_stamp.contains(&child.id()), "{fork_stamp}");
+
+        assert!(opening_stamp(&inherited, &child, /*forked*/ false).is_none());
+
+        // A fork of a parent that had saved nothing inherited nothing, so it
+        // stamps as the fresh session it effectively is.
+        let empty_parent = Session::new_with_id("m", "bb00bb11cc22dd33ee44ff5566778899");
+        let empty_fork = ActiveSession::new(empty_parent.fork_child("m"));
+        let stamp = opening_stamp(&[], &empty_fork, /*forked*/ true).expect("a stamp");
+        assert!(prompts::is_session_stamp(&stamp), "{stamp}");
     }
 
     #[test]
