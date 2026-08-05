@@ -922,6 +922,37 @@ fn internal(e: String) -> ApiError {
     ApiError::new(ErrorKind::Internal, e)
 }
 
+fn lock_of(lock: myco_machines::tool_services::ShellLock) -> api::ShellLockMode {
+    match lock {
+        myco_machines::tool_services::ShellLock::Assistant => api::ShellLockMode::Assistant,
+        myco_machines::tool_services::ShellLock::User => api::ShellLockMode::User,
+    }
+}
+
+fn shell_of(s: myco_machines::tool_services::ShellOverview) -> api::Shell {
+    api::Shell {
+        id: s.id,
+        cmdline: s.cmdline,
+        running: s.running,
+        exit_code: s.exit_code,
+        lock: lock_of(s.lock),
+        end_offset: s.end_offset,
+    }
+}
+
+/// One shell's fresh overview, for the responses of input/lock.
+fn shell_overview(
+    shells: &Arc<myco_machines::tool_services::BashService>,
+    shell: &str,
+) -> Result<api::Shell, ApiError> {
+    shells
+        .shell_overviews()
+        .into_iter()
+        .find(|s| s.id == shell)
+        .map(shell_of)
+        .ok_or_else(|| ApiError::new(ErrorKind::NotFound, format!("unknown shell {shell:?}")))
+}
+
 fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
     api::SessionSummary {
         archived: s.archived,
@@ -1103,6 +1134,139 @@ impl Server {
             entries: Vec::new(),
             last_error: None,
         })
+    }
+
+    /// Record a never-waking message through the room — shell keystrokes and
+    /// keyboard-lock transitions. Same acceptance path as `post_message`
+    /// (broadcast, inbox, poke, participants), so watchers see it at once and
+    /// the agent reads it at its next boundary; forced non-waking because the
+    /// user acted on the shell, not on the agent.
+    fn accept_room_note(&self, live: &Arc<Live>, author: &Author, text: &str) {
+        let entry = Entry::user(
+            author.clone(),
+            vec![Content::Text {
+                text: text.to_string(),
+            }],
+        );
+        let mut room = live.room.lock().unwrap_or_else(|e| e.into_inner());
+        if let Author::User { id, .. } = author {
+            room.participants.insert(id.clone());
+        }
+        let _ = live.events.send(SessionEvent::Message {
+            entry: entry.clone(),
+            wakes_agent: false,
+        });
+        room.inbox.push_back(Accepted {
+            entry,
+            wakes_agent: false,
+        });
+        let _ = live.tx.send(Cmd::Poke);
+    }
+
+    /// The live handle, or NotFound: the shell surface has nothing to say
+    /// about a session whose agent task (and with it every bash session) is
+    /// gone.
+    async fn live_for_shells(&self, id: &str) -> Result<Arc<Live>, ApiError> {
+        self.get_live(id)
+            .await
+            .ok_or_else(|| ApiError::new(ErrorKind::NotFound, "session not live (no shells)"))
+    }
+
+    pub(crate) async fn shells(&self, id: &str) -> Result<api::Shells, ApiError> {
+        let shells = match self.get_live(id).await {
+            Some(live) => live
+                .harness()
+                .local_shells()
+                .shell_overviews()
+                .into_iter()
+                .map(shell_of)
+                .collect(),
+            // Not resident is a fact, not a fault: the rail shows nothing.
+            None => Vec::new(),
+        };
+        Ok(api::Shells { shells })
+    }
+
+    pub(crate) async fn shell_tail(
+        &self,
+        id: &str,
+        shell: &str,
+        from: u64,
+    ) -> Result<api::ShellTailChunk, ApiError> {
+        /// One tail response's byte budget; a viewer further behind is
+        /// skipped forward (the terminal wants the present).
+        const TAIL_BUDGET: usize = 64 * 1024;
+        let live = self.live_for_shells(id).await?;
+        let tail = live
+            .harness()
+            .local_shells()
+            .shell_tail(shell, from, TAIL_BUDGET)
+            .map_err(|e| ApiError::new(ErrorKind::NotFound, e))?;
+        Ok(api::ShellTailChunk {
+            from: tail.from,
+            end: tail.end,
+            data: String::from_utf8_lossy(&tail.data).into_owned(),
+            running: tail.running,
+            lock: lock_of(tail.lock),
+        })
+    }
+
+    pub(crate) async fn shell_input(
+        &self,
+        author: &Author,
+        id: &str,
+        shell: &str,
+        data: String,
+    ) -> Result<api::Shell, ApiError> {
+        let live = self.live_for_shells(id).await?;
+        let shells = live.harness().local_shells().clone();
+        shells
+            .shell_user_write(shell, &data)
+            .await
+            .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
+        // The keystrokes become part of the conversation: the agent must not
+        // discover a mutated shell with no explanation in its history.
+        self.accept_room_note(
+            &live,
+            author,
+            &format!(
+                "[typed into shell {shell:?}]\n{}",
+                data.trim_end_matches('\n')
+            ),
+        );
+        shell_overview(&shells, shell)
+    }
+
+    pub(crate) async fn shell_lock(
+        &self,
+        author: &Author,
+        id: &str,
+        shell: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Shell, ApiError> {
+        let live = self.live_for_shells(id).await?;
+        let shells = live.harness().local_shells().clone();
+        let wanted = match lock {
+            api::ShellLockMode::Assistant => myco_machines::tool_services::ShellLock::Assistant,
+            api::ShellLockMode::User => myco_machines::tool_services::ShellLock::User,
+        };
+        let previous = shells
+            .shell_set_lock(shell, wanted)
+            .map_err(|e| ApiError::new(ErrorKind::NotFound, e))?;
+        // Announce transitions only: a double-click that re-takes the
+        // keyboard is not news.
+        if previous != wanted {
+            let text = match lock {
+                api::ShellLockMode::User => {
+                    format!("[took the keyboard for shell {shell:?}]")
+                }
+                api::ShellLockMode::Assistant => {
+                    format!("[returned the keyboard for shell {shell:?}]")
+                }
+            };
+            self.accept_room_note(&live, author, &text);
+        }
+        shell_overview(&shells, shell)
     }
 
     pub(crate) async fn poll(&self, id: &str, since: usize) -> Result<api::Poll, ApiError> {
@@ -1311,5 +1475,36 @@ impl MycoApi for UserApi {
             }),
             other => Err(internal(format!("handle is not a user: {other:?}"))),
         }
+    }
+
+    async fn shells(&self, id: &str) -> Result<api::Shells, ApiError> {
+        self.server.shells(id).await
+    }
+
+    async fn shell_tail(
+        &self,
+        id: &str,
+        shell: &str,
+        from: u64,
+    ) -> Result<api::ShellTailChunk, ApiError> {
+        self.server.shell_tail(id, shell, from).await
+    }
+
+    async fn shell_input(
+        &self,
+        id: &str,
+        shell: &str,
+        data: String,
+    ) -> Result<api::Shell, ApiError> {
+        self.server.shell_input(&self.author, id, shell, data).await
+    }
+
+    async fn shell_lock(
+        &self,
+        id: &str,
+        shell: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Shell, ApiError> {
+        self.server.shell_lock(&self.author, id, shell, lock).await
     }
 }

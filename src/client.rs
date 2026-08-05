@@ -188,4 +188,46 @@ impl MycoApi for HttpClient {
     async fn whoami(&self) -> Result<api::Identity, ApiError> {
         self.get("/whoami").await
     }
+
+    async fn shells(&self, id: &str) -> Result<api::Shells, ApiError> {
+        self.get(&format!("/sessions/{id}/shells")).await
+    }
+
+    async fn shell_tail(
+        &self,
+        id: &str,
+        shell: &str,
+        from: u64,
+    ) -> Result<api::ShellTailChunk, ApiError> {
+        self.get(&format!("/sessions/{id}/shells/{shell}?from={from}"))
+            .await
+    }
+
+    async fn shell_input(
+        &self,
+        id: &str,
+        shell: &str,
+        data: String,
+    ) -> Result<api::Shell, ApiError> {
+        self.send(
+            self.http
+                .post(format!("{}/sessions/{id}/shells/{shell}/input", self.base))
+                .json(&api::ShellInput { data }),
+        )
+        .await
+    }
+
+    async fn shell_lock(
+        &self,
+        id: &str,
+        shell: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Shell, ApiError> {
+        self.send(
+            self.http
+                .post(format!("{}/sessions/{id}/shells/{shell}/lock", self.base))
+                .json(&api::ShellLockRequest { lock }),
+        )
+        .await
+    }
 }
