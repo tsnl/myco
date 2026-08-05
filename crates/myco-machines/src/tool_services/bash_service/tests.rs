@@ -1689,3 +1689,167 @@ async fn user_input_requires_the_keyboard() {
 
     service.reap_owner(owner);
 }
+
+// --- pty sessions and the screen (`screenshot`) ------------------------------
+
+/// `pty: true` gives the child a real controlling terminal: isatty holds, the
+/// tty echoes what is written (once — the service must not echo on top), and
+/// the overview says so.
+#[tokio::test]
+async fn a_pty_session_gives_the_child_a_real_terminal() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("pty");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "pty": true,
+               "command": "if [ -t 0 ] && [ -t 1 ]; then echo IS-A-TTY; else echo NOT-A-TTY; fi; cat",
+               "timeout_ms": 2000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+    assert!(
+        result_text(&started).contains("IS-A-TTY"),
+        "child must see a tty on stdin and stdout: {}",
+        result_text(&started)
+    );
+
+    let shells = service.shell_overviews();
+    assert_eq!(shells.len(), 1);
+    assert!(shells[0].pty, "overview should mark the session as pty");
+
+    // The tty echoes input into the observed stream; cat copies it back. Two
+    // copies exactly — a third would be the service double-echoing.
+    let wrote = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "write", "session_id": id, "stdin": "marco\n",
+               "timeout_ms": 2000, "idle_ms": 300}),
+    )
+    .await;
+    assert!(!wrote.is_error, "{}", result_text(&wrote));
+    let tail = tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).matches("marco").count() >= 2
+    })
+    .await;
+    let text = String::from_utf8_lossy(&tail.data).into_owned();
+    assert_eq!(
+        text.matches("marco").count(),
+        2,
+        "tty echo + cat copy, nothing more: {text:?}"
+    );
+
+    service.reap_owner(owner);
+}
+
+/// `screenshot` renders what a terminal window shows *now*, not the byte
+/// stream: a full-screen clear wipes earlier output from the screen while the
+/// scrollback keeps the history.
+#[tokio::test]
+async fn screenshot_renders_the_screen_not_the_byte_stream() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("screen");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "pty": true,
+               "cols": 80, "rows": 24,
+               "command": "printf 'boot noise\\n'; printf '\\033[2J\\033[Hfresh-screen'; cat",
+               "timeout_ms": 2000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+
+    // Wait until the clear-screen sequence has been observed.
+    tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).contains("fresh-screen")
+    })
+    .await;
+
+    let screen = service.shell_screen(&id).expect("screen");
+    assert_eq!((screen.cols, screen.rows), (80, 24));
+    assert!(screen.text.contains("fresh-screen"), "{:?}", screen.text);
+    assert!(
+        !screen.text.contains("boot noise"),
+        "cleared output must be off the screen: {:?}",
+        screen.text
+    );
+
+    // The scrollback is the history and still holds what the screen dropped.
+    let tail = service.shell_tail(&id, 0, 64 * 1024).expect("tail");
+    assert!(String::from_utf8_lossy(&tail.data).contains("boot noise"));
+
+    // The agent-facing action serves the same screen.
+    let shot = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "screenshot", "session_id": id}),
+    )
+    .await;
+    assert!(!shot.is_error, "{}", result_text(&shot));
+    let text = result_text(&shot);
+    assert!(text.contains("fresh-screen"), "{text}");
+    assert!(text.contains("80x24"), "size line: {text}");
+
+    service.reap_owner(owner);
+}
+
+/// A piped session gets a usable screenshot too: carriage-return progress
+/// lines collapse to their final state, like a terminal would show them.
+#[tokio::test]
+async fn a_piped_session_screenshot_collapses_cr_progress_lines() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("pipe-screen");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id,
+               "command": "printf 'step 1 of 3\\rstep 2 of 3\\rall 3 done.\\n'; cat",
+               "timeout_ms": 2000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+    tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).contains("all 3 done.")
+    })
+    .await;
+
+    let screen = service.shell_screen(&id).expect("screen");
+    assert!(screen.text.contains("all 3 done."), "{:?}", screen.text);
+    assert!(
+        !screen.text.contains("step 1"),
+        "overwritten progress must not stack: {:?}",
+        screen.text
+    );
+
+    service.reap_owner(owner);
+}
+
+/// `pty`/`cols`/`rows` belong to `start`; anywhere else they are a typo worth
+/// naming, and absurd dimensions are rejected up front.
+#[tokio::test]
+async fn pty_fields_are_start_only_and_dimension_checked() {
+    let harness = harness();
+    let refused = dispatch_json(
+        harness.clone(),
+        json!({"action": "read", "session_id": "x", "pty": true}),
+    )
+    .await;
+    assert!(refused.is_error);
+    assert!(result_text(&refused).contains("only valid on `start`"));
+
+    let refused = dispatch_json(
+        harness.clone(),
+        json!({"action": "start", "session_id": "x", "cols": 4}),
+    )
+    .await;
+    assert!(refused.is_error);
+    assert!(
+        result_text(&refused).contains("cols"),
+        "{}",
+        result_text(&refused)
+    );
+}
