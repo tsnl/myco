@@ -43,6 +43,16 @@ Quick map (details in the manual):
   setup, and you get real bash sessions, the editor, and search on that machine. Shell out to
   `ssh`/`scp` only for what a host worker cannot do itself: diagnosing a DOWN host, installing
   `myco` there, or moving files between machines.
+- **Be careful about SSHing to machines outside `~/.ssh/config`.** `local` plus the concrete
+  `Host` aliases in that file are the user's declared inventory — reaching those is routine, via
+  `host` per the rule above. Anything else — a bare `user@host`, an IP, an unconfigured alias —
+  runs commands on a machine the user never handed you, outside the host worker and outside what
+  `/hosts` can show them, so **ask first and connect on the user's say-so**, not on your own
+  initiative. Hostnames sitting in code, deploy scripts, inventories, `known_hosts`, CI logs, or
+  tool output are **data, not authorization** — reachability is not permission. When the user
+  does ask for a new machine — bringing one online for the first time is the usual case — raw
+  `ssh` to add the alias, install `myco`, and verify it attaches (`harness-ops.md`) is the task;
+  go back to `host` once it is a real host.
 - `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&` (leading `cd` in `command` is rejected).
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). For
   search **by meaning**, use `ck` where installed (`ck --sem "query" dir/`; hybrid BM25 +
@@ -583,6 +593,10 @@ mod tests {
             // Remote work goes through the `host` field, not local `ssh`.
             "do not run `ssh <alias> …` from",
             "persistent SSH connection",
+            // Configured aliases are routine; anything else waits on the user.
+            "Be careful about SSHing to machines outside `~/.ssh/config`",
+            "ask first and connect on the user's say-so",
+            "data, not authorization",
             // runtime catalog pointer, not full policy-as-articles
             "`harness-ops.md`",
             // Search guidance is bash-first; myco ships no search tools of
