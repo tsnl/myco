@@ -612,7 +612,17 @@ fn tool_card(props: &ToolCardProps) -> Html {
     let is_error = status == ToolStatus::Failed;
 
     let result_body = props.result.as_ref().map(|r| {
-        let text = api::content_text(&r.content);
+        // Images render as images (a `view_image` preview belongs on screen,
+        // not as an `[image]` note), so the text preview reads Text parts only.
+        let text = text_parts(&r.content);
+        let images: Vec<Html> = r
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                api::Content::Image { source } => Some(render_image(source)),
+                _ => None,
+            })
+            .collect();
         let total = text.lines().count();
         let shown = if open || total <= RESULT_PREVIEW_LINES {
             text.clone()
@@ -625,7 +635,10 @@ fn tool_card(props: &ToolCardProps) -> Html {
         let hidden = total.saturating_sub(RESULT_PREVIEW_LINES);
         html! {
             <div class="tool-result">
-                <pre class={ if r.is_error { "err" } else { "dim" } }>{ shown }</pre>
+                { if !shown.is_empty() { html! {
+                    <pre class={ if r.is_error { "err" } else { "dim" } }>{ shown }</pre>
+                } } else { html!{} } }
+                { for images.into_iter() }
                 { if !open && hidden > 0 { html! {
                     <button class="linkish" onclick={toggle.clone()}>
                         { format!("+{hidden} more lines") }
@@ -640,7 +653,7 @@ fn tool_card(props: &ToolCardProps) -> Html {
     let foldable = props
         .result
         .as_ref()
-        .is_some_and(|r| api::content_text(&r.content).lines().count() > RESULT_PREVIEW_LINES);
+        .is_some_and(|r| text_parts(&r.content).lines().count() > RESULT_PREVIEW_LINES);
 
     // The DOM id is the jump target for the work rail's running-tool rows.
     html! {
@@ -659,6 +672,30 @@ fn tool_card(props: &ToolCardProps) -> Html {
             { result_body.unwrap_or_else(|| html!{}) }
         </div>
     }
+}
+
+/// An image content block, inline when it is a `data:` URL — the only source
+/// the tools and attachment expansion produce. Anything else stays a note: the
+/// client does not fetch remote URLs on the transcript's say-so.
+fn render_image(source: &str) -> Html {
+    if source.starts_with("data:image/") {
+        html! { <img class="content-image" src={source.to_string()} alt="image" /> }
+    } else {
+        html! { <pre class="dim">{ "[image]" }</pre> }
+    }
+}
+
+/// The `Text` parts of a content run, joined — for bodies that render their
+/// `Image` parts as actual images and must not also print an `[image]` note.
+fn text_parts(content: &[api::Content]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            api::Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A person's message, with `@handles` picked out so a room can see who is
@@ -791,10 +828,22 @@ fn blocks_for_entry(
     out: &mut Vec<Block>,
 ) {
     match &e.body {
-        api::EntryBody::User { content } => out.push(Block {
-            kind: user_turn(&e.author),
-            body: render_prose(&api::content_text(content), me),
-        }),
+        api::EntryBody::User { content } => {
+            let images: Vec<Html> = content
+                .iter()
+                .filter_map(|c| match c {
+                    api::Content::Image { source } => Some(render_image(source)),
+                    _ => None,
+                })
+                .collect();
+            out.push(Block {
+                kind: user_turn(&e.author),
+                body: html! { <>
+                    { render_prose(&text_parts(content), me) }
+                    { for images.into_iter() }
+                </> },
+            })
+        }
         api::EntryBody::Agent {
             content, tool_uses, ..
         } => {
@@ -808,7 +857,7 @@ fn blocks_for_entry(
                             { markdown(if *redacted { "[redacted]" } else { text }) }
                         </div>
                     },
-                    api::Content::Image { .. } => html! { <pre class="dim">{ "[image]" }</pre> },
+                    api::Content::Image { source } => render_image(source),
                 };
                 out.push(Block {
                     kind: TurnKind::Assistant,
