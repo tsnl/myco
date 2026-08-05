@@ -38,9 +38,7 @@ use myco_api::{Author, Entry, EntryBody};
 use myco_auth::AuthStore;
 use myco_config::Config;
 use myco_machines::harness::Harness;
-use myco_machines::tool_services::{
-    ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool, ToolService,
-};
+use myco_machines::tool_services::{PreludeTool, SessionMetaTool, ToolService};
 use myco_models::{
     BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
 };
@@ -379,21 +377,13 @@ impl Server {
         let active = ActiveSession::new(session);
 
         let session_tool = Arc::new(SessionMetaTool::new(active.clone())) as Arc<dyn ToolService>;
-        let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn ToolService>;
-        let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn ToolService>;
         let subagent_tool =
             Arc::new(SubagentTool::new(self.me.clone(), id.clone())) as Arc<dyn ToolService>;
         let prelude_tool =
             Arc::new(PreludeTool::new(self.config.max_prelude_bytes)) as Arc<dyn ToolService>;
         let harness = Harness::attach_with_root_services(
             self.config.harness.clone(),
-            vec![
-                session_tool,
-                history_tool,
-                list_recent_tool,
-                subagent_tool,
-                prelude_tool,
-            ],
+            vec![session_tool, subagent_tool, prelude_tool],
         )
         .await?;
 

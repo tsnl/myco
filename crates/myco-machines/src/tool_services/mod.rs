@@ -22,12 +22,6 @@ pub use view_image_service::ViewImageService;
 pub mod meta_tool_service;
 pub use meta_tool_service::SessionMetaTool;
 
-pub mod session_history_service;
-pub use session_history_service::SessionHistoryTool;
-
-pub mod list_recent_service;
-pub use list_recent_service::ListRecentService;
-
 pub mod prelude_service;
 pub use prelude_service::PreludeTool;
 

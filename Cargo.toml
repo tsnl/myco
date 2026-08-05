@@ -11,6 +11,7 @@ keywords = ["agent", "server", "ssh", "coding"]
 categories = ["development-tools"]
 
 [dependencies]
+uuid = { workspace = true }
 async-trait = { workspace = true }
 myco-core = { workspace = true }
 myco-prompts = { workspace = true }
@@ -23,20 +24,13 @@ myco-api = { workspace = true }
 myco-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 rocket = { workspace = true }
 clap = { workspace = true }
 dotenvy = { workspace = true }
-tokio-util = { workspace = true }
-dirs = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
-rustyline = "15"
-unicode-width = "0.2"
 libc = "0.2.189"
 
 [dev-dependencies]

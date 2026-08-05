@@ -1,575 +1,176 @@
-//! The interactive CLI, rebuilt on the session runtime: `myco` spawns a
-//! [`Server`] in-process, attaches one live session, and drives it
-//! through the same queue and event feed the web server uses.
+//! `myco -p "prompt"`: one agent turn over the HTTP API, answer to stdout.
 //!
-//! The v1 REPL was synchronous — one turn at a time, the prompt gone while
-//! the agent worked. This CLI is **async**: the prompt is always live
-//! (rustyline), agent output streams above it through an external printer,
-//! and lines typed while a turn runs queue as the next turns. Ctrl-C cancels
-//! the in-flight turn; `/exit` leaves (the session stays on disk).
+//! This is a *client*. There is exactly one door into the runtime — the REST
+//! API served by `myco --mode serve` — and this walks through it like the web
+//! GUI and `clients/myco.py` do, authenticating with the operator token the
+//! server writes to `$MYCO_HOME/v2/operator.token`. If no server is running
+//! on the target port, one is spawned (detached) and left running.
 
-use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rustyline::ExternalPrinter;
-use rustyline::error::ReadlineError;
+use myco_api::MycoApi;
 
-use myco_config::{Config, ConfigUserSettings};
-use myco_machines::harness::{StartupPreflight, fatal_startup_check};
-use myco_session::{Session, format_session_detail, format_session_list_line, list_sessions};
+use crate::client::HttpClient;
 
-use crate::server::{Cmd, Live, Server, SessionEvent, entry_text, last_answer};
-use crate::tui::{ConsoleTuiSink, StdoutTuiSink, TuiProducer, TuiSink, encode_ansi};
-use myco_session::ConsoleLog;
-
-const DEFAULT_WRAP_WIDTH: usize = 80;
-
-pub struct CliOptions {
-    pub config_path: Option<std::path::PathBuf>,
-    pub roster_path: Option<std::path::PathBuf>,
+pub struct PrintOptions {
+    pub prompt: String,
+    /// Catalog model key for a fresh session (`None` = server default).
     pub model: Option<String>,
-    /// `Some(None)` = resume most recent; `Some(Some(id))` = resume that id.
-    pub resume: Option<Option<String>>,
-    pub parent_session: Option<String>,
-    pub fork: bool,
-    /// `-p`: one non-interactive turn, answer to stdout, exit.
-    pub print: Option<String>,
+    /// Continue an existing session instead of creating one.
+    pub session: Option<String>,
+    pub port: u16,
 }
 
-/// Terminal sink that prints **above** the live rustyline prompt, so agent
-/// output and the input line coexist — the visible half of the async CLI.
-struct PrinterSink<P: ExternalPrinter + Send> {
-    printer: Mutex<P>,
-    colors: bool,
-}
+/// How long to wait for a just-spawned server to answer (config resolve +
+/// model boot can take a moment on a cold machine).
+const SPAWN_WAIT: Duration = Duration::from_secs(30);
 
-impl<P: ExternalPrinter + Send + Sync> TuiSink for PrinterSink<P> {
-    fn emit(&self, events: &[crate::tui::TuiEvent]) {
-        let text = encode_ansi(events, self.colors);
-        if let Ok(mut p) = self.printer.lock() {
-            let _ = p.print(text);
-        }
-    }
-}
+pub async fn run_print(opts: PrintOptions) -> i32 {
+    let base =
+        std::env::var("MYCO_API").unwrap_or_else(|_| format!("http://127.0.0.1:{}/api", opts.port));
 
-pub async fn run(opts: CliOptions) {
-    let config = match Config::resolve(ConfigUserSettings {
-        config_path: opts.config_path.clone(),
-        roster_path: opts.roster_path.clone(),
-        model: opts.model.clone(),
-    }) {
+    let client = match connect(&base, opts.port).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("myco: {e}");
-            std::process::exit(1);
+            return 1;
         }
     };
-    // Fatal checks first: they end the process, so run them before anything
-    // that would leave a half-built session behind.
-    if let Some(fatal) = fatal_startup_check(config.max_prelude_bytes) {
-        eprintln!("myco: {fatal}");
-        std::process::exit(1);
-    }
-    let preflight = StartupPreflight::run(&config.harness.remote_hosts);
-    let default_model = config.model.clone();
-    let sup = Server::new(config);
 
-    // Initial session: resume, nested child, or fresh.
-    let initial = match (&opts.resume, &opts.parent_session) {
-        (Some(id), _) => {
-            let id = match id {
-                Some(id) => id.clone(),
-                None => match list_sessions(1) {
-                    Ok(entries) if !entries.is_empty() => entries[0].id.clone(),
-                    _ => {
-                        eprintln!("myco: no session to resume");
-                        std::process::exit(1);
-                    }
-                },
-            };
-            match sup.ensure_live(&id, None).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("myco: {e}");
-                    std::process::exit(1);
-                }
+    let session_id = match &opts.session {
+        Some(id) => id.clone(),
+        None => match client
+            .create_session(myco_api::CreateSession {
+                model: opts.model.clone(),
+                parent_session: None,
+                fork: false,
+            })
+            .await
+        {
+            Ok(s) => s.id,
+            Err(e) => {
+                eprintln!("myco: create session: {e}");
+                return 1;
             }
-        }
-        (None, Some(parent)) => {
-            let fresh = match sup.new_child(parent, opts.model.clone(), opts.fork) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("myco: {e}");
-                    std::process::exit(1);
-                }
-            };
-            boot_fresh(&sup, fresh).await
-        }
-        (None, None) => boot_fresh(&sup, Session::new(default_model.clone())).await,
+        },
     };
 
-    if let Some(prompt) = opts.print {
-        run_print(&sup, initial, prompt).await;
-        return;
-    }
-
-    let tty = std::io::stdout().is_terminal();
-    let colors = tty
-        && std::env::var("NO_COLOR").is_err()
-        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
-    let wrap = tty.then_some(DEFAULT_WRAP_WIDTH);
-
-    // Line editor on its own thread; an external printer carries agent
-    // output above the prompt.
-    let mut editor = match rustyline::DefaultEditor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("myco: readline: {e}");
-            std::process::exit(1);
-        }
-    };
-    let terminal: Arc<dyn TuiSink> = match editor.create_external_printer() {
-        Ok(p) => Arc::new(PrinterSink {
-            printer: Mutex::new(p),
-            colors,
-        }),
-        Err(_) => Arc::new(StdoutTuiSink { colors }),
-    };
-
-    let mut live = initial;
-    // Turns queued on the *current* session this run; exit waits for them.
-    let mut submitted: u64 = *live.turns.borrow();
-    let mut producer = make_producer(&live, terminal.clone(), colors, wrap);
-    banner(&producer, &sup, &live, &preflight);
-    let mut pump = spawn_pump(&live, &producer);
-
-    // Input events from the editor thread.
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-    std::thread::spawn(move || {
-        loop {
-            match editor.readline("❯ ") {
-                Ok(line) => {
-                    let _ = editor.add_history_entry(&line);
-                    if line_tx.send(InputEvent::Line(line)).is_err() {
-                        break;
-                    }
-                }
-                Err(ReadlineError::Interrupted) => {
-                    if line_tx.send(InputEvent::CtrlC).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = line_tx.send(InputEvent::Eof);
-                    break;
-                }
-            }
-        }
-    });
-
-    while let Some(event) = line_rx.recv().await {
-        match event {
-            InputEvent::Eof => break,
-            InputEvent::CtrlC => {
-                if live.is_busy() {
-                    live.cancel_turn().await;
-                    producer.cancelled();
-                } else {
-                    producer.note("(Ctrl-C: cancels a running turn; /exit quits)");
-                }
-            }
-            InputEvent::Line(line) => {
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                match parse_meta(&line) {
-                    Some(Meta::Exit) => break,
-                    Some(Meta::Help) => help(&producer),
-                    Some(Meta::Unknown(head)) => {
-                        producer.error_section(&format!("Unknown command: {head}  (try /help)"));
-                    }
-                    Some(Meta::Session) => {
-                        producer.myco_section(&format_session_detail(&live.session.snapshot()));
-                    }
-                    Some(Meta::Sessions) => match list_sessions(20) {
-                        Ok(entries) if entries.is_empty() => producer.myco_section("(no sessions)"),
-                        Ok(entries) => {
-                            let body = entries
-                                .iter()
-                                .enumerate()
-                                .map(|(i, e)| format_session_list_line(i + 1, e))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            producer.myco_section(&body);
-                        }
-                        Err(e) => producer.error_section(&e),
-                    },
-                    Some(Meta::Hosts) => {
-                        let body = live
-                            .harness()
-                            .host_status()
-                            .iter()
-                            .map(|h| {
-                                let state = match (&h.error, h.connected, h.in_process) {
-                                    (Some(e), ..) => format!("DOWN ({e})"),
-                                    (None, _, true) => "ok (in-process)".into(),
-                                    (None, true, _) => "ok".into(),
-                                    (None, false, _) => "idle".into(),
-                                };
-                                format!("{}: {state}", h.name)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        producer.myco_section(&body);
-                    }
-                    Some(Meta::Title(t)) => {
-                        let done = live.session.with_mut(|s| s.set_title(t.clone()));
-                        if let Err(e) = done {
-                            producer.error_section(&e);
-                        }
-                    }
-                    Some(Meta::Archive(archived)) => {
-                        let done = live.session.with_mut(|s| {
-                            s.archived = archived;
-                            s.touch();
-                            s.save()
-                        });
-                        match done {
-                            Ok(()) => producer.note(if archived {
-                                "archived (hidden from /sessions)"
-                            } else {
-                                "unarchived"
-                            }),
-                            Err(e) => producer.error_section(&e),
-                        }
-                    }
-                    Some(Meta::Model(None)) => {
-                        let s = live.session.snapshot();
-                        let mut keys = sup.config().models.keys();
-                        keys.sort_unstable();
-                        producer.myco_section(&format!(
-                            "model: {}\navailable: {}  (/model <key> to switch)",
-                            s.model,
-                            keys.join(", ")
-                        ));
-                    }
-                    Some(Meta::Model(Some(key))) => {
-                        let req = myco_api::UpdateSession {
-                            model: Some(key),
-                            ..Default::default()
-                        };
-                        match sup.update_session(&live.session.id(), req).await {
-                            Ok(s) => {
-                                producer.note(&format!("model → {} (from the next turn)", s.model))
-                            }
-                            Err(e) => producer.error_section(&e.to_string()),
-                        }
-                    }
-                    Some(Meta::Effort(None)) => {
-                        let s = live.session.snapshot();
-                        producer.myco_section(&match s.effort {
-                            Some(e) => format!("effort: {e} (session override)"),
-                            None => "effort: model default \
-                                     (/effort low|medium|high|max to override)"
-                                .into(),
-                        });
-                    }
-                    Some(Meta::Effort(Some(level))) => {
-                        // `default`/`clear` drop the override; the wire spells
-                        // that as an empty string.
-                        let effort = match level.as_str() {
-                            "default" | "clear" => String::new(),
-                            _ => level,
-                        };
-                        let req = myco_api::UpdateSession {
-                            effort: Some(effort),
-                            ..Default::default()
-                        };
-                        match sup.update_session(&live.session.id(), req).await {
-                            Ok(s) => producer.note(&match s.effort {
-                                Some(e) => format!("effort → {e} (from the next turn)"),
-                                None => "effort → model default".into(),
-                            }),
-                            Err(e) => producer.error_section(&e.to_string()),
-                        }
-                    }
-                    Some(Meta::Compact) => {
-                        // Progress note under the current header: the
-                        // COMPACTED banner replaces it on success, and it
-                        // survives on screen (and in the mirror) when the
-                        // worker fails.
-                        producer.note("compacting…");
-                        let _ = live.tx.send(Cmd::Compact { automatic: false });
-                        submitted += 1;
-                    }
-                    Some(Meta::New) => {
-                        pump.abort();
-                        live = boot_fresh(&sup, Session::new(default_model.clone())).await;
-                        submitted = *live.turns.borrow();
-                        producer = make_producer(&live, terminal.clone(), colors, wrap);
-                        banner(&producer, &sup, &live, &preflight);
-                        pump = spawn_pump(&live, &producer);
-                    }
-                    Some(Meta::Resume(id)) => match sup.ensure_live(&id, None).await {
-                        Ok(l) => {
-                            pump.abort();
-                            live = l;
-                            submitted = *live.turns.borrow();
-                            producer = make_producer(&live, terminal.clone(), colors, wrap);
-                            banner(&producer, &sup, &live, &preflight);
-                            producer.replay_history(&live.session.snapshot().entries);
-                            pump = spawn_pump(&live, &producer);
-                        }
-                        Err(e) => producer.error_section(&e),
-                    },
-                    None => {
-                        submit(&sup, &live, &producer, &line);
-                        submitted += 1;
-                    }
-                }
-            }
-        }
-    }
-    // Drain: let in-flight and queued turns finish before quitting, so an
-    // exit right after a submit does not orphan the answer.
-    let mut turns = live.turns.clone();
-    if *turns.borrow() < submitted {
-        eprintln!("(waiting for queued turns…)");
-        while *turns.borrow() < submitted {
-            if turns.changed().await.is_err() {
-                break;
-            }
-        }
-    }
-    pump.abort();
-    println!("session={}", live.session.id());
-}
-
-enum InputEvent {
-    Line(String),
-    CtrlC,
-    Eof,
-}
-
-async fn boot_fresh(sup: &Arc<Server>, fresh: Session) -> Arc<Live> {
-    let id = fresh.id.clone();
-    match sup.ensure_live(&id, Some(fresh)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("myco: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn make_producer(
-    live: &Arc<Live>,
-    terminal: Arc<dyn TuiSink>,
-    colors: bool,
-    wrap: Option<usize>,
-) -> Arc<TuiProducer> {
-    let mirror = Arc::new(ConsoleTuiSink::new(ConsoleLog::new(
-        live.session.clone(),
-        true,
-    )));
-    Arc::new(TuiProducer::new(terminal, mirror, colors, wrap))
-}
-
-fn banner(
-    producer: &Arc<TuiProducer>,
-    sup: &Arc<Server>,
-    live: &Arc<Live>,
-    preflight: &StartupPreflight,
-) {
-    let snapshot = live.session.snapshot();
-    producer.startup_banner(&snapshot.model, &snapshot.id);
-    if preflight.has_problems() {
-        producer.warning_section(&preflight.warning_body());
-    }
-    let _ = sup;
-}
-
-/// Print the USER header (context fill, running tools) and queue the turn.
-fn submit(sup: &Arc<Server>, live: &Arc<Live>, producer: &Arc<TuiProducer>, line: &str) {
-    let snapshot = live.session.snapshot();
-    let max = sup
-        .config()
-        .models
-        .get(&snapshot.model)
-        .map(|m| m.spec.context_window_tokens)
-        .unwrap_or(0);
-    let used = match snapshot.last_usage {
-        Some(u) => Some(u.context_tokens()),
-        None if snapshot.entries.is_empty() => Some(0),
-        None => None,
-    };
-    let running = live.harness().running_tool_summaries(uuid::Uuid::nil());
-    producer.user_header(used, max, snapshot.last_usage, &running);
-    producer.submitted_input(line);
-    // The CLI is a private line by construction: one operator at the keyboard,
-    // so every line is addressed to the agent.
-    let _ = live.tx.send(Cmd::User {
-        entry: sup.compose(
-            crate::server::local_author(sup.config()),
-            line,
-            &snapshot.model,
-        ),
-    });
-}
-
-/// Forward the session's event feed into the terminal renderer.
-fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::JoinHandle<()> {
-    use myco_agent::EventSink;
-    let mut rx = live.subscribe();
-    let producer = producer.clone();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(SessionEvent::Agent(e)) => producer.emit(e),
-                Ok(SessionEvent::TurnFailed { message }) => producer.error_section(&message),
-                Ok(SessionEvent::Compacted { outcome }) => {
-                    producer.compacted_banner(&outcome);
-                    // The banner ends flush; the gap before the next USER
-                    // rule is the caller's, matching startup.
-                    producer.blank_line();
-                }
-                // The operator's own line is already on screen (echoed at
-                // submit); anything else posted into this session is somebody
-                // joining, and belongs in the terminal.
-                Ok(SessionEvent::Message { entry, .. }) => {
-                    if let myco_api::Author::User { name, .. } = &entry.author {
-                        producer.person_section(name, &entry_text(&entry));
-                    }
-                }
-                Ok(SessionEvent::TurnStarted) | Ok(SessionEvent::TurnFinished) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    })
-}
-
-async fn run_print(sup: &Arc<Server>, live: Arc<Live>, prompt: String) {
-    let mut turns = live.turns.clone();
-    let start = *turns.borrow();
-    let model = live.session.snapshot().model;
-    if live
-        .tx
-        .send(Cmd::User {
-            entry: sup.compose(crate::server::local_author(sup.config()), &prompt, &model),
-        })
-        .is_err()
+    if let Err(e) = client
+        .post_message(
+            &session_id,
+            myco_api::PostMessage {
+                text: opts.prompt.clone(),
+            },
+        )
+        .await
     {
-        eprintln!("myco: agent task gone");
-        std::process::exit(1);
+        eprintln!("myco: send: {e}");
+        return 1;
     }
-    loop {
-        if turns.changed().await.is_err() {
-            eprintln!("myco: agent task gone");
-            std::process::exit(1);
+
+    // Poll until the turn settles. No overall deadline: a long build is the
+    // agent working, not a hang — Ctrl-C is the escape hatch.
+    let final_poll = loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match client.poll(&session_id, 0).await {
+            Ok(p) if !p.busy => break p,
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("myco: poll: {e}");
+                return 1;
+            }
         }
-        if *turns.borrow() > start {
-            break;
-        }
-    }
-    eprintln!("session={}", live.session.id());
-    if let Some(err) = live.error() {
+    };
+
+    eprintln!("session={session_id}");
+    if let Some(err) = &final_poll.last_error {
         eprintln!("myco: {err}");
-        std::process::exit(1);
+        return 1;
     }
-    match last_answer(&live.session.snapshot().entries) {
+    match crate::server::last_answer(&final_poll.entries) {
         Some(text) => println!("{text}"),
         None => eprintln!("(no answer text)"),
     }
+    0
 }
 
-enum Meta {
-    Help,
-    Exit,
-    New,
-    Session,
-    Sessions,
-    Hosts,
-    Resume(String),
-    Title(Option<String>),
-    Compact,
-    /// `true` = archive, `false` = unarchive.
-    Archive(bool),
-    /// `/model` shows the current model and the catalog; `/model <key>`
-    /// switches this session (applies from the next turn).
-    Model(Option<String>),
-    /// `/effort` shows; `/effort <level>` sets the session override;
-    /// `/effort default` clears it back to the model's configured effort.
-    Effort(Option<String>),
-    /// Input that starts like a command (`/…`) but names none — reported as
-    /// an ERROR section, never sent to the model.
-    Unknown(String),
+/// An authenticated client for `base`, spawning a local server when nothing
+/// answers there and `base` is this machine's default endpoint.
+async fn connect(base: &str, port: u16) -> Result<HttpClient, String> {
+    if let Ok(client) = authed(base).await {
+        return Ok(client);
+    }
+
+    let local_default = base == format!("http://127.0.0.1:{port}/api");
+    if !local_default {
+        return Err(format!(
+            "no myco server answering at {base} (is it running, and does \
+             operator.token match it?)"
+        ));
+    }
+
+    spawn_server(port)?;
+    let deadline = std::time::Instant::now() + SPAWN_WAIT;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Ok(client) = authed(base).await {
+            return Ok(client);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "spawned `myco --mode serve --port {port}` but it never answered; \
+                 check `{}`",
+                server_log_path().display()
+            ));
+        }
+    }
 }
 
-/// Parse only — no printing. Rendering happens in the REPL loop, which is
-/// what keeps every command response under a headed block.
-fn parse_meta(input: &str) -> Option<Meta> {
-    let (head, rest) = match input.split_once(char::is_whitespace) {
-        Some((h, r)) => (h, Some(r.trim())),
-        None => (input, None),
+/// A client whose token the server actually accepts (`whoami` proves both
+/// reachability and that operator.token is this server's, not a stale one).
+async fn authed(base: &str) -> Result<HttpClient, String> {
+    let token = match std::env::var("MYCO_API_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            let path = crate::web::operator_token_path()?;
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?
+                .trim()
+                .to_string()
+        }
     };
-    let cmd = head.strip_prefix('/')?;
-    match (cmd, rest) {
-        ("help", _) => Some(Meta::Help),
-        ("exit" | "quit", _) => Some(Meta::Exit),
-        ("new", _) => Some(Meta::New),
-        ("session", _) => Some(Meta::Session),
-        ("sessions", _) => Some(Meta::Sessions),
-        ("hosts", _) => Some(Meta::Hosts),
-        ("compact", _) => Some(Meta::Compact),
-        ("archive", _) => Some(Meta::Archive(true)),
-        ("unarchive", _) => Some(Meta::Archive(false)),
-        ("resume", Some(id)) if !id.is_empty() => Some(Meta::Resume(id.to_string())),
-        ("resume", _) => Some(Meta::Help),
-        ("model", k) => Some(Meta::Model(
-            k.map(|s| s.to_string()).filter(|s| !s.is_empty()),
-        )),
-        ("effort", e) => Some(Meta::Effort(
-            e.map(|s| s.to_string()).filter(|s| !s.is_empty()),
-        )),
-        ("title", t) => Some(Meta::Title(
-            t.map(|s| s.to_string()).filter(|s| !s.is_empty()),
-        )),
-        _ => Some(Meta::Unknown(head.to_string())),
-    }
+    let client = HttpClient::new(base, token);
+    client.whoami().await.map_err(|e| e.to_string())?;
+    Ok(client)
 }
 
-fn help(producer: &Arc<TuiProducer>) {
-    producer.myco_section(
-        "/new /resume <id> /sessions /session /title [text] /archive /unarchive \
-         /model [key] /effort [low|medium|high|max|default] /compact /hosts \
-         /exit — input queues while a turn runs; Ctrl-C cancels the running turn",
-    );
+fn server_log_path() -> std::path::PathBuf {
+    myco_core::data_root()
+        .map(|d| d.join("serve.log"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("myco-serve.log"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_meta_reports_unknown_commands_instead_of_printing() {
-        assert!(matches!(parse_meta("/help"), Some(Meta::Help)));
-        assert!(matches!(parse_meta("/sessions"), Some(Meta::Sessions)));
-        assert!(matches!(parse_meta("/archive"), Some(Meta::Archive(true))));
-        assert!(matches!(
-            parse_meta("/unarchive"),
-            Some(Meta::Archive(false))
-        ));
-        // A typo'd command surfaces as Unknown (→ ERROR section in the REPL
-        // loop) and is never sent to the model.
-        assert!(matches!(parse_meta("/hlep"), Some(Meta::Unknown(h)) if h == "/hlep"));
-        assert!(matches!(
-            parse_meta("/bogus with args"),
-            Some(Meta::Unknown(h)) if h == "/bogus"
-        ));
-        // Plain prose is not a command — it goes to the model.
-        assert!(parse_meta("hello world").is_none());
-        assert!(parse_meta("help").is_none());
-    }
+/// Spawn `myco --mode serve` detached (own process group, output to a log
+/// file) and leave it running — the next `-p`, the GUI, and scripts all get
+/// to reuse it.
+fn spawn_server(port: u16) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(server_log_path())
+        .map_err(|e| format!("open serve log: {e}"))?;
+    eprintln!("myco: no server on port {port}; starting one");
+    std::process::Command::new(exe)
+        .args(["--mode", "serve", "--port", &port.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            log.try_clone().map_err(|e| e.to_string())?,
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("spawn serve: {e}"))?;
+    Ok(())
 }

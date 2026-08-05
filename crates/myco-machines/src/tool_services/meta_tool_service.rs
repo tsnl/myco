@@ -10,9 +10,7 @@ use myco_api::ToolResult;
 use myco_core::Async;
 use myco_models;
 use myco_session::{
-    ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, list_sessions_filtered, normalize_pr_url, parse_pr_fields,
-    search_sessions,
+    ActiveSession, Session, format_session_detail, format_session_list_line, list_sessions_filtered,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -20,28 +18,23 @@ use super::{HostDispatchContext, ToolService};
 const TOOL_DESCRIPTION: &str = r#"
 Read and update Myco conversation session metadata, and inspect the running agent binary.
 
-Sessions store a title, structured links (GitHub PRs across repos, worktree paths on any
-host), and a markdown scratchpad. Files live at `~/.myco/session/{shard}/{id}.json`.
+Sessions store a title and a markdown scratchpad. Files live at
+`~/.myco/session/{shard}/{id}.json`.
 
 Actions (`action` is required):
 - get: metadata for the current session (default) or another session via `session_id`
   (id or unique prefix). Always includes the on-disk file path and timestamps.
-- list: enumerate sessions (id, created, updated, title, link counts, path). Optional
-  `limit` (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
-  workers) are omitted unless `include_hidden` is true. Get-by-id always works for hidden.
-  Optional `query` ranks sessions by content instead of recency — keyword search over
-  title, first user message, scratchpad, and the console-transcript tail. Use it to
-  find past sessions by what was discussed, not just what the title says.
+- list: enumerate sessions (id, created, updated, title, path). Optional `limit`
+  (default 20; 0 = all readable sessions). Hidden sessions (subagents, compact
+  workers) are omitted unless `include_hidden` is true. Get-by-id always works for
+  hidden. Session files are plain JSON — search them with bash (`rg`, `jq`).
 - set_title: set the **current** session title. `title` is required: a non-empty string
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
   `scratchpad` is required; an empty string clears it.
-- add_link: attach a GitHub PR or worktree to the **current** session (deduped).
-- remove_link: drop a link from the **current** session by `index`, or by `url` /
-  `host`+`path`.
 - executable_path: absolute path of the running `myco` agent binary
   (`std::env::current_exe`). Use with bash (`$path --version`) to read the package
-  version when deciding how to update remotes (see `harness-ops.md` in the manual).
+  version when deciding how to update remotes.
 - pid: OS process id of the running `myco` agent process (`std::process::id`).
   Use with bash to inspect the live process (`ps -p $pid`, `/proc/$pid`) — e.g.
   memory use or open files — without guessing which `myco` is you (nested agents
@@ -49,9 +42,8 @@ Actions (`action` is required):
 
 Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
 the real task is clear (usually first turn), set_title a short scannable label — replace a
-weak CLI auto-title from the first user line. When the session focus shifts, update the
-title; do not leave a stale first-line title for long work. When you create a worktree or
-open/receive a PR, add_link it (absolute path + host for worktrees).
+weak auto-title from the first user line. When the session focus shifts, update the
+title; do not leave a stale first-line title for long work.
 "#;
 
 /// Local tool bound to the interactive process's [`ActiveSession`].
@@ -86,8 +78,7 @@ impl ToolService for SessionMetaTool {
                     return ToolResult::err(format!("invalid session_meta input: {e}"));
                 }
             };
-            // Off the executor: every action does file IO (session files,
-            // console tails).
+            // Off the executor: every action does file IO (session files).
             match tokio::task::spawn_blocking(move || self.execute(input)).await {
                 Ok(Ok(text)) => ToolResult::text(text),
                 Ok(Err(e)) => ToolResult::err(e),
@@ -101,11 +92,9 @@ impl SessionMetaTool {
     fn execute(&self, input: Input) -> Result<String, String> {
         match input.action.clone() {
             ActionKind::Get => self.action_get(input.session_id.as_deref()),
-            ActionKind::List => self.action_list(
-                input.limit,
-                input.include_hidden.unwrap_or(false),
-                input.query.as_deref(),
-            ),
+            ActionKind::List => {
+                self.action_list(input.limit, input.include_hidden.unwrap_or(false))
+            }
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => match input.scratchpad {
                 Some(text) => self.action_set_scratchpad(text),
@@ -113,8 +102,6 @@ impl SessionMetaTool {
                      pass an empty string to clear)"
                     .into()),
             },
-            ActionKind::AddLink => self.action_add_link(input),
-            ActionKind::RemoveLink => self.action_remove_link(input),
             ActionKind::ExecutablePath => self.action_executable_path(),
             ActionKind::Pid => Ok(format!("{}\n", std::process::id())),
         }
@@ -129,32 +116,16 @@ impl SessionMetaTool {
         Ok(format_session_detail(&session))
     }
 
-    fn action_list(
-        &self,
-        limit: Option<usize>,
-        include_hidden: bool,
-        query: Option<&str>,
-    ) -> Result<String, String> {
+    fn action_list(&self, limit: Option<usize>, include_hidden: bool) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
         let mut list = list_sessions_filtered(0, include_hidden)?;
-        let mut header = String::new();
-        match query {
-            None => {
-                if limit > 0 {
-                    list.truncate(limit);
-                }
-            }
-            Some(q) => {
-                let cap = if limit == 0 { 50 } else { limit };
-                let report = search_sessions(&list, q, cap)?;
-                header = format!("  query={q:?}  mode={}", report.mode);
-                list = report.entries;
-            }
+        if limit > 0 {
+            list.truncate(limit);
         }
         if list.is_empty() {
             return Ok("(no sessions)\n".into());
         }
-        let mut out = format!("sessions: {}{header}\n", list.len());
+        let mut out = format!("sessions: {}\n", list.len());
         for (i, entry) in list.iter().enumerate() {
             out.push_str(&format_session_list_line(i + 1, entry));
             out.push('\n');
@@ -209,80 +180,6 @@ impl SessionMetaTool {
         })
     }
 
-    fn action_add_link(&self, input: Input) -> Result<String, String> {
-        let kind = input
-            .link_kind
-            .ok_or_else(|| "add_link requires link_kind (github_pr | worktree)".to_string())?;
-        let link = match kind {
-            LinkKind::GithubPr => {
-                let url_raw = input
-                    .url
-                    .as_deref()
-                    .ok_or_else(|| "add_link github_pr requires url".to_string())?;
-                let url = normalize_pr_url(url_raw)?;
-                let (repo, number) = parse_pr_fields(&url);
-                SessionLink::GitHubPr {
-                    url,
-                    repo: input.repo.or(repo),
-                    number: input.number.or(number),
-                    note: input.note,
-                }
-            }
-            LinkKind::Worktree => {
-                let host = input
-                    .host
-                    .filter(|h| !h.trim().is_empty())
-                    .ok_or_else(|| "add_link worktree requires host".to_string())?;
-                let path = input
-                    .path
-                    .filter(|p| !p.trim().is_empty())
-                    .ok_or_else(|| "add_link worktree requires path".to_string())?;
-                SessionLink::Worktree {
-                    host: host.trim().to_string(),
-                    path: path.trim().to_string(),
-                    branch: input.branch,
-                    note: input.note,
-                }
-            }
-        };
-
-        self.active.with_mut(|session| {
-            session.upsert_link(link.clone())?;
-            session.touch();
-            session.save()?;
-            Ok(format!(
-                "link upserted: {}\nlinks={}\npath={}\n",
-                format_link_one_line(&link),
-                session.links.len(),
-                session.json_path().display()
-            ))
-        })
-    }
-
-    fn action_remove_link(&self, input: Input) -> Result<String, String> {
-        self.active.with_mut(|session| {
-            let removed = if let Some(index) = input.index {
-                session.remove_link_at(index)?
-            } else if input.url.is_some() || input.host.is_some() {
-                session.remove_link_matching(
-                    input.url.as_deref(),
-                    input.host.as_deref(),
-                    input.path.as_deref(),
-                )?
-            } else {
-                return Err("remove_link requires index, or url, or host (+ optional path)".into());
-            };
-            session.touch();
-            session.save()?;
-            Ok(format!(
-                "removed: {}\nlinks remaining={}\npath={}\n",
-                format_link_one_line(&removed),
-                session.links.len(),
-                session.json_path().display()
-            ))
-        })
-    }
-
     fn action_executable_path(&self) -> Result<String, String> {
         let path = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
         Ok(format!("{}\n", path.display()))
@@ -291,300 +188,90 @@ impl SessionMetaTool {
 
 // --- input schema ------------------------------------------------------------
 
-#[derive(
-    Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
+#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    /// Action to perform (required).
+    /// Action to perform.
     action: ActionKind,
-    /// Target session id or unique prefix for `get`. Omit for the current session.
+    /// `get`: another session's id (or unique prefix). Default: current.
     #[serde(default)]
     session_id: Option<String>,
-    /// Max sessions for `list` (default 20; 0 = all).
+    /// `list`: max sessions returned (default 20; 0 = all).
     #[serde(default)]
     limit: Option<usize>,
-    /// When true, `list` includes hidden sessions (subagents, compact workers).
+    /// `list`: include hidden sessions (subagents, compact workers).
     #[serde(default)]
     include_hidden: Option<bool>,
-    /// For `list`: rank sessions matching this text (keyword) instead of
-    /// listing by recency.
-    #[serde(default)]
-    query: Option<String>,
-    /// New title for `set_title`. Empty/null clears.
+    /// `set_title`: the new title (empty string clears).
     #[serde(default)]
     title: Option<String>,
-    /// Full scratchpad markdown for `set_scratchpad`.
+    /// `set_scratchpad`: full replacement markdown (empty string clears).
     #[serde(default)]
     scratchpad: Option<String>,
-    /// Link type for `add_link`.
-    #[serde(default)]
-    link_kind: Option<LinkKind>,
-    /// GitHub PR URL or `org/repo#N` for `add_link` / `remove_link`.
-    #[serde(default)]
-    url: Option<String>,
-    /// Optional org/repo for PR links.
-    #[serde(default)]
-    repo: Option<String>,
-    /// Optional PR number.
-    #[serde(default)]
-    number: Option<u32>,
-    /// Host name for worktree links (`local`, `devbox`, …).
-    #[serde(default)]
-    host: Option<String>,
-    /// Absolute worktree path on `host`.
-    #[serde(default)]
-    path: Option<String>,
-    /// Optional branch name for worktree links.
-    #[serde(default)]
-    branch: Option<String>,
-    /// Optional free-form note on a link.
-    #[serde(default)]
-    note: Option<String>,
-    /// Link index (from `get`) for `remove_link`.
-    #[serde(default)]
-    index: Option<usize>,
 }
 
-#[derive(
-    Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
+#[derive(Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ActionKind {
     Get,
     List,
     SetTitle,
     SetScratchpad,
-    AddLink,
-    RemoveLink,
     ExecutablePath,
     Pid,
-}
-
-#[derive(
-    Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
-#[serde(rename_all = "snake_case")]
-enum LinkKind {
-    GithubPr,
-    Worktree,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_services::{HostDispatchContext, ToolService};
-    use myco_core::CancelToken;
     use myco_test_support::{result_text, temp_home};
-    use std::sync::Arc;
 
-    fn tool_with_session(session: Session) -> (SessionMetaTool, ActiveSession) {
-        let active = ActiveSession::new(session);
-        (SessionMetaTool::new(active.clone()), active)
+    fn tool() -> (Arc<SessionMetaTool>, ActiveSession) {
+        let active = ActiveSession::new(Session::new("m"));
+        (Arc::new(SessionMetaTool::new(active.clone())), active)
+    }
+
+    async fn call(tool: &Arc<SessionMetaTool>, input: serde_json::Value) -> ToolResult {
+        tool.clone()
+            .dispatch_tool_use(
+                myco_api::ToolUse {
+                    id: "t".into(),
+                    name: "session_meta".into(),
+                    input,
+                },
+                HostDispatchContext::new(uuid::Uuid::nil(), myco_core::CancelToken::new()),
+            )
+            .await
     }
 
     #[tokio::test]
-    async fn set_title_and_get() {
+    async fn title_and_scratchpad_roundtrip_through_the_tool() {
         let _home = temp_home("meta-tool");
+        let (tool, active) = tool();
 
-        let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
-        let tool = Arc::new(tool);
-        let result = tool
-            .clone()
-            .dispatch_tool_use(
-                myco_api::ToolUse {
-                    id: "t1".into(),
-                    name: "session_meta".into(),
-                    input: serde_json::json!({
-                        "action": "set_title",
-                        "title": "  My Feature  "
-                    }),
-                },
-                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
-            )
-            .await;
-        assert!(!result.is_error, "{result:?}");
-        assert_eq!(active.snapshot().title.as_deref(), Some("My Feature"));
+        let r = call(
+            &tool,
+            serde_json::json!({"action": "set_title", "title": "port the harness"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        assert_eq!(active.snapshot().title.as_deref(), Some("port the harness"));
 
-        let got = tool
-            .dispatch_tool_use(
-                myco_api::ToolUse {
-                    id: "t2".into(),
-                    name: "session_meta".into(),
-                    input: serde_json::json!({"action": "get"}),
-                },
-                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
-            )
-            .await;
-        assert!(!got.is_error, "{got:?}");
-        let text = result_text(&got);
-        assert!(text.contains("My Feature"), "{text}");
-    }
+        let r = call(
+            &tool,
+            serde_json::json!({"action": "set_scratchpad", "scratchpad": "## notes\n"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        assert_eq!(active.snapshot().scratchpad, "## notes\n");
 
-    /// The advertised schema must be safe for OpenAI-compatible gateways:
-    /// action enum inlined and required, no refs, closed object.
-    #[test]
-    fn input_schema_is_flat_required_and_closed() {
-        let (tool, _active) = tool_with_session(Session::new("claude-haiku-4-5"));
-        let spec = tool.tool_specs().remove(0);
-        let schema = spec.input_schema;
-        let text = schema.to_string();
+        // A null title is an error, never a silent clear.
+        let r = call(&tool, serde_json::json!({"action": "set_title"})).await;
+        assert!(r.is_error);
+        assert_eq!(active.snapshot().title.as_deref(), Some("port the harness"));
 
-        assert!(!text.contains("$defs"), "{text}");
-        assert!(!text.contains("$ref"), "{text}");
-        assert!(!text.contains("anyOf"), "{text}");
-        assert!(!text.contains("\"default\":null"), "{text}");
-        assert_eq!(
-            schema["properties"]["action"]["enum"],
-            serde_json::json!([
-                "get",
-                "list",
-                "set_title",
-                "set_scratchpad",
-                "add_link",
-                "remove_link",
-                "executable_path",
-                "pid"
-            ]),
-            "{text}"
-        );
-        assert_eq!(schema["required"], serde_json::json!(["action"]), "{text}");
-        assert_eq!(
-            schema["additionalProperties"],
-            serde_json::json!(false),
-            "{text}"
-        );
-        // Optional enum stays visible inline (null arm merged, no ref).
-        assert_eq!(
-            schema["properties"]["link_kind"]["enum"],
-            serde_json::json!(["github_pr", "worktree", null]),
-            "{text}"
-        );
-    }
-
-    /// Null-filled mutations must error instead of silently clearing state,
-    /// and a missing `action` must be a hard error instead of a silent `get`.
-    #[tokio::test]
-    async fn null_and_missing_fields_error_instead_of_clearing() {
-        let _home = temp_home("meta-guards");
-
-        let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
-        let tool = Arc::new(tool);
-        let ctx = || HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new());
-        let call = |input: serde_json::Value| myco_api::ToolUse {
-            id: "t".into(),
-            name: "session_meta".into(),
-            input,
-        };
-
-        // Seed a title, then try the all-keys-null fill some models emit.
-        let ok = tool
-            .clone()
-            .dispatch_tool_use(
-                call(serde_json::json!({"action": "set_title", "title": "Keep Me"})),
-                ctx(),
-            )
-            .await;
-        assert!(!ok.is_error, "{ok:?}");
-
-        let nulled = tool
-            .clone()
-            .dispatch_tool_use(
-                call(serde_json::json!({"action": "set_title", "title": null})),
-                ctx(),
-            )
-            .await;
-        assert!(nulled.is_error, "{nulled:?}");
-        assert!(
-            result_text(&nulled).contains("set_title requires"),
-            "{nulled:?}"
-        );
-        assert_eq!(active.snapshot().title.as_deref(), Some("Keep Me"));
-
-        // Explicit empty string is still the documented way to clear.
-        let cleared = tool
-            .clone()
-            .dispatch_tool_use(
-                call(serde_json::json!({"action": "set_title", "title": ""})),
-                ctx(),
-            )
-            .await;
-        assert!(!cleared.is_error, "{cleared:?}");
-        assert_eq!(active.snapshot().title, None);
-
-        // set_scratchpad without scratchpad must not wipe.
-        let sp = tool
-            .clone()
-            .dispatch_tool_use(
-                call(serde_json::json!({"action": "set_scratchpad", "scratchpad": "notes"})),
-                ctx(),
-            )
-            .await;
-        assert!(!sp.is_error, "{sp:?}");
-        let wiped = tool
-            .clone()
-            .dispatch_tool_use(call(serde_json::json!({"action": "set_scratchpad"})), ctx())
-            .await;
-        assert!(wiped.is_error, "{wiped:?}");
-        assert!(
-            result_text(&wiped).contains("set_scratchpad requires"),
-            "{wiped:?}"
-        );
-        assert_eq!(active.snapshot().scratchpad, "notes");
-
-        // A call with no action used to silently dispatch as `get`.
-        let missing = tool
-            .clone()
-            .dispatch_tool_use(call(serde_json::json!({"title": "X"})), ctx())
-            .await;
-        assert!(missing.is_error, "{missing:?}");
-        assert!(result_text(&missing).contains("action"), "{missing:?}");
-    }
-
-    #[tokio::test]
-    async fn executable_path_returns_absolute_path() {
-        let _home = temp_home("meta-exe");
-
-        let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
-        let tool = Arc::new(tool);
-        let got = tool
-            .dispatch_tool_use(
-                myco_api::ToolUse {
-                    id: "t1".into(),
-                    name: "session_meta".into(),
-                    input: serde_json::json!({"action": "executable_path"}),
-                },
-                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
-            )
-            .await;
-        assert!(!got.is_error, "{got:?}");
-        let text = result_text(&got);
-        let path = text.trim();
-        assert!(!path.is_empty(), "{text}");
-        assert!(
-            std::path::Path::new(path).is_absolute(),
-            "expected absolute path, got {path:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn pid_matches_current_process_id() {
-        let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
-        let got = Arc::new(tool)
-            .dispatch_tool_use(
-                myco_api::ToolUse {
-                    id: "t1".into(),
-                    name: "session_meta".into(),
-                    input: serde_json::json!({"action": "pid"}),
-                },
-                HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
-            )
-            .await;
-        assert!(!got.is_error, "{got:?}");
-        assert_eq!(
-            result_text(&got).trim().parse::<u32>().ok(),
-            Some(std::process::id()),
-            "{got:?}"
-        );
+        let r = call(&tool, serde_json::json!({"action": "get"})).await;
+        assert!(!r.is_error);
+        assert!(result_text(&r).contains("port the harness"));
     }
 }

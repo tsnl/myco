@@ -41,7 +41,6 @@ pub fn compact_session(
 
     let mut successor = Session::new(model);
     successor.title = predecessor.title.clone();
-    successor.links = predecessor.links.clone();
     successor.scratchpad = predecessor.scratchpad.clone();
     successor.predecessor_id = Some(predecessor.id.clone());
     // Nested (hidden) sessions stay nested across compaction; user sessions stay user.

@@ -22,12 +22,7 @@ pub use myco_config::harness::{
 pub use crate::host::{HostConfig, HostController};
 
 mod preflight;
-pub use preflight::{
-    ExecutableCheckReport, StartupPreflight, check_expected_executables, fatal_startup_check,
-};
-
-mod ssh;
-pub use ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};
+pub use preflight::{fatal_startup_check, prelude_warning};
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -612,8 +607,11 @@ mod tests {
         );
     }
 
+    /// Root-only tools run on the in-process local worker and keep their
+    /// schema verbatim: routing must not inject its `host` field into a tool
+    /// that never routes.
     #[tokio::test]
-    async fn root_only_tools_keep_host_field_and_run_local() {
+    async fn root_only_tools_keep_their_schema_and_run_local() {
         use crate::tool_services::SessionMetaTool;
         use myco_session::{ActiveSession, Session};
 
@@ -623,43 +621,25 @@ mod tests {
         let meta = Arc::new(SessionMetaTool::new(active.clone())) as Arc<dyn ToolService>;
         let harness = Harness::local_with_services(vec![meta]);
 
-        // Schema must keep session_meta's own `host` (worktree links), not dual-purpose routing.
         let meta_spec = harness
             .tool_specs()
             .into_iter()
             .find(|s| s.name == "session_meta")
             .expect("session_meta advertised");
-        let host_desc = meta_spec.input_schema["properties"]["host"]["description"]
-            .as_str()
-            .unwrap_or("");
         assert!(
-            host_desc.contains("worktree") || host_desc.contains("Host name"),
-            "session_meta host should describe worktree links, got {host_desc:?}"
-        );
-        // Routing-only description is only for multi-host tools.
-        assert!(
-            !host_desc.contains("defaults to \"local\""),
-            "routing host description should not overwrite session_meta: {host_desc}"
+            meta_spec.input_schema["properties"]["host"].is_null(),
+            "root-only schemas must not grow a routing host field: {:?}",
+            meta_spec.input_schema
         );
 
         let result = call(
             &harness,
             "session_meta",
-            json!({
-                "action": "add_link",
-                "link_kind": "worktree",
-                "host": "devbox",
-                "path": "/tmp/wt",
-                "branch": "feat/x"
-            }),
+            json!({"action": "set_title", "title": "routed to local"}),
         )
         .await;
         assert!(!result.is_error, "{result:?}");
-        let text = result_text(&result);
-        assert!(text.contains("devbox"), "{text}");
-        assert!(text.contains("/tmp/wt"), "{text}");
-        let links = active.snapshot().links;
-        assert_eq!(links.len(), 1);
+        assert_eq!(active.snapshot().title.as_deref(), Some("routed to local"));
     }
 
     // Bash execution on the in-process local host is
