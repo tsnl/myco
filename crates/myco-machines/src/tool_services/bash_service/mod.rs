@@ -513,6 +513,7 @@ impl BashService {
             buffer: Mutex::new(OutputBuffer::default()),
             notify: Notify::new(),
             generation: AtomicU64::new(0),
+            scroll: Mutex::new(Scrollback::default()),
         });
 
         // Reader tasks push into the shared buffer and notify waiters.
@@ -528,6 +529,7 @@ impl BashService {
             created_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
             pid,
+            lock: Mutex::new(ShellLock::Assistant),
         };
 
         {
@@ -583,6 +585,9 @@ impl BashService {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return myco_api::ToolResult::err(e);
         }
+        if let Err(e) = self.ensure_agent_writable(session_id) {
+            return myco_api::ToolResult::err(e);
+        }
         if let Err(e) = self.write_to_session(session_id, stdin).await {
             return myco_api::ToolResult::err(e);
         }
@@ -633,6 +638,9 @@ impl BashService {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return myco_api::ToolResult::err(e);
         }
+        if let Err(e) = self.ensure_agent_writable(session_id) {
+            return myco_api::ToolResult::err(e);
+        }
         let pid = {
             let sessions = self.sessions();
             let Some(session) = sessions.get(session_id) else {
@@ -679,6 +687,9 @@ impl BashService {
     }
 
     async fn session_close(&self, session_id: &str, owner: Uuid) -> myco_api::ToolResult {
+        if let Err(e) = self.ensure_agent_writable(session_id) {
+            return myco_api::ToolResult::err(e);
+        }
         let session = {
             let mut sessions = self.sessions();
             match sessions.get(session_id) {
@@ -769,6 +780,25 @@ impl BashService {
         Ok(())
     }
 
+    /// Agent-side write gate: an error while the user holds the keyboard.
+    /// `read` and `list` are deliberately not gated — watching is always fine.
+    fn ensure_agent_writable(&self, session_id: &str) -> Result<(), String> {
+        let sessions = self.sessions();
+        let Some(session) = sessions.get(session_id) else {
+            // Unknown-session reporting belongs to the action itself.
+            return Ok(());
+        };
+        match *lock_unpoisoned(&session.lock) {
+            ShellLock::Assistant => Ok(()),
+            ShellLock::User => Err(format!(
+                "session {session_id:?} is user-locked: the user is typing into this shell \
+                 right now, so write/signal/close are theirs until they hand the keyboard \
+                 back. `read` still works, and what they type is echoed to you as messages — \
+                 work with them, not over them."
+            )),
+        }
+    }
+
     /// Synchronously kill and drop every session owned by `owner`.
     /// Called from `on_agent_finished` / `Agent::drop` — must not await.
     fn reap_owner(&self, owner: Uuid) {
@@ -846,6 +876,10 @@ impl BashService {
                 *t = Instant::now();
             }
         }
+        // Echo the input into the observer scrollback: a piped child has no
+        // pty to echo keystrokes, so without this a watched terminal would
+        // show answers to invisible questions — whichever side typed them.
+        lock_unpoisoned(&shared.scroll).push(data.as_bytes());
         shared.notify.notify_waiters();
         Ok(())
     }
@@ -856,6 +890,101 @@ impl BashService {
             return;
         };
         *lock_unpoisoned(&session.stdin) = Some(stdin);
+    }
+
+    // --- observer surface (the web terminal) --------------------------------
+    //
+    // Everything below is for a *person watching or driving* a session, not
+    // for the agent: reads come from the non-consuming scrollback, writes are
+    // gated on the keyboard lock, and none of it disturbs the agent's own
+    // drain buffer. Local host only by design — the NDJSON host protocol has
+    // no shell-observer messages, and the brains/hands doctrine keeps the
+    // interactive surface on the machine the user is signed into.
+
+    /// One session as the shells rail lists it.
+    pub fn shell_overviews(&self) -> Vec<ShellOverview> {
+        let sessions = self.sessions();
+        let mut out: Vec<ShellOverview> = sessions
+            .iter()
+            .map(|(id, s)| {
+                let (running, exit_code) = s
+                    .shared
+                    .buffer
+                    .lock()
+                    .map(|b| (!b.exited, b.exit_code))
+                    .unwrap_or((false, None));
+                ShellOverview {
+                    id: id.clone(),
+                    cmdline: s.cmdline.clone(),
+                    running,
+                    exit_code,
+                    lock: *lock_unpoisoned(&s.lock),
+                    end_offset: lock_unpoisoned(&s.shared.scroll).end(),
+                    created_secs: s.created_at.elapsed().as_secs(),
+                    idle_secs: s
+                        .last_used
+                        .lock()
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Scrollback from absolute offset `from`, non-consuming. A viewer that
+    /// fell more than `max_bytes` behind is skipped forward — a terminal
+    /// wants the present, and the returned `from` says the skip happened.
+    pub fn shell_tail(&self, id: &str, from: u64, max_bytes: usize) -> Result<ShellTail, String> {
+        let (shared, lock) = {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            (Arc::clone(&session.shared), *lock_unpoisoned(&session.lock))
+        };
+        let running = shared.buffer.lock().map(|b| !b.exited).unwrap_or(false);
+        let scroll = lock_unpoisoned(&shared.scroll);
+        let end = scroll.end();
+        let floor = end.saturating_sub(max_bytes as u64);
+        let (from, data) = scroll.tail(from.max(floor));
+        Ok(ShellTail {
+            from,
+            end,
+            data,
+            running,
+            lock,
+        })
+    }
+
+    /// Move the keyboard between the user and the agent. Returns the new
+    /// state; idempotent re-takes are fine (two clicks are not an error).
+    pub fn shell_set_lock(&self, id: &str, lock: ShellLock) -> Result<ShellLock, String> {
+        let sessions = self.sessions();
+        let session = sessions
+            .get(id)
+            .ok_or_else(|| format!("unknown session {id:?}"))?;
+        *lock_unpoisoned(&session.lock) = lock;
+        Ok(lock)
+    }
+
+    /// A keystroke line from the user. Requires the user to hold the
+    /// keyboard — accepting input while the agent is mid-`write` would
+    /// interleave two writers' bytes into one stdin.
+    pub async fn shell_user_write(&self, id: &str, data: &str) -> Result<(), String> {
+        {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            if *lock_unpoisoned(&session.lock) != ShellLock::User {
+                return Err(format!(
+                    "session {id:?} is assistant-locked: take the keyboard first"
+                ));
+            }
+        }
+        self.write_to_session(id, data).await
     }
 
     async fn collect_from_session(
@@ -902,6 +1031,8 @@ struct Session {
     last_used: Mutex<Instant>,
     /// OS pid for best-effort kill on close / reap.
     pid: Option<u32>,
+    /// Who holds the keyboard (see [`ShellLock`]). Starts assistant-locked.
+    lock: Mutex<ShellLock>,
 }
 
 struct SessionShared {
@@ -909,6 +1040,90 @@ struct SessionShared {
     notify: Notify,
     /// Bumped on each write so waiters reset their idle clock.
     generation: AtomicU64,
+    /// Observer scrollback (the web terminal reads this; see [`Scrollback`]).
+    scroll: Mutex<Scrollback>,
+}
+
+/// Who holds a session's keyboard.
+///
+/// The lock gates *writes* only — both sides always read. A session starts
+/// assistant-locked; the user takes the keyboard from the web terminal and
+/// hands it back when done. While the user holds it, the agent's
+/// write/signal/close calls fail with an error saying exactly that, because
+/// two writers interleaving keystrokes into one stdin is worse than either
+/// waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellLock {
+    Assistant,
+    User,
+}
+
+/// One live session as the observer surface lists it.
+#[derive(Debug, Clone)]
+pub struct ShellOverview {
+    pub id: String,
+    pub cmdline: String,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub lock: ShellLock,
+    /// Absolute end of the scrollback; a tail from here returns only new bytes.
+    pub end_offset: u64,
+    pub created_secs: u64,
+    pub idle_secs: u64,
+}
+
+/// A non-consuming scrollback read (see [`BashService::shell_tail`]).
+#[derive(Debug, Clone)]
+pub struct ShellTail {
+    /// Absolute offset `data` actually starts at (≥ the requested offset when
+    /// the viewer fell behind the ring or the byte budget).
+    pub from: u64,
+    /// Absolute end of the scrollback after this read.
+    pub end: u64,
+    pub data: Vec<u8>,
+    pub running: bool,
+    pub lock: ShellLock,
+}
+
+/// Bytes of observer scrollback kept per session.
+const SCROLLBACK_CAP: usize = 256 * 1024;
+
+/// Observer-facing scrollback: what the session printed — and what the user
+/// typed into it, echoed here because a piped child has no pty to echo for
+/// it — interleaved in arrival order, bounded to [`SCROLLBACK_CAP`].
+///
+/// Unlike [`OutputBuffer`], reads do not consume: watchers tail from an
+/// absolute byte offset, so any number of them can follow the same session
+/// without racing the agent's own `read` calls, which keep draining the
+/// consuming buffer untouched.
+#[derive(Default)]
+struct Scrollback {
+    /// Absolute offset of `data[0]` — grows as old bytes fall off the ring.
+    base: u64,
+    data: Vec<u8>,
+}
+
+impl Scrollback {
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > SCROLLBACK_CAP {
+            let excess = self.data.len() - SCROLLBACK_CAP;
+            self.data.drain(..excess);
+            self.base += excess as u64;
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.base + self.data.len() as u64
+    }
+
+    /// Bytes from absolute offset `from` (clamped into the ring). The true
+    /// start comes back with the data, so a caller that fell behind the ring
+    /// learns it skipped rather than silently missing bytes.
+    fn tail(&self, from: u64) -> (u64, Vec<u8>) {
+        let start = from.clamp(self.base, self.end());
+        (start, self.data[(start - self.base) as usize..].to_vec())
+    }
 }
 
 #[derive(Default)]
@@ -1212,6 +1427,7 @@ where
                         b.dropped_bytes = b.dropped_bytes.saturating_add(dropped);
                         b.total_bytes = b.total_bytes.saturating_add(n);
                     }
+                    lock_unpoisoned(&shared.scroll).push(&buf[..n]);
                     shared.notify.notify_waiters();
                 }
                 Err(_) => break,

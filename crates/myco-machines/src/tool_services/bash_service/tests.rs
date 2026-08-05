@@ -1536,3 +1536,156 @@ async fn a_typoed_field_is_rejected_not_silently_dropped() {
         result_text(&result)
     );
 }
+
+// --- shell observer surface (scrollback, keyboard lock) ----------------------
+
+/// Poll a shell's tail until `pred` holds or ~2s pass; returns the last tail.
+async fn tail_until(
+    service: &Arc<BashService>,
+    id: &str,
+    pred: impl Fn(&ShellTail) -> bool,
+) -> ShellTail {
+    let mut last = service.shell_tail(id, 0, 64 * 1024).expect("tail");
+    for _ in 0..100 {
+        if pred(&last) {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        last = service.shell_tail(id, 0, 64 * 1024).expect("tail");
+    }
+    last
+}
+
+/// The scrollback is non-consuming and offset-addressed: output the agent has
+/// already drained with `read` stays visible to a watcher, two watchers see
+/// the same bytes, and a tail from the end returns only what arrived after.
+#[tokio::test]
+async fn scrollback_survives_agent_reads_and_resumes_by_offset() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("scroll");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "command": "cat",
+               "stdin": "first\n", "timeout_ms": 1000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+
+    // The agent's own read consumed its drain buffer; the scrollback keeps
+    // the echoed input and cat's output regardless.
+    let tail = tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).matches("first").count() >= 2
+    })
+    .await;
+    let text = String::from_utf8_lossy(&tail.data);
+    assert!(
+        text.matches("first").count() >= 2,
+        "scrollback should hold the echoed stdin and cat's copy: {text:?}"
+    );
+
+    // Resume from the end: only new bytes come back.
+    let end = tail.end;
+    service.shell_set_lock(&id, ShellLock::User).expect("lock");
+    service
+        .shell_user_write(&id, "second\n")
+        .await
+        .expect("user write");
+    let tail2 = tail_until(&service, &id, |t| t.end > end).await;
+    let (from, data) = (tail2.from.max(end), &tail2.data);
+    let fresh = String::from_utf8_lossy(&data[(from - tail2.from) as usize..]);
+    assert!(fresh.contains("second"), "new bytes only: {fresh:?}");
+    assert!(
+        !fresh.contains("first"),
+        "old bytes not replayed: {fresh:?}"
+    );
+
+    service.reap_owner(owner);
+}
+
+/// The keyboard lock gates writes, not reads: a user-locked session refuses
+/// the agent's write/signal/close with an error that says who has the
+/// keyboard, while read still answers.
+#[tokio::test]
+async fn a_user_locked_session_refuses_agent_writes_but_not_reads() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("lock");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "command": "cat",
+               "timeout_ms": 500, "idle_ms": 100}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+
+    service.shell_set_lock(&id, ShellLock::User).expect("lock");
+    for action in ["write", "signal", "close"] {
+        let mut input = json!({"action": action, "session_id": id,
+                               "timeout_ms": 300, "idle_ms": 100});
+        if action == "write" {
+            input["stdin"] = json!("echo agent\n");
+        }
+        let result = dispatch_json_as(&service, owner, input).await;
+        assert!(result.is_error, "{action} should be refused");
+        assert!(
+            result_text(&result).contains("user-locked"),
+            "{action}: {}",
+            result_text(&result)
+        );
+    }
+    let read = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "read", "session_id": id, "timeout_ms": 300, "idle_ms": 100}),
+    )
+    .await;
+    assert!(!read.is_error, "read stays open: {}", result_text(&read));
+
+    // Handing the keyboard back restores the agent's writes.
+    service
+        .shell_set_lock(&id, ShellLock::Assistant)
+        .expect("unlock");
+    let write = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "write", "session_id": id, "stdin": "echo back\n",
+               "timeout_ms": 1000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!write.is_error, "{}", result_text(&write));
+
+    service.reap_owner(owner);
+}
+
+/// User input requires the user to hold the keyboard — without the lock the
+/// write is refused, so two writers can never interleave into one stdin.
+#[tokio::test]
+async fn user_input_requires_the_keyboard() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("kbd");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "command": "cat",
+               "timeout_ms": 500, "idle_ms": 100}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+
+    let refused = service.shell_user_write(&id, "sneaky\n").await;
+    assert!(refused.is_err(), "assistant-locked session must refuse");
+    assert!(refused.unwrap_err().contains("assistant-locked"));
+
+    // Overviews report the lock state the rail renders.
+    let shells = service.shell_overviews();
+    assert_eq!(shells.len(), 1);
+    assert_eq!(shells[0].id, id);
+    assert_eq!(shells[0].lock, ShellLock::Assistant);
+    assert!(shells[0].running);
+
+    service.reap_owner(owner);
+}

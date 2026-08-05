@@ -60,6 +60,12 @@ pub struct Harness {
     root_only_tool_names: std::collections::HashSet<String>,
     /// Cached tool specs advertised to the model (host field injected for multi-host tools).
     tool_specs: Vec<generative_model::ToolSpec>,
+    /// The local worker's bash service, held so the shell observer surface
+    /// (scrollback tails, the keyboard lock) is reachable without going
+    /// through tool dispatch. Local only: the host protocol has no
+    /// shell-observer messages, and the interactive surface stays on the
+    /// machine the user is signed into.
+    local_bash: Arc<crate::tool_services::BashService>,
 }
 
 /// Resolve `myco --mode host` argv (used by tests that still spawn a local subprocess).
@@ -213,8 +219,12 @@ impl Harness {
             }
         }
 
+        let local_bash = Arc::new(crate::tool_services::BashService::new());
         let mut local_services: Vec<Arc<dyn ToolService>> =
-            crate::host::HostWorker::standard_services(max_image_base64_bytes);
+            crate::host::HostWorker::standard_services_with(
+                local_bash.clone(),
+                max_image_base64_bytes,
+            );
         local_services.extend(root_services);
 
         let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
@@ -231,11 +241,17 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            local_bash,
         }
     }
 
     pub fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         self.tool_specs.clone()
+    }
+
+    /// The local host's shells, for the observer surface (see the field doc).
+    pub fn local_shells(&self) -> &Arc<crate::tool_services::BashService> {
+        &self.local_bash
     }
 
     /// Always `"local"`.

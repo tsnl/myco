@@ -51,8 +51,18 @@ impl HostWorker {
     /// Standard service list for building an extended local worker: the
     /// dispatchers behind [`Self::standard_tool_specs`].
     pub fn standard_services(max_image_base64_bytes: u64) -> Vec<Arc<dyn ToolService>> {
+        Self::standard_services_with(Arc::new(BashService::new()), max_image_base64_bytes)
+    }
+
+    /// [`Self::standard_services`] around a caller-held [`BashService`] — the
+    /// harness keeps the local instance so the shell observer surface
+    /// (scrollback, keyboard lock) is reachable outside tool dispatch.
+    pub fn standard_services_with(
+        bash: Arc<BashService>,
+        max_image_base64_bytes: u64,
+    ) -> Vec<Arc<dyn ToolService>> {
         vec![
-            Arc::new(BashService::new()) as Arc<dyn ToolService>,
+            bash as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ViewImageService::new(max_image_base64_bytes)) as Arc<dyn ToolService>,
         ]
