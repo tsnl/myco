@@ -62,12 +62,6 @@ pub struct Harness {
     root_only_tool_names: std::collections::HashSet<String>,
     /// Cached tool specs advertised to the model (host field injected for multi-host tools).
     tool_specs: Vec<generative_model::ToolSpec>,
-    /// The local worker's bash service, held so the shell observer surface
-    /// (scrollback tails, the keyboard lock) is reachable without going
-    /// through tool dispatch. Local only: the host protocol has no
-    /// shell-observer messages, and the interactive surface stays on the
-    /// machine the user is signed into.
-    local_bash: Arc<crate::tool_services::BashService>,
 }
 
 /// Resolve `myco --mode host` argv (used by tests that still spawn a local subprocess).
@@ -229,7 +223,8 @@ impl Harness {
             );
         local_services.extend(root_services);
 
-        let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
+        let local_worker =
+            Arc::new(crate::host::HostWorker::new("local", local_services).with_bash(local_bash));
         let local = HostController::in_process("local", local_worker);
         let mut hosts = HashMap::new();
         let mut host_commands = HashMap::new();
@@ -243,7 +238,6 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
-            local_bash,
         }
     }
 
@@ -251,9 +245,32 @@ impl Harness {
         self.tool_specs.clone()
     }
 
-    /// The local host's shells, for the observer surface (see the field doc).
-    pub fn local_shells(&self) -> &Arc<crate::tool_services::BashService> {
-        &self.local_bash
+    /// Every host's live shells for the observer surface, `(host, shell)`,
+    /// local first. A host that is down — or a remote nobody has used, which
+    /// is therefore not even connected — simply lists nothing: the rail shows
+    /// what exists, and is not an error surface.
+    pub async fn shell_overviews(&self) -> Vec<(String, crate::tool_services::ShellOverview)> {
+        let mut out = Vec::new();
+        for name in self.host_names() {
+            let Some(client) = self.hosts.get(&name) else {
+                continue;
+            };
+            if let Ok(shells) = client.shell_overviews().await {
+                out.extend(shells.into_iter().map(|s| (name.clone(), s)));
+            }
+        }
+        out
+    }
+
+    /// The controller for `host`, for observer calls addressed to one shell
+    /// (tail, input, lock, screen).
+    pub fn observer_host(&self, host: &str) -> Result<Arc<HostController>, String> {
+        self.hosts.get(host).cloned().ok_or_else(|| {
+            format!(
+                "unknown host {host:?} (known: [{}])",
+                self.host_names().join(", ")
+            )
+        })
     }
 
     /// Always `"local"`.
@@ -706,6 +723,81 @@ mod tests {
             "{}",
             result_text(&r)
         );
+    }
+
+    /// The observer surface reaches remote shells over the NDJSON protocol:
+    /// a session started on a subprocess host lists with its host name,
+    /// tails, moves its keyboard, takes user input, and screenshots — the
+    /// same surface the local host serves in-process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_shells_are_listed_and_driven_over_the_protocol() {
+        let program = myco_program();
+        if program == "myco" || !std::path::Path::new(&program).is_file() {
+            eprintln!("skip remote_shells: no myco binary at {program:?} (cargo build --bin myco)");
+            return;
+        }
+        let cfg = HarnessConfig {
+            attach_timeout_secs: 60,
+            remote_hosts: vec![subprocess_host("rem", program)],
+            ..Default::default()
+        };
+        let harness = Harness::attach(cfg).await.expect("attach");
+
+        // A dormant remote lists nothing — and listing must not connect it.
+        assert!(harness.shell_overviews().await.is_empty());
+        assert!(!harness.observer_host("rem").unwrap().is_connected());
+
+        let agent = uuid::Uuid::new_v4();
+        let started = call_on(
+            &harness,
+            agent,
+            "bash",
+            json!({"action": "start", "session_id": "rterm", "command": "cat",
+                   "host": "rem", "timeout_ms": 2000, "idle_ms": 200}),
+        )
+        .await;
+        assert!(!started.is_error, "{started:?}");
+
+        let shells = harness.shell_overviews().await;
+        assert_eq!(shells.len(), 1, "{shells:?}");
+        assert_eq!(shells[0].0, "rem");
+        assert_eq!(shells[0].1.id, "rterm");
+        assert!(shells[0].1.running);
+
+        let rem = harness.observer_host("rem").expect("host");
+        let (previous, overview) = rem
+            .shell_lock("rterm", crate::tool_services::ShellLock::User)
+            .await
+            .expect("lock");
+        assert_eq!(previous, crate::tool_services::ShellLock::Assistant);
+        assert_eq!(overview.lock, crate::tool_services::ShellLock::User);
+
+        rem.shell_input("rterm", "over the wire\n")
+            .await
+            .expect("input");
+        let mut text = String::new();
+        for _ in 0..100 {
+            let tail = rem.shell_tail("rterm", 0, 64 * 1024).await.expect("tail");
+            text = String::from_utf8_lossy(&tail.data).into_owned();
+            // Echoed by the service + copied back by cat.
+            if text.matches("over the wire").count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.matches("over the wire").count() >= 2,
+            "keystrokes must reach the remote child and come back: {text:?}"
+        );
+
+        let screen = rem.shell_screen("rterm").await.expect("screen");
+        assert!(screen.text.contains("over the wire"), "{:?}", screen.text);
+
+        // Unknown shells fail with the worker's own message, not a hang.
+        let missing = rem.shell_tail("ghost", 0, 1024).await;
+        assert!(missing.is_err(), "{missing:?}");
+
+        harness.notify_agent_finished(agent);
     }
 
     #[tokio::test]

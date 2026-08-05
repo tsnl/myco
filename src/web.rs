@@ -90,6 +90,7 @@ pub fn rocket(
             events,
             shells,
             shell_tail,
+            shell_screen,
             shell_input,
             shell_lock,
             cancel,
@@ -247,43 +248,65 @@ async fn events(caller: Caller, id: &str) -> Result<EventStream![], Custom<Json<
     })
 }
 
-/// Live bash sessions on the session's local host.
+/// Live bash sessions across the session's hosts.
 #[get("/sessions/<id>/shells")]
 async fn shells(caller: Caller, id: &str) -> ApiResult<api::Shells> {
     output(caller.shells(id).await)
 }
 
 /// Non-consuming scrollback tail from absolute offset `from`.
-#[get("/sessions/<id>/shells/<shell>?<from>")]
+#[get("/sessions/<id>/shells/<host>/<shell>?<from>")]
 async fn shell_tail(
     caller: Caller,
     id: &str,
+    host: &str,
     shell: &str,
     from: Option<u64>,
 ) -> ApiResult<api::ShellTailChunk> {
-    output(caller.shell_tail(id, shell, from.unwrap_or(0)).await)
+    output(caller.shell_tail(id, host, shell, from.unwrap_or(0)).await)
+}
+
+/// The shell's rendered terminal screen (what a pty session looks like now).
+#[get("/sessions/<id>/shells/<host>/<shell>/screen")]
+async fn shell_screen(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    shell: &str,
+) -> ApiResult<api::ShellScreen> {
+    output(caller.shell_screen(id, host, shell).await)
 }
 
 /// Type into a user-locked shell.
-#[post("/sessions/<id>/shells/<shell>/input", data = "<req>")]
+#[post("/sessions/<id>/shells/<host>/<shell>/input", data = "<req>")]
 async fn shell_input(
     caller: Caller,
     id: &str,
+    host: &str,
     shell: &str,
     req: Json<api::ShellInput>,
 ) -> ApiResult<api::Shell> {
-    output(caller.shell_input(id, shell, req.into_inner().data).await)
+    output(
+        caller
+            .shell_input(id, host, shell, req.into_inner().data)
+            .await,
+    )
 }
 
 /// Take or return the shell's keyboard.
-#[post("/sessions/<id>/shells/<shell>/lock", data = "<req>")]
+#[post("/sessions/<id>/shells/<host>/<shell>/lock", data = "<req>")]
 async fn shell_lock(
     caller: Caller,
     id: &str,
+    host: &str,
     shell: &str,
     req: Json<api::ShellLockRequest>,
 ) -> ApiResult<api::Shell> {
-    output(caller.shell_lock(id, shell, req.into_inner().lock).await)
+    output(
+        caller
+            .shell_lock(id, host, shell, req.into_inner().lock)
+            .await,
+    )
 }
 
 #[post("/sessions/<id>/cancel")]

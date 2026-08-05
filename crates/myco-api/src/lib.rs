@@ -106,10 +106,13 @@ pub enum ShellLockMode {
     User,
 }
 
-/// One live bash session on the session's local host, as the shells rail
-/// lists it.
+/// One live bash session, as the shells rail lists it. Shells exist per
+/// host — `(host, id)` addresses one — and remote hosts serve the same
+/// surface as local over the host protocol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shell {
+    /// Host the session runs on (`"local"` or a configured remote).
+    pub host: String,
     pub id: String,
     pub cmdline: String,
     pub running: bool,
@@ -117,6 +120,21 @@ pub struct Shell {
     pub lock: ShellLockMode,
     /// Absolute end of the scrollback; tail from here for only-new bytes.
     pub end_offset: u64,
+    /// Running under a pty — render the screen (see `shell_screen`), not the
+    /// raw scrollback.
+    #[serde(default)]
+    pub pty: bool,
+}
+
+/// A rendered terminal screen: the text a `cols`×`rows` window shows now
+/// (`GET /api/sessions/<id>/shells/<host>/<shell>/screen`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellScreen {
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub text: String,
 }
 
 /// `GET /api/sessions/<id>/shells`.
@@ -257,28 +275,45 @@ pub trait MycoApi: Send + Sync {
     /// here, so a client can show the user who they are posting as.
     async fn whoami(&self) -> Result<Identity, ApiError>;
 
-    /// Live bash sessions on the session's local host (empty when the
-    /// session is not resident — shells live and die with the agent task).
+    /// Live bash sessions across the session's hosts (empty when the session
+    /// is not resident — shells live and die with the agent task). A host
+    /// that is down or dormant lists nothing rather than erroring.
     async fn shells(&self, id: &str) -> Result<Shells, ApiError>;
     /// Non-consuming scrollback read from absolute offset `from`.
     async fn shell_tail(
         &self,
         id: &str,
+        host: &str,
         shell: &str,
         from: u64,
     ) -> Result<ShellTailChunk, ApiError>;
     /// Type into a user-locked shell. What was typed is echoed into the
     /// scrollback and recorded in the transcript as a non-waking message, so
     /// the agent reads it at its next boundary.
-    async fn shell_input(&self, id: &str, shell: &str, data: String) -> Result<Shell, ApiError>;
+    async fn shell_input(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        data: String,
+    ) -> Result<Shell, ApiError>;
     /// Take or return the shell's keyboard; transitions are recorded in the
     /// transcript the same way. Idempotent re-takes are silent.
     async fn shell_lock(
         &self,
         id: &str,
+        host: &str,
         shell: &str,
         lock: ShellLockMode,
     ) -> Result<Shell, ApiError>;
+    /// The shell's rendered terminal screen — what a person (or the GUI)
+    /// shows for a pty session instead of raw scrollback bytes.
+    async fn shell_screen(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+    ) -> Result<ShellScreen, ApiError>;
 }
 
 /// One SSE event on `/api/sessions/<id>/events` — a live projection of the

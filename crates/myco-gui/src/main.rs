@@ -1012,7 +1012,14 @@ struct PanelBuf {
     terms: std::collections::HashMap<String, Term>,
 }
 
-/// One shell's accumulated scrollback view.
+/// The panel key for one shell: shells are per host, so `(host, id)` is the
+/// identity everywhere the GUI files one.
+fn term_key(host: &str, id: &str) -> String {
+    format!("{host}/{id}")
+}
+
+/// One shell's accumulated scrollback view (piped sessions) or latest screen
+/// snapshot (pty sessions — see `replace`).
 #[derive(Default)]
 struct Term {
     /// Absolute offset to tail from next.
@@ -1038,6 +1045,16 @@ impl Term {
                 .unwrap_or(0);
             self.text.drain(..cut);
         }
+    }
+
+    /// Whole-screen replacement for a pty session: the screen snapshot *is*
+    /// the view, not an append. Returns whether anything changed.
+    fn replace(&mut self, screen: &api::ShellScreen) -> bool {
+        if self.text == screen.text {
+            return false;
+        }
+        self.text = screen.text.clone();
+        true
     }
 }
 
@@ -1077,8 +1094,9 @@ fn conversation(props: &ConversationProps) -> Html {
     // reads and the toggle button stay ordinary Yew.
     let rail_open = use_state(|| false);
     let rail_open_ref: Rc<RefCell<bool>> = use_mut_ref(|| false);
-    let term_open = use_state(|| Option::<String>::None);
-    let term_open_ref: Rc<RefCell<Option<String>>> = use_mut_ref(|| None);
+    // The opened terminal, addressed as shells are: `(host, shell id)`.
+    let term_open = use_state(|| Option::<(String, String)>::None);
+    let term_open_ref: Rc<RefCell<Option<(String, String)>>> = use_mut_ref(|| None);
     let panel: Rc<RefCell<PanelBuf>> = use_mut_ref(PanelBuf::default);
     let panel_rev = use_state(|| 0u64);
     let term_input = use_node_ref();
@@ -1312,26 +1330,46 @@ fn conversation(props: &ConversationProps) -> Html {
                         }
                     }
                     let open = term_open_ref.borrow().clone();
-                    if let Some(shell) = open {
-                        let from = panel
+                    if let Some((host, shell)) = open {
+                        let key = term_key(&host, &shell);
+                        // A pty session renders as its current screen (the
+                        // snapshot is the view); a piped one accumulates its
+                        // scrollback tail.
+                        let pty = panel
                             .borrow()
-                            .terms
-                            .get(&shell)
-                            .map(|t| t.from)
-                            .unwrap_or(0);
-                        if let Ok(chunk) = auth::get::<api::ShellTailChunk>(&format!(
-                            "/api/sessions/{id}/shells/{shell}?from={from}"
-                        ))
-                        .await
-                            && chunk.end != from
-                        {
-                            panel
-                                .borrow_mut()
-                                .terms
-                                .entry(shell.clone())
-                                .or_default()
-                                .absorb(&chunk);
-                            changed = true;
+                            .shells
+                            .iter()
+                            .any(|s| s.host == host && s.id == shell && s.pty);
+                        if pty {
+                            if let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
+                                "/api/sessions/{id}/shells/{host}/{shell}/screen"
+                            ))
+                            .await
+                                && panel
+                                    .borrow_mut()
+                                    .terms
+                                    .entry(key)
+                                    .or_default()
+                                    .replace(&screen)
+                            {
+                                changed = true;
+                            }
+                        } else {
+                            let from = panel.borrow().terms.get(&key).map(|t| t.from).unwrap_or(0);
+                            if let Ok(chunk) = auth::get::<api::ShellTailChunk>(&format!(
+                                "/api/sessions/{id}/shells/{host}/{shell}?from={from}"
+                            ))
+                            .await
+                                && chunk.end != from
+                            {
+                                panel
+                                    .borrow_mut()
+                                    .terms
+                                    .entry(key)
+                                    .or_default()
+                                    .absorb(&chunk);
+                                changed = true;
+                            }
                         }
                     }
                     if changed {
@@ -1348,9 +1386,9 @@ fn conversation(props: &ConversationProps) -> Html {
     {
         let term_open = (*term_open).clone();
         use_effect_with((*panel_rev, term_open), move |(_, term_open)| {
-            if let Some(shell) = term_open
+            if let Some((host, shell)) = term_open
                 && let Some(doc) = web_sys::window().and_then(|w| w.document())
-                && let Some(el) = doc.get_element_by_id(&format!("term-body-{shell}"))
+                && let Some(el) = doc.get_element_by_id(&format!("term-body-{host}-{shell}"))
             {
                 el.set_scroll_top(el.scroll_height());
             }
@@ -1531,14 +1569,15 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
-    let select_term = |shell: String| {
+    let select_term = |host: String, shell: String| {
         let term_open = term_open.clone();
         let term_open_ref = term_open_ref.clone();
         Callback::from(move |_: MouseEvent| {
-            let next = if term_open.as_deref() == Some(shell.as_str()) {
+            let this = (host.clone(), shell.clone());
+            let next = if term_open.as_ref() == Some(&this) {
                 None
             } else {
-                Some(shell.clone())
+                Some(this)
             };
             *term_open_ref.borrow_mut() = next.clone();
             term_open.set(next);
@@ -1547,7 +1586,7 @@ fn conversation(props: &ConversationProps) -> Html {
 
     // Take / return the keyboard. The optimistic lock flip makes the border
     // answer the click; the 1s poll is the truth that heals a failed POST.
-    let set_lock = |shell: String, lock: api::ShellLockMode| {
+    let set_lock = |host: String, shell: String, lock: api::ShellLockMode| {
         let id = props.id.clone();
         let panel = panel.clone();
         let panel_rev = panel_rev.clone();
@@ -1555,17 +1594,22 @@ fn conversation(props: &ConversationProps) -> Html {
         Callback::from(move |_: ()| {
             {
                 let mut p = panel.borrow_mut();
-                if let Some(s) = p.shells.iter_mut().find(|s| s.id == shell) {
+                if let Some(s) = p
+                    .shells
+                    .iter_mut()
+                    .find(|s| s.host == host && s.id == shell)
+                {
                     s.lock = lock;
                 }
             }
             panel_rev.set(*panel_rev + 1);
             let id = id.clone();
+            let host = host.clone();
             let shell = shell.clone();
             let dispatch = dispatch.clone();
             spawn_local(async move {
                 if let Err(e) = auth::post_json::<api::Shell, _>(
-                    &format!("/api/sessions/{id}/shells/{shell}/lock"),
+                    &format!("/api/sessions/{id}/shells/{host}/{shell}/lock"),
                     &api::ShellLockRequest { lock },
                 )
                 .await
@@ -1580,7 +1624,7 @@ fn conversation(props: &ConversationProps) -> Html {
         let id = props.id.clone();
         let term_input = term_input.clone();
         let dispatch = conv.dispatcher();
-        move |shell: String| {
+        move |host: String, shell: String| {
             let id = id.clone();
             let term_input = term_input.clone();
             let dispatch = dispatch.clone();
@@ -1591,11 +1635,12 @@ fn conversation(props: &ConversationProps) -> Html {
                 let data = field.value();
                 field.set_value("");
                 let id = id.clone();
+                let host = host.clone();
                 let shell = shell.clone();
                 let dispatch = dispatch.clone();
                 spawn_local(async move {
                     if let Err(e) = auth::post_json::<api::Shell, _>(
-                        &format!("/api/sessions/{id}/shells/{shell}/input"),
+                        &format!("/api/sessions/{id}/shells/{host}/{shell}/input"),
                         &api::ShellInput {
                             data: format!("{data}\n"),
                         },
@@ -1642,15 +1687,19 @@ fn conversation(props: &ConversationProps) -> Html {
                 <h2>{ "shells" }</h2>
                 { if p.shells.is_empty() { html!{ <div class="empty">{ "no live shells" }</div> } }
                   else { html! { for p.shells.iter().map(|shell| {
-                    let opened = term_open.as_deref() == Some(shell.id.as_str());
+                    let opened = term_open.as_ref()
+                        .is_some_and(|(h, s)| *h == shell.host && *s == shell.id);
                     let user_locked = shell.lock == api::ShellLockMode::User;
                     let head = html! {
-                        <div class="term-head" onclick={select_term(shell.id.clone())}
-                             ondblclick={ let take = set_lock(shell.id.clone(), api::ShellLockMode::User);
+                        <div class="term-head" onclick={select_term(shell.host.clone(), shell.id.clone())}
+                             ondblclick={ let take = set_lock(shell.host.clone(), shell.id.clone(), api::ShellLockMode::User);
                                           Callback::from(move |_: MouseEvent| take.emit(())) }>
                             <span class={ if shell.running { "tool-disc tool-disc-running" }
                                           else { "tool-disc tool-disc-ok" } }>{ "●" }</span>
                             <span class="tool-name">{ &shell.id }</span>
+                            { if shell.host != "local" { html! {
+                                <span class="host-badge">{ format!("@{}", shell.host) }</span>
+                            } } else { html!{} } }
                             <span class="dim">{ &shell.cmdline }</span>
                             <span class="lock-badge">
                                 { if user_locked { "⌨ yours" } else { "⌨ agent" } }
@@ -1660,10 +1709,11 @@ fn conversation(props: &ConversationProps) -> Html {
                     if !opened {
                         return html! { <div class={ classes!("term", user_locked.then_some("term-user")) }>{ head }</div> };
                     }
-                    let text = p.terms.get(&shell.id).map(|t| t.text.clone()).unwrap_or_default();
+                    let text = p.terms.get(&term_key(&shell.host, &shell.id))
+                        .map(|t| t.text.clone()).unwrap_or_default();
                     let on_key = {
-                        let send = send_term_input(shell.id.clone());
-                        let release = set_lock(shell.id.clone(), api::ShellLockMode::Assistant);
+                        let send = send_term_input(shell.host.clone(), shell.id.clone());
+                        let release = set_lock(shell.host.clone(), shell.id.clone(), api::ShellLockMode::Assistant);
                         Callback::from(move |e: KeyboardEvent| {
                             if e.key() == "Enter" {
                                 e.prevent_default();
@@ -1677,7 +1727,7 @@ fn conversation(props: &ConversationProps) -> Html {
                     html! {
                         <div class={ classes!("term", user_locked.then_some("term-user")) }>
                             { head }
-                            <pre id={format!("term-body-{}", shell.id)} class="term-body">{ text }</pre>
+                            <pre id={format!("term-body-{}-{}", shell.host, shell.id)} class="term-body">{ text }</pre>
                             { if user_locked { html! {
                                 <div class="term-input-row">
                                     <input ref={term_input.clone()} type="text"

@@ -25,6 +25,10 @@ pub struct HostWorker {
     name: String,
     services: Vec<Arc<dyn ToolService>>,
     tool_to_service: HashMap<String, Arc<dyn ToolService>>,
+    /// The bash service behind the `Shell*` observer requests. `None` on a
+    /// bespoke worker built without bash — those answer observer requests
+    /// with an error.
+    bash: Option<Arc<BashService>>,
 }
 
 impl HostWorker {
@@ -35,7 +39,21 @@ impl HostWorker {
             name: name.into(),
             services,
             tool_to_service,
+            bash: None,
         }
+    }
+
+    /// Register `bash` as this worker's shell-observer backend (the same
+    /// instance that serves the `bash` tool, or the observer would watch a
+    /// different set of sessions than the agent drives).
+    pub fn with_bash(mut self, bash: Arc<BashService>) -> Self {
+        self.bash = Some(bash);
+        self
+    }
+
+    /// The shell-observer backend, when this worker has one.
+    pub fn bash(&self) -> Option<&Arc<BashService>> {
+        self.bash.as_ref()
     }
 
     /// Standard host catalog (same on every host / remote binary).
@@ -45,7 +63,12 @@ impl HostWorker {
     /// remote worker must be spawned with the same value the agent side
     /// resolved (`--max-image-base64-bytes`).
     pub fn standard(name: impl Into<String>, max_image_base64_bytes: u64) -> Self {
-        Self::new(name, Self::standard_services(max_image_base64_bytes))
+        let bash = Arc::new(BashService::new());
+        Self::new(
+            name,
+            Self::standard_services_with(bash.clone(), max_image_base64_bytes),
+        )
+        .with_bash(bash)
     }
 
     /// Standard service list for building an extended local worker: the
@@ -164,6 +187,82 @@ impl HostWorker {
                 // Fire-and-forget: no reply message exists for this request.
                 self.notify_agent_finished(agent_id);
             }
+            Request::ShellList { id } => {
+                let reply = match self.bash() {
+                    Some(b) => Response::Shells {
+                        id,
+                        shells: b.shell_overviews(),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
+            Request::ShellTail {
+                id,
+                shell,
+                from,
+                max_bytes,
+            } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_tail(&shell, from, max_bytes as usize) {
+                        Ok(t) => Response::ShellTail {
+                            id,
+                            from: t.from,
+                            end: t.end,
+                            data: String::from_utf8_lossy(&t.data).into_owned(),
+                            running: t.running,
+                            lock: t.lock,
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
+            Request::ShellInput { id, shell, data } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_user_write(&shell, &data).await {
+                        Ok(()) => match b.shell_overview(&shell) {
+                            Ok(overview) => Response::Shell {
+                                id,
+                                shell: overview,
+                                previous_lock: None,
+                            },
+                            Err(e) => shell_err(id, e),
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
+            Request::ShellLock { id, shell, lock } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_set_lock(&shell, lock) {
+                        Ok(previous) => match b.shell_overview(&shell) {
+                            Ok(overview) => Response::Shell {
+                                id,
+                                shell: overview,
+                                previous_lock: Some(previous),
+                            },
+                            Err(e) => shell_err(id, e),
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
+            Request::ShellScreenshot { id, shell } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_screen(&shell) {
+                        Ok(screen) => Response::ShellScreen { id, screen },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
         }
     }
 
@@ -221,6 +320,19 @@ impl HostWorker {
             .serve(tokio::io::stdin(), tokio::io::stdout())
             .await
     }
+}
+
+/// Error reply for a shell-observer request that failed on this worker.
+fn shell_err(id: String, message: String) -> Response {
+    Response::Error {
+        id: Some(id),
+        message,
+    }
+}
+
+/// Error reply for a worker built without a bash service.
+fn no_bash(id: String) -> Response {
+    shell_err(id, "this worker has no bash service (no shells)".into())
 }
 
 fn build_tool_to_service_map(
