@@ -11,7 +11,7 @@ use myco_core::{Async, CancelToken};
 use myco_models as generative_model;
 
 pub mod bash_service;
-pub use bash_service::BashService;
+pub use bash_service::{BashService, ShellLock, ShellOverview, ShellTail};
 
 pub mod text_editor_service;
 pub use text_editor_service::TextEditorService;

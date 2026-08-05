@@ -958,15 +958,18 @@ impl BashService {
         })
     }
 
-    /// Move the keyboard between the user and the agent. Returns the new
-    /// state; idempotent re-takes are fine (two clicks are not an error).
+    /// Move the keyboard between the user and the agent. Returns the
+    /// *previous* state so a caller can tell a transition from an idempotent
+    /// re-take (two clicks are not an error, and not worth announcing twice).
     pub fn shell_set_lock(&self, id: &str, lock: ShellLock) -> Result<ShellLock, String> {
         let sessions = self.sessions();
         let session = sessions
             .get(id)
             .ok_or_else(|| format!("unknown session {id:?}"))?;
-        *lock_unpoisoned(&session.lock) = lock;
-        Ok(lock)
+        Ok(std::mem::replace(
+            &mut *lock_unpoisoned(&session.lock),
+            lock,
+        ))
     }
 
     /// A keystroke line from the user. Requires the user to hold the

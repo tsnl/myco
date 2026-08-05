@@ -88,6 +88,10 @@ pub fn rocket(
             post_message,
             poll,
             events,
+            shells,
+            shell_tail,
+            shell_input,
+            shell_lock,
             cancel,
             compact,
             archive,
@@ -241,6 +245,45 @@ async fn events(caller: Caller, id: &str) -> Result<EventStream![], Custom<Json<
             yield Event::json(&ev);
         }
     })
+}
+
+/// Live bash sessions on the session's local host.
+#[get("/sessions/<id>/shells")]
+async fn shells(caller: Caller, id: &str) -> ApiResult<api::Shells> {
+    output(caller.shells(id).await)
+}
+
+/// Non-consuming scrollback tail from absolute offset `from`.
+#[get("/sessions/<id>/shells/<shell>?<from>")]
+async fn shell_tail(
+    caller: Caller,
+    id: &str,
+    shell: &str,
+    from: Option<u64>,
+) -> ApiResult<api::ShellTailChunk> {
+    output(caller.shell_tail(id, shell, from.unwrap_or(0)).await)
+}
+
+/// Type into a user-locked shell.
+#[post("/sessions/<id>/shells/<shell>/input", data = "<req>")]
+async fn shell_input(
+    caller: Caller,
+    id: &str,
+    shell: &str,
+    req: Json<api::ShellInput>,
+) -> ApiResult<api::Shell> {
+    output(caller.shell_input(id, shell, req.into_inner().data).await)
+}
+
+/// Take or return the shell's keyboard.
+#[post("/sessions/<id>/shells/<shell>/lock", data = "<req>")]
+async fn shell_lock(
+    caller: Caller,
+    id: &str,
+    shell: &str,
+    req: Json<api::ShellLockRequest>,
+) -> ApiResult<api::Shell> {
+    output(caller.shell_lock(id, shell, req.into_inner().lock).await)
 }
 
 #[post("/sessions/<id>/cancel")]

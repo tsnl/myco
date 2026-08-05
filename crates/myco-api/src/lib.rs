@@ -85,6 +85,62 @@ pub struct Models {
     pub default_model: String,
 }
 
+/// Who holds a shell's keyboard. The lock gates writes only — reading is
+/// always open to both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellLockMode {
+    Assistant,
+    User,
+}
+
+/// One live bash session on the session's local host, as the shells rail
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shell {
+    pub id: String,
+    pub cmdline: String,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub lock: ShellLockMode,
+    /// Absolute end of the scrollback; tail from here for only-new bytes.
+    pub end_offset: u64,
+}
+
+/// `GET /api/sessions/<id>/shells`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shells {
+    pub shells: Vec<Shell>,
+}
+
+/// One non-consuming scrollback read
+/// (`GET /api/sessions/<id>/shells/<shell>?from=N`). `from` in the response
+/// is where `data` actually starts — ahead of the request when the viewer
+/// fell behind the ring, so a client knows bytes were skipped rather than
+/// silently missing them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellTailChunk {
+    pub from: u64,
+    pub end: u64,
+    /// Scrollback bytes, lossily UTF-8 (a terminal shows what it can).
+    pub data: String,
+    pub running: bool,
+    pub lock: ShellLockMode,
+}
+
+/// `POST /api/sessions/<id>/shells/<shell>/input` — a line the user typed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellInput {
+    pub data: String,
+}
+
+/// `POST /api/sessions/<id>/shells/<shell>/lock` — take or return the
+/// keyboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellLockRequest {
+    pub lock: ShellLockMode,
+}
+
 /// A successful `POST /api/auth/token` — the OAuth 2.0 access-token response
 /// (RFC 6749 §5.1). Field names are the spec's, not ours: a stock OAuth2
 /// client must be able to read this.
@@ -188,6 +244,29 @@ pub trait MycoApi: Send + Sync {
     /// The identity this handle acts as. Anything it writes is attributed
     /// here, so a client can show the user who they are posting as.
     async fn whoami(&self) -> Result<Identity, ApiError>;
+
+    /// Live bash sessions on the session's local host (empty when the
+    /// session is not resident — shells live and die with the agent task).
+    async fn shells(&self, id: &str) -> Result<Shells, ApiError>;
+    /// Non-consuming scrollback read from absolute offset `from`.
+    async fn shell_tail(
+        &self,
+        id: &str,
+        shell: &str,
+        from: u64,
+    ) -> Result<ShellTailChunk, ApiError>;
+    /// Type into a user-locked shell. What was typed is echoed into the
+    /// scrollback and recorded in the transcript as a non-waking message, so
+    /// the agent reads it at its next boundary.
+    async fn shell_input(&self, id: &str, shell: &str, data: String) -> Result<Shell, ApiError>;
+    /// Take or return the shell's keyboard; transitions are recorded in the
+    /// transcript the same way. Idempotent re-takes are silent.
+    async fn shell_lock(
+        &self,
+        id: &str,
+        shell: &str,
+        lock: ShellLockMode,
+    ) -> Result<Shell, ApiError>;
 }
 
 /// One SSE event on `/api/sessions/<id>/events` — a live projection of the
