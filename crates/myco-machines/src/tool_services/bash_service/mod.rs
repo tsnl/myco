@@ -15,6 +15,8 @@ use myco_core::external_command::BASH;
 
 use uuid::Uuid;
 
+mod pty;
+
 /// Default hard wait ceiling for a single session start/write/read.
 ///
 /// Sessions return early on idle (`idle_ms`) or byte cap; this is only the
@@ -41,6 +43,10 @@ const DEFAULT_IDLE_MS: u64 = 300;
 const DEFAULT_MAX_BYTES: usize = 4_096;
 /// Soft cap on concurrent sessions per harness.
 const MAX_SESSIONS: usize = 8;
+/// Default terminal size for `pty: true` sessions (also the screen model's
+/// size for piped sessions, whose "screen" is just the tail of their output).
+const DEFAULT_PTY_COLS: u16 = 120;
+const DEFAULT_PTY_ROWS: u16 = 40;
 
 /// Executes bash commands on behalf of the agent.
 ///
@@ -84,7 +90,11 @@ impl BashService {
                 - start: spawn a long-lived process **in the background**. Requires \
                 `session_id`. `command` is the program line (default: `bash -i`). Optional \
                 `stdin` is written after spawn. Returns a snapshot; the process keeps \
-                running.\n\
+                running. Pass `pty: true` to run the child under a real terminal \
+                (controlling tty, {DEFAULT_PTY_COLS}x{DEFAULT_PTY_ROWS} by default, \
+                `cols`/`rows` to override) — required for full-screen/TUI programs and \
+                anything that checks isatty; stdout+stderr merge into one stream and the \
+                tty echoes input.\n\
                 - write: write `stdin` to a session, then collect a snapshot (process stays \
                 alive).\n\
                 - read: collect more output without writing (process stays alive).\n\
@@ -98,6 +108,11 @@ impl BashService {
                 signal and the whole group gets it. Either way the session is not reaped — \
                 that is still `close`.\n\
                 - close: kill and reap a session.\n\
+                - screenshot: render the session's terminal screen as text — what a \
+                {DEFAULT_PTY_COLS}x{DEFAULT_PTY_ROWS} terminal window shows *now*, not the \
+                byte stream. The way to read a TUI app (editor, top, a curses installer); \
+                also works on piped sessions, where it shows the tail of output laid out \
+                as a terminal would. Non-consuming: does not disturb read/write.\n\
                 - list: list live sessions. Note the session cap ({MAX_SESSIONS}) is shared \
                 by every agent on the host while `list` shows only yours — if `start` \
                 reports too many sessions and your list looks short, other agents own the \
@@ -244,6 +259,9 @@ impl BashService {
                 command,
                 cwd,
                 stdin,
+                pty,
+                cols,
+                rows,
                 timeout_ms,
                 idle_ms,
                 max_bytes,
@@ -251,9 +269,14 @@ impl BashService {
                 self.session_start(
                     &session_id,
                     owner,
-                    command.as_deref(),
-                    cwd.as_deref(),
-                    stdin.as_deref(),
+                    StartOptions {
+                        command: command.as_deref(),
+                        cwd: cwd.as_deref(),
+                        stdin: stdin.as_deref(),
+                        pty,
+                        cols,
+                        rows,
+                    },
                     timeout_ms,
                     idle_ms,
                     max_bytes,
@@ -308,6 +331,7 @@ impl BashService {
             }
             Action::Close { session_id } => self.session_close(&session_id, owner).await,
             Action::List => self.session_list(owner),
+            Action::Screenshot { session_id } => self.session_screenshot(&session_id, owner),
         }
     }
 
@@ -435,9 +459,7 @@ impl BashService {
         &self,
         session_id: &str,
         owner: Uuid,
-        command: Option<&str>,
-        cwd: Option<&str>,
-        stdin: Option<&str>,
+        opts: StartOptions<'_>,
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
@@ -462,74 +484,104 @@ impl BashService {
             }
         }
 
-        let cmdline = command.unwrap_or("bash -i");
-        let mut cmd = BASH.tokio_command();
-        cmd.args(["-c", cmdline])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env("PYTHONUNBUFFERED", "1")
-            // Own process group so close/reap can kill the whole tree.
-            .process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return myco_api::ToolResult::err(format!(
-                    "failed to spawn session command {cmdline:?}{}: {e}",
-                    cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
-                ));
-            }
-        };
-
-        let pid = child.id();
-
-        let child_stdin = match child.stdin.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return myco_api::ToolResult::err("child stdin missing after spawn");
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return myco_api::ToolResult::err("child stdout missing after spawn");
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return myco_api::ToolResult::err("child stderr missing after spawn");
-            }
-        };
+        let cmdline = opts.command.unwrap_or("bash -i");
+        let cwd = opts.cwd;
+        let cols = opts.cols.unwrap_or(DEFAULT_PTY_COLS);
+        let rows = opts.rows.unwrap_or(DEFAULT_PTY_ROWS);
 
         let shared = Arc::new(SessionShared {
             buffer: Mutex::new(OutputBuffer::default()),
             notify: Notify::new(),
             generation: AtomicU64::new(0),
             scroll: Mutex::new(Scrollback::default()),
+            screen: Mutex::new(vt100::Parser::new(rows, cols, 0)),
+            pty: opts.pty,
         });
 
-        // Reader tasks push into the shared buffer and notify waiters.
-        spawn_reader(stdout, StreamKind::Stdout, Arc::clone(&shared));
-        spawn_reader(stderr, StreamKind::Stderr, Arc::clone(&shared));
+        let spawn_err = |e: String| {
+            myco_api::ToolResult::err(format!(
+                "failed to spawn session command {cmdline:?}{}: {e}",
+                cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
+            ))
+        };
+
+        // Two spawn shapes: piped (deterministic streams, no echo) and pty
+        // (one merged stream, tty semantics — what TUI programs need).
+        let (child, input, output_streams) = if opts.pty {
+            let (reader, writer, slave) = match pty::open(cols, rows) {
+                Ok(v) => v,
+                Err(e) => return spawn_err(e),
+            };
+            let (sin, sout) = match (slave.try_clone(), slave.try_clone()) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => return spawn_err(format!("pty slave dup: {e}")),
+            };
+            let mut cmd = BASH.tokio_command();
+            cmd.args(["-c", cmdline])
+                .stdin(Stdio::from(sin))
+                .stdout(Stdio::from(sout))
+                .stderr(Stdio::from(slave))
+                .kill_on_drop(true)
+                .env("PYTHONUNBUFFERED", "1")
+                .env("TERM", "xterm-256color");
+            // setsid puts the child in its own fresh process group (pgid =
+            // pid), so kill(-pid) on close/reap keeps working without
+            // process_group(0) — which would make setsid fail.
+            unsafe {
+                cmd.pre_exec(|| pty::make_controlling_tty());
+            }
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            let child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return spawn_err(e.to_string()),
+            };
+            spawn_reader(reader, StreamKind::Stdout, Arc::clone(&shared));
+            (child, SessionInput::Pty(writer), 1u8)
+        } else {
+            let mut cmd = BASH.tokio_command();
+            cmd.args(["-c", cmdline])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .env("PYTHONUNBUFFERED", "1")
+                // Own process group so close/reap can kill the whole tree.
+                .process_group(0);
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return spawn_err(e.to_string()),
+            };
+            let (child_stdin, stdout, stderr) =
+                match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                    (Some(i), Some(o), Some(e)) => (i, o, e),
+                    _ => {
+                        let _ = child.kill().await;
+                        return myco_api::ToolResult::err("child pipes missing after spawn");
+                    }
+                };
+            spawn_reader(stdout, StreamKind::Stdout, Arc::clone(&shared));
+            spawn_reader(stderr, StreamKind::Stderr, Arc::clone(&shared));
+            (child, SessionInput::Pipe(child_stdin), 2u8)
+        };
+
+        let pid = child.id();
         spawn_waiter(child, Arc::clone(&shared));
 
         let session = Session {
             owner,
             cmdline: cmdline.to_string(),
-            stdin: Mutex::new(Some(child_stdin)),
+            stdin: Mutex::new(Some(input)),
             shared,
             created_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
             pid,
             lock: Mutex::new(ShellLock::Assistant),
+            output_streams,
         };
 
         {
@@ -554,7 +606,7 @@ impl BashService {
         }
 
         // Optional initial stdin, then collect a first snapshot.
-        if let Some(data) = stdin
+        if let Some(data) = opts.stdin
             && let Err(e) = self.write_to_session(session_id, data).await
         {
             return myco_api::ToolResult::err(format!(
@@ -769,6 +821,26 @@ impl BashService {
         myco_api::ToolResult::text(lines.join("\n"))
     }
 
+    /// The agent-facing `screenshot` action: the same rendered screen the
+    /// observer surface serves, formatted as a tool result.
+    fn session_screenshot(&self, session_id: &str, owner: Uuid) -> myco_api::ToolResult {
+        if let Err(e) = self.ensure_owner(session_id, owner) {
+            return myco_api::ToolResult::err(e);
+        }
+        let shared = {
+            let sessions = self.sessions();
+            let Some(session) = sessions.get(session_id) else {
+                return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
+            };
+            Arc::clone(&session.shared)
+        };
+        let s = render_screen(&shared);
+        myco_api::ToolResult::text(format!(
+            "screen: {}x{} (cols x rows), cursor at row {} col {}\n{}\n",
+            s.cols, s.rows, s.cursor_row, s.cursor_col, s.text
+        ))
+    }
+
     fn ensure_owner(&self, session_id: &str, owner: Uuid) -> Result<(), String> {
         let sessions = self.sessions();
         let session = sessions
@@ -847,11 +919,8 @@ impl BashService {
         // Bound the write so a full pipe / stuck child cannot hang the agent.
         // Keep this independent of the larger session timeout_ms ceiling.
         let write_timeout = Duration::from_millis(STDIN_WRITE_TIMEOUT_MS);
-        let write_result = tokio::time::timeout(write_timeout, async {
-            stdin.write_all(data.as_bytes()).await?;
-            stdin.flush().await
-        })
-        .await;
+        let write_result =
+            tokio::time::timeout(write_timeout, stdin.write_all(data.as_bytes())).await;
         match write_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -876,15 +945,18 @@ impl BashService {
                 *t = Instant::now();
             }
         }
-        // Echo the input into the observer scrollback: a piped child has no
-        // pty to echo keystrokes, so without this a watched terminal would
-        // show answers to invisible questions — whichever side typed them.
-        lock_unpoisoned(&shared.scroll).push(data.as_bytes());
+        // Echo the input into the observer surfaces: a piped child has no pty
+        // to echo keystrokes, so without this a watched terminal would show
+        // answers to invisible questions — whichever side typed them. A pty
+        // session's tty echoes for real, so echoing here would double it.
+        if !shared.pty {
+            shared.observe(data.as_bytes());
+        }
         shared.notify.notify_waiters();
         Ok(())
     }
 
-    fn return_stdin(&self, session_id: &str, stdin: ChildStdin) {
+    fn return_stdin(&self, session_id: &str, stdin: SessionInput) {
         let sessions = self.sessions();
         let Some(session) = sessions.get(session_id) else {
             return;
@@ -926,6 +998,7 @@ impl BashService {
                         .lock()
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(0),
+                    pty: s.shared.pty,
                 }
             })
             .collect();
@@ -970,6 +1043,27 @@ impl BashService {
             &mut *lock_unpoisoned(&session.lock),
             lock,
         ))
+    }
+
+    /// One session's fresh overview (for input/lock responses).
+    pub fn shell_overview(&self, id: &str) -> Result<ShellOverview, String> {
+        self.shell_overviews()
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("unknown session {id:?}"))
+    }
+
+    /// The session's rendered terminal screen, non-consuming (see
+    /// [`ShellScreen`]). No lock gate: watching is always fine.
+    pub fn shell_screen(&self, id: &str) -> Result<ShellScreen, String> {
+        let shared = {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            Arc::clone(&session.shared)
+        };
+        Ok(render_screen(&shared))
     }
 
     /// A keystroke line from the user. Requires the user to hold the
@@ -1028,7 +1122,7 @@ struct Session {
     /// Agent that started this session; only this agent may write/read/close it.
     owner: Uuid,
     cmdline: String,
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Option<SessionInput>>,
     shared: Arc<SessionShared>,
     created_at: Instant,
     last_used: Mutex<Instant>,
@@ -1036,6 +1130,27 @@ struct Session {
     pid: Option<u32>,
     /// Who holds the keyboard (see [`ShellLock`]). Starts assistant-locked.
     lock: Mutex<ShellLock>,
+    /// Readers feeding the buffer: 2 piped (stdout+stderr), 1 pty (merged).
+    /// `kill_session_process` reads it to know when the group is truly done.
+    output_streams: u8,
+}
+
+/// Where session input goes: the child's stdin pipe, or the pty master.
+enum SessionInput {
+    Pipe(ChildStdin),
+    Pty(pty::PtyWriter),
+}
+
+impl SessionInput {
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            SessionInput::Pipe(s) => {
+                s.write_all(data).await?;
+                s.flush().await
+            }
+            SessionInput::Pty(w) => w.write_all(data).await,
+        }
+    }
 }
 
 struct SessionShared {
@@ -1045,6 +1160,36 @@ struct SessionShared {
     generation: AtomicU64,
     /// Observer scrollback (the web terminal reads this; see [`Scrollback`]).
     scroll: Mutex<Scrollback>,
+    /// Terminal screen model fed the same bytes as the scrollback — what
+    /// `screenshot` renders. For piped sessions it is a best-effort "as a
+    /// terminal would show it" view; for pty sessions it is the actual screen.
+    screen: Mutex<vt100::Parser>,
+    /// Session runs under a pty: one merged output stream, and the tty echoes
+    /// input (so the service must not echo it again).
+    pty: bool,
+}
+
+impl SessionShared {
+    /// Feed observer surfaces (scrollback ring + screen model) with bytes as
+    /// they arrive. Callers still notify waiters themselves.
+    fn observe(&self, bytes: &[u8]) {
+        lock_unpoisoned(&self.scroll).push(bytes);
+        let mut screen = lock_unpoisoned(&self.screen);
+        if self.pty {
+            screen.process(bytes);
+        } else {
+            // Pipe output has bare `\n`; a terminal needs `\r\n` or every
+            // line indents past the last (the staircase).
+            let mut translated = Vec::with_capacity(bytes.len() + 8);
+            for &b in bytes {
+                if b == b'\n' {
+                    translated.push(b'\r');
+                }
+                translated.push(b);
+            }
+            screen.process(&translated);
+        }
+    }
 }
 
 /// Who holds a session's keyboard.
@@ -1055,14 +1200,16 @@ struct SessionShared {
 /// write/signal/close calls fail with an error saying exactly that, because
 /// two writers interleaving keystrokes into one stdin is worse than either
 /// waiting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShellLock {
     Assistant,
     User,
 }
 
-/// One live session as the observer surface lists it.
-#[derive(Debug, Clone)]
+/// One live session as the observer surface lists it. Serde: this rides the
+/// NDJSON host protocol so remote shells list like local ones.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellOverview {
     pub id: String,
     pub cmdline: String,
@@ -1073,6 +1220,33 @@ pub struct ShellOverview {
     pub end_offset: u64,
     pub created_secs: u64,
     pub idle_secs: u64,
+    /// Running under a pty (a viewer should render the screen, not the ring).
+    pub pty: bool,
+}
+
+/// A rendered terminal screen — the text a `cols`×`rows` window shows now.
+/// Serde: rides the NDJSON host protocol (see [`ShellOverview`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShellScreen {
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub text: String,
+}
+
+fn render_screen(shared: &SessionShared) -> ShellScreen {
+    let parser = lock_unpoisoned(&shared.screen);
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    ShellScreen {
+        cols,
+        rows,
+        cursor_row,
+        cursor_col,
+        text: screen.contents(),
+    }
 }
 
 /// A non-consuming scrollback read (see [`BashService::shell_tail`]).
@@ -1430,7 +1604,7 @@ where
                         b.dropped_bytes = b.dropped_bytes.saturating_add(dropped);
                         b.total_bytes = b.total_bytes.saturating_add(n);
                     }
-                    lock_unpoisoned(&shared.scroll).push(&buf[..n]);
+                    shared.observe(&buf[..n]);
                     shared.notify.notify_waiters();
                 }
                 Err(_) => break,
@@ -1456,7 +1630,7 @@ fn kill_session_process(session: &Session) {
         .shared
         .buffer
         .lock()
-        .map(|b| b.exited && b.eof_streams >= 2)
+        .map(|b| b.exited && b.eof_streams >= session.output_streams)
         .unwrap_or(false);
     if !group_done {
         kill_process_group(session.pid);
@@ -1683,6 +1857,16 @@ pub struct Input {
     /// Signal to deliver for `signal`. Default `int`.
     #[serde(default)]
     signal: Option<SignalKind>,
+    /// `start` only: run the child under a real pty (controlling terminal).
+    /// For full-screen/TUI programs and isatty checks. Default false.
+    #[serde(default)]
+    pty: Option<bool>,
+    /// `start` only: terminal width in columns (default 120).
+    #[serde(default)]
+    cols: Option<u16>,
+    /// `start` only: terminal height in rows (default 40).
+    #[serde(default)]
+    rows: Option<u16>,
     /// Hard wait ceiling in milliseconds.
     /// - start/write/read: default 30000 (30s), max 1800000 (30 min); early return on idle/byte cap.
     /// - exec: default 60000 (60s), max 1800000 (30 min); waits for process exit.
@@ -1710,6 +1894,7 @@ enum ActionKind {
     Signal,
     Close,
     List,
+    Screenshot,
 }
 
 /// Signals a supervisor may deliver to a session. Deliberately small: SIGKILL
@@ -1761,6 +1946,9 @@ enum Action {
         command: Option<String>,
         cwd: Option<String>,
         stdin: Option<String>,
+        pty: bool,
+        cols: Option<u16>,
+        rows: Option<u16>,
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
@@ -1789,6 +1977,19 @@ enum Action {
         session_id: String,
     },
     List,
+    Screenshot {
+        session_id: String,
+    },
+}
+
+/// `start` parameters that shape the child, bundled so the call stays legible.
+struct StartOptions<'a> {
+    command: Option<&'a str>,
+    cwd: Option<&'a str>,
+    stdin: Option<&'a str>,
+    pty: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 /// True when `command` begins with a shell `cd` (after optional whitespace).
@@ -1847,6 +2048,9 @@ fn is_empty_object(input: &Input) -> bool {
         session_id,
         stdin,
         signal,
+        pty,
+        cols,
+        rows,
         timeout_ms,
         idle_ms,
         max_bytes,
@@ -1857,6 +2061,9 @@ fn is_empty_object(input: &Input) -> bool {
         && session_id.is_none()
         && stdin.is_none()
         && signal.is_none()
+        && pty.is_none()
+        && cols.is_none()
+        && rows.is_none()
         && timeout_ms.is_none()
         && idle_ms.is_none()
         && max_bytes.is_none()
@@ -1884,6 +2091,30 @@ fn normalize_cwd(cwd: Option<&String>) -> Result<Option<String>, String> {
             }
         }
     }
+}
+
+/// Reject `start`-only fields on other actions (same contract as `cwd`).
+fn reject_start_only_fields(input: &Input) -> Result<(), String> {
+    if input.pty.is_some() || input.cols.is_some() || input.rows.is_some() {
+        return Err("`pty`/`cols`/`rows` are only valid on `start`".into());
+    }
+    Ok(())
+}
+
+/// Terminal dimensions within reason: a 3-column or 5000-row "terminal" is a
+/// typo, not a request.
+fn validate_pty_dims(cols: Option<u16>, rows: Option<u16>) -> Result<(), String> {
+    if let Some(c) = cols
+        && !(20..=400).contains(&c)
+    {
+        return Err(format!("`cols` must be 20..=400, got {c}"));
+    }
+    if let Some(r) = rows
+        && !(5..=200).contains(&r)
+    {
+        return Err(format!("`rows` must be 5..=200, got {r}"));
+    }
+    Ok(())
 }
 
 fn resolve_action(input: &Input) -> Result<Action, String> {
@@ -1940,6 +2171,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
 
     match kind {
         ActionKind::Exec => {
+            reject_start_only_fields(input)?;
             let command = input
                 .command
                 .clone()
@@ -1963,11 +2195,15 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 require_non_blank("command", command)?;
                 reject_if_command_starts_with_cd(command)?;
             }
+            validate_pty_dims(input.cols, input.rows)?;
             Ok(Action::Start {
                 session_id,
                 command: input.command.clone(),
                 cwd,
                 stdin: input.stdin.clone(),
+                pty: input.pty.unwrap_or(false),
+                cols: input.cols,
+                rows: input.rows,
                 timeout_ms: session_timeout(input)?,
                 idle_ms,
                 max_bytes,
@@ -1977,6 +2213,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             if cwd.is_some() {
                 return Err("`cwd` is only valid on `exec` / `start`".into());
             }
+            reject_start_only_fields(input)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -1998,6 +2235,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             if cwd.is_some() {
                 return Err("`cwd` is only valid on `exec` / `start`".into());
             }
+            reject_start_only_fields(input)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -2014,6 +2252,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             if cwd.is_some() {
                 return Err("`cwd` is only valid on `exec` / `start`".into());
             }
+            reject_start_only_fields(input)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -2031,6 +2270,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             if cwd.is_some() {
                 return Err("`cwd` is only valid on `exec` / `start`".into());
             }
+            reject_start_only_fields(input)?;
             let session_id = input
                 .session_id
                 .clone()
@@ -2042,7 +2282,20 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             if cwd.is_some() {
                 return Err("`cwd` is only valid on `exec` / `start`".into());
             }
+            reject_start_only_fields(input)?;
             Ok(Action::List)
+        }
+        ActionKind::Screenshot => {
+            if cwd.is_some() {
+                return Err("`cwd` is only valid on `exec` / `start`".into());
+            }
+            reject_start_only_fields(input)?;
+            let session_id = input
+                .session_id
+                .clone()
+                .ok_or_else(|| "screenshot requires `session_id`".to_string())?;
+            require_non_blank("session_id", &session_id)?;
+            Ok(Action::Screenshot { session_id })
         }
     }
 }

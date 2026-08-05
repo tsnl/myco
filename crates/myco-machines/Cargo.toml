@@ -23,6 +23,7 @@ myco-prompts = { workspace = true }
 tokio-util = { workspace = true }
 schemars = { workspace = true }
 dirs = { workspace = true }
+vt100 = "0.15"
 
 [dev-dependencies]
 myco-test-support = { workspace = true }
