@@ -14,7 +14,10 @@ scripts.
   demand and need only `myco` on PATH — no config, no keys.
 - **Real computer use.** Bash (including multi-turn sessions) and a surgical
   file editor on each host; search and browsing compose from the tools already
-  on your machines (`rg`, `curl`, `ck`, …) via bash.
+  on your machines (`rg`, `curl`, `ck`, …) via bash. A session can run under
+  a real pty (`pty: true` on start — for TUI apps and anything that checks
+  isatty), and the `screenshot` action renders any session's terminal screen
+  as text, so the agent reads an editor or `top` the way you would.
 - **Async everywhere.** Input queues while a turn runs — in the CLI and the
   web alike. In serve mode each conversation is a URL and agents run in
   parallel server-side.
@@ -34,14 +37,16 @@ scripts.
   finishes, and whole messages; the GUI streams it and reconciles with a
   slow poll.
 - **Shared terminals with a keyboard lock.** The GUI's work rail lists the
-  agent's live bash sessions (local host) next to whatever tool calls are in
-  flight. Open one and you watch its scrollback live; double-click to take
+  agent's live bash sessions on **every host** — local and remotes alike,
+  reached over the same NDJSON host protocol the tools use — next to
+  whatever tool calls are in flight. Open one and you watch it live (pty
+  sessions render as their actual terminal screen); double-click to take
   the keyboard and type into it yourself. The lock decides who may write —
   shells start agent-held, the agent's writes fail politely while you hold
   it, and both sides always read. Everything you type (and every keyboard
-  handoff) lands in the transcript as an attributed, non-waking message, so
-  the agent reads what you did at its next boundary instead of discovering
-  a mutated shell.
+  handoff) lands in the transcript as an attributed, non-waking message
+  naming the host, so the agent reads what you did at its next boundary
+  instead of discovering a mutated shell.
 - **Shared sessions the agent stays out of.** Several people can hold one
   session. While you are the only person in it, everything you say is for
   the agent — as before. Once someone else posts, the room has rules: the
@@ -128,10 +133,13 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami` ·
-`GET /api/sessions/<id>/shells` · `GET /api/sessions/<id>/shells/<shell>?from=N`
+`GET /api/sessions/<id>/shells` (all hosts) ·
+`GET /api/sessions/<id>/shells/<host>/<shell>?from=N`
 (offset-addressed scrollback tail) ·
-`POST /api/sessions/<id>/shells/<shell>/input` (`{data}`, requires the user
-keyboard lock) · `POST /api/sessions/<id>/shells/<shell>/lock`
+`GET /api/sessions/<id>/shells/<host>/<shell>/screen` (rendered terminal
+screen — what a pty session looks like now) ·
+`POST /api/sessions/<id>/shells/<host>/<shell>/input` (`{data}`, requires the
+user keyboard lock) · `POST /api/sessions/<id>/shells/<host>/<shell>/lock`
 (`{lock: "user"|"assistant"}`).
 Wire types live in `crates/myco-api`.
 

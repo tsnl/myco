@@ -196,22 +196,27 @@ impl MycoApi for HttpClient {
     async fn shell_tail(
         &self,
         id: &str,
+        host: &str,
         shell: &str,
         from: u64,
     ) -> Result<api::ShellTailChunk, ApiError> {
-        self.get(&format!("/sessions/{id}/shells/{shell}?from={from}"))
+        self.get(&format!("/sessions/{id}/shells/{host}/{shell}?from={from}"))
             .await
     }
 
     async fn shell_input(
         &self,
         id: &str,
+        host: &str,
         shell: &str,
         data: String,
     ) -> Result<api::Shell, ApiError> {
         self.send(
             self.http
-                .post(format!("{}/sessions/{id}/shells/{shell}/input", self.base))
+                .post(format!(
+                    "{}/sessions/{id}/shells/{host}/{shell}/input",
+                    self.base
+                ))
                 .json(&api::ShellInput { data }),
         )
         .await
@@ -220,14 +225,28 @@ impl MycoApi for HttpClient {
     async fn shell_lock(
         &self,
         id: &str,
+        host: &str,
         shell: &str,
         lock: api::ShellLockMode,
     ) -> Result<api::Shell, ApiError> {
         self.send(
             self.http
-                .post(format!("{}/sessions/{id}/shells/{shell}/lock", self.base))
+                .post(format!(
+                    "{}/sessions/{id}/shells/{host}/{shell}/lock",
+                    self.base
+                ))
                 .json(&api::ShellLockRequest { lock }),
         )
         .await
+    }
+
+    async fn shell_screen(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+    ) -> Result<api::ShellScreen, ApiError> {
+        self.get(&format!("/sessions/{id}/shells/{host}/{shell}/screen"))
+            .await
     }
 }

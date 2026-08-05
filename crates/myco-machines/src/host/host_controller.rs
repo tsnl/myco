@@ -20,7 +20,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::host::HostWorker;
 use crate::host::protocol::{Request, Response};
-use crate::tool_services::HostDispatchContext;
+use crate::tool_services::{
+    BashService, HostDispatchContext, ShellLock, ShellOverview, ShellScreen, ShellTail,
+};
 use myco_api::{ToolResult, ToolUse};
 use myco_core::CancelToken;
 use myco_models::ToolSpec;
@@ -214,7 +216,7 @@ impl HostController {
             tool_use,
         };
 
-        let rx = match self.submit(&id, &request).await {
+        let rx = match self.submit(&id, &request, true).await {
             Ok(rx) => rx,
             Err(e) => {
                 return ToolResult::err(format!("host {:?}: {e}", self.name)).with_id(tool_id);
@@ -244,7 +246,11 @@ impl HostController {
             Ok(Response::Error { message, .. }) => {
                 ToolResult::err(format!("host {:?}: {message}", self.name)).with_id(tool_id)
             }
-            Ok(Response::HelloOk { .. }) => unreachable!("hello is consumed during connect"),
+            Ok(other) => ToolResult::err(format!(
+                "host {:?}: mismatched reply to a tool call: {other:?}",
+                self.name
+            ))
+            .with_id(tool_id),
             Err(_closed) => {
                 ToolResult::err(format!("host {:?}: connection closed", self.name)).with_id(tool_id)
             }
@@ -281,7 +287,9 @@ impl HostController {
     }
 
     /// Register waiter + enqueue request, spawning the worker if `conn` is
-    /// `None` (or only holds a dead connection).
+    /// `None` (or only holds a dead connection) and `connect` allows it.
+    /// Observer requests pass `connect: false`: a host nobody is using has no
+    /// shells, and a 1 Hz rail poll must never be what spawns SSH.
     ///
     /// The connection mutex is held to (re)connect and clone handles — never
     /// across the channel send — so a wedged host cannot block sibling submits
@@ -290,6 +298,7 @@ impl HostController {
         &self,
         id: &str,
         request: &Request,
+        connect: bool,
     ) -> Result<oneshot::Receiver<Response>, String> {
         let Backend::Subprocess {
             config,
@@ -314,6 +323,9 @@ impl HostController {
                 *slot = None;
             }
             if slot.is_none() {
+                if !connect {
+                    return Err("host not connected".into());
+                }
                 match connect_with_timeout(config, *connect_timeout_secs).await {
                     Ok(c) => {
                         if let Ok(mut err) = last_error.lock() {
@@ -375,6 +387,166 @@ impl HostController {
             return Err(msg);
         }
         Ok(rx)
+    }
+
+    // --- shell observer surface ------------------------------------------
+    //
+    // The same watch/type/lock/screenshot surface the local host serves,
+    // reached over the protocol for subprocess hosts. Reads never spawn a
+    // connection: a host that is not connected has no shells to show.
+
+    /// Live shells on this host. Not connected ⇒ empty, not an error — the
+    /// rail lists what exists, and nothing exists on a dormant host.
+    pub async fn shell_overviews(&self) -> Result<Vec<ShellOverview>, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => Ok(worker
+                .bash()
+                .map(|b| b.shell_overviews())
+                .unwrap_or_default()),
+            Backend::Subprocess { .. } => {
+                if !self.is_connected() {
+                    return Ok(Vec::new());
+                }
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                match self
+                    .shell_request(&id, &Request::ShellList { id: id.clone() })
+                    .await?
+                {
+                    Response::Shells { shells, .. } => Ok(shells),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// Non-consuming scrollback tail (see [`crate::tool_services::BashService::shell_tail`]).
+    pub async fn shell_tail(
+        &self,
+        shell: &str,
+        from: u64,
+        max_bytes: usize,
+    ) -> Result<ShellTail, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                self.bash_of(worker)?.shell_tail(shell, from, max_bytes)
+            }
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellTail {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                    from,
+                    max_bytes: max_bytes as u64,
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::ShellTail {
+                        from,
+                        end,
+                        data,
+                        running,
+                        lock,
+                        ..
+                    } => Ok(ShellTail {
+                        from,
+                        end,
+                        data: data.into_bytes(),
+                        running,
+                        lock,
+                    }),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// A user keystroke line (requires the user keyboard lock on the host).
+    pub async fn shell_input(&self, shell: &str, data: &str) -> Result<ShellOverview, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                let bash = self.bash_of(worker)?;
+                bash.shell_user_write(shell, data).await?;
+                bash.shell_overview(shell)
+            }
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellInput {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                    data: data.to_string(),
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::Shell { shell, .. } => Ok(shell),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// Move the keyboard; returns `(previous, fresh overview)` so a caller
+    /// can tell a transition from an idempotent re-take.
+    pub async fn shell_lock(
+        &self,
+        shell: &str,
+        lock: ShellLock,
+    ) -> Result<(ShellLock, ShellOverview), String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                let bash = self.bash_of(worker)?;
+                let previous = bash.shell_set_lock(shell, lock)?;
+                Ok((previous, bash.shell_overview(shell)?))
+            }
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellLock {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                    lock,
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::Shell {
+                        shell,
+                        previous_lock,
+                        ..
+                    } => Ok((previous_lock.unwrap_or(shell.lock), shell)),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// The shell's rendered terminal screen.
+    pub async fn shell_screen(&self, shell: &str) -> Result<ShellScreen, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => self.bash_of(worker)?.shell_screen(shell),
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellScreenshot {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::ShellScreen { screen, .. } => Ok(screen),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    fn bash_of<'w>(&self, worker: &'w Arc<HostWorker>) -> Result<&'w Arc<BashService>, String> {
+        worker
+            .bash()
+            .ok_or_else(|| format!("host {:?} has no bash service", self.name))
+    }
+
+    /// Submit an observer request (never connecting) and await its routed
+    /// reply, unwrapping worker-side errors.
+    async fn shell_request(&self, id: &str, request: &Request) -> Result<Response, String> {
+        let rx = self.submit(id, request, false).await?;
+        match rx.await {
+            Ok(Response::Error { message, .. }) => Err(message),
+            Ok(resp) => Ok(resp),
+            Err(_closed) => Err("host connection closed".into()),
+        }
     }
 
     /// Best-effort removal of this call's waiter so cancel returns instantly.
@@ -576,24 +748,16 @@ async fn run_reader(
             Err(_) => continue,
         };
 
-        match &msg {
-            Response::ToolResult { id, .. } => {
-                let mut pending = pending.lock().await;
-                if let Some(tx) = pending.remove(id) {
-                    let _ = tx.send(msg);
-                }
+        if let Some(id) = msg.correlation_id().map(str::to_string) {
+            let mut pending = pending.lock().await;
+            if let Some(tx) = pending.remove(&id) {
+                let _ = tx.send(msg);
             }
-            Response::Error { id: Some(id), .. } => {
-                let mut pending = pending.lock().await;
-                if let Some(tx) = pending.remove(id) {
-                    let _ = tx.send(msg);
-                }
-            }
-            Response::Error { id: None, message } => {
-                break format!("host protocol error: {message}");
-            }
-            Response::HelloOk { .. } => {}
+        } else if let Response::Error { id: None, message } = &msg {
+            break format!("host protocol error: {message}");
         }
+        // Anything else unaddressed (a stray hello) is noise, not a reason to
+        // poison the pipe.
     };
 
     dead.store(true, Ordering::SeqCst);

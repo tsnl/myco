@@ -4,9 +4,15 @@
 //! - [`Request`]  — controller → worker
 //! - [`Response`] — worker → controller
 
+use crate::tool_services::{ShellLock, ShellOverview, ShellScreen};
 use myco_api::{ToolResult, ToolUse};
 
 /// Controller → worker message.
+///
+/// The `Shell*` requests are the **observer surface**: a person watching or
+/// driving a live bash session from the web rail. They carry no `agent_id` —
+/// watching is not ownership — and every one is answered under its `id` like
+/// a tool call, so remote shells behave exactly like local ones.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -23,6 +29,30 @@ pub enum Request {
     /// Reap agent-owned host state (bash sessions, …). Fire-and-forget: the
     /// worker does not reply (host process exit is the hard guarantee).
     AgentFinished { agent_id: uuid::Uuid },
+    /// List live shells → [`Response::Shells`].
+    ShellList { id: String },
+    /// Scrollback from `from` → [`Response::ShellTail`].
+    ShellTail {
+        id: String,
+        shell: String,
+        from: u64,
+        max_bytes: u64,
+    },
+    /// A user keystroke line (requires the user keyboard lock on the host) →
+    /// [`Response::Shell`].
+    ShellInput {
+        id: String,
+        shell: String,
+        data: String,
+    },
+    /// Move the keyboard → [`Response::Shell`] with `previous_lock` set.
+    ShellLock {
+        id: String,
+        shell: String,
+        lock: ShellLock,
+    },
+    /// Rendered terminal screen → [`Response::ShellScreen`].
+    ShellScreenshot { id: String, shell: String },
 }
 
 impl Request {
@@ -50,11 +80,57 @@ pub enum Response {
         id: String,
         result: ToolResult,
     },
+    /// Reply to [`Request::ShellList`].
+    Shells {
+        id: String,
+        shells: Vec<ShellOverview>,
+    },
+    /// Reply to [`Request::ShellTail`]. `data` is the scrollback lossily
+    /// UTF-8 — same shape the HTTP layer serves a terminal.
+    ShellTail {
+        id: String,
+        from: u64,
+        end: u64,
+        data: String,
+        running: bool,
+        lock: ShellLock,
+    },
+    /// Reply to [`Request::ShellInput`] / [`Request::ShellLock`]: the shell's
+    /// fresh overview. For a lock move, `previous_lock` says who held the
+    /// keyboard before, so the caller can tell a transition from a re-take.
+    Shell {
+        id: String,
+        shell: ShellOverview,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_lock: Option<ShellLock>,
+    },
+    /// Reply to [`Request::ShellScreenshot`].
+    ShellScreen {
+        id: String,
+        screen: ShellScreen,
+    },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         message: String,
     },
+}
+
+impl Response {
+    /// The request id this response answers, when it answers one — what the
+    /// controller's demux routes on, so a new variant that forgets to appear
+    /// here would strand its waiter.
+    pub fn correlation_id(&self) -> Option<&str> {
+        match self {
+            Response::HelloOk { .. } => None,
+            Response::ToolResult { id, .. }
+            | Response::Shells { id, .. }
+            | Response::ShellTail { id, .. }
+            | Response::Shell { id, .. }
+            | Response::ShellScreen { id, .. } => Some(id),
+            Response::Error { id, .. } => id.as_deref(),
+        }
+    }
 }
 
 impl Response {
@@ -109,6 +185,60 @@ mod tests {
             Request::ToolCall { id, tool_use, .. } => {
                 assert_eq!(id, "1");
                 assert_eq!(tool_use.name, "bash");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The observer messages survive the wire, lock spelling included — and
+    /// every id-carrying response names its correlation id, or the demux
+    /// would strand its waiter.
+    #[test]
+    fn shell_observer_messages_roundtrip() {
+        let req = Request::ShellTail {
+            id: "7".into(),
+            shell: "term".into(),
+            from: 42,
+            max_bytes: 65536,
+        };
+        let line = String::from_utf8(req.encode().unwrap()).unwrap();
+        assert!(line.contains(r#""type":"shell_tail""#), "{line}");
+        match Request::decode(&line).unwrap() {
+            Request::ShellTail { shell, from, .. } => {
+                assert_eq!(shell, "term");
+                assert_eq!(from, 42);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let resp = Response::Shell {
+            id: "7".into(),
+            shell: crate::tool_services::ShellOverview {
+                id: "term".into(),
+                cmdline: "cat".into(),
+                running: true,
+                exit_code: None,
+                lock: ShellLock::User,
+                end_offset: 9,
+                created_secs: 1,
+                idle_secs: 0,
+                pty: true,
+            },
+            previous_lock: Some(ShellLock::Assistant),
+        };
+        let line = String::from_utf8(resp.encode().unwrap()).unwrap();
+        assert!(line.contains(r#""lock":"user""#), "{line}");
+        let back = Response::decode(&line).unwrap();
+        assert_eq!(back.correlation_id(), Some("7"));
+        match back {
+            Response::Shell {
+                shell,
+                previous_lock,
+                ..
+            } => {
+                assert_eq!(shell.lock, ShellLock::User);
+                assert!(shell.pty);
+                assert_eq!(previous_lock, Some(ShellLock::Assistant));
             }
             other => panic!("unexpected {other:?}"),
         }
