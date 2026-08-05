@@ -75,6 +75,13 @@ pub(super) fn validate_finish<'a>(
     Ok(())
 }
 
+/// A one-item stream carrying `e` — how `generate()` surfaces a failure
+/// found before any request was sent (the trait returns a stream, not a
+/// Result).
+pub(super) fn error_stream(e: GenerateError) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    Box::pin(futures::stream::once(async move { Err(e) }))
+}
+
 /// Send `request` in a spawned task and bridge its SSE stream into the
 /// [`GenerativeModel::generate`] stream shape. Dropping the returned stream
 /// cancels generation: the task's channel sends fail, it returns, and the HTTP

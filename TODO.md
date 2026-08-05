@@ -213,6 +213,15 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Uncategorized bugs
 
+- [ ] **Cut stored tool ids from history (positional-ids stage 2)** — requests
+      already carry minted positional wire ids (`wire_tool_ids`), so stored
+      provider ids never reach a provider and cross-provider resume works. The
+      stored ids remain as display/dispatch identity (SSE `tool_started`/
+      `tool_finished`, GUI card keys, `session_history` expand). Removing them
+      entirely means an ordinal-based `AgentEvent`/`StreamEvent` contract, a
+      positional GUI join, and a `session_history` schema change — a protocol
+      revision, not a deletion. Do it deliberately or not at all.
+
 - [x] Fix empty ASSISTANT block if just tool use.
   - Always request thinking/reasoning (default effort=high; `/effort`, `--effort`).
     UI always shows summary-only `Thinking: …` inside ASSISTANT (not a separate

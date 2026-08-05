@@ -88,7 +88,10 @@ impl OpenAIResponsesGenerativeModel {
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
-        let input_items = convert_messages(input);
+        let input_items = match convert_messages(input) {
+            Ok(items) => items,
+            Err(e) => return driver_core::error_stream(e),
+        };
         driver_core::spawn_generate(
             self.response_request(&input_items),
             StreamAccumulator::default(),
@@ -103,10 +106,13 @@ impl GenerativeModel for OpenAIResponsesGenerativeModel {
 // Message conversion → Responses `input` list
 //
 
-fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
+fn convert_messages(input: &[Message]) -> Result<Vec<ResponsesInputItem>, GenerateError> {
+    // Minted per-position ids go on the wire, never stored ids
+    // (see [`wire_tool_ids`]).
+    let wire_ids = wire_tool_ids(input)?;
     let mut out = Vec::new();
 
-    for message in input {
+    for (i, message) in input.iter().enumerate() {
         match message {
             Message::UserMessage { content } => {
                 out.push(ResponsesInputItem::Message {
@@ -115,10 +121,10 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                 });
             }
             Message::ToolResults { tool_use_results } => {
-                for result in tool_use_results {
+                for (j, result) in tool_use_results.iter().enumerate() {
                     out.push(ResponsesInputItem::FunctionCallOutput {
                         type_: "function_call_output",
-                        call_id: result.id.clone(),
+                        call_id: wire_ids[i][j].clone(),
                         output: tool_result_to_output(result),
                     });
                 }
@@ -138,10 +144,10 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
                         content: ResponsesMessageContent::Text(text),
                     });
                 }
-                for tool_use in tool_uses {
+                for (j, tool_use) in tool_uses.iter().enumerate() {
                     out.push(ResponsesInputItem::FunctionCall {
                         type_: "function_call",
-                        call_id: tool_use.id.clone(),
+                        call_id: wire_ids[i][j].clone(),
                         name: tool_use.name.clone(),
                         arguments: tool_use.input.to_string(),
                     });
@@ -150,7 +156,7 @@ fn convert_messages(input: &[Message]) -> Vec<ResponsesInputItem> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// User message content: plain string when text-only, `input_text` /
@@ -657,7 +663,7 @@ mod tests {
             ),
             tool_results(&[("call_1", "hi\n")]),
         ];
-        let items = convert_messages(&input);
+        let items = convert_messages(&input).unwrap();
         assert_eq!(items.len(), 3);
         assert!(matches!(
             &items[0],
@@ -671,7 +677,7 @@ mod tests {
                 call_id,
                 name,
                 ..
-            } if call_id == "call_1" && name == "bash"
+            } if call_id == "t00010000" && name == "bash"
         ));
         assert!(matches!(
             &items[2],
@@ -679,7 +685,7 @@ mod tests {
                 call_id,
                 output,
                 ..
-            } if call_id == "call_1" && *output == ResponsesFunctionOutput::Text("hi\n".into())
+            } if call_id == "t00010000" && *output == ResponsesFunctionOutput::Text("hi\n".into())
         ));
         // Text-only output serializes as a plain string, not a parts array.
         let json = serde_json::to_value(&items).unwrap();
@@ -688,43 +694,49 @@ mod tests {
 
     #[test]
     fn tool_result_image_becomes_output_parts() {
-        let input = [Message::ToolResults {
-            tool_use_results: vec![ToolResult {
-                id: "call_1".into(),
-                content: vec![
-                    Content::Text { text: "ok".into() },
-                    Content::Image {
-                        source: "data:image/png;base64,AAAA".into(),
-                    },
-                ],
-                is_error: false,
-            }],
-        }];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
-        assert_eq!(json[0]["type"], "function_call_output");
-        assert_eq!(json[0]["output"][0]["type"], "input_text");
-        assert_eq!(json[0]["output"][0]["text"], "ok");
-        assert_eq!(json[0]["output"][1]["type"], "input_image");
+        let input = [
+            assistant_tool(None, "call_1", "view_image", serde_json::json!({})),
+            Message::ToolResults {
+                tool_use_results: vec![ToolResult {
+                    id: "call_1".into(),
+                    content: vec![
+                        Content::Text { text: "ok".into() },
+                        Content::Image {
+                            source: "data:image/png;base64,AAAA".into(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+        ];
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
+        assert_eq!(json[1]["type"], "function_call_output");
+        assert_eq!(json[1]["output"][0]["type"], "input_text");
+        assert_eq!(json[1]["output"][0]["text"], "ok");
+        assert_eq!(json[1]["output"][1]["type"], "input_image");
         assert_eq!(
-            json[0]["output"][1]["image_url"],
+            json[1]["output"][1]["image_url"],
             "data:image/png;base64,AAAA"
         );
     }
 
     #[test]
     fn image_only_tool_result_has_no_empty_text_part() {
-        let input = [Message::ToolResults {
-            tool_use_results: vec![ToolResult {
-                id: "call_1".into(),
-                content: vec![Content::Image {
-                    source: "data:image/png;base64,AAAA".into(),
+        let input = [
+            assistant_tool(None, "call_1", "view_image", serde_json::json!({})),
+            Message::ToolResults {
+                tool_use_results: vec![ToolResult {
+                    id: "call_1".into(),
+                    content: vec![Content::Image {
+                        source: "data:image/png;base64,AAAA".into(),
+                    }],
+                    is_error: false,
                 }],
-                is_error: false,
-            }],
-        }];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
-        assert_eq!(json[0]["output"].as_array().unwrap().len(), 1);
-        assert_eq!(json[0]["output"][0]["type"], "input_image");
+            },
+        ];
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
+        assert_eq!(json[1]["output"].as_array().unwrap().len(), 1);
+        assert_eq!(json[1]["output"][0]["type"], "input_image");
     }
 
     /// A function_call item without call_id/name must fail the stream, not
@@ -761,7 +773,7 @@ mod tests {
                 },
             ],
         }];
-        let items = convert_messages(&input);
+        let items = convert_messages(&input).unwrap();
         let json = serde_json::to_value(&items).unwrap();
         assert_eq!(json[0]["role"], "user");
         assert_eq!(json[0]["content"][0]["type"], "input_image");
@@ -776,7 +788,7 @@ mod tests {
     #[test]
     fn text_only_user_message_stays_plain_string() {
         let input = [user("hi")];
-        let json = serde_json::to_value(convert_messages(&input)).unwrap();
+        let json = serde_json::to_value(convert_messages(&input).unwrap()).unwrap();
         assert_eq!(json[0]["content"], "hi");
     }
 
