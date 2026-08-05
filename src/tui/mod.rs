@@ -97,7 +97,8 @@ impl Style {
         color: Some(Color::Yellow),
         ..Style::RESET
     };
-    /// Startup banner: bold, uncolored (distinct from the section palette).
+    /// Banner family — startup/COMPACTED banners and the MYCO section: bold,
+    /// uncolored (distinct from the section palette).
     pub const BANNER: Style = Style {
         bold: true,
         ..Style::RESET
@@ -398,11 +399,18 @@ struct ProducerState {
 /// Owns the terminal sink and the console-mirror sink; translates domain
 /// [`AgentEvent`]s and REPL chrome calls into [`TuiEvent`]s. Headed sections:
 /// USER ([`Self::user_header`]), ASSISTANT (streamed via [`EventSink`]),
+/// MYCO ([`Self::myco_section`]), room participants ([`Self::person_section`]),
 /// ERROR ([`Self::error_section`]), WARNING ([`Self::warning_section`]).
 /// Thinking summaries, tool invocations, and answer text are paragraphs
 /// inside a single ASSISTANT section for the whole agent turn (including
-/// multi-step tool loops). ERROR/WARNING sections are live-only and not
-/// replayed.
+/// multi-step tool loops). MYCO/person/ERROR/WARNING sections are live-only
+/// and not replayed.
+///
+/// **Invariant: every content line sits under a banner or a headed section.**
+/// The API is what enforces it — there is no free-line emitter. The two
+/// non-section methods are scoped: [`Self::note`] appends a line *inside* the
+/// currently open section, and [`Self::blank_line`] is layout (the gap before
+/// the next USER rule), not content.
 pub struct TuiProducer {
     terminal: Arc<dyn TuiSink>,
     mirror: Arc<dyn TuiSink>,
@@ -535,14 +543,27 @@ impl TuiProducer {
     /// conversation is still on disk in both sessions and the mirror.
     pub fn compacted_banner(&self, outcome: &crate::session::CompactOutcome) {
         let events = self.with_state(|st| {
-            let mut events = compacted_banner_events(outcome, st.wrap);
-            // Blank line closes the banner before the next USER rule, matching startup.
-            events.push(TuiEvent::Text("\n".into()));
+            let events = compacted_banner_events(outcome, st.wrap);
             st.section = SectionState::new();
             st.section.at_line_start = true;
             events
         });
         self.broadcast(events);
+    }
+
+    /// Headed MYCO section (live-only): myco's own response to a meta-command
+    /// (`/help`, `/hosts`, `/session`, …) — the banner family's voice as a
+    /// mid-screen section, so command output is headed like every other block.
+    pub fn myco_section(&self, body: &str) {
+        self.headed_section(Style::BANNER, "MYCO", body);
+    }
+
+    /// Headed section for a room participant's message (live-only): the
+    /// speaker's name as the header in the USER palette — someone else talking
+    /// in this session, distinct from the local operator's turn
+    /// ([`Self::user_header`]).
+    pub fn person_section(&self, name: &str, body: &str) {
+        self.headed_section(Style::USER, name, body);
     }
 
     /// Headed ERROR section (live-only): generate failures, not stored in
@@ -578,24 +599,28 @@ impl TuiProducer {
         self.broadcast(vec![TuiEvent::Text("\n(cancelled)\n".into())]);
     }
 
-    /// One plain line (newline appended) to terminal + mirror. `text` is
+    /// One-line notice *inside the currently open section* (newline
+    /// appended): acks and transient progress under the current header.
+    /// Everything free-standing goes through a banner or a headed section
+    /// instead — that is what keeps the transcript fully headed. `text` is
     /// content, not markup: it must not contain escape bytes.
-    pub fn line(&self, text: &str) {
-        self.text(&format!("{text}\n"));
+    pub fn note(&self, text: &str) {
+        self.emit_text(&format!("{text}\n"));
+    }
+
+    /// Blank line to terminal + mirror — layout, not content: the gap that
+    /// closes a finished block before the next USER rule.
+    pub fn blank_line(&self) {
+        self.emit_text("\n");
     }
 
     /// Plain text verbatim to terminal + mirror (escape-free content only).
-    pub fn text(&self, text: &str) {
+    fn emit_text(&self, text: &str) {
         if text.is_empty() {
             return;
         }
         self.with_state(|st| st.section.at_line_start = text.ends_with('\n'));
         self.broadcast(vec![TuiEvent::Text(text.to_string())]);
-    }
-
-    /// Blank line to terminal + mirror (turn gaps, chrome separators).
-    pub fn blank_line(&self) {
-        self.line("");
     }
 
     // -- AgentEvent translation (root agent; nested workers are filtered) ---
@@ -1085,6 +1110,37 @@ mod tests {
         assert!(mirror.events().is_empty());
         let plain = encode_plain(&terminal.events());
         assert!(plain.contains("USER\n\nhello\n"), "{plain:?}");
+    }
+
+    #[test]
+    fn myco_section_joins_the_section_family() {
+        let (producer, terminal, mirror) = producer(None);
+        producer.myco_section("effort=high");
+        // Section layout (blank line, thin rule, header, blank line, body)…
+        assert_eq!(
+            encode_plain(&terminal.events()),
+            format!("\n{SECTION_RULE}\nMYCO\n\neffort=high\n")
+        );
+        // …in the banner family's voice: bold-uncolored rule + header.
+        let ansi = encode_ansi(&terminal.events(), true);
+        assert!(ansi.contains(&format!("\x1b[0;1m{SECTION_RULE}\x1b[0m\n")));
+        assert!(ansi.contains("\x1b[0;1mMYCO\x1b[0m\n"));
+        assert_eq!(terminal.events(), mirror.events());
+    }
+
+    #[test]
+    fn person_section_heads_participant_messages_with_their_name() {
+        let (producer, terminal, mirror) = producer(None);
+        producer.person_section("ada", "quick question");
+        // Same section layout, the speaker's name as the header…
+        assert_eq!(
+            encode_plain(&terminal.events()),
+            format!("\n{SECTION_RULE}\nada\n\nquick question\n")
+        );
+        // …in the USER palette (bold cyan), body plain.
+        let ansi = encode_ansi(&terminal.events(), true);
+        assert!(ansi.contains("\x1b[0;1;36mada\x1b[0m\n"));
+        assert_eq!(terminal.events(), mirror.events());
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Sectioned transcript layout for session restore and CLI display.
 //!
 //! Headed sections in the UI: USER (double rule), ASSISTANT (thin rule),
-//! ERROR (thin rule), and WARNING (thin rule). Thinking summaries and tool
-//! invocations are paragraphs inside ASSISTANT. ERROR is used for live
-//! generate failures, WARNING for startup preflight problems; both are
-//! live-only (not stored in session history).
+//! MYCO (thin rule, bold-uncolored), ERROR (thin rule), and WARNING (thin
+//! rule). Thinking summaries and tool invocations are paragraphs inside
+//! ASSISTANT. MYCO carries myco's own meta-command responses, ERROR live
+//! generate/command failures, WARNING startup preflight problems; all three
+//! are live-only (not stored in session history).
 //!
 //! Layout is built as [`TuiEvent`]s on the same section/paragraph helpers the
 //! live producer uses ([`crate::tui::TuiProducer`]), so replay and live output
@@ -22,8 +23,8 @@ use crate::tui::{
 };
 use myco_api::{Content, TokenUsage};
 
-/// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER
-/// uses [`user_rule`]).
+/// Thin 72-col rule before ASSISTANT / MYCO / ERROR / WARNING section headers
+/// (USER uses [`user_rule`]).
 pub const SECTION_RULE: &str =
     "────────────────────────────────────────────────────────────────────────";
 
@@ -45,7 +46,7 @@ pub fn user_rule(wrap: Option<usize>) -> String {
     "═".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
 }
 
-/// ASSISTANT / ERROR / WARNING rule sized to the wrap width.
+/// ASSISTANT / MYCO / ERROR / WARNING rule sized to the wrap width.
 pub fn section_rule(wrap: Option<usize>) -> String {
     "─".repeat(wrap.unwrap_or(DEFAULT_RULE_WIDTH))
 }

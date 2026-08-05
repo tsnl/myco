@@ -169,7 +169,7 @@ pub async fn run(opts: CliOptions) {
                     live.cancel_turn().await;
                     producer.cancelled();
                 } else {
-                    producer.line("(Ctrl-C: cancels a running turn; /exit quits)");
+                    producer.note("(Ctrl-C: cancels a running turn; /exit quits)");
                 }
             }
             InputEvent::Line(line) => {
@@ -180,29 +180,42 @@ pub async fn run(opts: CliOptions) {
                 match parse_meta(&line) {
                     Some(Meta::Exit) => break,
                     Some(Meta::Help) => help(&producer),
+                    Some(Meta::Unknown(head)) => {
+                        producer.error_section(&format!("Unknown command: {head}  (try /help)"));
+                    }
                     Some(Meta::Session) => {
-                        producer.text(&format_session_detail(&live.session.snapshot()));
+                        producer.myco_section(&format_session_detail(&live.session.snapshot()));
                     }
-                    Some(Meta::Sessions) => {
-                        match list_sessions(20) {
-                            Ok(entries) => {
-                                for (i, e) in entries.iter().enumerate() {
-                                    producer.line(&format_session_list_line(i + 1, e));
-                                }
-                            }
-                            Err(e) => producer.error_section(&e),
-                        };
-                    }
-                    Some(Meta::Hosts) => {
-                        for h in live.harness().host_status() {
-                            let state = match (&h.error, h.connected, h.in_process) {
-                                (Some(e), ..) => format!("DOWN ({e})"),
-                                (None, _, true) => "ok (in-process)".into(),
-                                (None, true, _) => "ok".into(),
-                                (None, false, _) => "idle".into(),
-                            };
-                            producer.line(&format!("{}: {state}", h.name));
+                    Some(Meta::Sessions) => match list_sessions(20) {
+                        Ok(entries) if entries.is_empty() => producer.myco_section("(no sessions)"),
+                        Ok(entries) => {
+                            let body = entries
+                                .iter()
+                                .enumerate()
+                                .map(|(i, e)| format_session_list_line(i + 1, e))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            producer.myco_section(&body);
                         }
+                        Err(e) => producer.error_section(&e),
+                    },
+                    Some(Meta::Hosts) => {
+                        let body = live
+                            .harness()
+                            .host_status()
+                            .iter()
+                            .map(|h| {
+                                let state = match (&h.error, h.connected, h.in_process) {
+                                    (Some(e), ..) => format!("DOWN ({e})"),
+                                    (None, _, true) => "ok (in-process)".into(),
+                                    (None, true, _) => "ok".into(),
+                                    (None, false, _) => "idle".into(),
+                                };
+                                format!("{}: {state}", h.name)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        producer.myco_section(&body);
                     }
                     Some(Meta::Title(t)) => {
                         let done = live.session.with_mut(|s| s.set_title(t.clone()));
@@ -217,7 +230,7 @@ pub async fn run(opts: CliOptions) {
                             s.save()
                         });
                         match done {
-                            Ok(()) => producer.line(if archived {
+                            Ok(()) => producer.note(if archived {
                                 "archived (hidden from /sessions)"
                             } else {
                                 "unarchived"
@@ -226,7 +239,11 @@ pub async fn run(opts: CliOptions) {
                         }
                     }
                     Some(Meta::Compact) => {
-                        producer.line("compacting…");
+                        // Progress note under the current header: the
+                        // COMPACTED banner replaces it on success, and it
+                        // survives on screen (and in the mirror) when the
+                        // worker fails.
+                        producer.note("compacting…");
                         let _ = live.tx.send(Cmd::Compact { automatic: false });
                         submitted += 1;
                     }
@@ -355,18 +372,18 @@ fn spawn_pump(live: &Arc<Live>, producer: &Arc<TuiProducer>) -> tokio::task::Joi
             match rx.recv().await {
                 Ok(SessionEvent::Agent(e)) => producer.emit(e),
                 Ok(SessionEvent::TurnFailed { message }) => producer.error_section(&message),
-                Ok(SessionEvent::Compacted {
-                    predecessor,
-                    successor,
-                }) => {
-                    producer.line(&format!("COMPACTED {predecessor} → {successor}"));
+                Ok(SessionEvent::Compacted { outcome }) => {
+                    producer.compacted_banner(&outcome);
+                    // The banner ends flush; the gap before the next USER
+                    // rule is the caller's, matching startup.
+                    producer.blank_line();
                 }
                 // The operator's own line is already on screen (echoed at
                 // submit); anything else posted into this session is somebody
                 // joining, and belongs in the terminal.
                 Ok(SessionEvent::Message { entry, .. }) => {
                     if let myco_api::Author::User { name, .. } = &entry.author {
-                        producer.line(&format!("{}: {}", name, entry_text(&entry)));
+                        producer.person_section(name, &entry_text(&entry));
                     }
                 }
                 Ok(SessionEvent::TurnStarted) | Ok(SessionEvent::TurnFinished) => {}
@@ -423,8 +440,13 @@ enum Meta {
     Compact,
     /// `true` = archive, `false` = unarchive.
     Archive(bool),
+    /// Input that starts like a command (`/…`) but names none — reported as
+    /// an ERROR section, never sent to the model.
+    Unknown(String),
 }
 
+/// Parse only — no printing. Rendering happens in the REPL loop, which is
+/// what keeps every command response under a headed block.
 fn parse_meta(input: &str) -> Option<Meta> {
     let (head, rest) = match input.split_once(char::is_whitespace) {
         Some((h, r)) => (h, Some(r.trim())),
@@ -446,14 +468,40 @@ fn parse_meta(input: &str) -> Option<Meta> {
         ("title", t) => Some(Meta::Title(
             t.map(|s| s.to_string()).filter(|s| !s.is_empty()),
         )),
-        _ => Some(Meta::Help),
+        _ => Some(Meta::Unknown(head.to_string())),
     }
 }
 
 fn help(producer: &Arc<TuiProducer>) {
-    producer.line(
+    producer.myco_section(
         "/new /resume <id> /sessions /session /title [text] /archive /unarchive \
          /compact /hosts /exit — input queues while a turn runs; Ctrl-C cancels \
          the running turn",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_meta_reports_unknown_commands_instead_of_printing() {
+        assert!(matches!(parse_meta("/help"), Some(Meta::Help)));
+        assert!(matches!(parse_meta("/sessions"), Some(Meta::Sessions)));
+        assert!(matches!(parse_meta("/archive"), Some(Meta::Archive(true))));
+        assert!(matches!(
+            parse_meta("/unarchive"),
+            Some(Meta::Archive(false))
+        ));
+        // A typo'd command surfaces as Unknown (→ ERROR section in the REPL
+        // loop) and is never sent to the model.
+        assert!(matches!(parse_meta("/hlep"), Some(Meta::Unknown(h)) if h == "/hlep"));
+        assert!(matches!(
+            parse_meta("/bogus with args"),
+            Some(Meta::Unknown(h)) if h == "/bogus"
+        ));
+        // Plain prose is not a command — it goes to the model.
+        assert!(parse_meta("hello world").is_none());
+        assert!(parse_meta("help").is_none());
+    }
 }
