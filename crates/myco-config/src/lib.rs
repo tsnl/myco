@@ -72,6 +72,11 @@ pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 /// takes that resolved value from its caller.
 pub const DEFAULT_MAX_IMAGE_BASE64_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Default consecutive `max_tokens` resumes per turn when a model entry sets
+/// no `max_truncated_resumes`: enough to triple the effective output budget
+/// without letting a looping model run unattended forever.
+pub const DEFAULT_MAX_TRUNCATED_RESUMES: u32 = 3;
+
 /// Default share of the context window at which a turn's end queues an
 /// auto-compaction, when a model entry sets no `auto_compact_at`. Resolution
 /// turns the fraction into a concrete `ModelSpec::auto_compact_at_tokens`;
@@ -325,6 +330,9 @@ fn resolve_catalog(
                 .max_image_base64_bytes
                 .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
             auto_compact_at_tokens: (entry.context_window as f64 * auto_compact_fraction) as u64,
+            max_truncated_resumes: entry
+                .max_truncated_resumes
+                .unwrap_or(DEFAULT_MAX_TRUNCATED_RESUMES),
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         // Like `auth`, the model's retry table replaces the gateway's

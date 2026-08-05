@@ -140,6 +140,25 @@ clear message naming both sizes instead of a provider 400. Remote hosts are
 spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
 which keeps every host in a session on the same limit.
 
+Two more per-model knobs govern long runs. `auto_compact_at` (fraction,
+0 < f < 1, default 0.85) sets the share of `context_window` at which a turn's
+end queues an automatic compaction; a failed automatic compaction disables the
+trigger for the session until a manual compact succeeds. `max_truncated_resumes`
+(default 3, `0` disables) is how many consecutive `max_tokens` truncations one
+turn resumes through: a truncated turn that carried tool calls continues off
+its own tool results, and truncated prose is resumed with a runtime user turn
+asking for the rest — so an overnight run finishes its answer instead of
+stopping mid-sentence.
+
+**Retry** is per gateway (`[gateways.NAME.retry]`), overridable per model like
+`auth` (the model's table replaces the gateway's wholesale). Knobs:
+`max_attempts` (total including the first, default 3; `1` disables),
+`initial_backoff_ms` (500), `max_backoff_ms` (30000), `backoff_multiplier`
+(2.0). Only transient failures retry — transport errors, 5xx, 429, 408, with
+`Retry-After` honoured under the backoff cap; a 400/401/413 fails immediately,
+and a failure after streaming has begun ends the turn rather than replaying
+already-delivered output.
+
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:
 `{ source = "env", var_name = "…" }` reads the process environment (`dotenvy`

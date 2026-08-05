@@ -119,6 +119,11 @@ pub struct ModelEntry {
     /// ([`crate::DEFAULT_AUTO_COMPACT_FRACTION`]).
     #[serde(default)]
     pub auto_compact_at: Option<f64>,
+    /// Consecutive `max_tokens` truncations one turn resumes through before
+    /// handing back the partial answer (`0` disables the resume). Unset ->
+    /// [`crate::DEFAULT_MAX_TRUNCATED_RESUMES`].
+    #[serde(default)]
+    pub max_truncated_resumes: Option<u32>,
     /// Retry override (see [`RetryEntry`]). Like `auth`, the model's table
     /// replaces the gateway's wholesale — a field unset here falls back to
     /// the built-in default, not to the gateway's value.

@@ -120,6 +120,7 @@ pub async fn run_compact_worker(
         },
     );
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+    worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     worker.set_model_key(catalog_model.spec.key.clone());
 
     let prompt = compact_subagent_prompt(&predecessor.id);
