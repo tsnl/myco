@@ -67,6 +67,75 @@ pub fn entries_to_messages(entries: &[myco_api::Entry]) -> Vec<Message> {
         .collect()
 }
 
+/// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
+/// sends for the `j`-th tool_use of the assistant message at index `i`, and
+/// equally for the `j`-th result of the `ToolResults` message answering it.
+///
+/// A call and its result pair positionally: `tool_use_results[j]` answers
+/// `tool_uses[j]` of the immediately preceding assistant message, the order
+/// the agent loop writes and compaction preserves (tails start at a user
+/// message and never split a pair). Providers, however, require an id on the
+/// wire to make that same pairing inside one request, and each has its own
+/// dialect ([`mint_tool_id`]) — so drivers mint one per position here. The
+/// ids *stored* in history are display and dispatch identity (tool cards,
+/// result correlation) and never reach the wire: echoing a provider-minted
+/// id is what used to wedge a session the moment it resumed on a different
+/// provider whose id grammar rejects it.
+///
+/// Ids derive from (message index, ordinal), so history growth never changes
+/// the ids of earlier messages and the request prefix stays byte-identical
+/// across turns for provider prompt caching. A history whose result count
+/// disagrees with the preceding assistant's tool calls fails here, before any
+/// request is sent: guessing the pairing would corrupt the conversation
+/// silently.
+pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, GenerateError> {
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(input.len());
+    for (i, message) in input.iter().enumerate() {
+        let ids = match message {
+            Message::UserMessage { .. } => Vec::new(),
+            Message::AssistantMessage { tool_uses, .. } => {
+                (0..tool_uses.len()).map(|j| mint_tool_id(i, j)).collect()
+            }
+            Message::ToolResults { tool_use_results } => {
+                let preceding_uses = match i.checked_sub(1).map(|p| &input[p]) {
+                    Some(Message::AssistantMessage { tool_uses, .. }) => tool_uses.len(),
+                    _ => 0,
+                };
+                if preceding_uses != tool_use_results.len() {
+                    return Err(GenerateError::ExecutionError(format!(
+                        "history is malformed: message {i} carries {} tool results but the \
+                         message before it has {preceding_uses} tool calls",
+                        tool_use_results.len()
+                    )));
+                }
+                out[i - 1].clone()
+            }
+        };
+        out.push(ids);
+    }
+    Ok(out)
+}
+
+/// One wire tool id: `'t'` + message index + ordinal, four base-36 digits
+/// each. Nine alphanumeric characters is the intersection of every dialect's
+/// constraints — Anthropic's `^[a-zA-Z0-9_-]+$`, OpenAI's length cap, and
+/// Mistral-style OpenAI-compatible backends requiring exactly nine
+/// alphanumerics (the binding constraint).
+fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
+    const CAP: usize = 36 * 36 * 36 * 36;
+    // A history long enough to overflow four digits (1.6M messages) exceeds
+    // the request size cap long before it gets here.
+    assert!(message_index < CAP && ordinal < CAP);
+    let mut id = String::with_capacity(9);
+    id.push('t');
+    for n in [message_index, ordinal] {
+        for place in [36 * 36 * 36, 36 * 36, 36, 1] {
+            id.push(char::from_digit(((n / place) % 36) as u32, 36).unwrap());
+        }
+    }
+    id
+}
+
 pub use anthropic::AnthropicBackendConfig;
 
 mod driver_core;
@@ -771,6 +840,7 @@ pub enum ModelCreationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assistant_tool, tool_results, user};
 
     #[tokio::test]
     async fn accumulate_thinking_then_text() {
@@ -1024,6 +1094,58 @@ mod tests {
             "HTTP 500: overloaded".into(),
         );
         assert_eq!(unrelated.recovery(), Recovery::Retry);
+    }
+
+    /// The `j`-th id of a ToolResults message equals the `j`-th id of the
+    /// assistant message it answers — the pairing providers require on the
+    /// wire, made from position alone.
+    #[test]
+    fn wire_ids_pair_results_with_the_preceding_calls() {
+        let input = [
+            user("hi"),
+            assistant_tool(None, "prov_a", "bash", serde_json::json!({})),
+            tool_results(&[("prov_a", "ok")]),
+        ];
+        let ids = wire_tool_ids(&input).unwrap();
+        assert!(ids[0].is_empty());
+        assert_eq!(ids[1].len(), 1);
+        assert_eq!(ids[1], ids[2]);
+        // Nine chars of [a-z0-9], every dialect's intersection.
+        assert_eq!(ids[1][0].len(), 9);
+        assert!(ids[1][0].chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// Appending messages must not change earlier ids: the request prefix has
+    /// to stay byte-identical across turns or provider prompt caching breaks.
+    #[test]
+    fn wire_ids_stable_as_history_grows() {
+        let mut input = vec![
+            user("hi"),
+            assistant_tool(None, "a", "bash", serde_json::json!({})),
+            tool_results(&[("a", "ok")]),
+        ];
+        let before = wire_tool_ids(&input).unwrap();
+        input.push(user("more"));
+        input.push(assistant_tool(None, "b", "bash", serde_json::json!({})));
+        input.push(tool_results(&[("b", "ok")]));
+        let after = wire_tool_ids(&input).unwrap();
+        assert_eq!(before[..], after[..3]);
+        assert_ne!(after[1], after[4], "distinct calls must get distinct ids");
+    }
+
+    /// Positional pairing must refuse to guess: a results message whose count
+    /// disagrees with the preceding assistant's tool calls fails before any
+    /// request is sent, instead of silently mispairing.
+    #[test]
+    fn wire_ids_fail_loud_on_broken_pairing() {
+        let orphaned = [user("hi"), tool_results(&[("a", "ok")])];
+        assert!(wire_tool_ids(&orphaned).is_err());
+
+        let miscounted = [
+            assistant_tool(None, "a", "bash", serde_json::json!({})),
+            tool_results(&[("a", "ok"), ("b", "ok")]),
+        ];
+        assert!(wire_tool_ids(&miscounted).is_err());
     }
 
     /// Backoff doubles from `initial_backoff`, stops at `max_backoff`, and a

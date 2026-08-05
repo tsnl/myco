@@ -215,9 +215,11 @@ pub enum StreamEvent {
         text: String,
     },
     ToolStarted {
-        /// The provider's id for this call. It is the identity a client keys
+        /// The call's id as history stores it — the identity a client keys
         /// the call's card on, so the running card and the finished one are
-        /// the same element rather than a removal and an insertion.
+        /// the same element rather than a removal and an insertion. Display
+        /// and dispatch identity only: requests to providers carry minted
+        /// positional ids, never this one.
         #[serde(default)]
         id: String,
         name: String,
