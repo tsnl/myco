@@ -39,7 +39,7 @@ use myco_auth::AuthStore;
 use myco_config::Config;
 use myco_machines::harness::Harness;
 use myco_machines::tool_services::{
-    ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
+    ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool, ToolService,
 };
 use myco_models::{
     BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
@@ -104,13 +104,7 @@ pub enum ModelPurpose {
 /// The seam between the server and model construction: tests inject scripted
 /// models here; production uses [`Server::new`]'s real factory.
 pub type ModelFactory = Box<
-    dyn Fn(
-            ModelPurpose,
-            &str,
-            &CatalogModel,
-            &Harness,
-            usize,
-        ) -> Result<Arc<dyn GenerativeModel>, String>
+    dyn Fn(ModelPurpose, &str, &CatalogModel, &Harness) -> Result<Arc<dyn GenerativeModel>, String>
         + Send
         + Sync,
 >;
@@ -186,14 +180,13 @@ fn default_model_factory(
     _session_id: &str,
     catalog_model: &CatalogModel,
     harness: &Harness,
-    max_soul_bytes: usize,
 ) -> Result<Arc<dyn GenerativeModel>, String> {
     match purpose {
-        ModelPurpose::Agent => build_model(catalog_model, harness, max_soul_bytes),
+        ModelPurpose::Agent => build_model(catalog_model, harness),
         ModelPurpose::Compactor => myco_models::new(GenerativeModelConfig {
             model: catalog_model.spec.clone(),
             tools: harness.tool_specs(),
-            system_prompt: myco_agent::compactor_system_prompt(catalog_model, max_soul_bytes),
+            system_prompt: myco_agent::compactor_system_prompt(catalog_model),
             backend_config: catalog_model.backend.clone(),
         })
         .map_err(|e| format!("failed to create compactor model: {e}")),
@@ -387,22 +380,24 @@ impl Server {
         let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn ToolService>;
         let subagent_tool =
             Arc::new(SubagentTool::new(self.me.clone(), id.clone())) as Arc<dyn ToolService>;
+        let prelude_tool =
+            Arc::new(PreludeTool::new(self.config.max_prelude_bytes)) as Arc<dyn ToolService>;
         let harness = Harness::attach_with_root_services(
             self.config.harness.clone(),
-            vec![session_tool, history_tool, list_recent_tool, subagent_tool],
+            vec![
+                session_tool,
+                history_tool,
+                list_recent_tool,
+                subagent_tool,
+                prelude_tool,
+            ],
         )
         .await?;
 
         let (events, _) = broadcast::channel::<SessionEvent>(EVENT_BUFFER);
         let sink = Arc::new(BroadcastSink { tx: events.clone() }) as Arc<dyn EventSink>;
 
-        let model = (self.model_factory)(
-            ModelPurpose::Agent,
-            &id,
-            catalog_model,
-            &harness,
-            self.config.max_soul_bytes,
-        )?;
+        let model = (self.model_factory)(ModelPurpose::Agent, &id, catalog_model, &harness)?;
         let mut agent = Agent::new(model, harness.clone(), sink);
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
         agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
@@ -758,7 +753,6 @@ async fn run_compact(t: &mut AgentTask, automatic: bool, cancel: CancelToken) {
         &predecessor.id,
         &t.catalog_model,
         &t.harness,
-        sup.config.max_soul_bytes,
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -834,7 +828,6 @@ fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
 fn build_model(
     catalog_model: &CatalogModel,
     harness: &Harness,
-    max_soul_bytes: usize,
 ) -> Result<Arc<dyn GenerativeModel>, String> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
@@ -848,7 +841,7 @@ fn build_model(
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
-            myco_prompts::agent_prompt_epilogue(max_soul_bytes),
+            myco_prompts::agent_prompt_epilogue(),
             myco_prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),

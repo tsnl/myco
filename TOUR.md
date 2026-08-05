@@ -56,7 +56,7 @@ live in `crates/`:
 | `myco-config` | Startup resolution: config.toml catalog, roster, harness config, all impure inputs injected |
 | `myco-auth` | Credentials and access tokens: the store behind the OAuth2 password grant |
 | `myco-machines` | The hands: `Harness`, `HostController`/`HostWorker` over NDJSON, and every `ToolService` (bash, editor, …) |
-| `myco-prompts` | System-prompt fragments, the soul, the session stamp, the embedded manual |
+| `myco-prompts` | System-prompt fragments, the prelude, the session stamp, the embedded manual |
 | `myco-agent` | The turn loop: `Agent::interact`, `AgentEvent`/`EventSink`, cancellation, the compaction *worker* half |
 | `myco-gui` | Minimal Yew client; one URL per conversation |
 | `myco-test-support` | `ScriptedModel`, fixtures, the `MYCO_HOME` guard |
@@ -720,7 +720,7 @@ offers.
 4. **Bounded everything.** Every cap has a number and a paragraph:
    request bytes (Stop 4), image base64 (Stops 1, 5), message
    attachments (Stop 3), bash capture and session streams (Stop 6),
-   soul and guidance bytes (Stop 7), event buffer (Stop 9). Read the
+   prelude and guidance bytes (Stop 7), event buffer (Stop 9). Read the
    paragraphs; each names the failure the cap prevents.
 5. **Prompt-cache economics.** Identity-free system prompt, volatile-
    last block ordering, day-granularity listings, session stamps riding

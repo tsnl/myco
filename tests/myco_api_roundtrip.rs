@@ -45,7 +45,7 @@ fn test_config() -> myco::config::Config {
 fn scripted_server(
     make: impl Fn() -> Arc<dyn GenerativeModel> + Send + Sync + 'static,
 ) -> Arc<Server> {
-    Server::with_model_factory(test_config(), Box::new(move |_, _, _, _, _| Ok(make())))
+    Server::with_model_factory(test_config(), Box::new(move |_, _, _, _| Ok(make())))
 }
 
 /// Poll until the queued turn lands (idle + condition), bounded.

@@ -6,8 +6,9 @@
 //! `# Manual` section below.
 
 pub mod manual;
+pub mod prelude;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 
@@ -27,7 +28,7 @@ You are running inside **myco**: a mycelial agent runtime. The same agent patter
 scale — supervisors drive **nested myco agents** over the local API (see Nested Agents below),
 and tools run on **hosts** (hands) spanning local and remote machines. The **local** host is always
 enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. Local
-tools (`session_meta`) stay in the agent process; host tools (`bash`, editor) run on
+tools (`session_meta`, `prelude`) stay in the agent process; host tools (`bash`, editor) run on
 a host worker (local in-process or remote).
 
 **Runtime docs are markdown files on disk** — see *Manual* below for the directory this build
@@ -37,7 +38,7 @@ exported them to. Read and search them with the tools you already have (`rg`, th
 Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
   local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
-  (`attach_timeout_secs`, `max_soul_bytes`).
+  (`attach_timeout_secs`, `max_prelude_bytes`).
 - Sessions: `~/.myco/v2/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - **To act on a remote machine, set `host` on the tool call — do not run `ssh <alias> …` from
@@ -113,7 +114,7 @@ The same surface is plain HTTP for scripts: the server exports `$MYCO_API`; POST
     "\n",
 );
 
-/// Stamp appended after the epilogue (and soul) naming the running model's
+/// Stamp appended after the epilogue (and prelude) naming the running model's
 /// catalog key, so agents can spawn nested/forked children on the same model.
 ///
 /// Keep this identity-free: the model key is shared by a supervisor and its
@@ -182,40 +183,49 @@ pub fn is_session_stamp(text: &str) -> bool {
     text.starts_with(SESSION_STAMP_HEADING)
 }
 
-/// Cap used when `config.toml` sets no `max_soul_bytes`.
+/// Cap used when `config.toml` sets no `max_prelude_bytes`.
 ///
-/// Backstop so one runaway soul revision cannot bloat every future prompt
-/// (the fragment asks for about a screenful; same cap as the session
-/// scratchpad). The truncation marker tells the agent to write a shorter one,
-/// and startup warns the user ([`soul_truncation`]).
-pub const DEFAULT_MAX_SOUL_BYTES: usize = 64 * 1024;
+/// The prelude is the default home for durable information (the workspace
+/// fragment tells agents to front-load it), so the cap is a generous
+/// runaway-growth backstop, not a target: 256 KiB is roughly 64K tokens on
+/// models with 500K+ windows, and the whole block is prompt-cached.
+///
+/// It is an **enforced invariant**: the `prelude` tool refuses an edit that
+/// would exceed it, and startup refuses to run against a prelude already over
+/// it ([`prelude_oversize`]). Both gates exist because the prompt cannot carry
+/// a partial prelude honestly — a shortened one reads, from inside the prompt,
+/// like knowledge that was never recorded.
+pub const DEFAULT_MAX_PRELUDE_BYTES: usize = 256 * 1024;
 
-/// Same backstop for injected project guidance (`AGENTS.md` / `CLAUDE.md`).
-/// Not user-configurable: `max_soul_bytes` is named for the soul and sizing
-/// the two together would surprise anyone who lowers it to shorten the soul.
+/// Backstop for injected project guidance (`AGENTS.md` / `CLAUDE.md`).
+/// Not user-configurable: `max_prelude_bytes` is named for the prelude and sizing
+/// the two together would surprise anyone who resizes it for the prelude.
 const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
 
-/// A soul version that did not fit under the `max_soul_bytes` cap. Losing the
-/// tail of the soul is silent from inside the prompt, so this is surfaced two
-/// ways: a marker in the prompt itself and a startup WARNING for the user.
+/// A rendered prelude that does not fit under the `max_prelude_bytes` cap.
+///
+/// Startup refuses to run in this state: the prelude is what every agent
+/// treats as known-without-checking, so shortening it to fit would have agents
+/// act on a partial picture with no way to notice. The only fixes are the
+/// user's — prune entries or raise the cap — so myco stops and says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoulTruncation {
-    /// Filename of the truncated version, under `workspace/soul/`.
-    pub version: String,
-    /// Size of the trimmed version on disk.
+pub struct PreludeOversize {
+    /// How many entries the prelude held on disk.
+    pub entries: usize,
+    /// Size of the full rendered prelude body.
     pub bytes: usize,
-    /// The `max_soul_bytes` cap it was cut to.
+    /// The `max_prelude_bytes` cap it exceeded.
     pub limit: usize,
 }
 
-impl SoulTruncation {
-    /// One line naming the cut, shared by the in-prompt marker and the
-    /// startup warning so both report the same numbers.
+impl PreludeOversize {
+    /// One line naming the overrun, in the sizes a human reads.
     pub fn describe(&self) -> String {
         format!(
-            "soul truncated at {} of {} (max_soul_bytes)",
+            "prelude is {} across {} entries, over the {} max_prelude_bytes cap",
+            human_bytes(self.bytes),
+            self.entries,
             self.human_limit(),
-            human_bytes(self.bytes)
         )
     }
 
@@ -238,47 +248,32 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// The epilogue plus the current soul (`~/.myco/v2/workspace/soul/`, respecting
-/// `MYCO_HOME`, capped at `max_soul_bytes`), the launch directory's project
-/// guidance (`AGENTS.md` / `CLAUDE.md`), and a listing of the rest of the
-/// workspace, when present. Read at model build time — session start, model
-/// switch, each worker spawn — so a running agent's prompt never changes
-/// mid-conversation and the cached conversation prefix stays valid.
-pub fn agent_prompt_epilogue(max_soul_bytes: usize) -> String {
-    epilogue_with(
-        myco_core::data_root().ok(),
-        std::env::current_dir().ok(),
-        max_soul_bytes,
-    )
+/// The epilogue plus the current prelude (`~/.myco/v2/workspace/prelude/`,
+/// respecting `MYCO_HOME`, enforced at `max_prelude_bytes`), the launch
+/// directory's project guidance (`AGENTS.md` / `CLAUDE.md`), and a listing of
+/// the rest of the workspace, when present. Read at model build time — session
+/// start, model switch, each worker spawn — so a running agent's prompt never
+/// changes mid-conversation and the cached conversation prefix stays valid.
+pub fn agent_prompt_epilogue() -> String {
+    epilogue_with(myco_core::data_root().ok(), std::env::current_dir().ok())
 }
 
-/// Whether the soul the next agent prompt will carry is cut short by the
-/// `max_soul_bytes` cap. Startup calls this to warn before the first turn;
-/// `None` means the soul fits (or there is none).
-pub fn soul_truncation(max_soul_bytes: usize) -> Option<SoulTruncation> {
-    let home = myco_core::data_root().ok()?;
-    let dir = home.join("workspace").join("soul");
-    capped_soul(&dir, max_soul_bytes)?.2
+/// Whether the prelude on disk is over the `max_prelude_bytes` cap. Startup
+/// calls this and refuses to run when it is `Some`; `None` means the prelude
+/// fits (or there is none).
+pub fn prelude_oversize(max_prelude_bytes: usize) -> Option<PreludeOversize> {
+    oversize_at(&crate::prelude::dir().ok()?, max_prelude_bytes)
 }
 
-/// The current soul snapshot: filename and trimmed contents of the
-/// lexicographically last visible `*.md` in `workspace/soul/`. Versions are
-/// write-once maildir-style files, so "newest name wins" is the whole
-/// contract — a whitespace-only newest version reads as "no soul".
-fn latest_soul(dir: &Path) -> Option<(String, String)> {
-    let mut versions: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.to_string();
-            (!name.starts_with('.') && name.ends_with(".md") && entry.path().is_file())
-                .then(|| (name, entry.path()))
-        })
-        .collect();
-    versions.sort();
-    let (name, path) = versions.pop()?;
-    let text = std::fs::read_to_string(path).ok()?.trim().to_string();
-    (!text.is_empty()).then_some((name, text))
+/// [`prelude_oversize`] against an explicit directory.
+fn oversize_at(dir: &std::path::Path, max_bytes: usize) -> Option<PreludeOversize> {
+    let entries = crate::prelude::entries(dir);
+    let bytes = crate::prelude::rendered_body(&entries).len();
+    (bytes > max_bytes).then_some(PreludeOversize {
+        entries: entries.len(),
+        bytes,
+        limit: max_bytes,
+    })
 }
 
 /// Project guidance for the launch directory: `AGENTS.md` (preferred) or
@@ -296,22 +291,18 @@ fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
     None
 }
 
-/// The current soul as it goes into a prompt: version name, text cut to
-/// `max_bytes` (on a char boundary, with a marker naming the cut), and the
-/// truncation record when the on-disk version did not fit.
-fn capped_soul(
-    dir: &std::path::Path,
-    max_bytes: usize,
-) -> Option<(String, String, Option<SoulTruncation>)> {
-    let (version, mut text) = latest_soul(dir)?;
-    let cut = SoulTruncation {
-        version: version.clone(),
-        bytes: text.len(),
-        limit: max_bytes,
-    };
-    let marker = format!("\n\n[{} — write a shorter revision]", cut.describe());
-    let truncated = cap_bytes(&mut text, max_bytes, &marker);
-    Some((version, text, truncated.then_some(cut)))
+/// The prelude as it goes into a prompt: every entry, whole. `None` when
+/// there is nothing recorded.
+///
+/// Renders whatever is on disk. `max_prelude_bytes` is enforced where it can
+/// still be acted on — the `prelude` tool refuses an oversized edit, startup
+/// refuses an oversized directory — so by the time a prompt is built the
+/// invariant holds. The one way past both gates is another process growing the
+/// prelude mid-session; rendering that in full keeps the failure visible, and
+/// the next startup reports it.
+fn rendered_prelude(dir: &std::path::Path) -> Option<String> {
+    let entries = crate::prelude::entries(dir);
+    (!entries.is_empty()).then(|| crate::prelude::rendered_body(&entries))
 }
 
 /// Truncate to `max` bytes on a char boundary, appending `marker` when cut.
@@ -334,28 +325,21 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 ///
 /// Blocks are ordered least to most volatile, because every agent's prompt
 /// carries them as a prefix: the manual path changes only when the binary
-/// does, the soul only on a deliberate revision, project guidance only when
-/// the repo's own file does, while any new workspace file rewrites the
-/// listing. Keeping the churniest block last leaves the longest shared prefix
+/// does, project guidance only when the repo's own file does, the prelude on
+/// every `prelude`-tool edit — which the workspace fragment asks agents to
+/// make eagerly, as they learn — while any new workspace file rewrites the
+/// listing. Keeping the churniest blocks last leaves the longest shared prefix
 /// for same-model forks to hit in the prompt cache.
-fn epilogue_with(
-    home: Option<std::path::PathBuf>,
-    cwd: Option<std::path::PathBuf>,
-    max_soul_bytes: usize,
-) -> String {
+///
+/// Hence the prelude sits *after* project guidance: recording a finding must
+/// not invalidate the cached guidance block (up to `MAX_GUIDANCE_BYTES`) for
+/// every agent that follows.
+fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
     if let Some(home) = home.as_deref() {
         prompt.push_str(&manual_section(&crate::manual::dir(home)));
     }
     let workspace = home.map(|home| home.join("workspace"));
-    let soul = workspace
-        .as_deref()
-        .and_then(|ws| capped_soul(&ws.join("soul"), max_soul_bytes));
-    if let Some((name, soul, _)) = soul {
-        prompt.push_str(&format!(
-            "\n---\n\n# Soul\n\n(current version: soul/{name})\n\n{soul}\n"
-        ));
-    }
     if let Some((name, mut guidance)) = cwd.as_deref().and_then(project_guidance) {
         cap_bytes(
             &mut guidance,
@@ -364,6 +348,16 @@ fn epilogue_with(
         );
         prompt.push_str(&format!(
             "\n---\n\n# Project guidance ({name})\n\n{guidance}\n"
+        ));
+    }
+    let prelude = workspace
+        .as_deref()
+        .and_then(|ws| rendered_prelude(&ws.join("prelude")));
+    if let Some(prelude) = prelude {
+        prompt.push_str(&format!(
+            "\n---\n\n# Prelude\n\n(entries under `~/.myco/v2/workspace/prelude/`, a snapshot from \
+             when this agent's model was built — edit with the `prelude` tool; action=list shows \
+             the live state)\n\n{prelude}\n"
         ));
     }
     if let Some(listing) = workspace.as_deref().and_then(workspace_listing) {
@@ -408,8 +402,8 @@ const MAX_TITLE_CHARS: usize = 80;
 /// Two choices keep the block cache-stable, since it lands in every agent's
 /// prompt prefix: days rather than timestamps (repeated writes to a file
 /// already listed as today change nothing), and path order rather than recency
-/// (touching one file cannot reshuffle the block). `soul/` is skipped — the
-/// live version is already quoted above, and its superseded siblings are noise.
+/// (touching one file cannot reshuffle the block). `prelude/` is skipped — its
+/// entries are already quoted in full above.
 fn workspace_listing(workspace: &Path) -> Option<String> {
     let mut entries = Vec::new();
     collect_listing(workspace, workspace, 0, &mut entries);
@@ -478,7 +472,7 @@ fn collect_listing(
             continue;
         }
         if file_type.is_dir() {
-            if depth == 0 && name == "soul" {
+            if depth == 0 && name == "prelude" {
                 continue;
             }
             subdirs.push(entry.path());
@@ -558,11 +552,11 @@ mod tests {
     use super::*;
     use myco_test_support::{TempDir, temp_dir};
 
-    /// Temp home-shaped dir with `workspace/soul/` created — the layout the
-    /// soul/workspace fixtures build on. Panic-safe cleanup via [`TempDir`].
-    fn soul_home(tag: &str) -> TempDir {
+    /// Temp home-shaped dir with `workspace/prelude/` created — the layout the
+    /// prelude/workspace fixtures build on. Panic-safe cleanup via [`TempDir`].
+    fn prelude_home(tag: &str) -> TempDir {
         let home = temp_dir(tag);
-        std::fs::create_dir_all(home.path().join("workspace").join("soul")).unwrap();
+        std::fs::create_dir_all(home.path().join("workspace").join("prelude")).unwrap();
         home
     }
 
@@ -591,11 +585,11 @@ mod tests {
             // its own. Semantic search is the external `ck` companion.
             "`rg`",
             "`ck`",
-            // Free-form workspace policy: maildir-style soul versions, the
-            // recall/record habit, and the consistency caution.
-            "Workspace & soul",
-            "~/.myco/v2/workspace/soul/",
-            "write-once, never edited in place",
+            // Free-form workspace policy: maildir-style prelude entries, the
+            // record/curate habit, and the consistency caution.
+            "Workspace & prelude",
+            "~/.myco/v2/workspace/prelude/",
+            "write-once",
             "weakly consistent",
         ] {
             assert!(
@@ -615,7 +609,7 @@ mod tests {
     fn project_guidance_is_appended_from_cwd() {
         let cwd = temp_dir("guidance");
         let dir = cwd.path().to_path_buf();
-        let epilogue = || epilogue_with(None, Some(dir.clone()), DEFAULT_MAX_SOUL_BYTES);
+        let epilogue = || epilogue_with(None, Some(dir.clone()));
 
         assert_eq!(epilogue(), DEFAULT_AGENT_PROMPT_EPILOGUE);
 
@@ -645,29 +639,33 @@ mod tests {
     fn manual_path_in_the_prompt_follows_myco_home() {
         let home =
             std::env::temp_dir().join(format!("myco-manual-prompt-{}", uuid::Uuid::new_v4()));
-        let prompt = epilogue_with(Some(home.clone()), None, DEFAULT_MAX_SOUL_BYTES);
+        let prompt = epilogue_with(Some(home.clone()), None);
         let dir = crate::manual::dir(&home);
         assert!(prompt.contains("# Manual"), "{prompt}");
         assert!(prompt.contains(&dir.display().to_string()), "{prompt}");
         assert!(prompt.contains("index.md"), "{prompt}");
 
         // No home to resolve: no path claimed rather than a guessed one.
-        let blind = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
+        let blind = epilogue_with(None, None);
         assert!(!blind.contains("# Manual"), "{blind}");
     }
 
-    /// The soul is prompt-resident, so the fragment has to say what earns a
-    /// place there (distilled dated pointers), what keeps it honest (prune on
-    /// every add, evidence over prompt), and that the listing exists to read
-    /// from.
+    /// The prelude is prompt-resident and the *default* home for durable
+    /// information, so the fragment has to say to record eagerly, what stays
+    /// out (only genuinely cold material), what keeps it honest (merge and
+    /// supersede, evidence over prompt), and that edits go through the tool.
     #[test]
-    fn workspace_fragment_biases_toward_recording_and_pruning() {
+    fn workspace_fragment_biases_toward_prelude_first_recording() {
         for needle in [
-            "index over the workspace",
-            "distilled line and the pointer",
-            "Date every line",
-            "Every revision that adds also prunes",
+            "default home for durable information",
+            "Record eagerly, as you learn, unasked",
+            "genuinely **cold**",
+            "Merge and supersede",
             "Evidence beats the prompt",
+            "Date what you record",
+            // Edits go through the builtin tool, never hand-rolled file dances.
+            "`prelude` tool",
+            "action=list shows the live state",
             "`# Workspace Files` section",
             "read the listed files",
         ] {
@@ -731,20 +729,20 @@ mod tests {
         // guessing at one.
         assert!(!stamp_with(id, started_at, None).contains("Launch directory"));
 
-        let prompt = epilogue_with(None, None, DEFAULT_MAX_SOUL_BYTES);
+        let prompt = epilogue_with(None, None);
         assert!(!prompt.contains(id), "{prompt}");
         // The epilogue points agents at the stamp instead of a tool call.
         assert!(prompt.contains("newest `# Session` block"), "{prompt}");
     }
 
     #[test]
-    fn newest_soul_version_is_appended_to_the_epilogue() {
-        let home = soul_home("soul");
+    fn all_prelude_entries_are_appended_in_filename_order() {
+        let home = prelude_home("prelude");
         let dir = home.path().to_path_buf();
-        let soul_dir = dir.join("workspace").join("soul");
-        let epilogue = || epilogue_with(Some(dir.clone()), None, DEFAULT_MAX_SOUL_BYTES);
+        let prelude_dir = dir.join("workspace").join("prelude");
+        let epilogue = || epilogue_with(Some(dir.clone()), None);
 
-        // No versions: the epilogue plus the unconditional Manual block, and
+        // No entries: the epilogue plus the unconditional Manual block, and
         // nothing else.
         let base = format!(
             "{DEFAULT_AGENT_PROMPT_EPILOGUE}{}",
@@ -752,103 +750,142 @@ mod tests {
         );
         assert_eq!(epilogue(), base);
 
-        // One version: appended verbatim under the promised heading, with the
-        // live version named so agents know what to supersede.
-        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "soul_token_alpha\n").unwrap();
+        // One entry: rendered under the promised heading with its id label,
+        // so agents know what to replace/remove.
+        std::fs::write(
+            prelude_dir.join("20260101T0000-aaaa.md"),
+            "prelude_token_alpha\n",
+        )
+        .unwrap();
         let prompt = epilogue();
         assert!(
             prompt.starts_with(DEFAULT_AGENT_PROMPT_EPILOGUE),
             "{prompt}"
         );
-        assert!(prompt.contains("# Soul"), "{prompt}");
+        assert!(prompt.contains("# Prelude"), "{prompt}");
+        assert!(prompt.contains("edit with the `prelude` tool"), "{prompt}");
         assert!(
-            prompt.contains("(current version: soul/20260101T0000-aaaa.md)"),
+            prompt.contains("[prelude entry 20260101T0000-aaaa.md]\nprelude_token_alpha"),
             "{prompt}"
         );
-        assert!(prompt.ends_with("soul_token_alpha\n"), "{prompt}");
+        assert!(prompt.ends_with("prelude_token_alpha\n"), "{prompt}");
 
-        // The lexicographically last name wins; hidden temp files and non-md
-        // files are ignored (in-progress writes never leak into prompts).
-        std::fs::write(soul_dir.join("20270101T0000-bbbb.md"), "soul_token_beta\n").unwrap();
-        std::fs::write(soul_dir.join(".tmp-20280101T0000.md"), "tmp_token_gamma\n").unwrap();
-        std::fs::write(soul_dir.join("zz-notes.txt"), "txt_token_delta\n").unwrap();
+        // The prelude is the union of entries in filename order — never "newest
+        // file wins". Hidden temp names and non-md files are ignored
+        // (in-progress writes never leak into prompts), and a whitespace-only
+        // entry contributes nothing.
+        std::fs::write(
+            prelude_dir.join("20270101T0000-bbbb.md"),
+            "prelude_token_beta\n",
+        )
+        .unwrap();
+        std::fs::write(
+            prelude_dir.join(".tmp-20280101T0000.md"),
+            "tmp_token_gamma\n",
+        )
+        .unwrap();
+        std::fs::write(prelude_dir.join("zz-notes.txt"), "txt_token_delta\n").unwrap();
+        std::fs::write(prelude_dir.join("20280101T0000-cccc.md"), "  \n\n").unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("soul_token_beta"), "{prompt}");
-        assert!(!prompt.contains("soul_token_alpha"), "{prompt}");
+        let alpha = prompt.find("prelude_token_alpha").expect("alpha rendered");
+        let beta = prompt.find("prelude_token_beta").expect("beta rendered");
+        assert!(alpha < beta, "{prompt}");
         assert!(!prompt.contains("tmp_token_gamma"), "{prompt}");
         assert!(!prompt.contains("txt_token_delta"), "{prompt}");
 
-        // A whitespace-only newest version reads as a cleared soul — no
-        // fallback to older versions.
-        std::fs::write(soul_dir.join("20280101T0000-cccc.md"), "  \n\n").unwrap();
+        // Removing every entry clears the prelude.
+        for name in [
+            "20260101T0000-aaaa.md",
+            "20270101T0000-bbbb.md",
+            "20280101T0000-cccc.md",
+        ] {
+            std::fs::remove_file(prelude_dir.join(name)).unwrap();
+        }
         assert_eq!(epilogue(), base);
 
-        // An oversized version is truncated with a visible marker, keeping
-        // the prompt bounded no matter what got written.
-        std::fs::write(
-            soul_dir.join("20290101T0000-dddd.md"),
-            "x".repeat(DEFAULT_MAX_SOUL_BYTES * 2),
-        )
-        .unwrap();
+        // Rendering never trims, whatever is on disk: the cap is enforced at
+        // the edit and at startup, so a prompt built here carries every byte
+        // rather than a silently shortened prelude.
+        let huge = "x".repeat(DEFAULT_MAX_PRELUDE_BYTES * 2);
+        std::fs::write(prelude_dir.join("20290101T0000-dddd.md"), &huge).unwrap();
         let prompt = epilogue();
-        assert!(prompt.contains("[soul truncated at 64 KiB"), "{prompt}");
-        // `base` (not the bare const): since #98 the epilogue also carries the
-        // unconditional Manual block naming the exported directory.
-        assert!(prompt.len() < base.len() + DEFAULT_MAX_SOUL_BYTES + 200);
+        assert!(
+            prompt.contains(&huge),
+            "oversized entry should render whole"
+        );
+        assert!(!prompt.contains("truncated"), "nothing should be trimmed");
     }
 
+    /// The cap is a startup gate, not a render-time clamp: `prelude_oversize`
+    /// reports what is on disk, and the configured limit is what it is
+    /// measured against.
     #[test]
-    fn the_cap_is_configurable_and_reports_what_it_cut() {
-        let home = soul_home("soul-cap");
-        let soul_dir = home.path().join("workspace").join("soul");
-        // Multi-byte tail: the cut lands on a char boundary, never mid-char.
+    fn the_cap_is_configurable_and_reports_the_overrun() {
+        let home = prelude_home("prelude-cap");
+        let prelude_dir = home.path().join("workspace").join("prelude");
         let body = "é".repeat(1000);
-        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), &body).unwrap();
+        std::fs::write(prelude_dir.join("20260101T0000-aaaa.md"), &body).unwrap();
+        // 38 bytes of `[prelude entry …]\n` label precede the 2000-byte body.
+        let rendered_len = 38 + 2000;
 
-        // A cap above the version's size leaves it verbatim and unreported.
-        let (_, text, cut) = capped_soul(&soul_dir, DEFAULT_MAX_SOUL_BYTES).unwrap();
-        assert_eq!(text, body);
-        assert_eq!(cut, None);
+        // A cap above the rendered size: nothing to report.
+        assert_eq!(oversize_at(&prelude_dir, DEFAULT_MAX_PRELUDE_BYTES), None);
+        // Exactly at the cap is still fine — only past it is a problem.
+        assert_eq!(oversize_at(&prelude_dir, rendered_len), None);
 
         // A tighter cap from config.toml applies instead of the default.
-        let (_, text, cut) = capped_soul(&soul_dir, 501).unwrap();
-        let cut = cut.expect("501 < 2000 bytes should truncate");
-        assert_eq!(cut.version, "20260101T0000-aaaa.md");
-        assert_eq!((cut.bytes, cut.limit), (2000, 501));
-        // 501 is mid-`é`, so the text is cut back to 500 plus the marker.
-        assert!(text.starts_with(&"é".repeat(250)), "{text}");
-        assert!(text.contains("[soul truncated at 501 B of 2 KiB"), "{text}");
-        assert!(text.contains("write a shorter revision"), "{text}");
-    }
-
-    #[test]
-    fn lowering_the_soul_cap_leaves_project_guidance_alone() {
-        // `max_soul_bytes` is named for the soul; shrinking it to shorten a
-        // soul must not silently start cutting AGENTS.md too.
-        let home = soul_home("both");
-        let dir = home.path().to_path_buf();
-        let soul_dir = dir.join("workspace").join("soul");
-        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "s".repeat(4000)).unwrap();
-        std::fs::write(dir.join("AGENTS.md"), "g".repeat(4000)).unwrap();
-
-        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()), 1024);
-        assert!(
-            prompt.contains("[soul truncated at 1 KiB of 3.9 KiB"),
-            "{prompt}"
+        let over = oversize_at(&prelude_dir, 503).expect("503 < rendered size is over the cap");
+        assert_eq!(
+            (over.entries, over.bytes, over.limit),
+            (1, rendered_len, 503)
         );
-        assert!(!prompt.contains("[project guidance truncated"), "{prompt}");
-        assert!(prompt.contains(&"g".repeat(4000)), "{prompt}");
+        assert!(
+            over.describe()
+                .contains("prelude is 2 KiB across 1 entries, over the 503 B max_prelude_bytes"),
+            "{}",
+            over.describe()
+        );
+
+        // Rendering is unaffected by the cap: the body comes back whole.
+        let rendered = rendered_prelude(&prelude_dir).expect("entries render");
+        assert_eq!(
+            rendered,
+            format!("[prelude entry 20260101T0000-aaaa.md]\n{body}")
+        );
+    }
+
+    /// The two injected user-supplied blocks are bounded independently, and
+    /// only one of them is bounded by trimming: `AGENTS.md` is not something
+    /// myco can refuse to start over, so it is cut with a marker, while the
+    /// prelude renders whole and is policed at the edit and at startup.
+    #[test]
+    fn project_guidance_is_capped_by_trimming_and_the_prelude_is_not() {
+        let home = prelude_home("both");
+        let dir = home.path().to_path_buf();
+        let prelude_dir = dir.join("workspace").join("prelude");
+        let long_entry = "s".repeat(MAX_GUIDANCE_BYTES * 2);
+        std::fs::write(prelude_dir.join("20260101T0000-aaaa.md"), &long_entry).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "g".repeat(MAX_GUIDANCE_BYTES * 2)).unwrap();
+
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()));
+        assert!(prompt.contains("[project guidance truncated"), "{prompt}");
+        assert!(prompt.contains(&long_entry), "prelude should render whole");
+        assert!(!prompt.contains("[prelude truncated"), "{}", prompt.len());
     }
 
     #[test]
-    fn workspace_listing_names_visible_files_after_the_soul() {
-        let home = soul_home("listing");
+    fn workspace_listing_names_visible_files_after_the_prelude() {
+        let home = prelude_home("listing");
         let dir = home.path().to_path_buf();
         let workspace = dir.join("workspace");
-        let soul_dir = workspace.join("soul");
+        let prelude_dir = workspace.join("prelude");
         std::fs::create_dir_all(workspace.join("notes")).unwrap();
 
-        std::fs::write(soul_dir.join("20260101T0000-aaaa.md"), "soul_token_alpha\n").unwrap();
+        std::fs::write(
+            prelude_dir.join("20260101T0000-aaaa.md"),
+            "prelude_token_alpha\n",
+        )
+        .unwrap();
         std::fs::write(
             workspace.join("notes").join("devbox.md"),
             "# Devbox build gotchas\n\nthe long material\n",
@@ -859,15 +896,21 @@ mod tests {
         std::fs::write(workspace.join("index.bin"), b"\x00\x01binary_token\n").unwrap();
         std::fs::write(dir.join("AGENTS.md"), "agents_guidance_token\n").unwrap();
 
-        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()), DEFAULT_MAX_SOUL_BYTES);
+        let prompt = epilogue_with(Some(dir.clone()), Some(dir.clone()));
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
-        // Churniest block last: a new workspace file must not invalidate the
-        // soul's or the guidance's share of the cached prefix. Anchor on the
-        // `---` delimiter — the fragment names both headings in its own prose.
+        // Least volatile first, so a write to one block never invalidates a
+        // steadier block's share of the cached prefix: guidance (changes with
+        // the repo file) before the prelude (changes on every eager recording)
+        // before the listing (changes on any workspace write). Anchor on the
+        // `---` delimiter — the fragment names the headings in its own prose.
         let block_at = |heading: &str| prompt.find(&format!("\n---\n\n{heading}")).unwrap();
         let listing_at = block_at("# Workspace Files\n");
-        assert!(block_at("# Soul\n") < listing_at, "{prompt}");
+        assert!(
+            block_at("# Project guidance (") < block_at("# Prelude\n"),
+            "{prompt}"
+        );
+        assert!(block_at("# Prelude\n") < listing_at, "{prompt}");
         assert!(block_at("# Project guidance (") < listing_at, "{prompt}");
 
         // Path relative to workspace/, UTC day, first heading as the title.
@@ -890,9 +933,9 @@ mod tests {
         );
         assert!(!prompt.contains("binary_token"), "{prompt}");
 
-        // The live soul is already quoted above and superseded versions are
+        // The live prelude is already quoted above and superseded versions are
         // noise; hidden names are writes still in flight.
-        assert!(!prompt.contains("- `soul/"), "{prompt}");
+        assert!(!prompt.contains("- `prelude/"), "{prompt}");
         assert!(!prompt.contains("hidden_token"), "{prompt}");
         assert!(!prompt.contains(".tmp-draft.md"), "{prompt}");
         // AGENTS.md is the launch directory's, not the workspace's.
@@ -916,11 +959,7 @@ mod tests {
             std::fs::write(workspace.join(format!("n-{i:03}.md")), "# t\n").unwrap();
         }
 
-        let prompt = epilogue_with(
-            Some(home.path().to_path_buf()),
-            None,
-            DEFAULT_MAX_SOUL_BYTES,
-        );
+        let prompt = epilogue_with(Some(home.path().to_path_buf()), None);
         assert!(
             prompt.contains(&format!("[at least {overflow} more file(s) not listed")),
             "{prompt}"

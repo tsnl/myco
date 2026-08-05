@@ -2,7 +2,7 @@
 //!
 //! Registered on a [`crate::host::HostWorker`]. The **standard** catalog is the same on
 //! every host. The agent **root** (in-process `local`) may instantiate additional
-//! services at configuration time (e.g. `session_meta`) — still
+//! services at configuration time (e.g. `session_meta`, `prelude`) — still
 //! [`ToolService`], just not installed on remotes.
 
 use std::sync::Arc;
@@ -27,6 +27,9 @@ pub use session_history_service::SessionHistoryTool;
 
 pub mod list_recent_service;
 pub use list_recent_service::ListRecentService;
+
+pub mod prelude_service;
+pub use prelude_service::PreludeTool;
 
 /// Model-facing JSON Schema for a tool input type.
 ///

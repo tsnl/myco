@@ -15,7 +15,7 @@ use rustyline::ExternalPrinter;
 use rustyline::error::ReadlineError;
 
 use myco_config::{Config, ConfigUserSettings};
-use myco_machines::harness::StartupPreflight;
+use myco_machines::harness::{StartupPreflight, fatal_startup_check};
 use myco_session::{Session, format_session_detail, format_session_list_line, list_sessions};
 
 use crate::server::{Cmd, Live, Server, SessionEvent, entry_text, last_answer};
@@ -64,7 +64,13 @@ pub async fn run(opts: CliOptions) {
             std::process::exit(1);
         }
     };
-    let preflight = StartupPreflight::run(&config.harness.remote_hosts, config.max_soul_bytes);
+    // Fatal checks first: they end the process, so run them before anything
+    // that would leave a half-built session behind.
+    if let Some(fatal) = fatal_startup_check(config.max_prelude_bytes) {
+        eprintln!("myco: {fatal}");
+        std::process::exit(1);
+    }
+    let preflight = StartupPreflight::run(&config.harness.remote_hosts);
     let default_model = config.model.clone();
     let sup = Server::new(config);
 
