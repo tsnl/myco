@@ -438,6 +438,14 @@ Notice, in `interact_entry`:
   user push, after each ToolResults push) — never between an assistant
   tool_use and its results, because that prefix is exactly what a
   context fork must not inherit.
+- `PendingInput` is the pre-emption seam, and it drains at exactly the
+  same boundaries: messages that arrive mid-turn are folded into
+  history right before the next generate, so the model reads them in
+  the turn they interrupted. The doc explains why it is pull, not push
+  (the agent owns its history exclusively while a turn runs), and why a
+  cancelled turn leaves the queue untouched — nothing may be folded
+  where nothing would answer it. The server's room inbox (Stop 9) is
+  the production supplier.
 
 The cancel path: `CANCEL_TOOL_GRACE` gives a cancelled dispatch two
 seconds to clean up before a synthetic `cancelled` result is recorded.
@@ -472,21 +480,37 @@ Read: `src/server.rs` top to bottom (it earns it), then
 
 Notice:
 
-- `Cmd::User` vs `Cmd::Note` is the multiplayer design in one enum: a
-  note is recorded, delivered, and read as context next time the agent
-  is addressed — but costs no turn, never marks the session busy, and
-  fires no turn events ("a client would read those as 'the agent is
-  answering me'").
-- `wakes_agent` and `is_shared` implement the room rule from
-  `README.md`: explicit address, with one carve-out — a session nobody
-  else has posted in is a private line. Agent and system entries do not
-  make a room; only other people do. "An agent that guesses wrong talks
-  over people; one that waits to be named never does."
-- `SessionEvent::Message` is broadcast at *post* time, ahead of the
-  queue, so watchers see people talking while the agent is mid-turn —
+- `Room` is the multiplayer design in one struct: who has posted
+  (`participants`) and what has been accepted but not yet folded into
+  history (`inbox`), under one lock. `post_message` decides whether a
+  message wakes the agent, broadcasts it, and enqueues it in a single
+  critical section — so the room rule reads the room as it is *now*,
+  including messages still queued behind a running turn, never a stale
+  disk snapshot. The rule itself (`Room::wakes_agent`, `Room::is_shared`)
+  is `README.md`'s: explicit address, with one carve-out — a session
+  nobody else has posted in is a private line. Agent and system entries
+  do not make a room; only other people do. "An agent that guesses wrong
+  talks over people; one that waits to be named never does."
+- Pre-emption is the inbox's other half: the agent drains it at every
+  well-formed boundary (Stop 8's `PendingInput`), so a message that
+  names the agent mid-turn is folded into the turn in flight and
+  answered by it, and a message between people lands in history where
+  the room saw it — costing no turn, no busy flag, no turn events ("a
+  client would read those as 'the agent is answering me'"). Whatever a
+  turn does not fold, `drain_inbox` runs afterwards: wake messages as
+  their own turns, notes as `run_note`.
+- `SessionEvent::Message` is broadcast at *post* time, ahead of any
+  folding, so watchers see people talking while the agent is mid-turn —
   and `compose` builds the entry once, at acceptance, so the record
   shown live and the record on disk are the same one (timestamps as
   identity; the GUI leans on this in Stop 11).
+- `run_turn` owns a turn's lifecycle, and the wire's `TurnFinished` is
+  its last act — sent only after `run_user_turn` persisted, and the
+  agent's own earlier `TurnFinished` is filtered out of `events()` — so
+  a client that refetches on it reads a transcript that already holds
+  the answer. The test
+  `the_wire_ends_a_turn_once_and_only_after_persistence` pins both
+  halves.
 - `ensure_live` is the boot sequence: load or accept a fresh session,
   acquire the write lock (Busy is a hard error naming the other
   process; Unavailable degrades to unlocked with a warning), attach a
@@ -594,14 +618,29 @@ styling so plain mode keeps the byte-identity guarantee, and a rejected
 capture replays through the line machine newline for newline.
 
 The GUI is deliberately the terminal's identity in a browser. The part
-worth close reading is the SSE-vs-poll consistency story, three short
-functions in `main.rs`: `merge` (identity is the timestamp — the
+worth close reading is `state.rs`, the conversation's whole state
+machine: one `ConvState`, one `apply`, every event a typed action. The
+module doc explains the family of bugs this shape exists to make
+impossible — a long-lived task holding a Yew `UseStateHandle` reads the
+value from the render that created it, so the old SSE loop merged every
+arrival into its *first* render's empty transcript and each incoming
+message wiped the screen down to itself. Now the loops hold only a
+dispatcher and never read state at all. Inside `apply`, the consistency
+story survives intact as `merge` (identity is the timestamp — the
 server composed the entry once, so the feed's copy and the poll's copy
 are the same record), `reconcile` (the server's copy wins, but a
-delivered-not-yet-persisted message must survive the poll), and the
-poll standing down while the stream buffer is non-empty (the agent
+delivered-not-yet-persisted message must survive the poll), and
+`Polled` standing down while the stream buffer is non-empty (the agent
 checkpoints at every tool round, so a mid-turn poll would show the same
-prose twice). Tool cards call `api::tool_input_json` — the same
+prose twice). Turn ends swap buffer for persisted entries in one step —
+the wire's `TurnFinished` arrives after persistence (Stop 9), so one
+fetch suffices. A tool call streams as a card keyed by the call id, its
+`ToolFinished` result completes that card in place, and the saved entry
+renders under the same key: running → complete → persisted is one
+element updating, never a shuffle. The state machine is yew-free and
+unit-tested on the host; the SSE loop owns reconnection, reloading the
+transcript on every (re)connect so a dropped stream heals instead of
+silently diverging. Tool cards call `api::tool_input_json` — the same
 truncation policy the CLI applies, shared from the wire crate so the
 frontends cannot drift.
 
@@ -629,7 +668,11 @@ for real; only the network hop is replaced. `TempHome` points
   token holders: the agent does not interject between people; naming it
   wakes it, and it can see what it overheard while quiet; a message
   reaches watchers as its own record whether or not the agent will
-  answer.
+  answer. Then the pre-emption half, driven by a gated model that holds
+  a turn provably mid-flight: a direct message folds into the turn in
+  flight and is answered by it (one turn, not two), and the room rule
+  counts messages still queued behind a turn — grace joining mid-turn
+  makes ada's next unaddressed line a note, not a prompt.
 - `tests/cancel_composed.rs` — the full Ctrl-C path leaves no process-
   group survivors and a well-formed history with a recorded cancelled
   result.

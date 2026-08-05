@@ -8,12 +8,16 @@
 //! The Rocket API server: v1 agent semantics behind `/api`, one live agent
 //! task per session, concurrent across sessions.
 //!
-//! Each live session owns a per-session [`Harness`] and an [`Agent`] driven by
-//! a dedicated tokio task; user messages queue on an mpsc channel and are
-//! consumed one turn at a time (queued input — the client never blocks on a
-//! running turn). Transcript reads go straight to the persisted session, so
-//! clients see exactly what a resume would see; mid-turn checkpoints keep that
-//! fresh at every completed tool round. Live output streams over SSE
+//! Each live session owns a per-session [`Harness`] and an [`Agent`] driven
+//! by a dedicated tokio task. Messages posted over the API are accepted into
+//! the session's [`Room`] inbox (the client never blocks on a running turn):
+//! while a turn is in flight the agent folds the inbox at every well-formed
+//! boundary — a message that names the agent pre-empts the turn and is
+//! answered by it, one between people rides along as context — and whatever
+//! the turn does not fold, the task drains afterwards as its own turns and
+//! notes. Transcript reads go straight to the persisted session, so clients
+//! see exactly what a resume would see; mid-turn checkpoints keep that fresh
+//! at every completed tool round. Live output streams over SSE
 //! (`/sessions/<id>/events`): the agent's [`EventSink`] feeds a per-session
 //! broadcast channel, so streaming is a projection of the existing event
 //! seam, not a second pipeline.
@@ -198,52 +202,93 @@ fn default_model_factory(
 
 /// One queued unit of work for a session's agent task.
 pub enum Cmd {
-    /// A message addressed to the agent: record it and answer it.
+    /// A message addressed to the agent: record it and answer it as its own
+    /// turn. The direct path for in-process callers (CLI, `subagent`) — web
+    /// messages go through the room inbox instead, so they can pre-empt a
+    /// running turn.
     User { entry: Entry },
-    /// A message between people: record it, do not answer it. Costs no turn
-    /// and does not mark the session busy, but the agent reads it as context
-    /// the next time it is spoken to.
-    Note { entry: Entry },
+    /// A message was accepted into the room inbox; drain whatever the running
+    /// turn has not already folded. Carries nothing: the inbox is the record.
+    Poke,
     /// Compact into a successor session (also queued automatically when a
     /// turn ends with the context nearly full).
     Compact,
 }
 
-/// Should this message wake the agent?
-///
-/// The rule is explicit address, with one carve-out: a session nobody else has
-/// posted in is a private line, and everything said there is said to the agent.
-/// The moment a second person joins, the room becomes a room — the agent
-/// answers when it is called (`@myco`, `@agent`, `@assistant`, or the model key
-/// it is running as) and otherwise listens.
-///
-/// Deliberately not a judgement call about intent. In a room, an agent that
-/// guesses wrong talks over people; one that waits to be named never does.
-fn wakes_agent(text: &str, snapshot: &Session, author: &Author) -> bool {
-    if api::mention::addresses_agent(text, &snapshot.model) {
-        return true;
-    }
-    !is_shared(snapshot, author)
+/// A message the room has accepted but the history has not absorbed yet.
+struct Accepted {
+    entry: Entry,
+    wakes_agent: bool,
 }
 
-/// Has anyone other than `author` posted here? Agent and system entries do not
-/// make a room — only other people do.
-fn is_shared(snapshot: &Session, author: &Author) -> bool {
-    let me = match author {
-        Author::User { id, .. } => id.as_str(),
-        // A non-human poster (subagent plumbing) never turns a session shared.
-        _ => return false,
-    };
-    snapshot.entries.iter().any(|e| {
-        matches!(&e.body, EntryBody::User { .. })
-            && matches!(&e.author, Author::User { id, .. } if id != me)
-    })
+/// Post-acceptance state for one live session: who has posted here, and what
+/// has been accepted but not yet folded into history. One lock covers the
+/// wake decision, the feed broadcast, and the inbox push, so acceptance order
+/// is feed order is fold order — and the room rule is never computed from a
+/// stale snapshot while messages sit queued behind a running turn.
+struct Room {
+    /// User ids that have posted. Agent and system entries do not make a room
+    /// — only other people do.
+    participants: std::collections::HashSet<String>,
+    /// Accepted messages the agent task (or the running turn's boundary
+    /// drain) has yet to fold, in acceptance order.
+    inbox: std::collections::VecDeque<Accepted>,
+}
+
+impl Room {
+    fn seeded(entries: &[Entry]) -> Self {
+        Self {
+            participants: Self::participants_of(entries),
+            inbox: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn participants_of(entries: &[Entry]) -> std::collections::HashSet<String> {
+        entries
+            .iter()
+            .filter(|e| matches!(&e.body, EntryBody::User { .. }))
+            .filter_map(|e| match &e.author {
+                Author::User { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Should this message wake the agent?
+    ///
+    /// The rule is explicit address, with one carve-out: a session nobody else
+    /// has posted in is a private line, and everything said there is said to
+    /// the agent. The moment a second person joins, the room becomes a room —
+    /// the agent answers when it is called (`@myco`, `@agent`, `@assistant`,
+    /// or the model key it is running as) and otherwise listens.
+    ///
+    /// Deliberately not a judgement call about intent. In a room, an agent
+    /// that guesses wrong talks over people; one that waits to be named never
+    /// does.
+    fn wakes_agent(&self, text: &str, model: &str, author: &Author) -> bool {
+        if api::mention::addresses_agent(text, model) {
+            return true;
+        }
+        !self.is_shared(author)
+    }
+
+    /// Has anyone other than `author` posted here?
+    fn is_shared(&self, author: &Author) -> bool {
+        match author {
+            Author::User { id, .. } => self.participants.iter().any(|p| p != id),
+            // A non-human poster (subagent plumbing) never turns a session
+            // shared, and is never gated by one.
+            _ => false,
+        }
+    }
 }
 
 /// One resident conversation: its agent task's input queue and shared handles.
 pub struct Live {
     pub session: ActiveSession,
     pub tx: mpsc::UnboundedSender<Cmd>,
+    /// Who has posted, and what is accepted but not yet folded (see [`Room`]).
+    room: Arc<std::sync::Mutex<Room>>,
     busy: Arc<AtomicBool>,
     cancel: Mutex<CancelToken>,
     /// Completed-turn counter; `subagent` (and turn-awaiting CLIs) wait on it.
@@ -356,9 +401,21 @@ impl Server {
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
         agent.set_model_key(catalog_model.spec.key.clone());
         let restored = active.snapshot();
+        let room = Arc::new(std::sync::Mutex::new(Room::seeded(&restored.entries)));
         agent.set_history(restored.entries.clone());
         agent.set_last_usage(restored.last_usage);
         wire_checkpoint(&mut agent, &active);
+        // Messages accepted while a turn runs pre-empt it: the agent drains
+        // the room inbox at every well-formed boundary, so a direct message
+        // is answered by the turn in flight and a message between people
+        // lands in history where the room actually saw it.
+        {
+            let room = room.clone();
+            agent.set_pending_input(Box::new(move || {
+                let mut room = room.lock().unwrap_or_else(|e| e.into_inner());
+                room.inbox.drain(..).map(|a| a.entry).collect()
+            }));
+        }
 
         let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
         let (turn_tx, turns) = watch::channel(0u64);
@@ -366,6 +423,7 @@ impl Server {
         let handle = Arc::new(Live {
             session: active.clone(),
             tx,
+            room,
             busy: busy.clone(),
             cancel: Mutex::new(CancelToken::new()),
             turns,
@@ -486,42 +544,72 @@ struct AgentTask {
     harness: Arc<Harness>,
 }
 
+/// What one turn runs: a user message or a compaction.
+enum TurnWork {
+    User(Entry),
+    Compact,
+}
+
 /// The per-session agent task: pop queued commands, run one turn each.
 async fn run_agent_task(mut t: AgentTask) {
     while let Some(cmd) = t.rx.recv().await {
-        // A note is bookkeeping, not work: it must not mark the session busy,
-        // must not bump the turn counter, and must not fire turn events — a
-        // client would read those as "the agent is answering me".
-        if let Cmd::Note { entry } = cmd {
-            run_note(&mut t, entry);
-            continue;
-        }
-
-        t.busy.store(true, Ordering::Relaxed);
-        t.handle.set_error(None);
-        let _ = t.events.send(SessionEvent::TurnStarted);
-
-        // Fresh token per turn so one cancel doesn't poison the next turn.
-        let cancel = CancelToken::new();
-        *t.handle.cancel.lock().await = cancel.clone();
-
         match cmd {
-            Cmd::User { entry } => run_user_turn(&mut t, entry, cancel).await,
-            Cmd::Compact => run_compact(&mut t, cancel).await,
-            Cmd::Note { .. } => unreachable!("notes are handled above"),
+            // A poke follows every room acceptance. Anything a running turn
+            // already folded is gone from the inbox by now; this drains the
+            // rest — messages that arrived after the turn's last boundary,
+            // or while the session was idle.
+            Cmd::Poke => drain_inbox(&mut t).await,
+            Cmd::User { entry } => run_turn(&mut t, TurnWork::User(entry)).await,
+            Cmd::Compact => run_turn(&mut t, TurnWork::Compact).await,
         }
-
-        t.busy.store(false, Ordering::Relaxed);
-        t.turn_tx.send_modify(|n| *n += 1);
-        // Belt and braces: the Agent emits TurnFinished on clean turns; this
-        // covers errored ones so clients always get their refetch trigger.
-        let _ = t.events.send(SessionEvent::TurnFinished);
     }
 }
 
-/// `Cmd::Note`: fold a person-to-person message into the history and persist,
-/// so a reload and a live view agree and the agent has the context next time
-/// it is addressed.
+/// Fold the room inbox in acceptance order: a message that wakes the agent
+/// runs as its own turn, one between people is recorded without costing one —
+/// no busy flag, no turn counter, no turn events, which a client would read
+/// as "the agent is answering me".
+async fn drain_inbox(t: &mut AgentTask) {
+    loop {
+        let next = {
+            let mut room = t.handle.room.lock().unwrap_or_else(|e| e.into_inner());
+            room.inbox.pop_front()
+        };
+        let Some(accepted) = next else { break };
+        if accepted.wakes_agent {
+            run_turn(t, TurnWork::User(accepted.entry)).await;
+        } else {
+            run_note(t, accepted.entry);
+        }
+    }
+}
+
+/// One turn, with its lifecycle bookkeeping: busy flag, turn events, a fresh
+/// cancel token, the completed-turn counter. `TurnFinished` goes out last —
+/// after the turn's entries are persisted — so it is the wire's one signal
+/// that a refetch will read the finished turn.
+async fn run_turn(t: &mut AgentTask, work: TurnWork) {
+    t.busy.store(true, Ordering::Relaxed);
+    t.handle.set_error(None);
+    let _ = t.events.send(SessionEvent::TurnStarted);
+
+    // Fresh token per turn so one cancel doesn't poison the next turn.
+    let cancel = CancelToken::new();
+    *t.handle.cancel.lock().await = cancel.clone();
+
+    match work {
+        TurnWork::User(entry) => run_user_turn(t, entry, cancel).await,
+        TurnWork::Compact => run_compact(t, cancel).await,
+    }
+
+    t.busy.store(false, Ordering::Relaxed);
+    t.turn_tx.send_modify(|n| *n += 1);
+    let _ = t.events.send(SessionEvent::TurnFinished);
+}
+
+/// Fold a person-to-person message into the history and persist, so a reload
+/// and a live view agree and the agent has the context next time it is
+/// addressed.
 fn run_note(t: &mut AgentTask, entry: Entry) {
     let _ = t
         .active
@@ -693,6 +781,12 @@ async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
     t.agent.set_history(successor.entries.clone());
     t.agent.set_last_usage(successor.last_usage);
     *t.handle.lock.lock().unwrap_or_else(|e| e.into_inner()) = new_lock;
+    // Reseed who has posted from the successor's tail; accepted-but-unfolded
+    // messages stay queued and fold into the successor.
+    {
+        let mut room = t.handle.room.lock().unwrap_or_else(|e| e.into_inner());
+        room.participants = Room::participants_of(&successor.entries);
+    }
 
     // Re-key the live table: the conversation now answers to the new id.
     {
@@ -781,9 +875,16 @@ impl From<SessionEvent> for api::StreamEvent {
                 AgentEvent::TextDelta { text, .. } => api::StreamEvent::TextDelta { text },
                 AgentEvent::ThinkingDelta { text, .. } => api::StreamEvent::ThinkingDelta { text },
                 AgentEvent::ToolStarted { tool_use, .. } => api::StreamEvent::ToolStarted {
+                    id: tool_use.id,
                     name: tool_use.name,
                     input: tool_use.input,
                 },
+                AgentEvent::ToolFinished { result, .. } => {
+                    api::StreamEvent::ToolFinished { result }
+                }
+                // Not sent: `events()` filters this variant so the wire
+                // carries exactly one TurnFinished per turn — the task-level
+                // one, emitted after the turn's entries are persisted.
                 AgentEvent::TurnFinished { .. } => api::StreamEvent::TurnFinished,
             },
             SessionEvent::Message { entry, wakes_agent } => {
@@ -960,28 +1061,35 @@ impl Server {
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
         let snapshot = live.session.snapshot();
-
         let entry = self.compose(author.clone(), &req.text, &snapshot.model);
-        let wakes_agent = wakes_agent(&req.text, &snapshot, author);
 
-        // Ahead of the queue, so a message shows up for everyone the instant it
-        // is accepted — even if the agent is three tool calls into someone
-        // else's turn and will not drain this command for a while.
-        let _ = live.events.send(SessionEvent::Message {
-            entry: entry.clone(),
-            wakes_agent,
-        });
-
-        let cmd = if wakes_agent {
-            Cmd::User { entry }
-        } else {
-            Cmd::Note { entry }
+        // Acceptance is atomic under the room lock: the wake decision reads
+        // the room as it is *now* — participants include everyone whose
+        // message is still queued behind a running turn, not just what has
+        // reached disk — and the feed broadcast and inbox push happen in the
+        // same order for every message. The broadcast goes out ahead of any
+        // folding, so a message shows up for everyone the instant it is
+        // accepted, even mid-turn.
+        let wakes_agent = {
+            let mut room = live.room.lock().unwrap_or_else(|e| e.into_inner());
+            let wakes_agent = room.wakes_agent(&req.text, &snapshot.model, author);
+            if let Author::User { id, .. } = author {
+                room.participants.insert(id.clone());
+            }
+            let _ = live.events.send(SessionEvent::Message {
+                entry: entry.clone(),
+                wakes_agent,
+            });
+            room.inbox.push_back(Accepted { entry, wakes_agent });
+            live.tx
+                .send(Cmd::Poke)
+                .map_err(|_| internal("agent task gone".into()))?;
+            wakes_agent
         };
-        live.tx
-            .send(cmd)
-            .map_err(|_| internal("agent task gone".into()))?;
         Ok(api::Poll {
-            busy: wakes_agent,
+            // Whether a reply is coming *or already underway* — a room note
+            // posted mid-turn must not tell the client the agent went idle.
+            busy: wakes_agent || live.is_busy(),
             total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: None,
@@ -1014,6 +1122,12 @@ impl Server {
         let stream = futures::stream::unfold(rx, |mut rx| async move {
             loop {
                 match rx.recv().await {
+                    // The agent emits its own TurnFinished *before* the task
+                    // persists the turn's entries; a client that refetched on
+                    // it would briefly read a transcript missing the answer.
+                    // The wire carries only the task-level one, sent after
+                    // persistence.
+                    Ok(SessionEvent::Agent(AgentEvent::TurnFinished { .. })) => continue,
                     Ok(ev) => return Some((api::StreamEvent::from(ev), rx)),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return None,

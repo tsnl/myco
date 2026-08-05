@@ -9,9 +9,12 @@
 mod auth;
 mod highlight;
 mod notify;
+mod state;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use state::{ConvAction, ConvState, StreamItem};
 
 use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
@@ -785,9 +788,11 @@ fn blocks_for_entry(
             for t in tool_uses {
                 out.push(Block {
                     kind: TurnKind::Tool,
+                    // Keyed by the call id so the card that streamed is the
+                    // card that persists — an in-place update, not a swap.
                     body: html! {
-                        <ToolCard tool={t.clone()} result={results.get(&t.id).cloned()}
-                                  {verbose} />
+                        <ToolCard key={t.id.clone()} tool={t.clone()}
+                                  result={results.get(&t.id).cloned()} {verbose} />
                     },
                 });
             }
@@ -820,7 +825,7 @@ fn render_transcript(
         blocks_for_entry(e, &results, verbose, me, &mut blocks);
     }
     for item in streaming {
-        blocks.push(item.block(verbose));
+        blocks.push(stream_block(item, verbose));
     }
 
     // Fold the flat block list into turns.
@@ -855,115 +860,36 @@ fn result_index(entries: &[api::Entry]) -> std::collections::HashMap<String, api
     out
 }
 
-/// One piece of the turn currently arriving.
-///
-/// The streaming buffer used to be a single `String`, which forced every kind
-/// of live event through the same channel — a tool start had to be written
-/// into the prose as `● bash` text, because a string cannot hold a widget.
-/// Modelling the buffer as a list of typed items instead lets a tool call
-/// stream as the same card it becomes once the turn is saved.
-#[derive(Clone, PartialEq)]
-enum StreamItem {
-    Text(String),
-    Thinking(String),
-    Tool {
-        name: String,
-        input: serde_json::Value,
-    },
-}
-
-impl StreamItem {
-    /// Render as a transcript block, so live output is grouped into turns by
-    /// exactly the same code that groups saved output.
-    fn block(&self, verbose: bool) -> Block {
-        match self {
-            StreamItem::Text(text) => Block {
-                kind: TurnKind::Assistant,
-                body: html! { <div class="role-assistant">{ markdown(text) }</div> },
+/// Render one streaming item as a transcript block, so live output is grouped
+/// into turns by exactly the same code that groups saved output. The tool
+/// card is keyed by the call's id — the identity the saved entry carries too,
+/// so the card completes and then persists in place instead of shuffling.
+fn stream_block(item: &StreamItem, verbose: bool) -> Block {
+    match item {
+        StreamItem::Text(text) => Block {
+            kind: TurnKind::Assistant,
+            body: html! { <div class="role-assistant">{ markdown(text) }</div> },
+        },
+        StreamItem::Thinking(text) => Block {
+            kind: TurnKind::Assistant,
+            body: html! { <div class="role-thinking">{ markdown(text) }</div> },
+        },
+        StreamItem::Tool {
+            id,
+            name,
+            input,
+            result,
+        } => Block {
+            kind: TurnKind::Tool,
+            body: html! {
+                <ToolCard key={id.clone()} tool={api::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }} result={result.clone()} {verbose} />
             },
-            StreamItem::Thinking(text) => Block {
-                kind: TurnKind::Assistant,
-                body: html! { <div class="role-thinking">{ markdown(text) }</div> },
-            },
-            StreamItem::Tool { name, input } => Block {
-                kind: TurnKind::Tool,
-                // No id yet — the card is keyed by nothing and has no result,
-                // so it renders in its "running" state until the turn ends and
-                // the saved entry replaces it.
-                body: html! {
-                    <ToolCard tool={api::ToolUse {
-                        id: String::new(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    }} result={None} {verbose} />
-                },
-            },
-        }
+        },
     }
-
-    /// Roughly how much has arrived; the scroll effect watches this so growing
-    /// text keeps the pane pinned to the bottom, not just new items.
-    fn size(&self) -> usize {
-        match self {
-            StreamItem::Text(t) | StreamItem::Thinking(t) => t.len(),
-            StreamItem::Tool { name, .. } => name.len(),
-        }
-    }
-}
-
-/// Append a delta to the buffer, extending the trailing item when it is the
-/// same kind and starting a new one otherwise — so prose either side of a tool
-/// call stays two blocks rather than merging across it.
-fn push_delta(buf: &mut Vec<StreamItem>, delta: StreamItem) {
-    match (buf.last_mut(), &delta) {
-        (Some(StreamItem::Text(prev)), StreamItem::Text(next)) => prev.push_str(next),
-        (Some(StreamItem::Thinking(prev)), StreamItem::Thinking(next)) => prev.push_str(next),
-        _ => buf.push(delta),
-    }
-}
-
-/// Add a live-delivered entry, unless the transcript already has it.
-///
-/// Identity is the timestamp. The server composes an entry once, when it
-/// accepts the message, and that stamp survives to disk — so the copy pushed
-/// down the event feed and the copy a later poll returns are the same record,
-/// and the client can tell without the protocol carrying an id.
-fn merge(mut entries: Vec<api::Entry>, entry: api::Entry) -> Vec<api::Entry> {
-    if entries.iter().any(|e| e.at == entry.at) {
-        return entries;
-    }
-    entries.push(entry);
-    entries
-}
-
-/// Fold a poll response into what we already have on screen.
-///
-/// The server's copy wins, but a message we were told about over the feed and
-/// that has not been persisted yet must survive the poll — otherwise a
-/// message posted mid-turn appears, vanishes on the next tick, and comes back
-/// when the turn ends. Only entries newer than anything the server knows are
-/// kept, so one the server deliberately dropped does not live forever.
-fn reconcile(local: &[api::Entry], server: Vec<api::Entry>) -> Vec<api::Entry> {
-    let newest = server.iter().map(|e| e.at).max();
-    let pending: Vec<api::Entry> = local
-        .iter()
-        .filter(|e| newest.is_none_or(|n| e.at > n))
-        .filter(|e| !server.iter().any(|s| s.at == e.at))
-        .cloned()
-        .collect();
-    let mut out = server;
-    out.extend(pending);
-    out
-}
-
-/// Has anyone but me posted here? A session with a second person in it is a
-/// room, and the agent only answers when it is named — so the composer says so.
-fn is_shared(entries: &[api::Entry], me: Option<&api::Identity>) -> bool {
-    entries.iter().any(|e| match (&e.author, me) {
-        (api::Author::User { id, .. }, Some(i)) => *id != i.id,
-        (api::Author::User { .. }, None) => true,
-        _ => false,
-    })
 }
 
 /// Tell the reader a message landed: always a title badge while the tab is in
@@ -997,27 +923,37 @@ struct ConversationProps {
     id: String,
 }
 
+/// Yew's `Reducible` over the pure [`ConvState::apply`]: the component holds
+/// one of these, and every event loop holds only its dispatcher — which is
+/// stable across renders and applies each action to the *current* state.
+struct Conv(ConvState);
+
+impl Reducible for Conv {
+    type Action = ConvAction;
+    fn reduce(self: Rc<Self>, action: ConvAction) -> Rc<Self> {
+        let mut next = self.0.clone();
+        next.apply(action);
+        Rc::new(Conv(next))
+    }
+}
+
 #[function_component(Conversation)]
 fn conversation(props: &ConversationProps) -> Html {
     let who = use_context::<Session>();
-    let entries = use_state(Vec::<api::Entry>::new);
+    let me = who.as_ref().map(|s| s.identity.clone());
+    // Every piece of live state, one reducer. See `state.rs` for why nothing
+    // here may be a `use_state` handle captured by a long-lived task.
+    let conv = use_reducer({
+        let me = me.clone();
+        move || Conv(ConvState::new(me))
+    });
     let verbose = use_state(|| false);
-    let busy = use_state(|| false);
-    let error = use_state(|| Option::<String>::None);
-    // The turn streamed since the last transcript refresh. The buffer is a
-    // ref, not state: a task spawned once would otherwise keep reading the
-    // value captured at its render and each delta would replace rather than
-    // append.
-    let stream_buf: Rc<RefCell<Vec<StreamItem>>> = use_mut_ref(Vec::new);
-    let streaming = use_state(Vec::<StreamItem>::new);
     let input = use_node_ref();
     let pane = use_node_ref();
     let at_bottom: Rc<RefCell<bool>> = use_mut_ref(|| true);
     let navigator = use_navigator().unwrap();
     // Unread messages that arrived while this tab was in the background.
     let unread: Rc<RefCell<u32>> = use_mut_ref(|| 0u32);
-    // Whether anyone but us has posted here; drives the addressing hint.
-    let shared = use_state(|| false);
 
     // Ask once, on the way in, so the first message that names someone can
     // actually reach them.
@@ -1049,139 +985,156 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
-    // SSE: live deltas; turn boundaries refresh the transcript.
+    // SSE: live deltas; turn boundaries refresh the transcript. The loop owns
+    // reconnection — a dropped stream (server restart, proxy hiccup, laptop
+    // lid) reloads the transcript and resubscribes, so one machine's blip no
+    // longer leaves it silently diverged from every other viewer until reload.
     {
-        let entries = entries.clone();
-        let busy = busy.clone();
-        let error = error.clone();
-        let streaming = streaming.clone();
-        let stream_buf = stream_buf.clone();
+        let dispatch = conv.dispatcher();
         let navigator = navigator.clone();
-        let shared = shared.clone();
+        let who = who.clone();
+        let me = me.clone();
         let unread = unread.clone();
-        let me = who.as_ref().map(|s| s.identity.clone());
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
             let alive = Rc::new(std::cell::Cell::new(true));
             let alive2 = alive.clone();
             spawn_local(async move {
-                // Existing transcript first, so opening a session shows its
-                // history whether or not the live feed ever connects.
-                match fetch_detail(&id).await {
-                    Ok(d) => {
-                        shared.set(is_shared(&d.entries, me.as_ref()));
-                        entries.set(d.entries);
-                        busy.set(d.summary.busy);
-                    }
-                    Err(e) => error.set(Some(e.to_string())),
-                }
-
-                let es = match EventSource::new(&auth::sse_url(&id)) {
-                    Ok(es) => es,
-                    Err(e) => {
-                        error.set(Some(format!("event stream: {e}")));
-                        return;
-                    }
-                };
-                let mut es = es;
-                let Ok(mut stream) = es.subscribe("message") else {
-                    error.set(Some("event stream: cannot subscribe".into()));
-                    return;
-                };
-                while alive2.get() {
-                    let Some(Ok((_, msg))) = stream.next().await else {
-                        break;
-                    };
-                    let Some(data) = msg.data().as_string() else {
-                        continue;
-                    };
-                    let Ok(ev) = serde_json::from_str::<api::StreamEvent>(&data) else {
-                        continue;
-                    };
-                    let push = |item: StreamItem| {
-                        push_delta(&mut stream_buf.borrow_mut(), item);
-                        streaming.set(stream_buf.borrow().clone());
-                    };
-                    match ev {
-                        // Somebody posted. Place it in the transcript on its
-                        // own terms, right now: it is a message from a person,
-                        // not a continuation of whatever the agent is saying,
-                        // and it must not wait for the turn in flight to end.
-                        api::StreamEvent::Message { entry, wakes_agent } => {
-                            let mine = matches!(
-                                (&entry.author, me.as_ref()),
-                                (api::Author::User { id, .. }, Some(i)) if *id == i.id
-                            );
-                            if !mine {
-                                shared.set(true);
-                                announce(&entry, me.as_ref(), &unread);
-                            }
-                            entries.set(merge((*entries).clone(), entry));
-                            if wakes_agent {
-                                busy.set(true);
-                            }
-                        }
-                        api::StreamEvent::TurnStarted => {
-                            busy.set(true);
-                            error.set(None);
-                            stream_buf.borrow_mut().clear();
-                            streaming.set(Vec::new());
-                            if let Ok(p) = fetch_poll(&id).await {
-                                entries.set(reconcile(&entries, p.entries));
-                            }
-                        }
-                        api::StreamEvent::TextDelta { text } => push(StreamItem::Text(text)),
-                        api::StreamEvent::ThinkingDelta { text } => {
-                            push(StreamItem::Thinking(text))
-                        }
-                        // A card from the moment the call starts, in its
-                        // running state — the same widget the saved entry
-                        // renders, rather than a bullet written into the prose.
-                        api::StreamEvent::ToolStarted { name, input } => {
-                            push(StreamItem::Tool { name, input })
-                        }
-                        api::StreamEvent::TurnFailed { message } => error.set(Some(message)),
-                        api::StreamEvent::Compacted { successor, .. } => {
-                            navigator.push(&Route::Session { id: successor });
+                let mut first_attempt = true;
+                'reconnect: while alive2.get() {
+                    if !first_attempt {
+                        gloo_timers::future::TimeoutFuture::new(1_000).await;
+                        if !alive2.get() {
                             break;
                         }
-                        api::StreamEvent::TurnFinished => {
-                            stream_buf.borrow_mut().clear();
-                            streaming.set(Vec::new());
-                            match fetch_poll(&id).await {
-                                Ok(p) => {
-                                    entries.set(reconcile(&entries, p.entries));
-                                    busy.set(p.busy);
-                                    if p.last_error.is_some() {
-                                        error.set(p.last_error);
+                    }
+                    // The transcript on every (re)connect, so history shows
+                    // whether or not the feed comes up, and a window missed
+                    // while disconnected heals.
+                    match fetch_detail(&id).await {
+                        Ok(d) => dispatch.dispatch(ConvAction::Loaded {
+                            entries: d.entries,
+                            busy: d.summary.busy,
+                        }),
+                        Err(Failure::Unauthorized) => {
+                            sign_out_now(&who);
+                            return;
+                        }
+                        Err(e) => {
+                            if first_attempt {
+                                dispatch.dispatch(ConvAction::Failed(e.to_string()));
+                            }
+                            first_attempt = false;
+                            continue;
+                        }
+                    }
+                    first_attempt = false;
+
+                    let mut es = match EventSource::new(&auth::sse_url(&id)) {
+                        Ok(es) => es,
+                        Err(_) => continue,
+                    };
+                    let Ok(mut stream) = es.subscribe("message") else {
+                        continue;
+                    };
+                    while alive2.get() {
+                        let Some(Ok((_, msg))) = stream.next().await else {
+                            // Closed or errored: fall out to reconnect.
+                            drop(es);
+                            continue 'reconnect;
+                        };
+                        let Some(data) = msg.data().as_string() else {
+                            continue;
+                        };
+                        let Ok(ev) = serde_json::from_str::<api::StreamEvent>(&data) else {
+                            continue;
+                        };
+                        match ev {
+                            // Somebody posted. Place it in the transcript on
+                            // its own terms, right now: it is a message from
+                            // a person, not a continuation of whatever the
+                            // agent is saying, and it must not wait for the
+                            // turn in flight to end.
+                            api::StreamEvent::Message { entry, wakes_agent } => {
+                                let mine = matches!(
+                                    (&entry.author, me.as_ref()),
+                                    (api::Author::User { id, .. }, Some(i)) if *id == i.id
+                                );
+                                if !mine {
+                                    announce(&entry, me.as_ref(), &unread);
+                                }
+                                dispatch.dispatch(ConvAction::Message { entry, wakes_agent });
+                            }
+                            api::StreamEvent::TurnStarted => {
+                                dispatch.dispatch(ConvAction::TurnStarted);
+                                // Pick up entries that bypassed the feed (a
+                                // CLI operator queues turns directly).
+                                if let Ok(p) = fetch_poll(&id).await {
+                                    dispatch.dispatch(ConvAction::Polled { poll: p });
+                                }
+                            }
+                            api::StreamEvent::TextDelta { text } => {
+                                dispatch.dispatch(ConvAction::Text(text))
+                            }
+                            api::StreamEvent::ThinkingDelta { text } => {
+                                dispatch.dispatch(ConvAction::Thinking(text))
+                            }
+                            // A card from the moment the call starts, in its
+                            // running state — the same widget, same key, the
+                            // saved entry renders.
+                            api::StreamEvent::ToolStarted { id, name, input } => {
+                                dispatch.dispatch(ConvAction::ToolStarted { id, name, input })
+                            }
+                            api::StreamEvent::ToolFinished { result } => {
+                                dispatch.dispatch(ConvAction::ToolFinished { result })
+                            }
+                            api::StreamEvent::TurnFailed { message } => {
+                                dispatch.dispatch(ConvAction::TurnFailed(message))
+                            }
+                            api::StreamEvent::Compacted { successor, .. } => {
+                                navigator.push(&Route::Session { id: successor });
+                                return;
+                            }
+                            api::StreamEvent::TurnFinished => {
+                                // The wire contract: the turn is persisted
+                                // before this event, so one fetch swaps the
+                                // stream buffer for its saved form in a
+                                // single step. Retry briefly — failing here
+                                // would strand the buffer.
+                                let mut fetched = None;
+                                for _ in 0..5 {
+                                    match fetch_poll(&id).await {
+                                        Ok(p) => {
+                                            fetched = Some(p);
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            gloo_timers::future::TimeoutFuture::new(1_000).await
+                                        }
                                     }
                                 }
-                                Err(e) => error.set(Some(e.to_string())),
+                                match fetched {
+                                    Some(poll) => dispatch.dispatch(ConvAction::TurnEnded { poll }),
+                                    None => dispatch.dispatch(ConvAction::Failed(
+                                        "transcript refresh failed".into(),
+                                    )),
+                                }
                             }
                         }
                     }
+                    drop(es);
                 }
-                // Dropping `es` closes the connection.
-                drop(es);
             });
             move || alive.set(false)
         });
     }
 
-    // Slow reconciliation poll: covers stream hiccups and other writers.
-    //
-    // It leaves the transcript alone while a turn is streaming. The agent
-    // checkpoints its history at every completed tool round, so a poll landing
-    // mid-turn returns entries covering output the buffer is still holding —
-    // adopting them would show the same prose, and the same tool card, twice.
-    // The turn boundaries already refresh the transcript and clear the buffer,
-    // which is the moment the two agree. Messages from other people do not
-    // depend on this: they arrive on the feed as their own event.
+    // Slow reconciliation poll: covers anything the feed cannot — a lagged
+    // broadcast, entries written by another process. The reducer stands it
+    // down while a turn streams (see `ConvAction::Polled`).
     {
-        let entries = entries.clone();
-        let busy = busy.clone();
-        let streaming = streaming.clone();
+        let dispatch = conv.dispatcher();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -1190,11 +1143,11 @@ fn conversation(props: &ConversationProps) -> Html {
             spawn_local(async move {
                 while alive2.get() {
                     gloo_timers::future::TimeoutFuture::new(5_000).await;
+                    if !alive2.get() {
+                        break;
+                    }
                     if let Ok(p) = fetch_poll(&id).await {
-                        if streaming.is_empty() {
-                            entries.set(reconcile(&entries, p.entries));
-                        }
-                        busy.set(p.busy);
+                        dispatch.dispatch(ConvAction::Polled { poll: p });
                     }
                 }
             });
@@ -1207,14 +1160,17 @@ fn conversation(props: &ConversationProps) -> Html {
     {
         let pane = pane.clone();
         let at_bottom = at_bottom.clone();
-        let streamed: usize = streaming.iter().map(StreamItem::size).sum();
-        use_effect_with((entries.len(), streaming.len(), streamed), move |_| {
-            if *at_bottom.borrow()
-                && let Some(el) = pane.cast::<web_sys::Element>()
-            {
-                el.set_scroll_top(el.scroll_height());
-            }
-        });
+        let streamed: usize = conv.0.streaming.iter().map(StreamItem::size).sum();
+        use_effect_with(
+            (conv.0.entries.len(), conv.0.streaming.len(), streamed),
+            move |_| {
+                if *at_bottom.borrow()
+                    && let Some(el) = pane.cast::<web_sys::Element>()
+                {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            },
+        );
     }
 
     // Track whether the pane is pinned to the bottom (within a line or two).
@@ -1232,8 +1188,7 @@ fn conversation(props: &ConversationProps) -> Html {
     let send_now: Callback<()> = {
         let id = props.id.clone();
         let input = input.clone();
-        let busy = busy.clone();
-        let error = error.clone();
+        let dispatch = conv.dispatcher();
         Callback::from(move |_| {
             let Some(ta) = input.cast::<HtmlTextAreaElement>() else {
                 return;
@@ -1244,8 +1199,7 @@ fn conversation(props: &ConversationProps) -> Html {
             }
             ta.set_value("");
             let id = id.clone();
-            let error = error.clone();
-            let busy = busy.clone();
+            let dispatch = dispatch.clone();
             spawn_local(async move {
                 match auth::post_json::<api::Poll, _>(
                     &format!("/api/sessions/{id}/messages"),
@@ -1253,12 +1207,12 @@ fn conversation(props: &ConversationProps) -> Html {
                 )
                 .await
                 {
-                    // The server decides whether this message wakes the agent;
-                    // it reports that as `busy`. Believing it — rather than
-                    // assuming a turn — keeps the composer honest when a
-                    // message was meant for the room, not the agent.
-                    Ok(p) => busy.set(p.busy),
-                    Err(e) => error.set(Some(format!("send failed: {e}"))),
+                    // The server decides whether this message wakes the agent
+                    // — or lands while it is already answering someone — and
+                    // reports that as `busy`. Believing it keeps the composer
+                    // honest when a message was meant for the room.
+                    Ok(p) => dispatch.dispatch(ConvAction::Sent { busy: p.busy }),
+                    Err(e) => dispatch.dispatch(ConvAction::Failed(format!("send failed: {e}"))),
                 }
             });
         })
@@ -1282,13 +1236,14 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
+    let st = &conv.0;
     html! {
         <div class="app">
             <div class="topbar">
                 <div class="column">
                     <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
                     <span class="dim">{ format!(" {} ", props.id) }</span>
-                    { if *busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                    { if st.busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
                     <button class="linkish" onclick={toggle_verbose}>
                         { if *verbose { "· concise" } else { "· verbose" } }
                     </button>
@@ -1297,9 +1252,9 @@ fn conversation(props: &ConversationProps) -> Html {
             </div>
             <div class="pane" ref={pane} onscroll={on_scroll}>
                 <div class="column">
-                { render_transcript(&entries, &streaming, *verbose,
+                { render_transcript(&st.entries, &st.streaming, *verbose,
                                     who.as_ref().map(|s| &s.identity)) }
-                { if let Some(e) = &*error { html! {
+                { if let Some(e) = &st.error { html! {
                     <div class="err"><hr class="rule" /><b>{ "ERROR" }</b><pre>{ e }</pre></div>
                 } } else { html!{} } }
                 </div>
@@ -1307,17 +1262,17 @@ fn conversation(props: &ConversationProps) -> Html {
             <div class="composer">
                 <div class="column">
                     <textarea ref={input} rows="3" onkeydown={on_keydown}
-                              placeholder={if *shared {
+                              placeholder={if st.shared {
                                   "message the room (@myco to ask the agent)"
                               } else {
                                   "message (Enter to send, Shift+Enter for a newline)"
                               }} />
                     <div class="actions">
                         <button class="send" onclick={on_send}>{ "send" }</button>
-                        { if *busy {
+                        { if st.busy {
                             html! { <button onclick={on_cancel}>{ "cancel" }</button> }
                         } else { html!{} } }
-                        { if *shared { html! {
+                        { if st.shared { html! {
                             <span class="dim hint">
                                 { "shared session · the agent replies when you say " }
                                 <span class="mention">{ "@myco" }</span>

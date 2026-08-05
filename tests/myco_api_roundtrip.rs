@@ -114,12 +114,23 @@ async fn a_turn_round_trips_through_the_trait() {
     assert!(matches!(p.entries[1].body, EntryBody::Agent { .. }));
     assert_eq!(p.entries[1].text(), "scripted answer");
 
-    // Queued input: two more messages posted back-to-back both run.
-    for text in ["second", "third"] {
+    // Later messages keep running turns through the same trait. (Posted one
+    // settled turn at a time: a message posted while a turn is in flight may
+    // legally fold into that turn instead of running its own — that
+    // pre-emption contract is pinned in `web_multiplayer`.)
+    for (text, replies) in [("second", 2), ("third", 3)] {
         server
             .post_message(&s.id, PostMessage { text: text.into() })
             .await
             .expect("post");
+        poll_until(server, &s.id, |p| {
+            p.entries
+                .iter()
+                .filter(|e| matches!(e.body, EntryBody::Agent { .. }))
+                .count()
+                == replies
+        })
+        .await;
     }
     let p = poll_until(server, &s.id, |p| {
         p.entries
@@ -263,6 +274,109 @@ async fn a_turn_streams_deltas_before_it_finishes() {
             .iter()
             .any(|e| e.text().contains("streamed **body**"))
     );
+}
+
+/// The wire's turn-boundary contract: exactly one `TurnFinished` per turn,
+/// sent only after the turn's entries are persisted — so a client that
+/// refetches on it reads a transcript that already holds the answer, instead
+/// of watching the answer vanish and reappear. Tool calls stream with their
+/// ids, and each call's result arrives as `ToolFinished` before the turn
+/// ends, so a live card completes in place.
+#[tokio::test]
+async fn the_wire_ends_a_turn_once_and_only_after_persistence() {
+    use futures::StreamExt;
+
+    let _home = myco_test_support::temp_home("api-turn-end");
+    let server = scripted_server(|| {
+        ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![myco_api::ToolUse {
+                    id: "call_wire".into(),
+                    name: "no_such_tool".into(),
+                    input: serde_json::json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "the persisted answer".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ])
+    });
+    let server = server.as_local();
+    let server: &dyn MycoApi = &server;
+
+    let s = server
+        .create_session(CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    let mut stream = server.events(&s.id).await.expect("events");
+    server
+        .post_message(&s.id, PostMessage { text: "go".into() })
+        .await
+        .expect("post");
+
+    let mut tool_started_at = None;
+    let mut tool_finished_at = None;
+    let mut seen = 0usize;
+    let collect = async {
+        while let Some(ev) = stream.next().await {
+            seen += 1;
+            match ev {
+                myco_api::StreamEvent::ToolStarted { id, .. } => {
+                    assert_eq!(id, "call_wire", "the running card's identity");
+                    tool_started_at = Some(seen);
+                }
+                myco_api::StreamEvent::ToolFinished { result } => {
+                    assert_eq!(result.id, "call_wire");
+                    tool_finished_at = Some(seen);
+                }
+                myco_api::StreamEvent::TurnFinished => break,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+        .await
+        .expect("the feed produced a complete turn");
+
+    // The call streamed with its id and completed, in order, mid-turn.
+    let (started, finished) = (
+        tool_started_at.expect("ToolStarted on the feed"),
+        tool_finished_at.expect("ToolFinished on the feed"),
+    );
+    assert!(started < finished);
+
+    // TurnFinished is the persistence signal: the transcript already holds
+    // the final answer the moment it arrives — no re-poll loop, one read.
+    let d = server.session_detail(&s.id).await.expect("detail");
+    assert!(
+        d.entries
+            .iter()
+            .any(|e| e.text().contains("the persisted answer")),
+        "TurnFinished arrived before the turn was persisted: {:?}",
+        d.entries
+    );
+
+    // And it is the only one: the feed stays quiet after it.
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next()).await;
+    match extra {
+        Err(_) => {}
+        Ok(Some(myco_api::StreamEvent::TurnFinished)) => {
+            panic!("a second TurnFinished reached the wire")
+        }
+        Ok(other) => panic!("unexpected trailing event: {other:?}"),
+    }
 }
 
 /// A session becomes durable when it has content. Opening one and walking
