@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream;
 use myco::generative_model::{
-    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
+    ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
     MessagePart, ToolUseDelta, ToolUseStart,
 };
+use myco_api::Content;
 
 /// Scripted model: each `generate` call yields the next pre-baked output.
 pub struct ScriptedModel {

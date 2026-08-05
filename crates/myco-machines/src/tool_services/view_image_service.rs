@@ -4,9 +4,10 @@ use myco_models as generative_model;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use myco_api::{Content, ToolResult};
 use myco_core::Async;
 use myco_core::image::{mib, read_image_data_url};
-use myco_models::{self, Content, ToolResult};
+use myco_models;
 
 use super::{HostDispatchContext, ToolService};
 
@@ -74,9 +75,9 @@ impl ToolService for ViewImageService {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: generative_model::ToolUse,
+        tool_use: myco_api::ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<generative_model::ToolResult> {
+    ) -> Async<myco_api::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(v) => v,
@@ -102,9 +103,9 @@ struct Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myco_api::ToolUse;
     use myco_config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use myco_core::CancelToken;
-    use myco_models::ToolUse;
     use myco_test_support::{result_text, temp_dir};
     use serde_json::json;
 

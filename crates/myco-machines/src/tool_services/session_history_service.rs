@@ -3,9 +3,10 @@
 use myco_models as generative_model;
 use std::sync::Arc;
 
+use myco_api::{Content, ToolResult, ToolUse};
 use myco_api::{Entry, EntryBody};
 use myco_core::Async;
-use myco_models::{self, Content, ToolResult, ToolUse};
+use myco_models;
 use myco_session::Session;
 
 use super::{HostDispatchContext, ToolService};
@@ -423,7 +424,7 @@ mod tests {
     /// with an honest marker, not emit ~1 MB into the caller's context.
     #[test]
     fn range_stops_at_total_output_cap() {
-        use myco_models::Content;
+        use myco_api::Content;
         let mut session = myco_session::Session::new("test-model");
         for i in 0..200 {
             session.entries.push(myco_api::Entry::user(

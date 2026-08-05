@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use myco_agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
+use myco_api::Content;
 use myco_api::{Author, Entry, EntryBody};
 use myco_auth::AuthStore;
 use myco_config::Config;
@@ -37,7 +38,7 @@ use myco_machines::tool_services::{
     ListRecentService, SessionHistoryTool, SessionMetaTool, ToolService,
 };
 use myco_models::{
-    BackendConfig, CatalogModel, Content, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
+    BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
 };
 use myco_session::{ActiveSession, Session, SessionWriteLock, expand_image_attachments};
 

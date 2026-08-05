@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use myco::server::Server;
+use myco_api::{Content, TurnEndReason};
 use myco_api::{CreateSession, EntryBody, MycoApi, PostMessage, UpdateSession};
-use myco_models::{Content, GenerateError, GenerateOutput, GenerativeModel, TurnEndReason};
+use myco_models::{GenerateError, GenerateOutput, GenerativeModel};
 use myco_test_support::ScriptedModel;
 
 const CONFIG_TOML: &str = r#"

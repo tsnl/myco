@@ -16,11 +16,11 @@ use std::io::Write;
 use super::markdown::{MarkdownRenderer, render_block};
 use myco_api::{Entry, EntryBody};
 
-use crate::generative_model::{Content, TokenUsage};
 use crate::tui::{
     SectionState, Style, TuiEvent, encode_ansi, encoded_ends_with_newline, section_open_events,
     styled_line, tool_invocation_events,
 };
+use myco_api::{Content, TokenUsage};
 
 /// Thin 72-col rule before ASSISTANT / ERROR / WARNING section headers (USER
 /// uses [`user_rule`]).
@@ -345,7 +345,7 @@ fn replay_paragraph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, ToolUse, TurnEndReason};
+    use myco_api::{Content, ToolUse, TurnEndReason};
     use myco_test_support::{assistant, thinking, thinking_msg, tool_loop, user};
     use serde_json::json;
 

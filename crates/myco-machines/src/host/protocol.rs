@@ -4,7 +4,7 @@
 //! - [`Request`]  — controller → worker
 //! - [`Response`] — worker → controller
 
-use myco_models::{ToolResult, ToolUse};
+use myco_api::{ToolResult, ToolUse};
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,7 +88,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myco_models::{Content, ToolResult, ToolUse};
+    use myco_api::{Content, ToolResult, ToolUse};
     use serde_json::json;
 
     #[test]

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use myco::core::CancelToken;
-use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
+use myco::generative_model::GenerateOutput;
 use myco::harness::{Harness, HarnessConfig};
 use myco::{Agent, NullEventSink};
 use myco_api::EntryBody;
+use myco_api::{Content, ToolUse, TurnEndReason};
 use serde_json::json;
 use test_utils::{ScriptedModel, tool_text};
 

@@ -2,8 +2,9 @@
 use std::sync::Arc;
 
 use myco::core::Async;
-use myco::generative_model::{ToolResult, ToolSpec, ToolUse};
+use myco::generative_model::ToolSpec;
 use myco::tool_services::{HostDispatchContext, ToolService};
+use myco_api::{ToolResult, ToolUse};
 
 /// Test tool: count occurrences of a letter in a word.
 #[derive(Default)]

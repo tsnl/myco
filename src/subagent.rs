@@ -12,9 +12,10 @@
 
 use std::sync::{Arc, Weak};
 
+use myco_api::{ToolResult, ToolUse};
 use myco_core::Async;
 use myco_machines::tool_services::{HostDispatchContext, ToolService, tool_input_schema};
-use myco_models::{self as generative_model, ToolResult, ToolUse};
+use myco_models::{self as generative_model};
 
 use crate::server::{Server, last_answer};
 

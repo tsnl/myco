@@ -6,8 +6,9 @@
 use myco_models as generative_model;
 use std::sync::Arc;
 
+use myco_api::ToolResult;
 use myco_core::Async;
-use myco_models::{self, ToolResult};
+use myco_models;
 use myco_session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
     format_session_list_line, list_sessions_filtered, normalize_pr_url, parse_pr_fields,
@@ -75,9 +76,9 @@ impl ToolService for SessionMetaTool {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: generative_model::ToolUse,
+        tool_use: myco_api::ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<generative_model::ToolResult> {
+    ) -> Async<myco_api::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input.clone()) {
                 Ok(v) => v,
@@ -391,7 +392,7 @@ mod tests {
         let result = tool
             .clone()
             .dispatch_tool_use(
-                generative_model::ToolUse {
+                myco_api::ToolUse {
                     id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({
@@ -407,7 +408,7 @@ mod tests {
 
         let got = tool
             .dispatch_tool_use(
-                generative_model::ToolUse {
+                myco_api::ToolUse {
                     id: "t2".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "get"}),
@@ -470,7 +471,7 @@ mod tests {
         let (tool, active) = tool_with_session(Session::new("claude-haiku-4-5"));
         let tool = Arc::new(tool);
         let ctx = || HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new());
-        let call = |input: serde_json::Value| generative_model::ToolUse {
+        let call = |input: serde_json::Value| myco_api::ToolUse {
             id: "t".into(),
             name: "session_meta".into(),
             input,
@@ -548,7 +549,7 @@ mod tests {
         let tool = Arc::new(tool);
         let got = tool
             .dispatch_tool_use(
-                generative_model::ToolUse {
+                myco_api::ToolUse {
                     id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "executable_path"}),
@@ -571,7 +572,7 @@ mod tests {
         let (tool, _) = tool_with_session(Session::new("claude-haiku-4-5"));
         let got = Arc::new(tool)
             .dispatch_tool_use(
-                generative_model::ToolUse {
+                myco_api::ToolUse {
                     id: "t1".into(),
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "pid"}),

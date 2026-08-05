@@ -7,9 +7,15 @@ use myco_core::*;
 mod anthropic;
 #[cfg(test)]
 pub(crate) mod test_support;
-/// The conversation vocabulary lives in `myco-api` — the session store and
-/// the wire own it, and this layer only projects it onto providers. Re-exported
-/// so `myco_models::Content` and friends keep resolving.
+
+// The conversation vocabulary lives in `myco-api`: the session store owns it
+// and the wire carries it, and this layer only projects it onto providers.
+// Imported, deliberately not re-exported — a caller holding a `Content` is
+// holding a wire type, and its `use` line should say so. Hiding that behind
+// `myco_api::Content` made the projection seam invisible and let provider
+// concerns drift into a type the browser deserializes.
+use myco_api::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason};
+
 /// Project session entries onto provider messages.
 ///
 /// One entry becomes one message, so nothing is lost in either direction.
@@ -60,10 +66,6 @@ pub fn entries_to_messages(entries: &[myco_api::Entry]) -> Vec<Message> {
         })
         .collect()
 }
-
-pub use myco_api::{
-    Content, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content, content_text,
-};
 
 pub use anthropic::AnthropicBackendConfig;
 
@@ -753,7 +755,7 @@ mod tests {
             Content::Text { text } => assert_eq!(text, "answer"),
             other => panic!("expected text, got {other:?}"),
         }
-        assert_eq!(answer_content(&output.content).len(), 1);
+        assert_eq!(myco_api::answer_content(&output.content).len(), 1);
     }
 
     #[test]
