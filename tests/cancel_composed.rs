@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 
 use myco::CancelToken;
 use myco::agent::{Agent, AgentInteractionError, NullEventSink};
-use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
+use myco::generative_model::GenerateOutput;
 use myco::harness::Harness;
 use myco_api::EntryBody;
+use myco_api::{Content, ToolUse, TurnEndReason};
 use test_utils::ScriptedModel;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

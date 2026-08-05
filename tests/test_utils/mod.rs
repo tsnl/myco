@@ -14,12 +14,12 @@ pub use stub_http_server::StubHttpServer;
 pub use transcript::format_transcript;
 
 /// The joined text blocks of a tool result.
-pub fn tool_text(result: &myco::generative_model::ToolResult) -> String {
+pub fn tool_text(result: &myco_api::ToolResult) -> String {
     result
         .content
         .iter()
         .filter_map(|c| match c {
-            myco::generative_model::Content::Text { text } => Some(text.as_str()),
+            myco_api::Content::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

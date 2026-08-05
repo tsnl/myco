@@ -35,8 +35,8 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::TokenUsage;
 use crate::session::ConsoleLog;
+use myco_api::TokenUsage;
 
 // ---------------------------------------------------------------------------
 // Events
@@ -761,7 +761,7 @@ fn end_text_stream(st: &mut ProducerState, events: &mut Vec<TuiEvent>, colors: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::ToolUse;
+    use myco_api::ToolUse;
 
     /// Capturing sink for assertions on the raw stream.
     #[derive(Default)]

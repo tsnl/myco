@@ -131,15 +131,15 @@ impl ToolService for BashService {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: generative_model::ToolUse,
+        tool_use: myco_api::ToolUse,
         ctx: HostDispatchContext,
-    ) -> Async<generative_model::ToolResult> {
+    ) -> Async<myco_api::ToolResult> {
         Box::pin(async move {
             // Anything but a JSON object (missing input, a bare string, a list)
             // is malformed: report it as such rather than letting serde's
             // "invalid type" message stand in for the real problem.
             if !tool_use.input.is_object() {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "bash input must be a JSON object, got {}. {EMPTY_INPUT_ERROR}",
                     json_type_name(&tool_use.input),
                 ));
@@ -147,14 +147,14 @@ impl ToolService for BashService {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(input) => input,
                 Err(e) => {
-                    return generative_model::ToolResult::err(format!(
+                    return myco_api::ToolResult::err(format!(
                         "Error deserializing bash input: {e}"
                     ));
                 }
             };
             let action = match resolve_action(&input) {
                 Ok(a) => a,
-                Err(e) => return generative_model::ToolResult::err(e),
+                Err(e) => return myco_api::ToolResult::err(e),
             };
             // Owner is the agent that issued this tool call (root or subagent).
             self.execute(action, ctx.agent_id, ctx.cancel).await
@@ -228,7 +228,7 @@ impl BashService {
         action: Action,
         owner: Uuid,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         match action {
             Action::Exec {
                 command,
@@ -328,7 +328,7 @@ impl BashService {
         timeout_ms: u64,
         max_bytes: usize,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         let mut cmd = BASH.tokio_command();
         cmd.args(["-c", command])
             // Never inherit stdin: in `--mode host` it is the NDJSON protocol
@@ -346,7 +346,7 @@ impl BashService {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(error) => {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "Error spawning command{}: {error}",
                     cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
                 ));
@@ -386,7 +386,7 @@ impl BashService {
                 drain_capture(stdout_task, stderr_task).await;
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
-                generative_model::ToolResult::err(format!(
+                myco_api::ToolResult::err(format!(
                     "exec cancelled\n\
                      stdout:\n{out}\n\
                      stderr:\n{err}"
@@ -399,7 +399,7 @@ impl BashService {
                 drain_capture(stdout_task, stderr_task).await;
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
-                generative_model::ToolResult::text(format!(
+                myco_api::ToolResult::text(format!(
                     "Exit code: None\n\
                      Termination signal: None\n\
                      status: timed_out\n\
@@ -414,7 +414,7 @@ impl BashService {
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
                 match status {
-                    Ok(status) => generative_model::ToolResult::text(format!(
+                    Ok(status) => myco_api::ToolResult::text(format!(
                         "Exit code: {:?}\n\
                          Termination signal: {:?}\n\
                          stdout:\n{out}\n\
@@ -422,9 +422,9 @@ impl BashService {
                         status.code(),
                         status.signal(),
                     )),
-                    Err(error) => generative_model::ToolResult::err(format!(
-                        "Error executing command: {error}"
-                    )),
+                    Err(error) => {
+                        myco_api::ToolResult::err(format!("Error executing command: {error}"))
+                    }
                 }
             }
         }
@@ -442,21 +442,21 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         if session_id.is_empty() {
-            return generative_model::ToolResult::err("session_id must be non-empty");
+            return myco_api::ToolResult::err("session_id must be non-empty");
         }
 
         // Reject duplicates and enforce session cap before spawning.
         {
             let sessions = self.sessions();
             if sessions.contains_key(session_id) {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
             }
@@ -478,7 +478,7 @@ impl BashService {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "failed to spawn session command {cmdline:?}{}: {e}",
                     cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
                 ));
@@ -491,21 +491,21 @@ impl BashService {
             Some(s) => s,
             None => {
                 let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stdin missing after spawn");
+                return myco_api::ToolResult::err("child stdin missing after spawn");
             }
         };
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
                 let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stdout missing after spawn");
+                return myco_api::ToolResult::err("child stdout missing after spawn");
             }
         };
         let stderr = match child.stderr.take() {
             Some(s) => s,
             None => {
                 let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stderr missing after spawn");
+                return myco_api::ToolResult::err("child stderr missing after spawn");
             }
         };
 
@@ -538,13 +538,13 @@ impl BashService {
             // is never stored anywhere the agent can reach.
             if sessions.contains_key(session_id) {
                 kill_process_group(pid);
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
                 kill_process_group(pid);
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
             }
@@ -555,7 +555,7 @@ impl BashService {
         if let Some(data) = stdin
             && let Err(e) = self.write_to_session(session_id, data).await
         {
-            return generative_model::ToolResult::err(format!(
+            return myco_api::ToolResult::err(format!(
                 "session {session_id:?} started but initial stdin write failed: {e}"
             ));
         }
@@ -564,8 +564,8 @@ impl BashService {
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await;
         match snapshot {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
-            Err(e) => generative_model::ToolResult::err(e),
+            Ok(s) => myco_api::ToolResult::text(s.format()),
+            Err(e) => myco_api::ToolResult::err(e),
         }
     }
 
@@ -579,19 +579,19 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return generative_model::ToolResult::err(e);
+            return myco_api::ToolResult::err(e);
         }
         if let Err(e) = self.write_to_session(session_id, stdin).await {
-            return generative_model::ToolResult::err(e);
+            return myco_api::ToolResult::err(e);
         }
         match self
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await
         {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
-            Err(e) => generative_model::ToolResult::err(e),
+            Ok(s) => myco_api::ToolResult::text(s.format()),
+            Err(e) => myco_api::ToolResult::err(e),
         }
     }
 
@@ -603,16 +603,16 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return generative_model::ToolResult::err(e);
+            return myco_api::ToolResult::err(e);
         }
         match self
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await
         {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
-            Err(e) => generative_model::ToolResult::err(e),
+            Ok(s) => myco_api::ToolResult::text(s.format()),
+            Err(e) => myco_api::ToolResult::err(e),
         }
     }
 
@@ -629,16 +629,14 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: myco_core::CancelToken,
-    ) -> generative_model::ToolResult {
+    ) -> myco_api::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return generative_model::ToolResult::err(e);
+            return myco_api::ToolResult::err(e);
         }
         let pid = {
             let sessions = self.sessions();
             let Some(session) = sessions.get(session_id) else {
-                return generative_model::ToolResult::err(format!(
-                    "unknown session {session_id:?}"
-                ));
+                return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
             };
             if session
                 .shared
@@ -647,7 +645,7 @@ impl BashService {
                 .map(|b| b.exited)
                 .unwrap_or(false)
             {
-                return generative_model::ToolResult::err(format!(
+                return myco_api::ToolResult::err(format!(
                     "session {session_id:?} has already exited; nothing to signal"
                 ));
             }
@@ -658,7 +656,7 @@ impl BashService {
         };
 
         if let Err(e) = signal_process_group(pid, signal.as_libc()) {
-            return generative_model::ToolResult::err(format!(
+            return myco_api::ToolResult::err(format!(
                 "could not send {} to session {session_id:?}: {e}",
                 signal.name()
             ));
@@ -674,26 +672,24 @@ impl BashService {
                     "\n(sent {} to the session process group)\n",
                     signal.name()
                 ));
-                generative_model::ToolResult::text(text)
+                myco_api::ToolResult::text(text)
             }
-            Err(e) => generative_model::ToolResult::err(e),
+            Err(e) => myco_api::ToolResult::err(e),
         }
     }
 
-    async fn session_close(&self, session_id: &str, owner: Uuid) -> generative_model::ToolResult {
+    async fn session_close(&self, session_id: &str, owner: Uuid) -> myco_api::ToolResult {
         let session = {
             let mut sessions = self.sessions();
             match sessions.get(session_id) {
                 Some(s) if s.owner != owner => {
-                    return generative_model::ToolResult::err(format!(
+                    return myco_api::ToolResult::err(format!(
                         "session {session_id:?} is owned by another agent"
                     ));
                 }
                 Some(_) => {}
                 None => {
-                    return generative_model::ToolResult::err(format!(
-                        "unknown session {session_id:?}"
-                    ));
+                    return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
                 }
             }
             sessions
@@ -721,14 +717,14 @@ impl BashService {
 
         let mut text = snapshot.format();
         text.push_str("\n(session closed)\n");
-        generative_model::ToolResult::text(text)
+        myco_api::ToolResult::text(text)
     }
 
-    fn session_list(&self, owner: Uuid) -> generative_model::ToolResult {
+    fn session_list(&self, owner: Uuid) -> myco_api::ToolResult {
         let sessions = self.sessions();
         let mine: Vec<_> = sessions.iter().filter(|(_, s)| s.owner == owner).collect();
         if mine.is_empty() {
-            return generative_model::ToolResult::text("(no live sessions)\n");
+            return myco_api::ToolResult::text("(no live sessions)\n");
         }
         let mut lines = Vec::new();
         lines.push(format!("sessions: {}", mine.len()));
@@ -759,7 +755,7 @@ impl BashService {
             ));
         }
         lines.push(String::new());
-        generative_model::ToolResult::text(lines.join("\n"))
+        myco_api::ToolResult::text(lines.join("\n"))
     }
 
     fn ensure_owner(&self, session_id: &str, owner: Uuid) -> Result<(), String> {

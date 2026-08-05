@@ -11,8 +11,8 @@ mod test_utils;
 use std::time::Duration;
 
 use myco::core::CancelToken;
-use myco::generative_model::ToolUse;
 use myco::harness::HostController;
+use myco_api::ToolUse;
 use serde_json::json;
 use test_utils::tool_text;
 

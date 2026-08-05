@@ -21,8 +21,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::host::HostWorker;
 use crate::host::protocol::{Request, Response};
 use crate::tool_services::HostDispatchContext;
+use myco_api::{ToolResult, ToolUse};
 use myco_core::CancelToken;
-use myco_models::{ToolResult, ToolSpec, ToolUse};
+use myco_models::ToolSpec;
 
 pub use myco_config::harness::HostConfig;
 
@@ -612,7 +613,7 @@ mod tests {
     /// Hosts under test serve the standard catalog at the resolved default;
     /// these tests are about routing and connection state, not the cap.
     const TEST_IMAGE_CAP: u64 = myco_config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
-    use myco_models::ToolUse;
+    use myco_api::ToolUse;
     use myco_test_support::text_parts;
     use serde_json::json;
     use std::time::{Duration, Instant};

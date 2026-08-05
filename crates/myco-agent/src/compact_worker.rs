@@ -9,9 +9,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use myco_api::Content;
 use myco_core::{CancelToken, uuid_simple_hex};
 use myco_machines::harness::Harness;
-use myco_models::{self as generative_model, CatalogModel, Content};
+use myco_models::{self as generative_model, CatalogModel};
 use myco_prompts as prompts;
 use myco_session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
 

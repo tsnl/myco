@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use myco::server::Server;
 use myco_api::{Author, EntryBody};
+use myco_api::{Content, TurnEndReason};
 use myco_auth::AuthStore;
-use myco_models::{Content, GenerateOutput, GenerativeModel, TurnEndReason};
+use myco_models::{GenerateOutput, GenerativeModel};
 use myco_test_support::ScriptedModel;
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::asynchronous::Client;

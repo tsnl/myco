@@ -155,9 +155,9 @@ pub trait ToolService: Send + Sync + 'static {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: generative_model::ToolUse,
+        tool_use: myco_api::ToolUse,
         ctx: HostDispatchContext,
-    ) -> Async<generative_model::ToolResult>;
+    ) -> Async<myco_api::ToolResult>;
 
     /// Called when an agent session ends so services can drop agent-scoped state
     /// (e.g. bash sessions owned by that agent). Default: no-op.

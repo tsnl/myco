@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use myco::generative_model::{Content, GenerateOutput, GenerativeModel, Message, TurnEndReason};
+use myco::generative_model::{GenerateOutput, GenerativeModel, Message};
+use myco_api::{Content, TurnEndReason};
 
 mod anthropic;
 mod openai_completions;

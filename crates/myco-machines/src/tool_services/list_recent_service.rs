@@ -8,8 +8,9 @@
 use myco_models as generative_model;
 use std::sync::Arc;
 
+use myco_api::{ToolResult, ToolUse};
 use myco_core::Async;
-use myco_models::{self, ToolResult, ToolUse};
+use myco_models;
 use myco_session::{SessionListEntry, format_session_list_line, list_sessions_filtered};
 
 use super::{HostDispatchContext, ToolService};
@@ -136,8 +137,8 @@ struct Input {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use myco_api::Content;
     use myco_core::CancelToken;
-    use myco_models::Content;
     use myco_session::{LinkCounts, Session, SessionKind};
     use myco_test_support::{result_text, temp_home};
     use serde_json::json;

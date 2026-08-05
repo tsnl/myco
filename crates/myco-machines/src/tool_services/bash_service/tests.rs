@@ -1,11 +1,10 @@
 use super::*;
 use crate::host::HostWorker;
-use myco_models as generative_model;
 use myco_test_support::{result_text, temp_dir};
 use serde_json::json;
 
-fn tool_use_json(value: serde_json::Value) -> generative_model::ToolUse {
-    generative_model::ToolUse {
+fn tool_use_json(value: serde_json::Value) -> myco_api::ToolUse {
+    myco_api::ToolUse {
         id: "test".into(),
         name: "bash".into(),
         input: value,
@@ -23,10 +22,7 @@ fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
     HostDispatchContext::new(agent_id, myco_core::CancelToken::new())
 }
 
-async fn dispatch_json(
-    harness: Arc<HostWorker>,
-    value: serde_json::Value,
-) -> generative_model::ToolResult {
+async fn dispatch_json(harness: Arc<HostWorker>, value: serde_json::Value) -> myco_api::ToolResult {
     harness
         .dispatch_tool_use(tool_use_json(value), dispatch_ctx(uuid::Uuid::nil()))
         .await
@@ -38,7 +34,7 @@ async fn dispatch_json_as(
     service: &Arc<BashService>,
     owner: uuid::Uuid,
     value: serde_json::Value,
-) -> generative_model::ToolResult {
+) -> myco_api::ToolResult {
     service
         .clone()
         .dispatch_tool_use(tool_use_json(value), dispatch_ctx(owner))
@@ -90,7 +86,7 @@ async fn write_ok(harness: &Arc<HostWorker>, id: &str, stdin: &str) -> String {
 }
 
 /// `close` a session, returning the raw result (cleanup callers ignore it).
-async fn close(harness: &Arc<HostWorker>, id: &str) -> generative_model::ToolResult {
+async fn close(harness: &Arc<HostWorker>, id: &str) -> myco_api::ToolResult {
     dispatch_json(
         harness.clone(),
         json!({"action": "close", "session_id": id}),

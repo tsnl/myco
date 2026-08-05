@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use myco::generative_model::{self, Content, GenerativeModelConfig};
+use myco::generative_model::{self, GenerativeModelConfig};
 use myco::harness::Harness;
 use myco::tool_services::ToolService;
 use myco::*;
+use myco_api::Content;
 
 mod generative_model_tests;
 mod test_tools;

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Human-readable rendering of an agent conversation history (transcript).
 
-use myco::generative_model::{Content, ToolResult, ToolUse};
+use myco_api::{Content, ToolResult, ToolUse};
 use myco_api::{Entry, EntryBody};
 
 /// Render the full agent history as a stable, inspectable transcript.
