@@ -4,10 +4,14 @@
 //! verifies that the external programs myco spawns (declared in
 //! [`myco_core::external_command`]) actually resolve on the agent machine. Results
 //! fold into one WARNING block with the ssh-agent preflight
-//! ([`SshAgentPreflightReport`]) and the soul size check
-//! ([`myco_prompts::soul_truncation`]) — one section after the banner,
+//! ([`SshAgentPreflightReport`]) and the prelude read check
+//! ([`myco_prompts::prelude::read_failure`]) — one section after the banner,
 //! silent when everything resolves. Remote hosts are not probed here; they
 //! report missing programs as tool errors at call time.
+//!
+//! Checks that *stop* startup are a separate pass, [`fatal_startup_check`],
+//! which the caller runs first and exits on. Keeping the two apart is what
+//! lets this type mean exactly one thing: problems a session can run through.
 //!
 //! Reporting stops at plain text ([`StartupPreflight::warning_body`]); the
 //! caller owns the WARNING block around it, because the interactive REPL and
@@ -18,7 +22,7 @@ use std::io::Write;
 use super::HostConfig;
 use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
 use myco_core::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
-use myco_prompts::{SoulTruncation, soul_truncation};
+use myco_prompts::{prelude, prelude_oversize};
 
 /// Outcome of [`check_expected_executables`].
 #[derive(Debug, Default, Clone)]
@@ -78,14 +82,17 @@ fn missing_executables(
 }
 
 /// Everything startup does before the first prompt: export the manual, check
-/// the soul size cap and the expected executables, then ssh-agent identities.
+/// the prelude directory and the expected executables, then ssh-agent
+/// identities.
 #[derive(Debug, Default, Clone)]
 pub struct StartupPreflight {
     /// Why the manual export failed, when it did. Agents are told in their
     /// system prompt to read those files, so a failure has to be visible.
     pub manual: Option<String>,
-    /// Set when the newest soul version does not fit under `max_soul_bytes`.
-    pub soul: Option<SoulTruncation>,
+    /// Set when the prelude directory exists but could not be read, so this
+    /// session's agents run with an empty prelude (see
+    /// [`myco_prompts::prelude::read_failure`]).
+    pub prelude_unreadable: Option<String>,
     pub executables: ExecutableCheckReport,
     pub ssh: SshAgentPreflightReport,
 }
@@ -95,9 +102,8 @@ impl StartupPreflight {
     /// at its directory). Then the executable check; the ssh-agent preflight
     /// runs only when the OpenSSH tools it spawns actually resolve —
     /// otherwise every step would fail with spawn errors the
-    /// missing-executable lines already explain. `max_soul_bytes` is the
-    /// resolved config cap the prompts will use.
-    pub fn run(hosts: &[HostConfig], max_soul_bytes: usize) -> Self {
+    /// missing-executable lines already explain.
+    pub fn run(hosts: &[HostConfig]) -> Self {
         let executables = check_expected_executables(hosts);
         let ssh = if executables.ssh_tools_missing() {
             SshAgentPreflightReport::default()
@@ -106,7 +112,10 @@ impl StartupPreflight {
         };
         Self {
             manual: export_manual().err(),
-            soul: soul_truncation(max_soul_bytes),
+            prelude_unreadable: prelude::dir()
+                .ok()
+                .as_deref()
+                .and_then(prelude::read_failure),
             executables,
             ssh,
         }
@@ -114,27 +123,56 @@ impl StartupPreflight {
 
     pub fn has_problems(&self) -> bool {
         self.manual.is_some()
-            || self.soul.is_some()
+            || self.prelude_unreadable.is_some()
             || !self.executables.is_clean()
             || self.ssh.has_problems()
     }
 
-    /// Every preflight problem as plain body lines — manual, soul, executables,
-    /// ssh-agent, in that order, with no rule or header. Empty when
-    /// [`Self::has_problems`] is false.
+    /// Every survivable preflight problem as plain body lines — manual,
+    /// prelude, executables, ssh-agent, in that order, with no rule or header.
+    /// Empty when [`Self::has_problems`] is false. Fatal findings are not
+    /// here; they go through [`fatal_startup_check`] and end the process.
     ///
     /// Order is by how invisible the problem is otherwise: a missing manual
-    /// export or a cut soul never announces itself again (the agent simply
-    /// runs without those bytes), while missing executables and ssh keys
-    /// resurface at the tool call that needs them.
+    /// export or an unreadable prelude never announces itself again (the agent
+    /// simply runs without those bytes), while missing executables and ssh
+    /// keys resurface at the tool call that needs them.
     pub fn warning_body(&self) -> String {
         let mut out = Vec::new();
         let _ = write_manual_body(self.manual.as_deref(), &mut out);
-        let _ = write_soul_body(self.soul.as_ref(), &mut out);
+        let _ = write_prelude_unreadable_body(self.prelude_unreadable.as_deref(), &mut out);
         let _ = self.executables.write_body(&mut out);
         let _ = self.ssh.write_body(&mut out);
         String::from_utf8(out).unwrap_or_default()
     }
+}
+
+/// The checks that stop startup, as a message to print before exiting, or
+/// `None` when myco may run.
+///
+/// Separate from [`StartupPreflight`] because the two have different
+/// consequences and different audiences: a warning is read by whoever is
+/// around, while this is the last thing the process says. It therefore has to
+/// carry the whole repair — there is no agent to delegate to and no session in
+/// which to ask.
+///
+/// Today the only such check is an oversized prelude: nothing shortens the
+/// prelude to fit, so a prompt could not carry it honestly.
+pub fn fatal_startup_check(max_prelude_bytes: usize) -> Option<String> {
+    let over = prelude_oversize(max_prelude_bytes)?;
+    let dir = prelude::dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "~/.myco/v2/workspace/prelude".into());
+    Some(format!(
+        "{}\n\
+         refusing to start: agents would run on a prelude too big to carry, and trimming it \
+         would hide the missing part from them.\n\
+         fix by hand in {dir} — merge overlapping entries or delete dead ones (each is a \
+         plain `*.md` file; `ls -S` lists the biggest first) — or raise max_prelude_bytes in \
+         config.toml above {} bytes.",
+        over.describe(),
+        over.bytes,
+    ))
 }
 
 /// Copy the manual articles to `<myco home>/manual/<version>/<commit>/` for
@@ -155,18 +193,20 @@ fn write_manual_body(failure: Option<&str>, out: &mut impl Write) -> std::io::Re
     )
 }
 
-/// Soul lines only (no rule/header); writes nothing when the soul fits.
-fn write_soul_body(cut: Option<&SoulTruncation>, out: &mut impl Write) -> std::io::Result<()> {
-    let Some(cut) = cut else { return Ok(()) };
-    writeln!(out, "soul/{}: {}", cut.version, cut.describe())?;
+/// Unreadable-prelude lines only (no rule/header); writes nothing when the
+/// directory reads, or is simply absent.
+fn write_prelude_unreadable_body(
+    failure: Option<&str>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    writeln!(out, "prelude directory unreadable: {failure}")?;
     writeln!(
         out,
-        "every agent prompt from now on carries only the first {} of that version",
-        cut.human_limit()
-    )?;
-    writeln!(
-        out,
-        "hint: write a shorter soul revision, or raise `max_soul_bytes` in config.toml"
+        "every agent this session runs with an empty prelude; `prelude` action=list \
+         will look empty too, so do not curate against it until this is fixed"
     )
 }
 
@@ -179,15 +219,13 @@ mod tests {
     use super::*;
 
     fn preflight(
-        soul: Option<SoulTruncation>,
         missing: Vec<&'static ExternalCommand>,
         ssh: SshAgentPreflightReport,
     ) -> StartupPreflight {
         StartupPreflight {
-            manual: None,
-            soul,
             executables: ExecutableCheckReport { missing },
             ssh,
+            ..Default::default()
         }
     }
 
@@ -218,7 +256,6 @@ mod tests {
     #[test]
     fn silent_when_everything_resolves() {
         let pf = preflight(
-            None,
             missing_executables(true, |_| true),
             SshAgentPreflightReport::default(),
         );
@@ -229,7 +266,6 @@ mod tests {
     #[test]
     fn a_missing_executable_reports_the_purpose_and_an_install_hint() {
         let pf = preflight(
-            None,
             missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport::default(),
         );
@@ -249,7 +285,6 @@ mod tests {
     #[test]
     fn executables_are_reported_before_ssh_agent() {
         let pf = preflight(
-            None,
             missing_executables(true, |e| e.name != "ssh"),
             SshAgentPreflightReport {
                 had_ssh_hosts: true,
@@ -269,7 +304,6 @@ mod tests {
         // A clean-but-noted ssh report (e.g. "no SSH-backed hosts") must not
         // leak into a WARNING block opened for missing executables.
         let pf = preflight(
-            None,
             missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
@@ -281,53 +315,51 @@ mod tests {
         assert!(!out.contains("note:"), "{out}");
     }
 
-    // The exact truncation strings ("soul truncated at 64 KiB of 128.9 KiB")
-    // are `soul_truncation`'s claim, pinned in `myco_prompts` tests; here
-    // only the block's shape and ordering are at stake.
+    /// The fatal pass is a different channel from the warning block: an
+    /// oversized prelude stops startup and never shows up as a survivable
+    /// warning. The message has to carry the whole repair, since the process
+    /// exits before any session or agent exists.
     #[test]
-    fn truncated_soul_warns_first_and_names_the_version() {
-        let pf = preflight(
-            Some(SoulTruncation {
-                version: "20260722T0215-3f2a.md".into(),
-                bytes: 132_000,
-                limit: 64 * 1024,
-            }),
-            missing_executables(false, |e| e.name != "bash"),
-            SshAgentPreflightReport::default(),
-        );
-        assert!(pf.has_problems());
-        let out = rendered(&pf);
-        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
+    fn an_oversized_prelude_is_fatal_and_self_contained() {
+        let home = myco_test_support::temp_home("preflight-fatal");
+        let dir = home.path().join("v2").join("workspace").join("prelude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20260101T0000-aaaa.md"), "x".repeat(4096)).unwrap();
+
+        let fatal = fatal_startup_check(2048).expect("an oversized prelude must be fatal");
         assert!(
-            out.contains("every agent prompt from now on carries only the first"),
-            "{out}"
+            fatal.contains("over the 2 KiB max_prelude_bytes cap"),
+            "{fatal}"
         );
-        assert!(
-            out.contains("raise `max_soul_bytes` in config.toml"),
-            "{out}"
-        );
-        // The soul leads the block; the other checks follow it.
-        let soul_at = out.find("soul/20260722T0215").unwrap();
-        let exec_at = out.find("missing executable bash").unwrap();
-        assert!(soul_at < exec_at, "{out}");
+        assert!(fatal.contains("refusing to start"), "{fatal}");
+        // Both repairs, and enough detail to act on without an agent's help.
+        assert!(fatal.contains("raise max_prelude_bytes"), "{fatal}");
+        assert!(fatal.contains(&dir.display().to_string()), "{fatal}");
+
+        // Room to spare: nothing fatal, and the warning report never mentions
+        // the prelude size either way.
+        assert_eq!(fatal_startup_check(64 * 1024), None);
     }
 
+    /// An unreadable prelude directory is invisible from inside the prompt —
+    /// the agent just runs without it — so startup has to say so, and has to
+    /// warn the agent off curating against a `list` that looks empty.
     #[test]
-    fn a_truncated_soul_alone_is_enough_to_report() {
-        // Nothing else wrong: the soul alone still opens a WARNING block.
-        let pf = preflight(
-            Some(SoulTruncation {
-                version: "20260722T0215-3f2a.md".into(),
-                bytes: 4096,
-                limit: 2048,
-            }),
-            missing_executables(true, |_| true),
-            SshAgentPreflightReport::default(),
-        );
+    fn unreadable_prelude_directory_is_reported() {
+        let pf = StartupPreflight {
+            prelude_unreadable: Some("/home/u/.myco/workspace/prelude: permission denied".into()),
+            ..Default::default()
+        };
         assert!(pf.has_problems());
         let out = rendered(&pf);
-        assert!(out.contains("soul/20260722T0215-3f2a.md:"), "{out}");
-        assert!(!out.contains("missing executable"), "{out}");
+        assert!(
+            out.contains(
+                "prelude directory unreadable: /home/u/.myco/workspace/prelude: permission denied"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("runs with an empty prelude"), "{out}");
+        assert!(out.contains("do not curate against it"), "{out}");
     }
 
     /// The prompt tells agents to read the exported files, so a failed export
@@ -336,11 +368,10 @@ mod tests {
     fn failed_manual_export_warns_first_and_names_the_path() {
         let pf = StartupPreflight {
             manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
-            soul: None,
             executables: ExecutableCheckReport {
                 missing: missing_executables(false, |e| e.name != "bash"),
             },
-            ssh: SshAgentPreflightReport::default(),
+            ..Default::default()
         };
         assert!(pf.has_problems());
         let out = rendered(&pf);

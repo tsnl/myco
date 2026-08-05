@@ -64,7 +64,7 @@ fn test_server() -> Arc<Server> {
     let auth = Arc::new(AuthStore::in_memory().with_work_factor(1));
     let server = Server::with_model_factory_and_auth(
         config,
-        Box::new(|_, _, _, _, _| {
+        Box::new(|_, _, _, _| {
             Ok(ScriptedModel::new(vec![GenerateOutput {
                 content: vec![Content::Text { text: "ok".into() }],
                 tool_uses: vec![],

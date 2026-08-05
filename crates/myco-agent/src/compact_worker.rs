@@ -70,12 +70,12 @@ pub enum CompactWorkerError {
 /// System prompt for the compaction worker; the default server model factory
 /// builds the worker model with it. Kept beside the worker so the prompt and
 /// the lifecycle stay in one file.
-pub fn compactor_system_prompt(catalog_model: &CatalogModel, max_soul_bytes: usize) -> String {
+pub fn compactor_system_prompt(catalog_model: &CatalogModel) -> String {
     [
         "You are a myco compaction worker. Follow the user instruction exactly. \
          Prefer session_history over bash for reading sessions."
             .to_string(),
-        prompts::agent_prompt_epilogue(max_soul_bytes),
+        prompts::agent_prompt_epilogue(),
         prompts::model_stamp(&catalog_model.spec.key),
     ]
     .join("\n\n")

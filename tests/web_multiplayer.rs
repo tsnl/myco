@@ -67,7 +67,7 @@ fn test_server_with(factory: myco::server::ModelFactory) -> Arc<Server> {
 }
 
 fn test_server() -> Arc<Server> {
-    test_server_with(Box::new(|_, _, _, _, _| {
+    test_server_with(Box::new(|_, _, _, _| {
         // Every reply is distinguishable from a user message, which is all
         // these tests need to count turns.
         let reply = || GenerateOutput {
@@ -450,7 +450,7 @@ fn gated_two_round_factory(
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,
 ) -> myco::server::ModelFactory {
-    Box::new(move |_, _, _, _, _| {
+    Box::new(move |_, _, _, _| {
         let round = |id: &str| GenerateOutput {
             content: vec![],
             tool_uses: vec![myco_api::ToolUse {

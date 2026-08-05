@@ -32,7 +32,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
   followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
   is reserved). Host name == alias == SSH destination.
 - **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
-  `attach_timeout_secs`, `max_soul_bytes`.
+  `attach_timeout_secs`, `max_prelude_bytes`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
 - **Connection sharing:** every myco process (the supervisor and each nested agent)

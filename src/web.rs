@@ -20,7 +20,7 @@ use rocket::{Request, State, delete, get, patch, post, routes};
 use futures::StreamExt;
 use myco_api::{ApiError, ErrorKind, MycoApi};
 use myco_config::Config;
-use myco_machines::harness::StartupPreflight;
+use myco_machines::harness::{StartupPreflight, fatal_startup_check};
 
 use crate::server::{Server, UserApi};
 use myco_api as api;
@@ -28,7 +28,13 @@ use myco_api as api;
 /// Resolve config, run preflight (warnings to stderr), and launch Rocket on
 /// `127.0.0.1:<port>` serving `/api`.
 pub async fn serve(config: Config, port: u16) -> Result<(), String> {
-    let preflight = StartupPreflight::run(&config.harness.remote_hosts, config.max_soul_bytes);
+    // Fatal checks first: they end the process, so run them before anything
+    // that would leave a half-built session behind.
+    if let Some(fatal) = fatal_startup_check(config.max_prelude_bytes) {
+        eprintln!("myco: {fatal}");
+        std::process::exit(1);
+    }
+    let preflight = StartupPreflight::run(&config.harness.remote_hosts);
     if preflight.has_problems() {
         eprintln!("{}", preflight.warning_body());
     }
