@@ -17,6 +17,7 @@ use myco_models::{Protocol, ThinkingMode};
 /// here — myco ships no built-in models. Catalog *resolution* (auth, overlay,
 /// validation) lives in [`crate::Config`].
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Default model **key** for the interactive CLI (`--model` overrides).
     /// Optional when exactly one `[models]` entry exists.
@@ -233,8 +234,15 @@ pub fn parse_file_config_str(text: &str) -> Result<FileConfig, String> {
 /// Load the on-disk knobs/model config from `path`. Missing file →
 /// [`FileConfig::default`]. Path defaulting (`--config` → `$MYCO_CONFIG` →
 /// `~/.myco/config.toml`) lives in [`crate::Config`].
-pub fn load_file_config(path: &Path) -> Result<FileConfig, String> {
+/// Load the config file. `required` says the user *named* this path
+/// (`--config`, `$MYCO_CONFIG`): a missing named file is an error — silently
+/// running on defaults would hide the typo — while the missing home default
+/// is the ordinary fresh-install state.
+pub fn load_file_config(path: &Path, required: bool) -> Result<FileConfig, String> {
     if !path.exists() {
+        if required {
+            return Err(format!("no such config file: {}", path.display()));
+        }
         return Ok(FileConfig::default());
     }
     let text = std::fs::read_to_string(path)
@@ -260,6 +268,34 @@ pub(crate) fn model_toml(key: &str, extra_lines: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo'd top-level key must be a parse error, not a silently ignored
+    /// setting: `modle = "opus"` used to parse fine and surface later as the
+    /// unrelated "no model selected".
+    #[test]
+    fn unknown_top_level_fields_are_rejected() {
+        for bad in ["modle = \"opus\"", "attach_timeout_sec = 10"] {
+            let err = parse_file_config_str(bad).expect_err(bad);
+            let field = bad.split_whitespace().next().unwrap();
+            assert!(err.contains(field), "{err}");
+        }
+        // The removed-section pre-check keeps its migration message rather
+        // than degrading to a generic unknown-field error.
+        let err = parse_file_config_str("[[remote_hosts]]\nname = \"x\"").unwrap_err();
+        assert!(err.contains("no longer supported"), "{err}");
+    }
+
+    /// A missing config file is an error exactly when the user named the
+    /// path; the missing home default is the ordinary fresh-install state.
+    #[test]
+    fn missing_config_file_errors_only_when_the_user_named_it() {
+        let missing = Path::new("/nonexistent/myco-test/config.toml");
+        let file = load_file_config(missing, false).expect("home default may be absent");
+        assert!(file.models.is_empty());
+        let err = load_file_config(missing, true).unwrap_err();
+        assert!(err.contains("no such config file"), "{err}");
+        assert!(err.contains("/nonexistent/myco-test/config.toml"), "{err}");
+    }
 
     #[test]
     fn scalar_knobs_parse_as_set_or_unset() {

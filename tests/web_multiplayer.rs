@@ -47,7 +47,7 @@ fn test_server_with(factory: myco::server::ModelFactory) -> Arc<Server> {
     let config = myco::config::Config::resolve_with(
         Default::default(),
         |k| (k == "USER").then(|| "ada".to_string()),
-        |_| myco::config::parse_file_config_str(CONFIG_TOML),
+        |_, _| myco::config::parse_file_config_str(CONFIG_TOML),
         |_| myco::config::parse_file_roster_str(ROSTER_TOML),
         || Ok(Vec::new()),
         |_| Err("no auth files in tests".into()),
