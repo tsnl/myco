@@ -84,10 +84,6 @@ pub enum SessionEvent {
 /// block the agent.
 const EVENT_BUFFER: usize = 1024;
 
-/// Auto-compact when a turn ends with the context this full. A failed compact
-/// re-triggers after the next turn — visibly, via `TurnFailed`.
-const AUTO_COMPACT_FRACTION: f64 = 0.85;
-
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -210,9 +206,15 @@ pub enum Cmd {
     /// A message was accepted into the room inbox; drain whatever the running
     /// turn has not already folded. Carries nothing: the inbox is the record.
     Poke,
-    /// Compact into a successor session (also queued automatically when a
-    /// turn ends with the context nearly full).
-    Compact,
+    /// Compact into a successor session.
+    Compact {
+        /// Queued by the auto-compact trigger rather than a person. An
+        /// automatic compaction that fails disables the trigger for this
+        /// session (the latch on [`AgentTask`]) — retrying it after every
+        /// turn would fail the same way, loudly, forever. A manual compact
+        /// still works and re-arms the trigger on success.
+        automatic: bool,
+    },
 }
 
 /// A message the room has accepted but the history has not absorbed yet.
@@ -445,6 +447,7 @@ impl Server {
             events,
             catalog_model: catalog_model.clone(),
             harness,
+            auto_compact_failed: false,
         }));
         Ok(handle)
     }
@@ -542,12 +545,17 @@ struct AgentTask {
     events: broadcast::Sender<SessionEvent>,
     catalog_model: CatalogModel,
     harness: Arc<Harness>,
+    /// Latched when an *automatic* compaction fails, so the trigger does not
+    /// queue the same failure after every turn. A successful compact (manual
+    /// or automatic) re-arms it; the session swap makes the next one a fresh
+    /// question.
+    auto_compact_failed: bool,
 }
 
 /// What one turn runs: a user message or a compaction.
 enum TurnWork {
     User(Entry),
-    Compact,
+    Compact { automatic: bool },
 }
 
 /// The per-session agent task: pop queued commands, run one turn each.
@@ -560,7 +568,7 @@ async fn run_agent_task(mut t: AgentTask) {
             // or while the session was idle.
             Cmd::Poke => drain_inbox(&mut t).await,
             Cmd::User { entry } => run_turn(&mut t, TurnWork::User(entry)).await,
-            Cmd::Compact => run_turn(&mut t, TurnWork::Compact).await,
+            Cmd::Compact { automatic } => run_turn(&mut t, TurnWork::Compact { automatic }).await,
         }
     }
 }
@@ -599,7 +607,7 @@ async fn run_turn(t: &mut AgentTask, work: TurnWork) {
 
     match work {
         TurnWork::User(entry) => run_user_turn(t, entry, cancel).await,
-        TurnWork::Compact => run_compact(t, cancel).await,
+        TurnWork::Compact { automatic } => run_compact(t, automatic, cancel).await,
     }
 
     t.busy.store(false, Ordering::Relaxed);
@@ -694,26 +702,34 @@ The last message was removed from the conversation so the                       
         eprintln!("[{}] session save failed: {e}", t.active.id());
     }
 
-    // Auto-compact: queue it when the context is nearly full, so the next
-    // thing this task does is shrink the session.
-    if let Some(usage) = t.agent.last_usage() {
-        let window = t.agent.context_window_tokens();
-        if window > 0 && usage.context_tokens() as f64 >= window as f64 * AUTO_COMPACT_FRACTION {
-            let _ = t.handle.tx.send(Cmd::Compact);
-        }
+    // Auto-compact: queue it when the measured prompt crossed this model's
+    // resolved threshold, so the next thing this task does is shrink the
+    // session. `last_usage` is the provider's own count for the request just
+    // sent — a measured size, not a guess at the next one.
+    if let Some(usage) = t.agent.last_usage()
+        && !t.auto_compact_failed
+        && usage.context_tokens() >= t.catalog_model.spec.auto_compact_at_tokens
+    {
+        let _ = t.handle.tx.send(Cmd::Compact { automatic: true });
     }
 }
 
 /// `Cmd::Compact`: run the worker, then swap this task's session, history,
 /// lock, and live-table entry over to the successor (the v1 `/compact`
 /// lifecycle, server-side).
-async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
-    let fail = |t: &AgentTask, msg: String| {
-        eprintln!("[{}] compact: {msg}", t.active.id());
-        t.handle.set_error(Some(format!("compact: {msg}")));
-        let _ = t.events.send(SessionEvent::TurnFailed {
-            message: format!("compact: {msg}"),
-        });
+async fn run_compact(t: &mut AgentTask, automatic: bool, cancel: CancelToken) {
+    let fail = |t: &mut AgentTask, msg: String| {
+        let mut msg = format!("compact: {msg}");
+        if automatic {
+            t.auto_compact_failed = true;
+            msg.push_str(
+                "\nauto-compact is disabled for this session after this failure; \
+                 compact manually to retry",
+            );
+        }
+        eprintln!("[{}] {msg}", t.active.id());
+        t.handle.set_error(Some(msg.clone()));
+        let _ = t.events.send(SessionEvent::TurnFailed { message: msg });
     };
 
     let Some(sup) = t.supervisor.upgrade() else {
@@ -795,6 +811,7 @@ async fn run_compact(t: &mut AgentTask, cancel: CancelToken) {
             live.insert(outcome.successor_id.clone(), entry);
         }
     }
+    t.auto_compact_failed = false;
     let _ = t.events.send(SessionEvent::Compacted {
         predecessor: outcome.predecessor_id,
         successor: outcome.successor_id,
@@ -1158,7 +1175,7 @@ impl Server {
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
         live.tx
-            .send(Cmd::Compact)
+            .send(Cmd::Compact { automatic: false })
             .map_err(|_| internal("agent task gone".into()))?;
         Ok(api::Poll {
             busy: true,

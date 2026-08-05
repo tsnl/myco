@@ -113,6 +113,12 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub max_image_base64_bytes: Option<u64>,
+    /// Auto-compact when a turn ends with the prompt at this share of the
+    /// model's `context_window` (0 < f < 1). Per model because the trigger is
+    /// a share of *this* model's window. Unset -> the built-in default
+    /// ([`crate::DEFAULT_AUTO_COMPACT_FRACTION`]).
+    #[serde(default)]
+    pub auto_compact_at: Option<f64>,
     /// Retry override (see [`RetryEntry`]). Like `auth`, the model's table
     /// replaces the gateway's wholesale — a field unset here falls back to
     /// the built-in default, not to the gateway's value.
