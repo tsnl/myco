@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
+use myco::auth::AuthStore;
+use myco::models::{GenerateOutput, GenerativeModel};
 use myco::server::Server;
+use myco::test_support::ScriptedModel;
 use myco_api::{Author, EntryBody};
 use myco_api::{Content, TurnEndReason};
-use myco_auth::AuthStore;
-use myco_models::{GenerateOutput, GenerativeModel};
-use myco_test_support::ScriptedModel;
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::asynchronous::Client;
 
@@ -188,7 +188,7 @@ fn user_messages(p: &myco_api::Poll) -> Vec<(&str, String)> {
 /// pre-multiplayer behaviour is the behaviour: say anything, get an answer.
 #[tokio::test]
 async fn a_solo_session_answers_without_being_addressed() {
-    let _home = myco_test_support::temp_home("mp-solo");
+    let _home = myco::test_support::temp_home("mp-solo");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await;
     let id = new_session(&c, &ada).await;
@@ -205,7 +205,7 @@ async fn a_solo_session_answers_without_being_addressed() {
 /// prompt. It is recorded, it is not answered.
 #[tokio::test]
 async fn the_agent_does_not_interject_when_users_talk_to_each_other() {
-    let _home = myco_test_support::temp_home("mp-quiet");
+    let _home = myco::test_support::temp_home("mp-quiet");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await;
     let grace = login(&c, "grace", GRACE_PASSWORD).await;
@@ -244,7 +244,7 @@ async fn the_agent_does_not_interject_when_users_talk_to_each_other() {
 /// it can see what it overheard while it was quiet.
 #[tokio::test]
 async fn naming_the_agent_in_a_shared_session_wakes_it() {
-    let _home = myco_test_support::temp_home("mp-address");
+    let _home = myco::test_support::temp_home("mp-address");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await;
     let grace = login(&c, "grace", GRACE_PASSWORD).await;
@@ -274,7 +274,7 @@ async fn naming_the_agent_in_a_shared_session_wakes_it() {
 /// reaches this session's agent — and a different model's key does not.
 #[tokio::test]
 async fn the_model_key_addresses_the_agent_but_another_key_does_not() {
-    let _home = myco_test_support::temp_home("mp-modelkey");
+    let _home = myco::test_support::temp_home("mp-modelkey");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await;
     let grace = login(&c, "grace", GRACE_PASSWORD).await;
@@ -303,7 +303,7 @@ async fn a_message_reaches_watchers_on_the_feed_as_its_own_record() {
     use futures::StreamExt;
     use myco_api::{MycoApi, PostMessage, StreamEvent};
 
-    let _home = myco_test_support::temp_home("mp-feed");
+    let _home = myco::test_support::temp_home("mp-feed");
     let server = test_server();
     let ada = server.as_user(Author::User {
         id: "ada".into(),
@@ -406,7 +406,7 @@ async fn a_message_reaches_watchers_on_the_feed_as_its_own_record() {
 // Pre-emption: what happens to a message posted while a turn is running
 // ---------------------------------------------------------------------------
 
-use myco_models::{GenerateError, Message, MessagePart};
+use myco::models::{GenerateError, Message, MessagePart};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A model whose `gate_call`-th generate call signals `entered` and then
@@ -424,7 +424,7 @@ impl GenerativeModel for GatedModel {
     fn generate(
         &self,
         input: &[Message],
-    ) -> myco_core::AsyncStream<Result<MessagePart, GenerateError>> {
+    ) -> myco::core::AsyncStream<Result<MessagePart, GenerateError>> {
         use futures::StreamExt;
         let inner = self.inner.generate(input);
         if self.calls.fetch_add(1, Ordering::SeqCst) != self.gate_call {
@@ -490,7 +490,7 @@ fn gated_two_round_factory(
 async fn a_direct_message_mid_turn_preempts_the_turn_in_flight() {
     use myco_api::{MycoApi, PostMessage};
 
-    let _home = myco_test_support::temp_home("mp-preempt");
+    let _home = myco::test_support::temp_home("mp-preempt");
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let server = test_server_with(gated_two_round_factory(entered.clone(), release.clone()));
@@ -571,7 +571,7 @@ async fn the_room_rule_counts_messages_still_queued_behind_a_turn() {
     use futures::StreamExt;
     use myco_api::{MycoApi, PostMessage, StreamEvent};
 
-    let _home = myco_test_support::temp_home("mp-queued-room");
+    let _home = myco::test_support::temp_home("mp-queued-room");
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let server = test_server_with(gated_two_round_factory(entered.clone(), release.clone()));

@@ -41,7 +41,11 @@ async fn test_agent_tool_use() {
             text: prompt.to_string(),
         }];
         let ret_content = agent
-            .interact(myco_test_support::tester(), input, myco::CancelToken::new())
+            .interact(
+                myco::test_support::tester(),
+                input,
+                myco::CancelToken::new(),
+            )
             .await
             .unwrap();
         eprintln!("Tool result: {ret_content:#?}");

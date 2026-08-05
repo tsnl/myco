@@ -32,23 +32,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
-use myco_agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
-use myco_api::Content;
-use myco_api::{Author, Entry, EntryBody};
-use myco_auth::AuthStore;
-use myco_config::Config;
-use myco_machines::harness::Harness;
-use myco_machines::tool_services::{PreludeTool, SessionMetaTool, ToolService};
-use myco_models::{
+use crate::agent::{Agent, AgentEvent, CompactWorkerError, EventSink, run_compact_worker};
+use crate::auth::AuthStore;
+use crate::config::Config;
+use crate::machines::harness::Harness;
+use crate::machines::tool_services::{PreludeTool, SessionMetaTool, ToolService};
+use crate::models::{
     BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
 };
-use myco_session::{
+use crate::session::{
     ActiveSession, CompactOutcome, Session, SessionWriteLock, expand_image_attachments,
 };
+use myco_api::Content;
+use myco_api::{Author, Entry, EntryBody};
 
+use crate::core::CancelToken;
 use crate::subagent::SubagentTool;
 use myco_api as api;
-use myco_core::CancelToken;
 
 const SYSTEM_PROMPT_PROLOGUE: &str = r#"
 You are a helpful assistant running in an agentic harness with unfettered computer access.
@@ -181,10 +181,10 @@ fn default_model_factory(
 ) -> Result<Arc<dyn GenerativeModel>, String> {
     match purpose {
         ModelPurpose::Agent => build_model(catalog_model, harness),
-        ModelPurpose::Compactor => myco_models::new(GenerativeModelConfig {
+        ModelPurpose::Compactor => crate::models::new(GenerativeModelConfig {
             model: catalog_model.spec.clone(),
             tools: harness.tool_specs(),
-            system_prompt: myco_agent::compactor_system_prompt(catalog_model),
+            system_prompt: crate::agent::compactor_system_prompt(catalog_model),
             backend_config: catalog_model.backend.clone(),
         })
         .map_err(|e| format!("failed to create compactor model: {e}")),
@@ -355,13 +355,13 @@ impl Server {
 
         let lock = match SessionWriteLock::acquire(&id) {
             Ok(lock) => Some(lock),
-            Err(myco_session::SessionLockError::Busy { path }) => {
+            Err(crate::session::SessionLockError::Busy { path }) => {
                 return Err(format!(
                     "session {id} is open in another myco process (lock: {})",
                     path.display()
                 ));
             }
-            Err(e @ myco_session::SessionLockError::Unavailable(_)) => {
+            Err(e @ crate::session::SessionLockError::Unavailable(_)) => {
                 eprintln!("warning: {e}; continuing without a single-writer guard");
                 None
             }
@@ -462,7 +462,7 @@ impl Server {
             Ok(parent_session.fork_child(model_key))
         } else {
             let mut fresh = Session::new(model_key);
-            fresh.kind = myco_session::SessionKind::Subagent;
+            fresh.kind = crate::session::SessionKind::Subagent;
             fresh.parent_session_id = Some(parent.to_string());
             Ok(fresh)
         }
@@ -700,7 +700,7 @@ async fn run_user_turn(t: &mut AgentTask, entry: Entry, cancel: CancelToken) {
         };
         match t.agent.interact_entry(entry, cancel.clone()).await {
             Ok(_) => break None,
-            Err(myco_agent::AgentInteractionError::Cancelled) => {
+            Err(crate::agent::AgentInteractionError::Cancelled) => {
                 break Some("(turn cancelled)".to_string());
             }
             Err(e) => match e.recovery() {
@@ -820,14 +820,14 @@ async fn run_compact(t: &mut AgentTask, automatic: bool, cancel: CancelToken) {
     // Relock under the successor's id, then switch this task over.
     let new_lock = match SessionWriteLock::acquire(&successor.id) {
         Ok(lock) => Some(lock),
-        Err(myco_session::SessionLockError::Busy { path }) => {
+        Err(crate::session::SessionLockError::Busy { path }) => {
             fail(
                 t,
                 format!("successor is locked elsewhere ({})", path.display()),
             );
             return;
         }
-        Err(myco_session::SessionLockError::Unavailable(_)) => None,
+        Err(crate::session::SessionLockError::Unavailable(_)) => None,
     };
     t.active.replace(successor.clone());
     t.agent.set_history(successor.entries.clone());
@@ -866,13 +866,13 @@ fn build_model(
     catalog_model: &CatalogModel,
     harness: &Harness,
 ) -> Result<Arc<dyn GenerativeModel>, String> {
-    myco_models::new(GenerativeModelConfig {
+    crate::models::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
-            myco_prompts::agent_prompt_epilogue(),
-            myco_prompts::model_stamp(&catalog_model.spec.key),
+            crate::prompts::agent_prompt_epilogue(),
+            crate::prompts::model_stamp(&catalog_model.spec.key),
         ]
         .join("\n"),
         backend_config: catalog_model.backend.clone(),
@@ -982,14 +982,14 @@ fn internal(e: String) -> ApiError {
     ApiError::new(ErrorKind::Internal, e)
 }
 
-fn lock_of(lock: myco_machines::tool_services::ShellLock) -> api::ShellLockMode {
+fn lock_of(lock: crate::machines::tool_services::ShellLock) -> api::ShellLockMode {
     match lock {
-        myco_machines::tool_services::ShellLock::Assistant => api::ShellLockMode::Assistant,
-        myco_machines::tool_services::ShellLock::User => api::ShellLockMode::User,
+        crate::machines::tool_services::ShellLock::Assistant => api::ShellLockMode::Assistant,
+        crate::machines::tool_services::ShellLock::User => api::ShellLockMode::User,
     }
 }
 
-fn shell_of(host: String, s: myco_machines::tool_services::ShellOverview) -> api::Shell {
+fn shell_of(host: String, s: crate::machines::tool_services::ShellOverview) -> api::Shell {
     api::Shell {
         host,
         id: s.id,
@@ -1039,8 +1039,9 @@ impl Server {
         &self,
         include_archived: bool,
     ) -> Result<Vec<api::SessionSummary>, ApiError> {
-        let entries = myco_session::list_sessions_with(SESSION_LIST_LIMIT, false, include_archived)
-            .map_err(internal)?;
+        let entries =
+            crate::session::list_sessions_with(SESSION_LIST_LIMIT, false, include_archived)
+                .map_err(internal)?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let (live, busy) = self.live_flags(&e.id).await;
@@ -1271,7 +1272,7 @@ impl Server {
         &self,
         id: &str,
         host: &str,
-    ) -> Result<(Arc<Live>, Arc<myco_machines::harness::HostController>), ApiError> {
+    ) -> Result<(Arc<Live>, Arc<crate::machines::harness::HostController>), ApiError> {
         let live = self.live_for_shells(id).await?;
         let ctl = live
             .harness()
@@ -1360,8 +1361,8 @@ impl Server {
     ) -> Result<api::Shell, ApiError> {
         let (live, ctl) = self.shell_host(id, host).await?;
         let wanted = match lock {
-            api::ShellLockMode::Assistant => myco_machines::tool_services::ShellLock::Assistant,
-            api::ShellLockMode::User => myco_machines::tool_services::ShellLock::User,
+            api::ShellLockMode::Assistant => crate::machines::tool_services::ShellLock::Assistant,
+            api::ShellLockMode::User => crate::machines::tool_services::ShellLock::User,
         };
         let (previous, overview) = ctl
             .shell_lock(shell, wanted)

@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
+use myco::auth::AuthStore;
+use myco::models::{GenerateOutput, GenerativeModel};
 use myco::server::Server;
+use myco::test_support::ScriptedModel;
 use myco_api::{Author, EntryBody};
 use myco_api::{Content, TurnEndReason};
-use myco_auth::AuthStore;
-use myco_models::{GenerateOutput, GenerativeModel};
-use myco_test_support::ScriptedModel;
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::asynchronous::Client;
 
@@ -119,7 +119,7 @@ async fn login(c: &Client, id: &str, password: &str) -> Result<String, Status> {
 /// Every route, with no credential at all. None may answer.
 #[tokio::test]
 async fn no_route_answers_without_a_token() {
-    let _home = myco_test_support::temp_home("web-auth-none");
+    let _home = myco::test_support::temp_home("web-auth-none");
     let c = client().await;
 
     for path in [
@@ -152,7 +152,7 @@ async fn no_route_answers_without_a_token() {
 /// comparison must not accept a partial match.
 #[tokio::test]
 async fn a_bad_token_is_rejected() {
-    let _home = myco_test_support::temp_home("web-auth-bad");
+    let _home = myco::test_support::temp_home("web-auth-bad");
     let c = client().await;
 
     let live = login(&c, "ada", ADA_PASSWORD).await.expect("login");
@@ -172,7 +172,7 @@ async fn a_bad_token_is_rejected() {
 
 #[tokio::test]
 async fn a_token_identifies_its_owner() {
-    let _home = myco_test_support::temp_home("web-auth-whoami");
+    let _home = myco::test_support::temp_home("web-auth-whoami");
     let c = client().await;
 
     for (password, id, name) in [
@@ -193,7 +193,7 @@ async fn a_token_identifies_its_owner() {
 /// message posted with grace's token proves the attribution follows the token.
 #[tokio::test]
 async fn a_posted_message_is_attributed_to_the_token_holder() {
-    let _home = myco_test_support::temp_home("web-auth-attrib");
+    let _home = myco::test_support::temp_home("web-auth-attrib");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
     let grace = login(&c, "grace", GRACE_PASSWORD).await.expect("login");
@@ -253,7 +253,7 @@ async fn a_posted_message_is_attributed_to_the_token_holder() {
 /// That must be a real check, not a way around one.
 #[tokio::test]
 async fn the_event_stream_accepts_a_query_token_but_still_checks_it() {
-    let _home = myco_test_support::temp_home("web-auth-sse");
+    let _home = myco::test_support::temp_home("web-auth-sse");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
 
@@ -286,7 +286,7 @@ async fn the_event_stream_accepts_a_query_token_but_still_checks_it() {
 /// failure never says which half was wrong.
 #[tokio::test]
 async fn the_password_grant_accepts_only_correct_credentials() {
-    let _home = myco_test_support::temp_home("web-auth-grant");
+    let _home = myco::test_support::temp_home("web-auth-grant");
     let c = client().await;
 
     assert!(login(&c, "ada", ADA_PASSWORD).await.is_ok());
@@ -323,7 +323,7 @@ async fn the_password_grant_accepts_only_correct_credentials() {
 /// forgets its token leaves a live credential behind.
 #[tokio::test]
 async fn logging_out_invalidates_the_token() {
-    let _home = myco_test_support::temp_home("web-auth-logout");
+    let _home = myco::test_support::temp_home("web-auth-logout");
     let c = client().await;
     let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
 
@@ -360,7 +360,7 @@ async fn logging_out_invalidates_the_token() {
 /// who exists; it does not grant access.
 #[tokio::test]
 async fn a_roster_user_without_a_password_cannot_sign_in() {
-    let _home = myco_test_support::temp_home("web-auth-nopass");
+    let _home = myco::test_support::temp_home("web-auth-nopass");
     let server = test_server();
     server.auth().add_user("mallory", "Mallory").ok();
     let figment = rocket::Config::figment().merge(("log_level", "off"));

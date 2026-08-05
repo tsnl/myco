@@ -89,7 +89,7 @@ async fn scripted_multi_turn_bash_session_transcript() {
     let t0 = Instant::now();
     let reply = agent
         .interact(
-            myco_test_support::tester(),
+            myco::test_support::tester(),
             vec![Content::Text {
                 text: "Drive an interactive shell across multiple turns.".into(),
             }],

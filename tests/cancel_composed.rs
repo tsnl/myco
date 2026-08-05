@@ -51,7 +51,7 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
     let t0 = Instant::now();
     let err = agent
         .interact(
-            myco_test_support::tester(),
+            myco::test_support::tester(),
             vec![Content::Text { text: "run".into() }],
             cancel,
         )

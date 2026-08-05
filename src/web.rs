@@ -17,10 +17,10 @@ use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
 use rocket::{Request, State, delete, get, patch, post, routes};
 
+use crate::config::Config;
+use crate::machines::harness::{fatal_startup_check, prelude_warning};
 use futures::StreamExt;
 use myco_api::{ApiError, ErrorKind, MycoApi};
-use myco_config::Config;
-use myco_machines::harness::{fatal_startup_check, prelude_warning};
 
 use crate::server::{Server, UserApi};
 use myco_api as api;
@@ -81,7 +81,7 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
 
 /// Path of the local operator's bearer token: `$MYCO_HOME/v2/operator.token`.
 pub fn operator_token_path() -> Result<std::path::PathBuf, String> {
-    Ok(myco_core::data_root()?.join("operator.token"))
+    Ok(crate::core::data_root()?.join("operator.token"))
 }
 
 /// Write the operator token where local clients can read it, `0600`.

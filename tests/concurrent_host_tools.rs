@@ -65,7 +65,7 @@ async fn agent_concurrent_host_bash_tools_complete() {
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
         agent.interact(
-            myco_test_support::tester(),
+            myco::test_support::tester(),
             vec![Content::Text {
                 text: "run three".into(),
             }],
@@ -130,7 +130,7 @@ async fn agent_concurrent_bash_and_editor_complete() {
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
         agent.interact(
-            myco_test_support::tester(),
+            myco::test_support::tester(),
             vec![Content::Text {
                 text: "run both".into(),
             }],

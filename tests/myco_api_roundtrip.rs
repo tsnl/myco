@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
+use myco::models::{GenerateError, GenerateOutput, GenerativeModel};
 use myco::server::Server;
+use myco::test_support::ScriptedModel;
 use myco_api::{Content, TurnEndReason};
 use myco_api::{CreateSession, EntryBody, MycoApi, PostMessage, UpdateSession};
-use myco_models::{GenerateError, GenerateOutput, GenerativeModel};
-use myco_test_support::ScriptedModel;
 
 const CONFIG_TOML: &str = r#"
 model = "fake"
@@ -66,7 +66,7 @@ async fn poll_until(
 
 #[tokio::test]
 async fn a_turn_round_trips_through_the_trait() {
-    let _home = myco_test_support::temp_home("api-roundtrip");
+    let _home = myco::test_support::temp_home("api-roundtrip");
     let server = scripted_server(|| {
         let turn = |text: &str| GenerateOutput {
             content: vec![Content::Text { text: text.into() }],
@@ -160,7 +160,7 @@ async fn a_turn_round_trips_through_the_trait() {
 
 #[tokio::test]
 async fn a_failing_turn_surfaces_on_last_error() {
-    let _home = myco_test_support::temp_home("api-fail");
+    let _home = myco::test_support::temp_home("api-fail");
     let server = scripted_server(|| {
         ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError(
             "provider down (scripted)".into(),
@@ -202,7 +202,7 @@ async fn a_failing_turn_surfaces_on_last_error() {
 /// the live feed *before* it finishes, so a client can render as it goes.
 #[tokio::test]
 async fn a_turn_streams_deltas_before_it_finishes() {
-    let _home = myco_test_support::temp_home("api-stream");
+    let _home = myco::test_support::temp_home("api-stream");
     let server = scripted_server(|| {
         ScriptedModel::new(vec![GenerateOutput {
             content: vec![
@@ -286,7 +286,7 @@ async fn a_turn_streams_deltas_before_it_finishes() {
 async fn the_wire_ends_a_turn_once_and_only_after_persistence() {
     use futures::StreamExt;
 
-    let _home = myco_test_support::temp_home("api-turn-end");
+    let _home = myco::test_support::temp_home("api-turn-end");
     let server = scripted_server(|| {
         ScriptedModel::new(vec![
             GenerateOutput {
@@ -384,7 +384,7 @@ async fn the_wire_ends_a_turn_once_and_only_after_persistence() {
 /// click accretes an empty file in the store.
 #[tokio::test]
 async fn an_abandoned_session_leaves_nothing_on_disk() {
-    let home = myco_test_support::temp_home("api-empty");
+    let home = myco::test_support::temp_home("api-empty");
     let server = scripted_server(|| {
         ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text {
@@ -454,7 +454,7 @@ async fn an_abandoned_session_leaves_nothing_on_disk() {
 /// listing, still readable, still there when archived ones are asked for.
 #[tokio::test]
 async fn archiving_hides_a_session_without_losing_it() {
-    let _home = myco_test_support::temp_home("api-archive");
+    let _home = myco::test_support::temp_home("api-archive");
     let server = scripted_server(|| {
         ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text {

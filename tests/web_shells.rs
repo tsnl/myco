@@ -10,11 +10,11 @@
 
 use std::sync::Arc;
 
+use myco::auth::AuthStore;
+use myco::models::{GenerateOutput, GenerativeModel};
 use myco::server::Server;
+use myco::test_support::ScriptedModel;
 use myco_api::{Author, Content, MycoApi, ShellLockMode, TurnEndReason};
-use myco_auth::AuthStore;
-use myco_models::{GenerateOutput, GenerativeModel};
-use myco_test_support::ScriptedModel;
 
 const CONFIG_TOML: &str = r#"
 model = "fake"
@@ -49,7 +49,7 @@ fn shell_server(host: Option<&str>) -> Arc<Server> {
         config
             .harness
             .remote_hosts
-            .push(myco_machines::harness::HostConfig {
+            .push(myco::machines::harness::HostConfig {
                 name: name.into(),
                 command: vec![
                     env!("CARGO_BIN_EXE_myco").into(),
@@ -141,7 +141,7 @@ async fn tail_until(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_can_watch_take_and_drive_the_agents_shell() {
-    let _home = myco_test_support::temp_home("web-shells");
+    let _home = myco::test_support::temp_home("web-shells");
     let server = shell_server(None);
     let ada = server.as_user(Author::User {
         id: "ada".into(),
@@ -264,7 +264,7 @@ async fn a_user_can_watch_take_and_drive_the_agents_shell() {
 /// in the transcript naming the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_shell_is_watchable_and_drivable_over_the_web_api() {
-    let _home = myco_test_support::temp_home("web-remote-shells");
+    let _home = myco::test_support::temp_home("web-remote-shells");
     let server = shell_server(Some("rem"));
     let ada = server.as_user(Author::User {
         id: "ada".into(),

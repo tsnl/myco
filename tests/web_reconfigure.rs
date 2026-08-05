@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
+use myco::auth::AuthStore;
+use myco::models::{BackendConfig, Effort, GenerateOutput, GenerativeModel};
 use myco::server::Server;
+use myco::test_support::ScriptedModel;
 use myco_api::{Author, Content, MycoApi, TurnEndReason};
-use myco_auth::AuthStore;
-use myco_models::{BackendConfig, Effort, GenerateOutput, GenerativeModel};
-use myco_test_support::ScriptedModel;
 
 const CONFIG_TOML: &str = r#"
 model = "fake1"
@@ -91,7 +91,7 @@ fn update(model: Option<&str>, effort: Option<&str>) -> myco_api::UpdateSession 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_patched_model_and_effort_drive_the_next_turn() {
-    let _home = myco_test_support::temp_home("web-reconfigure");
+    let _home = myco::test_support::temp_home("web-reconfigure");
     let server = echo_server();
     let ada = server.as_user(Author::User {
         id: "ada".into(),

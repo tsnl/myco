@@ -1,11 +1,9 @@
 # `myco`
 
 A minimalist coding agent that works across your machines over SSH. One
-session runtime, two frontends: the interactive **CLI** (default — now
-async: your prompt stays live, input queues while the agent works, output
-streams above it) and a **multiplayer web server** (`myco --mode serve`), a
-parallel experiment serving the same runtime over HTTP for the Yew GUI and
-scripts.
+**server** (`myco --mode serve`) with one door — the REST API — and thin
+clients through it: the multiplayer web GUI, `myco -p` for one-shot turns,
+and `clients/myco.py` (or plain HTTP) for scripts and agents driving agents.
 
 ## Why use it?
 
@@ -18,10 +16,9 @@ scripts.
   a real pty (`pty: true` on start — for TUI apps and anything that checks
   isatty), and the `screenshot` action renders any session's terminal screen
   as text, so the agent reads an editor or `top` the way you would.
-- **Async everywhere.** Input queues while a turn runs — in the CLI and the
-  web alike. In serve mode each conversation is a URL and agents run in
-  parallel server-side.
-- **Sessions you can resume.** Titles, scratchpads, links, and full history
+- **Async everywhere.** Input queues while a turn runs; each conversation is
+  a URL and agents run in parallel server-side.
+- **Sessions you can resume.** Titles, scratchpads, and full history
   live under `~/.myco/v2/` — reopen any session by URL, or from another
   client. Archive the ones you are done with; they stay readable.
 - **Attributed history.** A session is a log of `Entry { author, at, body }`,
@@ -53,8 +50,7 @@ scripts.
   agent answers when it is named (`@myco`, `@agent`, `@assistant`, or the
   model key it is running as) and otherwise listens. A message between two
   people is recorded, delivered to everyone watching, and read by the agent
-  as context — it just does not cost a turn. Mentions are highlighted, and
-  a message that names you raises a notification.
+  as context — it just does not cost a turn. Mentions are highlighted.
 - **Mid-turn messages pre-empt.** A message that names the agent while it
   is already working does not wait behind the whole turn: it is folded
   into the turn in flight at the next safe boundary (a completed tool
@@ -64,11 +60,16 @@ scripts.
 ## Run
 
 ```bash
-cargo run -p myco                          # interactive CLI (async)
-cargo run -p myco -- -p "explain src/"     # one-shot print mode
-cargo run -p myco -- --mode serve          # API server on http://127.0.0.1:7773/api
+cargo run -p myco -- --mode serve          # the server: http://127.0.0.1:7773/api
 trunk serve                                # web GUI on :8080 (proxies /api)
+cargo run -p myco -- -p "explain src/"     # one-shot turn (spawns the server if needed)
+python3 clients/myco.py ask "explain src/" # the same, over the same API
 ```
+
+There is no terminal REPL: the server is the product, and every client —
+GUI, `-p`, scripts — speaks the same REST API. `--mode serve` writes the
+local operator's bearer token to `~/.myco/v2/operator.token` (0600), which
+is how `myco -p` and local scripts authenticate without a login step.
 
 The web GUI keeps the terminal's visual identity: monospace, dark, USER
 rules — minimal chrome by design. Tool calls render as collapsed cards
@@ -84,7 +85,7 @@ the transcript's say-so.
 root builds `crates/myco-gui` and reverse-proxies `/api` to the server.
 
 Configure models first in `~/.myco/v2/config.toml` (`[gateways.*]` +
-`[models.*]`; `myco --model <key>` / `--config <path>` to override), and
+`[models.*]`; `--config <path>` to override), and
 register yourself in `~/.myco/v2/server.toml`:
 
 ```toml
@@ -93,8 +94,8 @@ id = "ada"            # matched against $MYCO_USER, then $USER
 name = "Ada Lovelace" # optional; defaults to the id
 ```
 
-Both the CLI and the server refuse to start without a roster that names the
-user they are running as — every session entry records its author, and a
+The server refuses to start without a roster that names the
+user it is running as — every session entry records its author, and a
 name nobody registered has no business in a shared transcript. Override the
 path with `--server-config` or `$MYCO_SERVER_CONFIG`.
 
@@ -150,9 +151,9 @@ configured default — set per model with `effort = "…"` in `config.toml`).
 The change is validated against the catalog, saved on the session document,
 and a live agent rebuilds its model between turns — the turn in flight
 finishes on what it started with. The GUI exposes both as topbar pickers
-(and a model picker on the new-session page); the CLI as `/model [key]` and
-`/effort [level|default]`. Forked children and compaction successors inherit
-the override.
+(and a model picker on the new-session page); scripts PATCH them directly
+(`clients/myco.py`: `update_session`). Forked children and compaction
+successors inherit the override.
 
 `POST /messages` answers with `busy`: whether a reply is coming or already
 underway — so a client knows not to wait for a reply that is not coming, and
@@ -186,15 +187,16 @@ token for the local operator and exports it as `$MYCO_API_TOKEN` alongside
 
 ## Workspace
 
-- `myco` — the **root crate**: the session runtime (`server`), the CLI,
-  the web server (Rocket, `/api`), the `subagent` tool, and `--mode host`
-  (the per-machine worker remotes run); the workspace lives in `crates/`
+- `myco` — **the** crate: session runtime (`server`), agent loop (`agent`),
+  multi-host harness + NDJSON host protocol + tool services (`machines`),
+  provider backends (`models`), sessions on disk (`session`), config, auth,
+  prompts, the Rocket adapter (`web`), the thin `-p` client (`cli`), and
+  `--mode host` (the per-machine worker remotes run)
+- `myco-api` — wire types + the `MycoApi` trait, shared by server and
+  clients; wasm-safe, which is the one crate boundary that earns its keep
 - `myco-gui` — minimal Yew web client (one URL per conversation)
-- `myco-api` — wire types shared by server and clients
-- `myco-auth` — credentials, access tokens, and the store behind `myco auth`
-- `myco-agent`, `myco-session`, `myco-machines`, `myco-models`,
-  `myco-config`, `myco-prompts`, `myco-core` — the server's pillars
-- `myco-test-support` — shared test fixtures
+- `clients/myco.py` — the API as a dependency-free Python client, doubling
+  as executable protocol documentation
 
 ## Develop
 
