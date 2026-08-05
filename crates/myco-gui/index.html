@@ -123,6 +123,13 @@
       }
       select.picker:hover { color: var(--fg); border-color: #666; }
 
+      /* Inline images: user attachments, view_image previews, agent blocks.
+         Capped so a full screenshot reads as a figure, not a takeover. */
+      .content-image {
+        display: block; max-width: 100%; max-height: 24rem;
+        margin: 0.4rem 0; border: 1px solid var(--line-soft);
+      }
+
       /* The work rail: running tools and live shells, beside the transcript.
          Collapsible; when open it owns a fixed width and its own scroll. */
       .pane-row { flex: 1 1 auto; min-height: 0; display: flex; }
