@@ -4,7 +4,7 @@
 //! [`crate::DEAD_tui::ConsoleTuiSink`] to the TUI stream, which plain-encodes every
 //! user-visible block — banner, preflight WARNING, USER headers + input, the
 //! streamed ASSISTANT section, live ERROR / cancellation notices, and
-//! meta-command output (`/hosts`, `/session`, …) — into [`ConsoleLog::append`],
+//! meta-command MYCO sections (`/hosts`, `/session`, …) — into [`ConsoleLog::append`],
 //! landing in `{id}.console` beside the session JSON. The result is an
 //! append-only, escape-free transcript of exactly what scrolled past — the
 //! agent can read it (via its file tools) to answer questions about the live

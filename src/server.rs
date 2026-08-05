@@ -44,7 +44,9 @@ use myco_machines::tool_services::{
 use myco_models::{
     BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig, Recovery,
 };
-use myco_session::{ActiveSession, Session, SessionWriteLock, expand_image_attachments};
+use myco_session::{
+    ActiveSession, CompactOutcome, Session, SessionWriteLock, expand_image_attachments,
+};
 
 use crate::subagent::SubagentTool;
 use myco_api as api;
@@ -74,9 +76,11 @@ pub enum SessionEvent {
         message: String,
     },
     TurnFinished,
+    /// Compaction replaced this session with a successor — follow
+    /// `outcome.successor_id` (the wire projection keeps only the id pair;
+    /// the CLI renders the full COMPACTED banner from the outcome).
     Compacted {
-        predecessor: String,
-        successor: String,
+        outcome: CompactOutcome,
     },
 }
 
@@ -813,10 +817,7 @@ async fn run_compact(t: &mut AgentTask, automatic: bool, cancel: CancelToken) {
         }
     }
     t.auto_compact_failed = false;
-    let _ = t.events.send(SessionEvent::Compacted {
-        predecessor: outcome.predecessor_id,
-        successor: outcome.successor_id,
-    });
+    let _ = t.events.send(SessionEvent::Compacted { outcome });
 }
 
 /// Persist agent history at replayable mid-turn boundaries (after the user
@@ -911,12 +912,9 @@ impl From<SessionEvent> for api::StreamEvent {
             SessionEvent::TurnStarted => api::StreamEvent::TurnStarted,
             SessionEvent::TurnFailed { message } => api::StreamEvent::TurnFailed { message },
             SessionEvent::TurnFinished => api::StreamEvent::TurnFinished,
-            SessionEvent::Compacted {
-                predecessor,
-                successor,
-            } => api::StreamEvent::Compacted {
-                predecessor,
-                successor,
+            SessionEvent::Compacted { outcome } => api::StreamEvent::Compacted {
+                predecessor: outcome.predecessor_id,
+                successor: outcome.successor_id,
             },
         }
     }
