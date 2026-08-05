@@ -47,6 +47,7 @@ pub fn compact_session(
     // Nested (hidden) sessions stay nested across compaction; user sessions stay user.
     successor.kind = predecessor.kind;
     successor.parent_session_id = predecessor.parent_session_id.clone();
+    successor.effort = predecessor.effort.clone();
 
     let mut resume = String::from("# Compaction resume\n\n");
     resume.push_str(summary_markdown.trim());

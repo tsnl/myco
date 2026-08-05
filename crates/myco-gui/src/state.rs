@@ -62,6 +62,11 @@ pub struct ConvState {
     pub error: Option<String>,
     /// Whether anyone but us has posted here; drives the addressing hint.
     pub shared: bool,
+    /// The session's catalog model key, for the topbar picker. Empty until
+    /// the first detail fetch reports it.
+    pub model: String,
+    /// Per-session effort override; `None` renders as the model's default.
+    pub effort: Option<String>,
 }
 
 impl ConvState {
@@ -73,6 +78,8 @@ impl ConvState {
             busy: false,
             error: None,
             shared: false,
+            model: String::new(),
+            effort: None,
         }
     }
 
@@ -125,6 +132,12 @@ pub enum ConvAction {
     /// already underway.
     Sent {
         busy: bool,
+    },
+    /// The session's model/effort as the server reports it — from the detail
+    /// fetch on (re)connect, or the response to our own `PATCH`.
+    Configured {
+        model: String,
+        effort: Option<String>,
     },
     Failed(String),
 }
@@ -192,6 +205,10 @@ impl ConvState {
                 self.busy = poll.busy;
             }
             ConvAction::Sent { busy } => self.busy = busy,
+            ConvAction::Configured { model, effort } => {
+                self.model = model;
+                self.effort = effort;
+            }
             ConvAction::Failed(message) => self.error = Some(message),
         }
     }

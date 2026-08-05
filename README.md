@@ -120,7 +120,7 @@ non-interactive SSH.
 
 `GET /api/sessions?include_archived=` · `POST /api/sessions` (`{model?,
 parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
-`PATCH /api/sessions/<id>` (`{title?, archived?}`) ·
+`PATCH /api/sessions/<id>` (`{title?, archived?, model?, effort?}`) ·
 `POST /api/sessions/<id>/messages`
 (`{text}`) · `GET /api/sessions/<id>/poll?since=N` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
@@ -131,6 +131,17 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 keyboard lock) · `POST /api/sessions/<id>/shells/<shell>/lock`
 (`{lock: "user"|"assistant"}`).
 Wire types live in `crates/myco-api`.
+
+A session can switch model or reasoning effort mid-conversation:
+`PATCH` with `model` (any catalog key) or `effort`
+(`low|medium|high|max`; `""` clears the override back to the model's
+configured default — set per model with `effort = "…"` in `config.toml`).
+The change is validated against the catalog, saved on the session document,
+and a live agent rebuilds its model between turns — the turn in flight
+finishes on what it started with. The GUI exposes both as topbar pickers
+(and a model picker on the new-session page); the CLI as `/model [key]` and
+`/effort [level|default]`. Forked children and compaction successors inherit
+the override.
 
 `POST /messages` answers with `busy`: whether a reply is coming or already
 underway — so a client knows not to wait for a reply that is not coming, and

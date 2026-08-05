@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use myco_models::{Protocol, ThinkingMode};
+use myco_models::{Effort, Protocol, ThinkingMode};
 
 /// On-disk config file shape (`~/.myco/config.toml`). Hosts come from
 /// `~/.ssh/config`; models come from the `[gateways]` / `[models]` catalog
@@ -114,6 +114,11 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub max_image_base64_bytes: Option<u64>,
+    /// Reasoning/thinking effort requested from the provider:
+    /// `"low"` | `"medium"` | `"high"` | `"max"`. Unset -> high. The
+    /// per-session override (PATCH `effort` / `/effort`) wins over this.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Auto-compact when a turn ends with the prompt at this share of the
     /// model's `context_window` (0 < f < 1). Per model because the trigger is
     /// a share of *this* model's window. Unset -> the built-in default

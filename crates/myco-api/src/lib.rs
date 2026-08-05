@@ -25,6 +25,10 @@ pub struct SessionSummary {
     /// Filed away: still readable, but out of the default listing.
     #[serde(default)]
     pub archived: bool,
+    /// Per-session reasoning-effort override (`"low"`…`"max"`); `None` means
+    /// the model's configured effort applies.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Live in this server process (an agent task exists for it).
     pub live: bool,
     /// An agent turn is currently running.
@@ -58,6 +62,14 @@ pub struct UpdateSession {
     pub title: Option<String>,
     #[serde(default)]
     pub archived: Option<bool>,
+    /// Switch the session to another catalog model key. A live session
+    /// rebuilds its agent's model between turns; the change applies from the
+    /// next turn onward.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Set (`"low"`…`"max"`) or clear (`""`) the per-session effort override.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
