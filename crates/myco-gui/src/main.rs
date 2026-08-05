@@ -569,8 +569,14 @@ fn tool_card(props: &ToolCardProps) -> Html {
     let open = *expanded;
 
     // Always the whole call, never summarized: a truncated command is one you
-    // have to expand the card to trust.
-    let args = api::tool_input_yaml(&props.tool.input, api::TOOL_DISPLAY_WIDTH);
+    // have to expand the card to trust. How it reads is the tool's own
+    // business — `bash` lays its command out as shell, everything else falls
+    // back to the structural rendering.
+    let args = api::tool_display::tool_input_yaml(
+        &props.tool.name,
+        &props.tool.input,
+        api::tool_display::TOOL_DISPLAY_WIDTH,
+    );
     let status = ToolStatus::of(props.result.as_ref());
     let is_error = status == ToolStatus::Failed;
 
