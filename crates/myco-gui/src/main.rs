@@ -614,8 +614,10 @@ fn tool_card(props: &ToolCardProps) -> Html {
         .as_ref()
         .is_some_and(|r| api::content_text(&r.content).lines().count() > RESULT_PREVIEW_LINES);
 
+    // The DOM id is the jump target for the work rail's running-tool rows.
     html! {
-        <div class={ classes!("tool-card", is_error.then_some("tool-card-error")) }>
+        <div id={format!("tool-{}", props.tool.id)}
+             class={ classes!("tool-card", is_error.then_some("tool-card-error")) }>
             <div class="tool-head" onclick={toggle.clone()}>
                 <span class={status.disc_class()} title={status.title()}>{ "●" }</span>
                 <span class="tool-name">{ &props.tool.name }</span>
@@ -923,6 +925,45 @@ struct ConversationProps {
     id: String,
 }
 
+/// The work rail's mutable surface: live shells and their terminal
+/// scrollback. A `use_mut_ref` cell (plus a revision counter for renders),
+/// because its writers are long-lived tasks and late-completing requests —
+/// exactly the closures a captured `UseStateHandle` would go stale in.
+#[derive(Default)]
+struct PanelBuf {
+    shells: Vec<api::Shell>,
+    terms: std::collections::HashMap<String, Term>,
+}
+
+/// One shell's accumulated scrollback view.
+#[derive(Default)]
+struct Term {
+    /// Absolute offset to tail from next.
+    from: u64,
+    text: String,
+}
+
+/// Keep a terminal's local text bounded; the server ring is the real cap.
+const TERM_TEXT_CAP: usize = 128 * 1024;
+
+impl Term {
+    fn absorb(&mut self, chunk: &api::ShellTailChunk) {
+        if chunk.from > self.from && !self.text.is_empty() {
+            self.text.push_str("\n[… output skipped …]\n");
+        }
+        self.text.push_str(&chunk.data);
+        self.from = chunk.end;
+        if self.text.len() > TERM_TEXT_CAP {
+            let cut = self.text.len() - TERM_TEXT_CAP;
+            // Cut on a char boundary; exactness does not matter here.
+            let cut = (cut..self.text.len())
+                .find(|i| self.text.is_char_boundary(*i))
+                .unwrap_or(0);
+            self.text.drain(..cut);
+        }
+    }
+}
+
 /// Yew's `Reducible` over the pure [`ConvState::apply`]: the component holds
 /// one of these, and every event loop holds only its dispatcher — which is
 /// stable across renders and applies each action to the *current* state.
@@ -954,6 +995,16 @@ fn conversation(props: &ConversationProps) -> Html {
     let navigator = use_navigator().unwrap();
     // Unread messages that arrived while this tab was in the background.
     let unread: Rc<RefCell<u32>> = use_mut_ref(|| 0u32);
+    // The work rail. State the poll task writes lives in refs (see
+    // `PanelBuf`); the mirrored `use_state` copies exist only so render-time
+    // reads and the toggle button stay ordinary Yew.
+    let rail_open = use_state(|| false);
+    let rail_open_ref: Rc<RefCell<bool>> = use_mut_ref(|| false);
+    let term_open = use_state(|| Option::<String>::None);
+    let term_open_ref: Rc<RefCell<Option<String>>> = use_mut_ref(|| None);
+    let panel: Rc<RefCell<PanelBuf>> = use_mut_ref(PanelBuf::default);
+    let panel_rev = use_state(|| 0u64);
+    let term_input = use_node_ref();
 
     // Ask once, on the way in, so the first message that names someone can
     // actually reach them.
@@ -1130,6 +1181,86 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
+    // The work rail's poll: the shells list every tick while the rail is
+    // open, plus the opened terminal's scrollback tail. Polling, not SSE —
+    // the tail is offset-addressed and idempotent, so a fixed cadence is
+    // simple and self-healing, and a closed rail costs nothing.
+    {
+        let panel = panel.clone();
+        let panel_rev = panel_rev.setter();
+        let rail_open_ref = rail_open_ref.clone();
+        let term_open_ref = term_open_ref.clone();
+        let id = props.id.clone();
+        use_effect_with(id, move |id| {
+            let id = id.clone();
+            let alive = Rc::new(std::cell::Cell::new(true));
+            let alive2 = alive.clone();
+            spawn_local(async move {
+                let mut rev = 0u64;
+                while alive2.get() {
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    if !alive2.get() {
+                        break;
+                    }
+                    if !*rail_open_ref.borrow() {
+                        continue;
+                    }
+                    let mut changed = false;
+                    if let Ok(s) =
+                        auth::get::<api::Shells>(&format!("/api/sessions/{id}/shells")).await
+                    {
+                        let mut p = panel.borrow_mut();
+                        if p.shells != s.shells {
+                            p.shells = s.shells;
+                            changed = true;
+                        }
+                    }
+                    let open = term_open_ref.borrow().clone();
+                    if let Some(shell) = open {
+                        let from = panel
+                            .borrow()
+                            .terms
+                            .get(&shell)
+                            .map(|t| t.from)
+                            .unwrap_or(0);
+                        if let Ok(chunk) = auth::get::<api::ShellTailChunk>(&format!(
+                            "/api/sessions/{id}/shells/{shell}?from={from}"
+                        ))
+                        .await
+                            && chunk.end != from
+                        {
+                            panel
+                                .borrow_mut()
+                                .terms
+                                .entry(shell.clone())
+                                .or_default()
+                                .absorb(&chunk);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        rev += 1;
+                        panel_rev.set(rev);
+                    }
+                }
+            });
+            move || alive.set(false)
+        });
+    }
+
+    // Keep an open terminal pinned to its bottom as output lands.
+    {
+        let term_open = (*term_open).clone();
+        use_effect_with((*panel_rev, term_open), move |(_, term_open)| {
+            if let Some(shell) = term_open
+                && let Some(doc) = web_sys::window().and_then(|w| w.document())
+                && let Some(el) = doc.get_element_by_id(&format!("term-body-{shell}"))
+            {
+                el.set_scroll_top(el.scroll_height());
+            }
+        });
+    }
+
     // Slow reconciliation poll: covers anything the feed cannot — a lagged
     // broadcast, entries written by another process. The reducer stands it
     // down while a turn streams (see `ConvAction::Polled`).
@@ -1236,7 +1367,192 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
+    let toggle_rail = {
+        let rail_open = rail_open.clone();
+        let rail_open_ref = rail_open_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            let now = !*rail_open;
+            *rail_open_ref.borrow_mut() = now;
+            rail_open.set(now);
+        })
+    };
+
+    // Jump from a rail row to its kickoff card in the transcript.
+    let jump_to_card = |call_id: String| {
+        Callback::from(move |_: MouseEvent| {
+            if let Some(doc) = web_sys::window().and_then(|w| w.document())
+                && let Some(el) = doc.get_element_by_id(&format!("tool-{call_id}"))
+            {
+                el.scroll_into_view();
+            }
+        })
+    };
+
+    let select_term = |shell: String| {
+        let term_open = term_open.clone();
+        let term_open_ref = term_open_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            let next = if term_open.as_deref() == Some(shell.as_str()) {
+                None
+            } else {
+                Some(shell.clone())
+            };
+            *term_open_ref.borrow_mut() = next.clone();
+            term_open.set(next);
+        })
+    };
+
+    // Take / return the keyboard. The optimistic lock flip makes the border
+    // answer the click; the 1s poll is the truth that heals a failed POST.
+    let set_lock = |shell: String, lock: api::ShellLockMode| {
+        let id = props.id.clone();
+        let panel = panel.clone();
+        let panel_rev = panel_rev.clone();
+        let dispatch = conv.dispatcher();
+        Callback::from(move |_: ()| {
+            {
+                let mut p = panel.borrow_mut();
+                if let Some(s) = p.shells.iter_mut().find(|s| s.id == shell) {
+                    s.lock = lock;
+                }
+            }
+            panel_rev.set(*panel_rev + 1);
+            let id = id.clone();
+            let shell = shell.clone();
+            let dispatch = dispatch.clone();
+            spawn_local(async move {
+                if let Err(e) = auth::post_json::<api::Shell, _>(
+                    &format!("/api/sessions/{id}/shells/{shell}/lock"),
+                    &api::ShellLockRequest { lock },
+                )
+                .await
+                {
+                    dispatch.dispatch(ConvAction::Failed(format!("shell lock: {e}")));
+                }
+            });
+        })
+    };
+
+    let send_term_input = {
+        let id = props.id.clone();
+        let term_input = term_input.clone();
+        let dispatch = conv.dispatcher();
+        move |shell: String| {
+            let id = id.clone();
+            let term_input = term_input.clone();
+            let dispatch = dispatch.clone();
+            Callback::from(move |_: ()| {
+                let Some(field) = term_input.cast::<HtmlInputElement>() else {
+                    return;
+                };
+                let data = field.value();
+                field.set_value("");
+                let id = id.clone();
+                let shell = shell.clone();
+                let dispatch = dispatch.clone();
+                spawn_local(async move {
+                    if let Err(e) = auth::post_json::<api::Shell, _>(
+                        &format!("/api/sessions/{id}/shells/{shell}/input"),
+                        &api::ShellInput {
+                            data: format!("{data}\n"),
+                        },
+                    )
+                    .await
+                    {
+                        dispatch.dispatch(ConvAction::Failed(format!("shell input: {e}")));
+                    }
+                });
+            })
+        }
+    };
+
     let st = &conv.0;
+
+    // The running half of the rail comes straight from the stream buffer:
+    // a card without a result is a call still in flight.
+    let running: Vec<(String, String)> = st
+        .streaming
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::Tool {
+                id,
+                name,
+                result: None,
+                ..
+            } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let rail = if *rail_open {
+        let p = panel.borrow();
+        html! {
+            <aside class="rail">
+                <h2>{ "running" }</h2>
+                { if running.is_empty() { html!{ <div class="empty">{ "nothing in flight" }</div> } }
+                  else { html! { for running.iter().map(|(call_id, name)| html! {
+                    <div class="rail-tool" onclick={jump_to_card(call_id.clone())}>
+                        <span class="tool-disc tool-disc-running">{ "●" }</span>
+                        <span class="tool-name">{ name }</span>
+                    </div>
+                  }) } } }
+                <h2>{ "shells" }</h2>
+                { if p.shells.is_empty() { html!{ <div class="empty">{ "no live shells" }</div> } }
+                  else { html! { for p.shells.iter().map(|shell| {
+                    let opened = term_open.as_deref() == Some(shell.id.as_str());
+                    let user_locked = shell.lock == api::ShellLockMode::User;
+                    let head = html! {
+                        <div class="term-head" onclick={select_term(shell.id.clone())}
+                             ondblclick={ let take = set_lock(shell.id.clone(), api::ShellLockMode::User);
+                                          Callback::from(move |_: MouseEvent| take.emit(())) }>
+                            <span class={ if shell.running { "tool-disc tool-disc-running" }
+                                          else { "tool-disc tool-disc-ok" } }>{ "●" }</span>
+                            <span class="tool-name">{ &shell.id }</span>
+                            <span class="dim">{ &shell.cmdline }</span>
+                            <span class="lock-badge">
+                                { if user_locked { "⌨ yours" } else { "⌨ agent" } }
+                            </span>
+                        </div>
+                    };
+                    if !opened {
+                        return html! { <div class={ classes!("term", user_locked.then_some("term-user")) }>{ head }</div> };
+                    }
+                    let text = p.terms.get(&shell.id).map(|t| t.text.clone()).unwrap_or_default();
+                    let on_key = {
+                        let send = send_term_input(shell.id.clone());
+                        let release = set_lock(shell.id.clone(), api::ShellLockMode::Assistant);
+                        Callback::from(move |e: KeyboardEvent| {
+                            if e.key() == "Enter" {
+                                e.prevent_default();
+                                send.emit(());
+                            } else if e.key() == "Escape" {
+                                e.prevent_default();
+                                release.emit(());
+                            }
+                        })
+                    };
+                    html! {
+                        <div class={ classes!("term", user_locked.then_some("term-user")) }>
+                            { head }
+                            <pre id={format!("term-body-{}", shell.id)} class="term-body">{ text }</pre>
+                            { if user_locked { html! {
+                                <div class="term-input-row">
+                                    <input ref={term_input.clone()} type="text"
+                                           placeholder="type into the shell (Enter sends · Esc hands the keyboard back)"
+                                           onkeydown={on_key} />
+                                </div>
+                            } } else { html! {
+                                <div class="term-hint">{ "double-click the title to take the keyboard" }</div>
+                            } } }
+                        </div>
+                    }
+                  }) } } }
+            </aside>
+        }
+    } else {
+        html! {}
+    };
+
     html! {
         <div class="app">
             <div class="topbar">
@@ -1247,9 +1563,13 @@ fn conversation(props: &ConversationProps) -> Html {
                     <button class="linkish" onclick={toggle_verbose}>
                         { if *verbose { "· concise" } else { "· verbose" } }
                     </button>
+                    <button class="linkish" onclick={toggle_rail}>
+                        { if *rail_open { "· hide work" } else { "· work" } }
+                    </button>
                     { whoami_line(&who) }
                 </div>
             </div>
+            <div class="pane-row">
             <div class="pane" ref={pane} onscroll={on_scroll}>
                 <div class="column">
                 { render_transcript(&st.entries, &st.streaming, *verbose,
@@ -1259,25 +1579,28 @@ fn conversation(props: &ConversationProps) -> Html {
                 } } else { html!{} } }
                 </div>
             </div>
+            { rail }
+            </div>
             <div class="composer">
                 <div class="column">
-                    <textarea ref={input} rows="3" onkeydown={on_keydown}
+                    <textarea ref={input} rows="2" onkeydown={on_keydown}
                               placeholder={if st.shared {
                                   "message the room (@myco to ask the agent)"
                               } else {
                                   "message (Enter to send, Shift+Enter for a newline)"
                               }} />
                     <div class="actions">
-                        <button class="send" onclick={on_send}>{ "send" }</button>
-                        { if st.busy {
-                            html! { <button onclick={on_cancel}>{ "cancel" }</button> }
-                        } else { html!{} } }
                         { if st.shared { html! {
                             <span class="dim hint">
                                 { "shared session · the agent replies when you say " }
                                 <span class="mention">{ "@myco" }</span>
                             </span>
                         } } else { html!{} } }
+                        <span class="spacer"></span>
+                        <button class="send" onclick={on_send}>{ "send" }</button>
+                        { if st.busy {
+                            html! { <button onclick={on_cancel}>{ "cancel" }</button> }
+                        } else { html!{} } }
                     </div>
                 </div>
             </div>

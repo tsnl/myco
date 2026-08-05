@@ -76,32 +76,108 @@
       /* Every band shares one centered column, so the page reads as a
          single centered transcript rather than a left-aligned wall. */
       .column { width: 100%; max-width: 84ch; margin: 0 auto; }
-      /* Input bar, after honk: the field fills the width, sits on a
-         transparent ground with a soft border, and lifts off the transcript
-         with a shadow. Enter submits, so the send button stays hidden. */
+      /* Input bar, after honk: the field fills the whole column width and
+         lifts off the transcript with a shadow. Everything else — the room
+         hint, the cancel affordance — lives on a slim status line *below*
+         the field, so nothing competes with it for width. Enter submits, so
+         the send button stays hidden. */
       .composer {
         flex: none; border-top: 1px solid var(--line);
         padding: 0.5rem 1rem;
         box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.45);
       }
       .composer .column {
-        display: flex; flex-direction: row; align-items: stretch; gap: 0.5rem;
+        display: flex; flex-direction: column; gap: 0.3rem;
       }
       .composer textarea {
-        /* `min-width: 0` lets a flex item shrink below its intrinsic `cols`
-           width; without it the field keeps its 20-column default. */
-        flex: 1 1 auto; min-width: 0;
+        width: 100%;
         background: transparent; color: var(--fg); font: inherit;
         border: 1px solid #3a3a3a; border-radius: 8px;
         padding: 0.5rem 0.6rem; resize: none; outline: none;
+        /* Grow with the draft where supported (Chromium); the rows
+           attribute is the graceful floor elsewhere. */
+        field-sizing: content;
+        min-height: 2.4em; max-height: 30vh;
       }
       .composer textarea::placeholder { color: var(--fg-dim); }
       .composer textarea:focus {
         border-color: var(--fg-dim);
         box-shadow: 0 0 2px var(--fg);
       }
-      .actions { display: flex; align-items: center; gap: 0.4rem; }
+      /* The line under the field: hint text left, controls right. Kept at a
+         fixed slim height so the composer does not jump when the hint or the
+         cancel button appears. */
+      .actions {
+        display: flex; align-items: center; gap: 0.4rem;
+        min-height: 1.5em; font-size: 0.85em;
+      }
       .actions .send { display: none; }
+      .actions .spacer { flex: 1 1 auto; }
+      .hint { margin-left: 0; }
+
+      /* The work rail: running tools and live shells, beside the transcript.
+         Collapsible; when open it owns a fixed width and its own scroll. */
+      .pane-row { flex: 1 1 auto; min-height: 0; display: flex; }
+      .pane-row .pane { flex: 1 1 auto; min-width: 0; }
+      .rail {
+        flex: none; width: 24rem; min-height: 0; overflow-y: auto;
+        border-left: 1px solid var(--line);
+        padding: 0.5rem 0.75rem;
+      }
+      .rail h2 {
+        color: var(--fg-dim); font-weight: bold; letter-spacing: 0.08em;
+        margin: 0.6rem 0 0.3rem; font-size: 0.85em; text-transform: uppercase;
+      }
+      .rail h2:first-child { margin-top: 0; }
+      .rail .empty { color: var(--fg-dim); font-size: 0.9em; }
+      /* One running tool call, mirroring its transcript card in miniature.
+         Clicking jumps to the kickoff card. */
+      .rail-tool {
+        display: flex; align-items: baseline; gap: 0.4rem;
+        border: 1px solid var(--line); border-radius: 6px;
+        background: var(--bg-raised);
+        padding: 0.25rem 0.5rem; margin: 0.25rem 0; cursor: pointer;
+        overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+      }
+      .rail-tool:hover { border-color: #666; }
+
+      /* A shell terminal. The border is the lock indicator: green while the
+         user holds the keyboard, the tool colour while the agent does. */
+      .term {
+        border: 1px solid var(--tool); border-radius: 6px;
+        margin: 0.35rem 0; overflow: hidden;
+        background: #0b0b0b;
+      }
+      .term-user { border-color: var(--user); box-shadow: 0 0 4px rgba(111, 194, 111, 0.35); }
+      .term-head {
+        display: flex; align-items: baseline; gap: 0.4rem;
+        padding: 0.25rem 0.5rem; cursor: pointer;
+        border-bottom: 1px solid var(--line-soft);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .term-head .lock-badge {
+        margin-left: auto; font-size: 0.8em; color: var(--fg-dim);
+      }
+      .term-user .term-head .lock-badge { color: var(--user); }
+      .term-body {
+        max-height: 40vh; overflow-y: auto;
+        padding: 0.3rem 0.5rem; font-size: 0.9em;
+        /* Terminal text is preformatted but must never widen the rail. */
+        white-space: pre-wrap; word-break: break-word;
+        user-select: text;
+      }
+      .term-input-row {
+        display: flex; border-top: 1px solid var(--line-soft);
+      }
+      .term-input-row input {
+        flex: 1 1 auto; min-width: 0;
+        background: transparent; color: var(--fg); font: inherit;
+        border: 0; outline: none; padding: 0.3rem 0.5rem;
+      }
+      .term-hint {
+        padding: 0.25rem 0.5rem; color: var(--fg-dim); font-size: 0.8em;
+        border-top: 1px solid var(--line-soft);
+      }
 
       /* Session browser */
       .browser { padding: 1rem; }
