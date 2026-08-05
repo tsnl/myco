@@ -1720,51 +1720,35 @@ name = "myco"
 version = "0.4.0-dev"
 dependencies = [
  "async-trait",
+ "atomic-write-file",
+ "base64",
+ "chrono",
  "clap",
+ "dirs",
  "dotenvy",
  "futures",
+ "hmac",
+ "infer",
  "libc",
- "myco-agent",
+ "myco",
  "myco-api",
- "myco-auth",
- "myco-config",
- "myco-core",
- "myco-machines",
- "myco-models",
- "myco-prompts",
- "myco-session",
- "myco-test-support",
+ "pbkdf2",
+ "rand 0.9.5",
  "reqwest",
  "rocket",
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "myco-agent"
-version = "0.4.0-dev"
-dependencies = [
- "chrono",
- "futures",
- "myco-api",
- "myco-config",
- "myco-core",
- "myco-machines",
- "myco-models",
- "myco-prompts",
- "myco-session",
- "myco-test-support",
- "serde",
- "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml",
+ "url",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -1776,66 +1760,6 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "myco-auth"
-version = "0.4.0-dev"
-dependencies = [
- "base64",
- "chrono",
- "hmac",
- "myco-api",
- "myco-core",
- "myco-test-support",
- "pbkdf2",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
-]
-
-[[package]]
-name = "myco-config"
-version = "0.4.0-dev"
-dependencies = [
- "chrono",
- "dirs",
- "dotenvy",
- "futures",
- "myco-api",
- "myco-core",
- "myco-models",
- "myco-prompts",
- "myco-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "myco-core"
-version = "0.4.0-dev"
-dependencies = [
- "atomic-write-file",
- "base64",
- "chrono",
- "dirs",
- "futures",
- "infer",
- "myco-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]
@@ -1855,113 +1779,6 @@ dependencies = [
  "web-sys",
  "yew",
  "yew-router",
-]
-
-[[package]]
-name = "myco-machines"
-version = "0.4.0-dev"
-dependencies = [
- "chrono",
- "dirs",
- "futures",
- "libc",
- "myco-api",
- "myco-config",
- "myco-core",
- "myco-models",
- "myco-prompts",
- "myco-session",
- "myco-test-support",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "uuid",
- "vt100",
-]
-
-[[package]]
-name = "myco-models"
-version = "0.4.0-dev"
-dependencies = [
- "base64",
- "chrono",
- "dirs",
- "futures",
- "myco-api",
- "myco-config",
- "myco-core",
- "myco-prompts",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "myco-prompts"
-version = "0.4.0-dev"
-dependencies = [
- "chrono",
- "dirs",
- "futures",
- "myco-core",
- "myco-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "myco-session"
-version = "0.4.0-dev"
-dependencies = [
- "atomic-write-file",
- "base64",
- "chrono",
- "dirs",
- "futures",
- "libc",
- "myco-api",
- "myco-config",
- "myco-core",
- "myco-prompts",
- "myco-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "myco-test-support"
-version = "0.4.0-dev"
-dependencies = [
- "chrono",
- "futures",
- "myco-api",
- "myco-core",
- "myco-models",
- "myco-session",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
 ]
 
 [[package]]

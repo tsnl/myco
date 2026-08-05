@@ -145,7 +145,7 @@ async fn authed(base: &str) -> Result<HttpClient, String> {
 }
 
 fn server_log_path() -> std::path::PathBuf {
-    myco_core::data_root()
+    crate::core::data_root()
         .map(|d| d.join("serve.log"))
         .unwrap_or_else(|_| std::path::PathBuf::from("myco-serve.log"))
 }

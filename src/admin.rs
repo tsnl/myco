@@ -11,8 +11,8 @@
 
 use std::io::Write as _;
 
-use myco_auth::{AuthStore, MIN_PASSWORD_LEN};
-use myco_config::Config;
+use crate::auth::{AuthStore, MIN_PASSWORD_LEN};
+use crate::config::Config;
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum AuthCommand {
