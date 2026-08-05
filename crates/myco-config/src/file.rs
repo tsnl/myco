@@ -56,6 +56,28 @@ pub struct GatewayEntry {
     /// Credential (see [`AuthEntry`]). Absent → no auth header.
     #[serde(default)]
     pub auth: Option<AuthEntry>,
+    /// Transient-failure retry knobs (see [`RetryEntry`]). Retry behavior is
+    /// a property of the *endpoint* — a flaky local proxy wants patience an
+    /// official API does not need — which is why it sits on the gateway.
+    #[serde(default)]
+    pub retry: Option<RetryEntry>,
+}
+
+/// `[gateways.NAME.retry]` / `[models.KEY.retry]`: transient-failure retry
+/// knobs, each overlaying the built-in default individually — setting one
+/// does not silently reset the others.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryEntry {
+    /// Total attempts including the first; `1` disables retry.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub initial_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub backoff_multiplier: Option<f64>,
 }
 
 /// `[models.KEY]`: one catalog entry. `gateway` pulls `protocol` / `base_url`
@@ -91,6 +113,11 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub max_image_base64_bytes: Option<u64>,
+    /// Retry override (see [`RetryEntry`]). Like `auth`, the model's table
+    /// replaces the gateway's wholesale — a field unset here falls back to
+    /// the built-in default, not to the gateway's value.
+    #[serde(default)]
+    pub retry: Option<RetryEntry>,
 }
 
 /// The `auth` value on a gateway or model entry.
