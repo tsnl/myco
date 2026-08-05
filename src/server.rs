@@ -401,6 +401,7 @@ impl Server {
         )?;
         let mut agent = Agent::new(model, harness.clone(), sink);
         agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
+        agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
         agent.set_model_key(catalog_model.spec.key.clone());
         let restored = active.snapshot();
         let room = Arc::new(std::sync::Mutex::new(Room::seeded(&restored.entries)));

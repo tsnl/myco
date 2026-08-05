@@ -142,6 +142,14 @@ pub type PendingInput = Box<dyn Fn() -> Vec<Entry> + Send + Sync>;
 /// and records a synthetic cancelled result.
 const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The user turn sent to resume a reply that `max_tokens` cut off mid-text.
+///
+/// A plain "Continue" invites the model to acknowledge the instruction or start
+/// the thought over; naming the requirement keeps the seam invisible in the
+/// finished answer.
+const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
+     and do not acknowledge this message.";
+
 pub struct Agent {
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
@@ -157,6 +165,9 @@ pub struct Agent {
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
+    /// Consecutive `max_tokens` resumes allowed within one turn, from the
+    /// active model's `max_truncated_resumes`.
+    max_truncated_resumes: u32,
     checkpoint: Option<HistoryCheckpoint>,
     pending_input: Option<PendingInput>,
 }
@@ -185,6 +196,7 @@ impl Agent {
             model_key: String::new(),
             last_usage: None,
             context_window_tokens: 200_000,
+            max_truncated_resumes: 3,
             checkpoint: None,
             pending_input: None,
         }
@@ -279,6 +291,12 @@ impl Agent {
         self.context_window_tokens
     }
 
+    /// Set how many consecutive `max_tokens` truncations one turn resumes
+    /// through (the active model's `max_truncated_resumes`; `0` never resumes).
+    pub fn set_max_truncated_resumes(&mut self, resumes: u32) {
+        self.max_truncated_resumes = resumes;
+    }
+
     /// Last observed prompt/context token usage (from the provider), if any.
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.last_usage
@@ -334,6 +352,8 @@ impl Agent {
         // tool round-trip); each new report's input side already covers the
         // whole prompt, so it replaces rather than adds.
         let mut turn_output: u64 = 0;
+        // Consecutive `max_tokens` stops, capped by `max_truncated_resumes`.
+        let mut truncations: u32 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -401,7 +421,8 @@ impl Agent {
             // tool_use nothing responds to makes the whole history unsendable
             // (every later request resends it), which strands the session on the
             // provider's "tool_use without tool_result" error.
-            if !tool_uses.is_empty() {
+            let answered_tool_calls = !tool_uses.is_empty();
+            if answered_tool_calls {
                 // Dispatch every tool use in this turn concurrently. join_all preserves
                 // input order so tool_results[i] matches tool_uses[i]; events may
                 // interleave freely while tools run. Each tool races against cancel so
@@ -424,9 +445,40 @@ impl Agent {
                 }
             }
 
-            // `tool_use` is the only stop that continues the turn; everything
+            // Consecutive-truncation guard; any clean stop clears it.
+            if matches!(reason, TurnEndReason::MaxTokens) {
+                truncations += 1;
+            } else {
+                truncations = 0;
+            }
+
+            // A `max_tokens` stop resumes rather than ending the turn: without
+            // this an overnight run stops mid-task, holding tool results nobody
+            // read or a sentence that breaks off mid-word.
+            let resume_truncated = matches!(reason, TurnEndReason::MaxTokens)
+                && truncations <= self.max_truncated_resumes;
+
+            // How it resumes depends on what the truncated turn left behind. A
+            // turn that carried tool calls already ends on their results, so the
+            // next request is an ordinary continuation. Truncated *text* ends on
+            // the assistant's own cut-off message, and re-sending that is the
+            // prefill shape current Anthropic models reject outright — so ask
+            // for the rest in a user turn, the one continuation every provider
+            // accepts. It is a real message: the provider is sent it, and the
+            // transcript shows it, attributed to the runtime.
+            if resume_truncated && !answered_tool_calls {
+                self.history.push(Entry::user(
+                    Author::System,
+                    vec![Content::Text {
+                        text: CONTINUE_PROMPT.to_string(),
+                    }],
+                ));
+                self.emit_checkpoint();
+            }
+
+            // `tool_use` is the other stop that continues the turn; everything
             // else hands control back with whatever the model managed to say.
-            if !matches!(reason, TurnEndReason::ToolUse) {
+            if !matches!(reason, TurnEndReason::ToolUse) && !resume_truncated {
                 self.sink.emit(AgentEvent::TurnFinished {
                     context: self.context.clone(),
                 });
@@ -1142,12 +1194,13 @@ mod tests {
     /// `tool_use`, but the tool_use block is still in the assistant message
     /// (typically with `input: {}` — the arguments never streamed). Tool calls
     /// are answered on their presence, not on the stop reason, because providers
-    /// reject any later request carrying a tool_use with no matching tool_result:
-    /// leaving it unanswered fails the very next user message, and every one
-    /// after it. Here the truncated call reaches the real bash tool, which
-    /// rejects the empty input — an error result, but a well-formed turn.
+    /// reject any later request carrying a tool_use with no matching tool_result.
+    /// Here the truncated call reaches the real bash tool, which rejects the
+    /// empty input — an error result, but a well-formed turn — and the turn
+    /// then *resumes*: the results already continue the conversation, so the
+    /// next generate reads them without any synthetic user message.
     #[tokio::test]
-    async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use() {
+    async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use_and_resumes() {
         // The standard local services include the real bash tool.
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![
@@ -1171,18 +1224,21 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent
+        let reply = agent
             .interact(
                 test_author(),
                 vec![Content::Text { text: "hi".into() }],
                 myco_core::CancelToken::new(),
             )
             .await
-            .expect("turn should return the partial answer, not an error");
+            .expect("the resumed turn should return the full answer");
+        assert!(matches!(&reply[0], Content::Text { text } if text == "ok"));
 
-        // user + assistant(tool_use) + tool_results — the tool_use is answered.
-        assert_eq!(agent.history().len(), 3);
-        match &agent.history()[2] {
+        // user + assistant(tool_use) + tool_results + assistant(end) — the
+        // dangling tool_use is answered and the same turn read the answer.
+        let history = agent.history();
+        assert_eq!(history.len(), 4, "history={history:?}");
+        match &history[2] {
             Entry {
                 body:
                     EntryBody::ToolResults {
@@ -1198,20 +1254,131 @@ mod tests {
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
+        assert!(matches!(history[3].body, EntryBody::Agent { .. }));
+    }
 
-        // And the session continues: the next turn generates against a history
-        // the provider accepts, instead of failing on the dangling tool_use.
-        let reply = agent
+    /// Truncated *text* ends on the assistant's own cut-off message — the
+    /// prefill shape providers reject — so the resume rides a real user turn
+    /// carrying the continue prompt, attributed to the runtime.
+    #[tokio::test]
+    async fn max_tokens_without_tool_calls_resumes_with_a_continue_turn() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "the answer begins".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::MaxTokens,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "and ends".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
             .interact(
                 test_author(),
-                vec![Content::Text {
-                    text: "Continue".into(),
-                }],
+                vec![Content::Text { text: "go".into() }],
                 myco_core::CancelToken::new(),
             )
             .await
-            .expect("follow-up turn should succeed");
-        assert!(matches!(&reply[0], Content::Text { text } if text == "ok"));
+            .expect("resumed turn succeeds");
+
+        // user + assistant(truncated) + user(continue) + assistant(end).
+        let history = agent.history();
+        assert_eq!(history.len(), 4, "history={history:?}");
+        match &history[2] {
+            Entry {
+                author: Author::System,
+                body: EntryBody::User { content },
+                ..
+            } => {
+                assert!(
+                    matches!(&content[0], Content::Text { text } if text == CONTINUE_PROMPT),
+                    "content={content:?}"
+                );
+            }
+            other => panic!("expected the runtime's continue turn, got {other:?}"),
+        }
+    }
+
+    /// The resume is bounded: a model that hits `max_tokens` every time gets
+    /// `max_truncated_resumes` continuations and then the turn ends with what
+    /// it managed, leaving the rest of the script unconsumed.
+    #[tokio::test]
+    async fn consecutive_max_tokens_resumes_are_bounded() {
+        const CAP: u32 = 2;
+        let truncated = |text: &str| GenerateOutput {
+            content: vec![Content::Text { text: text.into() }],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::MaxTokens,
+            usage: None,
+        };
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            truncated("a"),
+            truncated("b"),
+            truncated("c"),
+            truncated("never read"),
+        ]);
+        let script = model.clone();
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent.set_max_truncated_resumes(CAP);
+        agent
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "go".into() }],
+                myco_core::CancelToken::new(),
+            )
+            .await
+            .expect("bounded resume still returns the partial answer");
+        assert_eq!(script.remaining(), 1, "the cap stops the fourth generate");
+    }
+
+    /// `max_truncated_resumes = 0` is the opt-out: the partial answer comes
+    /// back exactly as it did before resumes existed.
+    #[tokio::test]
+    async fn zero_max_truncated_resumes_hands_back_the_partial_answer() {
+        let harness = Harness::local_with_services(vec![]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "partial".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::MaxTokens,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![Content::Text {
+                    text: "never read".into(),
+                }],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let script = model.clone();
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent.set_max_truncated_resumes(0);
+        let reply = agent
+            .interact(
+                test_author(),
+                vec![Content::Text { text: "go".into() }],
+                myco_core::CancelToken::new(),
+            )
+            .await
+            .expect("turn returns the partial answer");
+        assert!(matches!(&reply[0], Content::Text { text } if text == "partial"));
+        assert_eq!(agent.history().len(), 2);
+        assert_eq!(script.remaining(), 1);
     }
 
     /// A turn that ends cleanly with no tool calls gains no ToolResults message.
