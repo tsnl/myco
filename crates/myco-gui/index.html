@@ -160,6 +160,19 @@
       .tool-head:hover { background: #1c1c1c; }
       .tool-caret { color: var(--fg-dim); width: 1ch; }
       .tool-name { color: var(--tool); font-weight: bold; }
+
+      /* Status at a glance: one disc, three states. Colour is the fast signal
+         and the disc carries a title so it is not the only one. */
+      .tool-disc { width: 1ch; line-height: 1; }
+      .tool-disc-ok { color: var(--user); }
+      .tool-disc-failed { color: var(--err); }
+      .tool-disc-running { color: #fff; animation: tool-pulse 1s steps(1) infinite; }
+      @keyframes tool-pulse { 50% { opacity: 0.15; } }
+      /* A blinking element is exactly what vestibular and attention-related
+         motion sensitivity settings ask us to drop; the colour still reads. */
+      @media (prefers-reduced-motion: reduce) {
+        .tool-disc-running { animation: none; opacity: 0.6; }
+      }
       /* Pushed right, revealed on hover: present when wanted, quiet otherwise. */
       .tool-toggle {
         margin-left: auto; color: var(--fg-dim); font-size: 0.85em;
