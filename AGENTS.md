@@ -4,15 +4,19 @@ Guidance for humans and coding agents working on **myco**.
 
 ## Premise
 
-**myco** is a multi-host coding agent: one interactive process (model + harness +
-conversation) drives tools on an always-on **local** host (in-process) and on
-optional **remote** hosts (`ssh … myco --mode host` over NDJSON).
+**myco** is a multi-host coding agent: one **server** (`myco --mode serve`)
+runs sessions (model + harness + conversation) and drives tools on an
+always-on **local** host (in-process) and on optional **remote** hosts
+(`ssh … myco --mode host` over NDJSON). Everything else is a client of its
+REST API: the Yew web GUI, `myco -p`, `clients/myco.py`, and the agent's own
+nested tools.
 
 Primary goal: a **personal daily driver** that can replace Claude Code / Codex /
-OpenCode-class workflows — long sessions you trust, real computer use, and one
-conversation across machines. Multi-host execution and nested-agent orchestration
-(myco driving myco over bash sessions) are the product wedge; cluster/GUI work must not outrank CLI trust and long-session
-viability (`TODO.md`).
+OpenCode-class workflows — long sessions you trust, real computer use, one
+conversation across machines, and shared sessions where people and the agent
+work the same shells. Multi-host execution and nested-agent orchestration (the
+`subagent` tool) are the product wedge; feature work must not outrank session
+trust and long-session viability (`TODO.md`).
 
 This is **not** an educational textbook repo (unlike resin/unit). Prefer clarity
 and minimalism, but optimize for a tool people run every day, not for teaching
@@ -26,7 +30,7 @@ When goals conflict, rank them:
    no silent corruption on long runs.
 2. **Simplicity** — minimum code that solves the real problem.
 3. **Operability** — agents and humans can diagnose hosts, config, and failures
-   (the on-disk manual, `/hosts`, clear errors).
+   (clear errors that name the config path, host, or session).
 4. **Features / cleverness / premature generality** — last.
 
 A plainer design that stays reliable beats a flexible one that hangs, desyncs
@@ -39,8 +43,8 @@ hosts, or lies about resume.
 - No speculative abstraction, no config for futures that may never ship, no
   error taxonomies for impossible cases.
 - No features beyond what was asked in the task at hand.
-- Prefer one honest limitation (document it in the manual / `TODO.md`) over a
-  half-working generality.
+- Prefer one honest limitation (document it at the site and in `TODO.md`)
+  over a half-working generality.
 - When in doubt: cut it, inline it, or simplify it.
 
 ## Writing for the reader
@@ -59,47 +63,46 @@ hosts, or lies about resume.
   `local` in-process or remote worker) over “machine/node/target” in code,
   config, tool schemas, and CLI. User-facing marketing may say “machines”;
   the domain word is still `host`.
-- **Manual articles** (`src/manual/articles/`) are the runtime contract for
-  agents: startup copies them to `~/.myco/manual/<version>/<commit>/` and the
-  system prompt sends agents there to read and `rg` them (also
-  `myco --help <id>`). Keep them accurate when behavior changes.
 - **Tests are claims.** Prefer names that state the invariant
   (`cancel_during_slow_tool_records_cancelled_result`, not `test_cancel_1`).
 
 ## Architecture (current)
 
 ```
-myco (interactive) / Agent
-  └── Harness (routing, config, root-only services)
-        ├── HostController "local"  → in-process HostWorker (always on)
-        └── HostController "…"      → ssh … myco --mode host (lazy remote)
-              └── standard tools: bash, editor, view_image
+myco --mode serve  (the server: Rocket /api + one agent task per live session)
+  └── Server / Live sessions / Room (multiplayer inbox)
+        └── Agent (turn loop) → Harness (routing, root-only services)
+              ├── HostController "local"  → in-process HostWorker (always on)
+              └── HostController "…"      → ssh … myco --mode host (lazy remote)
+                    └── standard tools: bash, editor, view_image
+clients: myco-gui (Yew) · myco -p · clients/myco.py · agent tools via $MYCO_API
 ```
 
-Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
-bash session on the **local** host (piped stdin/stdout; wrap/color auto-off),
-passing `--parent-session <supervisor session id>` so the child's session is
-hidden and linked, and reads turns off the `USER n/m` headers — or runs
-`myco -p "<task>" --parent-session <id>` for a one-shot turn (answer on stdout,
-exit is the boundary). Nesting is local-only by doctrine: brains (config, keys,
-gateway access, session store) stay on the user's machine; remotes stay hands.
+Nested agents are the root-only `subagent` tool: one call runs one full turn
+of a hidden child session through the same `Server` and returns its answer;
+children surface in the GUI's work panel and can be taken over by a person.
+Nesting is local-only by doctrine: brains (config, keys, gateway access,
+session store) stay on the server's machine; remotes stay hands.
+
+Three crates — `myco` (everything server-side), `myco-api` (wire types, the
+`MycoApi` trait; wasm-safe), `myco-gui` (Yew client) — plus
+`clients/myco.py`. Inside `myco`:
 
 | Area | Role |
 |------|------|
-| `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
-| `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
-| `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
-| `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/agent/` | The agent runtime: one turn driven to completion (`Agent::interact`), the `AgentEvent` / `EventSink` stream, and the `/compact` worker |
-| `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
-| `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
-| `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
-| `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
-| `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
-| `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + prelude / project-guidance injection + the session stamp carried by a session's first user message |
-| `src/tui/` | The whole rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks, the streaming markdown renderer (`markdown/`), and section/transcript layout + `Palette` (`transcript.rs`) that live output and replay share |
-| `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
+| `src/main.rs` | The binary: `--mode serve` (the server), `--mode host` (worker), `-p` (thin one-shot HTTP client) |
+| `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, `myco_home()`/`atomically_write()`, and the external-command registry |
+| `src/models/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `src/config/` | Config file shape (`~/.myco/v2/config.toml`) + startup resolution; roster (`server.toml`) |
+| `src/session/` | Session persistence only: documents under `~/.myco/v2/`, the single-writer lock, and the compaction *document* logic |
+| `src/prompts/` | System prompt fragments + prelude / project-guidance injection + the session stamp |
+| `src/machines/` | The hands: `Harness` (host pool), `HostController`/`HostWorker` + NDJSON protocol (tool calls **and** the shell observer surface), every `ToolService` (bash with pty/screen/locks, editor, view_image) |
+| `src/agent/` | The turn loop: `Agent::interact`, `AgentEvent`/`EventSink`, cancellation, the compact worker |
+| `src/auth/` | Credentials and access tokens behind the OAuth2 password grant |
+| `src/server.rs` | The session runtime: `Live` handles, the `Room` (multiplayer + pre-emption), shells/subagent surfaces, `UserApi` (the `MycoApi` impl) |
+| `src/web.rs` | Rocket adapter: REST one-liners over `MycoApi`, SSE events, the shell WebSocket, operator token |
+| `src/cli.rs`, `src/client.rs`, `src/admin.rs`, `src/subagent.rs` | The `-p` client; `MycoApi` over HTTP; `myco auth`; the `subagent` tool |
+| `tests/` | Integration tests (multiplayer, shells, subagents, cancel, host desync, …) |
 
 **Invariants worth protecting**
 
@@ -107,25 +110,29 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   subprocess for the default host.
 - **Remotes are lazy** — connect on first tool use; soft-fail non-default hosts.
 - **Standard tool catalog is the same on every host**; root-only tools
-  (`session_meta`, `prelude`) are installed only on the in-process local worker.
+  (`session_meta`, `subagent`, `prelude`) are installed only on the in-process
+  local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
   (and per agent id).
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
-- **Builds are offline** beyond the crates.io fetch — `build.rs` shells out to
-  local `git` for the commit that keys the manual export and does nothing else;
-  no network at compile time. Ship platform-matched binaries; do not scp across
-  glibc/arch boundaries.
+- **Builds are offline** beyond the crates.io fetch; no network at compile
+  time. Ship platform-matched binaries; do not scp across glibc/arch
+  boundaries.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
-  `manual` → `prompts` → `session` → `tool_services` → `host` → `harness` →
-  `agent` → `tui`. A module reaching *up* that list is the smell; the fix is
-  usually that the shared thing belongs lower down (`myco_home` in `core`, not
-  `session`) or that the caller wants data instead of rendering
-  (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
-  reach anywhere — test setup composes real layers on purpose.
+- **The module graph is acyclic.** Bottom-up: `core` → `models` → `config` →
+  `session` → `prompts` → `machines` → `agent` → `server` → `web`/`cli`. A
+  module reaching *up* that list is the smell; the fix is usually that the
+  shared thing belongs lower down. `#[cfg(test)]` may reach anywhere — test
+  setup composes real layers on purpose.
+- **One keyboard.** Every interactive surface (shells, subagents) shares the
+  lock: writes gated, reads free, every handoff an attributed non-waking
+  transcript note, refusals polite on both sides.
+- **REST is canonical.** SSE and the shell WebSocket are projections of the
+  same `UserApi` guts; a client without them loses latency, not capability.
+  New capabilities land on `MycoApi` + REST first.
 
 ## Code style
 
@@ -158,37 +165,31 @@ Agent workflow defaults (also in system prompt fragments):
 5. **User authority** — never force-merge / admin-bypass checks or land PRs
    without explicit user approval (see prompt fragment `user-authority`).
 
-### Feature work layout
-
-New non-trivial features: dedicated git worktree + branch under the repo’s
-`.myco/worktrees/{branch-slug}/` (see prompt fragment `worktrees`). Register the
-worktree on the session with `session_meta` `add_link`. Skip worktrees only for
-tiny one-liners or when the user asks to edit the current checkout.
-
 ## Develop
 
 ```bash
 cargo build --locked
-cargo test --locked --lib
-cargo test --locked --test integration_test   # and other tests/ binaries as needed
-cargo run --locked --bin myco
+cargo test --locked                      # whole suite; no network, no providers
+cargo clippy --workspace --all-targets   # zero warnings is the bar
+cargo clippy -p myco-gui --target wasm32-unknown-unknown
+cargo run -p myco -- --mode serve        # then `trunk serve` for the GUI
 ```
 
-- API credentials: see `README.md` / `myco --help overview` (Anthropic +
-  xAI/OpenAI Responses env vars; `.env` loaded at startup).
-- Runtime docs for agents: `~/.myco/manual/<version>/<commit>/` (written at
-  startup) or `myco --help overview|cli|harness-ops`.
+- API credentials: `~/.myco/v2/config.toml` (`[gateways]` auth sources); see
+  `README.md`.
+- A guided reading of the whole codebase: `TOUR.md`.
 
 ## What not to do
 
 - Don’t rename the **host** domain (`host` tool field, `--mode host`,
-  `/hosts`, `src/host/`) for cosmetic synonyms without an
-  explicit, breakage-aware migration plan.
+  `src/machines/host/`) for cosmetic synonyms without an explicit,
+  breakage-aware migration plan.
 - Don’t scp prebuilt `myco` binaries across mismatched OS/arch/libc; build on
   the target or use a matching asset (`harness-ops`).
-- Don’t treat `/resume` as full workspace restore.
-- Don’t edit `~/.myco/session/*.json` by hand from the agent — use
-  `session_meta`.
+- Don’t treat reopening a session as full workspace restore (bash/editor
+  state dies with the agent task).
+- Don’t edit `~/.myco/v2/*.json` by hand from the agent — use `session_meta`
+  or the API.
 - Don’t force-merge PRs, bypass branch protection/required checks, or use
   admin privileges to override the user’s review workflow without explicit
   approval in the conversation.

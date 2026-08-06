@@ -73,6 +73,10 @@ pub struct ConvState {
     pub model: String,
     /// Per-session effort override; `None` renders as the model's default.
     pub effort: Option<String>,
+    /// Context tokens in use after the most recent turn, when known.
+    pub context_tokens: Option<u64>,
+    /// The model's context window (the meter's denominator).
+    pub context_window: Option<u64>,
 }
 
 impl ConvState {
@@ -87,6 +91,8 @@ impl ConvState {
             shared: false,
             model: String::new(),
             effort: None,
+            context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -145,6 +151,8 @@ pub enum ConvAction {
     Configured {
         model: String,
         effort: Option<String>,
+        context_tokens: Option<u64>,
+        context_window: Option<u64>,
     },
     Failed(String),
 }
@@ -218,6 +226,9 @@ impl ConvState {
                 reconcile(&mut self.entries, poll.entries);
                 self.streaming.clear();
                 self.busy = poll.busy;
+                if poll.context_tokens.is_some() {
+                    self.context_tokens = poll.context_tokens;
+                }
                 if poll.last_error.is_some() {
                     self.error = poll.last_error;
                 }
@@ -232,11 +243,23 @@ impl ConvState {
                         .retain(|a| !entries.iter().any(|e| e.at == a.at));
                 }
                 self.busy = poll.busy;
+                if poll.context_tokens.is_some() {
+                    self.context_tokens = poll.context_tokens;
+                }
             }
             ConvAction::Sent { busy } => self.busy = busy,
-            ConvAction::Configured { model, effort } => {
+            ConvAction::Configured {
+                model,
+                effort,
+                context_tokens,
+                context_window,
+            } => {
                 self.model = model;
                 self.effort = effort;
+                self.context_window = context_window;
+                if context_tokens.is_some() {
+                    self.context_tokens = context_tokens;
+                }
             }
             ConvAction::Failed(message) => self.error = Some(message),
         }
@@ -321,6 +344,7 @@ mod tests {
     fn poll(entries: Vec<api::Entry>, busy: bool) -> api::Poll {
         api::Poll {
             busy,
+            context_tokens: None,
             total: entries.len(),
             entries,
             last_error: None,

@@ -269,6 +269,87 @@ async fn a_user_can_watch_take_and_drive_the_agents_shell() {
     .await;
 }
 
+/// A terminal the user opens over the API is usable at once (user-held from
+/// birth), announced in the transcript so the agent knows it exists and can
+/// address it by name, and renameable — with the rename announced too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_opened_terminal_is_usable_at_once_and_renameable() {
+    let _home = myco::test_support::temp_home("web-open-term");
+    let server = shell_server(None);
+    let ada = server.as_user(Author::User {
+        id: "ada".into(),
+        name: "Ada Lovelace".into(),
+    });
+
+    let s = ada
+        .create_session(myco_api::CreateSession {
+            model: None,
+            parent_session: None,
+            fork: false,
+        })
+        .await
+        .expect("create");
+    ada.post_message(
+        &s.id,
+        myco_api::PostMessage {
+            text: "start a shell".into(),
+        },
+    )
+    .await
+    .expect("post");
+    settle(&ada, &s.id, |p| {
+        p.entries.iter().any(|e| e.text() == "shell is up")
+    })
+    .await;
+
+    let opened = ada
+        .shell_start(
+            &s.id,
+            "local",
+            myco_api::CreateShell {
+                shell: Some("scratch".into()),
+                command: Some("cat".into()),
+                pty: false,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .expect("open");
+    assert_eq!(opened.id, "scratch");
+    assert_eq!(opened.lock, ShellLockMode::User, "user-held from birth");
+
+    // No take step needed: typing works immediately.
+    ada.shell_input(&s.id, "local", "scratch", "mine first\n".into())
+        .await
+        .expect("input");
+    let text = tail_until(&ada, &s.id, "local", "scratch", |t| {
+        t.contains("mine first")
+    })
+    .await;
+    assert!(text.contains("mine first"), "{text:?}");
+
+    // Named for the human; addressed by id for everyone.
+    let renamed = ada
+        .shell_rename(&s.id, "local", "scratch", Some("build watch".into()))
+        .await
+        .expect("rename");
+    assert_eq!(renamed.title.as_deref(), Some("build watch"));
+    assert_eq!(renamed.id, "scratch");
+
+    // Both acts are transcript facts the agent reads at its next boundary.
+    settle(&ada, &s.id, |p| {
+        p.entries
+            .iter()
+            .any(|e| e.text().contains("[opened shell \"scratch\" on local"))
+            && p.entries.iter().any(|e| {
+                e.text()
+                    .contains("[named shell \"scratch\" on local \"build watch\"]")
+            })
+    })
+    .await;
+}
+
 /// The same surface for a shell the agent started on a *remote* host: it
 /// lists under its host name, its keyboard moves, keystrokes reach the child
 /// over the NDJSON protocol, the screen renders, and the interventions land

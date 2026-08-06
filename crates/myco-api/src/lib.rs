@@ -29,6 +29,12 @@ pub struct SessionSummary {
     /// the model's configured effort applies.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Context tokens the last turn reported in use (the prompt side).
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    /// The model's context window, for the meter's denominator.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     /// Live in this server process (an agent task exists for it).
     pub live: bool,
     /// An agent turn is currently running.
@@ -45,6 +51,9 @@ pub struct SessionDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Poll {
     pub busy: bool,
+    /// Context tokens in use after the most recent turn, when known.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
     /// Total entries currently renderable; poll again with this as `since`.
     pub total: usize,
     pub entries: Vec<Entry>,
@@ -114,6 +123,10 @@ pub struct Shell {
     /// Host the session runs on (`"local"` or a configured remote).
     pub host: String,
     pub id: String,
+    /// Display name a person gave it; the id remains the address the agent
+    /// (and every endpoint) uses.
+    #[serde(default)]
+    pub title: Option<String>,
     pub cmdline: String,
     pub running: bool,
     pub exit_code: Option<i32>,
@@ -177,6 +190,65 @@ pub struct ScreenRun {
 pub struct ShellResize {
     pub cols: u16,
     pub rows: u16,
+}
+
+/// `POST /api/sessions/<id>/shells/<host>` — open a terminal on that host.
+/// It is a real bash session owned by the session's agent (fully addressable
+/// by its bash tool), starting **user-held** — whoever opened it is typing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateShell {
+    /// Session name; `None` picks the first free `term-N`.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Child command; `None` runs an interactive bash.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// A real terminal by default — user terminals exist to be typed into.
+    #[serde(default = "default_true")]
+    pub pty: bool,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `POST /api/sessions/<id>/shells/<host>/<shell>/rename` — set or clear the
+/// display name (`""` clears). Organization only: the id is the address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRename {
+    pub title: String,
+}
+
+/// Client→server frame on a shell's WebSocket
+/// (`GET /api/sessions/<id>/shells/<host>/<shell>/ws`, JSON text frames).
+///
+/// The socket is the *interactive* transport — ordered keystrokes in, screen
+/// pushes out, one connection per open terminal. It carries nothing the REST
+/// surface doesn't: input and resize obey the same keyboard lock, and a
+/// client without the socket (scripts, `myco.py`) loses latency, not
+/// capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellWsInput {
+    /// Raw bytes typed or pasted (requires the user keyboard lock).
+    Input { data: String },
+    /// Fit the terminal (requires the user keyboard lock).
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Server→client frame on a shell's WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellWsOutput {
+    /// The screen changed; pushed coalesced, never faster than it renders.
+    Screen { screen: ShellScreen },
+    /// An input/resize frame was refused (lock not held, shell gone). The
+    /// socket stays up — watching is always allowed.
+    Error { message: String },
 }
 
 /// `GET /api/sessions/<id>/shells`.
@@ -387,6 +459,18 @@ pub trait MycoApi: Send + Sync {
         shell: &str,
         cols: u16,
         rows: u16,
+    ) -> Result<Shell, ApiError>;
+    /// Open a terminal on `host` for the user: a real bash session owned by
+    /// the session's agent (its bash tool can drive it), starting user-held.
+    async fn shell_start(&self, id: &str, host: &str, req: CreateShell) -> Result<Shell, ApiError>;
+    /// Set or clear a shell's display name (organization; the id stays the
+    /// address).
+    async fn shell_rename(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        title: Option<String>,
     ) -> Result<Shell, ApiError>;
 
     /// Live subagent children of this session (empty when it is not resident

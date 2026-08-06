@@ -514,6 +514,65 @@ impl HostController {
         }
     }
 
+    /// Open a user-held terminal owned by `agent_id` (see
+    /// [`BashService::shell_start`]).
+    pub async fn shell_start(
+        &self,
+        name: Option<&str>,
+        agent_id: uuid::Uuid,
+        command: Option<&str>,
+        pty: bool,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<ShellOverview, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                self.bash_of(worker)?
+                    .shell_start(name, agent_id, command, pty, cols, rows)
+                    .await
+            }
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellStart {
+                    id: id.clone(),
+                    shell: name.map(String::from),
+                    agent_id,
+                    command: command.map(String::from),
+                    pty,
+                    cols,
+                    rows,
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::Shell { shell, .. } => Ok(shell),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// Set or clear a terminal's display name.
+    pub async fn shell_rename(
+        &self,
+        shell: &str,
+        title: Option<&str>,
+    ) -> Result<ShellOverview, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => self.bash_of(worker)?.shell_rename(shell, title),
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellRename {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                    title: title.map(String::from),
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::Shell { shell, .. } => Ok(shell),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
     /// Resize the shell's terminal (requires the user keyboard lock on the
     /// host).
     pub async fn shell_resize(
@@ -540,6 +599,34 @@ impl HostController {
                     Response::Shell { shell, .. } => Ok(shell),
                     other => Err(format!("mismatched reply: {other:?}")),
                 }
+            }
+        }
+    }
+
+    /// Wait until the shell's observable output moves past `seen`, capped at
+    /// `timeout`; returns the new watermark. In-process hosts wait on the
+    /// session's own notify — a push, not a poll. Subprocess hosts have no
+    /// wait primitive on the NDJSON protocol (an honest limitation: adding
+    /// one means an unsolicited-message channel), so remote shells degrade
+    /// to a short server-side pause — the browser still gets pushes; only
+    /// the server↔host hop polls.
+    pub async fn shell_wait_change(
+        &self,
+        shell: &str,
+        seen: u64,
+        timeout: std::time::Duration,
+    ) -> Result<u64, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                self.bash_of(worker)?
+                    .shell_wait_change(shell, seen, timeout)
+                    .await
+            }
+            Backend::Subprocess { .. } => {
+                tokio::time::sleep(std::time::Duration::from_millis(150).min(timeout)).await;
+                // Force a fetch: the caller compares screens and drops
+                // no-change renders, so a false positive costs one compare.
+                Ok(seen.wrapping_add(1))
             }
         }
     }

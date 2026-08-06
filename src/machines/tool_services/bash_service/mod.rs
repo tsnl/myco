@@ -465,29 +465,69 @@ impl BashService {
         max_bytes: usize,
         cancel: crate::core::CancelToken,
     ) -> myco_api::ToolResult {
+        let spec = SpawnSpec {
+            command: opts.command,
+            cwd: opts.cwd,
+            pty: opts.pty,
+            cols: opts.cols,
+            rows: opts.rows,
+            lock: ShellLock::Assistant,
+        };
+        if let Err(e) = self.spawn_session(session_id, owner, spec).await {
+            return myco_api::ToolResult::err(e);
+        }
+
+        // Optional initial stdin, then collect a first snapshot.
+        if let Some(data) = opts.stdin
+            && let Err(e) = self.write_to_session(session_id, data).await
+        {
+            return myco_api::ToolResult::err(format!(
+                "session {session_id:?} started but initial stdin write failed: {e}"
+            ));
+        }
+
+        let snapshot = self
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .await;
+        match snapshot {
+            Ok(s) => myco_api::ToolResult::text(s.format()),
+            Err(e) => myco_api::ToolResult::err(e),
+        }
+    }
+
+    /// Spawn a session child and register it — the shared core of the agent's
+    /// `start` action and a user-opened terminal. `spec.lock` says who holds
+    /// the keyboard from birth: agent starts serve the agent; a terminal the
+    /// user opened is theirs until they hand it over.
+    async fn spawn_session(
+        &self,
+        session_id: &str,
+        owner: Uuid,
+        spec: SpawnSpec<'_>,
+    ) -> Result<(), String> {
         if session_id.is_empty() {
-            return myco_api::ToolResult::err("session_id must be non-empty");
+            return Err("session_id must be non-empty".into());
         }
 
         // Reject duplicates and enforce session cap before spawning.
         {
             let sessions = self.sessions();
             if sessions.contains_key(session_id) {
-                return myco_api::ToolResult::err(format!(
+                return Err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
-                return myco_api::ToolResult::err(format!(
+                return Err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
             }
         }
 
-        let cmdline = opts.command.unwrap_or("bash -i");
-        let cwd = opts.cwd;
-        let cols = opts.cols.unwrap_or(DEFAULT_PTY_COLS);
-        let rows = opts.rows.unwrap_or(DEFAULT_PTY_ROWS);
+        let cmdline = spec.command.unwrap_or("bash -i");
+        let cwd = spec.cwd;
+        let cols = spec.cols.unwrap_or(DEFAULT_PTY_COLS);
+        let rows = spec.rows.unwrap_or(DEFAULT_PTY_ROWS);
 
         let shared = Arc::new(SessionShared {
             buffer: Mutex::new(OutputBuffer::default()),
@@ -495,26 +535,26 @@ impl BashService {
             generation: AtomicU64::new(0),
             scroll: Mutex::new(Scrollback::default()),
             screen: Mutex::new(vt100::Parser::new(rows, cols, 0)),
-            pty: opts.pty,
+            pty: spec.pty,
         });
 
         let spawn_err = |e: String| {
-            myco_api::ToolResult::err(format!(
+            format!(
                 "failed to spawn session command {cmdline:?}{}: {e}",
                 cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
-            ))
+            )
         };
 
         // Two spawn shapes: piped (deterministic streams, no echo) and pty
         // (one merged stream, tty semantics — what TUI programs need).
-        let (child, input, output_streams) = if opts.pty {
+        let (child, input, output_streams) = if spec.pty {
             let (reader, writer, slave) = match pty::open(cols, rows) {
                 Ok(v) => v,
-                Err(e) => return spawn_err(e),
+                Err(e) => return Err(spawn_err(e)),
             };
             let (sin, sout) = match (slave.try_clone(), slave.try_clone()) {
                 (Ok(a), Ok(b)) => (a, b),
-                (Err(e), _) | (_, Err(e)) => return spawn_err(format!("pty slave dup: {e}")),
+                (Err(e), _) | (_, Err(e)) => return Err(spawn_err(format!("pty slave dup: {e}"))),
             };
             let mut cmd = BASH.tokio_command();
             cmd.args(["-c", cmdline])
@@ -535,7 +575,7 @@ impl BashService {
             }
             let child = match cmd.spawn() {
                 Ok(c) => c,
-                Err(e) => return spawn_err(e.to_string()),
+                Err(e) => return Err(spawn_err(e.to_string())),
             };
             spawn_reader(reader, StreamKind::Stdout, Arc::clone(&shared));
             (child, SessionInput::Pty(writer), 1u8)
@@ -554,14 +594,14 @@ impl BashService {
             }
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
-                Err(e) => return spawn_err(e.to_string()),
+                Err(e) => return Err(spawn_err(e.to_string())),
             };
             let (child_stdin, stdout, stderr) =
                 match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
                     (Some(i), Some(o), Some(e)) => (i, o, e),
                     _ => {
                         let _ = child.kill().await;
-                        return myco_api::ToolResult::err("child pipes missing after spawn");
+                        return Err("child pipes missing after spawn".into());
                     }
                 };
             spawn_reader(stdout, StreamKind::Stdout, Arc::clone(&shared));
@@ -575,12 +615,13 @@ impl BashService {
         let session = Session {
             owner,
             cmdline: cmdline.to_string(),
+            title: Mutex::new(None),
             stdin: Mutex::new(Some(input)),
             shared,
             created_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
             pid,
-            lock: Mutex::new(ShellLock::Assistant),
+            lock: Mutex::new(spec.lock),
             output_streams,
         };
 
@@ -592,35 +633,19 @@ impl BashService {
             // is never stored anywhere the agent can reach.
             if sessions.contains_key(session_id) {
                 kill_process_group(pid);
-                return myco_api::ToolResult::err(format!(
+                return Err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
                 kill_process_group(pid);
-                return myco_api::ToolResult::err(format!(
+                return Err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
             }
             sessions.insert(session_id.to_string(), session);
         }
-
-        // Optional initial stdin, then collect a first snapshot.
-        if let Some(data) = opts.stdin
-            && let Err(e) = self.write_to_session(session_id, data).await
-        {
-            return myco_api::ToolResult::err(format!(
-                "session {session_id:?} started but initial stdin write failed: {e}"
-            ));
-        }
-
-        let snapshot = self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
-            .await;
-        match snapshot {
-            Ok(s) => myco_api::ToolResult::text(s.format()),
-            Err(e) => myco_api::ToolResult::err(e),
-        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -987,6 +1012,7 @@ impl BashService {
                 ShellOverview {
                     id: id.clone(),
                     cmdline: s.cmdline.clone(),
+                    title: lock_unpoisoned(&s.title).clone(),
                     running,
                     exit_code,
                     lock: *lock_unpoisoned(&s.lock),
@@ -1052,6 +1078,44 @@ impl BashService {
             .ok_or_else(|| format!("unknown session {id:?}"))
     }
 
+    /// Wait until the session's observable output moves past `seen` (the
+    /// scrollback end offset — every observed byte lands there first), the
+    /// child exits, or `timeout` passes; returns the current end offset.
+    /// The change-driven half of a live terminal: a screen pusher waits
+    /// here instead of polling.
+    pub async fn shell_wait_change(
+        &self,
+        id: &str,
+        seen: u64,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let shared = {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            Arc::clone(&session.shared)
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Register *before* checking, or a notify that fires between the
+            // check and the await is lost and this sleeps out its whole
+            // timeout. `enable` is the documented pattern for exactly that.
+            let notified = shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let end = lock_unpoisoned(&shared.scroll).end();
+            if end != seen {
+                return Ok(end);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(end);
+            }
+            let _ = tokio::time::timeout(deadline - now, notified).await;
+        }
+    }
+
     /// The session's rendered terminal screen, non-consuming (see
     /// [`ShellScreen`]). No lock gate: watching is always fine.
     pub fn shell_screen(&self, id: &str) -> Result<ShellScreen, String> {
@@ -1103,6 +1167,58 @@ impl BashService {
         lock_unpoisoned(&shared.screen).set_size(rows, cols);
         shared.notify.notify_waiters();
         Ok(())
+    }
+
+    /// Open a terminal on the user's behalf, owned by `owner` — the agent's
+    /// id, so the session is fully addressable by its bash tool (write,
+    /// read, signal, close) like any it started itself. Starts **user-held**:
+    /// whoever opened it is typing; the head button hands it over. With no
+    /// name given, the first free `term-N` is picked.
+    pub async fn shell_start(
+        &self,
+        name: Option<&str>,
+        owner: Uuid,
+        command: Option<&str>,
+        pty: bool,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<ShellOverview, String> {
+        let id = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                let sessions = self.sessions();
+                (1..)
+                    .map(|n| format!("term-{n}"))
+                    .find(|c| !sessions.contains_key(c))
+                    .expect("unbounded candidate range")
+            }
+        };
+        let spec = SpawnSpec {
+            command,
+            cwd: None,
+            pty,
+            cols,
+            rows,
+            lock: ShellLock::User,
+        };
+        self.spawn_session(&id, owner, spec).await?;
+        self.shell_overview(&id)
+    }
+
+    /// Set or clear a session's display name. Organization only — the id is
+    /// still the address, so nothing the agent holds breaks.
+    pub fn shell_rename(&self, id: &str, title: Option<&str>) -> Result<ShellOverview, String> {
+        {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            *lock_unpoisoned(&session.title) = title
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from);
+        }
+        self.shell_overview(id)
     }
 
     /// A keystroke line from the user. Requires the user to hold the
@@ -1161,6 +1277,9 @@ struct Session {
     /// Agent that started this session; only this agent may write/read/close it.
     owner: Uuid,
     cmdline: String,
+    /// Display name a person gave it — organization, not identity. The id
+    /// stays the address (renaming must not break the agent's references).
+    title: Mutex<Option<String>>,
     stdin: Mutex<Option<SessionInput>>,
     shared: Arc<SessionShared>,
     created_at: Instant,
@@ -1252,6 +1371,9 @@ pub enum ShellLock {
 pub struct ShellOverview {
     pub id: String,
     pub cmdline: String,
+    /// Display name a person gave it; the id remains the address.
+    #[serde(default)]
+    pub title: Option<String>,
     pub running: bool,
     pub exit_code: Option<i32>,
     pub lock: ShellLock,
@@ -2175,6 +2297,17 @@ struct StartOptions<'a> {
     pty: bool,
     cols: Option<u16>,
     rows: Option<u16>,
+}
+
+/// What [`BashService::spawn_session`] needs to know: the child, its
+/// terminal shape, and who holds the keyboard from birth.
+struct SpawnSpec<'a> {
+    command: Option<&'a str>,
+    cwd: Option<&'a str>,
+    pty: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    lock: ShellLock,
 }
 
 /// True when `command` begins with a shell `cd` (after optional whitespace).

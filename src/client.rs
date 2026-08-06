@@ -269,6 +269,40 @@ impl MycoApi for HttpClient {
         .await
     }
 
+    async fn shell_start(
+        &self,
+        id: &str,
+        host: &str,
+        req: api::CreateShell,
+    ) -> Result<api::Shell, ApiError> {
+        self.send(
+            self.http
+                .post(format!("{}/sessions/{id}/shells/{host}", self.base))
+                .json(&req),
+        )
+        .await
+    }
+
+    async fn shell_rename(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        title: Option<String>,
+    ) -> Result<api::Shell, ApiError> {
+        self.send(
+            self.http
+                .post(format!(
+                    "{}/sessions/{id}/shells/{host}/{shell}/rename",
+                    self.base
+                ))
+                .json(&api::ShellRename {
+                    title: title.unwrap_or_default(),
+                }),
+        )
+        .await
+    }
+
     async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {
         self.get(&format!("/sessions/{id}/subagents")).await
     }

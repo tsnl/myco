@@ -262,6 +262,52 @@ impl HostWorker {
                 };
                 let _ = write_locked(&writer, &reply).await;
             }
+            Request::ShellStart {
+                id,
+                shell,
+                agent_id,
+                command,
+                pty,
+                cols,
+                rows,
+            } => {
+                let reply = match self.bash() {
+                    Some(b) => match b
+                        .shell_start(
+                            shell.as_deref(),
+                            agent_id,
+                            command.as_deref(),
+                            pty,
+                            cols,
+                            rows,
+                        )
+                        .await
+                    {
+                        Ok(overview) => Response::Shell {
+                            id,
+                            shell: overview,
+                            previous_lock: None,
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
+            Request::ShellRename { id, shell, title } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_rename(&shell, title.as_deref()) {
+                        Ok(overview) => Response::Shell {
+                            id,
+                            shell: overview,
+                            previous_lock: None,
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
             Request::ShellResize {
                 id,
                 shell,
