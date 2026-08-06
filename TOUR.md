@@ -439,12 +439,27 @@ Notice:
 
 - `auth`'s module doc explains the grant choice: RFC 6749 §4.3 because
   "the failure modes are known and the client side is boring."
-  Durability is deliberately asymmetric — users snapshot to disk, tokens
-  live only in memory, so a restart logs everyone out. Passwords are
-  PBKDF2 with a self-describing hash; tokens are a plain SHA-256 digest,
-  and the comment says why the asymmetry is right. `login` burns a real
-  verification against `dummy_hash()` for unknown users so response
-  timing does not enumerate the user list.
+  Durability is deliberately tiered — users snapshot to `auth.json`,
+  tokens live only in memory (a restart logs everyone out), one-time
+  codes live and die with the process (they are redeemed against *this*
+  server, so `myco auth code` mints over HTTP as the operator rather
+  than touching files), and passkeys persist in `passkeys.json` — the
+  server's own file, so the admin CLI's `auth.json` rewrites cannot
+  clobber it. Passwords are PBKDF2 with a self-describing hash; tokens
+  and codes are plain SHA-256 digests of high-entropy values. `login`
+  burns a real verification against `dummy_hash()` for unknown users so
+  response timing does not enumerate the user list; the passkey
+  login/start route answers identically for "no such user" and "no
+  passkeys enrolled" for the same reason.
+- The WebAuthn ceremonies (`web.rs`, `passkey_*` routes) lean on a wire
+  coincidence that is actually a standard: webauthn-rs serializes its
+  challenge types to exactly the JSON the browser's own
+  `PublicKeyCredential.parse*OptionsFromJSON` / `credential.toJSON()`
+  speak, so the GUI's bridge is two ten-line JS functions and the JSON
+  crosses this codebase untouched. The relying party comes from
+  `[passkeys]` in server.toml; the localhost default allows any port,
+  which is what makes passkeys work through an SSH tunnel and trunk's
+  dev proxy without configuration.
 - The roster→auth link is made by the *binary*: `Server` construction
   reconciles roster names into the store.
 - `src/web.rs`: every REST route is a one-liner over `MycoApi`; the
@@ -525,7 +540,12 @@ real; only the network hop is replaced.
   MycoApi` only: streaming publishes deltas before the turn finishes; an
   abandoned session leaves nothing on disk.
 - `tests/web_auth.rs` — no route answers without a token; a *prefix* of
-  a real token fails; writes are attributed to the token's owner.
+  a real token fails; writes are attributed to the token's owner. The
+  code and passkey flows run end to end — the latter against a software
+  authenticator (`webauthn-authenticator-rs`'s SoftToken), including the
+  claim that gives passkeys their point: a fresh store from the same
+  files signs the user back in after the restart that voided every
+  token.
 - `tests/web_multiplayer.rs` — the room rules over real HTTP with two
   token holders, then the pre-emption half, driven by a gated model that
   holds a turn provably mid-flight.

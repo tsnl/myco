@@ -190,22 +190,105 @@ fn login(props: &LoginProps) -> Html {
         })
     };
 
+    // A passkey needs only the username; the authenticator is the secret.
+    let on_passkey = {
+        let username = username.clone();
+        let error = error.clone();
+        let busy = busy.clone();
+        let on_signed_in = props.on_signed_in.clone();
+        Callback::from(move |_: MouseEvent| {
+            let Some(u) = username.cast::<HtmlInputElement>() else {
+                return;
+            };
+            let u = u.value();
+            if u.trim().is_empty() {
+                error.set(Some("enter your username, then use your passkey".into()));
+                return;
+            }
+            busy.set(true);
+            let error = error.clone();
+            let busy = busy.clone();
+            let on_signed_in = on_signed_in.clone();
+            spawn_local(async move {
+                match auth::passkey_login(&u).await {
+                    Ok(who) => {
+                        error.set(None);
+                        busy.set(false);
+                        on_signed_in.emit(who);
+                    }
+                    Err(e) => {
+                        busy.set(false);
+                        error.set(Some(e.to_string()));
+                    }
+                }
+            });
+        })
+    };
+
+    // A one-time code rides the password field: same box, different grant.
+    let on_code = {
+        let username = username.clone();
+        let password = password.clone();
+        let error = error.clone();
+        let busy = busy.clone();
+        let on_signed_in = props.on_signed_in.clone();
+        Callback::from(move |_: MouseEvent| {
+            let (Some(u), Some(c)) = (
+                username.cast::<HtmlInputElement>(),
+                password.cast::<HtmlInputElement>(),
+            ) else {
+                return;
+            };
+            let (u, c) = (u.value(), c.value());
+            if u.trim().is_empty() || c.trim().is_empty() {
+                error.set(Some(
+                    "enter your username and the one-time code (in the password box)".into(),
+                ));
+                return;
+            }
+            busy.set(true);
+            let error = error.clone();
+            let busy = busy.clone();
+            let on_signed_in = on_signed_in.clone();
+            spawn_local(async move {
+                match auth::code_login(&u, &c).await {
+                    Ok(who) => {
+                        error.set(None);
+                        busy.set(false);
+                        on_signed_in.emit(who);
+                    }
+                    Err(e) => {
+                        busy.set(false);
+                        error.set(Some(e.to_string()));
+                    }
+                }
+            });
+        })
+    };
+
     html! {
         <div class="app">
             <div class="pane">
                 <div class="column login">
                     <h1>{ "myco" }</h1>
                     <div class="login-row">
-                        <input ref={username} type="text" autocomplete="username"
+                        <input ref={username} type="text" autocomplete="username webauthn"
                                onkeydown={on_keydown.clone()} placeholder="username" />
                     </div>
                     <div class="login-row">
                         <input ref={password} type="password" autocomplete="current-password"
-                               onkeydown={on_keydown} placeholder="password" />
+                               onkeydown={on_keydown} placeholder="password or one-time code" />
                     </div>
                     <div class="login-row">
                         <button onclick={on_click} disabled={*busy}>
                             { if *busy { "signing in…" } else { "sign in" } }
+                        </button>
+                        { " " }
+                        <button onclick={on_passkey} disabled={*busy}>{ "passkey" }</button>
+                        { " " }
+                        <button onclick={on_code} disabled={*busy}
+                                title="redeem a one-time code from the operator (typed in the password box)">
+                            { "use code" }
                         </button>
                     </div>
                     { if let Some(e) = &*error { html! {
@@ -228,16 +311,35 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// `signed in as <name>`, with the sign-out affordance next to it.
+/// `signed in as <name>`, with the sign-out and passkey affordances next to
+/// it. Enrollment lives here — any authenticated session may add a passkey
+/// for its own account, which is how a password (or one-time code) bootstrap
+/// graduates to phishing-proof sign-in.
 fn whoami_line(who: &Option<Session>) -> Html {
     let Some(s) = who else { return html! {} };
     let sign_out = {
         let cb = s.sign_out.clone();
         Callback::from(move |_: MouseEvent| cb.emit(()))
     };
+    let add_passkey = Callback::from(move |_: MouseEvent| {
+        spawn_local(async move {
+            let message = match auth::register_passkey().await {
+                Ok(()) => "passkey enrolled — you can sign in with it from now on".to_string(),
+                Err(e) => e.to_string(),
+            };
+            if let Some(w) = web_sys::window() {
+                let _ = w.alert_with_message(&message);
+            }
+        });
+    });
     html! {
         <span class="dim">
             { format!(" · {} ", s.identity.name) }
+            <button class="linkish" onclick={add_passkey}
+                    title="enroll this device's passkey for your account">
+                { "add passkey" }
+            </button>
+            { " " }
             <button class="linkish" onclick={sign_out}>{ "sign out" }</button>
         </span>
     }

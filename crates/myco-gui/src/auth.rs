@@ -213,6 +213,105 @@ pub async fn login(username: &str, password: &str) -> Result<api::Identity, Fail
     Ok(issued.user)
 }
 
+/// Redeem an operator-minted one-time code for a session.
+pub async fn code_login(username: &str, code: &str) -> Result<api::Identity, Failure> {
+    let body = format!(
+        "grant_type=code&username={}&code={}",
+        encode(username.trim()),
+        encode(code.trim())
+    );
+    let req = Request::post("/api/auth/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .map_err(|e| Failure::Other(format!("redeem code: {e}")))?;
+    let issued: api::AccessToken = decode("redeem code", req.send().await).await?;
+    set_token(&issued.access_token);
+    Ok(issued.user)
+}
+
+// The WebAuthn ceremonies: the server speaks the standard JSON that the
+// browser's own `PublicKeyCredential.parse*OptionsFromJSON` and
+// `credential.toJSON()` understand, so the bridge is two thin JS functions
+// and the JSON passes through this module untouched.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+export async function myco_passkey_create(options_json) {
+  const opts = PublicKeyCredential.parseCreationOptionsFromJSON(
+    JSON.parse(options_json).publicKey);
+  const cred = await navigator.credentials.create({ publicKey: opts });
+  return JSON.stringify(cred.toJSON());
+}
+export async function myco_passkey_get(options_json) {
+  const opts = PublicKeyCredential.parseRequestOptionsFromJSON(
+    JSON.parse(options_json).publicKey);
+  const cred = await navigator.credentials.get({ publicKey: opts });
+  return JSON.stringify(cred.toJSON());
+}
+")]
+extern "C" {
+    #[wasm_bindgen(catch)]
+    async fn myco_passkey_create(
+        options_json: String,
+    ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+    #[wasm_bindgen(catch)]
+    async fn myco_passkey_get(
+        options_json: String,
+    ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+fn ceremony_err(what: &str, e: wasm_bindgen::JsValue) -> Failure {
+    // `NotAllowedError` is the browser's spelling of "dismissed or timed
+    // out" — the person changed their mind, not a fault to alarm about.
+    let text = e
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&e, &"message".into())
+                .ok()
+                .and_then(|m| m.as_string())
+        })
+        .unwrap_or_else(|| "cancelled".into());
+    Failure::Other(format!("{what}: {text}"))
+}
+
+/// Enroll a passkey for the signed-in user (authenticated ceremony).
+pub async fn register_passkey() -> Result<(), Failure> {
+    let options: serde_json::Value = post("/api/auth/passkey/register/start").await?;
+    let created = myco_passkey_create(options.to_string())
+        .await
+        .map_err(|e| ceremony_err("passkey enrollment", e))?;
+    let credential: serde_json::Value = created
+        .as_string()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .ok_or_else(|| Failure::Other("passkey enrollment: bad credential".into()))?;
+    let _: serde_json::Value = post_json("/api/auth/passkey/register/finish", &credential).await?;
+    Ok(())
+}
+
+/// Sign in with a passkey: challenge, authenticator, token.
+pub async fn passkey_login(username: &str) -> Result<api::Identity, Failure> {
+    let challenge: serde_json::Value = {
+        let req = Request::post("/api/auth/passkey/login/start")
+            .json(&serde_json::json!({ "username": username.trim() }))
+            .map_err(|e| Failure::Other(format!("passkey: {e}")))?;
+        decode("passkey", req.send().await).await?
+    };
+    let ticket = challenge["ticket"].as_str().unwrap_or_default().to_string();
+    let asserted = myco_passkey_get(challenge["options"].to_string())
+        .await
+        .map_err(|e| ceremony_err("passkey", e))?;
+    let credential: serde_json::Value = asserted
+        .as_string()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .ok_or_else(|| Failure::Other("passkey: bad assertion".into()))?;
+    let issued: api::AccessToken = {
+        let req = Request::post("/api/auth/passkey/login/finish")
+            .json(&serde_json::json!({ "ticket": ticket, "credential": credential }))
+            .map_err(|e| Failure::Other(format!("passkey: {e}")))?;
+        decode("passkey", req.send().await).await?
+    };
+    set_token(&issued.access_token);
+    Ok(issued.user)
+}
+
 /// End the session server-side, then locally. The local clear happens either
 /// way — a network failure must not leave the UI claiming to be signed in.
 pub async fn logout() {

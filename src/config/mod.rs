@@ -49,7 +49,8 @@ pub use file::{
 };
 pub use harness::{HarnessConfig, HostConfig, load_ssh_host_aliases};
 pub use roster::{
-    EXAMPLE_SERVER_TOML, FileRoster, Roster, RosterUser, load_file_roster, parse_file_roster_str,
+    EXAMPLE_SERVER_TOML, FileRoster, PasskeySettings, Roster, RosterUser, load_file_roster,
+    parse_file_roster_str,
 };
 
 /// Default per-generate output token cap when a model entry sets none.
