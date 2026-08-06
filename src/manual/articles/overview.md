@@ -181,11 +181,11 @@ reaches 80% of `context_window`, running exactly what `/compact` runs and
 switching the REPL to the successor. It must be greater than 0 and less than 1;
 anything else is a startup error. Unset (the default) means no automatic
 compaction — `/compact` still works. The check runs after each turn against the
-provider's own reported counts — the prompt just sent plus the reply it
-produced, which the next request replays — so it acts on measured numbers
-rather than a local guess; if an automatic compaction fails, it is not retried
-for the rest of that session (the note says so, and `/compact` remains
-available).
+same live-context estimate the USER header shows: the provider's own counts for
+the turn's final request and reply, plus a locally priced tail for anything a
+failed turn appended after that measurement — never a guess at content not yet
+typed. If an automatic compaction fails, it is not retried for the rest of that
+session (the note says so, and `/compact` remains available).
 
 **Retry** is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:

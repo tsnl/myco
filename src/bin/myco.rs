@@ -918,11 +918,7 @@ impl ReplSession {
             let max = self.agent.context_window_tokens();
             let usage = self.agent.last_usage();
             // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
-            let used = match usage {
-                Some(u) => Some(u.context_tokens()),
-                None if self.agent.history().is_empty() => Some(0),
-                None => None,
-            };
+            let used = self.agent.context_estimate_tokens();
             let running = self
                 .harness
                 .running_tool_summaries(self.agent.context().agent_id);
@@ -1238,11 +1234,12 @@ impl ReplSession {
     /// Compact without being asked once the context reaches the model's
     /// `auto_compact_at` share of its context window.
     ///
-    /// Checked *after* a turn, against `last_usage`: the provider's own counts
-    /// for the request just sent plus the reply it produced — everything the
-    /// next request is known to carry — rather than a guess at content not yet
-    /// typed. The successor starts from a summary, so its usage falls far
-    /// below the threshold and this cannot re-fire on the following turn.
+    /// Checked *after* a turn, against [`Agent::context_estimate_tokens`]: the
+    /// provider's own counts for the turn's final request and reply, plus the
+    /// priced tail a failed turn left behind — everything the next request is
+    /// known to carry, never a guess at content not yet typed. The successor
+    /// starts from a summary, so its usage falls far below the threshold and
+    /// this cannot re-fire on the following turn.
     async fn maybe_auto_compact(&mut self) {
         let Some(threshold) = self.catalog_model.spec.auto_compact_at_tokens else {
             return;
@@ -1250,12 +1247,12 @@ impl ReplSession {
         if self.auto_compact_failed {
             return;
         }
-        // No usage means nothing measured to act on: a resumed session before
-        // its first turn, or a turn that failed before the provider reported.
-        let Some(usage) = self.agent.last_usage() else {
+        // No estimate means nothing measured to act on: a resumed session
+        // predating usage tracking, or a first turn that failed before the
+        // provider reported.
+        let Some(used) = self.agent.context_estimate_tokens() else {
             return;
         };
-        let used = usage.context_tokens();
         if used < threshold {
             return;
         }

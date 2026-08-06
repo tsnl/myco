@@ -595,6 +595,10 @@ impl AnthropicUsage {
                 .saturating_add(cache_creation),
             output_tokens: self.output_tokens,
             cached_input_tokens: cache_read,
+            // Anthropic does not split thinking out of output_tokens, so the
+            // context estimate leans high by the final reply's thinking share
+            // (stripped on replay) until the next call's measured input.
+            reasoning_output_tokens: 0,
         }
     }
 }

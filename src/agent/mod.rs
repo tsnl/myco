@@ -21,7 +21,8 @@ use futures::future;
 use crate::core::CancelToken;
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
+    MessagePart, Recovery, ToolResult, ToolUse, TurnEndReason, TurnUsage, answer_content,
+    estimate_replayed_tokens,
 };
 use crate::harness::Harness;
 use uuid::Uuid;
@@ -108,7 +109,7 @@ impl EventSink for NullEventSink {
 /// the conversation before the turn completes. Not called between an assistant
 /// tool_use message and its results — that prefix is rejected by providers, so
 /// it must never be the snapshot a context fork inherits.
-pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
+pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TurnUsage>) + Send + Sync>;
 
 /// How long a cancelled tool dispatch may keep running to do its own
 /// cleanup (process-group kill, buffer drain) before the agent abandons it
@@ -129,11 +130,10 @@ pub struct Agent {
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
-    /// Last turn's usage: input = final request's prompt, output = summed
-    /// across that turn's generate calls. [`TokenUsage::context_tokens`] adds
-    /// the two for the next USER header — the reply is replayed in the next
-    /// request, so input alone under-reports the live context.
-    last_usage: Option<TokenUsage>,
+    /// Last turn's usage: the final generate call verbatim (whose
+    /// `context_tokens()` is the measured live context) plus the turn-summed
+    /// output for display. [`Self::context_estimate_tokens`] anchors on it.
+    last_usage: Option<TurnUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
     /// Consecutive `max_tokens` resumes allowed within one turn, from the
@@ -236,14 +236,40 @@ impl Agent {
         self.max_truncated_resumes = resumes;
     }
 
-    /// Last observed prompt/context token usage (from the provider), if any.
-    pub fn last_usage(&self) -> Option<TokenUsage> {
+    /// Last turn's usage (from the provider), if any.
+    pub fn last_usage(&self) -> Option<TurnUsage> {
         self.last_usage
     }
 
     /// Seed last-usage when resuming a saved session (`None` if never tracked).
-    pub fn set_last_usage(&mut self, usage: Option<TokenUsage>) {
+    pub fn set_last_usage(&mut self, usage: Option<TurnUsage>) {
         self.last_usage = usage;
+    }
+
+    /// Estimated live context: what the next request will carry before the
+    /// user adds anything to it.
+    ///
+    /// Anchored on measurement — the last generate call's own prompt + reply
+    /// counts ([`TokenUsage::context_tokens`]) — plus a local estimate for
+    /// history the provider never measured: everything after the last
+    /// assistant message, i.e. tool results a failed or cancelled round left
+    /// behind ([`estimate_replayed_tokens`]). After a clean turn that suffix
+    /// is empty and the estimate is pure measurement.
+    ///
+    /// `Some(0)` for an empty session; `None` when there is history but no
+    /// measurement to anchor on (sessions resumed from before usage tracking).
+    pub fn context_estimate_tokens(&self) -> Option<u64> {
+        let Some(usage) = self.last_usage else {
+            return self.history.is_empty().then_some(0);
+        };
+        // The final call's measurement covers its prompt (the history before
+        // the last assistant message) and its reply (that assistant message).
+        let unmeasured = self
+            .history
+            .iter()
+            .rposition(|m| matches!(m, Message::AssistantMessage { .. }))
+            .map_or(&[][..], |i| &self.history[i + 1..]);
+        Some(usage.context_tokens() + estimate_replayed_tokens(unmeasured))
     }
 
     pub fn context(&self) -> &TraceContext {
@@ -265,8 +291,9 @@ impl Agent {
         self.emit_checkpoint();
 
         // Output tokens accumulate across this turn's generate calls (one per
-        // tool round-trip); each new report's input side already covers the
-        // whole prompt, so it replaces rather than adds.
+        // tool round-trip) for the display side; the live-context side keeps
+        // each call verbatim, because a later call's prompt already contains
+        // the earlier calls' replies.
         let mut turn_output: u64 = 0;
         // Consecutive `max_tokens` stops, capped by MAX_TRUNCATED_RESUMES.
         let mut truncations: u32 = 0;
@@ -289,10 +316,7 @@ impl Agent {
 
             if let Some(usage) = output.usage {
                 turn_output += usage.output_tokens;
-                self.last_usage = Some(TokenUsage {
-                    output_tokens: turn_output,
-                    ..usage
-                });
+                self.last_usage = Some(TurnUsage::new(usage, turn_output));
             }
 
             let reason = output.turn_end_reason.clone();
@@ -524,7 +548,7 @@ impl AgentInteractionError {
 mod tests {
     use super::*;
     use crate::core::Async;
-    use crate::generative_model::{GenerateError, MessagePart, ToolSpec};
+    use crate::generative_model::{GenerateError, MessagePart, TokenUsage, ToolSpec};
     use crate::test_support::{
         ScriptedModel, assistant, assistant_tool, result_text, tool_results, user,
     };
@@ -762,6 +786,7 @@ mod tests {
                     input_tokens: 1_000,
                     output_tokens: 500,
                     cached_input_tokens: 800,
+                    ..Default::default()
                 }),
             },
             GenerateOutput {
@@ -774,6 +799,7 @@ mod tests {
                     input_tokens: 1_600,
                     output_tokens: 20,
                     cached_input_tokens: 900,
+                    ..Default::default()
                 }),
             },
         ]);
@@ -787,13 +813,74 @@ mod tests {
             .await
             .expect("interact");
 
-        // Input side tracks the latest request; output sums the turn; the
-        // context estimate carries both (the next request replays the output).
+        // The final call is kept verbatim (its prompt already contains the
+        // first call's 500-token reply, so only its own 20-token reply is
+        // added to the live context); the turn sum feeds the display.
         let usage = agent.last_usage().expect("usage recorded");
-        assert_eq!(usage.input_tokens, 1_600);
-        assert_eq!(usage.cached_input_tokens, 900);
-        assert_eq!(usage.output_tokens, 520);
-        assert_eq!(usage.context_tokens(), 2_120);
+        assert_eq!(usage.final_call.input_tokens, 1_600);
+        assert_eq!(usage.final_call.cached_input_tokens, 900);
+        assert_eq!(usage.final_call.output_tokens, 20);
+        assert_eq!(usage.turn_output_tokens(), 520);
+        assert_eq!(usage.context_tokens(), 1_620);
+        // Clean turn end: nothing unmeasured, the estimate is pure measurement.
+        assert_eq!(agent.context_estimate_tokens(), Some(1_620));
+    }
+
+    /// A turn that dies after tools ran leaves ToolResults nobody measured;
+    /// the context estimate must price that tail instead of ignoring it —
+    /// that gap is how a header can read 89% while the next request is
+    /// already over the window.
+    #[tokio::test]
+    async fn context_estimate_prices_tool_results_a_failed_turn_left_behind() {
+        let tool = Arc::new(SlowService {
+            name: "fast".into(),
+            delay: Duration::ZERO,
+            starts: Arc::new(Mutex::new(Vec::new())),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let harness = Harness::local_with_services(vec![tool as Arc<dyn ToolService>]);
+
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    name: "fast".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: Some(TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    ..Default::default()
+                }),
+            },
+            // Second call fails before reporting usage (see then_fail below),
+            // so the tool results above are never measured.
+        ])
+        .then_fail(GenerateError::ExecutionError("provider died".into()));
+
+        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        agent
+            .interact(
+                vec![Content::Text { text: "go".into() }],
+                crate::core::CancelToken::new(),
+            )
+            .await
+            .expect_err("second generate call has no scripted output");
+
+        assert!(matches!(
+            agent.history().last(),
+            Some(Message::ToolResults { .. })
+        ));
+        let measured = agent.last_usage().expect("first call reported");
+        assert_eq!(measured.context_tokens(), 1_050);
+        let estimate = agent.context_estimate_tokens().expect("anchored");
+        assert!(
+            estimate > measured.context_tokens(),
+            "tail must be priced: estimate {estimate} vs measured {}",
+            measured.context_tokens()
+        );
     }
 
     /// Slow generate stream: cancel mid-stream must return Cancelled quickly.

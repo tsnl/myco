@@ -165,10 +165,12 @@ compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arri
 (no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
 `⚙`-prefixed line shows its usage — `⚙ last turn: input 63.8k (58k cached) · output 1.4k` —
 where input is the prompt of the turn's final request and output is summed across all of the
-turn's requests (one per tool round-trip). The header's `used` is their sum: the reply is
-replayed inside the next request, so prompt-side tokens alone would under-count the live
-context. It is still an estimate from measured numbers — the message you are about to type,
-and any tool results a failed turn left behind, are on top of it. Below it, one
+turn's requests (one per tool round-trip). The header's `used` is a different cut of the same
+report: the final request plus its own reply — the content the next request replays — with
+reasoning subtracted where the provider splits it out (OpenAI dialects; Anthropic reports no
+split, so its number leans high by the final reply's thinking). Tool results a failed or
+cancelled turn left behind, which no request has measured yet, are priced in locally at ~4
+bytes per token. The one thing never counted is the message you are about to type. Below it, one
 `●`-prefixed line per still-running tool (live bash session on the in-process local host)
 shows its command, uptime, and idle time; remote hosts are not queried for this.
 

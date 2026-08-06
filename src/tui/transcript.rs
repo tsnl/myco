@@ -15,7 +15,7 @@
 use std::io::Write;
 
 use super::markdown::{MarkdownRenderer, render_block};
-use crate::generative_model::{Content, Message, TokenUsage};
+use crate::generative_model::{Content, Message, TurnUsage};
 use crate::tui::{
     SectionState, Style, TuiEvent, encode_ansi, encoded_ends_with_newline, section_open_events,
     styled_line, tool_invocation_events,
@@ -85,18 +85,26 @@ pub fn user_header_line(used: Option<u64>, max: u64) -> String {
 
 /// `⚙`-prefixed usage line under the USER header, describing the turn that
 /// just finished: input is the prompt of that turn's final request, output is
-/// summed across the turn's requests. Their sum is the header's live-context
-/// estimate ([`TokenUsage::context_tokens`]). Zero cached counts are elided.
-/// Pairs with the `●` running-tool lines printed below it.
-pub fn usage_line(u: TokenUsage) -> String {
-    let mut line = format!("⚙ last turn: input {}", format_tokens(u.input_tokens));
-    if u.cached_input_tokens > 0 {
+/// summed across the turn's requests (one per tool round-trip). The header's
+/// `used` is a different cut of the same report — the final call's prompt plus
+/// its own reply ([`crate::generative_model::TurnUsage::context_tokens`]).
+/// Zero cached counts are elided. Pairs with the `●` running-tool lines
+/// printed below it.
+pub fn usage_line(u: TurnUsage) -> String {
+    let mut line = format!(
+        "⚙ last turn: input {}",
+        format_tokens(u.final_call.input_tokens)
+    );
+    if u.final_call.cached_input_tokens > 0 {
         line.push_str(&format!(
             " ({} cached)",
-            format_tokens(u.cached_input_tokens)
+            format_tokens(u.final_call.cached_input_tokens)
         ));
     }
-    line.push_str(&format!(" · output {}", format_tokens(u.output_tokens)));
+    line.push_str(&format!(
+        " · output {}",
+        format_tokens(u.turn_output_tokens())
+    ));
     line
 }
 
@@ -376,7 +384,7 @@ pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, Message, ToolUse, TurnEndReason};
+    use crate::generative_model::{Content, Message, TokenUsage, ToolUse, TurnEndReason};
     use crate::test_support::{assistant, thinking, thinking_msg, tool_loop, user};
     use serde_json::json;
 
@@ -425,20 +433,29 @@ mod tests {
 
     #[test]
     fn usage_line_elides_zero_cached_counts() {
-        let full = TokenUsage {
-            input_tokens: 63_841,
-            output_tokens: 1_400,
-            cached_input_tokens: 58_000,
-        };
+        let full = TurnUsage::new(
+            TokenUsage {
+                input_tokens: 63_841,
+                output_tokens: 900,
+                cached_input_tokens: 58_000,
+                ..Default::default()
+            },
+            // The turn sum, not the final call's 900, is what the line shows.
+            1_400,
+        );
         assert_eq!(
             usage_line(full),
             "⚙ last turn: input 63.8k (58k cached) · output 1.4k"
         );
-        let uncached = TokenUsage {
-            input_tokens: 500,
-            output_tokens: 42,
-            cached_input_tokens: 0,
-        };
+        let uncached = TurnUsage::new(
+            TokenUsage {
+                input_tokens: 500,
+                output_tokens: 42,
+                cached_input_tokens: 0,
+                ..Default::default()
+            },
+            42,
+        );
         assert_eq!(usage_line(uncached), "⚙ last turn: input 500 · output 42");
     }
 

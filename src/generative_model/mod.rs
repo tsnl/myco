@@ -585,7 +585,7 @@ pub enum MessagePart {
 }
 
 /// Token counts for one generate call. `cached_input_tokens` is a subset of
-/// `input_tokens`.
+/// `input_tokens`; `reasoning_output_tokens` is a subset of `output_tokens`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     #[serde(default)]
@@ -594,22 +594,35 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Reasoning/thinking share of `output_tokens`, when the provider splits
+    /// it out (OpenAI dialects). Anthropic reports no split, so its drivers
+    /// leave this 0 — see [`Self::context_tokens`] for what that costs.
+    /// Skipped when 0 so pre-split session files re-serialize byte-identically
+    /// (the v2 golden fixture) and older binaries read newer files unchanged.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub reasoning_output_tokens: u64,
+}
+
+fn u64_is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl TokenUsage {
-    /// Live-context estimate: the measured prompt of the last request plus the
-    /// output generated since it. The next request replays that output, so
-    /// `input_tokens` alone under-reports the live context by the size of the
-    /// reply — a header can read 89% of the window while the next request is
-    /// already over it.
+    /// Live context after this call: the request's full prompt plus the part
+    /// of the reply the next request will replay. The prompt is measured
+    /// (`input_tokens` covers system, tools, history, and both cache sides);
+    /// the reply's replayed share is its output minus reasoning, which the
+    /// backends strip when composing the next request.
     ///
-    /// Leans high rather than low: on a multi-round-trip turn the intermediate
-    /// outputs are counted here and inside the final request's input, and
-    /// thinking output is counted although the backends strip it on replay. An
-    /// estimate that over-warns costs an early `/compact`; one that
-    /// under-reports costs a dead turn at the provider.
+    /// Where the provider reports no reasoning split (Anthropic),
+    /// `reasoning_output_tokens` is 0 and the estimate leans high by the final
+    /// reply's thinking share — the safe direction: over-warning costs an
+    /// early `/compact`, under-reporting costs a dead turn at the provider.
+    /// Either way it self-corrects at the next call's measured `input_tokens`.
     pub fn context_tokens(self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_sub(self.reasoning_output_tokens)
     }
 
     /// Fold a later usage report into this one, keeping known fields when the
@@ -622,8 +635,107 @@ impl TokenUsage {
             input_tokens: pick(self.input_tokens, next.input_tokens),
             output_tokens: pick(self.output_tokens, next.output_tokens),
             cached_input_tokens: pick(self.cached_input_tokens, next.cached_input_tokens),
+            reasoning_output_tokens: pick(
+                self.reasoning_output_tokens,
+                next.reasoning_output_tokens,
+            ),
         }
     }
+}
+
+/// One finished turn's usage as the agent aggregates it. Drivers report a
+/// [`TokenUsage`] per generate call and a turn makes one call per tool
+/// round-trip; two numbers matter afterwards, and they come from different
+/// calls, so neither can stand in for the other:
+///
+/// * `final_call` — the turn's last request and reply as the provider
+///   measured them. Its [`TokenUsage::context_tokens`] is the live context
+///   going into the next turn: the intermediate calls' replies are already
+///   inside this request's `input_tokens`, so nothing is counted twice.
+/// * the turn's summed output — what the model actually wrote across the
+///   whole turn, for the `⚙` usage line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnUsage {
+    /// The turn's final generate call, verbatim from the provider.
+    #[serde(flatten)]
+    pub final_call: TokenUsage,
+    /// Output tokens summed across the turn's generate calls. `None` in
+    /// sessions saved before the final call and the turn sum were tracked
+    /// separately — those files stored the turn sum *as* the final call's
+    /// `output_tokens`, so [`Self::turn_output_tokens`] falls back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_output_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    pub fn new(final_call: TokenUsage, turn_output_tokens: u64) -> Self {
+        Self {
+            final_call,
+            turn_output_tokens: Some(turn_output_tokens),
+        }
+    }
+
+    /// Output summed across the turn's generate calls (≥ the final call's).
+    pub fn turn_output_tokens(&self) -> u64 {
+        self.turn_output_tokens
+            .unwrap_or(self.final_call.output_tokens)
+    }
+
+    /// Measured live context after this turn — see [`TokenUsage::context_tokens`].
+    pub fn context_tokens(&self) -> u64 {
+        self.final_call.context_tokens()
+    }
+}
+
+/// Token allowance for one image in [`estimate_replayed_tokens`]. Providers
+/// meter images by dimensions, not bytes — Anthropic resizes to 1568px on the
+/// long edge and bills ~(w*h)/750, so ~1.6k is the standard-resolution
+/// ceiling — which makes byte-derived guesses wrong by orders of magnitude.
+const IMAGE_TOKEN_ALLOWANCE: u64 = 1_600;
+
+/// Local estimate of the prompt tokens a history suffix adds when replayed:
+/// for content the provider has *not yet measured* — tool results and user
+/// turns appended after a turn's final generate call failed or was cancelled.
+/// Never a guess about content that isn't in history yet.
+///
+/// Text counts at ~4 bytes per token (the usual English/code ratio; CJK-heavy
+/// text runs nearer 1 token per character, so this leans low there), images at
+/// a flat per-image allowance, and thinking at 0 — backends strip it on
+/// replay. The estimate is replaced by the provider's own `input_tokens` at
+/// the next successful call.
+pub fn estimate_replayed_tokens(messages: &[Message]) -> u64 {
+    fn text_tokens(len: usize) -> u64 {
+        (len as u64).div_ceil(4)
+    }
+    fn content_tokens(content: &[Content]) -> u64 {
+        content
+            .iter()
+            .map(|c| match c {
+                Content::Text { text } => text_tokens(text.len()),
+                Content::Image { .. } => IMAGE_TOKEN_ALLOWANCE,
+                Content::Thinking { .. } => 0,
+            })
+            .sum()
+    }
+    messages
+        .iter()
+        .map(|m| match m {
+            Message::UserMessage { content } => content_tokens(content),
+            Message::ToolResults { tool_use_results } => tool_use_results
+                .iter()
+                .map(|r| content_tokens(&r.content))
+                .sum(),
+            Message::AssistantMessage {
+                content, tool_uses, ..
+            } => {
+                content_tokens(content)
+                    + tool_uses
+                        .iter()
+                        .map(|t| text_tokens(t.name.len()) + text_tokens(t.input.to_string().len()))
+                        .sum::<u64>()
+            }
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -1018,18 +1130,85 @@ mod tests {
             input_tokens: 2195,
             output_tokens: 1,
             cached_input_tokens: 2000,
+            reasoning_output_tokens: 0,
         };
         let delta = TokenUsage {
             input_tokens: 0,
             output_tokens: 89,
             cached_input_tokens: 0,
+            reasoning_output_tokens: 34,
         };
         let merged = start.merge(delta);
         assert_eq!(merged.input_tokens, 2195);
         assert_eq!(merged.output_tokens, 89);
         assert_eq!(merged.cached_input_tokens, 2000);
-        // Estimate = prompt + the output the next request will replay.
-        assert_eq!(merged.context_tokens(), 2284);
+        assert_eq!(merged.reasoning_output_tokens, 34);
+        // Live context = prompt + the reply share the next request replays
+        // (output minus reasoning, which backends strip).
+        assert_eq!(merged.context_tokens(), 2195 + 89 - 34);
+    }
+
+    /// Old session files stored the turn-summed output as the only
+    /// `output_tokens`; they must load as a `TurnUsage` whose fallback keeps
+    /// that sum for the display side.
+    #[test]
+    fn turn_usage_reads_pre_split_session_json() {
+        let old: TurnUsage = serde_json::from_str(
+            r#"{"input_tokens":12345,"output_tokens":678,"cached_input_tokens":1000}"#,
+        )
+        .expect("old flat shape parses");
+        assert_eq!(old.final_call.input_tokens, 12_345);
+        assert_eq!(old.turn_output_tokens(), 678);
+        assert_eq!(old.context_tokens(), 13_023);
+
+        let new = TurnUsage::new(
+            TokenUsage {
+                input_tokens: 12_345,
+                output_tokens: 20,
+                cached_input_tokens: 1_000,
+                reasoning_output_tokens: 0,
+            },
+            678,
+        );
+        let json = serde_json::to_string(&new).unwrap();
+        let round: TurnUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, new);
+        assert_eq!(round.turn_output_tokens(), 678);
+        assert_eq!(round.context_tokens(), 12_365);
+    }
+
+    /// The tail estimator prices exactly what a replay would resend: text at
+    /// ~4 bytes/token, images at the flat allowance, thinking at nothing.
+    #[test]
+    fn estimate_replayed_tokens_prices_text_images_and_skips_thinking() {
+        let messages = [
+            Message::ToolResults {
+                tool_use_results: vec![ToolResult::text("x".repeat(400))],
+            },
+            Message::UserMessage {
+                content: vec![
+                    Content::Text { text: "ab".into() },
+                    Content::Image {
+                        source: "base64…".into(),
+                    },
+                ],
+            },
+            Message::AssistantMessage {
+                content: vec![Content::Thinking {
+                    text: "very long private plan".into(),
+                    signature: None,
+                    redacted: false,
+                }],
+                tool_uses: vec![],
+                turn_end_reason: None,
+            },
+        ];
+        // 400/4 + ceil(2/4) + image allowance + 0 for thinking.
+        assert_eq!(
+            estimate_replayed_tokens(&messages),
+            100 + 1 + IMAGE_TOKEN_ALLOWANCE
+        );
+        assert_eq!(estimate_replayed_tokens(&[]), 0);
     }
 
     #[tokio::test]
@@ -1042,6 +1221,7 @@ mod tests {
                 input_tokens: 2195,
                 output_tokens: 1,
                 cached_input_tokens: 2000,
+                ..Default::default()
             })),
             Ok(MessagePart::ContentStart(ContentStart::Text { index: 0 })),
             Ok(MessagePart::ContentDelta(ContentDelta::Text {
@@ -1052,6 +1232,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 89,
                 cached_input_tokens: 0,
+                ..Default::default()
             })),
             Ok(MessagePart::TurnEndReason(TurnEndReason::EndTurn)),
         ];

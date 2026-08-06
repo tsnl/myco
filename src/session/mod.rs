@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::core::{atomically_write, myco_home, uuid_simple_hex};
-use crate::generative_model::{Message, TokenUsage};
+use crate::generative_model::{Message, TurnUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
 pub const SESSION_FILE_VERSION: u32 = 2;
@@ -103,10 +103,11 @@ pub struct Session {
     /// Session created by compacting this one, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_id: Option<String>,
-    /// Last provider usage, persisted so a resumed session shows real context
-    /// (absent in sessions written before usage tracking).
+    /// Last turn's usage, persisted so a resumed session shows real context
+    /// (absent in sessions written before usage tracking; files from before
+    /// the final-call/turn-sum split load via [`TurnUsage`]'s fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_usage: Option<TokenUsage>,
+    pub last_usage: Option<TurnUsage>,
 }
 
 /// Structured association stored on a session.
@@ -212,7 +213,7 @@ impl ActiveSession {
     pub fn persist_messages(
         &self,
         messages: &[Message],
-        last_usage: Option<TokenUsage>,
+        last_usage: Option<TurnUsage>,
         force: bool,
     ) -> Result<(), String> {
         let mut session = self.lock();
@@ -1039,7 +1040,7 @@ pub(crate) fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::{Content, Message, TokenUsage};
+    use crate::generative_model::{Content, Message, TokenUsage, TurnUsage};
     use crate::test_support::{temp_dir, temp_home, user};
 
     /// Pre-`last_usage` / pre-`kind` v2 file: absent optional fields must default.
@@ -1208,11 +1209,15 @@ mod tests {
         parent.title = Some("parent title".into());
         parent.scratchpad = "parent notes".into();
         parent.messages = vec![user("hi")];
-        parent.last_usage = Some(TokenUsage {
-            input_tokens: 100,
-            output_tokens: 10,
-            cached_input_tokens: 50,
-        });
+        parent.last_usage = Some(TurnUsage::new(
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_input_tokens: 50,
+                ..Default::default()
+            },
+            10,
+        ));
 
         let child = parent.fork_child("othermodel");
         // Conversation + usage are inherited so the fork resumes the parent's
@@ -1237,16 +1242,22 @@ mod tests {
         let path = dir.path().join("with_usage.json");
         let mut session =
             Session::new_with_id("claude-opus-4-8", "aa00bb11cc22dd33ee44ff5566778899");
-        session.last_usage = Some(TokenUsage {
-            input_tokens: 12_345,
-            output_tokens: 678,
-            cached_input_tokens: 1_000,
-        });
+        session.last_usage = Some(TurnUsage::new(
+            TokenUsage {
+                input_tokens: 12_345,
+                output_tokens: 20,
+                cached_input_tokens: 1_000,
+                ..Default::default()
+            },
+            678,
+        ));
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.last_usage, session.last_usage);
-        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 13_023);
+        let usage = loaded.last_usage.unwrap();
+        assert_eq!(usage.context_tokens(), 12_365);
+        assert_eq!(usage.turn_output_tokens(), 678);
 
         assert!(load_legacy_v2().last_usage.is_none());
     }
@@ -1255,11 +1266,15 @@ mod tests {
     fn persist_messages_records_usage_and_none_keeps_last() {
         let _home = temp_home("session-persist");
 
-        let usage = TokenUsage {
-            input_tokens: 5_000,
-            output_tokens: 100,
-            cached_input_tokens: 0,
-        };
+        let usage = TurnUsage::new(
+            TokenUsage {
+                input_tokens: 5_000,
+                output_tokens: 100,
+                cached_input_tokens: 0,
+                ..Default::default()
+            },
+            100,
+        );
         let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
         let id = active.id();
 
@@ -1310,9 +1325,12 @@ mod tests {
         assert!(session.successor_id.is_some());
 
         let usage = session.last_usage.expect("last_usage");
-        assert_eq!(usage.input_tokens, 12_345);
-        assert_eq!(usage.output_tokens, 678);
-        assert_eq!(usage.cached_input_tokens, 9_000);
+        assert_eq!(usage.final_call.input_tokens, 12_345);
+        assert_eq!(usage.final_call.output_tokens, 678);
+        assert_eq!(usage.final_call.cached_input_tokens, 9_000);
+        // Pre-split file: the stored output *was* the turn sum — the fallback
+        // keeps it for the display side.
+        assert_eq!(usage.turn_output_tokens(), 678);
 
         // Both link kinds, with their optional fields populated.
         assert_eq!(session.links.len(), 2);

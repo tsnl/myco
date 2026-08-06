@@ -56,6 +56,8 @@ pub(super) struct OpenAIUsage {
     output_tokens: u64,
     #[serde(default, alias = "prompt_tokens_details")]
     input_tokens_details: Option<OpenAIInputTokensDetails>,
+    #[serde(default, alias = "completion_tokens_details")]
+    output_tokens_details: Option<OpenAIOutputTokensDetails>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -64,15 +66,28 @@ pub(super) struct OpenAIInputTokensDetails {
     cached_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct OpenAIOutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
 impl OpenAIUsage {
     pub(super) fn into_token_usage(self) -> TokenUsage {
         // input_tokens is already the full prompt; cached_tokens is a subset.
+        // reasoning_tokens is the subset of output the drivers never echo back
+        // (requests are stateless, `store: false`, and thinking is stripped on
+        // replay), so the context estimate can subtract it exactly.
         TokenUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_input_tokens: self
                 .input_tokens_details
                 .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            reasoning_output_tokens: self
+                .output_tokens_details
+                .and_then(|d| d.reasoning_tokens)
                 .unwrap_or(0),
         }
     }
@@ -178,18 +193,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usage_reports_cached_input_as_subset() {
+    fn usage_reports_cached_input_and_reasoning_output_as_subsets() {
         // One shared struct decodes both dialects' spellings of the same block.
         for json in [
             serde_json::json!({
                 "input_tokens": 10_000,
                 "output_tokens": 200,
-                "input_tokens_details": {"cached_tokens": 8_000}
+                "input_tokens_details": {"cached_tokens": 8_000},
+                "output_tokens_details": {"reasoning_tokens": 120}
             }),
             serde_json::json!({
                 "prompt_tokens": 10_000,
                 "completion_tokens": 200,
-                "prompt_tokens_details": {"cached_tokens": 8_000}
+                "prompt_tokens_details": {"cached_tokens": 8_000},
+                "completion_tokens_details": {"reasoning_tokens": 120}
             }),
         ] {
             let usage: OpenAIUsage = serde_json::from_value(json).expect("decode usage");
@@ -197,8 +214,20 @@ mod tests {
             assert_eq!(usage.input_tokens, 10_000);
             assert_eq!(usage.output_tokens, 200);
             assert_eq!(usage.cached_input_tokens, 8_000);
-            assert_eq!(usage.context_tokens(), 10_200);
+            assert_eq!(usage.reasoning_output_tokens, 120);
+            // Reasoning is never replayed, so it leaves the live context.
+            assert_eq!(usage.context_tokens(), 10_080);
         }
+
+        // Servers that omit the detail blocks (older gateways, local models)
+        // still decode; the estimate then counts the whole reply.
+        let bare: OpenAIUsage = serde_json::from_value(
+            serde_json::json!({"prompt_tokens": 50, "completion_tokens": 5}),
+        )
+        .expect("decode bare usage");
+        let bare = bare.into_token_usage();
+        assert_eq!(bare.reasoning_output_tokens, 0);
+        assert_eq!(bare.context_tokens(), 55);
     }
 
     #[test]

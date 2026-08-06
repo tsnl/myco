@@ -35,7 +35,7 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::{Message, TokenUsage};
+use crate::generative_model::{Message, TurnUsage};
 use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
@@ -474,7 +474,7 @@ impl TuiProducer {
         &self,
         used: Option<u64>,
         max: u64,
-        usage: Option<TokenUsage>,
+        usage: Option<TurnUsage>,
         running: &[String],
     ) {
         let events = self.with_state(|st| {
@@ -777,7 +777,7 @@ fn end_text_stream(st: &mut ProducerState, events: &mut Vec<TuiEvent>, colors: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::ToolUse;
+    use crate::generative_model::{TokenUsage, ToolUse};
 
     /// Capturing sink for assertions on the raw stream.
     #[derive(Default)]
@@ -922,11 +922,15 @@ mod tests {
         producer.user_header(
             Some(10),
             200,
-            Some(TokenUsage {
-                input_tokens: 10,
-                output_tokens: 3,
-                cached_input_tokens: 8,
-            }),
+            Some(TurnUsage::new(
+                TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    cached_input_tokens: 8,
+                    ..Default::default()
+                },
+                3,
+            )),
             &["bash: sleep 99 (up 3s)".to_string()],
         );
         let events = terminal.events();
