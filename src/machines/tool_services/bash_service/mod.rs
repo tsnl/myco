@@ -969,9 +969,8 @@ impl BashService {
     // Everything below is for a *person watching or driving* a session, not
     // for the agent: reads come from the non-consuming scrollback, writes are
     // gated on the keyboard lock, and none of it disturbs the agent's own
-    // drain buffer. Local host only by design — the NDJSON host protocol has
-    // no shell-observer messages, and the brains/hands doctrine keeps the
-    // interactive surface on the machine the user is signed into.
+    // drain buffer. The NDJSON host protocol mirrors this whole surface, so
+    // a remote host's shells watch and drive exactly like local ones.
 
     /// One session as the shells rail lists it.
     pub fn shell_overviews(&self) -> Vec<ShellOverview> {
@@ -1064,6 +1063,46 @@ impl BashService {
             Arc::clone(&session.shared)
         };
         Ok(render_screen(&shared))
+    }
+
+    /// Resize the session's terminal: the screen model always, and the pty
+    /// window (TIOCSWINSZ → SIGWINCH to the child) when there is one.
+    /// Requires the user to hold the keyboard — the agent sized the terminal
+    /// it asked for, and a viewer must not reshape it under a program the
+    /// agent is driving.
+    pub fn shell_resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        if !(1..=500).contains(&cols) || !(1..=500).contains(&rows) {
+            return Err(format!("unreasonable terminal size {cols}x{rows}"));
+        }
+        let (shared, stdin_slot) = {
+            let sessions = self.sessions();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| format!("unknown session {id:?}"))?;
+            if *lock_unpoisoned(&session.lock) != ShellLock::User {
+                return Err(format!(
+                    "session {id:?} is assistant-locked: take the keyboard first"
+                ));
+            }
+            (
+                Arc::clone(&session.shared),
+                lock_unpoisoned(&session.stdin).take(),
+            )
+        };
+        // Stdin briefly out for a write: report busy rather than resize the
+        // model without the pty — the viewer's next size check retries.
+        let Some(stdin) = stdin_slot else {
+            return Err(format!("session {id:?} input is busy; retrying"));
+        };
+        let result = match &stdin {
+            SessionInput::Pty(w) => w.resize(cols, rows).map_err(|e| format!("pty resize: {e}")),
+            SessionInput::Pipe(_) => Ok(()),
+        };
+        self.return_stdin(id, stdin);
+        result?;
+        lock_unpoisoned(&shared.screen).set_size(rows, cols);
+        shared.notify.notify_waiters();
+        Ok(())
     }
 
     /// A keystroke line from the user. Requires the user to hold the
@@ -1224,15 +1263,116 @@ pub struct ShellOverview {
     pub pty: bool,
 }
 
-/// A rendered terminal screen — the text a `cols`×`rows` window shows now.
-/// Serde: rides the NDJSON host protocol (see [`ShellOverview`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A rendered terminal screen — what a `cols`×`rows` window shows now, as
+/// plain text (`text`, for the agent's `screenshot` and simple clients) and
+/// as styled runs (`runs`, for a client drawing a real terminal). Serde:
+/// rides the NDJSON host protocol (see [`ShellOverview`]); the styled fields
+/// default so older peers still parse.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShellScreen {
     pub cols: u16,
     pub rows: u16,
     pub cursor_row: u16,
     pub cursor_col: u16,
     pub text: String,
+    /// Styled cell runs, row-major; the cursor cell is its own run.
+    #[serde(default)]
+    pub runs: Vec<ScreenRun>,
+    #[serde(default)]
+    pub cursor_hidden: bool,
+    /// DECCKM: arrow keys should send SS3 (`\x1bOA`…) instead of CSI.
+    #[serde(default)]
+    pub application_cursor: bool,
+}
+
+/// A run of consecutive same-styled cells on one screen row. Colors are
+/// concrete `#rrggbb` (indexed colors resolved against the xterm-256
+/// palette here, so every client draws the same thing); `None` means the
+/// terminal default.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScreenRun {
+    pub row: u16,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
+    /// The cursor sits on (the first cell of) this run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor: bool,
+}
+
+impl ScreenRun {
+    fn same_style(&self, other: &ScreenRun) -> bool {
+        self.row == other.row
+            && self.fg == other.fg
+            && self.bg == other.bg
+            && self.bold == other.bold
+            && self.italic == other.italic
+            && self.underline == other.underline
+            && self.inverse == other.inverse
+            && !self.cursor
+            && !other.cursor
+    }
+
+    fn unstyled_blank(&self) -> bool {
+        self.fg.is_none()
+            && self.bg.is_none()
+            && !self.bold
+            && !self.italic
+            && !self.underline
+            && !self.inverse
+            && !self.cursor
+            && self.text.trim().is_empty()
+    }
+}
+
+/// The xterm-256 palette, resolved to `#rrggbb`; `Default` stays `None` so
+/// the client's own theme colors apply.
+fn color_hex(color: vt100::Color) -> Option<String> {
+    let (r, g, b) = match color {
+        vt100::Color::Default => return None,
+        vt100::Color::Rgb(r, g, b) => (r, g, b),
+        vt100::Color::Idx(i) => match i {
+            // The 16 base colors, xterm defaults.
+            0 => (0, 0, 0),
+            1 => (0xcd, 0, 0),
+            2 => (0, 0xcd, 0),
+            3 => (0xcd, 0xcd, 0),
+            4 => (0, 0, 0xee),
+            5 => (0xcd, 0, 0xcd),
+            6 => (0, 0xcd, 0xcd),
+            7 => (0xe5, 0xe5, 0xe5),
+            8 => (0x7f, 0x7f, 0x7f),
+            9 => (0xff, 0, 0),
+            10 => (0, 0xff, 0),
+            11 => (0xff, 0xff, 0),
+            12 => (0x5c, 0x5c, 0xff),
+            13 => (0xff, 0, 0xff),
+            14 => (0, 0xff, 0xff),
+            15 => (0xff, 0xff, 0xff),
+            // 6×6×6 color cube.
+            16..=231 => {
+                let n = i - 16;
+                let level = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
+                (level(n / 36), level((n / 6) % 6), level(n % 6))
+            }
+            // Grayscale ramp.
+            232..=255 => {
+                let v = 8 + 10 * (i - 232);
+                (v, v, v)
+            }
+        },
+    };
+    Some(format!("#{r:02x}{g:02x}{b:02x}"))
 }
 
 fn render_screen(shared: &SessionShared) -> ShellScreen {
@@ -1240,12 +1380,57 @@ fn render_screen(shared: &SessionShared) -> ShellScreen {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_hidden = screen.hide_cursor();
+
+    let mut runs: Vec<ScreenRun> = Vec::new();
+    for row in 0..rows {
+        let mut row_runs: Vec<ScreenRun> = Vec::new();
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            // A wide character's second column carries no glyph of its own.
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let contents = cell.contents();
+            let run = ScreenRun {
+                row,
+                text: if contents.is_empty() {
+                    " ".into()
+                } else {
+                    contents
+                },
+                fg: color_hex(cell.fgcolor()),
+                bg: color_hex(cell.bgcolor()),
+                bold: cell.bold(),
+                italic: cell.italic(),
+                underline: cell.underline(),
+                inverse: cell.inverse(),
+                cursor: !cursor_hidden && row == cursor_row && col == cursor_col,
+            };
+            match row_runs.last_mut() {
+                Some(last) if last.same_style(&run) => last.text.push_str(&run.text),
+                _ => row_runs.push(run),
+            }
+        }
+        // Trailing unstyled blanks carry nothing a renderer needs (rows are
+        // addressed, so alignment survives without them).
+        while row_runs.last().is_some_and(ScreenRun::unstyled_blank) {
+            row_runs.pop();
+        }
+        runs.append(&mut row_runs);
+    }
+
     ShellScreen {
         cols,
         rows,
         cursor_row,
         cursor_col,
+        cursor_hidden,
+        application_cursor: screen.application_cursor(),
         text: screen.contents(),
+        runs,
     }
 }
 

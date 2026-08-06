@@ -100,6 +100,14 @@
         min-height: 2.4em; max-height: 30vh;
       }
       .composer textarea::placeholder { color: var(--fg-dim); }
+      /* The conversation's composer sits inline under the last message,
+         inside the chat's scroll — the work panel beside it gets the whole
+         window height. (The fixed variant remains for the draft page.) */
+      .composer-inline {
+        border-top: none; box-shadow: none;
+        padding: 0.75rem 0 0;
+        display: flex; flex-direction: column; gap: 0.3rem;
+      }
       .composer textarea:focus {
         border-color: var(--fg-dim);
         box-shadow: 0 0 2px var(--fg);
@@ -193,13 +201,34 @@
       .work-view-head .host-badge { color: var(--tool); font-size: 0.85em; }
       .work-view-user .work-view-head .lock-badge { color: var(--user); }
       .work-body {
+        --term-bg: #0b0b0b;
+        position: relative;
         flex: 1 1 auto; min-height: 0; overflow-y: auto;
         padding: 0.3rem 0.5rem; font-size: 0.9em;
-        background: #0b0b0b;
+        background: var(--term-bg);
         /* Terminal text is preformatted but must never widen the panel. */
         white-space: pre-wrap; word-break: break-word;
         user-select: text;
       }
+      /* Raw mode: the body *is* the terminal — it holds keyboard focus and
+         every keystroke goes down the wire. The ring says the keys are
+         yours. */
+      .work-body-raw { cursor: text; }
+      .work-body-raw:focus {
+        outline: none;
+        box-shadow: inset 0 0 0 1px var(--user);
+      }
+      /* Cell-size probe for fitting the pty to the panel: rendered in the
+         terminal's own font, measured, never seen. */
+      .term-probe {
+        position: absolute; top: 0; left: -9999px;
+        visibility: hidden; white-space: pre;
+      }
+      /* The styled screen grid: exact columns, no wrapping, a row per line.
+         line-height matches the probe so rows measure true. */
+      .term-screen { line-height: 1.3; }
+      .term-screen .trow { white-space: pre; min-height: 1.3em; }
+      .term-screen .cur { background: var(--fg); color: var(--term-bg); }
       /* A subagent chat is prose in transcript form, not terminal bytes. */
       .chat-body { white-space: normal; background: transparent; }
       .chat-open-link { margin-top: 0.5rem; font-size: 0.9em; }
@@ -275,13 +304,7 @@
       .tool-disc { width: 1ch; line-height: 1; }
       .tool-disc-ok { color: var(--user); }
       .tool-disc-failed { color: var(--err); }
-      .tool-disc-running { color: #fff; animation: tool-pulse 1s steps(1) infinite; }
-      @keyframes tool-pulse { 50% { opacity: 0.15; } }
-      /* A blinking element is exactly what vestibular and attention-related
-         motion sensitivity settings ask us to drop; the colour still reads. */
-      @media (prefers-reduced-motion: reduce) {
-        .tool-disc-running { animation: none; opacity: 0.6; }
-      }
+      .tool-disc-running { color: #fff; }
       /* Pushed right, revealed on hover: present when wanted, quiet otherwise. */
       .tool-toggle {
         margin-left: auto; color: var(--fg-dim); font-size: 0.85em;

@@ -178,6 +178,12 @@ class Myco:
         return self._call("POST", f"/sessions/{sid}/shells/{host}/{shell}/lock",
                           {"lock": lock})
 
+    def shell_resize(self, sid: str, host: str, shell: str, cols: int, rows: int):
+        """Fit the terminal (requires the user keyboard lock); a pty child
+        learns via SIGWINCH."""
+        return self._call("POST", f"/sessions/{sid}/shells/{host}/{shell}/resize",
+                          {"cols": cols, "rows": rows})
+
     # -- subagents ---------------------------------------------------------
 
     def subagents(self, sid: str):

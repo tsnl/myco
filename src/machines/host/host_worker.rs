@@ -262,6 +262,28 @@ impl HostWorker {
                 };
                 let _ = write_locked(&writer, &reply).await;
             }
+            Request::ShellResize {
+                id,
+                shell,
+                cols,
+                rows,
+            } => {
+                let reply = match self.bash() {
+                    Some(b) => match b.shell_resize(&shell, cols, rows) {
+                        Ok(()) => match b.shell_overview(&shell) {
+                            Ok(overview) => Response::Shell {
+                                id,
+                                shell: overview,
+                                previous_lock: None,
+                            },
+                            Err(e) => shell_err(id, e),
+                        },
+                        Err(e) => shell_err(id, e),
+                    },
+                    None => no_bash(id),
+                };
+                let _ = write_locked(&writer, &reply).await;
+            }
         }
     }
 

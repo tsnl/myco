@@ -310,6 +310,12 @@ pub struct Live {
     /// to it fail politely (see [`crate::subagent::SubagentTool`]). In-memory
     /// like a shell's lock: the hold ends with the agent task.
     user_hold: AtomicBool,
+    /// What has been typed into each user-held shell (keyed `host/shell`)
+    /// since its keyboard was taken. Keystrokes stream raw and would spam
+    /// the transcript one note apiece, so they accumulate here and flush as
+    /// a single attributed note when the keyboard is handed back — the
+    /// boundary where the agent's writes resume and it needs the story.
+    typed: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Live {
@@ -442,6 +448,7 @@ impl Server {
             lock: std::sync::Mutex::new(lock),
             harness: harness.clone(),
             user_hold: AtomicBool::new(false),
+            typed: std::sync::Mutex::new(HashMap::new()),
         });
         live.insert(id.clone(), handle.clone());
 
@@ -1018,6 +1025,26 @@ fn shell_of(host: String, s: crate::machines::tool_services::ShellOverview) -> a
     }
 }
 
+/// Keystrokes as a person (or the agent) reads them back: printable text
+/// untouched, Enter as a newline, everything else in caret notation (`^C`,
+/// `^[[A`) — a transcript note is for reading, not replaying.
+fn readable_keys(data: &str) -> String {
+    let mut out = String::with_capacity(data.len());
+    for c in data.chars() {
+        match c {
+            '\n' | '\r' => out.push('\n'),
+            '\t' => out.push('\t'),
+            '\x7f' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push(char::from((c as u8) + 0x40));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A live child as the rail lists it. Metadata reads only — no snapshot.
 fn subagent_of(l: &Live) -> api::Subagent {
     let (id, model) = l.session.with(|s| (s.id.clone(), s.model.clone()));
@@ -1353,12 +1380,45 @@ impl Server {
             cursor_row: s.cursor_row,
             cursor_col: s.cursor_col,
             text: s.text,
+            runs: s
+                .runs
+                .into_iter()
+                .map(|r| api::ScreenRun {
+                    row: r.row,
+                    text: r.text,
+                    fg: r.fg,
+                    bg: r.bg,
+                    bold: r.bold,
+                    italic: r.italic,
+                    underline: r.underline,
+                    inverse: r.inverse,
+                    cursor: r.cursor,
+                })
+                .collect(),
+            cursor_hidden: s.cursor_hidden,
+            application_cursor: s.application_cursor,
         })
+    }
+
+    pub(crate) async fn shell_resize(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<api::Shell, ApiError> {
+        let (_, ctl) = self.shell_host(id, host).await?;
+        let overview = ctl
+            .shell_resize(shell, cols, rows)
+            .await
+            .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
+        Ok(shell_of(host.to_string(), overview))
     }
 
     pub(crate) async fn shell_input(
         &self,
-        author: &Author,
+        _author: &Author,
         id: &str,
         host: &str,
         shell: &str,
@@ -1369,16 +1429,16 @@ impl Server {
             .shell_input(shell, &data)
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
-        // The keystrokes become part of the conversation: the agent must not
-        // discover a mutated shell with no explanation in its history.
-        self.accept_room_note(
-            &live,
-            author,
-            &format!(
-                "[typed into shell {shell:?} on {host}]\n{}",
-                data.trim_end_matches('\n')
-            ),
-        );
+        // The keystrokes become part of the conversation — the agent must not
+        // discover a mutated shell with no explanation in its history — but
+        // they stream one at a time now, so they accumulate per hold and
+        // flush as a single note when the keyboard is handed back.
+        live.typed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(format!("{host}/{shell}"))
+            .or_default()
+            .push_str(&data);
         Ok(shell_of(host.to_string(), overview))
     }
 
@@ -1402,15 +1462,42 @@ impl Server {
         // Announce transitions only: a double-click that re-takes the
         // keyboard is not news.
         if previous != wanted {
-            let text = match lock {
+            match lock {
                 api::ShellLockMode::User => {
-                    format!("[took the keyboard for shell {shell:?} on {host}]")
+                    // A fresh hold starts a fresh story.
+                    live.typed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&format!("{host}/{shell}"));
+                    self.accept_room_note(
+                        &live,
+                        author,
+                        &format!("[took the keyboard for shell {shell:?} on {host}]"),
+                    );
                 }
                 api::ShellLockMode::Assistant => {
-                    format!("[returned the keyboard for shell {shell:?} on {host}]")
+                    let typed = live
+                        .typed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&format!("{host}/{shell}"));
+                    if let Some(data) = typed.filter(|d| !d.is_empty()) {
+                        self.accept_room_note(
+                            &live,
+                            author,
+                            &format!(
+                                "[typed into shell {shell:?} on {host}]\n{}",
+                                readable_keys(&data)
+                            ),
+                        );
+                    }
+                    self.accept_room_note(
+                        &live,
+                        author,
+                        &format!("[returned the keyboard for shell {shell:?} on {host}]"),
+                    );
                 }
-            };
-            self.accept_room_note(&live, author, &text);
+            }
         }
         Ok(shell_of(host.to_string(), overview))
     }
@@ -1764,6 +1851,17 @@ impl MycoApi for UserApi {
         shell: &str,
     ) -> Result<api::ShellScreen, ApiError> {
         self.server.shell_screen(id, host, shell).await
+    }
+
+    async fn shell_resize(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<api::Shell, ApiError> {
+        self.server.shell_resize(id, host, shell, cols, rows).await
     }
 
     async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {

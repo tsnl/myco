@@ -58,6 +58,12 @@ pub struct ConvState {
     pub entries: Vec<api::Entry>,
     /// The turn streaming right now, cleared when its persisted form arrives.
     pub streaming: Vec<StreamItem>,
+    /// Messages delivered while that turn streams. They arrived *during* the
+    /// turn, so they render after its buffer — appending them to `entries`
+    /// would show them above output that started before they were sent, and
+    /// they would visibly jump below it when the turn persisted. Folded into
+    /// `entries` at the next boundary.
+    pub arrivals: Vec<api::Entry>,
     pub busy: bool,
     pub error: Option<String>,
     /// Whether anyone but us has posted here; drives the addressing hint.
@@ -75,6 +81,7 @@ impl ConvState {
             me,
             entries: Vec::new(),
             streaming: Vec::new(),
+            arrivals: Vec::new(),
             busy: false,
             error: None,
             shared: false,
@@ -152,12 +159,21 @@ impl ConvState {
                 // A full reload is the whole truth — dispatched on (re)connect,
                 // where a stale buffer would double whatever it still holds.
                 self.streaming.clear();
+                self.arrivals.clear();
             }
             ConvAction::Message { entry, wakes_agent } => {
                 if !self.mine(&entry.author) {
                     self.shared = true;
                 }
-                merge(&mut self.entries, entry);
+                // Mid-turn deliveries hold position *after* the stream buffer
+                // (that is where the room saw them); otherwise straight in.
+                if self.busy || !self.streaming.is_empty() {
+                    if !self.entries.iter().any(|e| e.at == entry.at) {
+                        merge(&mut self.arrivals, entry);
+                    }
+                } else {
+                    merge(&mut self.entries, entry);
+                }
                 if wakes_agent {
                     self.busy = true;
                 }
@@ -166,6 +182,11 @@ impl ConvState {
                 self.busy = true;
                 self.error = None;
                 self.streaming.clear();
+                // The boundary passed: what arrived mid-turn is part of the
+                // transcript now (the refetch that follows orders it).
+                for entry in std::mem::take(&mut self.arrivals) {
+                    merge(&mut self.entries, entry);
+                }
             }
             ConvAction::Text(t) => push_text(&mut self.streaming, t, false),
             ConvAction::Thinking(t) => push_text(&mut self.streaming, t, true),
@@ -191,6 +212,9 @@ impl ConvState {
             }
             ConvAction::TurnFailed(message) => self.error = Some(message),
             ConvAction::TurnEnded { poll } => {
+                for entry in std::mem::take(&mut self.arrivals) {
+                    merge(&mut self.entries, entry);
+                }
                 reconcile(&mut self.entries, poll.entries);
                 self.streaming.clear();
                 self.busy = poll.busy;
@@ -201,6 +225,11 @@ impl ConvState {
             ConvAction::Polled { poll } => {
                 if self.streaming.is_empty() {
                     reconcile(&mut self.entries, poll.entries);
+                    // An arrival the server has absorbed is transcript now —
+                    // holding it would render it twice.
+                    let entries = &self.entries;
+                    self.arrivals
+                        .retain(|a| !entries.iter().any(|e| e.at == a.at));
                 }
                 self.busy = poll.busy;
             }
@@ -335,17 +364,27 @@ mod tests {
             wakes_agent: false,
         });
 
-        // A poll that does not know the note yet must not erase it.
+        // A poll that does not know the note yet must not erase it. (It was
+        // delivered mid-turn, so it is held as an arrival, still on screen.)
         st.apply(ConvAction::Polled {
             poll: poll(vec![older.clone()], true),
         });
-        assert!(st.entries.iter().any(|e| e.at == note.at), "note vanished");
+        let on_screen = |st: &ConvState| {
+            st.entries
+                .iter()
+                .chain(st.arrivals.iter())
+                .filter(|e| e.at == note.at)
+                .count()
+        };
+        assert_eq!(on_screen(&st), 1, "note vanished");
 
-        // Once the server returns it, there is exactly one copy.
+        // Once the server returns it, there is exactly one copy — in the
+        // transcript, not still held as an arrival too.
         st.apply(ConvAction::Polled {
             poll: poll(vec![older, note.clone()], false),
         });
-        assert_eq!(st.entries.iter().filter(|e| e.at == note.at).count(), 1);
+        assert_eq!(on_screen(&st), 1);
+        assert!(st.arrivals.is_empty(), "absorbed arrivals must not linger");
     }
 
     /// Mid-turn, the checkpointed entries cover output the stream buffer
@@ -429,6 +468,35 @@ mod tests {
             StreamItem::Tool { result, .. } => assert!(result.is_none()),
             other => panic!("expected the tool card, got {:?}", other.size()),
         }
+    }
+
+    /// A message delivered while a turn streams renders after the stream
+    /// buffer (see `ConvState::arrivals`), and joins the transcript exactly
+    /// once when the turn ends.
+    #[test]
+    fn a_mid_turn_message_holds_position_after_the_stream_buffer() {
+        let mut st = ConvState::new(me());
+        st.apply(ConvAction::Loaded {
+            entries: vec![msg("ada", "go")],
+            busy: true,
+        });
+        st.apply(ConvAction::Text("partial answer".into()));
+        let note = msg("grace", "mid-turn note");
+        st.apply(ConvAction::Message {
+            entry: note.clone(),
+            wakes_agent: false,
+        });
+        assert_eq!(st.entries.len(), 1, "must not appear above the stream");
+        assert_eq!(st.arrivals.len(), 1, "renders after the stream buffer");
+
+        // The persisted turn absorbs it, in the server's order, one copy.
+        let saved = vec![msg("ada", "go"), msg("ada", "partial answer"), note.clone()];
+        st.apply(ConvAction::TurnEnded {
+            poll: poll(saved, false),
+        });
+        assert!(st.arrivals.is_empty());
+        assert_eq!(st.entries.iter().filter(|e| e.at == note.at).count(), 1);
+        assert_eq!(st.entries[2].at, note.at, "server order wins");
     }
 
     /// Duplicate delivery (feed + poll, reconnect replays) folds to one copy.

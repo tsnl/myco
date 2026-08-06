@@ -208,16 +208,13 @@ async fn a_user_can_watch_take_and_drive_the_agents_shell() {
         .expect("screen");
     assert!(screen.text.contains("hello from ada"), "{:?}", screen.text);
 
-    // The intervention is part of the conversation: keystrokes and the lock
-    // transition land as entries — attributed, non-waking — so the agent
-    // does not discover a mutated shell with no explanation in its history.
+    // The take lands in the transcript at once; the keystrokes accumulate
+    // per hold (they stream one at a time now) and are *not* in the
+    // transcript yet.
     settle(&ada, &s.id, |p| {
         p.entries
             .iter()
-            .any(|e| e.text().contains("[typed into shell"))
-            && p.entries
-                .iter()
-                .any(|e| e.text().contains("[took the keyboard"))
+            .any(|e| e.text().contains("[took the keyboard"))
     })
     .await;
     // Exactly one agent answer so far: none of it woke the agent.
@@ -228,8 +225,16 @@ async fn a_user_can_watch_take_and_drive_the_agents_shell() {
         .filter(|e| matches!(e.body, myco_api::EntryBody::Agent { .. }))
         .count();
     assert_eq!(answers, 2, "start turn only: tool round + answer");
+    assert!(
+        !p.entries
+            .iter()
+            .any(|e| e.text().contains("[typed into shell")),
+        "keystrokes flush on handoff, not per keypress"
+    );
 
-    // Handing the keyboard back re-opens the agent's writes and is recorded.
+    // Handing the keyboard back re-opens the agent's writes and is recorded
+    // — and flushes everything typed during the hold as one note, so the
+    // agent reads the whole intervention at its next boundary.
     let returned = ada
         .shell_lock(&s.id, "local", "term", ShellLockMode::Assistant)
         .await
@@ -238,7 +243,13 @@ async fn a_user_can_watch_take_and_drive_the_agents_shell() {
     settle(&ada, &s.id, |p| {
         p.entries
             .iter()
-            .any(|e| e.text().contains("[returned the keyboard"))
+            .any(|e| e.text().contains("[typed into shell"))
+            && p.entries
+                .iter()
+                .any(|e| e.text().contains("hello from ada"))
+            && p.entries
+                .iter()
+                .any(|e| e.text().contains("[returned the keyboard"))
     })
     .await;
 
@@ -322,7 +333,11 @@ async fn a_remote_shell_is_watchable_and_drivable_over_the_web_api() {
         screen.text
     );
 
-    // The transcript names the host, so "who typed what where" reads back.
+    // The transcript names the host, so "who typed what where" reads back —
+    // flushed when the keyboard is handed back.
+    ada.shell_lock(&s.id, "rem", "term", ShellLockMode::Assistant)
+        .await
+        .expect("unlock");
     settle(&ada, &s.id, |p| {
         p.entries
             .iter()

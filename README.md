@@ -37,14 +37,20 @@ and `clients/myco.py` (or plain HTTP) for scripts and agents driving agents.
   horizontal split beside the chat: a tab per live bash session on **every
   host** — local and remotes alike, reached over the same NDJSON host
   protocol the tools use — plus chips for whatever tool calls are in
-  flight. Tabs come and go as shells do; the active one fills the panel as
-  its own terminal (pty sessions render as their actual terminal screen).
-  A button takes the keyboard so you can type into it yourself. The lock
-  decides who may write — shells start agent-held, the agent's writes fail
-  politely while you hold it, and both sides always read. Everything you
-  type (and every keyboard handoff) lands in the transcript as an
-  attributed, non-waking message naming the host, so the agent reads what
-  you did at its next boundary instead of discovering a mutated shell.
+  flight. Tabs come and go as shells do; the active one fills the panel.
+  A pty session is a **real terminal emulator**: colors and cursor render
+  from the server's vt100 screen, the window resizes to fit the panel
+  (SIGWINCH and all), and once you take the keyboard you type straight
+  into it — Ctrl+C, Ctrl+D, Esc, arrows, F-keys, Alt chords, paste
+  (Ctrl+Shift+C/V stay the browser's copy and paste) — with keystrokes
+  streamed raw, in order, and echo one round trip away. Piped sessions
+  keep an honest line-based input row. The lock decides who may write —
+  shells start agent-held, the agent's writes fail politely while you hold
+  it, and both sides always read. Every handoff lands in the transcript as
+  an attributed, non-waking message naming the host, and everything you
+  typed during a hold flushes as one such note when you hand the keyboard
+  back — so the agent reads the whole intervention at its next boundary
+  instead of discovering a mutated shell.
 - **Subagents get the same window.** The `subagent` tool's children are
   full sessions, and each live child is a tab too — a chat rendered by the
   same transcript view as the main pane, streaming while the child works.
@@ -151,9 +157,12 @@ user hold; echoes into the parent transcript) ·
 `GET /api/sessions/<id>/shells/<host>/<shell>?from=N`
 (offset-addressed scrollback tail) ·
 `GET /api/sessions/<id>/shells/<host>/<shell>/screen` (rendered terminal
-screen — what a pty session looks like now) ·
-`POST /api/sessions/<id>/shells/<host>/<shell>/input` (`{data}`, requires the
-user keyboard lock) · `POST /api/sessions/<id>/shells/<host>/<shell>/lock`
+screen: plain text plus styled runs with colors and cursor) ·
+`POST /api/sessions/<id>/shells/<host>/<shell>/input` (`{data}`, raw bytes,
+requires the user keyboard lock) ·
+`POST /api/sessions/<id>/shells/<host>/<shell>/resize` (`{cols, rows}`,
+requires the lock; pty children get SIGWINCH) ·
+`POST /api/sessions/<id>/shells/<host>/<shell>/lock`
 (`{lock: "user"|"assistant"}`).
 Wire types live in `crates/myco-api`.
 
