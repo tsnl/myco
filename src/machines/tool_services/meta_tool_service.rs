@@ -10,7 +10,7 @@ use crate::core::Async;
 use crate::session::{
     ActiveSession, Session, format_session_detail, format_session_list_line, list_sessions_filtered,
 };
-use myco_api::ToolResult;
+use myco_types::ToolResult;
 
 use super::{HostDispatchContext, ToolService};
 
@@ -67,9 +67,9 @@ impl ToolService for SessionMetaTool {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: myco_api::ToolUse,
+        tool_use: myco_types::ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<myco_api::ToolResult> {
+    ) -> Async<myco_types::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input.clone()) {
                 Ok(v) => v,
@@ -233,7 +233,7 @@ mod tests {
     async fn call(tool: &Arc<SessionMetaTool>, input: serde_json::Value) -> ToolResult {
         tool.clone()
             .dispatch_tool_use(
-                myco_api::ToolUse {
+                myco_types::ToolUse {
                     id: "t".into(),
                     name: "session_meta".into(),
                     input,

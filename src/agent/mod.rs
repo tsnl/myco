@@ -26,8 +26,8 @@ use crate::models::{
     self as generative_model, ContentDelta, GenerateError, GenerateOutput, GenerativeModel,
     MessagePart, Recovery,
 };
-use myco_api::{Author, Entry, EntryBody};
-use myco_api::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content};
+use myco_types::{Author, Entry, EntryBody};
+use myco_types::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content};
 use uuid::Uuid;
 
 //

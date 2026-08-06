@@ -12,9 +12,9 @@ pub(crate) mod test_support;
 // and the wire carries it, and this layer only projects it onto providers.
 // Imported, deliberately not re-exported — a caller holding a `Content` is
 // holding a wire type, and its `use` line should say so. Hiding that behind
-// `myco_api::Content` made the projection seam invisible and let provider
+// `myco_types::Content` made the projection seam invisible and let provider
 // concerns drift into a type the browser deserializes.
-use myco_api::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason};
+use myco_types::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason};
 
 /// Project session entries onto provider messages.
 ///
@@ -23,8 +23,8 @@ use myco_api::{Content, TokenUsage, ToolResult, ToolUse, TurnEndReason};
 /// in it, each user entry is prefixed with the speaker's name, because a
 /// model reading a shared transcript needs to know who said what. Solo
 /// sessions are left exactly as typed.
-pub fn entries_to_messages(entries: &[myco_api::Entry]) -> Vec<Message> {
-    use myco_api::{Author, EntryBody};
+pub fn entries_to_messages(entries: &[myco_types::Entry]) -> Vec<Message> {
+    use myco_types::{Author, EntryBody};
 
     let mut names = std::collections::BTreeSet::new();
     for e in entries {
@@ -884,7 +884,7 @@ mod tests {
             Content::Text { text } => assert_eq!(text, "answer"),
             other => panic!("expected text, got {other:?}"),
         }
-        assert_eq!(myco_api::answer_content(&output.content).len(), 1);
+        assert_eq!(myco_types::answer_content(&output.content).len(), 1);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::prompts;
 use crate::session::Session;
-use myco_api::{Author, Content, Entry, EntryBody};
+use myco_types::{Author, Content, Entry, EntryBody};
 
 /// How many trailing user-turns the successor keeps verbatim (well-formed).
 const TAIL_USER_TURNS: usize = 2;

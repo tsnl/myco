@@ -227,8 +227,11 @@ token for the local operator and exports it as `$MYCO_API_TOKEN` alongside
   provider backends (`models`), sessions on disk (`session`), config, auth,
   prompts, the Rocket adapter (`web`), the thin `-p` client (`cli`), and
   `--mode host` (the per-machine worker remotes run)
-- `myco-api` — wire types + the `MycoApi` trait, shared by server and
-  clients; wasm-safe, which is the one crate boundary that earns its keep
+- `myco-types` — the shared vocabulary: conversation records, tool calls,
+  terminal screens, the keyboard lock — what the store persists, the wires
+  carry, and the browser deserializes
+- `myco-api` — the API surface on top of it: the `MycoApi` trait, request/
+  response types, stream events (re-exports all of `myco-types`)
 - `myco-gui` — minimal Yew web client (one URL per conversation)
 - `clients/myco.py` — the API as a dependency-free Python client, doubling
   as executable protocol documentation

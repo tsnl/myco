@@ -84,9 +84,12 @@ children surface in the GUI's work panel and can be taken over by a person.
 Nesting is local-only by doctrine: brains (config, keys, gateway access,
 session store) stay on the server's machine; remotes stay hands.
 
-Three crates — `myco` (everything server-side), `myco-api` (wire types, the
-`MycoApi` trait; wasm-safe), `myco-gui` (Yew client) — plus
-`clients/myco.py`. Inside `myco`:
+Four crates — `myco` (everything server-side), `myco-types` (the shared
+vocabulary; serde-only, wasm-safe, bottom of everything), `myco-api` (the
+API surface: `MycoApi` trait + request/response types; re-exports
+`myco-types`), `myco-gui` (Yew client) — plus `clients/myco.py`. Server
+internals import `myco_types`, never `myco_api`; the wire surface stays at
+the edge (`server/`, `web`, `cli`). Inside `myco`:
 
 | Area | Role |
 |------|------|
@@ -99,7 +102,7 @@ Three crates — `myco` (everything server-side), `myco-api` (wire types, the
 | `src/machines/` | The hands: `Harness` (host pool), `HostController`/`HostWorker` + NDJSON protocol (tool calls **and** the shell observer surface), every `ToolService` (bash with pty/screen/locks, editor, view_image) |
 | `src/agent/` | The turn loop: `Agent::interact`, `AgentEvent`/`EventSink`, cancellation, the compact worker |
 | `src/auth/` | Credentials and access tokens behind the OAuth2 password grant |
-| `src/server.rs` | The session runtime: `Live` handles, the `Room` (multiplayer + pre-emption), shells/subagent surfaces, `UserApi` (the `MycoApi` impl) |
+| `src/server/` | The session runtime: `Live` handles + the agent task (`mod.rs`), the `Room` (`room.rs`), the shells/subagent observer surface (`observer.rs`), `UserApi` — the `MycoApi` impl (`user_api.rs`) |
 | `src/web.rs` | Rocket adapter: REST one-liners over `MycoApi`, SSE events, the shell WebSocket, operator token |
 | `src/cli.rs`, `src/client.rs`, `src/admin.rs`, `src/subagent.rs` | The `-p` client; `MycoApi` over HTTP; `myco auth`; the `subagent` tool |
 | `tests/` | Integration tests (multiplayer, shells, subagents, cancel, host desync, …) |
@@ -122,8 +125,9 @@ Three crates — `myco` (everything server-side), `myco-api` (wire types, the
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `core` → `models` → `config` →
-  `session` → `prompts` → `machines` → `agent` → `server` → `web`/`cli`. A
+- **The module graph is acyclic.** Bottom-up: `myco-types` → `core` →
+  `models` → `config` → `session` → `prompts` → `machines` → `agent` →
+  `server` → `web`/`cli` (only the last tier may import `myco_api`). A
   module reaching *up* that list is the smell; the fix is usually that the
   shared thing belongs lower down. `#[cfg(test)]` may reach anywhere — test
   setup composes real layers on purpose.

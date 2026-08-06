@@ -14,7 +14,7 @@ use crate::machines::harness::Harness;
 use crate::models::{self as generative_model, CatalogModel};
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
-use myco_api::Content;
+use myco_types::Content;
 
 use super::{Agent, AgentInteractionError, NullEventSink, TraceContext};
 
@@ -126,7 +126,7 @@ pub async fn run_compact_worker(
     let prompt = compact_subagent_prompt(&predecessor.id);
     let result = worker
         .interact(
-            myco_api::Author::System,
+            myco_types::Author::System,
             vec![Content::Text { text: prompt }],
             cancel,
         )

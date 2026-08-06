@@ -15,7 +15,7 @@ use crate::models::{
     ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
     MessagePart, ToolUseDelta, ToolUseStart,
 };
-use myco_api::{Author, Content, Entry, ToolResult, ToolUse, TurnEndReason};
+use myco_types::{Author, Content, Entry, ToolResult, ToolUse, TurnEndReason};
 
 // ---------------------------------------------------------------------------
 // ScriptedModel

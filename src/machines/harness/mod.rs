@@ -312,16 +312,16 @@ impl Harness {
     /// what the NDJSON protocol carries to remotes.
     pub fn dispatch_tool_use(
         self: Arc<Self>,
-        mut tool_use: myco_api::ToolUse,
+        mut tool_use: myco_types::ToolUse,
         agent_id: uuid::Uuid,
         cancel: CancelToken,
-    ) -> Async<myco_api::ToolResult> {
+    ) -> Async<myco_types::ToolResult> {
         Box::pin(async move {
             let id = tool_use.id.clone();
             let name = tool_use.name.clone();
 
             if !self.host_tool_names.contains(&name) {
-                return myco_api::ToolResult::err(format!("unknown tool '{name}'")).with_id(id);
+                return myco_types::ToolResult::err(format!("unknown tool '{name}'")).with_id(id);
             }
 
             // Root-only tools always run on the in-process local worker. Their schemas
@@ -332,7 +332,7 @@ impl Harness {
             } else {
                 match resolve_host_for_call(&tool_use, &self.default_host) {
                     Ok(h) => h,
-                    Err(e) => return myco_api::ToolResult::err(e).with_id(id),
+                    Err(e) => return myco_types::ToolResult::err(e).with_id(id),
                 }
             };
 
@@ -343,7 +343,7 @@ impl Harness {
 
             let Some(client) = self.hosts.get(&host_name).cloned() else {
                 let known = self.host_names().join(", ");
-                return myco_api::ToolResult::err(format!(
+                return myco_types::ToolResult::err(format!(
                     "unknown host {host_name:?} (known: [{known}]; default={})",
                     self.default_host
                 ))
@@ -390,7 +390,7 @@ impl Harness {
 
 /// Read optional `host` from tool input; default to `default_host` (always `"local"`).
 fn resolve_host_for_call(
-    tool_use: &myco_api::ToolUse,
+    tool_use: &myco_types::ToolUse,
     default_host: &str,
 ) -> Result<String, String> {
     match tool_use.input.get("host") {
@@ -409,7 +409,7 @@ fn resolve_host_for_call(
     }
 }
 
-fn strip_host_field(tool_use: &mut myco_api::ToolUse) {
+fn strip_host_field(tool_use: &mut myco_types::ToolUse) {
     if let serde_json::Value::Object(map) = &mut tool_use.input {
         map.remove("host");
     }
@@ -444,7 +444,7 @@ fn inject_host_field(mut spec: generative_model::ToolSpec) -> generative_model::
 mod tests {
     use super::*;
     use crate::test_support::result_text;
-    use myco_api::ToolUse;
+    use myco_types::ToolUse;
     use serde_json::json;
 
     /// Dispatch `name` with `input` through the harness on behalf of `agent_id`.
@@ -453,7 +453,7 @@ mod tests {
         agent_id: uuid::Uuid,
         name: &str,
         input: serde_json::Value,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         harness
             .clone()
             .dispatch_tool_use(
@@ -472,7 +472,7 @@ mod tests {
         harness: &Arc<Harness>,
         name: &str,
         input: serde_json::Value,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         call_on(harness, uuid::Uuid::nil(), name, input).await
     }
 

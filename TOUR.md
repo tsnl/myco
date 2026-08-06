@@ -47,12 +47,14 @@ write, with every handoff recorded in the transcript.
 
 ## The map
 
-Three crates. The wasm boundary is the one split that earns its keep:
+Four crates. The wasm boundary and the vocabulary/surface split are the
+two divisions that earn their keep:
 
 | Crate | One line |
 |-------|----------|
 | `myco` | Everything server-side: the binary, the runtime, the tools, the drivers |
-| `myco-api` | The wire vocabulary: `Entry`/`Author`/`Content`, the `MycoApi` trait, `StreamEvent`, shells/subagents/screen types, `@mention` parsing. Serde-only, wasm-safe |
+| `myco-types` | The shared vocabulary: `Entry`/`Author`/`Content`, tool calls, `ShellScreen`/`ShellLock`. Serde-only, wasm-safe, bottom of everything |
+| `myco-api` | The API surface on top: the `MycoApi` trait, request/response types, `StreamEvent`, `@mention` parsing. Re-exports all of `myco-types` |
 | `myco-gui` | Minimal Yew client; one URL per conversation |
 
 Plus `clients/myco.py`: the REST surface as a dependency-free Python
@@ -67,9 +69,12 @@ core → models → config → session → prompts → machines → agent
 server (composes everything) → web / cli / admin / subagent
 ```
 
-Two structural facts to verify early: `myco-api` depends on nothing in
-the workspace and `myco-gui` depends on `myco-api` alone — the browser
-deserializes the same types the store persists. `src/test_support/` is a
+Two structural facts to verify early: `myco-types` depends on nothing in
+the workspace, and `myco-gui` depends on `myco-api` alone (which re-
+exports the vocabulary) — the browser deserializes the same types the
+store persists. Server internals (`models`, `session`, `machines`,
+`agent`) import `myco_types` directly and never the API crate: the wire
+surface sits at the edge, not under the guts. `src/test_support/` is a
 feature-gated module (`test-support`), enabled through the crate's dev-
 dependency on itself, so one lib build serves unit and integration tests
 alike.
@@ -107,19 +112,20 @@ empty component must not mean cwd), and the fallback in
 `ExternalCommand::resolve` that spawns the bare name so a missing
 program fails with the OS's error, not a myco-invented one.
 
-## Stop 2 — `crates/myco-api`: the vocabulary
+## Stop 2 — `myco-types` and `myco-api`: the vocabulary and the surface
 
-Read this crate before any consumer, because it is the noun list for
-everything else: what a conversation *is*, what the wire carries, and
-the one trait every client holds.
+Read these before any consumer: the noun list for everything else —
+what a conversation *is*, what the wires carry, and the one trait every
+client holds.
 
-Read: `lib.rs` top to bottom, then `mention.rs` with its tests.
+Read: `crates/myco-types/src/lib.rs` top to bottom, then
+`crates/myco-api/src/lib.rs`, then `mention.rs` with its tests.
 
 Notice:
 
-- The section banner above the conversation types: they live here — not
-  in the model layer — because `session` stores them, the wire carries
-  them, and `models` only *projects* them onto providers. `Entry {
+- The conversation types live in `myco-types` — not in the model layer —
+  because `session` stores them, the host protocol and the HTTP wire both
+  carry them, and `models` only *projects* them onto providers. `Entry {
   author, at, body }` with `EntryBody::{User, Agent, ToolResults}` is
   the durable shape; one entry maps one-to-one onto a provider message.
 - `Author` is intrinsic to the record ("a shared session is unreadable
@@ -129,9 +135,10 @@ Notice:
   implemented by the in-process `Server` (as `UserApi`) and by
   `client::HttpClient`, and identity is a property of the handle, not a
   parameter on each call. Keep this in mind for Stops 8–9.
-- The interactive-surface vocabulary reads as one design: `ShellLockMode`
-  is *who holds a keyboard* — a shell's or a subagent child's, one enum,
-  one meaning. `Shell` carries `title` (a person's label) beside `id`
+- The interactive-surface vocabulary reads as one design: `ShellLock` is
+  *who holds a keyboard* — a shell's or a subagent child's, one enum, one
+  meaning, riding both the host protocol and the HTTP wire (which re-
+  exports it under its historical name `ShellLockMode`). `Shell` carries `title` (a person's label) beside `id`
   (the address); `ShellScreen` carries plain `text` beside styled `runs`
   (colors pre-resolved to `#rrggbb` server-side, the cursor its own run);
   `ShellWsInput`/`ShellWsOutput` are the socket frames, and their doc
@@ -281,7 +288,10 @@ the in-process local worker and never receive the injected routing
 `host` field.
 
 **Host pair** (`host/protocol.rs`, `host_worker.rs`,
-`host_controller.rs`): read the protocol first. Beyond `Hello`/
+`host_controller.rs`): read the protocol first — and notice it carries
+`myco_types` structs verbatim (`ShellScreen`, `ShellLock`): one
+definition of the terminal serves the NDJSON wire and the HTTP wire, so
+the server's screen route is a passthrough, not a mapping. Beyond `Hello`/
 `ToolCall`/`AgentFinished`, the `Shell*` requests are the **observer
 surface** — a person watching or driving a live bash session — and the
 protocol doc states the rule: they carry no `agent_id` (watching is not
@@ -298,7 +308,9 @@ hours later.
 ambient context a tool gets. Read `tool_input_schema`'s long doc about
 why schemars output is scrubbed: the schema is prompt engineering. Then:
 
-- `bash_service/mod.rs`: each agent call is a *bounded interaction*
+- `bash_service/` — `mod.rs` (agent surface + session internals),
+  `observer.rs` (the person's half), `screen.rs` (vt100 → styled runs),
+  `pty.rs`: each agent call is a *bounded interaction*
   against a live child — write optional stdin, collect until idle gap,
   timeout, byte cap, or exit. Sessions are owned per agent and reaped on
   agent finish. Below the agent surface sits the observer surface — the
@@ -310,9 +322,8 @@ why schemars output is scrubbed: the schema is prompt engineering. Then:
   are addresses), `shell_resize` (TIOCSWINSZ → SIGWINCH, gated on the
   user lock), and `shell_wait_change` — the change-driven wait the
   WebSocket pusher blocks on, with the `Notified::enable` dance that
-  prevents a lost wakeup.
-- `bash_service/pty.rs`: deliberately libc-only pty plumbing — openpty,
-  controlling-tty setup for the child, nonblocking master I/O, and
+  prevents a lost wakeup. The pty plumbing (`pty.rs`) is deliberately
+  libc-only: openpty, controlling-tty setup, nonblocking master I/O,
   `resize`.
 - `text_editor_service.rs`: mutations require a read-stamp — a content
   fingerprint recorded at view time and re-checked under one lock across
@@ -380,7 +391,8 @@ queue, a broadcast event feed, a fresh `CancelToken` per turn, the
 session's write lock, the subagent hold, the per-hold typed-keys
 buffer.
 
-Read: `src/server.rs` top to bottom (it earns it), then
+Read: `src/server/mod.rs` (the runtime: `Live`, `ensure_live`, the
+agent task), then `room.rs`, `observer.rs`, `user_api.rs`, then
 `src/subagent.rs`.
 
 Notice:
@@ -459,8 +471,9 @@ Notice:
 
 ## Stop 10 — `crates/myco-gui`: the frontend
 
-Read: `state.rs` first, then `main.rs` (transcript, then the work
-panel), then `auth.rs`, `highlight.rs`.
+Read: `state.rs` first, then `transcript.rs` and `work.rs`, then
+`main.rs` (the pages and the `Conversation` wiring), then `auth.rs`,
+`highlight.rs`.
 
 **The state machine** (`state.rs`) is the part worth close reading: one
 `ConvState`, one `apply`, every event a typed action, yew-free and
@@ -475,7 +488,8 @@ buffer, because that is where the room actually saw them, and fold into
 the transcript at the next boundary deduped against what the server
 absorbed.
 
-**The work panel** (`main.rs`) is the multiplayer cockpit: a horizontal
+**The work panel** (`work.rs` for the machinery, wired in `main.rs`) is
+the multiplayer cockpit: a horizontal
 split beside the chat, one tab per live shell and live subagent (tabs
 come and go with the lists; `+` opens a terminal of your own), the
 active tab filling the panel through one shared `WorkView` — chrome,
