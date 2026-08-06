@@ -1865,6 +1865,114 @@ async fn the_screen_carries_styled_runs_and_resizes_under_the_user_lock() {
     service.reap_owner(owner);
 }
 
+/// A terminal the user opens is a real session in the agent's own table:
+/// user-held from birth (whoever opened it is typing), addressable by the
+/// agent's bash tool the moment the keyboard is handed back, and renameable
+/// without changing the id the agent addresses.
+#[tokio::test]
+async fn a_user_opened_terminal_is_agent_owned_user_held_and_renameable() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+
+    let opened = service
+        .shell_start(None, owner, Some("cat"), false, None, None)
+        .await
+        .expect("start");
+    assert_eq!(opened.id, "term-1", "anonymous opens pick the free name");
+    assert_eq!(opened.lock, ShellLock::User);
+    assert!(opened.title.is_none());
+
+    // Agent-owned — the bash tool addresses it — but the user holds the
+    // keyboard, so the agent's write is refused in the lock's own words.
+    let refused = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "write", "session_id": "term-1", "stdin": "hi\n",
+               "timeout_ms": 500, "idle_ms": 100}),
+    )
+    .await;
+    assert!(refused.is_error);
+    assert!(
+        result_text(&refused).contains("user-locked"),
+        "{}",
+        result_text(&refused)
+    );
+
+    // Handed back, the same write works: full addressability, no adoption
+    // step.
+    service
+        .shell_set_lock("term-1", ShellLock::Assistant)
+        .expect("lock");
+    let wrote = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "write", "session_id": "term-1", "stdin": "hello agent\n",
+               "timeout_ms": 2000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!wrote.is_error, "{}", result_text(&wrote));
+
+    // Renaming is organization, not identity.
+    let renamed = service
+        .shell_rename("term-1", Some("scratch"))
+        .expect("rename");
+    assert_eq!(renamed.title.as_deref(), Some("scratch"));
+    assert_eq!(renamed.id, "term-1");
+    let cleared = service.shell_rename("term-1", None).expect("clear");
+    assert!(cleared.title.is_none());
+
+    let second = service
+        .shell_start(None, owner, Some("cat"), false, None, None)
+        .await
+        .expect("second");
+    assert_eq!(second.id, "term-2");
+
+    service.reap_owner(owner);
+}
+
+/// The live-terminal wait: quiet sessions time out reporting the same
+/// watermark; output (or an echoed keystroke) wakes the waiter promptly.
+#[tokio::test]
+async fn wait_change_wakes_on_output_and_times_out_quietly() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": "w", "command": "cat",
+               "timeout_ms": 1000, "idle_ms": 100}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+    let end0 = service.shell_tail("w", 0, 1024).expect("tail").end;
+
+    let quiet = std::time::Instant::now();
+    let same = service
+        .shell_wait_change("w", end0, Duration::from_millis(120))
+        .await
+        .expect("wait");
+    assert_eq!(same, end0, "nothing happened, same watermark");
+    assert!(quiet.elapsed() >= Duration::from_millis(100));
+
+    let waiter = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .shell_wait_change("w", end0, Duration::from_secs(5))
+                .await
+        })
+    };
+    service.shell_set_lock("w", ShellLock::User).expect("lock");
+    service
+        .shell_user_write("w", "ping\n")
+        .await
+        .expect("write");
+    let end1 = waiter.await.expect("join").expect("wait");
+    assert!(end1 > end0, "the echoed keystroke woke the waiter");
+
+    service.reap_owner(owner);
+}
+
 /// A piped session gets a usable screenshot too: carriage-return progress
 /// lines collapse to their final state, like a terminal would show them.
 #[tokio::test]

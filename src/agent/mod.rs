@@ -181,6 +181,12 @@ impl Agent {
         Self::with_context(model, harness, sink, TraceContext::root())
     }
 
+    /// The id host state (bash sessions) is owned under — what the server
+    /// passes when it opens a terminal *for* this agent.
+    pub fn agent_id(&self) -> Uuid {
+        self.context.agent_id
+    }
+
     pub fn with_context(
         model: Arc<dyn GenerativeModel>,
         harness: Arc<Harness>,

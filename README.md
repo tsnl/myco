@@ -42,9 +42,16 @@ and `clients/myco.py` (or plain HTTP) for scripts and agents driving agents.
   from the server's vt100 screen, the window resizes to fit the panel
   (SIGWINCH and all), and once you take the keyboard you type straight
   into it — Ctrl+C, Ctrl+D, Esc, arrows, F-keys, Alt chords, paste
-  (Ctrl+Shift+C/V stay the browser's copy and paste) — with keystrokes
-  streamed raw, in order, and echo one round trip away. Piped sessions
-  keep an honest line-based input row. The lock decides who may write —
+  (Ctrl+Shift+C/V stay the browser's copy and paste). The active terminal
+  rides a **per-shell WebSocket**: keystrokes go down as ordered frames
+  and screens push back the moment they change, so echo is one round trip
+  and an idle terminal costs nothing; if the socket drops, the REST
+  polling underneath takes over. Piped sessions keep an honest line-based
+  input row. You can also **open terminals yourself** (the `+` tab):
+  a user-opened terminal is a real bash session owned by the session's
+  agent — fully addressable by its tools once you hand the keyboard over —
+  starting user-held, announced in the transcript, and renameable (names
+  are labels; the id stays the address). The lock decides who may write —
   shells start agent-held, the agent's writes fail politely while you hold
   it, and both sides always read. Every handoff lands in the transcript as
   an attributed, non-waking message naming the host, and everything you
@@ -163,7 +170,13 @@ requires the user keyboard lock) ·
 `POST /api/sessions/<id>/shells/<host>/<shell>/resize` (`{cols, rows}`,
 requires the lock; pty children get SIGWINCH) ·
 `POST /api/sessions/<id>/shells/<host>/<shell>/lock`
-(`{lock: "user"|"assistant"}`).
+(`{lock: "user"|"assistant"}`) ·
+`POST /api/sessions/<id>/shells/<host>` (`{shell?, command?, pty?}` — open a
+user-held, agent-owned terminal) ·
+`POST /api/sessions/<id>/shells/<host>/<shell>/rename` (`{title}`) ·
+`GET /api/sessions/<id>/shells/<host>/<shell>/ws` (WebSocket: `input`/`resize`
+frames in, `screen` pushes out — the interactive fast path; REST remains the
+canonical surface).
 Wire types live in `crates/myco-api`.
 
 A session can switch model or reasoning effort mid-conversation:

@@ -61,6 +61,22 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    /// Open a user-held terminal owned by `agent_id` → [`Response::Shell`].
+    ShellStart {
+        id: String,
+        shell: Option<String>,
+        agent_id: uuid::Uuid,
+        command: Option<String>,
+        pty: bool,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
+    /// Set or clear a terminal's display name → [`Response::Shell`].
+    ShellRename {
+        id: String,
+        shell: String,
+        title: Option<String>,
+    },
 }
 
 impl Request {
@@ -224,6 +240,7 @@ mod tests {
             shell: crate::machines::tool_services::ShellOverview {
                 id: "term".into(),
                 cmdline: "cat".into(),
+                title: None,
                 running: true,
                 exit_code: None,
                 lock: ShellLock::User,

@@ -212,6 +212,17 @@ fn login(props: &LoginProps) -> Html {
     }
 }
 
+/// `41.2k` — tokens at a glance; exact numbers belong in tooltips.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 10_000 {
+        format!("{}k", n / 1_000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// `signed in as <name>`, with the sign-out affordance next to it.
 fn whoami_line(who: &Option<Session>) -> Html {
     let Some(s) = who else { return html! {} };
@@ -1242,6 +1253,9 @@ struct WorkViewProps {
     app_cursor: bool,
     /// Point the keyboard: `true` takes it, `false` hands it back.
     on_lock: Callback<bool>,
+    /// Rename affordance (shells only; a subagent's name is its id).
+    #[prop_or_default]
+    on_rename: Option<Callback<()>>,
     /// A line submitted from the input row (line mode).
     #[prop_or_default]
     on_send: Callback<String>,
@@ -1375,6 +1389,12 @@ fn work_view(props: &WorkViewProps) -> Html {
                     <span class="host-badge">{ b }</span>
                 } } else { html!{} } }
                 <span class="dim">{ &props.detail }</span>
+                { if let Some(rename) = props.on_rename.clone() { html! {
+                    <button class="linkish rename-badge" title="rename this terminal"
+                            onclick={Callback::from(move |_: MouseEvent| rename.emit(()))}>
+                        { "✎" }
+                    </button>
+                } } else { html!{} } }
                 <button class="linkish lock-badge" onclick={on_lock_click}>
                     { if props.user_locked { "⌨ yours — hand back" } else { "⌨ agent — take keyboard" } }
                 </button>
@@ -1450,6 +1470,11 @@ fn conversation(props: &ConversationProps) -> Html {
             setter.set(*c);
         })
     };
+    // The active pty tab's WebSocket, when one is up: the shell key it
+    // serves and the sender its frames go through. Keystrokes and resizes
+    // prefer it; everything falls back to REST when it is absent.
+    type WsSender = futures::channel::mpsc::UnboundedSender<api::ShellWsInput>;
+    let ws_link: Rc<RefCell<Option<(String, WsSender)>>> = use_mut_ref(|| None);
     // Keystrokes in flight, per shell (see [`TypeQueue`]).
     let typing: Rc<RefCell<std::collections::HashMap<String, TypeQueue>>> =
         use_mut_ref(std::collections::HashMap::new);
@@ -1501,6 +1526,8 @@ fn conversation(props: &ConversationProps) -> Html {
                             dispatch.dispatch(ConvAction::Configured {
                                 model: d.summary.model,
                                 effort: d.summary.effort,
+                                context_tokens: d.summary.context_tokens,
+                                context_window: d.summary.context_window,
                             });
                             dispatch.dispatch(ConvAction::Loaded {
                                 entries: d.entries,
@@ -1613,6 +1640,84 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
+    // The active pty tab's socket: opened when a pty shell becomes the
+    // active tab, closed when it stops being one. Screen frames land in the
+    // panel buffer; input/resize frames go up the same pipe, ordered by the
+    // socket itself. If the socket dies mid-tab the link clears and the REST
+    // paths take over until the tab is switched away and back.
+    {
+        let active_pty: Option<(String, String)> = {
+            let p = panel.borrow();
+            match active_tab.borrow().as_ref() {
+                Some(Tab::Shell { host, id }) => p
+                    .shells
+                    .iter()
+                    .find(|s| s.host == *host && s.id == *id && s.pty)
+                    .map(|s| (s.host.clone(), s.id.clone())),
+                _ => None,
+            }
+        };
+        let ws_link = ws_link.clone();
+        let panel = panel.clone();
+        let bump = bump.clone();
+        let dispatch = conv.dispatcher();
+        let sid = props.id.clone();
+        use_effect_with(active_pty, move |active| {
+            *ws_link.borrow_mut() = None;
+            let alive = Rc::new(std::cell::Cell::new(true));
+            if let Some((host, shell)) = active.clone() {
+                let alive = alive.clone();
+                spawn_local(async move {
+                    use futures::{SinkExt, StreamExt};
+                    use gloo_net::websocket::{Message as WsMessage, futures::WebSocket};
+                    let key = term_key(&host, &shell);
+                    let Ok(ws) = WebSocket::open(&auth::shell_ws_url(&sid, &host, &shell)) else {
+                        return;
+                    };
+                    let (mut sink, mut read) = ws.split();
+                    let (tx, mut rx) = futures::channel::mpsc::unbounded::<api::ShellWsInput>();
+                    *ws_link.borrow_mut() = Some((key.clone(), tx));
+                    spawn_local(async move {
+                        while let Some(frame) = rx.next().await {
+                            let Ok(json) = serde_json::to_string(&frame) else {
+                                continue;
+                            };
+                            if sink.send(WsMessage::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = sink.close().await;
+                    });
+                    while alive.get() {
+                        let Some(Ok(WsMessage::Text(text))) = read.next().await else {
+                            break;
+                        };
+                        match serde_json::from_str::<api::ShellWsOutput>(&text) {
+                            Ok(api::ShellWsOutput::Screen { screen }) => {
+                                let mut p = panel.borrow_mut();
+                                if p.screens.get(&key) != Some(&screen) {
+                                    p.screens.insert(key.clone(), screen);
+                                    drop(p);
+                                    bump();
+                                }
+                            }
+                            Ok(api::ShellWsOutput::Error { message }) => {
+                                dispatch.dispatch(ConvAction::Failed(message));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    // Socket gone: back to REST until the tab is reopened.
+                    let mut link = ws_link.borrow_mut();
+                    if link.as_ref().is_some_and(|(k, _)| *k == key) {
+                        *link = None;
+                    }
+                });
+            }
+            move || alive.set(false)
+        });
+    }
+
     // The work panel's poll: the shell and subagent lists while the panel is
     // open, plus the active tab's content — a terminal's screen or
     // scrollback tail, or a chat's new entries. Polling, not SSE — the reads
@@ -1624,6 +1729,7 @@ fn conversation(props: &ConversationProps) -> Html {
         let bump = bump.clone();
         let rail_open_ref = rail_open_ref.clone();
         let active_tab = active_tab.clone();
+        let ws_link = ws_link.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -1702,11 +1808,16 @@ fn conversation(props: &ConversationProps) -> Html {
                                 .shells
                                 .iter()
                                 .any(|s| s.host == host && s.id == shell && s.pty);
+                            let socket_live =
+                                ws_link.borrow().as_ref().is_some_and(|(k, _)| *k == key);
                             if pty {
-                                if let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
-                                    "/api/sessions/{id}/shells/{host}/{shell}/screen"
-                                ))
-                                .await
+                                // The socket pushes screens; polling one on
+                                // top would just re-render the same bytes.
+                                if !socket_live
+                                    && let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
+                                        "/api/sessions/{id}/shells/{host}/{shell}/screen"
+                                    ))
+                                    .await
                                 {
                                     let mut p = panel.borrow_mut();
                                     if p.screens.get(&key) != Some(&screen) {
@@ -1887,6 +1998,8 @@ fn conversation(props: &ConversationProps) -> Html {
                         Ok(s) => dispatch.dispatch(ConvAction::Configured {
                             model: s.model,
                             effort: s.effort,
+                            context_tokens: s.context_tokens,
+                            context_window: s.context_window,
                         }),
                         Err(e) => {
                             dispatch.dispatch(ConvAction::Failed(format!("reconfigure: {e}")))
@@ -2025,15 +2138,33 @@ fn conversation(props: &ConversationProps) -> Html {
         let typing = typing.clone();
         let panel = panel.clone();
         let bump = bump.clone();
+        let ws_link = ws_link.clone();
         let dispatch = conv.dispatcher();
         move |host: String, shell: String| {
             let id = id.clone();
             let typing = typing.clone();
             let panel = panel.clone();
             let bump = bump.clone();
+            let ws_link = ws_link.clone();
             let dispatch = dispatch.clone();
             Callback::from(move |keys: String| {
                 let key = term_key(&host, &shell);
+                // The socket is the fast path: ordered frames, echo pushed
+                // back the moment the pty produces it.
+                {
+                    let mut link = ws_link.borrow_mut();
+                    if let Some((k, tx)) = link.as_ref()
+                        && *k == key
+                    {
+                        if tx
+                            .unbounded_send(api::ShellWsInput::Input { data: keys.clone() })
+                            .is_ok()
+                        {
+                            return;
+                        }
+                        *link = None;
+                    }
+                }
                 {
                     let mut q = typing.borrow_mut();
                     let queue = q.entry(key.clone()).or_default();
@@ -2098,11 +2229,13 @@ fn conversation(props: &ConversationProps) -> Html {
         let sized = sized.clone();
         let panel = panel.clone();
         let bump = bump.clone();
+        let ws_link = ws_link.clone();
         move |host: String, shell: String| {
             let id = id.clone();
             let sized = sized.clone();
             let panel = panel.clone();
             let bump = bump.clone();
+            let ws_link = ws_link.clone();
             Callback::from(move |(cols, rows): (u16, u16)| {
                 let key = term_key(&host, &shell);
                 {
@@ -2120,6 +2253,17 @@ fn conversation(props: &ConversationProps) -> Html {
                         return;
                     }
                     s.insert(key.clone(), (cols, rows));
+                }
+                {
+                    let link = ws_link.borrow();
+                    if let Some((k, tx)) = link.as_ref()
+                        && *k == key
+                        && tx
+                            .unbounded_send(api::ShellWsInput::Resize { cols, rows })
+                            .is_ok()
+                    {
+                        return;
+                    }
                 }
                 let id = id.clone();
                 let host = host.clone();
@@ -2182,6 +2326,110 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
+    // Open a terminal for the user (on the local host; remote shells are
+    // still opened by the agent, which is what remotes are for). The name
+    // prompt is native chrome on purpose — a modal input is not worth a
+    // component.
+    let open_term = {
+        let id = props.id.clone();
+        let active_tab = active_tab.clone();
+        let panel_rev = panel_rev.clone();
+        let panel = panel.clone();
+        let dispatch = conv.dispatcher();
+        Callback::from(move |_: MouseEvent| {
+            let name = web_sys::window()
+                .and_then(|w| w.prompt_with_message_and_default("terminal name", "").ok())
+                .flatten()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+            let id = id.clone();
+            let active_tab = active_tab.clone();
+            let panel_rev = panel_rev.clone();
+            let panel = panel.clone();
+            let dispatch = dispatch.clone();
+            spawn_local(async move {
+                match auth::post_json::<api::Shell, _>(
+                    &format!("/api/sessions/{id}/shells/local"),
+                    &api::CreateShell {
+                        shell: name,
+                        command: None,
+                        pty: true,
+                        cols: None,
+                        rows: None,
+                    },
+                )
+                .await
+                {
+                    Ok(shell) => {
+                        let mut p = panel.borrow_mut();
+                        let tab = Tab::Shell {
+                            host: shell.host.clone(),
+                            id: shell.id.clone(),
+                        };
+                        p.shells.push(shell);
+                        drop(p);
+                        *active_tab.borrow_mut() = Some(tab);
+                        panel_rev.set(*panel_rev + 1);
+                    }
+                    Err(e) => dispatch.dispatch(ConvAction::Failed(format!("open terminal: {e}"))),
+                }
+            });
+        })
+    };
+
+    let rename_term = {
+        let id = props.id.clone();
+        let panel = panel.clone();
+        let panel_rev = panel_rev.clone();
+        let dispatch = conv.dispatcher();
+        move |host: String, shell: String, current: Option<String>| {
+            let id = id.clone();
+            let panel = panel.clone();
+            let panel_rev = panel_rev.clone();
+            let dispatch = dispatch.clone();
+            Callback::from(move |_: ()| {
+                let Some(title) = web_sys::window().and_then(|w| {
+                    w.prompt_with_message_and_default(
+                        "terminal name (empty clears)",
+                        current.as_deref().unwrap_or(""),
+                    )
+                    .ok()
+                    .flatten()
+                }) else {
+                    return; // cancelled
+                };
+                let id = id.clone();
+                let host = host.clone();
+                let shell = shell.clone();
+                let panel = panel.clone();
+                let panel_rev = panel_rev.clone();
+                let dispatch = dispatch.clone();
+                spawn_local(async move {
+                    match auth::post_json::<api::Shell, _>(
+                        &format!("/api/sessions/{id}/shells/{host}/{shell}/rename"),
+                        &api::ShellRename { title },
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            let mut p = panel.borrow_mut();
+                            if let Some(s) = p
+                                .shells
+                                .iter_mut()
+                                .find(|s| s.host == fresh.host && s.id == fresh.id)
+                            {
+                                s.title = fresh.title;
+                            }
+                            drop(p);
+                            panel_rev.set(*panel_rev + 1);
+                        }
+                        Err(e) => dispatch.dispatch(ConvAction::Failed(format!("rename: {e}"))),
+                    }
+                });
+            })
+        }
+    };
+
     let sub_send = {
         let id = props.id.clone();
         let dispatch = conv.dispatcher();
@@ -2241,10 +2489,11 @@ fn conversation(props: &ConversationProps) -> Html {
                     host: shell.host.clone(),
                     id: shell.id.clone(),
                 };
+                let name = shell.title.clone().unwrap_or_else(|| shell.id.clone());
                 let label = if shell.host == "local" {
-                    shell.id.clone()
+                    name
                 } else {
-                    format!("{}@{}", shell.id, shell.host)
+                    format!("{name}@{}", shell.host)
                 };
                 (tab, label, shell.running, shell.lock)
             })
@@ -2281,10 +2530,11 @@ fn conversation(props: &ConversationProps) -> Html {
                     };
                     html! {
                         <WorkView running={shell.running}
-                                  title={shell.id.clone()}
+                                  title={shell.title.clone().unwrap_or_else(|| shell.id.clone())}
                                   badge={(shell.host != "local").then(|| format!("@{}", shell.host))}
                                   detail={shell.cmdline.clone()}
                                   user_locked={shell.lock == api::ShellLockMode::User}
+                                  on_rename={rename_term(shell.host.clone(), shell.id.clone(), shell.title.clone())}
                                   pty={shell.pty}
                                   app_cursor={screen.is_some_and(|s| s.application_cursor)}
                                   on_lock={shell_lock(shell.host.clone(), shell.id.clone())}
@@ -2338,7 +2588,11 @@ fn conversation(props: &ConversationProps) -> Html {
                         }) }
                     </div>
                 } } else { html!{} } }
-                <div class="work-tabs">{ for tabs.into_iter() }</div>
+                <div class="work-tabs">
+                    { for tabs.into_iter() }
+                    <div class="work-tab work-tab-new" title="open a terminal (yours until you hand it over)"
+                         onclick={open_term.clone()}>{ "+" }</div>
+                </div>
                 { view.unwrap_or_else(|| html! {
                     <div class="empty work-empty">{ "no live shells or subagents" }</div>
                 }) }
@@ -2355,6 +2609,14 @@ fn conversation(props: &ConversationProps) -> Html {
                     <Link<Route> to={Route::Browser}>{ "← sessions" }</Link<Route>>
                     <span class="dim">{ format!(" {} ", props.id) }</span>
                     { if st.busy { html!{ <span class="dim">{ "· working…" }</span> } } else { html!{} } }
+                    { if let Some(used) = st.context_tokens { html! {
+                        <span class="dim" title="context tokens in use / context window">
+                            { match st.context_window {
+                                Some(w) if w > 0 => format!("· {}/{} ctx", fmt_tokens(used), fmt_tokens(w)),
+                                _ => format!("· {} ctx", fmt_tokens(used)),
+                            } }
+                        </span>
+                    } } else { html!{} } }
                     <button class="linkish" onclick={toggle_verbose}>
                         { if *verbose { "· concise" } else { "· verbose" } }
                     </button>

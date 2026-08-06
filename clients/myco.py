@@ -178,6 +178,18 @@ class Myco:
         return self._call("POST", f"/sessions/{sid}/shells/{host}/{shell}/lock",
                           {"lock": lock})
 
+    def shell_start(self, sid: str, host: str = "local", name: str = None,
+                    command: str = None, pty: bool = True):
+        """Open a terminal on `host`: a real bash session owned by the
+        session's agent, starting user-held."""
+        return self._call("POST", f"/sessions/{sid}/shells/{host}",
+                          {"shell": name, "command": command, "pty": pty})
+
+    def shell_rename(self, sid: str, host: str, shell: str, title: str):
+        """Set (or clear, with "") a terminal's display name."""
+        return self._call("POST", f"/sessions/{sid}/shells/{host}/{shell}/rename",
+                          {"title": title})
+
     def shell_resize(self, sid: str, host: str, shell: str, cols: int, rows: int):
         """Fit the terminal (requires the user keyboard lock); a pty child
         learns via SIGWINCH."""

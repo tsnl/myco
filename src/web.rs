@@ -118,6 +118,9 @@ pub fn rocket(
             shell_input,
             shell_lock,
             shell_resize,
+            shell_start,
+            shell_rename,
+            shell_ws,
             subagents,
             subagent_lock,
             subagent_input,
@@ -321,6 +324,30 @@ async fn shell_input(
     )
 }
 
+/// Open a terminal on `host` for the user (agent-owned, user-held).
+#[post("/sessions/<id>/shells/<host>", data = "<req>")]
+async fn shell_start(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    req: Json<api::CreateShell>,
+) -> ApiResult<api::Shell> {
+    output(caller.shell_start(id, host, req.into_inner()).await)
+}
+
+/// Set or clear a shell's display name (`""` clears).
+#[post("/sessions/<id>/shells/<host>/<shell>/rename", data = "<req>")]
+async fn shell_rename(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    shell: &str,
+    req: Json<api::ShellRename>,
+) -> ApiResult<api::Shell> {
+    let title = Some(req.into_inner().title).filter(|t| !t.trim().is_empty());
+    output(caller.shell_rename(id, host, shell, title).await)
+}
+
 /// Fit the shell's terminal to the viewer's window (requires the user
 /// keyboard lock).
 #[post("/sessions/<id>/shells/<host>/<shell>/resize", data = "<req>")]
@@ -333,6 +360,119 @@ async fn shell_resize(
 ) -> ApiResult<api::Shell> {
     let r = req.into_inner();
     output(caller.shell_resize(id, host, shell, r.cols, r.rows).await)
+}
+
+/// The shell's live socket: ordered input/resize frames in, change-driven
+/// screen pushes out. The interactive accelerator over the same guts as the
+/// REST routes — same lock checks, same typed-note batching — so a client
+/// without it loses latency, not capability. Auth rides `?token=` like the
+/// SSE route: the browser's WebSocket cannot set headers either.
+#[get("/sessions/<id>/shells/<host>/<shell>/ws")]
+fn shell_ws(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    shell: &str,
+    ws: rocket_ws::WebSocket,
+) -> rocket_ws::Channel<'static> {
+    let (id, host, shell) = (id.to_string(), host.to_string(), shell.to_string());
+    ws.channel(move |stream| {
+        Box::pin(async move {
+            shell_ws_run(caller, &id, &host, &shell, stream).await;
+            Ok(())
+        })
+    })
+}
+
+/// The socket's event loop: one task, two sources — client frames and the
+/// shell's change signal. Screens are pushed only when they differ from the
+/// last one sent, with a short coalescing pause so a burst of output is one
+/// redraw, not fifty.
+async fn shell_ws_run(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    shell: &str,
+    mut stream: rocket_ws::stream::DuplexStream,
+) {
+    use futures::SinkExt;
+    use rocket_ws::Message;
+
+    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let send = |frame: api::ShellWsOutput| {
+        Message::Text(serde_json::to_string(&frame).unwrap_or_default())
+    };
+
+    // The opening screen, so the terminal paints before anything happens.
+    let mut last_screen = match caller.shell_screen(id, host, shell).await {
+        Ok(s) => {
+            if stream
+                .send(send(api::ShellWsOutput::Screen { screen: s.clone() }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            Some(s)
+        }
+        Err(_) => None,
+    };
+    let mut seen = 0u64;
+
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                let frame = match msg {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => return,
+                };
+                let Ok(input) = serde_json::from_str::<api::ShellWsInput>(&frame) else {
+                    continue;
+                };
+                let refused = match input {
+                    api::ShellWsInput::Input { data } => {
+                        caller.shell_input(id, host, shell, data).await.err()
+                    }
+                    api::ShellWsInput::Resize { cols, rows } => {
+                        caller.shell_resize(id, host, shell, cols, rows).await.err()
+                    }
+                };
+                if let Some(e) = refused
+                    && stream
+                        .send(send(api::ShellWsOutput::Error { message: e.error }))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            changed = caller.server().shell_wait_change(id, host, shell, seen, WAIT_SLICE) => {
+                let Ok(watermark) = changed else { return };
+                if watermark != seen {
+                    // Let the burst land before rendering it.
+                    tokio::time::sleep(COALESCE).await;
+                }
+                seen = watermark;
+                let Ok(screen) = caller.shell_screen(id, host, shell).await else {
+                    return;
+                };
+                if last_screen.as_ref() != Some(&screen) {
+                    if stream
+                        .send(send(api::ShellWsOutput::Screen { screen: screen.clone() }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_screen = Some(screen);
+                }
+            }
+        }
+    }
 }
 
 /// Take or return the shell's keyboard.

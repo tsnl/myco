@@ -305,6 +305,9 @@ pub struct Live {
     lock: std::sync::Mutex<Option<SessionWriteLock>>,
     /// The agent's harness, shared for status displays.
     harness: Arc<Harness>,
+    /// The agent task's id — what its host state (bash sessions) is owned
+    /// under, and what a terminal opened *for* it must be owned by too.
+    agent_id: uuid::Uuid,
     /// The subagent keyboard — meaningful on child sessions only. True while
     /// a person holds this child, which makes the parent's `subagent` calls
     /// to it fail politely (see [`crate::subagent::SubagentTool`]). In-memory
@@ -447,6 +450,7 @@ impl Server {
             last_error: std::sync::Mutex::new(None),
             lock: std::sync::Mutex::new(lock),
             harness: harness.clone(),
+            agent_id: agent.agent_id(),
             user_hold: AtomicBool::new(false),
             typed: std::sync::Mutex::new(HashMap::new()),
         });
@@ -1016,6 +1020,7 @@ fn shell_of(host: String, s: crate::machines::tool_services::ShellOverview) -> a
     api::Shell {
         host,
         id: s.id,
+        title: s.title,
         cmdline: s.cmdline,
         running: s.running,
         exit_code: s.exit_code,
@@ -1060,7 +1065,7 @@ fn subagent_of(l: &Live) -> api::Subagent {
     }
 }
 
-fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
+fn summary_of(config: &Config, s: &Session, live: bool, busy: bool) -> api::SessionSummary {
     api::SessionSummary {
         archived: s.archived,
         id: s.id.clone(),
@@ -1071,6 +1076,12 @@ fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
         message_count: s.entries.len(),
         snippet: String::new(),
         effort: s.effort.clone(),
+        context_tokens: s.last_usage.map(|u| u.context_tokens()),
+        context_window: config
+            .models
+            .get(&s.model)
+            .ok()
+            .map(|m| m.spec.context_window_tokens),
         live,
         busy,
     }
@@ -1113,6 +1124,10 @@ impl Server {
                 snippet: e.snippet,
                 archived: e.archived,
                 effort: e.effort,
+                // The browser list shows no context meter; the conversation
+                // view gets these from its own detail fetch.
+                context_tokens: None,
+                context_window: None,
                 live,
                 busy,
             });
@@ -1144,7 +1159,12 @@ impl Server {
             .ensure_live(&id, Some(session))
             .await
             .map_err(internal)?;
-        Ok(summary_of(&live.session.snapshot(), true, false))
+        Ok(summary_of(
+            &self.config,
+            &live.session.snapshot(),
+            true,
+            false,
+        ))
     }
 
     pub(crate) async fn session_detail(&self, id: &str) -> Result<api::SessionDetail, ApiError> {
@@ -1152,7 +1172,7 @@ impl Server {
         let (live, busy) = self.live_flags(&session.id).await;
         Ok(api::SessionDetail {
             entries: session.entries.clone(),
-            summary: summary_of(&session, live, busy),
+            summary: summary_of(&self.config, &session, live, busy),
         })
     }
 
@@ -1221,7 +1241,7 @@ impl Server {
             }
         };
         let (live, busy) = self.live_flags(&session.id).await;
-        Ok(summary_of(&session, live, busy))
+        Ok(summary_of(&self.config, &session, live, busy))
     }
 
     pub(crate) async fn post_message(
@@ -1267,6 +1287,7 @@ impl Server {
             // Whether a reply is coming *or already underway* — a room note
             // posted mid-turn must not tell the client the agent went idle.
             busy: wakes_agent || live.is_busy(),
+            context_tokens: snapshot.last_usage.map(|u| u.context_tokens()),
             total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: None,
@@ -1400,6 +1421,24 @@ impl Server {
         })
     }
 
+    /// Wait for the shell's output to move past `seen` (bounded by
+    /// `timeout`); the shell WebSocket's pusher blocks here. Not on
+    /// [`MycoApi`]: the trait is the request/response surface, and this is
+    /// the socket's private half.
+    pub(crate) async fn shell_wait_change(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        seen: u64,
+        timeout: std::time::Duration,
+    ) -> Result<u64, ApiError> {
+        let (_, ctl) = self.shell_host(id, host).await?;
+        ctl.shell_wait_change(shell, seen, timeout)
+            .await
+            .map_err(|e| ApiError::new(ErrorKind::NotFound, e))
+    }
+
     pub(crate) async fn shell_resize(
         &self,
         id: &str,
@@ -1413,6 +1452,61 @@ impl Server {
             .shell_resize(shell, cols, rows)
             .await
             .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
+        Ok(shell_of(host.to_string(), overview))
+    }
+
+    /// Open a terminal for the user on `host`: a real bash session owned by
+    /// this session's agent — its bash tool can write/read/signal/close it —
+    /// starting user-held, because whoever opened it is the one typing.
+    pub(crate) async fn shell_start(
+        &self,
+        author: &Author,
+        id: &str,
+        host: &str,
+        req: api::CreateShell,
+    ) -> Result<api::Shell, ApiError> {
+        let (live, ctl) = self.shell_host(id, host).await?;
+        let overview = ctl
+            .shell_start(
+                req.shell.as_deref(),
+                live.agent_id,
+                req.command.as_deref(),
+                req.pty,
+                req.cols,
+                req.rows,
+            )
+            .await
+            .map_err(|e| ApiError::new(ErrorKind::Conflict, e))?;
+        // Announced like a keyboard grab: the agent can address this session
+        // by name from here on, and must not wonder where it came from.
+        self.accept_room_note(
+            &live,
+            author,
+            &format!("[opened shell {:?} on {host} (user-held)]", overview.id),
+        );
+        Ok(shell_of(host.to_string(), overview))
+    }
+
+    /// Set or clear a shell's display name. The id stays the address; the
+    /// note keeps the agent's mental map current.
+    pub(crate) async fn shell_rename(
+        &self,
+        author: &Author,
+        id: &str,
+        host: &str,
+        shell: &str,
+        title: Option<String>,
+    ) -> Result<api::Shell, ApiError> {
+        let (live, ctl) = self.shell_host(id, host).await?;
+        let overview = ctl
+            .shell_rename(shell, title.as_deref())
+            .await
+            .map_err(|e| ApiError::new(ErrorKind::NotFound, e))?;
+        let text = match &overview.title {
+            Some(t) => format!("[named shell {shell:?} on {host} {t:?}]"),
+            None => format!("[cleared shell {shell:?}'s name on {host}]"),
+        };
+        self.accept_room_note(&live, author, &text);
         Ok(shell_of(host.to_string(), overview))
     }
 
@@ -1609,6 +1703,7 @@ impl Server {
         let since = since.min(all.len());
         Ok(api::Poll {
             busy,
+            context_tokens: session.last_usage.map(|u| u.context_tokens()),
             total: all.len(),
             entries: all[since..].to_vec(),
             last_error,
@@ -1648,6 +1743,7 @@ impl Server {
         let snapshot = live.session.snapshot();
         Ok(api::Poll {
             busy: live.is_busy(),
+            context_tokens: snapshot.last_usage.map(|u| u.context_tokens()),
             total: snapshot.entries.len(),
             entries: Vec::new(),
             last_error: live.error(),
@@ -1664,6 +1760,7 @@ impl Server {
             .map_err(|_| internal("agent task gone".into()))?;
         Ok(api::Poll {
             busy: true,
+            context_tokens: None,
             total: 0,
             entries: Vec::new(),
             last_error: None,
@@ -1674,6 +1771,7 @@ impl Server {
         match self.retire_live(id).await {
             Some(_) => Ok(api::Poll {
                 busy: false,
+                context_tokens: None,
                 total: 0,
                 entries: Vec::new(),
                 last_error: None,
@@ -1862,6 +1960,27 @@ impl MycoApi for UserApi {
         rows: u16,
     ) -> Result<api::Shell, ApiError> {
         self.server.shell_resize(id, host, shell, cols, rows).await
+    }
+
+    async fn shell_start(
+        &self,
+        id: &str,
+        host: &str,
+        req: api::CreateShell,
+    ) -> Result<api::Shell, ApiError> {
+        self.server.shell_start(&self.author, id, host, req).await
+    }
+
+    async fn shell_rename(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        title: Option<String>,
+    ) -> Result<api::Shell, ApiError> {
+        self.server
+            .shell_rename(&self.author, id, host, shell, title)
+            .await
     }
 
     async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {

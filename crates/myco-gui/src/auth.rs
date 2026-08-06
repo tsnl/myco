@@ -80,6 +80,27 @@ pub fn sse_url(id: &str) -> String {
     format!("/api/sessions/{id}/events?token={}", encode(&token))
 }
 
+/// The shell WebSocket for `(id, host, shell)`, absolute (`ws://`/`wss://`
+/// from the page's own origin — the socket opener does not resolve relative
+/// URLs) with the token in the query string, the same concession the SSE
+/// route makes: a browser socket cannot set headers.
+pub fn shell_ws_url(id: &str, host: &str, shell: &str) -> String {
+    let token = token().unwrap_or_default();
+    let location = web_sys::window().map(|w| w.location());
+    let origin_host = location
+        .as_ref()
+        .and_then(|l| l.host().ok())
+        .unwrap_or_default();
+    let scheme = match location.and_then(|l| l.protocol().ok()) {
+        Some(p) if p == "https:" => "wss",
+        _ => "ws",
+    };
+    format!(
+        "{scheme}://{origin_host}/api/sessions/{id}/shells/{host}/{shell}/ws?token={}",
+        encode(&token)
+    )
+}
+
 /// Percent-encode a query-string value. Tokens are hex in practice, but a
 /// hand-written one may not be, and a stray `&` would silently truncate it.
 fn encode(s: &str) -> String {
