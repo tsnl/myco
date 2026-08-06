@@ -126,8 +126,10 @@ pub struct Shell {
     pub pty: bool,
 }
 
-/// A rendered terminal screen: the text a `cols`×`rows` window shows now
-/// (`GET /api/sessions/<id>/shells/<host>/<shell>/screen`).
+/// A rendered terminal screen: what a `cols`×`rows` window shows now
+/// (`GET /api/sessions/<id>/shells/<host>/<shell>/screen`) — as plain text
+/// (`text`) and as styled runs (`runs`) for a client drawing a real
+/// terminal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShellScreen {
     pub cols: u16,
@@ -135,6 +137,46 @@ pub struct ShellScreen {
     pub cursor_row: u16,
     pub cursor_col: u16,
     pub text: String,
+    /// Styled cell runs, row-major; the cursor cell is its own run.
+    #[serde(default)]
+    pub runs: Vec<ScreenRun>,
+    #[serde(default)]
+    pub cursor_hidden: bool,
+    /// DECCKM: arrow keys should send SS3 (`\x1bOA`…) instead of CSI.
+    #[serde(default)]
+    pub application_cursor: bool,
+}
+
+/// A run of consecutive same-styled cells on one screen row. Colors are
+/// concrete `#rrggbb` (indexed colors already resolved server-side); `None`
+/// means the terminal default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenRun {
+    pub row: u16,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
+    /// The cursor sits on (the first cell of) this run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor: bool,
+}
+
+/// `POST /api/sessions/<id>/shells/<host>/<shell>/resize` — fit the terminal
+/// to the viewer's window (requires the user keyboard lock).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellResize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// `GET /api/sessions/<id>/shells`.
@@ -336,6 +378,16 @@ pub trait MycoApi: Send + Sync {
         host: &str,
         shell: &str,
     ) -> Result<ShellScreen, ApiError>;
+    /// Resize the shell's terminal to fit the viewer's window. Requires the
+    /// user keyboard lock; pty children learn via SIGWINCH.
+    async fn shell_resize(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Shell, ApiError>;
 
     /// Live subagent children of this session (empty when it is not resident
     /// — children surface on the rail while their agent tasks exist).

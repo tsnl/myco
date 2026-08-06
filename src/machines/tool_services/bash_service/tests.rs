@@ -1796,6 +1796,75 @@ async fn screenshot_renders_the_screen_not_the_byte_stream() {
     service.reap_owner(owner);
 }
 
+/// The screen carries styled runs — indexed colors resolved to `#rrggbb`,
+/// the cursor as its own run — and a resize (a write, so user-held keyboard
+/// only) reshapes both the screen model and the pty window, SIGWINCH and
+/// all: the child's own `stty size` reports the new geometry.
+#[tokio::test]
+async fn the_screen_carries_styled_runs_and_resizes_under_the_user_lock() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("styled");
+    let started = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action": "start", "session_id": id, "pty": true,
+               "cols": 80, "rows": 24,
+               "command": "printf '\\033[31mred\\033[0m plain\\n'; exec sh",
+               "timeout_ms": 2000, "idle_ms": 200}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", result_text(&started));
+    tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).contains("plain")
+    })
+    .await;
+
+    let screen = service.shell_screen(&id).expect("screen");
+    let red = screen
+        .runs
+        .iter()
+        .find(|r| r.text.contains("red"))
+        .expect("styled run");
+    assert_eq!(red.row, 0);
+    assert_eq!(
+        red.fg.as_deref(),
+        Some("#cd0000"),
+        "indexed red resolves against the xterm palette"
+    );
+    let plain = screen
+        .runs
+        .iter()
+        .find(|r| r.text.contains("plain"))
+        .expect("plain run");
+    assert!(plain.fg.is_none(), "{:?}", plain.fg);
+    assert!(
+        screen.runs.iter().any(|r| r.cursor),
+        "the cursor cell is its own run: {:?}",
+        screen.runs
+    );
+
+    // Resize is a write: agent-held refuses; user-held reshapes for real.
+    assert!(
+        service.shell_resize(&id, 100, 30).is_err(),
+        "assistant-locked resize must fail"
+    );
+    service.shell_set_lock(&id, ShellLock::User).expect("lock");
+    service.shell_resize(&id, 100, 30).expect("resize");
+    let screen = service.shell_screen(&id).expect("screen");
+    assert_eq!((screen.cols, screen.rows), (100, 30));
+    service
+        .shell_user_write(&id, "stty size\n")
+        .await
+        .expect("write");
+    tail_until(&service, &id, |t| {
+        String::from_utf8_lossy(&t.data).contains("30 100")
+    })
+    .await;
+
+    service.reap_owner(owner);
+}
+
 /// A piped session gets a usable screenshot too: carriage-return progress
 /// lines collapse to their final state, like a terminal would show them.
 #[tokio::test]

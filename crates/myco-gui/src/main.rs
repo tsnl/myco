@@ -918,6 +918,7 @@ fn blocks_for_entry(
 fn render_transcript(
     entries: &[api::Entry],
     streaming: &[StreamItem],
+    arrivals: &[api::Entry],
     verbose: bool,
     me: Option<&api::Identity>,
 ) -> Html {
@@ -928,6 +929,11 @@ fn render_transcript(
     }
     for item in streaming {
         blocks.push(stream_block(item, verbose));
+    }
+    // Messages delivered mid-turn come after the stream: that is where the
+    // room actually saw them.
+    for e in arrivals {
+        blocks_for_entry(e, &results, verbose, me, &mut blocks);
     }
 
     // Fold the flat block list into turns.
@@ -1008,10 +1014,21 @@ struct ConversationProps {
 struct PanelBuf {
     shells: Vec<api::Shell>,
     terms: std::collections::HashMap<String, Term>,
+    /// Each pty session's latest rendered screen (the snapshot is the view).
+    screens: std::collections::HashMap<String, api::ShellScreen>,
     /// Live subagent children — the `subagent` tool's sessions, as tabs.
     subs: Vec<api::Subagent>,
     /// Each opened child's transcript so far (`poll?since=` pages).
     chats: std::collections::HashMap<String, Chat>,
+}
+
+/// Keystrokes on their way to one shell: a byte buffer drained by a single
+/// in-flight POST at a time, so bytes arrive in the order they were typed
+/// however fast the typist outruns the network.
+#[derive(Default)]
+struct TypeQueue {
+    buf: String,
+    busy: bool,
 }
 
 /// One subagent chat's accumulated entries.
@@ -1062,25 +1079,146 @@ impl Term {
             self.text.drain(..cut);
         }
     }
+}
 
-    /// Whole-screen replacement for a pty session: the screen snapshot *is*
-    /// the view, not an append. Returns whether anything changed.
-    fn replace(&mut self, screen: &api::ShellScreen) -> bool {
-        if self.text == screen.text {
-            return false;
-        }
-        self.text = screen.text.clone();
-        true
+/// Translate one keydown into the bytes a terminal sends, or `None` for
+/// keys the browser should keep. Follows xterm's conventions, including the
+/// copy/paste carve-out: `Ctrl+Shift+C`/`Ctrl+Shift+V` stay the browser's,
+/// while plain `Ctrl+C`/`Ctrl+V` are the control bytes a terminal owns.
+fn key_bytes(e: &KeyboardEvent, app_cursor: bool) -> Option<String> {
+    if e.meta_key() {
+        return None;
     }
+    let key = e.key();
+    if e.ctrl_key() && e.shift_key() && (key == "C" || key == "V") {
+        return None;
+    }
+    if e.ctrl_key() && !e.alt_key() {
+        let mut chars = key.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            let byte = match c {
+                'a'..='z' => (c as u8) - b'a' + 1,
+                'A'..='Z' => (c as u8) - b'A' + 1,
+                '@' | ' ' => 0,
+                '[' => 0x1b,
+                '\\' => 0x1c,
+                ']' => 0x1d,
+                '^' => 0x1e,
+                '_' => 0x1f,
+                _ => return None,
+            };
+            return Some(char::from(byte).to_string());
+        }
+        return None;
+    }
+    let arrow = |c: char| {
+        Some(if app_cursor {
+            format!("\x1bO{c}")
+        } else {
+            format!("\x1b[{c}")
+        })
+    };
+    let base = match key.as_str() {
+        "Enter" => Some("\r".to_string()),
+        "Backspace" => Some("\x7f".to_string()),
+        "Tab" => Some("\t".to_string()),
+        "Escape" => Some("\x1b".to_string()),
+        "ArrowUp" => arrow('A'),
+        "ArrowDown" => arrow('B'),
+        "ArrowRight" => arrow('C'),
+        "ArrowLeft" => arrow('D'),
+        "Home" => Some("\x1b[H".to_string()),
+        "End" => Some("\x1b[F".to_string()),
+        "PageUp" => Some("\x1b[5~".to_string()),
+        "PageDown" => Some("\x1b[6~".to_string()),
+        "Insert" => Some("\x1b[2~".to_string()),
+        "Delete" => Some("\x1b[3~".to_string()),
+        "F1" => Some("\x1bOP".to_string()),
+        "F2" => Some("\x1bOQ".to_string()),
+        "F3" => Some("\x1bOR".to_string()),
+        "F4" => Some("\x1bOS".to_string()),
+        "F5" => Some("\x1b[15~".to_string()),
+        "F6" => Some("\x1b[17~".to_string()),
+        "F7" => Some("\x1b[18~".to_string()),
+        "F8" => Some("\x1b[19~".to_string()),
+        "F9" => Some("\x1b[20~".to_string()),
+        "F10" => Some("\x1b[21~".to_string()),
+        "F11" => Some("\x1b[23~".to_string()),
+        "F12" => Some("\x1b[24~".to_string()),
+        k if k.chars().count() == 1 => Some(k.to_string()),
+        _ => None,
+    };
+    match (base, e.alt_key()) {
+        // Alt is the ESC prefix, terminal-style.
+        (Some(b), true) => Some(format!("\x1b{b}")),
+        (b, false) => b,
+        (None, true) => None,
+    }
+}
+
+/// The styled terminal grid: one `div` per row, one `span` per same-styled
+/// run, colors resolved server-side. The cursor cell renders inverse.
+fn render_screen(screen: &api::ShellScreen) -> Html {
+    let mut runs = screen.runs.iter().peekable();
+    let rows = (0..screen.rows).map(|row| {
+        let mut spans: Vec<Html> = Vec::new();
+        while let Some(r) = runs.peek() {
+            if r.row != row {
+                break;
+            }
+            let r = runs.next().expect("peeked");
+            // Inverse swaps the pair; a missing side swaps in the terminal
+            // default. The cursor is its own run and styles itself.
+            let (fg, bg) = if r.inverse && !r.cursor {
+                (
+                    Some(r.bg.clone().unwrap_or_else(|| "var(--term-bg)".into())),
+                    Some(r.fg.clone().unwrap_or_else(|| "var(--fg)".into())),
+                )
+            } else {
+                (r.fg.clone(), r.bg.clone())
+            };
+            let mut style = String::new();
+            if !r.cursor {
+                if let Some(fg) = fg {
+                    style.push_str(&format!("color:{fg};"));
+                }
+                if let Some(bg) = bg {
+                    style.push_str(&format!("background:{bg};"));
+                }
+            }
+            if r.bold {
+                style.push_str("font-weight:bold;");
+            }
+            if r.italic {
+                style.push_str("font-style:italic;");
+            }
+            if r.underline {
+                style.push_str("text-decoration:underline;");
+            }
+            spans.push(html! {
+                <span class={ classes!(r.cursor.then_some("cur")) } style={style}>
+                    { r.text.clone() }
+                </span>
+            });
+        }
+        html! { <div class="trow">{ for spans.into_iter() }</div> }
+    });
+    html! { <div class="term-screen">{ for rows }</div> }
 }
 
 /// The active tab's window — a shell terminal or a subagent chat behind one
 /// piece of chrome. The head names the thing and carries the keyboard-lock
 /// affordance as an explicit button (a double-click on a header that also
-/// selects was two gestures fighting over one element); the body is
-/// scroll-pinned; the input row appears while the user holds the lock
-/// (Enter sends, Esc hands back). What the body shows — scrollback or a
-/// transcript — is the caller's business.
+/// selects was two gestures fighting over one element).
+///
+/// Two input modes, by what the thing *is*:
+/// - a pty session is a real terminal: while the user holds the lock the
+///   body itself has keyboard focus and every keystroke goes down raw —
+///   Ctrl+C, Esc, arrows, F-keys, Alt chords, paste — so full-screen
+///   programs behave. The window is also fitted to the panel (resize →
+///   SIGWINCH).
+/// - a piped shell or a subagent chat is line-based: an input row appears
+///   while the lock is held (Enter sends, Esc hands back).
 #[derive(Properties, PartialEq)]
 struct WorkViewProps {
     /// Something is running inside (a command, a turn) — the disc state.
@@ -1096,10 +1234,23 @@ struct WorkViewProps {
     /// Prose content (a chat) rather than preformatted terminal text.
     #[prop_or_default]
     chat: bool,
+    /// A pty session: raw keystrokes into the body, no input row.
+    #[prop_or_default]
+    pty: bool,
+    /// DECCKM from the screen: arrows send SS3 instead of CSI.
+    #[prop_or_default]
+    app_cursor: bool,
     /// Point the keyboard: `true` takes it, `false` hands it back.
     on_lock: Callback<bool>,
-    /// A line submitted from the input row.
+    /// A line submitted from the input row (line mode).
+    #[prop_or_default]
     on_send: Callback<String>,
+    /// Raw bytes typed or pasted into the terminal (pty mode).
+    #[prop_or_default]
+    on_keys: Callback<String>,
+    /// The cols×rows that currently fit the body (pty mode, lock held).
+    #[prop_or_default]
+    on_resize: Callback<(u16, u16)>,
     #[prop_or_default]
     placeholder: AttrValue,
     #[prop_or_default]
@@ -1110,15 +1261,53 @@ struct WorkViewProps {
 fn work_view(props: &WorkViewProps) -> Html {
     let input = use_node_ref();
     let body = use_node_ref();
+    let probe = use_node_ref();
+    let raw_mode = props.pty && props.user_locked;
 
-    // Ride the bottom on every render: these are live surfaces, and the
-    // newest output (or newest chat entry) is what the viewer opened them
-    // for.
+    // Ride the bottom on every render — for the scrolling views. A pty
+    // screen is a fixed grid; there is nothing to chase.
     {
         let body = body.clone();
+        let scrolling = !props.pty;
         use_effect(move || {
-            if let Some(el) = body.cast::<web_sys::Element>() {
+            if scrolling && let Some(el) = body.cast::<web_sys::Element>() {
                 el.set_scroll_top(el.scroll_height());
+            }
+        });
+    }
+
+    // Taking a terminal's keyboard focuses it, so typing starts immediately.
+    {
+        let body = body.clone();
+        use_effect_with(raw_mode, move |raw| {
+            if *raw && let Some(el) = body.cast::<web_sys::HtmlElement>() {
+                let _ = el.focus();
+            }
+        });
+    }
+
+    // Fit the terminal to the panel: measure a 10-char probe for the cell
+    // size, emit the cols×rows that fit. The parent dedupes and resizes the
+    // pty; runs every render so panel-size changes are picked up on the
+    // next tick.
+    {
+        let body = body.clone();
+        let probe = probe.clone();
+        let on_resize = props.on_resize.clone();
+        use_effect(move || {
+            if raw_mode
+                && let Some(p) = probe.cast::<web_sys::HtmlElement>()
+                && let Some(b) = body.cast::<web_sys::HtmlElement>()
+            {
+                let cell_w = p.offset_width() as f64 / 10.0;
+                let cell_h = p.offset_height() as f64;
+                if cell_w > 0.0 && cell_h > 0.0 {
+                    let cols = ((b.client_width() as f64 - 18.0) / cell_w) as i64;
+                    let rows = ((b.client_height() as f64 - 10.0) / cell_h) as i64;
+                    if cols >= 10 && rows >= 3 {
+                        on_resize.emit((cols.min(500) as u16, rows.min(500) as u16));
+                    }
+                }
             }
         });
     }
@@ -1128,7 +1317,8 @@ fn work_view(props: &WorkViewProps) -> Html {
         let take = !props.user_locked;
         Callback::from(move |_: MouseEvent| on_lock.emit(take))
     };
-    let on_key = {
+    // Line mode: Enter sends the line, Esc hands the keyboard back.
+    let on_line_key = {
         let input = input.clone();
         let on_send = props.on_send.clone();
         let on_lock = props.on_lock.clone();
@@ -1143,6 +1333,34 @@ fn work_view(props: &WorkViewProps) -> Html {
             } else if e.key() == "Escape" {
                 e.prevent_default();
                 on_lock.emit(false);
+            }
+        })
+    };
+    // Raw mode: the body is the terminal. (Esc types ESC here — handing the
+    // keyboard back is the head button.)
+    let on_raw_key = {
+        let on_keys = props.on_keys.clone();
+        let app_cursor = props.app_cursor;
+        Callback::from(move |e: KeyboardEvent| {
+            if let Some(bytes) = key_bytes(&e, app_cursor) {
+                e.prevent_default();
+                on_keys.emit(bytes);
+            }
+        })
+    };
+    let on_paste = {
+        let on_keys = props.on_keys.clone();
+        Callback::from(move |e: Event| {
+            use wasm_bindgen::JsCast;
+            let Ok(e) = e.dyn_into::<web_sys::ClipboardEvent>() else {
+                return;
+            };
+            if let Some(data) = e.clipboard_data()
+                && let Ok(text) = data.get_data("text")
+                && !text.is_empty()
+            {
+                e.prevent_default();
+                on_keys.emit(text);
             }
         })
     };
@@ -1161,13 +1379,19 @@ fn work_view(props: &WorkViewProps) -> Html {
                     { if props.user_locked { "⌨ yours — hand back" } else { "⌨ agent — take keyboard" } }
                 </button>
             </div>
-            <div ref={body} class={ classes!("work-body", props.chat.then_some("chat-body")) }>
+            <div ref={body}
+                 class={ classes!("work-body", props.chat.then_some("chat-body"),
+                                  raw_mode.then_some("work-body-raw")) }
+                 tabindex={ raw_mode.then_some("0") }
+                 onkeydown={ raw_mode.then_some(on_raw_key) }
+                 onpaste={ raw_mode.then_some(on_paste) }>
+                <span class="term-probe" ref={probe} aria-hidden="true">{ "0000000000" }</span>
                 { props.children.clone() }
             </div>
-            { if props.user_locked { html! {
+            { if props.user_locked && !props.pty { html! {
                 <div class="term-input-row">
                     <input ref={input} type="text" placeholder={props.placeholder.clone()}
-                           onkeydown={on_key} />
+                           onkeydown={on_line_key} />
                 </div>
             } } else { html!{} } }
         </div>
@@ -1214,6 +1438,25 @@ fn conversation(props: &ConversationProps) -> Html {
     let active_tab: Rc<RefCell<Option<Tab>>> = use_mut_ref(|| None);
     let panel: Rc<RefCell<PanelBuf>> = use_mut_ref(PanelBuf::default);
     let panel_rev = use_state(|| 0u64);
+    // One render trigger shared by every panel writer (the poll loop, the
+    // typing queues, resize echoes): a monotonic counter, so two writers can
+    // never set the same value and lose a render.
+    let bump: Rc<dyn Fn()> = {
+        let counter: Rc<RefCell<u64>> = use_mut_ref(|| 0u64);
+        let setter = panel_rev.setter();
+        Rc::new(move || {
+            let mut c = counter.borrow_mut();
+            *c += 1;
+            setter.set(*c);
+        })
+    };
+    // Keystrokes in flight, per shell (see [`TypeQueue`]).
+    let typing: Rc<RefCell<std::collections::HashMap<String, TypeQueue>>> =
+        use_mut_ref(std::collections::HashMap::new);
+    // The last size we asked each pty for, so the per-render measurements
+    // only POST on change.
+    let sized: Rc<RefCell<std::collections::HashMap<String, (u16, u16)>>> =
+        use_mut_ref(std::collections::HashMap::new);
     // The catalog, for the topbar model picker. One fetch; the catalog does
     // not change while the page is open.
     let models = use_state(Vec::<String>::new);
@@ -1370,14 +1613,15 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
-    // The work panel's poll: the shell and subagent lists every tick while
-    // the panel is open, plus the active tab's content — a terminal's
-    // scrollback tail or a chat's new entries. Polling, not SSE — the reads
+    // The work panel's poll: the shell and subagent lists while the panel is
+    // open, plus the active tab's content — a terminal's screen or
+    // scrollback tail, or a chat's new entries. Polling, not SSE — the reads
     // are offset-addressed and idempotent, so a fixed cadence is simple and
-    // self-healing, and a closed panel costs nothing.
+    // self-healing, and a closed panel costs nothing. Content every 500ms
+    // (a terminal wants the present), the lists every other tick.
     {
         let panel = panel.clone();
-        let panel_rev = panel_rev.setter();
+        let bump = bump.clone();
         let rail_open_ref = rail_open_ref.clone();
         let active_tab = active_tab.clone();
         let id = props.id.clone();
@@ -1386,9 +1630,10 @@ fn conversation(props: &ConversationProps) -> Html {
             let alive = Rc::new(std::cell::Cell::new(true));
             let alive2 = alive.clone();
             spawn_local(async move {
-                let mut rev = 0u64;
+                let mut tick = 0u64;
                 while alive2.get() {
-                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    gloo_timers::future::TimeoutFuture::new(500).await;
+                    tick += 1;
                     if !alive2.get() {
                         break;
                     }
@@ -1396,22 +1641,25 @@ fn conversation(props: &ConversationProps) -> Html {
                         continue;
                     }
                     let mut changed = false;
-                    if let Ok(s) =
-                        auth::get::<api::Shells>(&format!("/api/sessions/{id}/shells")).await
-                    {
-                        let mut p = panel.borrow_mut();
-                        if p.shells != s.shells {
-                            p.shells = s.shells;
-                            changed = true;
+                    if tick.is_multiple_of(2) {
+                        if let Ok(s) =
+                            auth::get::<api::Shells>(&format!("/api/sessions/{id}/shells")).await
+                        {
+                            let mut p = panel.borrow_mut();
+                            if p.shells != s.shells {
+                                p.shells = s.shells;
+                                changed = true;
+                            }
                         }
-                    }
-                    if let Ok(s) =
-                        auth::get::<api::Subagents>(&format!("/api/sessions/{id}/subagents")).await
-                    {
-                        let mut p = panel.borrow_mut();
-                        if p.subs != s.subagents {
-                            p.subs = s.subagents;
-                            changed = true;
+                        if let Ok(s) =
+                            auth::get::<api::Subagents>(&format!("/api/sessions/{id}/subagents"))
+                                .await
+                        {
+                            let mut p = panel.borrow_mut();
+                            if p.subs != s.subagents {
+                                p.subs = s.subagents;
+                                changed = true;
+                            }
                         }
                     }
                     // Tabs come and go with the lists; keep the active one
@@ -1459,14 +1707,12 @@ fn conversation(props: &ConversationProps) -> Html {
                                     "/api/sessions/{id}/shells/{host}/{shell}/screen"
                                 ))
                                 .await
-                                    && panel
-                                        .borrow_mut()
-                                        .terms
-                                        .entry(key)
-                                        .or_default()
-                                        .replace(&screen)
                                 {
-                                    changed = true;
+                                    let mut p = panel.borrow_mut();
+                                    if p.screens.get(&key) != Some(&screen) {
+                                        p.screens.insert(key, screen);
+                                        changed = true;
+                                    }
                                 }
                             } else {
                                 let from =
@@ -1510,8 +1756,7 @@ fn conversation(props: &ConversationProps) -> Html {
                         None => {}
                     }
                     if changed {
-                        rev += 1;
-                        panel_rev.set(rev);
+                        bump();
                     }
                 }
             });
@@ -1770,6 +2015,137 @@ fn conversation(props: &ConversationProps) -> Html {
         }
     };
 
+    // Raw keystrokes into a pty, in typed order: each shell has one queue
+    // and at most one POST in flight — a fast typist appends while the
+    // previous chunk sends, and the drain loop carries the rest. Every
+    // successful send refetches the screen at once, so the echo latency is
+    // one round trip, not one poll tick.
+    let shell_keys = {
+        let id = props.id.clone();
+        let typing = typing.clone();
+        let panel = panel.clone();
+        let bump = bump.clone();
+        let dispatch = conv.dispatcher();
+        move |host: String, shell: String| {
+            let id = id.clone();
+            let typing = typing.clone();
+            let panel = panel.clone();
+            let bump = bump.clone();
+            let dispatch = dispatch.clone();
+            Callback::from(move |keys: String| {
+                let key = term_key(&host, &shell);
+                {
+                    let mut q = typing.borrow_mut();
+                    let queue = q.entry(key.clone()).or_default();
+                    queue.buf.push_str(&keys);
+                    if queue.busy {
+                        return;
+                    }
+                    queue.busy = true;
+                }
+                let id = id.clone();
+                let host = host.clone();
+                let shell = shell.clone();
+                let typing = typing.clone();
+                let panel = panel.clone();
+                let bump = bump.clone();
+                let dispatch = dispatch.clone();
+                spawn_local(async move {
+                    loop {
+                        let data = {
+                            let mut q = typing.borrow_mut();
+                            let queue = q.entry(key.clone()).or_default();
+                            if queue.buf.is_empty() {
+                                queue.busy = false;
+                                break;
+                            }
+                            std::mem::take(&mut queue.buf)
+                        };
+                        let sent = auth::post_json::<api::Shell, _>(
+                            &format!("/api/sessions/{id}/shells/{host}/{shell}/input"),
+                            &api::ShellInput { data },
+                        )
+                        .await;
+                        if let Err(e) = sent {
+                            typing.borrow_mut().entry(key.clone()).or_default().busy = false;
+                            dispatch.dispatch(ConvAction::Failed(format!("shell input: {e}")));
+                            break;
+                        }
+                        if let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
+                            "/api/sessions/{id}/shells/{host}/{shell}/screen"
+                        ))
+                        .await
+                        {
+                            let mut p = panel.borrow_mut();
+                            if p.screens.get(&key) != Some(&screen) {
+                                p.screens.insert(key.clone(), screen);
+                                drop(p);
+                                bump();
+                            }
+                        }
+                    }
+                });
+            })
+        }
+    };
+
+    // Fit a pty to the panel. WorkView measures every render; this dedupes
+    // against the last size asked for and lets errors pass silently — a
+    // resize that lost a race with an agent write retries on the next
+    // measurement.
+    let shell_fit = {
+        let id = props.id.clone();
+        let sized = sized.clone();
+        let panel = panel.clone();
+        let bump = bump.clone();
+        move |host: String, shell: String| {
+            let id = id.clone();
+            let sized = sized.clone();
+            let panel = panel.clone();
+            let bump = bump.clone();
+            Callback::from(move |(cols, rows): (u16, u16)| {
+                let key = term_key(&host, &shell);
+                {
+                    let mut s = sized.borrow_mut();
+                    let current = panel
+                        .borrow()
+                        .screens
+                        .get(&key)
+                        .map(|scr| (scr.cols, scr.rows));
+                    if s.get(&key) == Some(&(cols, rows)) && current == Some((cols, rows)) {
+                        return;
+                    }
+                    if current == Some((cols, rows)) {
+                        s.insert(key.clone(), (cols, rows));
+                        return;
+                    }
+                    s.insert(key.clone(), (cols, rows));
+                }
+                let id = id.clone();
+                let host = host.clone();
+                let shell = shell.clone();
+                let panel = panel.clone();
+                let bump = bump.clone();
+                spawn_local(async move {
+                    if auth::post_json::<api::Shell, _>(
+                        &format!("/api/sessions/{id}/shells/{host}/{shell}/resize"),
+                        &api::ShellResize { cols, rows },
+                    )
+                    .await
+                    .is_ok()
+                        && let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
+                            "/api/sessions/{id}/shells/{host}/{shell}/screen"
+                        ))
+                        .await
+                    {
+                        panel.borrow_mut().screens.insert(key, screen);
+                        bump();
+                    }
+                });
+            })
+        }
+    };
+
     // The subagent twins of the two above, against the child's lock and
     // composer endpoints on the *parent* session.
     let sub_lock = |child: String| {
@@ -1895,18 +2271,28 @@ fn conversation(props: &ConversationProps) -> Html {
         let view = match &active {
             Some(Tab::Shell { host, id }) => {
                 p.shells.iter().find(|s| s.host == *host && s.id == *id).map(|shell| {
-                    let text = p.terms.get(&term_key(host, id))
-                        .map(|t| t.text.clone()).unwrap_or_default();
+                    let key = term_key(host, id);
+                    let screen = shell.pty.then(|| p.screens.get(&key)).flatten();
+                    let body = if shell.pty {
+                        screen.map(render_screen)
+                            .unwrap_or_else(|| html! { <span class="dim">{ "…" }</span> })
+                    } else {
+                        html! { { p.terms.get(&key).map(|t| t.text.clone()).unwrap_or_default() } }
+                    };
                     html! {
                         <WorkView running={shell.running}
                                   title={shell.id.clone()}
                                   badge={(shell.host != "local").then(|| format!("@{}", shell.host))}
                                   detail={shell.cmdline.clone()}
                                   user_locked={shell.lock == api::ShellLockMode::User}
+                                  pty={shell.pty}
+                                  app_cursor={screen.is_some_and(|s| s.application_cursor)}
                                   on_lock={shell_lock(shell.host.clone(), shell.id.clone())}
                                   on_send={shell_send(shell.host.clone(), shell.id.clone())}
+                                  on_keys={shell_keys(shell.host.clone(), shell.id.clone())}
+                                  on_resize={shell_fit(shell.host.clone(), shell.id.clone())}
                                   placeholder="type into the shell (Enter sends · Esc hands the keyboard back)">
-                            { text }
+                            { body }
                         </WorkView>
                     }
                 })
@@ -1914,7 +2300,7 @@ fn conversation(props: &ConversationProps) -> Html {
             Some(Tab::Sub { id }) => {
                 p.subs.iter().find(|s| s.id == *id).map(|sub| {
                     let body = match p.chats.get(&sub.id) {
-                        Some(c) => render_transcript(&c.entries, &[], *verbose,
+                        Some(c) => render_transcript(&c.entries, &[], &[], *verbose,
                                                      who.as_ref().map(|s| &s.identity)),
                         None => html! { <span class="dim">{ "…" }</span> },
                     };
@@ -2002,17 +2388,15 @@ fn conversation(props: &ConversationProps) -> Html {
             <div class="pane-row">
             <div class="pane" ref={pane} onscroll={on_scroll}>
                 <div class="column">
-                { render_transcript(&st.entries, &st.streaming, *verbose,
+                { render_transcript(&st.entries, &st.streaming, &st.arrivals, *verbose,
                                     who.as_ref().map(|s| &s.identity)) }
                 { if let Some(e) = &st.error { html! {
                     <div class="err"><hr class="rule" /><b>{ "ERROR" }</b><pre>{ e }</pre></div>
                 } } else { html!{} } }
-                </div>
-            </div>
-            { rail }
-            </div>
-            <div class="composer">
-                <div class="column">
+                // The composer sits inline under the last message, inside
+                // the chat's own scroll — so the work panel beside it owns
+                // the full window height.
+                <div class="composer composer-inline">
                     <textarea ref={input} rows="2" onkeydown={on_keydown}
                               placeholder={if st.shared {
                                   "message the room (@myco to ask the agent)"
@@ -2033,6 +2417,9 @@ fn conversation(props: &ConversationProps) -> Html {
                         } else { html!{} } }
                     </div>
                 </div>
+                </div>
+            </div>
+            { rail }
             </div>
         </div>
     }

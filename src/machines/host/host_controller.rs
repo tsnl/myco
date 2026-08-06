@@ -514,6 +514,36 @@ impl HostController {
         }
     }
 
+    /// Resize the shell's terminal (requires the user keyboard lock on the
+    /// host).
+    pub async fn shell_resize(
+        &self,
+        shell: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ShellOverview, String> {
+        match &self.backend {
+            Backend::InProcess { worker } => {
+                let bash = self.bash_of(worker)?;
+                bash.shell_resize(shell, cols, rows)?;
+                bash.shell_overview(shell)
+            }
+            Backend::Subprocess { .. } => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+                let request = Request::ShellResize {
+                    id: id.clone(),
+                    shell: shell.to_string(),
+                    cols,
+                    rows,
+                };
+                match self.shell_request(&id, &request).await? {
+                    Response::Shell { shell, .. } => Ok(shell),
+                    other => Err(format!("mismatched reply: {other:?}")),
+                }
+            }
+        }
+    }
+
     /// The shell's rendered terminal screen.
     pub async fn shell_screen(&self, shell: &str) -> Result<ShellScreen, String> {
         match &self.backend {

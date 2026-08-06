@@ -53,6 +53,14 @@ pub enum Request {
     },
     /// Rendered terminal screen → [`Response::ShellScreen`].
     ShellScreenshot { id: String, shell: String },
+    /// Resize the terminal (requires the user keyboard lock on the host) →
+    /// [`Response::Shell`].
+    ShellResize {
+        id: String,
+        shell: String,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl Request {

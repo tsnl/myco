@@ -250,6 +250,25 @@ impl MycoApi for HttpClient {
             .await
     }
 
+    async fn shell_resize(
+        &self,
+        id: &str,
+        host: &str,
+        shell: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<api::Shell, ApiError> {
+        self.send(
+            self.http
+                .post(format!(
+                    "{}/sessions/{id}/shells/{host}/{shell}/resize",
+                    self.base
+                ))
+                .json(&api::ShellResize { cols, rows }),
+        )
+        .await
+    }
+
     async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {
         self.get(&format!("/sessions/{id}/subagents")).await
     }

@@ -143,6 +143,23 @@ impl tokio::io::AsyncRead for PtyReader {
 }
 
 impl PtyWriter {
+    /// Resize the terminal window (TIOCSWINSZ on the master): the kernel
+    /// delivers SIGWINCH to the foreground process group, so a full-screen
+    /// program redraws at the new size.
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Safety: plain ioctl on an fd we own.
+        if unsafe { libc::ioctl(self.io.get_ref().as_raw_fd(), libc::TIOCSWINSZ, &ws) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Write all of `data` to the master (delivered to the child as terminal
     /// input).
     pub async fn write_all(&mut self, mut data: &[u8]) -> std::io::Result<()> {

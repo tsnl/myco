@@ -117,6 +117,7 @@ pub fn rocket(
             shell_screen,
             shell_input,
             shell_lock,
+            shell_resize,
             subagents,
             subagent_lock,
             subagent_input,
@@ -318,6 +319,20 @@ async fn shell_input(
             .shell_input(id, host, shell, req.into_inner().data)
             .await,
     )
+}
+
+/// Fit the shell's terminal to the viewer's window (requires the user
+/// keyboard lock).
+#[post("/sessions/<id>/shells/<host>/<shell>/resize", data = "<req>")]
+async fn shell_resize(
+    caller: Caller,
+    id: &str,
+    host: &str,
+    shell: &str,
+    req: Json<api::ShellResize>,
+) -> ApiResult<api::Shell> {
+    let r = req.into_inner();
+    output(caller.shell_resize(id, host, shell, r.cols, r.rows).await)
 }
 
 /// Take or return the shell's keyboard.
