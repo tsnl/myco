@@ -167,6 +167,12 @@ New non-trivial features: dedicated git worktree + branch under the repo’s
 worktree on the session with `session_meta` `add_link`. Skip worktrees only for
 tiny one-liners or when the user asks to edit the current checkout.
 
+**Branch names in this repo:** `feat/…` for features, `fix/…` for fixes, short
+and descriptive after the prefix. The prompt fragment deliberately names no
+convention — branch naming is per-project, so it is stated here (and read from
+whatever `AGENTS.md` the launch directory has) rather than in every agent's
+system prompt.
+
 ## Develop
 
 ```bash
