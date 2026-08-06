@@ -121,15 +121,39 @@ user it is running as — every session entry records its author, and a
 name nobody registered has no business in a shared transcript. Override the
 path with `--server-config` or `$MYCO_SERVER_CONFIG`.
 
-The roster says who *exists*; passwords are set separately, so a name in the
-file is not by itself access to the server:
+The roster says who *exists*; credentials are set separately, so a name in
+the file is not by itself access to the server:
 
 ```bash
-myco auth list             # who exists, who can sign in, live sessions
-myco auth passwd ada       # prompts; ends ada's existing sessions
+myco auth list             # who exists, their credentials, live sessions
+myco auth passwd ada       # set a password (prompts; ends ada's sessions)
+myco auth code ada         # mint a one-time login code (15 min, single use)
 myco auth disable ada      # refuse logins, keep the history attributed
-myco auth revoke ada       # end sessions without changing the password
+myco auth revoke ada       # end sessions without changing credentials
+myco auth clear-passkeys ada   # forget a lost/compromised authenticator
 ```
+
+Three ways in, by strength: a **password**, an **operator-minted one-time
+code** (`auth code` talks to the running server; the code is memory-only,
+single-use, and bound to its user — the recovery path when someone is locked
+out), and a **passkey**. Passkeys are the intended steady state: any signed-
+in session can enroll one ("add passkey" in the GUI topbar), the credential
+persists in `~/.myco/v2/passkeys.json` — so it survives the restarts that
+void every token by design — and sign-in is phishing-proof and secret-free.
+The relying party defaults to `localhost` (any port), which covers both
+local use and the supported remote pattern; set `[passkeys]` in
+`server.toml` (`rp_id`, `origin`) when the GUI lives behind a real HTTPS
+hostname. Passwords can then be treated as bootstrap: once a user has a
+passkey, their password can simply never be set again.
+
+**Transport doctrine:** the server binds `127.0.0.1` only and speaks plain
+HTTP, which is safe *because* loopback traffic never crosses a wire. The
+supported remote pattern is an SSH tunnel
+(`ssh -L 7773:localhost:7773 you@server`) — transport security from keys
+you already have, and the browser still sees `localhost`, a secure context,
+so passkeys work unchanged. Do not expose the port itself; if you want a
+real URL, put a TLS reverse proxy (e.g. Caddy) in front and point
+`[passkeys]` at it.
 
 ### Talking in a shared session
 

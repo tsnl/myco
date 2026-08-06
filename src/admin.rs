@@ -34,6 +34,14 @@ pub enum AuthCommand {
     Revoke { id: String },
     /// Forget a user's credentials entirely.
     Remove { id: String },
+    /// Mint a one-time login code for a user (15 minutes, single use).
+    /// Talks to the running server — codes are redeemed against it, so they
+    /// live in its memory and die with it.
+    Code { id: String },
+    /// Forget every passkey enrolled for a user (lost or compromised
+    /// authenticator). A running server keeps its in-memory copy until
+    /// restart; run `myco auth revoke <id>` too if sessions must end now.
+    ClearPasskeys { id: String },
 }
 
 /// Run an admin command. Returns the process exit code.
@@ -70,6 +78,20 @@ pub fn run(config: &Config, command: AuthCommand) -> i32 {
             println!("revoked {n} session(s) for {id}");
             0
         }
+        AuthCommand::Code { id } => mint_code(&id),
+        AuthCommand::ClearPasskeys { id } => match store.clear_passkeys(&id) {
+            Ok(n) => {
+                println!("forgot {n} passkey(s) for {id}");
+                println!(
+                    "note: a running server keeps its copy until restart;                      `myco auth revoke {id}` ends live sessions"
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("myco: {e}");
+                1
+            }
+        },
         AuthCommand::Remove { id } => match store.remove_user(&id) {
             Ok(()) => {
                 println!("removed {id}");
@@ -90,30 +112,101 @@ pub fn run(config: &Config, command: AuthCommand) -> i32 {
 fn list(store: &AuthStore) -> i32 {
     let sessions: std::collections::HashMap<String, usize> =
         store.session_counts().into_iter().collect();
+    let passkeys = store.passkey_counts();
     let users = store.users();
     if users.is_empty() {
         println!("no users");
         return 0;
     }
     let width = users.iter().map(|u| u.id.len()).max().unwrap_or(4).max(4);
-    println!("{:<width$}  {:<10}  {:<8}  NAME", "ID", "LOGIN", "SESSIONS");
+    println!(
+        "{:<width$}  {:<10}  {:<8}  {:<8}  NAME",
+        "ID", "LOGIN", "PASSKEYS", "SESSIONS"
+    );
     for u in &users {
         let state = if u.disabled {
             "disabled"
-        } else if u.password_hash.is_none() {
-            "no passwd"
+        } else if u.password_hash.is_none() && passkeys.get(&u.id).copied().unwrap_or(0) == 0 {
+            "no cred"
         } else {
             "ok"
         };
         println!(
-            "{:<width$}  {:<10}  {:<8}  {}",
+            "{:<width$}  {:<10}  {:<8}  {:<8}  {}",
             u.id,
             state,
+            passkeys.get(&u.id).copied().unwrap_or(0),
             sessions.get(&u.id).copied().unwrap_or(0),
             u.name,
         );
     }
     0
+}
+
+/// Mint a code against the live server, as the operator. File-based minting
+/// cannot work: the code must live in the memory of the process it will be
+/// redeemed against.
+fn mint_code(id: &str) -> i32 {
+    let base =
+        std::env::var("MYCO_API").unwrap_or_else(|_| "http://127.0.0.1:7773/api".to_string());
+    let token = match crate::web::operator_token_path().map(std::fs::read_to_string) {
+        Ok(Ok(t)) => t.trim().to_string(),
+        _ => {
+            eprintln!(
+                "myco: no operator token — is the server running?                  (`myco --mode serve` writes it at startup)"
+            );
+            return 1;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("myco: {e}");
+            return 1;
+        }
+    };
+    let result = runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/auth/codes"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "username": id }))
+            .send()
+            .await
+            .map_err(|e| format!("cannot reach the server at {base}: {e}"))?;
+        let status = response.status();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("bad reply: {e}"))?;
+        if !status.is_success() {
+            return Err(body["error"]
+                .as_str()
+                .unwrap_or("request failed")
+                .to_string());
+        }
+        Ok(body)
+    });
+    match result {
+        Ok(body) => {
+            println!(
+                "one-time code for {}: {}",
+                body["username"].as_str().unwrap_or(id),
+                body["code"].as_str().unwrap_or("?")
+            );
+            println!(
+                "single use, expires {} — redeem in the GUI ('use code') or                  POST /api/auth/token with grant_type=code",
+                body["expires_at"].as_str().unwrap_or("soon")
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("myco: {e}");
+            1
+        }
+    }
 }
 
 fn set_disabled(store: &AuthStore, id: &str, disabled: bool) -> i32 {

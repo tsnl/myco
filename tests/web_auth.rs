@@ -375,3 +375,275 @@ async fn a_roster_user_without_a_password_cannot_sign_in() {
         Status::Unauthorized
     );
 }
+
+// ---------------------------------------------------------------------------
+// One-time codes and passkeys
+// ---------------------------------------------------------------------------
+
+/// The code grant: the operator mints against the live server, the code
+/// signs its user in exactly once, and nobody but the operator can mint.
+#[tokio::test]
+async fn a_one_time_code_signs_in_once_and_only_the_operator_mints() {
+    let c = client().await;
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+
+    // Grace (not the operator) may not mint, even authenticated.
+    let grace_token = login(&c, "grace", GRACE_PASSWORD).await.expect("login");
+    let refused = c
+        .post("/api/auth/codes")
+        .header(bearer(&grace_token))
+        .header(ContentType::JSON)
+        .body(r#"{"username": "grace"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(refused.status(), Status::Unauthorized);
+
+    // The operator (the roster's local user, ada) mints for grace.
+    let operator = server.auth().issue_for("ada").expect("operator token");
+    let minted = c
+        .post("/api/auth/codes")
+        .header(bearer(&operator.access_token))
+        .header(ContentType::JSON)
+        .body(r#"{"username": "grace"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(minted.status(), Status::Ok);
+    let body: serde_json::Value =
+        serde_json::from_str(&minted.into_string().await.unwrap()).unwrap();
+    let code = body["code"].as_str().expect("code").to_string();
+    assert_eq!(body["username"], "grace");
+
+    // The code is bound to its user: ada cannot redeem grace's code.
+    let wrong_user = c
+        .post("/api/auth/token")
+        .header(ContentType::Form)
+        .body(format!("grant_type=code&username=ada&code={code}"))
+        .dispatch()
+        .await;
+    assert_eq!(wrong_user.status(), Status::Unauthorized);
+
+    // Grace redeems it and the token speaks as her.
+    let redeemed = c
+        .post("/api/auth/token")
+        .header(ContentType::Form)
+        .body(format!("grant_type=code&username=grace&code={code}"))
+        .dispatch()
+        .await;
+    assert_eq!(redeemed.status(), Status::Ok);
+    let issued: serde_json::Value =
+        serde_json::from_str(&redeemed.into_string().await.unwrap()).unwrap();
+    let token = issued["access_token"].as_str().expect("token");
+    let who = c.get("/api/whoami").header(bearer(token)).dispatch().await;
+    assert_eq!(who.status(), Status::Ok);
+    assert!(who.into_string().await.unwrap().contains("grace"));
+
+    // Single use: the same code is dead now.
+    let replay = c
+        .post("/api/auth/token")
+        .header(ContentType::Form)
+        .body(format!("grant_type=code&username=grace&code={code}"))
+        .dispatch()
+        .await;
+    assert_eq!(replay.status(), Status::Unauthorized);
+}
+
+/// The passkey ceremonies end to end against a software authenticator: an
+/// authenticated session enrolls, the passkey signs its user in, a stranger's
+/// ticket cannot be replayed, and unknown users get the same answer as users
+/// without passkeys.
+#[tokio::test]
+async fn a_passkey_enrolls_and_signs_in_via_the_ceremonies() {
+    use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
+
+    let c = client().await;
+    let origin = url::Url::parse("http://localhost:7773").expect("origin");
+    let (token, _cert) = SoftToken::new(true).expect("soft token");
+    let mut authenticator = WebauthnAuthenticator::new(token);
+
+    // Enrollment requires a session; bootstrap with the password.
+    let ada_token = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+    let start = c
+        .post("/api/auth/passkey/register/start")
+        .header(bearer(&ada_token))
+        .dispatch()
+        .await;
+    assert_eq!(start.status(), Status::Ok);
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_str(&start.into_string().await.unwrap()).unwrap();
+    let created = authenticator
+        .do_registration(origin.clone(), challenge)
+        .expect("softtoken registration");
+    let finish = c
+        .post("/api/auth/passkey/register/finish")
+        .header(bearer(&ada_token))
+        .header(ContentType::JSON)
+        .body(serde_json::to_string(&created).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(finish.status(), Status::Ok);
+
+    // Sign in with it: challenge → assertion → token that speaks as ada.
+    let start = c
+        .post("/api/auth/passkey/login/start")
+        .header(ContentType::JSON)
+        .body(r#"{"username": "ada"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(start.status(), Status::Ok);
+    let body: serde_json::Value =
+        serde_json::from_str(&start.into_string().await.unwrap()).unwrap();
+    let ticket = body["ticket"].as_str().expect("ticket").to_string();
+    let options: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(body["options"].clone()).unwrap();
+    let asserted = authenticator
+        .do_authentication(origin, options)
+        .expect("softtoken assertion");
+    let finish = c
+        .post("/api/auth/passkey/login/finish")
+        .header(ContentType::JSON)
+        .body(serde_json::json!({ "ticket": ticket, "credential": asserted }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(finish.status(), Status::Ok);
+    let issued: serde_json::Value =
+        serde_json::from_str(&finish.into_string().await.unwrap()).unwrap();
+    let who = c
+        .get("/api/whoami")
+        .header(bearer(issued["access_token"].as_str().unwrap()))
+        .dispatch()
+        .await;
+    assert!(who.into_string().await.unwrap().contains("ada"));
+
+    // A ticket is single use — replaying the finished ceremony fails.
+    let replay = c
+        .post("/api/auth/passkey/login/finish")
+        .header(ContentType::JSON)
+        .body(serde_json::json!({ "ticket": ticket, "credential": asserted }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(replay.status(), Status::Unauthorized);
+
+    // No enumeration: a user without passkeys and a user who does not exist
+    // answer identically.
+    let mut answers = Vec::new();
+    for name in ["grace", "nobody-here"] {
+        let r = c
+            .post("/api/auth/passkey/login/start")
+            .header(ContentType::JSON)
+            .body(format!(r#"{{"username": "{name}"}}"#))
+            .dispatch()
+            .await;
+        answers.push((r.status(), r.into_string().await.unwrap()));
+    }
+    assert_eq!(answers[0], answers[1], "uniform answer, no enumeration");
+}
+
+/// The point of passkeys over tokens: credentials persist in
+/// `passkeys.json`, so a server restart — which voids every token by design
+/// — does not cost anyone their sign-in method.
+#[tokio::test]
+async fn passkeys_survive_a_server_restart() {
+    use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
+
+    let dir = std::env::temp_dir().join(format!("myco-passkey-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth_path = dir.join("auth.json");
+    let origin = url::Url::parse("http://localhost:7773").expect("origin");
+    let (token, _cert) = SoftToken::new(true).expect("soft token");
+    let mut authenticator = WebauthnAuthenticator::new(token);
+
+    let build = |auth: Arc<AuthStore>| {
+        let config = myco::config::Config::resolve_with(
+            Default::default(),
+            |k| (k == "USER").then(|| "ada".to_string()),
+            |_, _| myco::config::parse_file_config_str(CONFIG_TOML),
+            |_| myco::config::parse_file_roster_str(ROSTER_TOML),
+            || Ok(Vec::new()),
+            |_| Err("no auth files in tests".into()),
+        )
+        .expect("test config resolves");
+        Server::with_model_factory_and_auth(
+            config,
+            Box::new(|_, _, _, _| Ok(ScriptedModel::new(vec![]) as Arc<dyn GenerativeModel>)),
+            auth,
+        )
+    };
+
+    // First life: enroll.
+    {
+        let store = Arc::new(
+            AuthStore::open(&auth_path)
+                .expect("open store")
+                .with_work_factor(1),
+        );
+        let server = build(store);
+        server.auth().set_password("ada", ADA_PASSWORD).unwrap();
+        let c = Client::tracked(myco::web::rocket(
+            server,
+            rocket::Config::figment().merge(("log_level", "off")),
+        ))
+        .await
+        .expect("rocket");
+        let ada_token = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+        let start = c
+            .post("/api/auth/passkey/register/start")
+            .header(bearer(&ada_token))
+            .dispatch()
+            .await;
+        let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+            serde_json::from_str(&start.into_string().await.unwrap()).unwrap();
+        let created = authenticator
+            .do_registration(origin.clone(), challenge)
+            .expect("registration");
+        let finish = c
+            .post("/api/auth/passkey/register/finish")
+            .header(bearer(&ada_token))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&created).unwrap())
+            .dispatch()
+            .await;
+        assert_eq!(finish.status(), Status::Ok);
+    }
+
+    // Second life: a fresh store from the same files — every token is gone,
+    // the passkey is not, and it signs ada in.
+    {
+        let store = Arc::new(
+            AuthStore::open(&auth_path)
+                .expect("reopen store")
+                .with_work_factor(1),
+        );
+        assert_eq!(store.passkey_counts().get("ada"), Some(&1));
+        let server = build(store);
+        let c = Client::tracked(myco::web::rocket(
+            server,
+            rocket::Config::figment().merge(("log_level", "off")),
+        ))
+        .await
+        .expect("rocket");
+        let start = c
+            .post("/api/auth/passkey/login/start")
+            .header(ContentType::JSON)
+            .body(r#"{"username": "ada"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(start.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&start.into_string().await.unwrap()).unwrap();
+        let options: webauthn_rs::prelude::RequestChallengeResponse =
+            serde_json::from_value(body["options"].clone()).unwrap();
+        let asserted = authenticator
+            .do_authentication(origin, options)
+            .expect("assertion");
+        let finish = c
+            .post("/api/auth/passkey/login/finish")
+            .header(ContentType::JSON)
+            .body(
+                serde_json::json!({ "ticket": body["ticket"], "credential": asserted }).to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(finish.status(), Status::Ok);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

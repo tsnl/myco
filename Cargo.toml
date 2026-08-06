@@ -41,6 +41,7 @@ toml = { workspace = true }
 url = { workspace = true }
 vt100 = "0.15"
 rocket_ws = "0.1.1"
+webauthn-rs = "0.5.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -48,6 +49,9 @@ libc = "0.2"
 [dev-dependencies]
 myco = { path = ".", features = ["test-support"] }
 tempfile = "3"
+url.workspace = true
+uuid.workspace = true
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softtoken"] }
 
 [features]
 # Test fixtures (ScriptedModel, temp_home, entry builders) for integration
@@ -91,4 +95,4 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "0.8"
 url = "2"
-uuid = { version = "1.23.2", features = ["v4", "serde"] }
+uuid = { version = "1.23.2", features = ["v4", "serde", "v5"] }

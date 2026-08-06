@@ -284,3 +284,53 @@ fn session_counts_report_live_tokens_per_user() {
     assert_eq!(store.revoke_all_for("ada"), 2);
     assert_eq!(store.session_counts(), vec![("grace".to_string(), 1)]);
 }
+
+// ---------------------------------------------------------------------------
+// One-time codes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_code_redeems_once_for_its_user_within_its_ttl() {
+    let store = AuthStore::in_memory().with_work_factor(1);
+    store.add_user("ada", "Ada").unwrap();
+    store.add_user("grace", "Grace").unwrap();
+
+    let minted = store.mint_code("ada").expect("mint");
+    assert_eq!(minted.user_id, "ada");
+    assert_eq!(minted.code.len(), 11, "XXXXX-XXXXX");
+
+    // Bound to its user; a guess burns nothing.
+    assert!(store.redeem_code("grace", &minted.code).is_err());
+    assert!(store.redeem_code("ada", "WRONG-WRONG").is_err());
+
+    // Redeems exactly once, and the token it mints speaks as ada.
+    let issued = store.redeem_code("ada", &minted.code).expect("redeem");
+    assert_eq!(issued.user.id, "ada");
+    assert!(store.authenticate_token(&issued.access_token).is_some());
+    assert!(
+        store.redeem_code("ada", &minted.code).is_err(),
+        "single use"
+    );
+}
+
+#[test]
+fn minting_again_replaces_the_previous_code() {
+    let store = AuthStore::in_memory().with_work_factor(1);
+    store.add_user("ada", "Ada").unwrap();
+    let first = store.mint_code("ada").expect("mint");
+    let second = store.mint_code("ada").expect("mint again");
+    assert!(
+        store.redeem_code("ada", &first.code).is_err(),
+        "a mis-sent code dies the moment its replacement exists"
+    );
+    assert!(store.redeem_code("ada", &second.code).is_ok());
+}
+
+#[test]
+fn disabled_and_unknown_users_cannot_be_minted_for() {
+    let store = AuthStore::in_memory().with_work_factor(1);
+    store.add_user("ada", "Ada").unwrap();
+    store.set_disabled("ada", true).unwrap();
+    assert!(store.mint_code("ada").is_err());
+    assert!(store.mint_code("nobody").is_err());
+}

@@ -24,6 +24,7 @@ use myco_api::{ApiError, ErrorKind, MycoApi};
 
 use crate::server::{Server, UserApi};
 use myco_api as api;
+use webauthn_rs::prelude as webauthn;
 
 /// Resolve config, run preflight (warnings to stderr), and launch Rocket on
 /// `127.0.0.1:<port>` serving `/api`.
@@ -96,43 +97,78 @@ fn write_operator_token(token: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Build the WebAuthn relying party from `[passkeys]` in server.toml. With
+/// the localhost defaults any port is allowed, so the direct server port,
+/// trunk's dev proxy, and an SSH tunnel all pass origin checks.
+fn build_webauthn(config: &Config) -> Result<webauthn::Webauthn, String> {
+    let settings = &config.roster.passkeys;
+    let origin = webauthn::Url::parse(&settings.origin)
+        .map_err(|e| format!("[passkeys] origin {:?}: {e}", settings.origin))?;
+    let mut builder = webauthn::WebauthnBuilder::new(&settings.rp_id, &origin)
+        .map_err(|e| format!("[passkeys] rp_id {:?}: {e:?}", settings.rp_id))?
+        .rp_name("myco");
+    if settings.rp_id == "localhost" {
+        builder = builder.allow_any_port(true);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("passkey relying party: {e:?}"))
+}
+
 /// The Rocket instance serving `/api` for `server` — separated from [`serve`]
 /// so tests drive it with `rocket::local` clients.
 pub fn rocket(
     server: Arc<Server>,
     figment: rocket::figment::Figment,
 ) -> rocket::Rocket<rocket::Build> {
-    rocket::custom(figment).manage(server).mount(
-        "/api",
-        routes![
-            list,
-            create,
-            detail,
-            update,
-            post_message,
-            poll,
-            events,
-            shells,
-            shell_tail,
-            shell_screen,
-            shell_input,
-            shell_lock,
-            shell_resize,
-            shell_start,
-            shell_rename,
-            shell_ws,
-            subagents,
-            subagent_lock,
-            subagent_input,
-            cancel,
-            compact,
-            archive,
-            models,
-            whoami,
-            auth_token,
-            auth_logout
-        ],
-    )
+    // A bad [passkeys] section fails startup, not the first enrollment: the
+    // operator wrote it, so they are at the terminal to read the error.
+    let webauthn = match build_webauthn(server.config()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("myco: {e}");
+            std::process::exit(1);
+        }
+    };
+    rocket::custom(figment)
+        .manage(server)
+        .manage(webauthn)
+        .mount(
+            "/api",
+            routes![
+                list,
+                create,
+                detail,
+                update,
+                post_message,
+                poll,
+                events,
+                shells,
+                shell_tail,
+                shell_screen,
+                shell_input,
+                shell_lock,
+                shell_resize,
+                shell_start,
+                shell_rename,
+                shell_ws,
+                subagents,
+                subagent_lock,
+                subagent_input,
+                cancel,
+                compact,
+                archive,
+                models,
+                whoami,
+                auth_token,
+                auth_logout,
+                auth_mint_code,
+                passkey_register_start,
+                passkey_register_finish,
+                passkey_login_start,
+                passkey_login_finish
+            ],
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +599,19 @@ async fn auth_token(
 ) -> ApiResult<api::AccessToken> {
     // `grant_type` is required by the spec; refusing an unknown one keeps a
     // future grant from silently being treated as this one.
-    if let Some(grant) = &form.grant_type
-        && grant != "password"
-    {
+    let grant = form.grant_type.as_deref().unwrap_or("password");
+    if grant == "code" {
+        return match server.auth().redeem_code(&form.username, &form.code) {
+            Ok(issued) => output(Ok(api::AccessToken {
+                access_token: issued.access_token,
+                token_type: "bearer".into(),
+                expires_in: issued.expires_in_seconds,
+                user: issued.user.identity(),
+            })),
+            Err(e) => output(Err(ApiError::new(ErrorKind::Unauthorized, e.to_string()))),
+        };
+    }
+    if grant != "password" {
         return output(Err(ApiError::new(
             ErrorKind::BadRequest,
             format!("unsupported grant_type: {grant}"),
@@ -593,11 +639,235 @@ async fn auth_logout(server: &State<Arc<Server>>, caller: Caller) -> ApiResult<a
     output(who)
 }
 
-/// The `POST /auth/token` form body.
+/// The `POST /auth/token` form body. Two grants share it: `password`
+/// (the default) reads `password`; `code` redeems an operator-minted
+/// one-time code.
 #[derive(FromForm)]
 struct TokenRequest {
     username: String,
+    #[field(default = String::new())]
     password: String,
+    #[field(default = String::new())]
+    code: String,
     /// Spec-required, but tolerated when absent so `curl -d user -d pass` works.
     grant_type: Option<String>,
+}
+
+/// Mint a one-time login code for `username`. Operator-only: the caller must
+/// be the server's own identity (the roster's local user), which is who holds
+/// `operator.token` — this is `myco auth code` reaching the live server, not
+/// a self-service surface.
+#[derive(serde::Deserialize)]
+struct MintCodeRequest {
+    username: String,
+}
+
+#[derive(serde::Serialize)]
+struct MintedCodeResponse {
+    username: String,
+    code: String,
+    expires_at: String,
+}
+
+#[post("/auth/codes", data = "<req>")]
+async fn auth_mint_code(
+    server: &State<Arc<Server>>,
+    caller: Caller,
+    req: Json<MintCodeRequest>,
+) -> ApiResult<MintedCodeResponse> {
+    let operator = &server.config().roster.local().id;
+    let is_operator = matches!(caller.author(), api::Author::User { id, .. } if id == operator);
+    if !is_operator {
+        return output(Err(ApiError::new(
+            ErrorKind::Unauthorized,
+            "only the operator may mint codes",
+        )));
+    }
+    match server.auth().mint_code(&req.username) {
+        Ok(minted) => output(Ok(MintedCodeResponse {
+            username: minted.user_id,
+            code: minted.code,
+            expires_at: minted.expires_at.to_rfc3339(),
+        })),
+        Err(e) => output(Err(ApiError::new(ErrorKind::BadRequest, e.to_string()))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Passkeys
+// ---------------------------------------------------------------------------
+//
+// Standard WebAuthn ceremonies over the webauthn-rs types, which serialize
+// to the exact JSON `PublicKeyCredential.parse*OptionsFromJSON` and
+// `credential.toJSON()` speak — the GUI passes them through untouched.
+// Enrollment requires an authenticated session (password or code bootstrap);
+// login requires only a username, and answers uniformly for "no such user"
+// and "no passkeys enrolled".
+
+/// Start enrolling a passkey for the signed-in user.
+#[post("/auth/passkey/register/start")]
+async fn passkey_register_start(
+    server: &State<Arc<Server>>,
+    wan: &State<webauthn::Webauthn>,
+    caller: Caller,
+) -> ApiResult<webauthn::CreationChallengeResponse> {
+    let api::Author::User { id, name } = caller.author().clone() else {
+        return output(Err(ApiError::new(
+            ErrorKind::BadRequest,
+            "only a person can enroll a passkey",
+        )));
+    };
+    // Stable per-user handle, so authenticators overwrite their own old
+    // credential for this account instead of piling up duplicates.
+    let user_uuid = webauthn::Uuid::new_v5(&webauthn::Uuid::NAMESPACE_OID, id.as_bytes());
+    let exclude: Vec<webauthn::CredentialID> = server
+        .auth()
+        .passkeys_for(&id)
+        .iter()
+        .map(|p| p.cred_id().clone())
+        .collect();
+    match wan.start_passkey_registration(user_uuid, &id, &name, Some(exclude)) {
+        Ok((challenge, state)) => {
+            server.auth().store_registration(&id, state);
+            output(Ok(challenge))
+        }
+        Err(e) => output(Err(ApiError::new(
+            ErrorKind::Internal,
+            format!("passkey registration: {e:?}"),
+        ))),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PasskeyEnrolled {
+    passkeys: usize,
+}
+
+/// Finish enrollment with the browser's created credential.
+#[post("/auth/passkey/register/finish", data = "<req>")]
+async fn passkey_register_finish(
+    server: &State<Arc<Server>>,
+    wan: &State<webauthn::Webauthn>,
+    caller: Caller,
+    req: Json<webauthn::RegisterPublicKeyCredential>,
+) -> ApiResult<PasskeyEnrolled> {
+    let api::Author::User { id, .. } = caller.author().clone() else {
+        return output(Err(ApiError::new(
+            ErrorKind::BadRequest,
+            "only a person can enroll a passkey",
+        )));
+    };
+    let Some(state) = server.auth().take_registration(&id) else {
+        return output(Err(ApiError::new(
+            ErrorKind::Conflict,
+            "no registration in progress (it may have expired — start again)",
+        )));
+    };
+    match wan.finish_passkey_registration(&req, &state) {
+        Ok(passkey) => match server.auth().add_passkey(&id, passkey) {
+            Ok(count) => output(Ok(PasskeyEnrolled { passkeys: count })),
+            Err(e) => output(Err(ApiError::new(ErrorKind::Internal, e.to_string()))),
+        },
+        Err(e) => output(Err(ApiError::new(
+            ErrorKind::BadRequest,
+            format!("passkey rejected: {e:?}"),
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PasskeyLoginStart {
+    username: String,
+}
+
+#[derive(serde::Serialize)]
+struct PasskeyChallenge {
+    ticket: String,
+    options: webauthn::RequestChallengeResponse,
+}
+
+/// Start a passkey login. One uniform error covers "no such user" and "no
+/// passkeys enrolled" — the answer an attacker gets is the same either way.
+#[post("/auth/passkey/login/start", data = "<req>")]
+async fn passkey_login_start(
+    server: &State<Arc<Server>>,
+    wan: &State<webauthn::Webauthn>,
+    req: Json<PasskeyLoginStart>,
+) -> ApiResult<PasskeyChallenge> {
+    let no_passkey = || {
+        ApiError::new(
+            ErrorKind::Unauthorized,
+            "no passkey available for this user",
+        )
+    };
+    let user = server.auth().get(&req.username);
+    let passkeys = match &user {
+        Some(u) if !u.disabled => server.auth().passkeys_for(&u.id),
+        _ => Vec::new(),
+    };
+    if passkeys.is_empty() {
+        return output(Err(no_passkey()));
+    }
+    match wan.start_passkey_authentication(&passkeys) {
+        Ok((challenge, state)) => {
+            let ticket = server
+                .auth()
+                .store_authentication(&user.expect("checked above").id, state);
+            output(Ok(PasskeyChallenge {
+                ticket,
+                options: challenge,
+            }))
+        }
+        Err(e) => output(Err(ApiError::new(
+            ErrorKind::Internal,
+            format!("passkey login: {e:?}"),
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PasskeyLoginFinish {
+    ticket: String,
+    credential: webauthn::PublicKeyCredential,
+}
+
+/// Finish a passkey login: verify the assertion, update the stored
+/// credential's counters, and issue a token — the same response shape the
+/// password grant returns.
+#[post("/auth/passkey/login/finish", data = "<req>")]
+async fn passkey_login_finish(
+    server: &State<Arc<Server>>,
+    wan: &State<webauthn::Webauthn>,
+    req: Json<PasskeyLoginFinish>,
+) -> ApiResult<api::AccessToken> {
+    let req = req.into_inner();
+    let Some((user_id, state)) = server.auth().take_authentication(&req.ticket) else {
+        return output(Err(ApiError::new(
+            ErrorKind::Unauthorized,
+            "unknown or expired login challenge — start again",
+        )));
+    };
+    match wan.finish_passkey_authentication(&req.credential, &state) {
+        Ok(result) => {
+            if let Err(e) = server.auth().update_passkey(&user_id, &result) {
+                eprintln!("myco: passkey counter update failed: {e}");
+            }
+            match server.auth().issue_for(&user_id) {
+                Some(issued) => output(Ok(api::AccessToken {
+                    access_token: issued.access_token,
+                    token_type: "bearer".into(),
+                    expires_in: issued.expires_in_seconds,
+                    user: issued.user.identity(),
+                })),
+                None => output(Err(ApiError::new(
+                    ErrorKind::Unauthorized,
+                    "this account is disabled",
+                ))),
+            }
+        }
+        Err(e) => output(Err(ApiError::new(
+            ErrorKind::Unauthorized,
+            format!("passkey assertion rejected: {e:?}"),
+        ))),
+    }
 }

@@ -64,10 +64,19 @@ class Myco:
     @classmethod
     def login(cls, username: str, password: str, base: str | None = None) -> "Myco":
         """OAuth password grant → an authenticated client."""
+        return cls._grant({"grant_type": "password", "username": username,
+                           "password": password}, base)
+
+    @classmethod
+    def login_with_code(cls, username: str, code: str, base: str | None = None) -> "Myco":
+        """Redeem an operator-minted one-time code (`myco auth code <user>`)."""
+        return cls._grant({"grant_type": "code", "username": username,
+                           "code": code}, base)
+
+    @classmethod
+    def _grant(cls, fields: dict, base: str | None) -> "Myco":
         base = (base or _default_base()).rstrip("/")
-        body = urllib.parse.urlencode(
-            {"grant_type": "password", "username": username, "password": password}
-        ).encode()
+        body = urllib.parse.urlencode(fields).encode()
         req = urllib.request.Request(f"{base}/auth/token", data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         with urllib.request.urlopen(req) as resp:

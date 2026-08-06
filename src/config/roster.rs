@@ -61,6 +61,43 @@ impl RosterUser {
 pub struct FileRoster {
     #[serde(default)]
     pub users: Vec<RosterUser>,
+    /// Optional `[passkeys]` section; defaults serve the localhost story.
+    #[serde(default)]
+    pub passkeys: PasskeySettings,
+}
+
+/// `[passkeys]` in `server.toml`: the WebAuthn relying party.
+///
+/// The defaults bind passkeys to `localhost` with any port allowed, which
+/// covers the supported remote pattern (an SSH tunnel — the browser still
+/// sees `localhost`, a secure context) and trunk's dev proxy alike. Set both
+/// fields when the GUI lives behind a real HTTPS hostname; the rp_id must be
+/// a domain (passkeys cannot bind to an IP address), and changing it strands
+/// passkeys enrolled under the old one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PasskeySettings {
+    #[serde(default = "default_rp_id")]
+    pub rp_id: String,
+    /// The origin the GUI is browsed at, scheme included.
+    #[serde(default = "default_rp_origin")]
+    pub origin: String,
+}
+
+fn default_rp_id() -> String {
+    "localhost".into()
+}
+
+fn default_rp_origin() -> String {
+    "http://localhost".into()
+}
+
+impl Default for PasskeySettings {
+    fn default() -> Self {
+        Self {
+            rp_id: default_rp_id(),
+            origin: default_rp_origin(),
+        }
+    }
 }
 
 /// The validated roster, plus which entry this process is acting as.
@@ -69,6 +106,8 @@ pub struct Roster {
     pub path: PathBuf,
     users: Vec<RosterUser>,
     local: usize,
+    /// The WebAuthn relying party (`[passkeys]` in the same file).
+    pub passkeys: PasskeySettings,
 }
 
 /// What a usable `server.toml` looks like, quoted in every startup error so
@@ -110,6 +149,7 @@ impl Roster {
         file: FileRoster,
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
+        let passkeys = file.passkeys;
         let users = file.users;
         if users.is_empty() {
             return Err(format!(
@@ -161,7 +201,12 @@ impl Roster {
             )
         })?;
 
-        Ok(Self { path, users, local })
+        Ok(Self {
+            path,
+            users,
+            local,
+            passkeys,
+        })
     }
 }
 
