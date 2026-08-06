@@ -129,8 +129,10 @@ pub struct Agent {
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
-    /// Last turn's usage: input = final request's prompt (context estimate for
-    /// the next USER header), output = summed across that turn's generate calls.
+    /// Last turn's usage: input = final request's prompt, output = summed
+    /// across that turn's generate calls. [`TokenUsage::context_tokens`] adds
+    /// the two for the next USER header — the reply is replayed in the next
+    /// request, so input alone under-reports the live context.
     last_usage: Option<TokenUsage>,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
@@ -785,12 +787,13 @@ mod tests {
             .await
             .expect("interact");
 
-        // Input side tracks the latest request (the live context); output sums the turn.
+        // Input side tracks the latest request; output sums the turn; the
+        // context estimate carries both (the next request replays the output).
         let usage = agent.last_usage().expect("usage recorded");
         assert_eq!(usage.input_tokens, 1_600);
         assert_eq!(usage.cached_input_tokens, 900);
         assert_eq!(usage.output_tokens, 520);
-        assert_eq!(usage.context_tokens(), 1_600);
+        assert_eq!(usage.context_tokens(), 2_120);
     }
 
     /// Slow generate stream: cancel mid-stream must return Cancelled quickly.

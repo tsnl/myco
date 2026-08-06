@@ -1246,7 +1246,7 @@ mod tests {
         fs::write(&path, &json).unwrap();
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.last_usage, session.last_usage);
-        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
+        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 13_023);
 
         assert!(load_legacy_v2().last_usage.is_none());
     }

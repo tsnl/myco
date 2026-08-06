@@ -52,7 +52,11 @@ body names or describes the size — to the same failure. That failure
 is not retryable — every later turn resends the same history — so myco **rewinds
 the last user message out of the conversation** and says so in the ERROR
 section. The session continues; re-send the message with a smaller image, or
-`/compact` (or `/new`) to shed history.
+`/compact` (or `/new`) to shed history. A prompt over the model's **context
+window** (Anthropic: `prompt is too long: N tokens > M maximum`) is the same
+failure measured in tokens and takes the same rewind — but there the history
+itself is what no longer fits, so removing one message only buys a little room:
+`/compact` is the durable fix.
 
 ### Session browser
 
@@ -160,8 +164,11 @@ Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / 
 compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`
 (no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
 `⚙`-prefixed line shows its usage — `⚙ last turn: input 63.8k (58k cached) · output 1.4k` —
-where input is the prompt of the turn's final request (≈ the live context) and output is
-summed across all of the turn's requests (one per tool round-trip). Below it, one
+where input is the prompt of the turn's final request and output is summed across all of the
+turn's requests (one per tool round-trip). The header's `used` is their sum: the reply is
+replayed inside the next request, so prompt-side tokens alone would under-count the live
+context. It is still an estimate from measured numbers — the message you are about to type,
+and any tool results a failed turn left behind, are on top of it. Below it, one
 `●`-prefixed line per still-running tool (live bash session on the in-process local host)
 shows its command, uptime, and idle time; remote hosts are not queried for this.
 

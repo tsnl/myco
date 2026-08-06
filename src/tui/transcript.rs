@@ -84,9 +84,10 @@ pub fn user_header_line(used: Option<u64>, max: u64) -> String {
 }
 
 /// `⚙`-prefixed usage line under the USER header, describing the turn that
-/// just finished: input is the prompt of that turn's final request (≈ live
-/// context), output is summed across the turn's requests. Zero cached counts
-/// are elided. Pairs with the `●` running-tool lines printed below it.
+/// just finished: input is the prompt of that turn's final request, output is
+/// summed across the turn's requests. Their sum is the header's live-context
+/// estimate ([`TokenUsage::context_tokens`]). Zero cached counts are elided.
+/// Pairs with the `●` running-tool lines printed below it.
 pub fn usage_line(u: TokenUsage) -> String {
     let mut line = format!("⚙ last turn: input {}", format_tokens(u.input_tokens));
     if u.cached_input_tokens > 0 {

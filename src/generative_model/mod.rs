@@ -597,10 +597,19 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Context occupied by the prompt = total input tokens (cached input is a
-    /// subset, already included).
+    /// Live-context estimate: the measured prompt of the last request plus the
+    /// output generated since it. The next request replays that output, so
+    /// `input_tokens` alone under-reports the live context by the size of the
+    /// reply — a header can read 89% of the window while the next request is
+    /// already over it.
+    ///
+    /// Leans high rather than low: on a multi-round-trip turn the intermediate
+    /// outputs are counted here and inside the final request's input, and
+    /// thinking output is counted although the backends strip it on replay. An
+    /// estimate that over-warns costs an early `/compact`; one that
+    /// under-reports costs a dead turn at the provider.
     pub fn context_tokens(self) -> u64 {
-        self.input_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
     /// Fold a later usage report into this one, keeping known fields when the
@@ -1019,7 +1028,8 @@ mod tests {
         assert_eq!(merged.input_tokens, 2195);
         assert_eq!(merged.output_tokens, 89);
         assert_eq!(merged.cached_input_tokens, 2000);
-        assert_eq!(merged.context_tokens(), 2195);
+        // Estimate = prompt + the output the next request will replay.
+        assert_eq!(merged.context_tokens(), 2284);
     }
 
     #[tokio::test]
@@ -1052,7 +1062,7 @@ mod tests {
         assert_eq!(usage.input_tokens, 2195);
         assert_eq!(usage.output_tokens, 89);
         assert_eq!(usage.cached_input_tokens, 2000);
-        assert_eq!(usage.context_tokens(), 2195);
+        assert_eq!(usage.context_tokens(), 2284);
     }
 
     /// Backoff doubles from `initial_backoff`, stops at `max_backoff`, and a
@@ -1243,6 +1253,19 @@ mod tests {
         );
         assert_eq!(described.recovery(), Recovery::OmitLastMessage);
 
+        // A prompt over the model's *context window* is the same failure mode
+        // measured in tokens instead of bytes — resent identically forever if
+        // read as retryable. The wordings below are Anthropic's and OpenAI's.
+        for body in [
+            r#"HTTP 400: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1014660 tokens > 1000000 maximum"}}"#,
+            r#"HTTP 400: {"error":{"code":"context_length_exceeded","message":"..."}}"#,
+            r#"HTTP 400: {"error":{"message":"This model's maximum context length is 128000 tokens."}}"#,
+            r#"HTTP 400: {"error":{"message":"Your input exceeds the context window of this model."}}"#,
+        ] {
+            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
+            assert_eq!(err.recovery(), Recovery::OmitLastMessage, "{body}");
+        }
+
         let unrelated = http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "HTTP 500: overloaded".into(),
@@ -1259,6 +1282,8 @@ mod tests {
             r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
             r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
             r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
+            // Field-validation "too long" is not a context overflow.
+            r#"HTTP 400: {"error":{"message":"metadata.user_id: string too long"}}"#,
         ] {
             let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
             assert_eq!(err.recovery(), Recovery::Retry, "{body}");
@@ -1398,14 +1423,26 @@ pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> Genera
     }
 }
 
-/// Does this provider error body say the request was too big?
+/// Does this provider error body say the request was too big — in bytes or in
+/// tokens?
 ///
-/// Matching prose is unavoidable, so it is kept to phrasings only a size
-/// rejection produces: "too large" however the provider spells it, or a size
-/// that "exceeds" a stated limit.
+/// A prompt over the model's context window ("prompt is too long: 1014660
+/// tokens > 1000000 maximum") fails exactly like a byte-size rejection: every
+/// later turn resends the same history and fails identically, so it takes the
+/// same rewind. Matching prose is unavoidable, so it is kept to phrasings only
+/// a size or length rejection produces: "too large" however the provider
+/// spells it, a size that "exceeds" a stated limit, or the providers' own
+/// context-overflow wordings.
 fn describes_a_size_rejection(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("too_large")
         || message.contains("too large")
         || (message.contains("size") && message.contains("exceeds"))
+        // Anthropic's context-window overflow.
+        || message.contains("prompt is too long")
+        // OpenAI's: the machine-readable code, then the prose variants
+        // ("maximum context length is N tokens", "exceeds the context window").
+        || message.contains("context_length_exceeded")
+        || message.contains("maximum context length")
+        || (message.contains("context window") && message.contains("exceed"))
 }

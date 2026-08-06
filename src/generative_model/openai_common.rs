@@ -197,7 +197,7 @@ mod tests {
             assert_eq!(usage.input_tokens, 10_000);
             assert_eq!(usage.output_tokens, 200);
             assert_eq!(usage.cached_input_tokens, 8_000);
-            assert_eq!(usage.context_tokens(), 10_000);
+            assert_eq!(usage.context_tokens(), 10_200);
         }
     }
 

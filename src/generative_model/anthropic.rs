@@ -1192,7 +1192,7 @@ mod tests {
             .expect("message_start should emit usage");
         assert_eq!(usage.input_tokens, 2195);
         assert_eq!(usage.cached_input_tokens, 100);
-        assert_eq!(usage.context_tokens(), 2195);
+        assert_eq!(usage.context_tokens(), 2196);
     }
 
     #[test]

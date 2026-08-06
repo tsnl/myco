@@ -1132,7 +1132,8 @@ impl ReplSession {
                 {
                     message.push_str(&format!(
                         "\n\nThe last message was removed from the conversation so the session \
-                         can continue{}.",
+                         can continue{}. If the conversation itself is what no longer fits, \
+                         /compact shrinks it.",
                         describe_dropped_images(&dropped)
                     ));
                 }
@@ -1234,14 +1235,14 @@ impl ReplSession {
         true
     }
 
-    /// Compact without being asked once the prompt reaches the model's
+    /// Compact without being asked once the context reaches the model's
     /// `auto_compact_at` share of its context window.
     ///
-    /// Checked *after* a turn, against `last_usage`: that is the provider's own
-    /// count for the request just sent, so the trigger uses a measured prompt
-    /// size rather than a guess at the next one. The successor starts from a
-    /// summary, so its usage falls far below the threshold and this cannot
-    /// re-fire on the following turn.
+    /// Checked *after* a turn, against `last_usage`: the provider's own counts
+    /// for the request just sent plus the reply it produced — everything the
+    /// next request is known to carry — rather than a guess at content not yet
+    /// typed. The successor starts from a summary, so its usage falls far
+    /// below the threshold and this cannot re-fire on the following turn.
     async fn maybe_auto_compact(&mut self) {
         let Some(threshold) = self.catalog_model.spec.auto_compact_at_tokens else {
             return;
@@ -1260,7 +1261,7 @@ impl ReplSession {
         }
 
         self.ui.note(&format!(
-            "auto-compacting: prompt reached {used} tokens of {} (threshold {threshold}) …",
+            "auto-compacting: context reached {used} tokens of {} (threshold {threshold}) …",
             self.agent.context_window_tokens()
         ));
         if !self.run_compact().await {
