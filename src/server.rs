@@ -305,6 +305,11 @@ pub struct Live {
     lock: std::sync::Mutex<Option<SessionWriteLock>>,
     /// The agent's harness, shared for status displays.
     harness: Arc<Harness>,
+    /// The subagent keyboard — meaningful on child sessions only. True while
+    /// a person holds this child, which makes the parent's `subagent` calls
+    /// to it fail politely (see [`crate::subagent::SubagentTool`]). In-memory
+    /// like a shell's lock: the hold ends with the agent task.
+    user_hold: AtomicBool,
 }
 
 impl Live {
@@ -324,6 +329,16 @@ impl Live {
     /// The harness this session's agent drives (host status, running tools).
     pub fn harness(&self) -> Arc<Harness> {
         self.harness.clone()
+    }
+
+    /// Does a person hold this (child) session's keyboard?
+    pub fn user_holds(&self) -> bool {
+        self.user_hold.load(Ordering::Relaxed)
+    }
+
+    /// Point the keyboard; returns whether a person held it before.
+    fn set_user_hold(&self, held: bool) -> bool {
+        self.user_hold.swap(held, Ordering::Relaxed)
     }
 
     fn set_error(&self, msg: Option<String>) {
@@ -426,6 +441,7 @@ impl Server {
             last_error: std::sync::Mutex::new(None),
             lock: std::sync::Mutex::new(lock),
             harness: harness.clone(),
+            user_hold: AtomicBool::new(false),
         });
         live.insert(id.clone(), handle.clone());
 
@@ -1002,6 +1018,21 @@ fn shell_of(host: String, s: crate::machines::tool_services::ShellOverview) -> a
     }
 }
 
+/// A live child as the rail lists it. Metadata reads only — no snapshot.
+fn subagent_of(l: &Live) -> api::Subagent {
+    let (id, model) = l.session.with(|s| (s.id.clone(), s.model.clone()));
+    api::Subagent {
+        id,
+        model,
+        busy: l.is_busy(),
+        lock: if l.user_holds() {
+            api::ShellLockMode::User
+        } else {
+            api::ShellLockMode::Assistant
+        },
+    }
+}
+
 fn summary_of(s: &Session, live: bool, busy: bool) -> api::SessionSummary {
     api::SessionSummary {
         archived: s.archived,
@@ -1242,13 +1273,13 @@ impl Server {
         let _ = live.tx.send(Cmd::Poke);
     }
 
-    /// The live handle, or NotFound: the shell surface has nothing to say
-    /// about a session whose agent task (and with it every bash session) is
-    /// gone.
+    /// The live handle, or NotFound: the shell and subagent surfaces have
+    /// nothing to say about a session whose agent task (and with it every
+    /// bash session) is gone.
     async fn live_for_shells(&self, id: &str) -> Result<Arc<Live>, ApiError> {
         self.get_live(id)
             .await
-            .ok_or_else(|| ApiError::new(ErrorKind::NotFound, "session not live (no shells)"))
+            .ok_or_else(|| ApiError::new(ErrorKind::NotFound, "session not live"))
     }
 
     pub(crate) async fn shells(&self, id: &str) -> Result<api::Shells, ApiError> {
@@ -1382,6 +1413,102 @@ impl Server {
             self.accept_room_note(&live, author, &text);
         }
         Ok(shell_of(host.to_string(), overview))
+    }
+
+    /// The live children of `parent` — subagent sessions whose agent tasks
+    /// exist right now. The rail's list, so it must stay cheap: metadata
+    /// reads under the session lock, never a snapshot of the entries.
+    async fn live_children(&self, parent: &str) -> Vec<Arc<Live>> {
+        let map = self.live.lock().await;
+        let mut children: Vec<Arc<Live>> = map
+            .values()
+            .filter(|l| {
+                l.session.with(|s| {
+                    s.kind == crate::session::SessionKind::Subagent
+                        && s.parent_session_id.as_deref() == Some(parent)
+                })
+            })
+            .cloned()
+            .collect();
+        children.sort_by_key(|l| l.session.with(|s| s.created_at));
+        children
+    }
+
+    /// One live child of `parent`, or NotFound — the subagent surface has
+    /// nothing to say about children whose agent tasks are gone.
+    async fn live_child(&self, parent: &str, child: &str) -> Result<Arc<Live>, ApiError> {
+        self.live_children(parent)
+            .await
+            .into_iter()
+            .find(|l| l.session.with(|s| s.id == child))
+            .ok_or_else(|| ApiError::new(ErrorKind::NotFound, "no such live subagent"))
+    }
+
+    pub(crate) async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {
+        // Not resident is a fact, not a fault, same as the shells rail — and
+        // children die with their own tasks, not the parent's.
+        let subagents = self
+            .live_children(id)
+            .await
+            .iter()
+            .map(|l| subagent_of(l))
+            .collect();
+        Ok(api::Subagents { subagents })
+    }
+
+    pub(crate) async fn subagent_lock(
+        &self,
+        author: &Author,
+        id: &str,
+        child: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Subagent, ApiError> {
+        let parent = self.live_for_shells(id).await?;
+        let child_live = self.live_child(id, child).await?;
+        let wanted = lock == api::ShellLockMode::User;
+        let previous = child_live.set_user_hold(wanted);
+        // Announce transitions only, in the parent's transcript — the room
+        // where the agent that owns this child lives.
+        if previous != wanted {
+            let short = &child[..child.len().min(8)];
+            let text = if wanted {
+                format!("[took subagent {short}]")
+            } else {
+                format!("[handed subagent {short} back to the agent]")
+            };
+            self.accept_room_note(&parent, author, &text);
+        }
+        Ok(subagent_of(&child_live))
+    }
+
+    pub(crate) async fn subagent_input(
+        &self,
+        author: &Author,
+        id: &str,
+        child: &str,
+        text: String,
+    ) -> Result<api::Subagent, ApiError> {
+        let parent = self.live_for_shells(id).await?;
+        let child_live = self.live_child(id, child).await?;
+        if !child_live.user_holds() {
+            return Err(ApiError::new(
+                ErrorKind::Conflict,
+                "subagent is agent-held; take it before posting into it",
+            ));
+        }
+        let child_id = child_live.session.id();
+        self.post_message(author, &child_id, api::PostMessage { text: text.clone() })
+            .await?;
+        // Mirror shell keystrokes: what was said to the child is part of the
+        // parent's conversation too — the parent agent must not continue a
+        // child that answered someone it never saw ask.
+        let short = &child[..child.len().min(8)];
+        self.accept_room_note(
+            &parent,
+            author,
+            &format!("[posted to subagent {short}]\n{text}"),
+        );
+        Ok(subagent_of(&child_live))
     }
 
     pub(crate) async fn poll(&self, id: &str, since: usize) -> Result<api::Poll, ApiError> {
@@ -1637,5 +1764,31 @@ impl MycoApi for UserApi {
         shell: &str,
     ) -> Result<api::ShellScreen, ApiError> {
         self.server.shell_screen(id, host, shell).await
+    }
+
+    async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {
+        self.server.subagents(id).await
+    }
+
+    async fn subagent_lock(
+        &self,
+        id: &str,
+        child: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Subagent, ApiError> {
+        self.server
+            .subagent_lock(&self.author, id, child, lock)
+            .await
+    }
+
+    async fn subagent_input(
+        &self,
+        id: &str,
+        child: &str,
+        text: String,
+    ) -> Result<api::Subagent, ApiError> {
+        self.server
+            .subagent_input(&self.author, id, child, text)
+            .await
     }
 }

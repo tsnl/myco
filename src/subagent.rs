@@ -29,8 +29,10 @@ this session); `fork: true` seeds it with a copy of this conversation so far,
 that id back as `session_id` to continue the same child with follow-up turns.
 
 Prompts must be self-contained; ask for terse summaries. Children persist in
-the shared session store — inspect them via `session_history` or
-`session_meta` list with `include_hidden: true`.
+the shared session store, and people can watch a child live in the GUI's work
+rail — or take it over. While someone holds a child, your calls to it are
+refused; try again after they hand it back (the handoff shows up in this
+conversation).
 "#;
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -84,6 +86,15 @@ impl SubagentTool {
             }
         };
         let child_id = child.session.id();
+        // The subagent keyboard, pointed away from us: a person took this
+        // child over in the GUI. Refuse politely rather than interleave — the
+        // same courtesy the bash tool extends on a user-held shell.
+        if child.user_holds() {
+            return Err(format!(
+                "subagent session {child_id} is held by a person right now; \
+                 try again once they hand it back"
+            ));
+        }
 
         let mut turns = child.turns.clone();
         let start = *turns.borrow();

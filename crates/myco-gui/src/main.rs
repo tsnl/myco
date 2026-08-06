@@ -260,12 +260,15 @@ async fn fetch_poll(id: &str) -> Result<api::Poll, Failure> {
 /// escapes the code it is given — so the un-trusted text still cannot become
 /// tags, it just gets colored on the way through.
 fn markdown(src: &str) -> Html {
-    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let mut events = Vec::new();
     // `Some` while inside a fence: the language and the code collected so far.
     let mut fence: Option<(String, String)> = None;
-    for ev in Parser::new(src) {
+    // Tables and strikethrough are extensions the parser must be asked for —
+    // without them a model's table renders as one line of pipes.
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    for ev in Parser::new_ext(src, options) {
         match ev {
             Event::Start(Tag::CodeBlock(kind)) => {
                 let lang = match &kind {
@@ -528,6 +531,12 @@ fn draft() -> Html {
 /// conversation.
 const RESULT_PREVIEW_LINES: usize = 8;
 
+/// Lines of a collapsed call's *arguments* before they are cut off. More
+/// generous than the result budget — the arguments are what you scan a
+/// transcript for — but a 200-line heredoc is still a click away, not a
+/// wall.
+const ARGS_PREVIEW_LINES: usize = 15;
+
 #[derive(Properties, PartialEq)]
 struct ToolCardProps {
     tool: api::ToolUse,
@@ -578,11 +587,11 @@ impl ToolStatus {
 /// One tool call as its own bordered block: a status disc, the name, the
 /// arguments, and the result folded in underneath.
 ///
-/// The call and its output are collapsed on different terms, because they are
-/// read for different reasons. The arguments are *what was asked for* — short,
-/// and the thing you scan a transcript to find — so they are always shown in
-/// full. The output is *what came back*, which can be a 5,000-line build log,
-/// so it is capped until asked for. Only the result has a toggle.
+/// The call and its output are collapsed on different budgets, because they
+/// are read for different reasons. The arguments are *what was asked for* —
+/// the thing you scan a transcript to find — so they get the larger cap; the
+/// output is *what came back*, which can be a 5,000-line build log, so it is
+/// cut sooner. One toggle opens both in full.
 #[function_component(ToolCard)]
 fn tool_card(props: &ToolCardProps) -> Html {
     let expanded = use_state(|| props.verbose);
@@ -596,15 +605,26 @@ fn tool_card(props: &ToolCardProps) -> Html {
     };
     let open = *expanded;
 
-    // Always the whole call, never summarized: a truncated command is one you
-    // have to expand the card to trust. How it reads is the tool's own
-    // business — `bash` lays its command out as shell, everything else falls
-    // back to the structural rendering.
+    // The whole call, structurally: every argument appears, long string
+    // values elided. How it reads is the tool's own business — `bash` lays
+    // its command out as shell, everything else falls back to the structural
+    // rendering. Line-capped like the result (a 300-line heredoc command
+    // would bury the conversation), with its own expander.
     let args = api::tool_display::tool_input_yaml(
         &props.tool.name,
         &props.tool.input,
         api::tool_display::TOOL_DISPLAY_WIDTH,
     );
+    let args_total = args.lines().count();
+    let args_shown = if open || args_total <= ARGS_PREVIEW_LINES {
+        args.clone()
+    } else {
+        args.lines()
+            .take(ARGS_PREVIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let args_hidden = args_total.saturating_sub(ARGS_PREVIEW_LINES);
     let status = ToolStatus::of(props.result.as_ref());
     let is_error = status == ToolStatus::Failed;
 
@@ -645,14 +665,15 @@ fn tool_card(props: &ToolCardProps) -> Html {
         }
     });
 
-    // Nothing to fold away until output exists, and a long result is the only
-    // thing the toggle acts on.
-    let foldable = props
-        .result
-        .as_ref()
-        .is_some_and(|r| text_parts(&r.content).lines().count() > RESULT_PREVIEW_LINES);
+    // Nothing to fold away unless something got cut: a long result, or a
+    // long call.
+    let foldable = args_hidden > 0
+        || props
+            .result
+            .as_ref()
+            .is_some_and(|r| text_parts(&r.content).lines().count() > RESULT_PREVIEW_LINES);
 
-    // The DOM id is the jump target for the work rail's running-tool rows.
+    // The DOM id is the jump target for the work panel's running-tool chips.
     html! {
         <div id={format!("tool-{}", props.tool.id)}
              class={ classes!("tool-card", is_error.then_some("tool-card-error")) }>
@@ -661,11 +682,16 @@ fn tool_card(props: &ToolCardProps) -> Html {
                 <span class="tool-name">{ &props.tool.name }</span>
                 { if foldable { html! {
                     <span class="tool-toggle">
-                        { if open { "collapse output" } else { "expand output" } }
+                        { if open { "collapse" } else { "expand" } }
                     </span>
                 } } else { html!{} } }
             </div>
-            { yaml_block(&args) }
+            { yaml_block(&args_shown) }
+            { if !open && args_hidden > 0 { html! {
+                <button class="linkish tool-args-more" onclick={toggle.clone()}>
+                    { format!("+{args_hidden} more lines of the call") }
+                </button>
+            } } else { html!{} } }
             { result_body.unwrap_or_else(|| html!{}) }
         </div>
     }
@@ -973,14 +999,33 @@ struct ConversationProps {
     id: String,
 }
 
-/// The work rail's mutable surface: live shells and their terminal
-/// scrollback. A `use_mut_ref` cell (plus a revision counter for renders),
-/// because its writers are long-lived tasks and late-completing requests —
-/// exactly the closures a captured `UseStateHandle` would go stale in.
+/// The work panel's mutable surface: live shells and subagent children, the
+/// opened terminals' scrollback, and the opened chats' transcripts. A
+/// `use_mut_ref` cell (plus a revision counter for renders), because its
+/// writers are long-lived tasks and late-completing requests — exactly the
+/// closures a captured `UseStateHandle` would go stale in.
 #[derive(Default)]
 struct PanelBuf {
     shells: Vec<api::Shell>,
     terms: std::collections::HashMap<String, Term>,
+    /// Live subagent children — the `subagent` tool's sessions, as tabs.
+    subs: Vec<api::Subagent>,
+    /// Each opened child's transcript so far (`poll?since=` pages).
+    chats: std::collections::HashMap<String, Chat>,
+}
+
+/// One subagent chat's accumulated entries.
+#[derive(Default)]
+struct Chat {
+    since: usize,
+    entries: Vec<api::Entry>,
+}
+
+/// One tab of the work panel: a shell terminal or a subagent chat.
+#[derive(Clone, PartialEq)]
+enum Tab {
+    Shell { host: String, id: String },
+    Sub { id: String },
 }
 
 /// The panel key for one shell: shells are per host, so `(host, id)` is the
@@ -1029,6 +1074,106 @@ impl Term {
     }
 }
 
+/// The active tab's window — a shell terminal or a subagent chat behind one
+/// piece of chrome. The head names the thing and carries the keyboard-lock
+/// affordance as an explicit button (a double-click on a header that also
+/// selects was two gestures fighting over one element); the body is
+/// scroll-pinned; the input row appears while the user holds the lock
+/// (Enter sends, Esc hands back). What the body shows — scrollback or a
+/// transcript — is the caller's business.
+#[derive(Properties, PartialEq)]
+struct WorkViewProps {
+    /// Something is running inside (a command, a turn) — the disc state.
+    running: bool,
+    title: String,
+    /// Small annotation after the title: `@host`, a model key.
+    #[prop_or_default]
+    badge: Option<String>,
+    /// Dim detail text in the head (a shell's command line).
+    #[prop_or_default]
+    detail: String,
+    user_locked: bool,
+    /// Prose content (a chat) rather than preformatted terminal text.
+    #[prop_or_default]
+    chat: bool,
+    /// Point the keyboard: `true` takes it, `false` hands it back.
+    on_lock: Callback<bool>,
+    /// A line submitted from the input row.
+    on_send: Callback<String>,
+    #[prop_or_default]
+    placeholder: AttrValue,
+    #[prop_or_default]
+    children: Html,
+}
+
+#[function_component(WorkView)]
+fn work_view(props: &WorkViewProps) -> Html {
+    let input = use_node_ref();
+    let body = use_node_ref();
+
+    // Ride the bottom on every render: these are live surfaces, and the
+    // newest output (or newest chat entry) is what the viewer opened them
+    // for.
+    {
+        let body = body.clone();
+        use_effect(move || {
+            if let Some(el) = body.cast::<web_sys::Element>() {
+                el.set_scroll_top(el.scroll_height());
+            }
+        });
+    }
+
+    let on_lock_click = {
+        let on_lock = props.on_lock.clone();
+        let take = !props.user_locked;
+        Callback::from(move |_: MouseEvent| on_lock.emit(take))
+    };
+    let on_key = {
+        let input = input.clone();
+        let on_send = props.on_send.clone();
+        let on_lock = props.on_lock.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" {
+                e.prevent_default();
+                if let Some(field) = input.cast::<HtmlInputElement>() {
+                    let text = field.value();
+                    field.set_value("");
+                    on_send.emit(text);
+                }
+            } else if e.key() == "Escape" {
+                e.prevent_default();
+                on_lock.emit(false);
+            }
+        })
+    };
+
+    html! {
+        <div class={ classes!("work-view", props.user_locked.then_some("work-view-user")) }>
+            <div class="work-view-head">
+                <span class={ if props.running { "tool-disc tool-disc-running" }
+                              else { "tool-disc tool-disc-ok" } }>{ "●" }</span>
+                <span class="tool-name">{ &props.title }</span>
+                { if let Some(b) = &props.badge { html! {
+                    <span class="host-badge">{ b }</span>
+                } } else { html!{} } }
+                <span class="dim">{ &props.detail }</span>
+                <button class="linkish lock-badge" onclick={on_lock_click}>
+                    { if props.user_locked { "⌨ yours — hand back" } else { "⌨ agent — take keyboard" } }
+                </button>
+            </div>
+            <div ref={body} class={ classes!("work-body", props.chat.then_some("chat-body")) }>
+                { props.children.clone() }
+            </div>
+            { if props.user_locked { html! {
+                <div class="term-input-row">
+                    <input ref={input} type="text" placeholder={props.placeholder.clone()}
+                           onkeydown={on_key} />
+                </div>
+            } } else { html!{} } }
+        </div>
+    }
+}
+
 /// Yew's `Reducible` over the pure [`ConvState::apply`]: the component holds
 /// one of these, and every event loop holds only its dispatcher — which is
 /// stable across renders and applies each action to the *current* state.
@@ -1058,17 +1203,17 @@ fn conversation(props: &ConversationProps) -> Html {
     let pane = use_node_ref();
     let at_bottom: Rc<RefCell<bool>> = use_mut_ref(|| true);
     let navigator = use_navigator().unwrap();
-    // The work rail. State the poll task writes lives in refs (see
+    // The work panel. State the poll task writes lives in refs (see
     // `PanelBuf`); the mirrored `use_state` copies exist only so render-time
     // reads and the toggle button stay ordinary Yew.
     let rail_open = use_state(|| false);
     let rail_open_ref: Rc<RefCell<bool>> = use_mut_ref(|| false);
-    // The opened terminal, addressed as shells are: `(host, shell id)`.
-    let term_open = use_state(|| Option::<(String, String)>::None);
-    let term_open_ref: Rc<RefCell<Option<(String, String)>>> = use_mut_ref(|| None);
+    // The active tab. A ref rather than state: the poll task both reads it
+    // (what to fetch) and writes it (auto-select when tabs come and go), and
+    // every write bumps `panel_rev` to render.
+    let active_tab: Rc<RefCell<Option<Tab>>> = use_mut_ref(|| None);
     let panel: Rc<RefCell<PanelBuf>> = use_mut_ref(PanelBuf::default);
     let panel_rev = use_state(|| 0u64);
-    let term_input = use_node_ref();
     // The catalog, for the topbar model picker. One fetch; the catalog does
     // not change while the page is open.
     let models = use_state(Vec::<String>::new);
@@ -1225,15 +1370,16 @@ fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
-    // The work rail's poll: the shells list every tick while the rail is
-    // open, plus the opened terminal's scrollback tail. Polling, not SSE —
-    // the tail is offset-addressed and idempotent, so a fixed cadence is
-    // simple and self-healing, and a closed rail costs nothing.
+    // The work panel's poll: the shell and subagent lists every tick while
+    // the panel is open, plus the active tab's content — a terminal's
+    // scrollback tail or a chat's new entries. Polling, not SSE — the reads
+    // are offset-addressed and idempotent, so a fixed cadence is simple and
+    // self-healing, and a closed panel costs nothing.
     {
         let panel = panel.clone();
         let panel_rev = panel_rev.setter();
         let rail_open_ref = rail_open_ref.clone();
-        let term_open_ref = term_open_ref.clone();
+        let active_tab = active_tab.clone();
         let id = props.id.clone();
         use_effect_with(id, move |id| {
             let id = id.clone();
@@ -1259,48 +1405,109 @@ fn conversation(props: &ConversationProps) -> Html {
                             changed = true;
                         }
                     }
-                    let open = term_open_ref.borrow().clone();
-                    if let Some((host, shell)) = open {
-                        let key = term_key(&host, &shell);
-                        // A pty session renders as its current screen (the
-                        // snapshot is the view); a piped one accumulates its
-                        // scrollback tail.
-                        let pty = panel
-                            .borrow()
-                            .shells
-                            .iter()
-                            .any(|s| s.host == host && s.id == shell && s.pty);
-                        if pty {
-                            if let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
-                                "/api/sessions/{id}/shells/{host}/{shell}/screen"
-                            ))
-                            .await
-                                && panel
-                                    .borrow_mut()
-                                    .terms
-                                    .entry(key)
-                                    .or_default()
-                                    .replace(&screen)
-                            {
-                                changed = true;
+                    if let Ok(s) =
+                        auth::get::<api::Subagents>(&format!("/api/sessions/{id}/subagents")).await
+                    {
+                        let mut p = panel.borrow_mut();
+                        if p.subs != s.subagents {
+                            p.subs = s.subagents;
+                            changed = true;
+                        }
+                    }
+                    // Tabs come and go with the lists; keep the active one
+                    // honest — dead tabs drop, and the first live thing is
+                    // selected when nothing is.
+                    {
+                        let p = panel.borrow();
+                        let mut at = active_tab.borrow_mut();
+                        let valid = |t: &Tab| match t {
+                            Tab::Shell { host, id } => {
+                                p.shells.iter().any(|s| s.host == *host && s.id == *id)
                             }
+                            Tab::Sub { id } => p.subs.iter().any(|s| s.id == *id),
+                        };
+                        let want = if at.as_ref().is_some_and(valid) {
+                            at.clone()
                         } else {
-                            let from = panel.borrow().terms.get(&key).map(|t| t.from).unwrap_or(0);
-                            if let Ok(chunk) = auth::get::<api::ShellTailChunk>(&format!(
-                                "/api/sessions/{id}/shells/{host}/{shell}?from={from}"
+                            p.shells
+                                .first()
+                                .map(|s| Tab::Shell {
+                                    host: s.host.clone(),
+                                    id: s.id.clone(),
+                                })
+                                .or_else(|| p.subs.first().map(|s| Tab::Sub { id: s.id.clone() }))
+                        };
+                        if *at != want {
+                            *at = want;
+                            changed = true;
+                        }
+                    }
+                    let tab = active_tab.borrow().clone();
+                    match tab {
+                        Some(Tab::Shell { host, id: shell }) => {
+                            let key = term_key(&host, &shell);
+                            // A pty session renders as its current screen
+                            // (the snapshot is the view); a piped one
+                            // accumulates its scrollback tail.
+                            let pty = panel
+                                .borrow()
+                                .shells
+                                .iter()
+                                .any(|s| s.host == host && s.id == shell && s.pty);
+                            if pty {
+                                if let Ok(screen) = auth::get::<api::ShellScreen>(&format!(
+                                    "/api/sessions/{id}/shells/{host}/{shell}/screen"
+                                ))
+                                .await
+                                    && panel
+                                        .borrow_mut()
+                                        .terms
+                                        .entry(key)
+                                        .or_default()
+                                        .replace(&screen)
+                                {
+                                    changed = true;
+                                }
+                            } else {
+                                let from =
+                                    panel.borrow().terms.get(&key).map(|t| t.from).unwrap_or(0);
+                                if let Ok(chunk) = auth::get::<api::ShellTailChunk>(&format!(
+                                    "/api/sessions/{id}/shells/{host}/{shell}?from={from}"
+                                ))
+                                .await
+                                    && chunk.end != from
+                                {
+                                    panel
+                                        .borrow_mut()
+                                        .terms
+                                        .entry(key)
+                                        .or_default()
+                                        .absorb(&chunk);
+                                    changed = true;
+                                }
+                            }
+                        }
+                        Some(Tab::Sub { id: child }) => {
+                            let since = panel
+                                .borrow()
+                                .chats
+                                .get(&child)
+                                .map(|c| c.since)
+                                .unwrap_or(0);
+                            if let Ok(p) = auth::get::<api::Poll>(&format!(
+                                "/api/sessions/{child}/poll?since={since}"
                             ))
                             .await
-                                && chunk.end != from
+                                && (p.total != since || !p.entries.is_empty())
                             {
-                                panel
-                                    .borrow_mut()
-                                    .terms
-                                    .entry(key)
-                                    .or_default()
-                                    .absorb(&chunk);
+                                let mut buf = panel.borrow_mut();
+                                let chat = buf.chats.entry(child.clone()).or_default();
+                                chat.entries.extend(p.entries);
+                                chat.since = p.total;
                                 changed = true;
                             }
                         }
+                        None => {}
                     }
                     if changed {
                         rev += 1;
@@ -1309,19 +1516,6 @@ fn conversation(props: &ConversationProps) -> Html {
                 }
             });
             move || alive.set(false)
-        });
-    }
-
-    // Keep an open terminal pinned to its bottom as output lands.
-    {
-        let term_open = (*term_open).clone();
-        use_effect_with((*panel_rev, term_open), move |(_, term_open)| {
-            if let Some((host, shell)) = term_open
-                && let Some(doc) = web_sys::window().and_then(|w| w.document())
-                && let Some(el) = doc.get_element_by_id(&format!("term-body-{host}-{shell}"))
-            {
-                el.set_scroll_top(el.scroll_height());
-            }
         });
     }
 
@@ -1499,29 +1693,28 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
-    let select_term = |host: String, shell: String| {
-        let term_open = term_open.clone();
-        let term_open_ref = term_open_ref.clone();
+    let select_tab = |tab: Tab| {
+        let active_tab = active_tab.clone();
+        let panel_rev = panel_rev.clone();
         Callback::from(move |_: MouseEvent| {
-            let this = (host.clone(), shell.clone());
-            let next = if term_open.as_ref() == Some(&this) {
-                None
-            } else {
-                Some(this)
-            };
-            *term_open_ref.borrow_mut() = next.clone();
-            term_open.set(next);
+            *active_tab.borrow_mut() = Some(tab.clone());
+            panel_rev.set(*panel_rev + 1);
         })
     };
 
-    // Take / return the keyboard. The optimistic lock flip makes the border
+    // Point a shell's keyboard. The optimistic lock flip makes the head
     // answer the click; the 1s poll is the truth that heals a failed POST.
-    let set_lock = |host: String, shell: String, lock: api::ShellLockMode| {
+    let shell_lock = |host: String, shell: String| {
         let id = props.id.clone();
         let panel = panel.clone();
         let panel_rev = panel_rev.clone();
         let dispatch = conv.dispatcher();
-        Callback::from(move |_: ()| {
+        Callback::from(move |take: bool| {
+            let lock = if take {
+                api::ShellLockMode::User
+            } else {
+                api::ShellLockMode::Assistant
+            };
             {
                 let mut p = panel.borrow_mut();
                 if let Some(s) = p
@@ -1550,20 +1743,13 @@ fn conversation(props: &ConversationProps) -> Html {
         })
     };
 
-    let send_term_input = {
+    let shell_send = {
         let id = props.id.clone();
-        let term_input = term_input.clone();
         let dispatch = conv.dispatcher();
         move |host: String, shell: String| {
             let id = id.clone();
-            let term_input = term_input.clone();
             let dispatch = dispatch.clone();
-            Callback::from(move |_: ()| {
-                let Some(field) = term_input.cast::<HtmlInputElement>() else {
-                    return;
-                };
-                let data = field.value();
-                field.set_value("");
+            Callback::from(move |data: String| {
                 let id = id.clone();
                 let host = host.clone();
                 let shell = shell.clone();
@@ -1578,6 +1764,69 @@ fn conversation(props: &ConversationProps) -> Html {
                     .await
                     {
                         dispatch.dispatch(ConvAction::Failed(format!("shell input: {e}")));
+                    }
+                });
+            })
+        }
+    };
+
+    // The subagent twins of the two above, against the child's lock and
+    // composer endpoints on the *parent* session.
+    let sub_lock = |child: String| {
+        let id = props.id.clone();
+        let panel = panel.clone();
+        let panel_rev = panel_rev.clone();
+        let dispatch = conv.dispatcher();
+        Callback::from(move |take: bool| {
+            let lock = if take {
+                api::ShellLockMode::User
+            } else {
+                api::ShellLockMode::Assistant
+            };
+            {
+                let mut p = panel.borrow_mut();
+                if let Some(s) = p.subs.iter_mut().find(|s| s.id == child) {
+                    s.lock = lock;
+                }
+            }
+            panel_rev.set(*panel_rev + 1);
+            let id = id.clone();
+            let child = child.clone();
+            let dispatch = dispatch.clone();
+            spawn_local(async move {
+                if let Err(e) = auth::post_json::<api::Subagent, _>(
+                    &format!("/api/sessions/{id}/subagents/{child}/lock"),
+                    &api::ShellLockRequest { lock },
+                )
+                .await
+                {
+                    dispatch.dispatch(ConvAction::Failed(format!("subagent lock: {e}")));
+                }
+            });
+        })
+    };
+
+    let sub_send = {
+        let id = props.id.clone();
+        let dispatch = conv.dispatcher();
+        move |child: String| {
+            let id = id.clone();
+            let dispatch = dispatch.clone();
+            Callback::from(move |text: String| {
+                if text.trim().is_empty() {
+                    return;
+                }
+                let id = id.clone();
+                let child = child.clone();
+                let dispatch = dispatch.clone();
+                spawn_local(async move {
+                    if let Err(e) = auth::post_json::<api::Subagent, _>(
+                        &format!("/api/sessions/{id}/subagents/{child}/input"),
+                        &api::PostMessage { text },
+                    )
+                    .await
+                    {
+                        dispatch.dispatch(ConvAction::Failed(format!("subagent input: {e}")));
                     }
                 });
             })
@@ -1602,74 +1851,111 @@ fn conversation(props: &ConversationProps) -> Html {
         })
         .collect();
 
+    // The work panel: a horizontal split beside the chat, VSCode-style — a
+    // tab per live shell and live subagent (tabs come and go with the
+    // lists), the active one filling the panel as its own terminal or chat.
     let rail = if *rail_open {
         let p = panel.borrow();
-        html! {
-            <aside class="rail">
-                <h2>{ "running" }</h2>
-                { if running.is_empty() { html!{ <div class="empty">{ "nothing in flight" }</div> } }
-                  else { html! { for running.iter().map(|(call_id, name)| html! {
-                    <div class="rail-tool" onclick={jump_to_card(call_id.clone())}>
-                        <span class="tool-disc tool-disc-running">{ "●" }</span>
-                        <span class="tool-name">{ name }</span>
+        let active = active_tab.borrow().clone();
+        let tabs: Vec<Html> = p
+            .shells
+            .iter()
+            .map(|shell| {
+                let tab = Tab::Shell {
+                    host: shell.host.clone(),
+                    id: shell.id.clone(),
+                };
+                let label = if shell.host == "local" {
+                    shell.id.clone()
+                } else {
+                    format!("{}@{}", shell.id, shell.host)
+                };
+                (tab, label, shell.running, shell.lock)
+            })
+            .chain(p.subs.iter().map(|sub| {
+                let label = format!("sub:{}", &sub.id[..sub.id.len().min(8)]);
+                (Tab::Sub { id: sub.id.clone() }, label, sub.busy, sub.lock)
+            }))
+            .map(|(tab, label, running, lock)| {
+                let is_active = active.as_ref() == Some(&tab);
+                let user_locked = lock == api::ShellLockMode::User;
+                html! {
+                    <div class={ classes!("work-tab",
+                                          is_active.then_some("work-tab-active"),
+                                          user_locked.then_some("work-tab-user")) }
+                         onclick={select_tab(tab)}>
+                        <span class={ if running { "tool-disc tool-disc-running" }
+                                      else { "tool-disc tool-disc-ok" } }>{ "●" }</span>
+                        { label }
                     </div>
-                  }) } } }
-                <h2>{ "shells" }</h2>
-                { if p.shells.is_empty() { html!{ <div class="empty">{ "no live shells" }</div> } }
-                  else { html! { for p.shells.iter().map(|shell| {
-                    let opened = term_open.as_ref()
-                        .is_some_and(|(h, s)| *h == shell.host && *s == shell.id);
-                    let user_locked = shell.lock == api::ShellLockMode::User;
-                    let head = html! {
-                        <div class="term-head" onclick={select_term(shell.host.clone(), shell.id.clone())}
-                             ondblclick={ let take = set_lock(shell.host.clone(), shell.id.clone(), api::ShellLockMode::User);
-                                          Callback::from(move |_: MouseEvent| take.emit(())) }>
-                            <span class={ if shell.running { "tool-disc tool-disc-running" }
-                                          else { "tool-disc tool-disc-ok" } }>{ "●" }</span>
-                            <span class="tool-name">{ &shell.id }</span>
-                            { if shell.host != "local" { html! {
-                                <span class="host-badge">{ format!("@{}", shell.host) }</span>
-                            } } else { html!{} } }
-                            <span class="dim">{ &shell.cmdline }</span>
-                            <span class="lock-badge">
-                                { if user_locked { "⌨ yours" } else { "⌨ agent" } }
-                            </span>
-                        </div>
-                    };
-                    if !opened {
-                        return html! { <div class={ classes!("term", user_locked.then_some("term-user")) }>{ head }</div> };
-                    }
-                    let text = p.terms.get(&term_key(&shell.host, &shell.id))
+                }
+            })
+            .collect();
+
+        let view = match &active {
+            Some(Tab::Shell { host, id }) => {
+                p.shells.iter().find(|s| s.host == *host && s.id == *id).map(|shell| {
+                    let text = p.terms.get(&term_key(host, id))
                         .map(|t| t.text.clone()).unwrap_or_default();
-                    let on_key = {
-                        let send = send_term_input(shell.host.clone(), shell.id.clone());
-                        let release = set_lock(shell.host.clone(), shell.id.clone(), api::ShellLockMode::Assistant);
-                        Callback::from(move |e: KeyboardEvent| {
-                            if e.key() == "Enter" {
-                                e.prevent_default();
-                                send.emit(());
-                            } else if e.key() == "Escape" {
-                                e.prevent_default();
-                                release.emit(());
-                            }
-                        })
+                    html! {
+                        <WorkView running={shell.running}
+                                  title={shell.id.clone()}
+                                  badge={(shell.host != "local").then(|| format!("@{}", shell.host))}
+                                  detail={shell.cmdline.clone()}
+                                  user_locked={shell.lock == api::ShellLockMode::User}
+                                  on_lock={shell_lock(shell.host.clone(), shell.id.clone())}
+                                  on_send={shell_send(shell.host.clone(), shell.id.clone())}
+                                  placeholder="type into the shell (Enter sends · Esc hands the keyboard back)">
+                            { text }
+                        </WorkView>
+                    }
+                })
+            }
+            Some(Tab::Sub { id }) => {
+                p.subs.iter().find(|s| s.id == *id).map(|sub| {
+                    let body = match p.chats.get(&sub.id) {
+                        Some(c) => render_transcript(&c.entries, &[], *verbose,
+                                                     who.as_ref().map(|s| &s.identity)),
+                        None => html! { <span class="dim">{ "…" }</span> },
                     };
                     html! {
-                        <div class={ classes!("term", user_locked.then_some("term-user")) }>
-                            { head }
-                            <pre id={format!("term-body-{}-{}", shell.host, shell.id)} class="term-body">{ text }</pre>
-                            { if user_locked { html! {
-                                <div class="term-input-row">
-                                    <input ref={term_input.clone()} type="text"
-                                           placeholder="type into the shell (Enter sends · Esc hands the keyboard back)"
-                                           onkeydown={on_key} />
-                                </div>
-                            } } else { html! {
-                                <div class="term-hint">{ "double-click the title to take the keyboard" }</div>
-                            } } }
-                        </div>
+                        <WorkView running={sub.busy}
+                                  title={format!("subagent {}", &sub.id[..sub.id.len().min(8)])}
+                                  badge={Some(sub.model.clone())}
+                                  user_locked={sub.lock == api::ShellLockMode::User}
+                                  chat=true
+                                  on_lock={sub_lock(sub.id.clone())}
+                                  on_send={sub_send(sub.id.clone())}
+                                  placeholder="message the subagent (Enter sends · Esc hands it back)">
+                            { body }
+                            <div class="chat-open-link">
+                                <Link<Route> to={Route::Session { id: sub.id.clone() }}>
+                                    { "open as full session ↗" }
+                                </Link<Route>>
+                            </div>
+                        </WorkView>
                     }
-                  }) } } }
+                })
+            }
+            None => None,
+        };
+
+        html! {
+            <aside class="work">
+                { if !running.is_empty() { html! {
+                    <div class="work-strip">
+                        { for running.iter().map(|(call_id, name)| html! {
+                            <div class="rail-tool" onclick={jump_to_card(call_id.clone())}>
+                                <span class="tool-disc tool-disc-running">{ "●" }</span>
+                                <span class="tool-name">{ name }</span>
+                            </div>
+                        }) }
+                    </div>
+                } } else { html!{} } }
+                <div class="work-tabs">{ for tabs.into_iter() }</div>
+                { view.unwrap_or_else(|| html! {
+                    <div class="empty work-empty">{ "no live shells or subagents" }</div>
+                }) }
             </aside>
         }
     } else {
