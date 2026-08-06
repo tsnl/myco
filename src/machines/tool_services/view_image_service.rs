@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::core::Async;
 use crate::core::image::{mib, read_image_data_url};
-use myco_api::{Content, ToolResult};
+use myco_types::{Content, ToolResult};
 
 use super::{HostDispatchContext, ToolService};
 
@@ -74,9 +74,9 @@ impl ToolService for ViewImageService {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: myco_api::ToolUse,
+        tool_use: myco_types::ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<myco_api::ToolResult> {
+    ) -> Async<myco_types::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(v) => v,
@@ -105,7 +105,7 @@ mod tests {
     use crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::core::CancelToken;
     use crate::test_support::{result_text, temp_dir};
-    use myco_api::ToolUse;
+    use myco_types::ToolUse;
     use serde_json::json;
 
     const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47];

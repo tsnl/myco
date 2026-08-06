@@ -16,7 +16,7 @@ use crate::machines::host::protocol::{Request, Response};
 use crate::machines::tool_services::{
     BashService, HostDispatchContext, TextEditorService, ToolService, ViewImageService,
 };
-use myco_api::ToolUse;
+use myco_types::ToolUse;
 
 /// Worker process: tool registry + NDJSON serve loop.
 #[derive(Clone)]
@@ -125,10 +125,10 @@ impl HostWorker {
         self: &Arc<Self>,
         tool_use: ToolUse,
         ctx: HostDispatchContext,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         let id = tool_use.id.clone();
         let Some(service) = self.tool_to_service.get(&tool_use.name).cloned() else {
-            return myco_api::ToolResult::err(format!("unknown tool '{}'", tool_use.name))
+            return myco_types::ToolResult::err(format!("unknown tool '{}'", tool_use.name))
                 .with_id(id);
         };
         service.dispatch_tool_use(tool_use, ctx).await.with_id(id)

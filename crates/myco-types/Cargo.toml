@@ -1,15 +1,12 @@
 [package]
-name = "myco-api"
-description = "myco: wire types shared by the API server and its clients"
+name = "myco-types"
+description = "myco: the shared vocabulary — conversation records, tool calls, terminal screens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-myco-types = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }

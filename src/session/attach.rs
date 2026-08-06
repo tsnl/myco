@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use crate::core::image::{looks_like_image_path, mib, read_image_data_url};
-use myco_api::Content;
+use myco_types::Content;
 
 /// Limit on the combined upload payload of one message's attachments. Well
 /// under the request cap so a single message still leaves room for the

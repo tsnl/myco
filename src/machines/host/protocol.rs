@@ -5,7 +5,7 @@
 //! - [`Response`] — worker → controller
 
 use crate::machines::tool_services::{ShellLock, ShellOverview, ShellScreen};
-use myco_api::{ToolResult, ToolUse};
+use myco_types::{ToolResult, ToolUse};
 
 /// Controller → worker message.
 ///
@@ -188,7 +188,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myco_api::{Content, ToolResult, ToolUse};
+    use myco_types::{Content, ToolResult, ToolUse};
     use serde_json::json;
 
     #[test]

@@ -45,21 +45,21 @@ impl ToolService for TextEditorService {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: myco_api::ToolUse,
+        tool_use: myco_types::ToolUse,
         _ctx: HostDispatchContext,
-    ) -> Async<myco_api::ToolResult> {
+    ) -> Async<myco_types::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(input) => input,
                 Err(e) => {
-                    return myco_api::ToolResult::err(format!(
+                    return myco_types::ToolResult::err(format!(
                         "Error deserializing text editor input: {e}"
                     ));
                 }
             };
             match self.execute(input) {
-                Ok(text) => myco_api::ToolResult::text(text),
-                Err(e) => myco_api::ToolResult::err(e),
+                Ok(text) => myco_types::ToolResult::text(text),
+                Err(e) => myco_types::ToolResult::err(e),
             }
         })
     }
@@ -523,9 +523,9 @@ mod tests {
     }
 
     /// Dispatch a wire-shaped input (same flat JSON the model sends).
-    fn dispatch(harness: &Arc<HostWorker>, input: serde_json::Value) -> myco_api::ToolResult {
+    fn dispatch(harness: &Arc<HostWorker>, input: serde_json::Value) -> myco_types::ToolResult {
         futures::executor::block_on(harness.dispatch_tool_use(
-            myco_api::ToolUse {
+            myco_types::ToolUse {
                 id: "test".into(),
                 name: "str_replace_based_edit_tool".into(),
                 input,

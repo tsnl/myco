@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::core::{atomically_write, data_root, uuid_simple_hex};
-use myco_api::{Entry, EntryBody, TokenUsage};
+use myco_types::{Entry, EntryBody, TokenUsage};
 
 /// On-disk session schema version. Older files are rejected (WIP break).
 ///
@@ -648,7 +648,9 @@ pub fn first_user_text(entries: &[Entry]) -> Option<String> {
             let text: String = content
                 .iter()
                 .filter_map(|c| match c {
-                    myco_api::Content::Text { text } if !crate::prompts::is_session_stamp(text) => {
+                    myco_types::Content::Text { text }
+                        if !crate::prompts::is_session_stamp(text) =>
+                    {
                         Some(text.as_str())
                     }
                     _ => None,
@@ -764,7 +766,7 @@ pub fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::test_support::{temp_dir, temp_home, user};
-    use myco_api::{Content, TokenUsage};
+    use myco_types::{Content, TokenUsage};
 
     /// Minimal v3 file: every optional field absent, so all must default.
     const MINIMAL_JSON: &[u8] = br#"{"version":3,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","entries":[]}"#;
@@ -828,7 +830,7 @@ mod tests {
     #[test]
     fn first_user_text_skips_the_session_stamp() {
         let messages = vec![Entry::user(
-            myco_api::Author::System,
+            myco_types::Author::System,
             vec![
                 Content::Text {
                     text: crate::prompts::session_stamp(
@@ -965,7 +967,7 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 9_000);
 
         // Every entry body, every author kind, and every Content variant.
-        use myco_api::{Author, TurnEndReason};
+        use myco_types::{Author, TurnEndReason};
         assert_eq!(session.entries.len(), 6);
         assert!(
             matches!(&session.entries[0].author, Author::User { id, name } if id == "u_ada" && name == "ada")
@@ -1061,7 +1063,7 @@ mod tests {
 
         let mut good = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
         good.entries.push(Entry::user(
-            myco_api::Author::System,
+            myco_types::Author::System,
             vec![Content::Text {
                 text: "readable".into(),
             }],

@@ -3,8 +3,8 @@ use crate::machines::host::HostWorker;
 use crate::test_support::{result_text, temp_dir};
 use serde_json::json;
 
-fn tool_use_json(value: serde_json::Value) -> myco_api::ToolUse {
-    myco_api::ToolUse {
+fn tool_use_json(value: serde_json::Value) -> myco_types::ToolUse {
+    myco_types::ToolUse {
         id: "test".into(),
         name: "bash".into(),
         input: value,
@@ -22,7 +22,10 @@ fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
     HostDispatchContext::new(agent_id, crate::core::CancelToken::new())
 }
 
-async fn dispatch_json(harness: Arc<HostWorker>, value: serde_json::Value) -> myco_api::ToolResult {
+async fn dispatch_json(
+    harness: Arc<HostWorker>,
+    value: serde_json::Value,
+) -> myco_types::ToolResult {
     harness
         .dispatch_tool_use(tool_use_json(value), dispatch_ctx(uuid::Uuid::nil()))
         .await
@@ -34,7 +37,7 @@ async fn dispatch_json_as(
     service: &Arc<BashService>,
     owner: uuid::Uuid,
     value: serde_json::Value,
-) -> myco_api::ToolResult {
+) -> myco_types::ToolResult {
     service
         .clone()
         .dispatch_tool_use(tool_use_json(value), dispatch_ctx(owner))
@@ -86,7 +89,7 @@ async fn write_ok(harness: &Arc<HostWorker>, id: &str, stdin: &str) -> String {
 }
 
 /// `close` a session, returning the raw result (cleanup callers ignore it).
-async fn close(harness: &Arc<HostWorker>, id: &str) -> myco_api::ToolResult {
+async fn close(harness: &Arc<HostWorker>, id: &str) -> myco_types::ToolResult {
     dispatch_json(
         harness.clone(),
         json!({"action": "close", "session_id": id}),

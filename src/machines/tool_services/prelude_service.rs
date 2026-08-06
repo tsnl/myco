@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::core::Async;
 use crate::models as generative_model;
 use crate::prompts::prelude;
-use myco_api::{ToolResult, ToolUse};
+use myco_types::{ToolResult, ToolUse};
 
 use super::{HostDispatchContext, ToolService};
 

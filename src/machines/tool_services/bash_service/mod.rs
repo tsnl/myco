@@ -15,7 +15,13 @@ use crate::core::external_command::BASH;
 
 use uuid::Uuid;
 
+pub use myco_types::{ScreenRun, ShellLock, ShellScreen};
+
+mod observer;
 mod pty;
+mod screen;
+
+use screen::render_screen;
 
 /// Default hard wait ceiling for a single session start/write/read.
 ///
@@ -146,15 +152,15 @@ impl ToolService for BashService {
 
     fn dispatch_tool_use(
         self: Arc<Self>,
-        tool_use: myco_api::ToolUse,
+        tool_use: myco_types::ToolUse,
         ctx: HostDispatchContext,
-    ) -> Async<myco_api::ToolResult> {
+    ) -> Async<myco_types::ToolResult> {
         Box::pin(async move {
             // Anything but a JSON object (missing input, a bare string, a list)
             // is malformed: report it as such rather than letting serde's
             // "invalid type" message stand in for the real problem.
             if !tool_use.input.is_object() {
-                return myco_api::ToolResult::err(format!(
+                return myco_types::ToolResult::err(format!(
                     "bash input must be a JSON object, got {}. {EMPTY_INPUT_ERROR}",
                     json_type_name(&tool_use.input),
                 ));
@@ -162,14 +168,14 @@ impl ToolService for BashService {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(input) => input,
                 Err(e) => {
-                    return myco_api::ToolResult::err(format!(
+                    return myco_types::ToolResult::err(format!(
                         "Error deserializing bash input: {e}"
                     ));
                 }
             };
             let action = match resolve_action(&input) {
                 Ok(a) => a,
-                Err(e) => return myco_api::ToolResult::err(e),
+                Err(e) => return myco_types::ToolResult::err(e),
             };
             // Owner is the agent that issued this tool call (root or subagent).
             self.execute(action, ctx.agent_id, ctx.cancel).await
@@ -243,7 +249,7 @@ impl BashService {
         action: Action,
         owner: Uuid,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         match action {
             Action::Exec {
                 command,
@@ -352,7 +358,7 @@ impl BashService {
         timeout_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         let mut cmd = BASH.tokio_command();
         cmd.args(["-c", command])
             // Never inherit stdin: in `--mode host` it is the NDJSON protocol
@@ -370,7 +376,7 @@ impl BashService {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(error) => {
-                return myco_api::ToolResult::err(format!(
+                return myco_types::ToolResult::err(format!(
                     "Error spawning command{}: {error}",
                     cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
                 ));
@@ -410,7 +416,7 @@ impl BashService {
                 drain_capture(stdout_task, stderr_task).await;
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
-                myco_api::ToolResult::err(format!(
+                myco_types::ToolResult::err(format!(
                     "exec cancelled\n\
                      stdout:\n{out}\n\
                      stderr:\n{err}"
@@ -423,7 +429,7 @@ impl BashService {
                 drain_capture(stdout_task, stderr_task).await;
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
-                myco_api::ToolResult::text(format!(
+                myco_types::ToolResult::text(format!(
                     "Exit code: None\n\
                      Termination signal: None\n\
                      status: timed_out\n\
@@ -438,7 +444,7 @@ impl BashService {
                 let out = render_locked_capture(&stdout_buf, max_bytes);
                 let err = render_locked_capture(&stderr_buf, max_bytes);
                 match status {
-                    Ok(status) => myco_api::ToolResult::text(format!(
+                    Ok(status) => myco_types::ToolResult::text(format!(
                         "Exit code: {:?}\n\
                          Termination signal: {:?}\n\
                          stdout:\n{out}\n\
@@ -447,7 +453,7 @@ impl BashService {
                         status.signal(),
                     )),
                     Err(error) => {
-                        myco_api::ToolResult::err(format!("Error executing command: {error}"))
+                        myco_types::ToolResult::err(format!("Error executing command: {error}"))
                     }
                 }
             }
@@ -464,7 +470,7 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         let spec = SpawnSpec {
             command: opts.command,
             cwd: opts.cwd,
@@ -474,14 +480,14 @@ impl BashService {
             lock: ShellLock::Assistant,
         };
         if let Err(e) = self.spawn_session(session_id, owner, spec).await {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
 
         // Optional initial stdin, then collect a first snapshot.
         if let Some(data) = opts.stdin
             && let Err(e) = self.write_to_session(session_id, data).await
         {
-            return myco_api::ToolResult::err(format!(
+            return myco_types::ToolResult::err(format!(
                 "session {session_id:?} started but initial stdin write failed: {e}"
             ));
         }
@@ -490,8 +496,8 @@ impl BashService {
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await;
         match snapshot {
-            Ok(s) => myco_api::ToolResult::text(s.format()),
-            Err(e) => myco_api::ToolResult::err(e),
+            Ok(s) => myco_types::ToolResult::text(s.format()),
+            Err(e) => myco_types::ToolResult::err(e),
         }
     }
 
@@ -658,22 +664,22 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         if let Err(e) = self.ensure_agent_writable(session_id) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         if let Err(e) = self.write_to_session(session_id, stdin).await {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         match self
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await
         {
-            Ok(s) => myco_api::ToolResult::text(s.format()),
-            Err(e) => myco_api::ToolResult::err(e),
+            Ok(s) => myco_types::ToolResult::text(s.format()),
+            Err(e) => myco_types::ToolResult::err(e),
         }
     }
 
@@ -685,16 +691,16 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         match self
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
             .await
         {
-            Ok(s) => myco_api::ToolResult::text(s.format()),
-            Err(e) => myco_api::ToolResult::err(e),
+            Ok(s) => myco_types::ToolResult::text(s.format()),
+            Err(e) => myco_types::ToolResult::err(e),
         }
     }
 
@@ -711,17 +717,17 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
-    ) -> myco_api::ToolResult {
+    ) -> myco_types::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         if let Err(e) = self.ensure_agent_writable(session_id) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         let pid = {
             let sessions = self.sessions();
             let Some(session) = sessions.get(session_id) else {
-                return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
+                return myco_types::ToolResult::err(format!("unknown session {session_id:?}"));
             };
             if session
                 .shared
@@ -730,7 +736,7 @@ impl BashService {
                 .map(|b| b.exited)
                 .unwrap_or(false)
             {
-                return myco_api::ToolResult::err(format!(
+                return myco_types::ToolResult::err(format!(
                     "session {session_id:?} has already exited; nothing to signal"
                 ));
             }
@@ -741,7 +747,7 @@ impl BashService {
         };
 
         if let Err(e) = signal_process_group(pid, signal.as_libc()) {
-            return myco_api::ToolResult::err(format!(
+            return myco_types::ToolResult::err(format!(
                 "could not send {} to session {session_id:?}: {e}",
                 signal.name()
             ));
@@ -757,27 +763,27 @@ impl BashService {
                     "\n(sent {} to the session process group)\n",
                     signal.name()
                 ));
-                myco_api::ToolResult::text(text)
+                myco_types::ToolResult::text(text)
             }
-            Err(e) => myco_api::ToolResult::err(e),
+            Err(e) => myco_types::ToolResult::err(e),
         }
     }
 
-    async fn session_close(&self, session_id: &str, owner: Uuid) -> myco_api::ToolResult {
+    async fn session_close(&self, session_id: &str, owner: Uuid) -> myco_types::ToolResult {
         if let Err(e) = self.ensure_agent_writable(session_id) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         let session = {
             let mut sessions = self.sessions();
             match sessions.get(session_id) {
                 Some(s) if s.owner != owner => {
-                    return myco_api::ToolResult::err(format!(
+                    return myco_types::ToolResult::err(format!(
                         "session {session_id:?} is owned by another agent"
                     ));
                 }
                 Some(_) => {}
                 None => {
-                    return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
+                    return myco_types::ToolResult::err(format!("unknown session {session_id:?}"));
                 }
             }
             sessions
@@ -805,14 +811,14 @@ impl BashService {
 
         let mut text = snapshot.format();
         text.push_str("\n(session closed)\n");
-        myco_api::ToolResult::text(text)
+        myco_types::ToolResult::text(text)
     }
 
-    fn session_list(&self, owner: Uuid) -> myco_api::ToolResult {
+    fn session_list(&self, owner: Uuid) -> myco_types::ToolResult {
         let sessions = self.sessions();
         let mine: Vec<_> = sessions.iter().filter(|(_, s)| s.owner == owner).collect();
         if mine.is_empty() {
-            return myco_api::ToolResult::text("(no live sessions)\n");
+            return myco_types::ToolResult::text("(no live sessions)\n");
         }
         let mut lines = Vec::new();
         lines.push(format!("sessions: {}", mine.len()));
@@ -843,24 +849,24 @@ impl BashService {
             ));
         }
         lines.push(String::new());
-        myco_api::ToolResult::text(lines.join("\n"))
+        myco_types::ToolResult::text(lines.join("\n"))
     }
 
     /// The agent-facing `screenshot` action: the same rendered screen the
     /// observer surface serves, formatted as a tool result.
-    fn session_screenshot(&self, session_id: &str, owner: Uuid) -> myco_api::ToolResult {
+    fn session_screenshot(&self, session_id: &str, owner: Uuid) -> myco_types::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
-            return myco_api::ToolResult::err(e);
+            return myco_types::ToolResult::err(e);
         }
         let shared = {
             let sessions = self.sessions();
             let Some(session) = sessions.get(session_id) else {
-                return myco_api::ToolResult::err(format!("unknown session {session_id:?}"));
+                return myco_types::ToolResult::err(format!("unknown session {session_id:?}"));
             };
             Arc::clone(&session.shared)
         };
         let s = render_screen(&shared);
-        myco_api::ToolResult::text(format!(
+        myco_types::ToolResult::text(format!(
             "screen: {}x{} (cols x rows), cursor at row {} col {}\n{}\n",
             s.cols, s.rows, s.cursor_row, s.cursor_col, s.text
         ))
@@ -989,256 +995,6 @@ impl BashService {
         *lock_unpoisoned(&session.stdin) = Some(stdin);
     }
 
-    // --- observer surface (the web terminal) --------------------------------
-    //
-    // Everything below is for a *person watching or driving* a session, not
-    // for the agent: reads come from the non-consuming scrollback, writes are
-    // gated on the keyboard lock, and none of it disturbs the agent's own
-    // drain buffer. The NDJSON host protocol mirrors this whole surface, so
-    // a remote host's shells watch and drive exactly like local ones.
-
-    /// One session as the shells rail lists it.
-    pub fn shell_overviews(&self) -> Vec<ShellOverview> {
-        let sessions = self.sessions();
-        let mut out: Vec<ShellOverview> = sessions
-            .iter()
-            .map(|(id, s)| {
-                let (running, exit_code) = s
-                    .shared
-                    .buffer
-                    .lock()
-                    .map(|b| (!b.exited, b.exit_code))
-                    .unwrap_or((false, None));
-                ShellOverview {
-                    id: id.clone(),
-                    cmdline: s.cmdline.clone(),
-                    title: lock_unpoisoned(&s.title).clone(),
-                    running,
-                    exit_code,
-                    lock: *lock_unpoisoned(&s.lock),
-                    end_offset: lock_unpoisoned(&s.shared.scroll).end(),
-                    created_secs: s.created_at.elapsed().as_secs(),
-                    idle_secs: s
-                        .last_used
-                        .lock()
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0),
-                    pty: s.shared.pty,
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        out
-    }
-
-    /// Scrollback from absolute offset `from`, non-consuming. A viewer that
-    /// fell more than `max_bytes` behind is skipped forward — a terminal
-    /// wants the present, and the returned `from` says the skip happened.
-    pub fn shell_tail(&self, id: &str, from: u64, max_bytes: usize) -> Result<ShellTail, String> {
-        let (shared, lock) = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            (Arc::clone(&session.shared), *lock_unpoisoned(&session.lock))
-        };
-        let running = shared.buffer.lock().map(|b| !b.exited).unwrap_or(false);
-        let scroll = lock_unpoisoned(&shared.scroll);
-        let end = scroll.end();
-        let floor = end.saturating_sub(max_bytes as u64);
-        let (from, data) = scroll.tail(from.max(floor));
-        Ok(ShellTail {
-            from,
-            end,
-            data,
-            running,
-            lock,
-        })
-    }
-
-    /// Move the keyboard between the user and the agent. Returns the
-    /// *previous* state so a caller can tell a transition from an idempotent
-    /// re-take (two clicks are not an error, and not worth announcing twice).
-    pub fn shell_set_lock(&self, id: &str, lock: ShellLock) -> Result<ShellLock, String> {
-        let sessions = self.sessions();
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| format!("unknown session {id:?}"))?;
-        Ok(std::mem::replace(
-            &mut *lock_unpoisoned(&session.lock),
-            lock,
-        ))
-    }
-
-    /// One session's fresh overview (for input/lock responses).
-    pub fn shell_overview(&self, id: &str) -> Result<ShellOverview, String> {
-        self.shell_overviews()
-            .into_iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| format!("unknown session {id:?}"))
-    }
-
-    /// Wait until the session's observable output moves past `seen` (the
-    /// scrollback end offset — every observed byte lands there first), the
-    /// child exits, or `timeout` passes; returns the current end offset.
-    /// The change-driven half of a live terminal: a screen pusher waits
-    /// here instead of polling.
-    pub async fn shell_wait_change(
-        &self,
-        id: &str,
-        seen: u64,
-        timeout: Duration,
-    ) -> Result<u64, String> {
-        let shared = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            Arc::clone(&session.shared)
-        };
-        let deadline = Instant::now() + timeout;
-        loop {
-            // Register *before* checking, or a notify that fires between the
-            // check and the await is lost and this sleeps out its whole
-            // timeout. `enable` is the documented pattern for exactly that.
-            let notified = shared.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let end = lock_unpoisoned(&shared.scroll).end();
-            if end != seen {
-                return Ok(end);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(end);
-            }
-            let _ = tokio::time::timeout(deadline - now, notified).await;
-        }
-    }
-
-    /// The session's rendered terminal screen, non-consuming (see
-    /// [`ShellScreen`]). No lock gate: watching is always fine.
-    pub fn shell_screen(&self, id: &str) -> Result<ShellScreen, String> {
-        let shared = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            Arc::clone(&session.shared)
-        };
-        Ok(render_screen(&shared))
-    }
-
-    /// Resize the session's terminal: the screen model always, and the pty
-    /// window (TIOCSWINSZ → SIGWINCH to the child) when there is one.
-    /// Requires the user to hold the keyboard — the agent sized the terminal
-    /// it asked for, and a viewer must not reshape it under a program the
-    /// agent is driving.
-    pub fn shell_resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
-        if !(1..=500).contains(&cols) || !(1..=500).contains(&rows) {
-            return Err(format!("unreasonable terminal size {cols}x{rows}"));
-        }
-        let (shared, stdin_slot) = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            if *lock_unpoisoned(&session.lock) != ShellLock::User {
-                return Err(format!(
-                    "session {id:?} is assistant-locked: take the keyboard first"
-                ));
-            }
-            (
-                Arc::clone(&session.shared),
-                lock_unpoisoned(&session.stdin).take(),
-            )
-        };
-        // Stdin briefly out for a write: report busy rather than resize the
-        // model without the pty — the viewer's next size check retries.
-        let Some(stdin) = stdin_slot else {
-            return Err(format!("session {id:?} input is busy; retrying"));
-        };
-        let result = match &stdin {
-            SessionInput::Pty(w) => w.resize(cols, rows).map_err(|e| format!("pty resize: {e}")),
-            SessionInput::Pipe(_) => Ok(()),
-        };
-        self.return_stdin(id, stdin);
-        result?;
-        lock_unpoisoned(&shared.screen).set_size(rows, cols);
-        shared.notify.notify_waiters();
-        Ok(())
-    }
-
-    /// Open a terminal on the user's behalf, owned by `owner` — the agent's
-    /// id, so the session is fully addressable by its bash tool (write,
-    /// read, signal, close) like any it started itself. Starts **user-held**:
-    /// whoever opened it is typing; the head button hands it over. With no
-    /// name given, the first free `term-N` is picked.
-    pub async fn shell_start(
-        &self,
-        name: Option<&str>,
-        owner: Uuid,
-        command: Option<&str>,
-        pty: bool,
-        cols: Option<u16>,
-        rows: Option<u16>,
-    ) -> Result<ShellOverview, String> {
-        let id = match name.map(str::trim).filter(|n| !n.is_empty()) {
-            Some(n) => n.to_string(),
-            None => {
-                let sessions = self.sessions();
-                (1..)
-                    .map(|n| format!("term-{n}"))
-                    .find(|c| !sessions.contains_key(c))
-                    .expect("unbounded candidate range")
-            }
-        };
-        let spec = SpawnSpec {
-            command,
-            cwd: None,
-            pty,
-            cols,
-            rows,
-            lock: ShellLock::User,
-        };
-        self.spawn_session(&id, owner, spec).await?;
-        self.shell_overview(&id)
-    }
-
-    /// Set or clear a session's display name. Organization only — the id is
-    /// still the address, so nothing the agent holds breaks.
-    pub fn shell_rename(&self, id: &str, title: Option<&str>) -> Result<ShellOverview, String> {
-        {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            *lock_unpoisoned(&session.title) = title
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(String::from);
-        }
-        self.shell_overview(id)
-    }
-
-    /// A keystroke line from the user. Requires the user to hold the
-    /// keyboard — accepting input while the agent is mid-`write` would
-    /// interleave two writers' bytes into one stdin.
-    pub async fn shell_user_write(&self, id: &str, data: &str) -> Result<(), String> {
-        {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| format!("unknown session {id:?}"))?;
-            if *lock_unpoisoned(&session.lock) != ShellLock::User {
-                return Err(format!(
-                    "session {id:?} is assistant-locked: take the keyboard first"
-                ));
-            }
-        }
-        self.write_to_session(id, data).await
-    }
-
     async fn collect_from_session(
         &self,
         session_id: &str,
@@ -1350,21 +1106,6 @@ impl SessionShared {
     }
 }
 
-/// Who holds a session's keyboard.
-///
-/// The lock gates *writes* only — both sides always read. A session starts
-/// assistant-locked; the user takes the keyboard from the web terminal and
-/// hands it back when done. While the user holds it, the agent's
-/// write/signal/close calls fail with an error saying exactly that, because
-/// two writers interleaving keystrokes into one stdin is worse than either
-/// waiting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellLock {
-    Assistant,
-    User,
-}
-
 /// One live session as the observer surface lists it. Serde: this rides the
 /// NDJSON host protocol so remote shells list like local ones.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1383,177 +1124,6 @@ pub struct ShellOverview {
     pub idle_secs: u64,
     /// Running under a pty (a viewer should render the screen, not the ring).
     pub pty: bool,
-}
-
-/// A rendered terminal screen — what a `cols`×`rows` window shows now, as
-/// plain text (`text`, for the agent's `screenshot` and simple clients) and
-/// as styled runs (`runs`, for a client drawing a real terminal). Serde:
-/// rides the NDJSON host protocol (see [`ShellOverview`]); the styled fields
-/// default so older peers still parse.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ShellScreen {
-    pub cols: u16,
-    pub rows: u16,
-    pub cursor_row: u16,
-    pub cursor_col: u16,
-    pub text: String,
-    /// Styled cell runs, row-major; the cursor cell is its own run.
-    #[serde(default)]
-    pub runs: Vec<ScreenRun>,
-    #[serde(default)]
-    pub cursor_hidden: bool,
-    /// DECCKM: arrow keys should send SS3 (`\x1bOA`…) instead of CSI.
-    #[serde(default)]
-    pub application_cursor: bool,
-}
-
-/// A run of consecutive same-styled cells on one screen row. Colors are
-/// concrete `#rrggbb` (indexed colors resolved against the xterm-256
-/// palette here, so every client draws the same thing); `None` means the
-/// terminal default.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ScreenRun {
-    pub row: u16,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fg: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bg: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub bold: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub italic: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub underline: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub inverse: bool,
-    /// The cursor sits on (the first cell of) this run.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub cursor: bool,
-}
-
-impl ScreenRun {
-    fn same_style(&self, other: &ScreenRun) -> bool {
-        self.row == other.row
-            && self.fg == other.fg
-            && self.bg == other.bg
-            && self.bold == other.bold
-            && self.italic == other.italic
-            && self.underline == other.underline
-            && self.inverse == other.inverse
-            && !self.cursor
-            && !other.cursor
-    }
-
-    fn unstyled_blank(&self) -> bool {
-        self.fg.is_none()
-            && self.bg.is_none()
-            && !self.bold
-            && !self.italic
-            && !self.underline
-            && !self.inverse
-            && !self.cursor
-            && self.text.trim().is_empty()
-    }
-}
-
-/// The xterm-256 palette, resolved to `#rrggbb`; `Default` stays `None` so
-/// the client's own theme colors apply.
-fn color_hex(color: vt100::Color) -> Option<String> {
-    let (r, g, b) = match color {
-        vt100::Color::Default => return None,
-        vt100::Color::Rgb(r, g, b) => (r, g, b),
-        vt100::Color::Idx(i) => match i {
-            // The 16 base colors, xterm defaults.
-            0 => (0, 0, 0),
-            1 => (0xcd, 0, 0),
-            2 => (0, 0xcd, 0),
-            3 => (0xcd, 0xcd, 0),
-            4 => (0, 0, 0xee),
-            5 => (0xcd, 0, 0xcd),
-            6 => (0, 0xcd, 0xcd),
-            7 => (0xe5, 0xe5, 0xe5),
-            8 => (0x7f, 0x7f, 0x7f),
-            9 => (0xff, 0, 0),
-            10 => (0, 0xff, 0),
-            11 => (0xff, 0xff, 0),
-            12 => (0x5c, 0x5c, 0xff),
-            13 => (0xff, 0, 0xff),
-            14 => (0, 0xff, 0xff),
-            15 => (0xff, 0xff, 0xff),
-            // 6×6×6 color cube.
-            16..=231 => {
-                let n = i - 16;
-                let level = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
-                (level(n / 36), level((n / 6) % 6), level(n % 6))
-            }
-            // Grayscale ramp.
-            232..=255 => {
-                let v = 8 + 10 * (i - 232);
-                (v, v, v)
-            }
-        },
-    };
-    Some(format!("#{r:02x}{g:02x}{b:02x}"))
-}
-
-fn render_screen(shared: &SessionShared) -> ShellScreen {
-    let parser = lock_unpoisoned(&shared.screen);
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let (cursor_row, cursor_col) = screen.cursor_position();
-    let cursor_hidden = screen.hide_cursor();
-
-    let mut runs: Vec<ScreenRun> = Vec::new();
-    for row in 0..rows {
-        let mut row_runs: Vec<ScreenRun> = Vec::new();
-        for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            // A wide character's second column carries no glyph of its own.
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let contents = cell.contents();
-            let run = ScreenRun {
-                row,
-                text: if contents.is_empty() {
-                    " ".into()
-                } else {
-                    contents
-                },
-                fg: color_hex(cell.fgcolor()),
-                bg: color_hex(cell.bgcolor()),
-                bold: cell.bold(),
-                italic: cell.italic(),
-                underline: cell.underline(),
-                inverse: cell.inverse(),
-                cursor: !cursor_hidden && row == cursor_row && col == cursor_col,
-            };
-            match row_runs.last_mut() {
-                Some(last) if last.same_style(&run) => last.text.push_str(&run.text),
-                _ => row_runs.push(run),
-            }
-        }
-        // Trailing unstyled blanks carry nothing a renderer needs (rows are
-        // addressed, so alignment survives without them).
-        while row_runs.last().is_some_and(ScreenRun::unstyled_blank) {
-            row_runs.pop();
-        }
-        runs.append(&mut row_runs);
-    }
-
-    ShellScreen {
-        cols,
-        rows,
-        cursor_row,
-        cursor_col,
-        cursor_hidden,
-        application_cursor: screen.application_cursor(),
-        text: screen.contents(),
-        runs,
-    }
 }
 
 /// A non-consuming scrollback read (see [`BashService::shell_tail`]).
@@ -2619,7 +2189,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
 }
 
 /// The display for a tool is looked up by the name the model calls, so the
-/// name here and the arm in `myco_api::tool_display` are one agreement in two
+/// name here and the arm in `myco_types::tool_display` are one agreement in two
 /// places. Renaming the tool without moving the display would silently drop
 /// this service back to the generic rendering.
 #[cfg(test)]
@@ -2632,7 +2202,7 @@ mod display_agreement {
             .collect();
         assert!(
             names.iter().any(|n| n == "bash"),
-            "myco_api::tool_display::for_tool(\"bash\") lays out shell; this \
+            "myco_types::tool_display::for_tool(\"bash\") lays out shell; this \
              service must still be called that. Registered: {names:?}"
         );
     }

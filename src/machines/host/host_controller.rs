@@ -25,7 +25,7 @@ use crate::machines::tool_services::{
     BashService, HostDispatchContext, ShellLock, ShellOverview, ShellScreen, ShellTail,
 };
 use crate::models::ToolSpec;
-use myco_api::{ToolResult, ToolUse};
+use myco_types::{ToolResult, ToolUse};
 
 pub use crate::config::harness::HostConfig;
 
@@ -895,7 +895,7 @@ mod tests {
     /// these tests are about routing and connection state, not the cap.
     const TEST_IMAGE_CAP: u64 = crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::test_support::text_parts;
-    use myco_api::ToolUse;
+    use myco_types::ToolUse;
     use serde_json::json;
     use std::time::{Duration, Instant};
 
