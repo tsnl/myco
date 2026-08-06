@@ -117,6 +117,9 @@ pub fn rocket(
             shell_screen,
             shell_input,
             shell_lock,
+            subagents,
+            subagent_lock,
+            subagent_input,
             cancel,
             compact,
             archive,
@@ -329,6 +332,38 @@ async fn shell_lock(
     output(
         caller
             .shell_lock(id, host, shell, req.into_inner().lock)
+            .await,
+    )
+}
+
+/// Live subagent children (the `subagent` tool's hidden sessions).
+#[get("/sessions/<id>/subagents")]
+async fn subagents(caller: Caller, id: &str) -> ApiResult<api::Subagents> {
+    output(caller.subagents(id).await)
+}
+
+/// Take or return a subagent child.
+#[post("/sessions/<id>/subagents/<child>/lock", data = "<req>")]
+async fn subagent_lock(
+    caller: Caller,
+    id: &str,
+    child: &str,
+    req: Json<api::ShellLockRequest>,
+) -> ApiResult<api::Subagent> {
+    output(caller.subagent_lock(id, child, req.into_inner().lock).await)
+}
+
+/// Post into a user-held subagent child.
+#[post("/sessions/<id>/subagents/<child>/input", data = "<req>")]
+async fn subagent_input(
+    caller: Caller,
+    id: &str,
+    child: &str,
+    req: Json<api::PostMessage>,
+) -> ApiResult<api::Subagent> {
+    output(
+        caller
+            .subagent_input(id, child, req.into_inner().text)
             .await,
     )
 }

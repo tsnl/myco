@@ -249,4 +249,42 @@ impl MycoApi for HttpClient {
         self.get(&format!("/sessions/{id}/shells/{host}/{shell}/screen"))
             .await
     }
+
+    async fn subagents(&self, id: &str) -> Result<api::Subagents, ApiError> {
+        self.get(&format!("/sessions/{id}/subagents")).await
+    }
+
+    async fn subagent_lock(
+        &self,
+        id: &str,
+        child: &str,
+        lock: api::ShellLockMode,
+    ) -> Result<api::Subagent, ApiError> {
+        self.send(
+            self.http
+                .post(format!(
+                    "{}/sessions/{id}/subagents/{child}/lock",
+                    self.base
+                ))
+                .json(&api::ShellLockRequest { lock }),
+        )
+        .await
+    }
+
+    async fn subagent_input(
+        &self,
+        id: &str,
+        child: &str,
+        text: String,
+    ) -> Result<api::Subagent, ApiError> {
+        self.send(
+            self.http
+                .post(format!(
+                    "{}/sessions/{id}/subagents/{child}/input",
+                    self.base
+                ))
+                .json(&api::PostMessage { text }),
+        )
+        .await
+    }
 }

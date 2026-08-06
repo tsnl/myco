@@ -38,6 +38,13 @@ impl ScriptedModel {
         })
     }
 
+    /// Append an output after construction — for tests whose later turns
+    /// depend on ids (a child session's, say) that exist only once the
+    /// earlier turns have run.
+    pub fn push(&self, output: GenerateOutput) {
+        self.scripts.lock().expect("scripts lock").push_back(output);
+    }
+
     /// Fail every call after the scripts drain (`new(vec![]).then_fail(err)`
     /// is a model that always fails).
     pub fn then_fail(self: Arc<Self>, err: GenerateError) -> Arc<Self> {

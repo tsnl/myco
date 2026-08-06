@@ -130,59 +130,79 @@
         margin: 0.4rem 0; border: 1px solid var(--line-soft);
       }
 
-      /* The work rail: running tools and live shells, beside the transcript.
-         Collapsible; when open it owns a fixed width and its own scroll. */
+      /* The work panel: a horizontal split beside the chat — a tab bar over
+         one live surface (a shell terminal or a subagent chat), VSCode-style.
+         Collapsible; when open it owns its share of the row and its own
+         scroll. */
       .pane-row { flex: 1 1 auto; min-height: 0; display: flex; }
       .pane-row .pane { flex: 1 1 auto; min-width: 0; }
-      .rail {
-        flex: none; width: 24rem; min-height: 0; overflow-y: auto;
+      .work {
+        flex: 1 1 42%; min-width: 24rem; min-height: 0;
+        display: flex; flex-direction: column;
         border-left: 1px solid var(--line);
-        padding: 0.5rem 0.75rem;
       }
-      .rail h2 {
-        color: var(--fg-dim); font-weight: bold; letter-spacing: 0.08em;
-        margin: 0.6rem 0 0.3rem; font-size: 0.85em; text-transform: uppercase;
+      .work .empty { color: var(--fg-dim); font-size: 0.9em; }
+      .work-empty { padding: 0.5rem 0.75rem; }
+      /* Tool calls in flight, as chips; clicking jumps to the kickoff card. */
+      .work-strip {
+        display: flex; flex-wrap: wrap; gap: 0.3rem;
+        padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line-soft);
       }
-      .rail h2:first-child { margin-top: 0; }
-      .rail .empty { color: var(--fg-dim); font-size: 0.9em; }
-      /* One running tool call, mirroring its transcript card in miniature.
-         Clicking jumps to the kickoff card. */
       .rail-tool {
         display: flex; align-items: baseline; gap: 0.4rem;
         border: 1px solid var(--line); border-radius: 6px;
         background: var(--bg-raised);
-        padding: 0.25rem 0.5rem; margin: 0.25rem 0; cursor: pointer;
+        padding: 0.1rem 0.5rem; cursor: pointer;
         overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
       }
       .rail-tool:hover { border-color: #666; }
-
-      /* A shell terminal. The border is the lock indicator: green while the
-         user holds the keyboard, the tool colour while the agent does. */
-      .term {
-        border: 1px solid var(--tool); border-radius: 6px;
-        margin: 0.35rem 0; overflow: hidden;
-        background: #0b0b0b;
+      .tool-args-more { margin: 0 0.5rem 0.3rem; }
+      /* One tab per live shell / subagent; the underline is the lock
+         indicator — green while the user holds that tab's keyboard. */
+      .work-tabs {
+        display: flex; overflow-x: auto;
+        border-bottom: 1px solid var(--line);
       }
-      .term-user { border-color: var(--user); box-shadow: 0 0 4px rgba(111, 194, 111, 0.35); }
-      .term-head {
+      .work-tab {
+        display: flex; align-items: baseline; gap: 0.35rem;
+        padding: 0.3rem 0.7rem; cursor: pointer; white-space: nowrap;
+        color: var(--fg-dim); border-right: 1px solid var(--line-soft);
+        border-bottom: 2px solid transparent;
+      }
+      .work-tab:hover { color: var(--fg); }
+      .work-tab-active {
+        color: var(--fg); background: var(--bg-raised);
+        border-bottom-color: var(--tool);
+      }
+      .work-tab-user.work-tab-active { border-bottom-color: var(--user); }
+      /* The active tab's window, filling the panel. */
+      .work-view {
+        flex: 1 1 auto; min-height: 0;
+        display: flex; flex-direction: column;
+      }
+      .work-view-head {
         display: flex; align-items: baseline; gap: 0.4rem;
-        padding: 0.25rem 0.5rem; cursor: pointer;
+        padding: 0.25rem 0.5rem;
         border-bottom: 1px solid var(--line-soft);
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
-      .term-head .lock-badge {
+      .work-view-head .lock-badge {
         margin-left: auto; font-size: 0.8em; color: var(--fg-dim);
       }
       /* Which machine a shell runs on; local goes unmarked. */
-      .term-head .host-badge { color: var(--tool); font-size: 0.85em; }
-      .term-user .term-head .lock-badge { color: var(--user); }
-      .term-body {
-        max-height: 40vh; overflow-y: auto;
+      .work-view-head .host-badge { color: var(--tool); font-size: 0.85em; }
+      .work-view-user .work-view-head .lock-badge { color: var(--user); }
+      .work-body {
+        flex: 1 1 auto; min-height: 0; overflow-y: auto;
         padding: 0.3rem 0.5rem; font-size: 0.9em;
-        /* Terminal text is preformatted but must never widen the rail. */
+        background: #0b0b0b;
+        /* Terminal text is preformatted but must never widen the panel. */
         white-space: pre-wrap; word-break: break-word;
         user-select: text;
       }
+      /* A subagent chat is prose in transcript form, not terminal bytes. */
+      .chat-body { white-space: normal; background: transparent; }
+      .chat-open-link { margin-top: 0.5rem; font-size: 0.9em; }
       .term-input-row {
         display: flex; border-top: 1px solid var(--line-soft);
       }
@@ -190,10 +210,6 @@
         flex: 1 1 auto; min-width: 0;
         background: transparent; color: var(--fg); font: inherit;
         border: 0; outline: none; padding: 0.3rem 0.5rem;
-      }
-      .term-hint {
-        padding: 0.25rem 0.5rem; color: var(--fg-dim); font-size: 0.8em;
-        border-top: 1px solid var(--line-soft);
       }
 
       /* Session browser */
@@ -291,6 +307,18 @@
       .md > *:first-child { margin-top: 0; }
       .md > *:last-child { margin-bottom: 0; }
       .md p, .md ul, .md ol, .md blockquote, .md pre { margin: 0.4rem 0; }
+      /* Tables, in the terminal's idiom: ruled cells, no zebra. `display:
+         block` lets a wide table scroll inside the column instead of
+         widening it. */
+      .md table {
+        border-collapse: collapse; margin: 0.4rem 0;
+        display: block; max-width: 100%; overflow-x: auto;
+      }
+      .md th, .md td {
+        border: 1px solid var(--line); padding: 0.1rem 0.6rem;
+        text-align: left; vertical-align: top;
+      }
+      .md th { color: var(--fg-dim); }
       /* Headings never grow: same size as body, distinguished by weight,
          color, and the markdown marker itself. */
       .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {

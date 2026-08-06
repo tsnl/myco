@@ -97,8 +97,8 @@ pub struct Models {
     pub default_model: String,
 }
 
-/// Who holds a shell's keyboard. The lock gates writes only — reading is
-/// always open to both sides.
+/// Who holds a keyboard — a shell's, or a subagent child's. The lock gates
+/// writes only: reading is always open to both sides, whichever way it points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellLockMode {
@@ -165,10 +165,32 @@ pub struct ShellInput {
 }
 
 /// `POST /api/sessions/<id>/shells/<shell>/lock` — take or return the
-/// keyboard.
+/// keyboard. Also the body of `/subagents/<child>/lock`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellLockRequest {
     pub lock: ShellLockMode,
+}
+
+/// One live subagent child, as the work rail lists it — the `subagent` tool's
+/// hidden sessions, surfaced. A child is a full session (its id is a URL),
+/// so this carries only what the rail shows; the child's transcript comes
+/// from the ordinary session endpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Subagent {
+    pub id: String,
+    pub model: String,
+    /// A turn is running in the child right now.
+    pub busy: bool,
+    /// The shell keyboard lock's twin: while a person holds the child, the
+    /// parent agent's `subagent` calls to it are refused until it is handed
+    /// back.
+    pub lock: ShellLockMode,
+}
+
+/// `GET /api/sessions/<id>/subagents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subagents {
+    pub subagents: Vec<Subagent>,
 }
 
 /// A successful `POST /api/auth/token` — the OAuth 2.0 access-token response
@@ -314,6 +336,28 @@ pub trait MycoApi: Send + Sync {
         host: &str,
         shell: &str,
     ) -> Result<ShellScreen, ApiError>;
+
+    /// Live subagent children of this session (empty when it is not resident
+    /// — children surface on the rail while their agent tasks exist).
+    async fn subagents(&self, id: &str) -> Result<Subagents, ApiError>;
+    /// Take or return a subagent child. Transitions are recorded in the
+    /// *parent* transcript as non-waking messages, exactly like a shell's
+    /// keyboard; idempotent re-takes are silent.
+    async fn subagent_lock(
+        &self,
+        id: &str,
+        child: &str,
+        lock: ShellLockMode,
+    ) -> Result<Subagent, ApiError>;
+    /// Post one message into a user-held subagent child (its agent answers
+    /// the caller directly). Refused while the child is agent-held; recorded
+    /// in the parent transcript the same way shell keystrokes are.
+    async fn subagent_input(
+        &self,
+        id: &str,
+        child: &str,
+        text: String,
+    ) -> Result<Subagent, ApiError>;
 }
 
 /// One SSE event on `/api/sessions/<id>/events` — a live projection of the

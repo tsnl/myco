@@ -19,7 +19,7 @@ agent-spawned tools), then $MYCO_HOME/v2/operator.token (written by
         print(m.shell_screen(sid, shell["host"], shell["id"])["text"])
 
 CLI:  python3 myco.py ask "prompt" [--session ID] [--model KEY]
-      python3 myco.py sessions | shells SID | screen SID HOST SHELL
+      python3 myco.py sessions | shells SID | screen SID HOST SHELL | subagents SID
 
 Dependencies: none (urllib only).
 """
@@ -178,6 +178,24 @@ class Myco:
         return self._call("POST", f"/sessions/{sid}/shells/{host}/{shell}/lock",
                           {"lock": lock})
 
+    # -- subagents ---------------------------------------------------------
+
+    def subagents(self, sid: str):
+        """Live subagent children of `sid` (each is a full session by id)."""
+        return self._get(f"/sessions/{sid}/subagents")
+
+    def subagent_lock(self, sid: str, child: str, lock: str):
+        """lock: "user" (take the child over) or "assistant" (hand it back).
+        While user-held, the parent agent's `subagent` calls to it are
+        refused."""
+        return self._call("POST", f"/sessions/{sid}/subagents/{child}/lock",
+                          {"lock": lock})
+
+    def subagent_input(self, sid: str, child: str, text: str):
+        """Post into a user-held child; its agent answers you directly."""
+        return self._call("POST", f"/sessions/{sid}/subagents/{child}/input",
+                          {"text": text})
+
 
 def _main(argv: list[str]) -> int:
     if len(argv) < 2:
@@ -207,6 +225,9 @@ def _main(argv: list[str]) -> int:
     elif cmd == "shells":
         for s in m.shells(args[0])["shells"]:
             print(f"{s['host']}/{s['id']}  running={s['running']} lock={s['lock']} pty={s['pty']}")
+    elif cmd == "subagents":
+        for s in m.subagents(args[0])["subagents"]:
+            print(f"{s['id'][:8]}  {s['model']:<12} busy={s['busy']} lock={s['lock']}")
     elif cmd == "screen":
         print(m.shell_screen(args[0], args[1], args[2])["text"])
     else:

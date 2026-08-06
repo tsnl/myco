@@ -33,17 +33,26 @@ and `clients/myco.py` (or plain HTTP) for scripts and agents driving agents.
   (`/api/sessions/<id>/events`) of text/thinking deltas, tool starts and
   finishes, and whole messages; the GUI streams it and reconciles with a
   slow poll.
-- **Shared terminals with a keyboard lock.** The GUI's work rail lists the
-  agent's live bash sessions on **every host** — local and remotes alike,
-  reached over the same NDJSON host protocol the tools use — next to
-  whatever tool calls are in flight. Open one and you watch it live (pty
-  sessions render as their actual terminal screen); double-click to take
-  the keyboard and type into it yourself. The lock decides who may write —
-  shells start agent-held, the agent's writes fail politely while you hold
-  it, and both sides always read. Everything you type (and every keyboard
-  handoff) lands in the transcript as an attributed, non-waking message
-  naming the host, so the agent reads what you did at its next boundary
-  instead of discovering a mutated shell.
+- **Shared terminals with a keyboard lock.** The GUI's work panel is a
+  horizontal split beside the chat: a tab per live bash session on **every
+  host** — local and remotes alike, reached over the same NDJSON host
+  protocol the tools use — plus chips for whatever tool calls are in
+  flight. Tabs come and go as shells do; the active one fills the panel as
+  its own terminal (pty sessions render as their actual terminal screen).
+  A button takes the keyboard so you can type into it yourself. The lock
+  decides who may write — shells start agent-held, the agent's writes fail
+  politely while you hold it, and both sides always read. Everything you
+  type (and every keyboard handoff) lands in the transcript as an
+  attributed, non-waking message naming the host, so the agent reads what
+  you did at its next boundary instead of discovering a mutated shell.
+- **Subagents get the same window.** The `subagent` tool's children are
+  full sessions, and each live child is a tab too — a chat rendered by the
+  same transcript view as the main pane, streaming while the child works.
+  The same lock applies: take a child over and you talk to its agent
+  directly, the parent's `subagent` calls to it are refused until you hand
+  it back, and the takeover, your messages, and the handoff are all
+  recorded in the parent transcript. Or pop it out: every child opens as a
+  full session by URL.
 - **Shared sessions the agent stays out of.** Several people can hold one
   session. While you are the only person in it, everything you say is for
   the agent — as before. Once someone else posts, the room has rules: the
@@ -135,6 +144,10 @@ parent_session?, fork?}`) · `GET /api/sessions/<id>` ·
 `GET /api/sessions/<id>/events` (SSE) · `POST /api/sessions/<id>/cancel` ·
 `DELETE /api/sessions/<id>/live` · `GET /api/models` · `GET /api/whoami` ·
 `GET /api/sessions/<id>/shells` (all hosts) ·
+`GET /api/sessions/<id>/subagents` (live children) ·
+`POST /api/sessions/<id>/subagents/<child>/lock` (`{lock}`) ·
+`POST /api/sessions/<id>/subagents/<child>/input` (`{text}`, requires the
+user hold; echoes into the parent transcript) ·
 `GET /api/sessions/<id>/shells/<host>/<shell>?from=N`
 (offset-addressed scrollback tail) ·
 `GET /api/sessions/<id>/shells/<host>/<shell>/screen` (rendered terminal
