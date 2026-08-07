@@ -65,8 +65,8 @@ state" into "authorized verbs over named instances". Each instance is one
 cell whose state is the kind's `Instance` object; dispatch wraps a verb
 into a closure and authority into two checks — at enqueue (refuse ahead of
 the queue) and again at apply (inside the ordering, so authority is bound
-to effect: after `sys.take` returns, no verb the old driver had queued
-will land). Identity, title, driver, and the verb log live *beside* the
+to effect: after `sys.take` returns, no verb the old driver had queued but
+not yet applying will land). Identity, title, driver, and the verb log live *beside* the
 cell, not inside it, so listing, introspection, seat transfer, and removal
 work on a wedged or crashed instance — the rescue path never enters a
 mailbox. Kind events are forwarded onto the global feed tagged with the
@@ -112,7 +112,8 @@ generic `call` — unification is for the substrate, never the prompt.
 **Instance.** Identity (`id`, `kind`, `project`, `title`), canonical
 state, a watermark bumped on **every** observable change — kind-state
 writes, driver transfer, rename, and removal alike (review finding: meta
-changes must wake meta watchers) — an event stream for significant
+changes must wake meta watchers; for kind-state writes this is the kind's
+contract to honor — the framework cannot verify a missing bump) — an event stream for significant
 moments, and a bounded verb log (who called what; introspection reads are
 not recorded, so watching the debugger does not erase the evidence).
 Instances outlive any viewer; attachment is never ownership.
@@ -138,10 +139,12 @@ native notation; the payload may carry more (tty's `text` also reports
 
 **Driver.** Not a mutex: durable, visible state, changed by
 `sys.take`/`sys.release`, enforced by refusal. The policy, complete:
-humans may take from agents or from nobody; **nobody else takes an
-occupied seat** (not another human's, and System never takes at all —
-agents do not wrestle each other either); release returns the seat to the
-creator, or empties it when the creator releases. A take **fences**: every
+humans may take from agents or from nobody; **nobody takes an occupied
+seat** except a human from an agent (not another human's seat, and System
+never contends for an occupied one — agents do not wrestle each other
+either; an *empty* seat is anyone's, which is how system automation will
+drive unheld instances); release returns the seat to the creator, or
+empties it when the creator releases. A take **fences**: every
 verb the old driver had queued but not yet applied is refused at apply
 time. A take does not interrupt the verb already mid-application — a
 fence, not an abort.
@@ -155,8 +158,9 @@ state (`kill_on_drop`).
 **Concurrency** is three mechanisms, none a client-visible lock:
 1. *Consistency* — per-instance serialization: every verb, reads
    included, applies in mailbox order. Stated honestly (review finding):
-   reads are unrestricted and cheap but **serialize with writes**; the
-   claim is "no read ever needs permission or blocks on *authority*", not
+   reads are never driver-gated and never *wait* on authority — the one
+   read refusal is owner scoping, immediate at enqueue — but they
+   **serialize with writes**; the claim is refusal-not-blocking, not
    parallel read execution. If a kind ever needs truly concurrent reads,
    the side-feed shape (state in an `Arc<Mutex>` beside the cell) already
    permits serving them off-mailbox — a future contract extension, not a
@@ -169,9 +173,11 @@ state (`kill_on_drop`).
 **Events vs reads, and the feed doctrine.** Read verbs report current
 state; events record what happened; a chat transcript stores only the
 latter. The global feed is **best-effort by design**: bounded broadcast,
-lossy under lag, not causally ordered across instances or with removal (a
-side-feed's dying words — tty's `exited` — can trail `removed`; consumers
-ignore events for ids they saw removed). The recovery rule for any
+lossy under lag, not causally ordered across instances, with creation, or
+with removal (a kind's own event can precede its `created` on a
+multi-threaded runtime, and a side-feed's dying words — tty's `exited` —
+can trail `removed`; consumers key existence off `list`, never off
+`created`, and ignore events for ids they saw removed). The recovery rule for any
 consumer that must not miss: treat the feed as a wake-up hint, and on lag
 re-`list()` (which carries every watermark) and re-read cursored state.
 Corollary, pinned as a convention: **any kind that emits
@@ -184,9 +190,12 @@ and publish via `Signals` (commands serialize, streams flow). Two rules,
 review-hardened: a side-feed whose input source does not die with the
 instance (a pool event feed, unlike a pty) must be cancelled by the
 instance's `Drop`; and side-feed tasks may call the pool freely, but verb
-handlers must not call verbs on instances that may call back — the
-framework refuses the direct self-call, cycles past one hop are the
-kind-author's contract to avoid.
+handlers must not call verbs on instances that may call back. The
+framework's self-call refusal is task-scoped: a task *spawned inside a
+handler* escapes it, so a handler must never await verb results from
+tasks it spawns — hand such work to the side-feed pattern,
+fire-and-forget. Cycles past one hop are likewise the kind-author's
+contract to avoid.
 
 **Kinds that consume the bus** (notifiers, future debuggers) hold a
 `Pool` clone as a factory field — blessed dependency injection, wired at

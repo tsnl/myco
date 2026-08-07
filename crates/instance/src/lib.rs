@@ -228,8 +228,11 @@ pub trait Instance: Send {
 /// three rules that keep it safe:
 /// - side-feed tasks may call the pool freely;
 /// - a verb handler must never call a verb on its own instance (the
-///   framework refuses the direct case) nor on instances that may call
-///   back — call cycles deadlock, undetectably past one hop;
+///   framework refuses the direct case — but the refusal is task-scoped:
+///   a task *spawned inside* a handler escapes it, so a handler must
+///   never await verb results from tasks it spawns; hand that work to a
+///   side-feed, fire-and-forget) nor on instances that may call back —
+///   call cycles deadlock, undetectably past one hop;
 /// - a side-feed whose input does not die with the instance (a pool event
 ///   feed, unlike a pty) must be cancelled by the instance's `Drop`.
 pub trait Kind: Send + Sync {
