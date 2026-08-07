@@ -3,7 +3,7 @@
 //! the parallel experiment — over the same session runtime. `--mode host` is
 //! the worker remotes run (`ssh <alias> myco --mode host`).
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use myco::config::{Config, ConfigUserSettings, DEFAULT_MAX_IMAGE_BASE64_BYTES};
 use myco::host::HostWorker;
 
@@ -19,24 +19,17 @@ enum Mode {
     Host,
 }
 
-/// Subcommands that do administration rather than run an agent.
-#[derive(Subcommand, Debug, Clone)]
-enum Command {
-    /// Manage who can sign in to the web server.
-    Auth {
-        #[command(subcommand)]
-        command: myco::admin::AuthCommand,
-    },
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "myco", version, about = "myco: multi-host coding agent")]
 struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
-
     #[arg(long, value_enum, default_value_t = Mode::Cli)]
     mode: Mode,
+
+    /// With `--mode serve`: print a fresh one-time sign-in code for the
+    /// operator, even if they have passkeys enrolled. The lockout escape
+    /// hatch — restarting the server is what proves the right to it.
+    #[arg(long)]
+    recover: bool,
 
     /// Print mode: run one agent turn over the API, print the answer to
     /// stdout, exit. The session is saved like any other (`session=<id>` on
@@ -79,22 +72,6 @@ async fn main() {
     let _ = dotenvy::dotenv();
     let args = Args::parse();
 
-    // Administration runs and exits; it never starts a runtime.
-    if let Some(Command::Auth { command }) = args.command {
-        let config = match Config::resolve(ConfigUserSettings {
-            config_path: args.config,
-            roster_path: args.server_config,
-            model: args.model,
-        }) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("myco: {e}");
-                std::process::exit(1);
-            }
-        };
-        std::process::exit(myco::admin::run(&config, command));
-    }
-
     match args.mode {
         Mode::Host => {
             if let Err(e) = HostWorker::standard(args.name, args.max_image_base64_bytes)
@@ -121,7 +98,7 @@ async fn main() {
                 "myco server: http://127.0.0.1:{}/api (model: {})",
                 args.port, config.model
             );
-            if let Err(e) = myco::web::serve(config, args.port).await {
+            if let Err(e) = myco::web::serve(config, args.port, args.recover).await {
                 eprintln!("myco server error: {e}");
                 std::process::exit(1);
             }

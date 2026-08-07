@@ -121,30 +121,31 @@ user it is running as — every session entry records its author, and a
 name nobody registered has no business in a shared transcript. Override the
 path with `--server-config` or `$MYCO_SERVER_CONFIG`.
 
-The roster says who *exists*; credentials are set separately, so a name in
-the file is not by itself access to the server:
+The roster says who *exists*; credentials are separate, so a name in the
+file is not by itself access to the server. There are no passwords and no
+signup — two ways in, by strength:
 
-```bash
-myco auth list             # who exists, their credentials, live sessions
-myco auth passwd ada       # set a password (prompts; ends ada's sessions)
-myco auth code ada         # mint a one-time login code (15 min, single use)
-myco auth disable ada      # refuse logins, keep the history attributed
-myco auth revoke ada       # end sessions without changing credentials
-myco auth clear-passkeys ada   # forget a lost/compromised authenticator
-```
+- A **one-time code**, the bootstrap and recovery path. On first start (no
+  passkey enrolled for the operator yet) the server prints one to its
+  terminal; after that the operator mints them from the **admin panel** in
+  the GUI topbar. Codes are memory-only, single-use, bound to their user,
+  and last 15 minutes; a restart voids them.
+- A **passkey**, the steady state. Any signed-in session can enroll one
+  ("add passkey" in the GUI topbar), the credential persists in
+  `~/.myco/v2/passkeys.json` — so it survives the restarts that void every
+  token by design — and sign-in is phishing-proof and secret-free. The
+  relying party defaults to `localhost` (any port), which covers both local
+  use and the supported remote pattern; set `[passkeys]` in `server.toml`
+  (`rp_id`, `origin`) when the GUI lives behind a real HTTPS hostname.
 
-Three ways in, by strength: a **password**, an **operator-minted one-time
-code** (`auth code` talks to the running server; the code is memory-only,
-single-use, and bound to its user — the recovery path when someone is locked
-out), and a **passkey**. Passkeys are the intended steady state: any signed-
-in session can enroll one ("add passkey" in the GUI topbar), the credential
-persists in `~/.myco/v2/passkeys.json` — so it survives the restarts that
-void every token by design — and sign-in is phishing-proof and secret-free.
-The relying party defaults to `localhost` (any port), which covers both
-local use and the supported remote pattern; set `[passkeys]` in
-`server.toml` (`rp_id`, `origin`) when the GUI lives behind a real HTTPS
-hostname. Passwords can then be treated as bootstrap: once a user has a
-passkey, their password can simply never be set again.
+All administration lives in that admin panel (or the same `/api/admin`
+routes from a script — see `clients/myco.py`): list users with their live
+sessions and passkey counts, mint codes, disable/enable, revoke sessions,
+clear passkeys, remove. The server process is the only writer of the
+credential files. The operator is the roster's local user; their account
+cannot be disabled or removed, and if they lose every passkey,
+`myco --mode serve --recover` prints a fresh code — possession of the
+process is what proves the right to it.
 
 **Transport doctrine:** the server binds `127.0.0.1` only and speaks plain
 HTTP, which is safe *because* loopback traffic never crosses a wire. The
@@ -229,10 +230,12 @@ as `tool_started` (with the call's `id`) and complete mid-turn as
 `tool_finished`; `turn_finished` arrives exactly once per turn, after the
 turn is persisted, so one refetch on it reads the finished transcript.
 
-Sign in with the **OAuth 2.0 password grant** (RFC 6749 §4.3):
+Sign in by redeeming a one-time code at the token endpoint:
 `POST /api/auth/token` takes form-encoded
-`grant_type=password&username=&password=` and returns
-`{access_token, token_type, expires_in, user}`. Every other route requires
+`grant_type=code&username=&code=` and returns
+`{access_token, token_type, expires_in, user}` (RFC 6749's response shape,
+so a stock OAuth2 client can read it; passkey sign-in is the WebAuthn
+ceremony pair under `/api/auth/passkey/`). Every other route requires
 `Authorization: Bearer <access_token>`; `POST /api/auth/logout` ends the
 session server-side. Tokens last 12 hours, are stored hashed, and live only
 in memory — a restart logs everyone out.

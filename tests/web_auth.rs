@@ -6,8 +6,11 @@
 //! valid has its writes attributed to the token's owner, not to whoever
 //! happens to be running the process.
 //!
-//! Tokens are obtained the way a client obtains them: the OAuth 2.0 password
-//! grant at `POST /api/auth/token`.
+//! There are no passwords. Tokens are obtained the way a client obtains
+//! them: redeeming an operator-minted one-time code at `POST /api/auth/token`
+//! (`grant_type=code`), or a passkey ceremony. Administration is the
+//! operator-only `/api/admin` surface — the server is the only writer of the
+//! credential files, and this suite is where that surface is pinned.
 
 use std::sync::Arc;
 
@@ -33,10 +36,8 @@ gateway = "g"
 context_window = 100000
 "#;
 
-const ADA_PASSWORD: &str = "ada's long enough password";
-const GRACE_PASSWORD: &str = "grace's long enough password";
-
-/// The roster names who exists; credentials come from the store.
+/// The roster names who exists; credentials come from the store. `ada` is the
+/// local user, which makes her the operator.
 const ROSTER_TOML: &str = r#"
 [[users]]
 id = "ada"
@@ -59,10 +60,8 @@ fn test_server() -> Arc<Server> {
         |_| Err("no auth files in tests".into()),
     )
     .expect("test config resolves");
-    // Token work factor: these tests are about the HTTP contract, not the KDF
-    // (which `myco-auth` covers on its own).
-    let auth = Arc::new(AuthStore::in_memory().with_work_factor(1));
-    let server = Server::with_model_factory_and_auth(
+    let auth = Arc::new(AuthStore::in_memory());
+    Server::with_model_factory_and_auth(
         config,
         Box::new(|_, _, _, _| {
             Ok(ScriptedModel::new(vec![GenerateOutput {
@@ -73,17 +72,7 @@ fn test_server() -> Arc<Server> {
             }]) as Arc<dyn GenerativeModel>)
         }),
         auth,
-    );
-    // Roster users exist by construction; give two of them passwords.
-    server
-        .auth()
-        .set_password("ada", ADA_PASSWORD)
-        .expect("chpass");
-    server
-        .auth()
-        .set_password("grace", GRACE_PASSWORD)
-        .expect("chpass");
-    server
+    )
 }
 
 async fn client() -> Client {
@@ -97,23 +86,26 @@ fn bearer(token: &str) -> Header<'static> {
     Header::new("Authorization", format!("Bearer {token}"))
 }
 
-/// The password grant, as a client performs it.
-async fn login(c: &Client, id: &str, password: &str) -> Result<String, Status> {
+/// Sign `id` in the way a person does: a one-time code (minted here straight
+/// into the store — the HTTP mint route has its own test) redeemed at the
+/// token endpoint.
+async fn signin(c: &Client, id: &str) -> String {
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+    let minted = server.auth().mint_code(id).expect("mint");
     let resp = c
         .post("/api/auth/token")
         .header(ContentType::Form)
         .body(format!(
-            "grant_type=password&username={id}&password={password}"
+            "grant_type=code&username={id}&code={}",
+            minted.code
         ))
         .dispatch()
         .await;
-    if resp.status() != Status::Ok {
-        return Err(resp.status());
-    }
+    assert_eq!(resp.status(), Status::Ok, "code sign-in for {id}");
     let token: myco_api::AccessToken = resp.into_json().await.expect("token response");
     assert_eq!(token.token_type, "bearer");
     assert!(token.expires_in > 0);
-    Ok(token.access_token)
+    token.access_token
 }
 
 /// Every route, with no credential at all. None may answer.
@@ -129,6 +121,7 @@ async fn no_route_answers_without_a_token() {
         "/api/sessions/deadbeef/events",
         "/api/models",
         "/api/whoami",
+        "/api/admin/users",
     ] {
         let resp = c.get(path).dispatch().await;
         assert_eq!(resp.status(), Status::Unauthorized, "GET {path}");
@@ -138,12 +131,16 @@ async fn no_route_answers_without_a_token() {
         "/api/sessions/deadbeef/messages",
         "/api/sessions/deadbeef/cancel",
         "/api/sessions/deadbeef/compact",
+        "/api/admin/users/ada/code",
+        "/api/admin/users/grace/disable",
     ] {
         let resp = c.post(path).dispatch().await;
         assert_eq!(resp.status(), Status::Unauthorized, "POST {path}");
     }
-    let resp = c.delete("/api/sessions/deadbeef/live").dispatch().await;
-    assert_eq!(resp.status(), Status::Unauthorized);
+    for path in ["/api/sessions/deadbeef/live", "/api/admin/users/grace"] {
+        let resp = c.delete(path).dispatch().await;
+        assert_eq!(resp.status(), Status::Unauthorized, "DELETE {path}");
+    }
     let resp = c.patch("/api/sessions/deadbeef").dispatch().await;
     assert_eq!(resp.status(), Status::Unauthorized);
 }
@@ -155,7 +152,7 @@ async fn a_bad_token_is_rejected() {
     let _home = myco::test_support::temp_home("web-auth-bad");
     let c = client().await;
 
-    let live = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+    let live = signin(&c, "ada").await;
     for token in ["", "wrong", &live[..16], &format!("{live}x")] {
         let resp = c.get("/api/whoami").header(bearer(token)).dispatch().await;
         assert_eq!(resp.status(), Status::Unauthorized, "token {token:?}");
@@ -175,11 +172,8 @@ async fn a_token_identifies_its_owner() {
     let _home = myco::test_support::temp_home("web-auth-whoami");
     let c = client().await;
 
-    for (password, id, name) in [
-        (ADA_PASSWORD, "ada", "Ada Lovelace"),
-        (GRACE_PASSWORD, "grace", "Grace Hopper"),
-    ] {
-        let token = login(&c, id, password).await.expect("login");
+    for (id, name) in [("ada", "Ada Lovelace"), ("grace", "Grace Hopper")] {
+        let token = signin(&c, id).await;
         let resp = c.get("/api/whoami").header(bearer(&token)).dispatch().await;
         assert_eq!(resp.status(), Status::Ok);
         let who: myco_api::Identity = resp.into_json().await.expect("identity");
@@ -195,8 +189,8 @@ async fn a_token_identifies_its_owner() {
 async fn a_posted_message_is_attributed_to_the_token_holder() {
     let _home = myco::test_support::temp_home("web-auth-attrib");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
-    let grace = login(&c, "grace", GRACE_PASSWORD).await.expect("login");
+    let ada = signin(&c, "ada").await;
+    let grace = signin(&c, "grace").await;
 
     let created = c
         .post("/api/sessions")
@@ -255,7 +249,7 @@ async fn a_posted_message_is_attributed_to_the_token_holder() {
 async fn the_event_stream_accepts_a_query_token_but_still_checks_it() {
     let _home = myco::test_support::temp_home("web-auth-sse");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+    let ada = signin(&c, "ada").await;
 
     let created = c
         .post("/api/sessions")
@@ -282,41 +276,42 @@ async fn the_event_stream_accepts_a_query_token_but_still_checks_it() {
     assert_eq!(ok.status(), Status::Ok);
 }
 
-/// The grant itself: right credentials succeed, wrong ones do not, and the
-/// failure never says which half was wrong.
+/// The retired grants stay retired: `password` (and anything else) is refused
+/// by name, so a stale client learns the grant is gone rather than being told
+/// its credentials are wrong.
 #[tokio::test]
-async fn the_password_grant_accepts_only_correct_credentials() {
-    let _home = myco::test_support::temp_home("web-auth-grant");
+async fn only_the_code_grant_exists() {
+    let _home = myco::test_support::temp_home("web-auth-grants");
     let c = client().await;
 
-    assert!(login(&c, "ada", ADA_PASSWORD).await.is_ok());
-    assert_eq!(
-        login(&c, "ada", "wrong password entirely")
-            .await
-            .unwrap_err(),
-        Status::Unauthorized
-    );
-    assert_eq!(
-        login(&c, "nobody", ADA_PASSWORD).await.unwrap_err(),
-        Status::Unauthorized
-    );
-    // Ada's password must not work for Grace.
-    assert_eq!(
-        login(&c, "grace", ADA_PASSWORD).await.unwrap_err(),
-        Status::Unauthorized
-    );
+    for grant in ["password", "client_credentials", "authorization_code"] {
+        let resp = c
+            .post("/api/auth/token")
+            .header(ContentType::Form)
+            .body(format!(
+                "grant_type={grant}&username=ada&password=whatever&code=whatever"
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(resp.status(), Status::BadRequest, "grant {grant}");
+        let body = resp.into_string().await.unwrap();
+        assert!(body.contains(grant), "the refusal names the grant: {body}");
+    }
 
-    // A grant type we do not implement is rejected outright, so adding one
-    // later cannot be mistaken for this one.
-    let resp = c
-        .post("/api/auth/token")
-        .header(ContentType::Form)
-        .body(format!(
-            "grant_type=client_credentials&username=ada&password={ADA_PASSWORD}"
-        ))
-        .dispatch()
-        .await;
-    assert_eq!(resp.status(), Status::BadRequest);
+    // The failure mode for a *bad code* is uniform: unknown user, known user
+    // with no code outstanding, and a wrong guess all answer identically.
+    let mut answers = Vec::new();
+    for user in ["nobody", "grace", "ada"] {
+        let resp = c
+            .post("/api/auth/token")
+            .header(ContentType::Form)
+            .body(format!("grant_type=code&username={user}&code=AAAAA-AAAAA"))
+            .dispatch()
+            .await;
+        answers.push((resp.status(), resp.into_string().await.unwrap()));
+    }
+    assert_eq!(answers[0], answers[1], "uniform answer, no enumeration");
+    assert_eq!(answers[1], answers[2], "uniform answer, no enumeration");
 }
 
 /// Signing out has to end the session server-side. A client that merely
@@ -325,7 +320,7 @@ async fn the_password_grant_accepts_only_correct_credentials() {
 async fn logging_out_invalidates_the_token() {
     let _home = myco::test_support::temp_home("web-auth-logout");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+    let ada = signin(&c, "ada").await;
 
     assert_eq!(
         c.get("/api/whoami")
@@ -352,72 +347,46 @@ async fn logging_out_invalidates_the_token() {
         Status::Unauthorized,
         "the token must be dead after logout"
     );
-    // And logging in again works.
-    assert!(login(&c, "ada", ADA_PASSWORD).await.is_ok());
-}
-
-/// A user in the roster with no password set cannot log in. The roster says
-/// who exists; it does not grant access.
-#[tokio::test]
-async fn a_roster_user_without_a_password_cannot_sign_in() {
-    let _home = myco::test_support::temp_home("web-auth-nopass");
-    let server = test_server();
-    server.auth().add_user("mallory", "Mallory").ok();
-    let figment = rocket::Config::figment().merge(("log_level", "off"));
-    let c = Client::tracked(myco::web::rocket(server, figment))
-        .await
-        .expect("rocket builds");
-
-    assert_eq!(
-        login(&c, "mallory", "any password at all")
-            .await
-            .unwrap_err(),
-        Status::Unauthorized
-    );
+    // And signing in again works.
+    let _ = signin(&c, "ada").await;
 }
 
 // ---------------------------------------------------------------------------
-// One-time codes and passkeys
+// One-time codes
 // ---------------------------------------------------------------------------
 
-/// The code grant: the operator mints against the live server, the code
-/// signs its user in exactly once, and nobody but the operator can mint.
+/// The code lifecycle over HTTP: the operator mints at the admin route, the
+/// code signs its user in exactly once, and nobody but the operator can mint.
 #[tokio::test]
 async fn a_one_time_code_signs_in_once_and_only_the_operator_mints() {
+    let _home = myco::test_support::temp_home("web-auth-codes");
     let c = client().await;
-    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
 
     // Grace (not the operator) may not mint, even authenticated.
-    let grace_token = login(&c, "grace", GRACE_PASSWORD).await.expect("login");
+    let grace_token = signin(&c, "grace").await;
     let refused = c
-        .post("/api/auth/codes")
+        .post("/api/admin/users/grace/code")
         .header(bearer(&grace_token))
-        .header(ContentType::JSON)
-        .body(r#"{"username": "grace"}"#)
         .dispatch()
         .await;
     assert_eq!(refused.status(), Status::Unauthorized);
 
     // The operator (the roster's local user, ada) mints for grace.
-    let operator = server.auth().issue_for("ada").expect("operator token");
+    let ada_token = signin(&c, "ada").await;
     let minted = c
-        .post("/api/auth/codes")
-        .header(bearer(&operator.access_token))
-        .header(ContentType::JSON)
-        .body(r#"{"username": "grace"}"#)
+        .post("/api/admin/users/grace/code")
+        .header(bearer(&ada_token))
         .dispatch()
         .await;
     assert_eq!(minted.status(), Status::Ok);
-    let body: serde_json::Value =
-        serde_json::from_str(&minted.into_string().await.unwrap()).unwrap();
-    let code = body["code"].as_str().expect("code").to_string();
-    assert_eq!(body["username"], "grace");
+    let body: myco_api::MintedLoginCode = minted.into_json().await.expect("minted");
+    assert_eq!(body.username, "grace");
 
     // The code is bound to its user: ada cannot redeem grace's code.
     let wrong_user = c
         .post("/api/auth/token")
         .header(ContentType::Form)
-        .body(format!("grant_type=code&username=ada&code={code}"))
+        .body(format!("grant_type=code&username=ada&code={}", body.code))
         .dispatch()
         .await;
     assert_eq!(wrong_user.status(), Status::Unauthorized);
@@ -426,14 +395,16 @@ async fn a_one_time_code_signs_in_once_and_only_the_operator_mints() {
     let redeemed = c
         .post("/api/auth/token")
         .header(ContentType::Form)
-        .body(format!("grant_type=code&username=grace&code={code}"))
+        .body(format!("grant_type=code&username=grace&code={}", body.code))
         .dispatch()
         .await;
     assert_eq!(redeemed.status(), Status::Ok);
-    let issued: serde_json::Value =
-        serde_json::from_str(&redeemed.into_string().await.unwrap()).unwrap();
-    let token = issued["access_token"].as_str().expect("token");
-    let who = c.get("/api/whoami").header(bearer(token)).dispatch().await;
+    let issued: myco_api::AccessToken = redeemed.into_json().await.expect("token");
+    let who = c
+        .get("/api/whoami")
+        .header(bearer(&issued.access_token))
+        .dispatch()
+        .await;
     assert_eq!(who.status(), Status::Ok);
     assert!(who.into_string().await.unwrap().contains("grace"));
 
@@ -441,27 +412,192 @@ async fn a_one_time_code_signs_in_once_and_only_the_operator_mints() {
     let replay = c
         .post("/api/auth/token")
         .header(ContentType::Form)
-        .body(format!("grant_type=code&username=grace&code={code}"))
+        .body(format!("grant_type=code&username=grace&code={}", body.code))
         .dispatch()
         .await;
     assert_eq!(replay.status(), Status::Unauthorized);
 }
 
-/// The passkey ceremonies end to end against a software authenticator: an
-/// authenticated session enrolls, the passkey signs its user in, a stranger's
-/// ticket cannot be replayed, and unknown users get the same answer as users
-/// without passkeys.
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+
+/// The `/api/admin` surface is operator-only: an authenticated non-operator
+/// gets the same refusal on every route.
+#[tokio::test]
+async fn admin_routes_refuse_everyone_but_the_operator() {
+    let _home = myco::test_support::temp_home("web-auth-admin-gate");
+    let c = client().await;
+    let grace = signin(&c, "grace").await;
+
+    let get = c
+        .get("/api/admin/users")
+        .header(bearer(&grace))
+        .dispatch()
+        .await;
+    assert_eq!(get.status(), Status::Unauthorized);
+    for path in [
+        "/api/admin/users/ada/code",
+        "/api/admin/users/ada/disable",
+        "/api/admin/users/ada/enable",
+        "/api/admin/users/ada/revoke",
+        "/api/admin/users/ada/passkeys/clear",
+    ] {
+        let resp = c.post(path).header(bearer(&grace)).dispatch().await;
+        assert_eq!(resp.status(), Status::Unauthorized, "POST {path}");
+    }
+    let del = c
+        .delete("/api/admin/users/ada")
+        .header(bearer(&grace))
+        .dispatch()
+        .await;
+    assert_eq!(del.status(), Status::Unauthorized);
+}
+
+/// The admin listing is the old `auth list` table, as data: who exists,
+/// their state, and their live-session and passkey counts.
+#[tokio::test]
+async fn the_admin_listing_reports_the_roster_and_its_state() {
+    let _home = myco::test_support::temp_home("web-auth-admin-list");
+    let c = client().await;
+    let ada = signin(&c, "ada").await;
+    let _grace_one = signin(&c, "grace").await;
+    let _grace_two = signin(&c, "grace").await;
+
+    let resp = c
+        .get("/api/admin/users")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let list: myco_api::AdminUsers = resp.into_json().await.expect("admin users");
+    assert_eq!(list.operator, "ada");
+    let grace = list.users.iter().find(|u| u.id == "grace").expect("grace");
+    assert_eq!(grace.sessions, 2);
+    assert_eq!(grace.passkeys, 0);
+    assert!(!grace.disabled);
+    assert!(list.users.iter().any(|u| u.id == "ada"));
+}
+
+/// disable → refused sign-in and dead sessions; enable → fresh codes work
+/// again; revoke → sessions die but the account stays; remove → forgotten.
+#[tokio::test]
+async fn the_admin_actions_manage_a_user_end_to_end() {
+    let _home = myco::test_support::temp_home("web-auth-admin-act");
+    let c = client().await;
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+    let ada = signin(&c, "ada").await;
+
+    // Disable grace mid-session: her token dies with the account.
+    let grace = signin(&c, "grace").await;
+    let resp = c
+        .post("/api/admin/users/grace/disable")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    assert_eq!(
+        c.get("/api/whoami")
+            .header(bearer(&grace))
+            .dispatch()
+            .await
+            .status(),
+        Status::Unauthorized
+    );
+    // A disabled account cannot even be minted for.
+    let resp = c
+        .post("/api/admin/users/grace/code")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::BadRequest);
+
+    // Enable and she signs in again.
+    let resp = c
+        .post("/api/admin/users/grace/enable")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let grace = signin(&c, "grace").await;
+
+    // Revoke ends the session but keeps the account.
+    let resp = c
+        .post("/api/admin/users/grace/revoke")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    let count: myco_api::AdminActionCount = resp.into_json().await.expect("count");
+    assert_eq!(count.affected, 1);
+    assert_eq!(
+        c.get("/api/whoami")
+            .header(bearer(&grace))
+            .dispatch()
+            .await
+            .status(),
+        Status::Unauthorized
+    );
+
+    // Remove forgets her entirely.
+    let resp = c
+        .delete("/api/admin/users/grace")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+    assert!(server.auth().get("grace").is_none());
+}
+
+/// The lockout invariant: the account `--recover` signs in as can never be
+/// disabled or removed, not even by itself.
+#[tokio::test]
+async fn the_operator_account_cannot_be_locked_out() {
+    let _home = myco::test_support::temp_home("web-auth-admin-self");
+    let c = client().await;
+    let ada = signin(&c, "ada").await;
+
+    let disable = c
+        .post("/api/admin/users/ada/disable")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(disable.status(), Status::BadRequest);
+    let remove = c
+        .delete("/api/admin/users/ada")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(remove.status(), Status::BadRequest);
+    // Still alive and still the operator.
+    let resp = c
+        .get("/api/admin/users")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok);
+}
+
+// ---------------------------------------------------------------------------
+// Passkeys
+// ---------------------------------------------------------------------------
+
+/// The passkey ceremonies end to end against a software authenticator: a
+/// code-bootstrapped session enrolls, the passkey signs its user in, a
+/// stranger's ticket cannot be replayed, and unknown users get the same
+/// answer as users without passkeys.
 #[tokio::test]
 async fn a_passkey_enrolls_and_signs_in_via_the_ceremonies() {
     use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
 
     let c = client().await;
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
     let origin = url::Url::parse("http://localhost:7773").expect("origin");
     let (token, _cert) = SoftToken::new(true).expect("soft token");
     let mut authenticator = WebauthnAuthenticator::new(token);
 
-    // Enrollment requires a session; bootstrap with the password.
-    let ada_token = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+    // Enrollment requires a session; a one-time code bootstraps it.
+    let ada_token = signin(&c, "ada").await;
     let start = c
         .post("/api/auth/passkey/register/start")
         .header(bearer(&ada_token))
@@ -481,6 +617,12 @@ async fn a_passkey_enrolls_and_signs_in_via_the_ceremonies() {
         .dispatch()
         .await;
     assert_eq!(finish.status(), Status::Ok);
+
+    // With a passkey on file the startup banner has nothing to say — unless
+    // `--recover` demands a code anyway.
+    assert!(myco::web::startup_code(&server, false).is_none());
+    let banner = myco::web::startup_code(&server, true).expect("--recover always mints");
+    assert!(banner.contains("--recover"), "{banner}");
 
     // Sign in with it: challenge → assertion → token that speaks as ada.
     let start = c
@@ -538,9 +680,91 @@ async fn a_passkey_enrolls_and_signs_in_via_the_ceremonies() {
     assert_eq!(answers[0], answers[1], "uniform answer, no enumeration");
 }
 
+/// "Forget a user" forgets their passkeys too: after an admin remove, the
+/// re-added roster name answers the login-start probe exactly like a user
+/// who never enrolled.
+#[tokio::test]
+async fn removing_a_user_forgets_their_passkeys() {
+    use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
+
+    let c = client().await;
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+    let origin = url::Url::parse("http://localhost:7773").expect("origin");
+    let (token, _cert) = SoftToken::new(true).expect("soft token");
+    let mut authenticator = WebauthnAuthenticator::new(token);
+
+    let grace_token = signin(&c, "grace").await;
+    let start = c
+        .post("/api/auth/passkey/register/start")
+        .header(bearer(&grace_token))
+        .dispatch()
+        .await;
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_str(&start.into_string().await.unwrap()).unwrap();
+    let created = authenticator
+        .do_registration(origin, challenge)
+        .expect("registration");
+    let finish = c
+        .post("/api/auth/passkey/register/finish")
+        .header(bearer(&grace_token))
+        .header(ContentType::JSON)
+        .body(serde_json::to_string(&created).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(finish.status(), Status::Ok);
+    assert_eq!(server.auth().passkey_counts().get("grace"), Some(&1));
+
+    let ada = signin(&c, "ada").await;
+    let removed = c
+        .delete("/api/admin/users/grace")
+        .header(bearer(&ada))
+        .dispatch()
+        .await;
+    assert_eq!(removed.status(), Status::Ok);
+    assert_eq!(server.auth().passkey_counts().get("grace"), None);
+
+    // Re-added (as the roster reconciliation would on restart), she is
+    // indistinguishable from someone who never enrolled.
+    server.auth().add_user("grace", "Grace Hopper").unwrap();
+    let probe = c
+        .post("/api/auth/passkey/login/start")
+        .header(ContentType::JSON)
+        .body(r#"{"username": "grace"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(probe.status(), Status::Unauthorized);
+}
+
+/// The bootstrap path: a fresh server (no passkeys for the operator) prints
+/// a code, and that code actually signs the operator in over HTTP.
+#[tokio::test]
+async fn the_startup_code_bootstraps_a_fresh_server() {
+    let _home = myco::test_support::temp_home("web-auth-bootstrap");
+    let c = client().await;
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+
+    let banner = myco::web::startup_code(&server, false).expect("fresh server mints");
+    assert!(banner.contains("ada"), "{banner}");
+    assert!(banner.contains("no passkey enrolled yet"), "{banner}");
+    let code = banner
+        .split_whitespace()
+        .find(|w| w.len() == 11 && w.as_bytes()[5] == b'-')
+        .expect("banner carries the code");
+
+    let resp = c
+        .post("/api/auth/token")
+        .header(ContentType::Form)
+        .body(format!("grant_type=code&username=ada&code={code}"))
+        .dispatch()
+        .await;
+    assert_eq!(resp.status(), Status::Ok, "{banner}");
+    let issued: myco_api::AccessToken = resp.into_json().await.expect("token");
+    assert_eq!(issued.user.id, "ada");
+}
+
 /// The point of passkeys over tokens: credentials persist in
-/// `passkeys.json`, so a server restart — which voids every token by design
-/// — does not cost anyone their sign-in method.
+/// `passkeys.json`, so a server restart — which voids every token and code
+/// by design — does not cost anyone their sign-in method.
 #[tokio::test]
 async fn passkeys_survive_a_server_restart() {
     use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
@@ -571,20 +795,15 @@ async fn passkeys_survive_a_server_restart() {
 
     // First life: enroll.
     {
-        let store = Arc::new(
-            AuthStore::open(&auth_path)
-                .expect("open store")
-                .with_work_factor(1),
-        );
+        let store = Arc::new(AuthStore::open(&auth_path).expect("open store"));
         let server = build(store);
-        server.auth().set_password("ada", ADA_PASSWORD).unwrap();
         let c = Client::tracked(myco::web::rocket(
             server,
             rocket::Config::figment().merge(("log_level", "off")),
         ))
         .await
         .expect("rocket");
-        let ada_token = login(&c, "ada", ADA_PASSWORD).await.expect("login");
+        let ada_token = signin(&c, "ada").await;
         let start = c
             .post("/api/auth/passkey/register/start")
             .header(bearer(&ada_token))
@@ -608,13 +827,11 @@ async fn passkeys_survive_a_server_restart() {
     // Second life: a fresh store from the same files — every token is gone,
     // the passkey is not, and it signs ada in.
     {
-        let store = Arc::new(
-            AuthStore::open(&auth_path)
-                .expect("reopen store")
-                .with_work_factor(1),
-        );
+        let store = Arc::new(AuthStore::open(&auth_path).expect("reopen store"));
         assert_eq!(store.passkey_counts().get("ada"), Some(&1));
         let server = build(store);
+        // With a passkey on file, a restart no longer volunteers a code.
+        assert!(myco::web::startup_code(&server, false).is_none());
         let c = Client::tracked(myco::web::rocket(
             server,
             rocket::Config::figment().merge(("log_level", "off")),

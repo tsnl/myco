@@ -102,7 +102,7 @@ fn shell_server(host: Option<&str>) -> Arc<Server> {
                 },
             ]) as Arc<dyn GenerativeModel>)
         }),
-        Arc::new(AuthStore::in_memory().with_work_factor(1)),
+        Arc::new(AuthStore::in_memory()),
     )
 }
 

@@ -15,7 +15,6 @@ pub mod session;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub mod admin;
 pub mod cli;
 pub mod client;
 pub mod server;

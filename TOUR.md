@@ -430,27 +430,34 @@ Notice:
 - `UserApi` is `Server` bound to one caller; the `MycoApi` impl lives on
   it, so no route can reach the runtime without naming who is asking.
 
-## Stop 9 — the door: auth, admin, web, client, myco.py
+## Stop 9 — the door: auth, admin routes, web, client, myco.py
 
-Read: `src/auth/mod.rs` and its tests, then `src/admin.rs`,
-`src/web.rs`, `src/client.rs`, `src/cli.rs`, `clients/myco.py`.
+Read: `src/auth/mod.rs` and its tests, then `src/web.rs`,
+`src/client.rs`, `src/cli.rs`, `clients/myco.py`.
 
 Notice:
 
-- `auth`'s module doc explains the grant choice: RFC 6749 §4.3 because
-  "the failure modes are known and the client side is boring."
-  Durability is deliberately tiered — users snapshot to `auth.json`,
-  tokens live only in memory (a restart logs everyone out), one-time
-  codes live and die with the process (they are redeemed against *this*
-  server, so `myco auth code` mints over HTTP as the operator rather
-  than touching files), and passkeys persist in `passkeys.json` — the
-  server's own file, so the admin CLI's `auth.json` rewrites cannot
-  clobber it. Passwords are PBKDF2 with a self-describing hash; tokens
-  and codes are plain SHA-256 digests of high-entropy values. `login`
-  burns a real verification against `dummy_hash()` for unknown users so
-  response timing does not enumerate the user list; the passkey
-  login/start route answers identically for "no such user" and "no
-  passkeys enrolled" for the same reason.
+- There are no passwords, and there is no admin CLI: administration is
+  the operator-only `/api/admin` surface (plus the panel the GUI hangs
+  off it), so the server process is the only writer of the credential
+  files. Durability is deliberately tiered — users snapshot to
+  `auth.json`, tokens live only in memory (a restart logs everyone
+  out), one-time codes live and die with the process (they are
+  redeemed against *this* server's memory, which is why minting is a
+  route and could never be a file), and passkeys persist in
+  `passkeys.json`. Tokens and codes are stored as plain SHA-256
+  digests of high-entropy values — nothing brute-forceable remains at
+  rest. `redeem_code` answers one way for unknown user, wrong code,
+  and expired code; the passkey login/start route answers identically
+  for "no such user" and "no passkeys enrolled" for the same
+  anti-enumeration reason.
+- The bootstrap chicken-and-egg is broken at startup: `web::startup_code`
+  prints a one-time code when the operator has no passkey to sign in
+  with (first run), and `--recover` forces one (lockout). Possession of
+  the process is the root credential; the `Operator` request guard is
+  the same rule at the HTTP layer, and `not_the_operator` keeps that
+  account impossible to disable or remove — the escape hatch must
+  always have someone to sign in as.
 - The WebAuthn ceremonies (`web.rs`, `passkey_*` routes) lean on a wire
   coincidence that is actually a standard: webauthn-rs serializes its
   challenge types to exactly the JSON the browser's own
@@ -664,6 +671,6 @@ Answerable only from the code; each names its stop.
    (Stop 6)
 9. How does a signal sent to a quiet bash session produce a snapshot of
    the child's *reaction* rather than an empty buffer? (Stop 6)
-10. `myco auth disable ada` runs while ada has a live token and a
-    session mid-turn. What stops working, what keeps working, and which
-    two mechanisms make the token dead? (Stop 9)
+10. The operator disables ada from the admin panel while ada has a live
+    token and a session mid-turn. What stops working, what keeps
+    working, and which two mechanisms make the token dead? (Stop 9)

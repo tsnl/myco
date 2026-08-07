@@ -30,9 +30,6 @@ gateway = "g"
 context_window = 100000
 "#;
 
-const ADA_PASSWORD: &str = "ada's long enough password";
-const GRACE_PASSWORD: &str = "grace's long enough password";
-
 const ROSTER_TOML: &str = r#"
 [[users]]
 id = "ada"
@@ -53,17 +50,8 @@ fn test_server_with(factory: myco::server::ModelFactory) -> Arc<Server> {
         |_| Err("no auth files in tests".into()),
     )
     .expect("test config resolves");
-    let auth = Arc::new(AuthStore::in_memory().with_work_factor(1));
-    let server = Server::with_model_factory_and_auth(config, factory, auth);
-    server
-        .auth()
-        .set_password("ada", ADA_PASSWORD)
-        .expect("chpass");
-    server
-        .auth()
-        .set_password("grace", GRACE_PASSWORD)
-        .expect("chpass");
-    server
+    let auth = Arc::new(AuthStore::in_memory());
+    Server::with_model_factory_and_auth(config, factory, auth)
 }
 
 fn test_server() -> Arc<Server> {
@@ -94,12 +82,17 @@ fn bearer(token: &str) -> Header<'static> {
     Header::new("Authorization", format!("Bearer {token}"))
 }
 
-async fn login(c: &Client, id: &str, password: &str) -> String {
+/// Sign `id` in the way a person does: a one-time code redeemed at the
+/// token endpoint.
+async fn login(c: &Client, id: &str) -> String {
+    let server = c.rocket().state::<Arc<Server>>().expect("server").clone();
+    let minted = server.auth().mint_code(id).expect("mint");
     let resp = c
         .post("/api/auth/token")
         .header(ContentType::Form)
         .body(format!(
-            "grant_type=password&username={id}&password={password}"
+            "grant_type=code&username={id}&code={}",
+            minted.code
         ))
         .dispatch()
         .await;
@@ -190,7 +183,7 @@ fn user_messages(p: &myco_api::Poll) -> Vec<(&str, String)> {
 async fn a_solo_session_answers_without_being_addressed() {
     let _home = myco::test_support::temp_home("mp-solo");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await;
+    let ada = login(&c, "ada").await;
     let id = new_session(&c, &ada).await;
 
     assert!(
@@ -207,8 +200,8 @@ async fn a_solo_session_answers_without_being_addressed() {
 async fn the_agent_does_not_interject_when_users_talk_to_each_other() {
     let _home = myco::test_support::temp_home("mp-quiet");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await;
-    let grace = login(&c, "grace", GRACE_PASSWORD).await;
+    let ada = login(&c, "ada").await;
+    let grace = login(&c, "grace").await;
     let id = new_session(&c, &ada).await;
 
     // Ada opens the session alone, so this one is for the agent.
@@ -246,8 +239,8 @@ async fn the_agent_does_not_interject_when_users_talk_to_each_other() {
 async fn naming_the_agent_in_a_shared_session_wakes_it() {
     let _home = myco::test_support::temp_home("mp-address");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await;
-    let grace = login(&c, "grace", GRACE_PASSWORD).await;
+    let ada = login(&c, "ada").await;
+    let grace = login(&c, "grace").await;
     let id = new_session(&c, &ada).await;
 
     assert!(post(&c, &ada, &id, "opening").await);
@@ -276,8 +269,8 @@ async fn naming_the_agent_in_a_shared_session_wakes_it() {
 async fn the_model_key_addresses_the_agent_but_another_key_does_not() {
     let _home = myco::test_support::temp_home("mp-modelkey");
     let c = client().await;
-    let ada = login(&c, "ada", ADA_PASSWORD).await;
-    let grace = login(&c, "grace", GRACE_PASSWORD).await;
+    let ada = login(&c, "ada").await;
+    let grace = login(&c, "grace").await;
     let id = new_session(&c, &ada).await;
 
     assert!(post(&c, &ada, &id, "opening").await);
