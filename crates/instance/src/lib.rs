@@ -30,7 +30,9 @@ pub mod events;
 /// Who is asking. An agent is named by the chat instance it drives — both
 /// adapters (HTTP for humans, the model loop for agents) resolve to this
 /// before anything touches the bus.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Principal {
     Human(String),

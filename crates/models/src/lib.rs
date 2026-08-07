@@ -33,7 +33,7 @@ pub use types::{
 mod catalog;
 pub use catalog::{
     AuthEntry, CatalogFile, GatewayEntry, ModelEntry, RetryEntry, read_auth_file,
-    resolve_catalog,
+    resolve_catalog, resolve_default_model,
 };
 
 /// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver

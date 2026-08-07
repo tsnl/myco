@@ -383,6 +383,39 @@ pub fn resolve_catalog(
     Ok(ModelCatalog::new(entries))
 }
 
+/// The default model for new chats: the file's `model` key, or the sole
+/// catalog entry when the file names none. `Ok(None)` is the modelless
+/// workspace (an empty catalog); a named key that does not exist is a
+/// startup error — silently running modelless would hide the typo.
+pub fn resolve_default_model(
+    file: &CatalogFile,
+    catalog: &ModelCatalog,
+) -> Result<Option<String>, String> {
+    match &file.model {
+        Some(key) => {
+            if !catalog.contains(key) {
+                return Err(format!(
+                    "default model {key:?} is not in the catalog (configured: [{}])",
+                    catalog.keys().join(", ")
+                ));
+            }
+            Ok(Some(key.clone()))
+        }
+        None => {
+            let keys = catalog.keys();
+            match keys.as_slice() {
+                [] => Ok(None),
+                [sole] => Ok(Some(sole.to_string())),
+                _ => Err(format!(
+                    "several models are configured ([{}]) — set `model = \"…\"` to pick the \
+                     default for new chats",
+                    keys.join(", ")
+                )),
+            }
+        }
+    }
+}
+
 /// Overlay a config `[retry]` table onto the built-in policy, field by
 /// field — setting one knob does not silently reset the others.
 ///

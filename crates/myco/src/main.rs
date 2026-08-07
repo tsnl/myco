@@ -68,9 +68,25 @@ async fn main() {
         eprintln!("{banner}");
     }
 
+    // The model catalog rides server.toml; resolution is a startup gate
+    // (shape errors stop the boot) while credential lookups stay soft
+    // until a model is used. An empty catalog is a modelless workspace:
+    // chats are plain transcripts.
+    let catalog = myco_models::resolve_catalog(
+        &roster.catalog,
+        &|k| std::env::var(k).ok().filter(|v| !v.is_empty()),
+        &myco_models::read_auth_file,
+    )
+    .unwrap_or_else(|e| fatal(e));
+    let default_model = myco_models::resolve_default_model(&roster.catalog, &catalog)
+        .unwrap_or_else(|e| fatal(e));
+
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
-    pool.register(Arc::new(myco_kind_chat::ChatKind));
+    pool.register(Arc::new(myco_kind_chat::ChatKind::new(
+        catalog,
+        default_model,
+    )));
 
     let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
         .unwrap_or_else(|e| fatal(e));

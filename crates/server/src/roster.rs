@@ -36,13 +36,19 @@ impl RosterUser {
 }
 
 /// `server.toml` as written on disk.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct FileRoster {
     #[serde(default)]
     pub users: Vec<RosterUser>,
     /// Optional `[passkeys]` section; defaults serve the localhost story.
     #[serde(default)]
     pub passkeys: PasskeySettings,
+    /// The model catalog: `model` + `[gateways]` + `[models]`, resolved by
+    /// `myco_models::resolve_catalog` at boot. Lives in this file rather
+    /// than a `config.toml` because v1 owns that name in the shared
+    /// `~/.myco`.
+    #[serde(flatten)]
+    pub catalog: myco_models::CatalogFile,
 }
 
 /// `[passkeys]` in `server.toml`: the WebAuthn relying party.
@@ -88,6 +94,8 @@ pub struct Roster {
     local: usize,
     /// The WebAuthn relying party (`[passkeys]` in the same file).
     pub passkeys: PasskeySettings,
+    /// The unresolved model catalog (`model` / `[gateways]` / `[models]`).
+    pub catalog: myco_models::CatalogFile,
 }
 
 /// What a usable `server.toml` looks like, quoted in every startup error so
@@ -118,7 +126,11 @@ impl Roster {
         file: FileRoster,
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let FileRoster { users, passkeys } = file;
+        let FileRoster {
+            users,
+            passkeys,
+            catalog,
+        } = file;
         if users.is_empty() {
             return Err(format!(
                 "no users defined in {} — add at least one [[users]] entry:\n\n{EXAMPLE_SERVER_TOML}",
@@ -174,6 +186,7 @@ impl Roster {
             users,
             local,
             passkeys,
+            catalog,
         })
     }
 }
@@ -289,6 +302,24 @@ id = "grace"
         let r = roster(&configured, &[("USER", "ada")]).unwrap();
         assert_eq!(r.passkeys.rp_id, "myco.example");
         assert_eq!(r.passkeys.origin, "https://myco.example");
+    }
+
+    #[test]
+    fn the_model_catalog_rides_the_same_file() {
+        // Top-level keys (`model`) must precede any table in TOML.
+        let with_models = format!(
+            "model = \"fast\"\n{TWO_USERS}\n[gateways.g]\nprotocol = \"openai-completions\"\n\
+             base_url = \"https://example.test/v1\"\n\n[models.fast]\ngateway = \"g\"\n\
+             context_window = 100000\n"
+        );
+        let r = roster(&with_models, &[("USER", "ada")]).unwrap();
+        assert_eq!(r.catalog.model.as_deref(), Some("fast"));
+        assert!(r.catalog.models.contains_key("fast"));
+        assert!(r.catalog.gateways.contains_key("g"));
+
+        // A roster without model tables is still a roster.
+        let bare = roster(TWO_USERS, &[("USER", "ada")]).unwrap();
+        assert!(bare.catalog.models.is_empty());
     }
 
     #[test]

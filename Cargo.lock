@@ -1067,6 +1067,7 @@ dependencies = [
  "myco-instance",
  "myco-kind-chat",
  "myco-kind-tty",
+ "myco-models",
  "myco-server",
  "tokio",
 ]
@@ -1092,10 +1093,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "myco-instance",
+ "myco-models",
  "myco-runtime",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1148,6 +1151,7 @@ dependencies = [
  "http-body-util",
  "myco-instance",
  "myco-kind-tty",
+ "myco-models",
  "myco-runtime",
  "rand 0.9.5",
  "serde",
