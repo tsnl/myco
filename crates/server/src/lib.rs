@@ -22,6 +22,7 @@
 pub mod auth;
 pub mod roster;
 mod util;
+mod watch;
 
 use std::sync::Arc;
 
@@ -37,8 +38,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use auth::AuthStore;
 
 #[derive(Clone)]
-struct App {
-    pool: Pool,
+pub(crate) struct App {
+    pub(crate) pool: Pool,
     auth: Arc<AuthStore>,
 }
 
@@ -50,6 +51,8 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>) -> Router {
         .route("/api/kinds", get(kinds))
         .route("/api/instances", post(create).get(list))
         .route("/api/instances/{id}/verbs/{verb}", post(call))
+        .route("/api/instances/{id}/changed", get(watch::changed))
+        .route("/api/ws", get(watch::ws))
         .route("/api/auth/token", post(token))
         .route("/api/auth/logout", post(logout))
         .route("/api/whoami", get(whoami))
@@ -71,7 +74,7 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>) -> Router {
 /// An authenticated request, already resolved to a principal. Taking this as
 /// a handler parameter *is* the auth check: a route that asks for it cannot
 /// run without a live token.
-struct Caller {
+pub(crate) struct Caller {
     user: auth::StoredUser,
 }
 
@@ -281,7 +284,7 @@ async fn call(
 
 /// `VerbError` → HTTP, and the serde form (tagged `error`) *is* the wire
 /// body, so the log's error names and the wire's never disagree.
-fn refusal(e: VerbError) -> (StatusCode, Json<VerbError>) {
+pub(crate) fn refusal(e: VerbError) -> (StatusCode, Json<VerbError>) {
     let status = match &e {
         VerbError::UnknownKind { .. }
         | VerbError::UnknownInstance { .. }
