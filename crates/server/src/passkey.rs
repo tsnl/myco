@@ -169,12 +169,15 @@ pub(crate) async fn login_finish(
                 eprintln!("myco: passkey counter update failed: {e}");
             }
             match app.auth.issue_for(&user_id) {
-                Some(issued) => Ok(Json(json!({
+                Some(issued) => {
+                    crate::ensure_notifier(&app.pool, &issued.user.id);
+                    Ok(Json(json!({
                     "access_token": issued.access_token,
                     "token_type": "bearer",
-                    "expires_in": issued.expires_in_seconds,
-                    "user": {"id": issued.user.id, "name": issued.user.name},
-                }))),
+                        "expires_in": issued.expires_in_seconds,
+                        "user": {"id": issued.user.id, "name": issued.user.name},
+                    })))
+                }
                 None => Err(refuse(StatusCode::UNAUTHORIZED, "this account is disabled")),
             }
         }

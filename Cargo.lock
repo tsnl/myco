@@ -1066,6 +1066,7 @@ dependencies = [
  "clap",
  "myco-instance",
  "myco-kind-chat",
+ "myco-kind-notifier",
  "myco-kind-tty",
  "myco-models",
  "myco-server",
@@ -1100,6 +1101,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "myco-kind-notifier"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "myco-instance",
+ "myco-kind-chat",
+ "myco-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

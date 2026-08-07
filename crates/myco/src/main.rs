@@ -88,6 +88,10 @@ async fn main() {
         catalog,
         default_model,
     )));
+    pool.register(Arc::new(myco_kind_notifier::NotifierKind::new(pool.clone())));
+    // The operator signs in via operator.token without touching the token
+    // endpoint, so their inbox is provisioned here.
+    myco_server::ensure_notifier(&pool, &operator);
 
     let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
         .unwrap_or_else(|e| fatal(e));
