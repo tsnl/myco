@@ -1,22 +1,28 @@
 //! Credentials and access tokens: the store behind `POST /api/auth/token`.
-//! Ported from v2 (`main-v2:src/auth/mod.rs`), which got this right; the
-//! passkey half of the store follows in its own PR.
+//! Ported from v2 (`main-v2:src/auth/mod.rs`), which got this right.
 //!
 //! Two ways in, ranked by strength — and no passwords at all:
 //!
 //! - **One-time codes**, the bootstrap and recovery path. The operator mints
 //!   one; it redeems exactly once at the token endpoint (`grant_type=code`)
 //!   for a bearer token with a fixed lifetime.
-//! - **Passkeys**, the steady state (arrives with the WebAuthn PRs).
+//! - **Passkeys**, the steady state: WebAuthn credentials enrolled by any
+//!   signed-in session, persisted in `passkeys.json`. (The HTTP ceremonies
+//!   arrive in the next PR; this store holds the credentials and the
+//!   in-flight ceremony state.)
 //!
 //! ## Where the data lives
 //!
 //! - **users** — id → [`StoredUser`] (name, disabled flag, timestamps).
 //!   Snapshotted to `$MYCO_HOME/auth.json` on every write, so a disabled
 //!   account stays disabled across restarts.
-//! - **tokens, codes** — never persisted. A restart logs everyone out and
-//!   voids every outstanding code, which is the behavior you want from a
-//!   process that just changed underneath its clients.
+//! - **passkeys** — id → enrolled credentials, in `passkeys.json` next to
+//!   `auth.json`. The only durable credential-holder, and it holds public
+//!   keys.
+//! - **tokens, codes, ceremonies** — never persisted. A restart logs
+//!   everyone out and voids every outstanding code and half-finished
+//!   ceremony, which is the behavior you want from a process that just
+//!   changed underneath its clients.
 //!
 //! Tokens and codes are stored *hashed*, because the store is a credential
 //! table: reading a memory dump must not hand over a live session. Lookup
@@ -31,6 +37,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use rand::TryRngCore as _;
 use sha2::{Digest, Sha256};
+use webauthn_rs::prelude::{Passkey, PasskeyAuthentication, PasskeyRegistration};
 
 /// How long an issued access token stays valid.
 pub const ACCESS_TOKEN_TTL_HOURS: i64 = 12;
@@ -39,6 +46,10 @@ pub const ACCESS_TOKEN_TTL_HOURS: i64 = 12;
 /// handed to a person out-of-band (a message, a shoulder); a quarter hour
 /// covers that without leaving live codes lying around.
 pub const CODE_TTL_MINUTES: i64 = 15;
+
+/// How long an in-flight passkey ceremony (a challenge the browser has not
+/// answered yet) stays valid.
+pub const CEREMONY_TTL_MINUTES: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -61,6 +72,10 @@ pub struct StoredToken {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
+
+/// A parked passkey-login ceremony: whose it is, its server-side state, and
+/// when it stops being answerable.
+type PendingAuthentication = (String, PasskeyAuthentication, DateTime<Utc>);
 
 /// An operator-minted one-time code, stored hashed like a token. Memory-only
 /// and single-use: it exists to be redeemed against *this* server process —
@@ -142,6 +157,15 @@ struct Snapshot {
     users: Vec<StoredUser>,
 }
 
+/// `passkeys.json`: user id → enrolled credentials. Kept as its own file
+/// rather than a field of `auth.json` so each snapshot stays a single
+/// concern: who exists, versus what they hold.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PasskeySnapshot {
+    #[serde(default)]
+    passkeys: HashMap<String, Vec<Passkey>>,
+}
+
 /// The in-memory credential store. Cheap to read (an `RwLock` over maps),
 /// and the only thing that can turn a bearer token into a person.
 pub struct AuthStore {
@@ -149,6 +173,13 @@ pub struct AuthStore {
     tokens: RwLock<HashMap<String, StoredToken>>,
     /// One-time codes, hashed → record. Memory-only (see [`StoredCode`]).
     codes: RwLock<HashMap<String, StoredCode>>,
+    /// Enrolled passkeys per user, persisted to `passkeys.json`.
+    passkeys: RwLock<HashMap<String, Vec<Passkey>>>,
+    passkeys_path: Option<PathBuf>,
+    /// In-flight registration ceremonies, one per user (the newest wins).
+    reg_states: RwLock<HashMap<String, (PasskeyRegistration, DateTime<Utc>)>>,
+    /// In-flight login ceremonies, keyed by an opaque ticket.
+    auth_states: RwLock<HashMap<String, PendingAuthentication>>,
     /// Where users are snapshotted. `None` for tests that want a pure
     /// in-memory store with no disk footprint at all.
     path: Option<PathBuf>,
@@ -161,6 +192,10 @@ impl AuthStore {
             users: RwLock::new(HashMap::new()),
             tokens: RwLock::new(HashMap::new()),
             codes: RwLock::new(HashMap::new()),
+            passkeys: RwLock::new(HashMap::new()),
+            passkeys_path: None,
+            reg_states: RwLock::new(HashMap::new()),
+            auth_states: RwLock::new(HashMap::new()),
             path: None,
         }
     }
@@ -170,8 +205,9 @@ impl AuthStore {
         Ok(crate::util::data_root()?.join("auth.json"))
     }
 
-    /// Load the user snapshot from `path`, or start empty if it is absent.
-    /// Tokens always start empty — a restart is a logout.
+    /// Load the user and passkey snapshots from `path` (and its sibling
+    /// `passkeys.json`), or start empty where absent. Tokens always start
+    /// empty — a restart is a logout.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, AuthError> {
         let path = path.into();
         let users = match std::fs::read(&path) {
@@ -183,12 +219,47 @@ impl AuthStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(AuthError::Io(format!("read {}: {e}", path.display()))),
         };
+        let passkeys_path = path.with_file_name("passkeys.json");
+        let passkeys = match std::fs::read(&passkeys_path) {
+            Ok(bytes) => {
+                serde_json::from_slice::<PasskeySnapshot>(&bytes)
+                    .map_err(|e| AuthError::Io(format!("parse {}: {e}", passkeys_path.display())))?
+                    .passkeys
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                return Err(AuthError::Io(format!(
+                    "read {}: {e}",
+                    passkeys_path.display()
+                )));
+            }
+        };
         Ok(Self {
             users: RwLock::new(users),
             tokens: RwLock::new(HashMap::new()),
             codes: RwLock::new(HashMap::new()),
+            passkeys: RwLock::new(passkeys),
+            passkeys_path: Some(passkeys_path),
+            reg_states: RwLock::new(HashMap::new()),
+            auth_states: RwLock::new(HashMap::new()),
             path: Some(path),
         })
+    }
+
+    fn persist_passkeys(&self) -> Result<(), AuthError> {
+        let Some(path) = &self.passkeys_path else {
+            return Ok(());
+        };
+        let passkeys = self.passkeys.read().unwrap_or_else(|e| e.into_inner());
+        let bytes = serde_json::to_vec_pretty(&PasskeySnapshot {
+            passkeys: passkeys.clone(),
+        })
+        .map_err(|e| AuthError::Io(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AuthError::Io(format!("create {}: {e}", parent.display())))?;
+        }
+        crate::util::atomically_write(path, &bytes).map_err(AuthError::Io)
     }
 
     fn persist(&self) -> Result<(), AuthError> {
@@ -245,10 +316,10 @@ impl AuthStore {
         self.persist()
     }
 
-    /// Remove a user entirely: sessions and outstanding codes die with
-    /// them. Entries they already authored keep their name, since a
-    /// transcript is a record of what happened, not of who currently has an
-    /// account. (Passkey forgetting joins this in the passkey PR.)
+    /// Remove a user entirely: sessions, outstanding codes, passkeys, and
+    /// in-flight ceremonies all die with them. Entries they already authored
+    /// keep their name, since a transcript is a record of what happened, not
+    /// of who currently has an account.
     pub fn remove_user(&self, id: &str) -> Result<(), AuthError> {
         let id = normalize_id(id);
         {
@@ -262,6 +333,15 @@ impl AuthStore {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, c| c.user_id != id);
+        self.reg_states
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.auth_states
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (uid, _, _)| *uid != id);
+        self.clear_passkeys(&id)?;
         self.persist()
     }
 
@@ -375,6 +455,122 @@ impl AuthStore {
             return Err(AuthError::Disabled);
         }
         Ok(self.issue(&user))
+    }
+
+    // -- passkeys ----------------------------------------------------------
+
+    pub fn passkeys_for(&self, id: &str) -> Vec<Passkey> {
+        self.passkeys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&normalize_id(id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every user's passkey count, for the admin listing.
+    pub fn passkey_counts(&self) -> HashMap<String, usize> {
+        self.passkeys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, list)| (id.clone(), list.len()))
+            .collect()
+    }
+
+    /// Record a freshly enrolled credential.
+    pub fn add_passkey(&self, id: &str, passkey: Passkey) -> Result<usize, AuthError> {
+        let id = normalize_id(id);
+        let count = {
+            let mut passkeys = self.passkeys.write().unwrap_or_else(|e| e.into_inner());
+            let list = passkeys.entry(id).or_default();
+            list.push(passkey);
+            list.len()
+        };
+        self.persist_passkeys()?;
+        Ok(count)
+    }
+
+    /// Apply a successful authentication's credential update (sign counter,
+    /// backup state) to the stored copy.
+    pub fn update_passkey(
+        &self,
+        id: &str,
+        result: &webauthn_rs::prelude::AuthenticationResult,
+    ) -> Result<(), AuthError> {
+        let changed = {
+            let mut passkeys = self.passkeys.write().unwrap_or_else(|e| e.into_inner());
+            passkeys
+                .get_mut(&normalize_id(id))
+                .map(|list| {
+                    list.iter_mut()
+                        .filter_map(|p| p.update_credential(result))
+                        .any(|updated| updated)
+                })
+                .unwrap_or(false)
+        };
+        if changed {
+            self.persist_passkeys()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Forget every credential for `id` (lost or compromised authenticator).
+    pub fn clear_passkeys(&self, id: &str) -> Result<usize, AuthError> {
+        let removed = self
+            .passkeys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&normalize_id(id))
+            .map(|l| l.len())
+            .unwrap_or(0);
+        self.persist_passkeys()?;
+        Ok(removed)
+    }
+
+    // -- passkey ceremony state -------------------------------------------
+
+    /// Park a registration challenge for `id` (the newest wins — a user who
+    /// restarts the ceremony should not race their own abandoned attempt).
+    pub fn store_registration(&self, id: &str, state: PasskeyRegistration) {
+        let mut states = self.reg_states.write().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        states.retain(|_, (_, exp)| *exp > now);
+        states.insert(
+            normalize_id(id),
+            (state, now + Duration::minutes(CEREMONY_TTL_MINUTES)),
+        );
+    }
+
+    pub fn take_registration(&self, id: &str) -> Option<PasskeyRegistration> {
+        let mut states = self.reg_states.write().unwrap_or_else(|e| e.into_inner());
+        let (state, expires) = states.remove(&normalize_id(id))?;
+        (expires > Utc::now()).then_some(state)
+    }
+
+    /// Park a login challenge under a fresh opaque ticket.
+    pub fn store_authentication(&self, id: &str, state: PasskeyAuthentication) -> String {
+        let raw: [u8; 16] = random_bytes();
+        let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        let mut states = self.auth_states.write().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        states.retain(|_, (_, _, exp)| *exp > now);
+        states.insert(
+            ticket.clone(),
+            (
+                normalize_id(id),
+                state,
+                now + Duration::minutes(CEREMONY_TTL_MINUTES),
+            ),
+        );
+        ticket
+    }
+
+    pub fn take_authentication(&self, ticket: &str) -> Option<(String, PasskeyAuthentication)> {
+        let mut states = self.auth_states.write().unwrap_or_else(|e| e.into_inner());
+        let (id, state, expires) = states.remove(ticket)?;
+        (expires > Utc::now()).then_some((id, state))
     }
 
     // -- the grant ---------------------------------------------------------

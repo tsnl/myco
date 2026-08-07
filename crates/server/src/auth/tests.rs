@@ -1,6 +1,7 @@
-//! Ported from v2's passwordless auth suite; the passkey tests follow the
-//! passkey PR. Sign-in is codes-only here, exercised the way a person does
-//! it: mint, redeem, present the bearer token.
+//! Ported from v2's passwordless auth suite. Sign-in is exercised the way a
+//! person does it: mint a code, redeem it, present the bearer token — and
+//! for passkeys, real credentials minted by a software authenticator
+//! ([`SoftEnroller`]) driven through full WebAuthn ceremonies, no HTTP.
 
 use super::*;
 
@@ -254,4 +255,178 @@ fn disabled_and_unknown_users_cannot_be_minted_for() {
     store.set_disabled("ada", true).unwrap();
     assert!(store.mint_code("ada").is_err());
     assert!(store.mint_code("nobody").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Passkeys
+// ---------------------------------------------------------------------------
+
+use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
+use webauthn_rs::prelude::{AuthenticationResult, Url, Uuid, Webauthn, WebauthnBuilder};
+
+/// A relying party and a software authenticator in one: everything needed
+/// to mint real [`Passkey`] values (and answer challenges with them)
+/// without a browser or an HTTP stack.
+struct SoftEnroller {
+    rp: Webauthn,
+    origin: Url,
+    authenticator: WebauthnAuthenticator<SoftToken>,
+}
+
+impl SoftEnroller {
+    fn new() -> Self {
+        let origin = Url::parse("http://localhost").expect("origin");
+        let rp = WebauthnBuilder::new("localhost", &origin)
+            .expect("relying party")
+            .rp_name("myco-tests")
+            .build()
+            .expect("webauthn");
+        let (token, _cert) = SoftToken::new(true).expect("soft token");
+        Self {
+            rp,
+            origin,
+            authenticator: WebauthnAuthenticator::new(token),
+        }
+    }
+
+    /// The full registration ceremony, start to credential.
+    fn enroll(&mut self, id: &str, name: &str) -> Passkey {
+        let (challenge, state) = self
+            .rp
+            .start_passkey_registration(Uuid::new_v4(), id, name, None)
+            .expect("start registration");
+        let created = self
+            .authenticator
+            .do_registration(self.origin.clone(), challenge)
+            .expect("softtoken registration");
+        self.rp
+            .finish_passkey_registration(&created, &state)
+            .expect("finish registration")
+    }
+
+    /// The full login ceremony against `passkeys`, start to verified result.
+    fn sign(&mut self, passkeys: &[Passkey]) -> AuthenticationResult {
+        let (challenge, state) = self
+            .rp
+            .start_passkey_authentication(passkeys)
+            .expect("start authentication");
+        let asserted = self
+            .authenticator
+            .do_authentication(self.origin.clone(), challenge)
+            .expect("softtoken assertion");
+        self.rp
+            .finish_passkey_authentication(&asserted, &state)
+            .expect("finish authentication")
+    }
+}
+
+/// The point of passkeys over tokens: they persist. And the persisted copy
+/// is not just present after a reopen — it still *works*, answering a full
+/// authentication ceremony.
+#[test]
+fn passkeys_enroll_persist_and_answer_sign_ins_across_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("auth.json");
+    let mut enroller = SoftEnroller::new();
+
+    {
+        let store = AuthStore::open(&path).expect("open");
+        store.add_user("ada", "Ada Lovelace").expect("add");
+        let enrolled = enroller.enroll("ada", "Ada Lovelace");
+        // Ids stay case-insensitive handles on this axis too.
+        assert_eq!(store.add_passkey("Ada", enrolled).unwrap(), 1);
+        assert_eq!(store.passkeys_for("ADA").len(), 1);
+    }
+    assert!(
+        path.with_file_name("passkeys.json").exists(),
+        "credentials live in their own file next to auth.json"
+    );
+
+    let store = AuthStore::open(&path).expect("reopen");
+    assert_eq!(store.passkey_counts().get("ada"), Some(&1));
+    let result = enroller.sign(&store.passkeys_for("ada"));
+    store
+        .update_passkey("ada", &result)
+        .expect("the counter update writes back");
+}
+
+#[test]
+fn clearing_passkeys_forgets_them_durably() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("auth.json");
+    let mut enroller = SoftEnroller::new();
+
+    let store = AuthStore::open(&path).expect("open");
+    store.add_user("ada", "Ada").expect("add");
+    store
+        .add_passkey("ada", enroller.enroll("ada", "Ada"))
+        .expect("enroll");
+    assert_eq!(store.clear_passkeys("ada").unwrap(), 1);
+    assert!(store.passkeys_for("ada").is_empty());
+
+    let reopened = AuthStore::open(&path).expect("reopen");
+    assert_eq!(reopened.passkey_counts().get("ada"), None);
+}
+
+/// "Forget a user" means the passkey axis too: credentials and any
+/// half-finished ceremonies die with the account.
+#[test]
+fn removing_a_user_purges_passkeys_and_ceremonies() {
+    let mut enroller = SoftEnroller::new();
+    let store = AuthStore::in_memory();
+    store.add_user("ada", "Ada").expect("add");
+    let passkey = enroller.enroll("ada", "Ada");
+    store
+        .add_passkey("ada", passkey.clone())
+        .expect("add passkey");
+
+    // Park one ceremony of each shape, then remove.
+    let (_, reg) = enroller
+        .rp
+        .start_passkey_registration(Uuid::new_v4(), "ada", "Ada", None)
+        .expect("start registration");
+    store.store_registration("ada", reg);
+    let (_, auth) = enroller
+        .rp
+        .start_passkey_authentication(&[passkey])
+        .expect("start authentication");
+    let ticket = store.store_authentication("ada", auth);
+
+    store.remove_user("ada").expect("remove");
+    assert_eq!(store.passkey_counts().get("ada"), None);
+    assert!(store.take_registration("ada").is_none());
+    assert!(store.take_authentication(&ticket).is_none());
+}
+
+/// Ceremony state is single-use by construction: `take_*` removes as it
+/// answers, so a finished (or replayed) ceremony cannot be finished again.
+#[test]
+fn ceremony_state_is_taken_exactly_once() {
+    let mut enroller = SoftEnroller::new();
+    let store = store_with_user();
+
+    let (_, reg) = enroller
+        .rp
+        .start_passkey_registration(Uuid::new_v4(), "ada", "Ada", None)
+        .expect("start registration");
+    store.store_registration("ada", reg);
+    assert!(store.take_registration("ada").is_some());
+    assert!(store.take_registration("ada").is_none(), "single use");
+
+    let passkey = enroller.enroll("ada", "Ada");
+    let (_, first) = enroller
+        .rp
+        .start_passkey_authentication(std::slice::from_ref(&passkey))
+        .expect("start");
+    let (_, second) = enroller
+        .rp
+        .start_passkey_authentication(&[passkey])
+        .expect("start again");
+    let t1 = store.store_authentication("ada", first);
+    let t2 = store.store_authentication("ada", second);
+    assert_ne!(t1, t2, "tickets are fresh and opaque");
+    assert!(store.take_authentication("bogus-ticket").is_none());
+    assert!(store.take_authentication(&t1).is_some());
+    assert!(store.take_authentication(&t1).is_none(), "single use");
+    assert!(store.take_authentication(&t2).is_some(), "and independent");
 }
