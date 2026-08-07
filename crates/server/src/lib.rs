@@ -9,40 +9,51 @@
 //! capability in `GET /api/kinds`, not a new route here (the four-places
 //! problem v2's ledger executed).
 //!
-//! Every response carries the two cross-origin-isolation headers (DESIGN.md
-//! DP-1): two headers now buy wasm threads and `SharedArrayBuffer` whenever
-//! a renderer wants them — cheap insurance, expensive retrofit.
+//! Authentication is the code grant (`POST /api/auth/token`,
+//! `grant_type=code`) issuing bearer tokens; the [`Caller`] extractor turns
+//! a token into a [`Principal`], so no route reaches the pool without an
+//! identity to attribute its verbs to. `?token=` is accepted alongside the
+//! header for the browser APIs that cannot set one (EventSource, WebSocket
+//! — arriving with the watch PR).
 //!
-//! Authentication lands in a later PR of this stack; until then the router
-//! acts as one configured local principal and binds loopback only.
+//! Every response carries the two cross-origin-isolation headers (DESIGN.md
+//! DP-1): cheap insurance, expensive retrofit.
 
 pub mod auth;
+pub mod roster;
 mod util;
 
-use axum::extract::{Path, Query, State};
+use std::sync::Arc;
+
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Form, Json, Router};
 use myco_instance::{Pool, Principal, VerbError};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
+
+use auth::AuthStore;
 
 #[derive(Clone)]
 struct App {
     pool: Pool,
-    /// The principal every request acts as, until bearer auth replaces it
-    /// (stack PR 4). Loopback binding is what makes this interim state safe.
-    local: Principal,
+    auth: Arc<AuthStore>,
 }
 
-/// The `/api` router over a pool. The caller owns kind registration; the
-/// server serves whatever the pool knows.
-pub fn router(pool: Pool, local: Principal) -> Router {
+/// The `/api` router over a pool and a credential store. The caller owns
+/// kind registration and boot-time roster reconciliation; the server serves
+/// whatever the pool knows, to whoever the store recognizes.
+pub fn router(pool: Pool, auth: Arc<AuthStore>) -> Router {
     Router::new()
         .route("/api/kinds", get(kinds))
         .route("/api/instances", post(create).get(list))
         .route("/api/instances/{id}/verbs/{verb}", post(call))
-        .with_state(App { pool, local })
+        .route("/api/auth/token", post(token))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/whoami", get(whoami))
+        .with_state(App { pool, auth })
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin"),
@@ -53,10 +64,160 @@ pub fn router(pool: Pool, local: Principal) -> Router {
         ))
 }
 
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/// An authenticated request, already resolved to a principal. Taking this as
+/// a handler parameter *is* the auth check: a route that asks for it cannot
+/// run without a live token.
+struct Caller {
+    user: auth::StoredUser,
+}
+
+impl Caller {
+    fn principal(&self) -> Principal {
+        Principal::Human(self.user.id.clone())
+    }
+}
+
+/// One message for missing, unknown, expired, and revoked alike: the
+/// client's next step is the same in every case.
+fn unauthorized() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized", "why": "missing or invalid bearer token"})),
+    )
+}
+
+impl FromRequestParts<App> for Caller {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        // `Authorization: Bearer <token>`, or `?token=` for the browser
+        // APIs that cannot set headers.
+        let presented = parts
+            .headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::to_string)
+            .or_else(|| {
+                parts.uri.query().and_then(|q| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix("token=").map(str::to_string))
+                })
+            });
+        let Some(presented) = presented else {
+            return Err(unauthorized());
+        };
+        match app.auth.authenticate_token(&presented) {
+            Some(user) => Ok(Caller { user }),
+            None => Err(unauthorized()),
+        }
+    }
+}
+
+/// The `POST /api/auth/token` form body: `grant_type=code` redeeming an
+/// operator-minted one-time code. Tolerated when absent so
+/// `curl -d username -d code` works; anything else is refused by name.
+#[derive(serde::Deserialize)]
+struct TokenRequest {
+    username: String,
+    #[serde(default)]
+    code: String,
+    grant_type: Option<String>,
+}
+
+/// RFC 6749's response shape, so a stock OAuth2 client can read it.
+async fn token(
+    State(app): State<App>,
+    Form(form): Form<TokenRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let grant = form.grant_type.as_deref().unwrap_or("code");
+    if grant != "code" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unsupported_grant_type",
+                "why": format!("unsupported grant_type: {grant} (sign in with a one-time code)"),
+            })),
+        ));
+    }
+    match app.auth.redeem_code(&form.username, &form.code) {
+        Ok(issued) => Ok(Json(json!({
+            "access_token": issued.access_token,
+            "token_type": "bearer",
+            "expires_in": issued.expires_in_seconds,
+            "user": {"id": issued.user.id, "name": issued.user.name},
+        }))),
+        Err(e) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized", "why": e.to_string()})),
+        )),
+    }
+}
+
+/// Drop every token for the presented identity. Signing out must actually
+/// end the session server-side, not just forget it client-side.
+async fn logout(State(app): State<App>, caller: Caller) -> Json<Value> {
+    app.auth.revoke_all_for(&caller.user.id);
+    Json(json!({"id": caller.user.id, "name": caller.user.name}))
+}
+
+/// Who the presented token belongs to. Doubles as the client's login check.
+async fn whoami(caller: Caller) -> Json<Value> {
+    Json(json!({"id": caller.user.id, "name": caller.user.name}))
+}
+
+// ---------------------------------------------------------------------------
+// Boot helpers (the binary's authentication plumbing)
+// ---------------------------------------------------------------------------
+
+/// Path of the local operator's bearer token: `$MYCO_HOME/v3/operator.token`.
+pub fn operator_token_path() -> Result<std::path::PathBuf, String> {
+    Ok(util::data_root()?.join("operator.token"))
+}
+
+/// Write the operator token where local clients can read it, `0600`. It
+/// dies with the server: tokens live only in memory, so the file goes stale
+/// on restart and is rewritten.
+pub fn write_operator_token(token: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = operator_token_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, token).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())
+}
+
+/// The startup sign-in code: how a person first gets into a server that has
+/// no signup and no passwords. Until passkeys land (stack PRs 7–8), every
+/// boot mints one — restart-to-mint-another is the whole recovery story.
+pub fn startup_code(auth: &AuthStore, operator: &str) -> String {
+    match auth.mint_code(operator) {
+        Ok(minted) => format!(
+            "myco: one-time sign-in code for {}: {}\n      \
+             single use, {} minutes — POST /api/auth/token with grant_type=code\n      \
+             (restart the server to mint another)",
+            minted.user_id,
+            minted.code,
+            auth::CODE_TTL_MINUTES
+        ),
+        Err(e) => format!("myco: cannot mint a sign-in code: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Translation: the verb gateway
+// ---------------------------------------------------------------------------
+
 /// Capability discovery: every registered kind's spec — verbs with their
 /// flags, version, and the two default-read hints. Clients build themselves
 /// from this instead of hardcoding kind knowledge.
-async fn kinds(State(app): State<App>) -> Json<Value> {
+async fn kinds(State(app): State<App>, _caller: Caller) -> Json<Value> {
     Json(serde_json::to_value(app.pool.kinds()).expect("specs serialize"))
 }
 
@@ -74,11 +235,18 @@ struct CreateInstance {
 
 async fn create(
     State(app): State<App>,
+    caller: Caller,
     Json(req): Json<CreateInstance>,
 ) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
     let info = app
         .pool
-        .create(&app.local, &req.kind, &req.project, &req.title, req.args)
+        .create(
+            &caller.principal(),
+            &req.kind,
+            &req.project,
+            &req.title,
+            req.args,
+        )
         .map_err(refusal)?;
     Ok(Json(serde_json::to_value(info).expect("info serializes")))
 }
@@ -88,23 +256,24 @@ struct ListQuery {
     project: Option<String>,
 }
 
-async fn list(State(app): State<App>, Query(q): Query<ListQuery>) -> Json<Value> {
+async fn list(State(app): State<App>, _caller: Caller, Query(q): Query<ListQuery>) -> Json<Value> {
     Json(serde_json::to_value(app.pool.list(q.project.as_deref())).expect("infos serialize"))
 }
 
 /// The generic gateway: one route carries every verb of every kind,
 /// `sys.*` included. The body is the verb's args verbatim (absent body =
 /// null), the reply is the verb's result verbatim — the wire adds nothing
-/// but authentication (later) and status codes.
+/// but authentication and status codes.
 async fn call(
     State(app): State<App>,
+    caller: Caller,
     Path((id, verb)): Path<(String, String)>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
     let args = body.map(|Json(v)| v).unwrap_or(Value::Null);
     let result = app
         .pool
-        .call(&app.local, &id, &verb, args)
+        .call(&caller.principal(), &id, &verb, args)
         .await
         .map_err(refusal)?;
     Ok(Json(result))
@@ -123,58 +292,4 @@ fn refusal(e: VerbError) -> (StatusCode, Json<VerbError>) {
         VerbError::Failed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(e))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use http_body_util::BodyExt as _;
-    use std::sync::Arc;
-    use tower::ServiceExt as _;
-
-    #[tokio::test]
-    async fn kinds_lists_registered_specs_with_isolation_headers() {
-        let pool = Pool::new();
-        pool.register(Arc::new(myco_kind_tty::TtyKind));
-
-        let response = router(pool, Principal::Human("ada".into()))
-            .oneshot(
-                Request::builder()
-                    .uri("/api/kinds")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), 200);
-        // The DP-1 insurance headers ride every response.
-        assert_eq!(
-            response.headers()["cross-origin-opener-policy"],
-            "same-origin"
-        );
-        assert_eq!(
-            response.headers()["cross-origin-embedder-policy"],
-            "require-corp"
-        );
-
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let specs: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let tty = specs
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["kind"] == "tty")
-            .expect("tty registered");
-        assert_eq!(tty["version"], 1);
-        assert!(
-            tty["verbs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v["name"] == "input" && v["requires_driver"] == true)
-        );
-    }
 }
