@@ -40,6 +40,43 @@ impl RosterUser {
 pub struct FileRoster {
     #[serde(default)]
     pub users: Vec<RosterUser>,
+    /// Optional `[passkeys]` section; defaults serve the localhost story.
+    #[serde(default)]
+    pub passkeys: PasskeySettings,
+}
+
+/// `[passkeys]` in `server.toml`: the WebAuthn relying party.
+///
+/// The defaults bind passkeys to `localhost` with any port allowed, which
+/// covers the doctrine's remote pattern (an SSH tunnel — the browser still
+/// sees `localhost`, a secure context) as well as any local dev proxy. Set
+/// both fields if the client is ever browsed at a real HTTPS hostname; the
+/// rp_id must be a domain (passkeys cannot bind to an IP address), and
+/// changing it strands passkeys enrolled under the old one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PasskeySettings {
+    #[serde(default = "default_rp_id")]
+    pub rp_id: String,
+    /// The origin the client is browsed at, scheme included.
+    #[serde(default = "default_rp_origin")]
+    pub origin: String,
+}
+
+fn default_rp_id() -> String {
+    "localhost".into()
+}
+
+fn default_rp_origin() -> String {
+    "http://localhost".into()
+}
+
+impl Default for PasskeySettings {
+    fn default() -> Self {
+        Self {
+            rp_id: default_rp_id(),
+            origin: default_rp_origin(),
+        }
+    }
 }
 
 /// The validated roster, plus which entry this process is acting as — the
@@ -49,6 +86,8 @@ pub struct Roster {
     pub path: PathBuf,
     users: Vec<RosterUser>,
     local: usize,
+    /// The WebAuthn relying party (`[passkeys]` in the same file).
+    pub passkeys: PasskeySettings,
 }
 
 /// What a usable `server.toml` looks like, quoted in every startup error so
@@ -79,7 +118,7 @@ impl Roster {
         file: FileRoster,
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let users = file.users;
+        let FileRoster { users, passkeys } = file;
         if users.is_empty() {
             return Err(format!(
                 "no users defined in {} — add at least one [[users]] entry:\n\n{EXAMPLE_SERVER_TOML}",
@@ -130,7 +169,12 @@ impl Roster {
             )
         })?;
 
-        Ok(Self { path, users, local })
+        Ok(Self {
+            path,
+            users,
+            local,
+            passkeys,
+        })
     }
 }
 
@@ -231,6 +275,20 @@ id = "grace"
 
         let spacey = roster("[[users]]\nid = \"ada l\"\n", &[("USER", "ada l")]).unwrap_err();
         assert!(spacey.contains("whitespace"), "{spacey}");
+    }
+
+    #[test]
+    fn the_passkeys_section_is_optional_with_localhost_defaults() {
+        let r = roster(TWO_USERS, &[("USER", "ada")]).unwrap();
+        assert_eq!(r.passkeys.rp_id, "localhost");
+        assert_eq!(r.passkeys.origin, "http://localhost");
+
+        let configured = format!(
+            "{TWO_USERS}\n[passkeys]\nrp_id = \"myco.example\"\norigin = \"https://myco.example\"\n"
+        );
+        let r = roster(&configured, &[("USER", "ada")]).unwrap();
+        assert_eq!(r.passkeys.rp_id, "myco.example");
+        assert_eq!(r.passkeys.origin, "https://myco.example");
     }
 
     #[test]
