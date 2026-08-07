@@ -12,7 +12,7 @@
 //! ## Where the data lives
 //!
 //! - **users** — id → [`StoredUser`] (name, disabled flag, timestamps).
-//!   Snapshotted to `$MYCO_HOME/v3/auth.json` on every write, so a disabled
+//!   Snapshotted to `$MYCO_HOME/auth.json` on every write, so a disabled
 //!   account stays disabled across restarts.
 //! - **tokens, codes** — never persisted. A restart logs everyone out and
 //!   voids every outstanding code, which is the behavior you want from a
@@ -165,7 +165,7 @@ impl AuthStore {
         }
     }
 
-    /// Default location: `$MYCO_HOME/v3/auth.json`.
+    /// Default location: `$MYCO_HOME/auth.json`.
     pub fn default_path() -> Result<PathBuf, String> {
         Ok(crate::util::data_root()?.join("auth.json"))
     }
