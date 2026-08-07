@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use clap::Parser;
+
+mod webdist;
 use myco_instance::Pool;
 use myco_server::auth::AuthStore;
 use myco_server::roster;
@@ -94,7 +96,11 @@ async fn main() {
     myco_server::ensure_notifier(&pool, &operator);
 
     let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
-        .unwrap_or_else(|e| fatal(e));
+        .unwrap_or_else(|e| fatal(e))
+        // The delivery decision: the same origin serves the client. /api/*
+        // wins; everything else answers the shell (or the honest
+        // placeholder when the client was not built in).
+        .fallback(webdist::serve);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
