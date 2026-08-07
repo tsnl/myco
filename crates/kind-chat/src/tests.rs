@@ -684,19 +684,29 @@ async fn subagents_two_deep_may_not_spawn_deeper() {
 async fn a_watched_terminal_splices_deltas_into_turns_exactly_once() {
     let scripted = ScriptedModel::replying(&["saw it", "saw the rest"]);
     let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
-    // `stty -echo` silences the pty's input echo, so every line appears in
-    // the scrollback exactly once (cat's copy) — without it, the echo and
-    // cat's output are two copies racing across refreshes, and a late
-    // first-round copy would masquerade as second-round delta.
+    // `stty -echo` silences the pty's input echo so every typed line lands
+    // in the scrollback exactly once (cat's copy). The READY sentinel
+    // matters: typing before stty has executed would still be echoed, and
+    // that stray copy arriving late would masquerade as a later delta. We
+    // type only after READY proves echo is off, and watch only after it,
+    // so the primed cursor starts past the sentinel.
     let tty = pool
         .create(
             &ada(),
             "tty",
             "",
             "cat",
-            json!({"command": "stty -echo; cat"}),
+            json!({"command": "stty -echo; echo READY; cat"}),
         )
         .expect("tty");
+    let mut mark = 0;
+    loop {
+        let text = pool.call(&ada(), &tty.id, "text", Value::Null).await.unwrap();
+        if text["text"].as_str().unwrap_or("").contains("READY") {
+            break;
+        }
+        mark = pool.changed(&tty.id, mark).await.expect("changed");
+    }
 
     let watching = pool
         .call(&ada(), &id, "watch", json!({"instance": tty.id}))
