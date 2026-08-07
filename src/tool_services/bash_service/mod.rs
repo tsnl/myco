@@ -110,9 +110,10 @@ impl BashService {
                 Raise `timeout_ms` when you need to wait longer for quiet interactive \
                 programs.\n\n\
                 **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
-                process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
-                Tool uses whose `command` starts with `cd` are **rejected** — use `cwd` \
-                instead. (`write` stdin may still send interactive `cd` into a live shell.)",
+                process working directory. Prefer `cwd` over prefixing commands with `cd … &&`, \
+                though both work. A `command` that is *only* a `cd` is **rejected** — it \
+                would have no effect; use `cwd` instead. (`write` stdin may still send \
+                interactive `cd` into a live shell.)",
                 exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
                 exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
                 session_default_s = DEFAULT_TIMEOUT_MS / 1000,
@@ -1451,7 +1452,7 @@ pub struct Input {
     action: Option<ActionKind>,
     /// Command line. For `exec`: run via `bash -c`. For `start`: program line (default `bash -i`).
     ///
-    /// Must not start with `cd` — use [`Self::cwd`] instead.
+    /// Must not be just a `cd` — use [`Self::cwd`] instead.
     #[serde(default)]
     command: Option<String>,
     /// Working directory for `exec` / `start` (process `current_dir`). Prefer this over
@@ -1575,23 +1576,25 @@ enum Action {
     List,
 }
 
-/// True when `command` begins with a shell `cd` (after optional whitespace).
+/// True when `command` is nothing but a shell `cd`: a leading `cd` word with no
+/// follow-on command (no `&&`, `;`, `|`, `&`, or newline).
 ///
-/// Models should use the `cwd` param instead of prefixing with `cd … &&`.
-fn command_starts_with_cd(command: &str) -> bool {
-    let trimmed = command.trim_start();
+/// A lone `cd` is a mistake — in `exec` the process exits before the directory
+/// change matters — so it points the model at the `cwd` param instead.
+/// `cd dir && cmd` works fine and is allowed; `cwd` is merely preferred.
+fn command_is_lone_cd(command: &str) -> bool {
+    let trimmed = command.trim();
     // Match `cd` as a shell word: `cd`, `cd …`, `cd\t…`, not `cdo` / `cdpath`.
-    matches!(trimmed.as_bytes(), [b'c', b'd'])
-        || trimmed.starts_with("cd ")
-        || trimmed.starts_with("cd\t")
-        || trimmed.starts_with("cd\n")
+    let starts_with_cd =
+        trimmed == "cd" || trimmed.starts_with("cd ") || trimmed.starts_with("cd\t");
+    starts_with_cd && !trimmed.contains(['&', ';', '|', '\n'])
 }
 
-fn reject_if_command_starts_with_cd(command: &str) -> Result<(), String> {
-    if command_starts_with_cd(command) {
+fn reject_lone_cd(command: &str) -> Result<(), String> {
+    if command_is_lone_cd(command) {
         return Err(
-            "command must not start with `cd`; pass the directory via the `cwd` parameter instead \
-             (e.g. {\"command\": \"ls\", \"cwd\": \"/path\"} rather than \"cd /path && ls\")"
+            "`command` is only a `cd`, which has no effect here; pass the directory via the \
+             `cwd` parameter instead (e.g. {\"command\": \"ls\", \"cwd\": \"/path\"})"
                 .into(),
         );
     }
@@ -1729,7 +1732,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .clone()
                 .ok_or_else(|| "exec requires `command`".to_string())?;
             require_non_blank("command", &command)?;
-            reject_if_command_starts_with_cd(&command)?;
+            reject_lone_cd(&command)?;
             Ok(Action::Exec {
                 command,
                 cwd,
@@ -1745,7 +1748,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             require_non_blank("session_id", &session_id)?;
             if let Some(command) = input.command.as_deref() {
                 require_non_blank("command", command)?;
-                reject_if_command_starts_with_cd(command)?;
+                reject_lone_cd(command)?;
             }
             Ok(Action::Start {
                 session_id,
