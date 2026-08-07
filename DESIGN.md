@@ -107,6 +107,13 @@ moved), splices results into model context, and dispatches the model's
 named tools (`bash`, `subagent`, …) to verbs. The model never sees a
 generic `call` — unification is for the substrate, never the prompt.
 
+One consequence of the fence-not-abort mailbox: a model *turn* is not a
+mailbox command. It runs as a cancellable side-feed task the chat kind
+owns, so a higher-priority verb — a user's interject, an explicit cancel
+— can abort it mid-stream while the mailbox stays short and the fence
+stays sharp. Cancellation is a kind-level concern; the runtime never
+aborts a command.
+
 ## Concepts (the contract, post-review)
 
 **Instance.** Identity (`id`, `kind`, `project`, `title`), canonical
