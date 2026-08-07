@@ -32,6 +32,7 @@ struct Counter(i64);
 impl Instance for Counter {
     async fn verb(
         &mut self,
+        _caller: &Principal,
         verb: &str,
         args: Value,
         signals: &Signals,
@@ -223,7 +224,13 @@ async fn a_self_call_is_refused_not_deadlocked() {
     }
     #[async_trait::async_trait]
     impl Instance for SelfieInstance {
-        async fn verb(&mut self, verb: &str, args: Value, _: &Signals) -> Result<Value, VerbError> {
+        async fn verb(
+            &mut self,
+            _caller: &Principal,
+            verb: &str,
+            args: Value,
+            _: &Signals,
+        ) -> Result<Value, VerbError> {
             match verb {
                 "recurse" => {
                     let id = args["id"].as_str().unwrap_or_default();
@@ -563,7 +570,13 @@ async fn a_kind_bug_crashes_one_instance_only() {
     struct BuggyInstance;
     #[async_trait::async_trait]
     impl Instance for BuggyInstance {
-        async fn verb(&mut self, verb: &str, _: Value, _: &Signals) -> Result<Value, VerbError> {
+        async fn verb(
+            &mut self,
+            _caller: &Principal,
+            verb: &str,
+            _: Value,
+            _: &Signals,
+        ) -> Result<Value, VerbError> {
             match verb {
                 "boom" => panic!("kind bug"),
                 _ => Ok(json!(1)),

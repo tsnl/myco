@@ -70,6 +70,7 @@ async fn main() {
 
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
+    pool.register(Arc::new(myco_kind_chat::ChatKind));
 
     let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
         .unwrap_or_else(|e| fatal(e));

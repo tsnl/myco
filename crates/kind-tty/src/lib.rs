@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use myco_instance::{Instance, Kind, KindSpec, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Principal, VerbError, VerbSpec};
 use myco_runtime::Signals;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
@@ -159,6 +159,7 @@ struct Tty {
 impl Instance for Tty {
     async fn verb(
         &mut self,
+        _caller: &Principal,
         verb: &str,
         args: Value,
         signals: &Signals,

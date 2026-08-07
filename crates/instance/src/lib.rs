@@ -209,10 +209,16 @@ impl From<CellGone> for VerbError {
 /// A live instance's behavior: dispatch one verb. The framework has already
 /// authorized the call and routed `sys.*`; implementations see only their
 /// own vocabulary. Runs inside the instance's cell — serialized, may await.
+///
+/// `caller` is the authenticated principal the framework already checked —
+/// attribution as a framework fact, so an attributed kind (a chat recording
+/// who posted) can never be lied to by its own arguments. Kinds that don't
+/// attribute simply ignore it.
 #[async_trait::async_trait]
 pub trait Instance: Send {
     async fn verb(
         &mut self,
+        caller: &Principal,
         verb: &str,
         args: Value,
         signals: &Signals,
@@ -552,7 +558,7 @@ impl Pool {
                             return Err(VerbError::NotDriver { held_by: held });
                         }
                     }
-                    instance.verb(&verb_name, args, signals).await
+                    instance.verb(&caller, &verb_name, args, signals).await
                 }))
             })
             .await?
