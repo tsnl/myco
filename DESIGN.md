@@ -472,7 +472,9 @@ Functionality crosses from v2 only with a verdict recorded here.
   dispatcher, standing subscriptions, notifier kind; user-created chats
   and chat-parenting (subagents) fall out.
 - **M3** — GUI: tree sidebar, split-tree panes, renderer registry (tty +
-  chat renderers ported).
+  chat renderers ported). The visual contract is **STYLE.md** (approved
+  "amethyst" direction: islands on violet-biased paper, presence/seat/ember
+  vocabulary, theme-constant terminal material).
 - **M4** — protocol providers (toolds/hosts as bus-over-stdio); cron
   kind; browser kind (`a11y_tree` + `screenshot`, computer-use verb
   vocabulary); web-push delivery for the notifier.
