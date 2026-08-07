@@ -1,5 +1,5 @@
 //! The user roster: who is allowed to drive this server, read from
-//! `$MYCO_HOME/v3/server.toml`. Ported from v2 (`main-v2:src/config/roster.rs`).
+//! `$MYCO_HOME/server.toml`. Ported from v2 (`main-v2:src/config/roster.rs`).
 //!
 //! Instances are attributed — every verb call names its principal — so the
 //! server needs a real identity before it records anything. There is
@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Where the roster lives: `$MYCO_SERVER_CONFIG` → `$MYCO_HOME/v3/server.toml`.
+/// Where the roster lives: `$MYCO_SERVER_CONFIG` → `$MYCO_HOME/server.toml`.
 pub fn resolve_roster_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     if let Some(p) = env("MYCO_SERVER_CONFIG") {
         return Ok(PathBuf::from(p));

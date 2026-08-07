@@ -13,7 +13,7 @@ deliberately tiny: everything is a verb.
     /api/admin/...                           operator only (see Myco.admin_*)
 
 Auth: pass a bearer token, or let it find one — $MYCO_API_TOKEN, then
-$MYCO_HOME/v3/operator.token (written by the server at boot for local
+$MYCO_HOME/operator.token (written by the server at boot for local
 scripts). Remote users redeem a one-time code via Myco.login_with_code
 (minted in the admin surface, or printed by the server at startup).
 
@@ -50,7 +50,7 @@ def _default_token() -> str:
     if tok:
         return tok
     home = pathlib.Path(os.environ.get("MYCO_HOME", pathlib.Path.home() / ".myco"))
-    path = home / "v3" / "operator.token"
+    path = home / "operator.token"
     try:
         return path.read_text().strip()
     except OSError as e:
