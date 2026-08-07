@@ -582,6 +582,28 @@ async fn cancel_mid_command_removes_the_workhorse_terminal() {
     }
 }
 
+/// Exit codes reach the model: a failing command is an error result that
+/// names the code, with the output attached.
+#[tokio::test]
+async fn a_failing_command_reports_its_exit_code_as_an_error() {
+    let scripted = ScriptedModel::new(vec![
+        tool_turn("echo doomed; exit 7", "t1"),
+        myco_models::test_support::text_output("noted the failure"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "try it"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let result = &entries[2]["results"][0];
+    assert_eq!(result["is_error"], json!(true));
+    let why = result["content"][0]["Text"]["text"].as_str().unwrap();
+    assert!(why.contains("exit code 7"), "{why}");
+    assert!(why.contains("doomed"), "{why}");
+}
+
 // ---------------------------------------------------------------------------
 // Subagents
 // ---------------------------------------------------------------------------
