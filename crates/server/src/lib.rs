@@ -3,24 +3,43 @@
 //! into `Pool` calls; the razor for everything in this crate is that it must
 //! be either **authentication** or **translation**, or it belongs elsewhere.
 //!
-//! This is the skeleton: capability discovery (`GET /api/kinds`) over a
-//! generic router, plus the two cross-origin-isolation headers every
-//! response carries from day one (DESIGN.md DP-1: two headers now buy wasm
-//! threads and `SharedArrayBuffer` whenever a renderer wants them — cheap
-//! insurance, expensive retrofit).
+//! The whole instance surface is three translation routes — create, list,
+//! and the generic verb call — because the bus already is the API. There is
+//! no route per operation and never will be: a new verb on a kind is a new
+//! capability in `GET /api/kinds`, not a new route here (the four-places
+//! problem v2's ledger executed).
+//!
+//! Every response carries the two cross-origin-isolation headers (DESIGN.md
+//! DP-1): two headers now buy wasm threads and `SharedArrayBuffer` whenever
+//! a renderer wants them — cheap insurance, expensive retrofit.
+//!
+//! Authentication lands in a later PR of this stack; until then the router
+//! acts as one configured local principal and binds loopback only.
 
-use axum::http::HeaderValue;
-use axum::routing::get;
-use axum::{Json, Router, extract::State};
-use myco_instance::Pool;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use myco_instance::{Pool, Principal, VerbError};
+use serde_json::Value;
 use tower_http::set_header::SetResponseHeaderLayer;
+
+#[derive(Clone)]
+struct App {
+    pool: Pool,
+    /// The principal every request acts as, until bearer auth replaces it
+    /// (stack PR 4). Loopback binding is what makes this interim state safe.
+    local: Principal,
+}
 
 /// The `/api` router over a pool. The caller owns kind registration; the
 /// server serves whatever the pool knows.
-pub fn router(pool: Pool) -> Router {
+pub fn router(pool: Pool, local: Principal) -> Router {
     Router::new()
         .route("/api/kinds", get(kinds))
-        .with_state(pool)
+        .route("/api/instances", post(create).get(list))
+        .route("/api/instances/{id}/verbs/{verb}", post(call))
+        .with_state(App { pool, local })
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin"),
@@ -34,8 +53,73 @@ pub fn router(pool: Pool) -> Router {
 /// Capability discovery: every registered kind's spec — verbs with their
 /// flags, version, and the two default-read hints. Clients build themselves
 /// from this instead of hardcoding kind knowledge.
-async fn kinds(State(pool): State<Pool>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(pool.kinds()).expect("specs serialize"))
+async fn kinds(State(app): State<App>) -> Json<Value> {
+    Json(serde_json::to_value(app.pool.kinds()).expect("specs serialize"))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateInstance {
+    kind: String,
+    /// Empty means unscoped; projects are a grouping key, not a namespace.
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    args: Value,
+}
+
+async fn create(
+    State(app): State<App>,
+    Json(req): Json<CreateInstance>,
+) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
+    let info = app
+        .pool
+        .create(&app.local, &req.kind, &req.project, &req.title, req.args)
+        .map_err(refusal)?;
+    Ok(Json(serde_json::to_value(info).expect("info serializes")))
+}
+
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    project: Option<String>,
+}
+
+async fn list(State(app): State<App>, Query(q): Query<ListQuery>) -> Json<Value> {
+    Json(serde_json::to_value(app.pool.list(q.project.as_deref())).expect("infos serialize"))
+}
+
+/// The generic gateway: one route carries every verb of every kind,
+/// `sys.*` included. The body is the verb's args verbatim (absent body =
+/// null), the reply is the verb's result verbatim — the wire adds nothing
+/// but authentication (later) and status codes.
+async fn call(
+    State(app): State<App>,
+    Path((id, verb)): Path<(String, String)>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
+    let args = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let result = app
+        .pool
+        .call(&app.local, &id, &verb, args)
+        .await
+        .map_err(refusal)?;
+    Ok(Json(result))
+}
+
+/// `VerbError` → HTTP, and the serde form (tagged `error`) *is* the wire
+/// body, so the log's error names and the wire's never disagree.
+fn refusal(e: VerbError) -> (StatusCode, Json<VerbError>) {
+    let status = match &e {
+        VerbError::UnknownKind { .. }
+        | VerbError::UnknownInstance { .. }
+        | VerbError::UnknownVerb { .. } => StatusCode::NOT_FOUND,
+        VerbError::NotDriver { .. } | VerbError::Denied { .. } => StatusCode::FORBIDDEN,
+        VerbError::BadArgs { .. } => StatusCode::BAD_REQUEST,
+        VerbError::Gone => StatusCode::GONE,
+        VerbError::Failed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(e))
 }
 
 #[cfg(test)]
@@ -52,7 +136,7 @@ mod tests {
         let pool = Pool::new();
         pool.register(Arc::new(myco_kind_tty::TtyKind));
 
-        let response = router(pool)
+        let response = router(pool, Principal::Human("ada".into()))
             .oneshot(
                 Request::builder()
                     .uri("/api/kinds")
