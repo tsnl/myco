@@ -245,7 +245,12 @@ pub trait Instance: Send {
 ///   feed, unlike a pty) must be cancelled by the instance's `Drop`.
 pub trait Kind: Send + Sync {
     fn spec(&self) -> &'static KindSpec;
-    fn create(&self, args: Value, signals: Signals) -> Result<Box<dyn Instance>, VerbError>;
+    /// `id` is the instance's own name in the pool — handed in so a kind
+    /// that acts on the bus (a chat dispatching tools) can speak as
+    /// `Principal::Agent(id)` and introspect itself; kinds that don't need
+    /// an identity ignore it.
+    fn create(&self, id: &str, args: Value, signals: Signals)
+    -> Result<Box<dyn Instance>, VerbError>;
 }
 
 /// One `sys.log` entry: who called what, and how it went. The acme `event`
@@ -405,16 +410,17 @@ impl Pool {
                 .cloned()
                 .ok_or_else(|| VerbError::UnknownKind { kind: kind.into() })?
         };
+        // The id exists before the instance does, so `create` can hand its
+        // kind a usable self-name.
+        let id = uuid::Uuid::new_v4().to_string();
         // Subscribe inside the builder, before `create` can spawn side-feed
         // tasks: nothing the instance ever emits predates the subscription.
         let mut cell_events = None;
         let cell = Cell::try_spawn_with(|signals| {
             cell_events = Some(signals.subscribe());
-            factory.create(args, signals)
+            factory.create(&id, args, signals)
         })?;
         let mut rx = cell_events.expect("builder ran");
-
-        let id = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(Entry {
             id: id.clone(),
             kind: factory.spec(),

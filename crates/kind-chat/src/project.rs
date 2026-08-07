@@ -43,6 +43,9 @@ pub fn project(entries: &[Entry]) -> Vec<Message> {
                 tool_uses: tool_uses.clone(),
                 turn_end_reason: turn_end.clone(),
             },
+            Body::ToolResults { results } => Message::ToolResults {
+                tool_use_results: results.clone(),
+            },
         })
         .collect()
 }

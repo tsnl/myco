@@ -1093,6 +1093,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "myco-instance",
+ "myco-kind-tty",
  "myco-models",
  "myco-runtime",
  "serde",

@@ -67,7 +67,7 @@ impl Kind for CounterSpec {
         &COUNTER_SPEC
     }
 
-    fn create(&self, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(&self, _id: &str, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
         let start = args.get("start").and_then(Value::as_i64).unwrap_or(0);
         Ok(Box::new(Counter(start)))
     }
@@ -247,7 +247,7 @@ async fn a_self_call_is_refused_not_deadlocked() {
         fn spec(&self) -> &'static KindSpec {
             &SELFIE_SPEC
         }
-        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(SelfieInstance {
                 pool: self.pool.clone(),
             }))
@@ -587,7 +587,7 @@ async fn a_kind_bug_crashes_one_instance_only() {
         fn spec(&self) -> &'static KindSpec {
             &BUGGY_SPEC
         }
-        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(BuggyInstance))
         }
     }

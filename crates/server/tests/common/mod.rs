@@ -52,7 +52,7 @@ impl Kind for CounterKind {
     fn spec(&self) -> &'static KindSpec {
         &COUNTER_SPEC
     }
-    fn create(&self, args: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(&self, _id: &str, args: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
         Ok(Box::new(Counter(
             args.get("start").and_then(Value::as_i64).unwrap_or(0),
         )))

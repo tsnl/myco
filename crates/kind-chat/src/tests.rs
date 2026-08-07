@@ -17,7 +17,7 @@ fn ada() -> Principal {
 
 fn pool_with_chat(args: Value) -> (Pool, String) {
     let pool = Pool::new();
-    pool.register(Arc::new(ChatKind::default()));
+    pool.register(Arc::new(ChatKind::transcript_only(pool.clone())));
     let info = pool.create(&ada(), "chat", "", "", args).expect("create");
     (pool, info.id)
 }
@@ -40,10 +40,13 @@ context_window = 100000
 fn modeled_pool(factory: ModelFactory) -> (Pool, String) {
     let pool = Pool::new();
     pool.register(Arc::new(ChatKind::with_factory(
+        pool.clone(),
         fake_catalog(),
         Some("fake".into()),
         factory,
     )));
+    // The dispatcher's workhorse: tool turns create tty instances.
+    pool.register(Arc::new(myco_kind_tty::TtyKind));
     let info = pool
         .create(&ada(), "chat", "", "", Value::Null)
         .expect("create");
@@ -398,6 +401,7 @@ async fn a_failing_stream_marks_the_entry_instead_of_wedging_the_chat() {
 async fn an_unknown_model_is_refused_at_create_with_the_catalog_listed() {
     let pool = Pool::new();
     pool.register(Arc::new(ChatKind::with_factory(
+        pool.clone(),
         fake_catalog(),
         None,
         Arc::new(|_| panic!("factory must not run for an unknown key")),
@@ -408,6 +412,173 @@ async fn an_unknown_model_is_refused_at_create_with_the_catalog_listed() {
     match err {
         VerbError::BadArgs { why } => assert!(why.contains("fake"), "{why}"),
         other => panic!("expected BadArgs, got {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+use myco_models::{GenerateOutput, ToolUse, TurnEndReason};
+
+fn tool_turn(command: &str, id: &str) -> GenerateOutput {
+    GenerateOutput {
+        content: vec![],
+        tool_uses: vec![ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input: json!({"command": command}),
+        }],
+        turn_end_reason: TurnEndReason::ToolUse,
+        usage: None,
+    }
+}
+
+/// The whole loop: the model calls bash, the dispatcher runs it as a tty
+/// on the bus (as the agent principal), the result feeds the next
+/// generation, and the workhorse tty is removed afterwards.
+#[tokio::test]
+async fn a_tool_turn_runs_bash_on_the_bus_and_feeds_the_result_back() {
+    let scripted = ScriptedModel::new(vec![
+        tool_turn("echo tool-says-hi", "t1"),
+        myco_models::test_support::text_output("done"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "run it"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+
+    // post · assistant(tool_use) · tool_results · assistant(done)
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[1]["t"], "assistant");
+    assert_eq!(entries[1]["turn_end"], json!("ToolUse"));
+    assert_eq!(entries[1]["tool_uses"][0]["name"], "bash");
+    assert_eq!(entries[2]["t"], "tool_results");
+    let result_text = entries[2]["results"][0]["content"][0]["Text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(result_text.contains("tool-says-hi"), "{result_text}");
+    assert_eq!(entries[2]["results"][0]["id"], "t1", "paired by id");
+    assert_eq!(entries[3]["content"][0]["Text"]["text"], "done");
+
+    // Every model-side entry speaks as the chat's own agent principal.
+    for e in &entries[1..] {
+        assert_eq!(e["author"], json!({"kind": "agent", "id": id}));
+    }
+
+    // The workhorse terminal is gone; only the chat remains.
+    let mut mark = 0;
+    loop {
+        if pool.list(None).len() == 1 {
+            break;
+        }
+        mark = pool.changed(&id, mark).await.expect("changed");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_tool_answers_with_an_error_result_not_a_wedge() {
+    let scripted = ScriptedModel::new(vec![
+        GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                id: "t1".into(),
+                name: "teleport".into(),
+                input: json!({}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        },
+        myco_models::test_support::text_output("noted"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "go"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+    assert_eq!(entries[2]["results"][0]["is_error"], json!(true));
+    let why = entries[2]["results"][0]["content"][0]["Text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(why.contains("unknown tool"), "{why}");
+}
+
+#[tokio::test]
+async fn a_timed_out_command_is_killed_and_reports_partial_output() {
+    let scripted = ScriptedModel::new(vec![
+        tool_turn("echo started; sleep 60", "t1"),
+        myco_models::test_support::text_output("gave up"),
+    ]);
+    // Rewrite the timeout down so the test runs in ~1s.
+    let scripted_with_timeout = ScriptedModel::new(vec![
+        GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!({"command": "echo started; sleep 60", "timeout_secs": 1}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        },
+        myco_models::test_support::text_output("gave up"),
+    ]);
+    drop(scripted);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted_with_timeout.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "go"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let result = &entries[2]["results"][0];
+    assert_eq!(result["is_error"], json!(true));
+    let why = result["content"][0]["Text"]["text"].as_str().unwrap();
+    assert!(why.contains("timed out"), "{why}");
+    assert!(why.contains("started"), "partial output survives: {why}");
+
+    // The killed command's terminal is removed too.
+    let mut mark = 0;
+    loop {
+        if pool.list(None).len() == 1 {
+            break;
+        }
+        mark = pool.changed(&id, mark).await.expect("changed");
+    }
+}
+
+/// Cancelling mid-command still cleans up: the removal rides a drop guard
+/// on the turn task, so an aborted task cannot leak its terminal.
+#[tokio::test]
+async fn cancel_mid_command_removes_the_workhorse_terminal() {
+    let scripted = ScriptedModel::new(vec![tool_turn("sleep 60", "t1")]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "go"}))
+        .await
+        .expect("post");
+    // Wait until the tool's tty exists.
+    let mut mark = 0;
+    loop {
+        if pool.list(None).len() == 2 {
+            break;
+        }
+        mark = pool.changed(&id, mark).await.expect("changed");
+    }
+
+    pool.call(&ada(), &id, "cancel", Value::Null)
+        .await
+        .expect("cancel");
+    loop {
+        if pool.list(None).len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
