@@ -174,7 +174,7 @@ async fn whoami(caller: Caller) -> Json<Value> {
 // Boot helpers (the binary's authentication plumbing)
 // ---------------------------------------------------------------------------
 
-/// Path of the local operator's bearer token: `$MYCO_HOME/v3/operator.token`.
+/// Path of the local operator's bearer token: `$MYCO_HOME/operator.token`.
 pub fn operator_token_path() -> Result<std::path::PathBuf, String> {
     Ok(util::data_root()?.join("operator.token"))
 }

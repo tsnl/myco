@@ -3,16 +3,19 @@
 
 use std::path::{Path, PathBuf};
 
-/// `$MYCO_HOME` → `~/.myco`, then the `v3` generation directory. Every
-/// durable file the server writes lives under here.
+/// `$MYCO_HOME` → `~/.myco`. Every durable file the server writes lives
+/// directly here, shared with v1's home rather than a versioned subfolder:
+/// v3's files (`server.toml`, `auth.json`, `passkeys.json`,
+/// `operator.token`) collide with nothing v1 ever wrote (`config.toml`,
+/// its own data), and v2 keeps to `~/.myco/v2/`, so all three generations
+/// coexist in one home.
 pub fn data_root() -> Result<PathBuf, String> {
-    let home = match std::env::var_os("MYCO_HOME") {
-        Some(p) => PathBuf::from(p),
+    match std::env::var_os("MYCO_HOME") {
+        Some(p) => Ok(PathBuf::from(p)),
         None => std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(".myco"))
-            .ok_or("neither $MYCO_HOME nor $HOME is set")?,
-    };
-    Ok(home.join("v3"))
+            .ok_or_else(|| "neither $MYCO_HOME nor $HOME is set".to_string()),
+    }
 }
 
 /// Write via a sibling temp file and rename, so a crash mid-write leaves
