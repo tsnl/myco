@@ -356,6 +356,87 @@ model saw"). The debugger is the product.
 - **VSCode/LSP, Zellij** — process-isolate plugins; negotiate
   capabilities; version the schemas (now a field, not a vow).
 
+## Deferred problems
+
+Problems examined, decided against solving now, and recorded so the
+revisit starts from the analysis instead of from scratch. Each names its
+trigger, its path, and the cheap insurance adopted immediately so the
+deferral forecloses nothing.
+
+### DP-1 — Browser-client performance ceiling (Zed/Sublime feel)
+
+**Deferred until** the GUI demonstrably feels slow, or a
+latency-sensitive pane (map editor) arrives. **Verdict when examined:**
+perceptually Zed-class is reachable in a browser for myco's hot surfaces,
+because the heavy machinery (vt100 parsing, transcripts, rendering to
+styled runs) is server-side native Rust — the client draws small
+projections. What decomposes and where the browser taxes it:
+
+- *Keypress→photon*: native ~8–16ms; browser floor keeps ~1 frame of
+  event-loop/compositor tax; Chromium's `desynchronized: true` canvas
+  claws much back → ~15–25ms achievable. Perception threshold for typing
+  is ~40–70ms (sensitive users ~20ms): under it, but instrumented
+  shootouts lose to Zed forever.
+- *Consistency* (the larger half of "feel"): a Rust/wasm core has no
+  GC'd hot path; repaint only on watermark-or-input. No jank sources.
+- *Throughput*: solved in public — xterm.js's WebGL glyph-atlas renderer
+  (VS Code's terminal) is the reference; Figma the broader proof.
+- *Startup*: not matchable (tab boot + wasm fetch); a workspace lives in
+  a pinned tab; accepted.
+
+**The path, when triggered:** (1) DOM for chrome (tree, chat —
+virtualized; selection/IME/a11y free), GPU canvas for hot panes, and the
+framework never owns the hot path (v2's flicker saga, named and fenced);
+(2) damage-delta screen payloads — dirty rows keyed to the watermark;
+(3) binary framing for hot payloads so the 60Hz path allocates nothing;
+(4) predictive local echo for remote typing (the mosh trick; loopback
+does not need it); (5) hot renderers written on **wgpu**, which compiles
+to WebGPU-in-wasm today and native tomorrow — a native shell later
+re-hosts the same pane renderers and swaps DOM chrome for egui: a
+re-shelling, not a rewrite. (HWRT is the one thing a tab will never do;
+the wgpu clause is what keeps that exit open.)
+
+**Adopted now regardless (cheap):** serve COOP/COEP headers from M1 (two
+headers; unlocks wasm threads/SharedArrayBuffer whenever wanted);
+renderer crates framework-free (payload in, pixels out — no GUI-framework
+types in their signatures); screen payloads shaped so row-level deltas
+can be added without breaking consumers (rows are addressed already).
+
+### DP-2 — QUIC / WebTransport instead of HTTP(S)+WebSocket
+
+**Decision:** HTTP(S) + WebSocket is the baseline wire; QUIC enters
+later as an upgrade, not a replacement. Facts that decided it:
+
+- Browsers expose QUIC only two ways: HTTP/3 (transparent transport for
+  ordinary fetches — a server config detail, no app change) and
+  **WebTransport** (streams + unreliable datagrams over HTTP/3;
+  Chromium and Firefox ship it, Safari has lagged — verify before
+  relying). Raw QUIC sockets do not exist for pages; WebSocket-over-h3
+  (RFC 9220) is not dependably implemented. And the page shell always
+  loads over HTTP(S) — "instead of" can never be total.
+- **The tunnel collision:** the supported remote pattern is an SSH
+  tunnel, which forwards TCP only. WebTransport's UDP cannot ride it, so
+  WebSocket must remain a first-class fallback under the current
+  transport doctrine no matter what. QUIC's actual wins (loss recovery,
+  no head-of-line blocking, 0-RTT, migration) are real-network wins;
+  loopback has no loss to recover from.
+- Certificates: browser QUIC requires TLS even on localhost. Workable —
+  WebTransport's `serverCertificateHashes` pins a self-signed cert
+  (ECDSA, ≤14-day validity, so the server mints at startup and the page
+  fetches the current hash over its HTTP origin) — but it is ceremony
+  that buys nothing on loopback.
+
+**Upgrade triggers:** M4 media flows crossing real networks (lossy
+frames want datagrams, latest-wins) — WebTransport with WS fallback; or
+a native client (the same quinn endpoint serves WebTransport and native
+QUIC alike — one server, both worlds, still no WebRTC).
+
+**Adopted now regardless (cheap):** transport-agnostic framing. The
+protocol is logical channels — one control (verbs), one event/watch
+stream, N media flows — and the carrier maps them: WS multiplexes all of
+them today; WebTransport assigns streams and datagram flows later. The
+verb envelope never learns what carried it.
+
 ## The ledger
 
 Functionality crosses from v2 only with a verdict recorded here.
