@@ -20,7 +20,7 @@ fn fixture() -> (axum::Router, Arc<AuthStore>) {
     auth.add_user("grace", "Grace Hopper").unwrap();
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
-    (myco_server::router(pool, Arc::clone(&auth)), auth)
+    (myco_server::router(pool, Arc::clone(&auth), "ada"), auth)
 }
 
 async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {

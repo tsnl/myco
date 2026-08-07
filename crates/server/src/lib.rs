@@ -19,6 +19,7 @@
 //! Every response carries the two cross-origin-isolation headers (DESIGN.md
 //! DP-1): cheap insurance, expensive retrofit.
 
+mod admin;
 pub mod auth;
 pub mod roster;
 mod util;
@@ -40,13 +41,16 @@ use auth::AuthStore;
 #[derive(Clone)]
 pub(crate) struct App {
     pub(crate) pool: Pool,
-    auth: Arc<AuthStore>,
+    pub(crate) auth: Arc<AuthStore>,
+    /// The roster's local user: possession of the process, spelled as an id.
+    pub(crate) operator: String,
 }
 
 /// The `/api` router over a pool and a credential store. The caller owns
 /// kind registration and boot-time roster reconciliation; the server serves
-/// whatever the pool knows, to whoever the store recognizes.
-pub fn router(pool: Pool, auth: Arc<AuthStore>) -> Router {
+/// whatever the pool knows, to whoever the store recognizes, with the
+/// `/api/admin` surface reserved for `operator`.
+pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
     Router::new()
         .route("/api/kinds", get(kinds))
         .route("/api/instances", post(create).get(list))
@@ -56,7 +60,20 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>) -> Router {
         .route("/api/auth/token", post(token))
         .route("/api/auth/logout", post(logout))
         .route("/api/whoami", get(whoami))
-        .with_state(App { pool, auth })
+        .route("/api/admin/users", get(admin::users))
+        .route("/api/admin/users/{id}/code", post(admin::mint_code))
+        .route("/api/admin/users/{id}/disable", post(admin::disable))
+        .route("/api/admin/users/{id}/enable", post(admin::enable))
+        .route("/api/admin/users/{id}/revoke", post(admin::revoke))
+        .route(
+            "/api/admin/users/{id}",
+            axum::routing::delete(admin::remove),
+        )
+        .with_state(App {
+            pool,
+            auth,
+            operator: operator.into(),
+        })
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin"),
@@ -81,6 +98,10 @@ pub(crate) struct Caller {
 impl Caller {
     fn principal(&self) -> Principal {
         Principal::Human(self.user.id.clone())
+    }
+
+    pub(crate) fn user_id(&self) -> &str {
+        &self.user.id
     }
 }
 

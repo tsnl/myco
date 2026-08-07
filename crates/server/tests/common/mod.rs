@@ -1,5 +1,7 @@
 //! Shared fixtures for the server's integration tests: the counter kind
-//! (so nothing depends on a shell) and a signed-in router.
+//! (so nothing depends on a shell) and a signed-in router. Each test binary
+//! uses its own subset, hence the blanket allow.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -64,5 +66,5 @@ pub fn counter_app() -> (axum::Router, Pool, String) {
     let token = auth.issue_for("ada").unwrap().access_token;
     let pool = Pool::new();
     pool.register(Arc::new(CounterKind));
-    (myco_server::router(pool.clone(), auth), pool, token)
+    (myco_server::router(pool.clone(), auth, "ada"), pool, token)
 }
