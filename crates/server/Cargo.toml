@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
+webauthn-rs = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -26,3 +27,6 @@ http-body-util = { workspace = true }
 myco-kind-tty = { path = "../kind-tty" }
 myco-runtime = { path = "../runtime" }
 tower = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+webauthn-authenticator-rs = { workspace = true }
