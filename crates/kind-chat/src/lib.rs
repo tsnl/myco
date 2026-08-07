@@ -59,7 +59,18 @@ static CHAT_SPEC: KindSpec = KindSpec {
             "text",
             "the transcript as plain text, one `author: message` line per entry",
         ),
-        VerbSpec::read("about", "the chat's shape: {parent, model, len, turn_running}"),
+        VerbSpec::write(
+            "watch",
+            "add a standing subscription: {instance, verb?, args?} — before each generation, \
+             changes since the last look are spliced into the transcript as watched entries. \
+             The verb must be cursored (default: the target's first cursored verb); watching \
+             starts from now",
+        ),
+        VerbSpec::write("unwatch", "drop the standing subscription on {instance}"),
+        VerbSpec::read(
+            "about",
+            "the chat's shape: {parent, model, len, turn_running, watching}",
+        ),
     ],
     primary_render: "tail",
     recommended_context: "text",
@@ -103,6 +114,11 @@ pub enum Body {
     /// The answers to the preceding assistant entry's tool calls, paired
     /// positionally (result j answers tool_use j).
     ToolResults { results: Vec<ToolResult> },
+    /// What a standing subscription saw: the delta a cursored read on
+    /// `instance` returned since the last look. A real entry, on purpose —
+    /// the transcript is the record of what the agent knew, and hidden
+    /// context would break that.
+    Watched { instance: String, data: String },
 }
 
 impl Body {
@@ -115,6 +131,7 @@ impl Body {
                 .map(|r| myco_models::content_text(&r.content))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Body::Watched { instance, data } => format!("[watched {instance}]\n{data}"),
         }
     }
 }
@@ -235,6 +252,24 @@ struct Transcript {
     entries: Vec<Entry>,
     /// Index of the assistant entry the running turn streams into.
     pending: Option<usize>,
+    /// Standing subscriptions: refreshed by the turn task where watermarks
+    /// moved, edited by the watch/unwatch verbs. Living beside the entries
+    /// under one lock keeps cursor advance and splice atomic.
+    subs: Vec<Subscription>,
+}
+
+/// One standing subscription: (instance, cursored read, args, budget) plus
+/// where we are — the cursor the verb returned and the watermark at the
+/// last look (the cheap "anything new?" check).
+#[derive(Debug, Clone, serde::Serialize)]
+struct Subscription {
+    instance: String,
+    verb: String,
+    args: Value,
+    #[serde(skip)]
+    cursor: Option<Value>,
+    #[serde(skip)]
+    mark: u64,
 }
 
 impl Transcript {
@@ -459,6 +494,7 @@ async fn run_turn(ctx: TurnCtx) {
     signals.bump();
 
     let reason = loop {
+        refresh_subscriptions(&pool, &agent, &transcript, &signals).await;
         let messages = {
             let t = transcript.lock().unwrap_or_else(|e| e.into_inner());
             project::project(&t.entries)
@@ -515,6 +551,107 @@ async fn run_turn(ctx: TurnCtx) {
     };
     signals.emit("turn_ended", json!({ "reason": reason }));
     signals.bump();
+}
+
+/// Chat-side cap on one splice, kind-agnostic: whatever the verb returned,
+/// at most this much lands in the transcript (freshest end kept).
+const SPLICE_BUDGET_BYTES: usize = 16 * 1024;
+
+/// Refresh every standing subscription whose target's watermark moved:
+/// call the cursored verb from the stored cursor, append the delta as a
+/// watched entry, advance the cursor. Dead targets unsubscribe themselves
+/// with a final note — a watch on a corpse is a leak, not a vigil.
+async fn refresh_subscriptions(
+    pool: &Pool,
+    agent: &Principal,
+    transcript: &Arc<Mutex<Transcript>>,
+    signals: &Signals,
+) {
+    let subs: Vec<Subscription> = {
+        let t = transcript.lock().unwrap_or_else(|e| e.into_inner());
+        t.subs.clone()
+    };
+    for sub in subs {
+        let moved = match pool.watermark(&sub.instance) {
+            Ok(mark) if mark > sub.mark => Some(mark),
+            Ok(_) => None,
+            Err(_) => {
+                // Target gone: drop the subscription, say so once.
+                let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
+                t.subs.retain(|s| s.instance != sub.instance);
+                t.push(
+                    agent.clone(),
+                    Body::Watched {
+                        instance: sub.instance.clone(),
+                        data: "[the watched instance is gone — subscription dropped]".into(),
+                    },
+                );
+                signals.bump();
+                None
+            }
+        };
+        let Some(mark) = moved else { continue };
+        let mut args = sub.args.clone();
+        if let Some(cursor) = &sub.cursor
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("from".into(), cursor.clone());
+        }
+        let Ok(page) = pool.call(agent, &sub.instance, &sub.verb, args).await else {
+            continue;
+        };
+        let next = page.get("next").cloned();
+        let mut data = watched_text(&page);
+        if data.len() > SPLICE_BUDGET_BYTES {
+            let cut = (data.len() - SPLICE_BUDGET_BYTES..data.len())
+                .find(|i| data.is_char_boundary(*i))
+                .unwrap_or(0);
+            data = format!("[truncated]\n{}", &data[cut..]);
+        }
+        let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = t.subs.iter_mut().find(|s| s.instance == sub.instance) {
+            live.mark = mark;
+            if next.is_some() {
+                live.cursor = next;
+            }
+        }
+        if !data.trim().is_empty() {
+            t.push(
+                agent.clone(),
+                Body::Watched {
+                    instance: sub.instance.clone(),
+                    data,
+                },
+            );
+            drop(t);
+            signals.bump();
+        }
+    }
+}
+
+/// The delta as text: cursored reads answer differently per kind, so take
+/// the canonical fields we know ({data} from byte tails, {entries} from
+/// chat tails via their plain text) and fall back to compact JSON.
+fn watched_text(page: &Value) -> String {
+    if let Some(data) = page.get("data").and_then(Value::as_str) {
+        return data.to_string();
+    }
+    if let Some(entries) = page.get("entries").and_then(Value::as_array) {
+        return entries
+            .iter()
+            .map(|e| {
+                let author = e
+                    .get("author")
+                    .and_then(|a| a.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let text = e.get("text").and_then(Value::as_str).unwrap_or_default();
+                format!("{author}: {text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    page.to_string()
 }
 
 fn turn_end_name(reason: &TurnEndReason) -> String {
@@ -610,16 +747,122 @@ impl Instance for Chat {
                 }
                 Ok(json!({ "text": out, "len": t.entries.len() as u64 }))
             }
+            "watch" => {
+                let target = args
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or_else(|| VerbError::BadArgs {
+                        why: "watch needs {instance}".into(),
+                    })?;
+                if matches!(&self.agent, Principal::Agent(own) if own == target) {
+                    return Err(VerbError::BadArgs {
+                        why: "a chat cannot watch itself".into(),
+                    });
+                }
+                // sys.spec never enters a mailbox, and the priming read is
+                // on another instance that cannot call back — both safe
+                // from a verb handler.
+                let spec = self.pool.call(caller, target, "sys.spec", Value::Null).await?;
+                let empty = Vec::new();
+                let verbs = spec["verbs"].as_array().unwrap_or(&empty);
+                let cursored =
+                    |v: &&Value| v["cursored"] == json!(true);
+                let verb = match args.get("verb").and_then(Value::as_str) {
+                    Some(name) => {
+                        let found = verbs.iter().find(|v| v["name"] == json!(name));
+                        match found {
+                            Some(v) if cursored(&v) => name.to_string(),
+                            Some(_) => {
+                                return Err(VerbError::BadArgs {
+                                    why: format!(
+                                        "{name} is not cursored — a watch needs a delta read"
+                                    ),
+                                });
+                            }
+                            None => {
+                                return Err(VerbError::BadArgs {
+                                    why: format!("the target has no verb {name:?}"),
+                                });
+                            }
+                        }
+                    }
+                    None => verbs
+                        .iter()
+                        .find(cursored)
+                        .and_then(|v| v["name"].as_str())
+                        .map(String::from)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "the target has no cursored verb to watch".into(),
+                        })?,
+                };
+                let sub_args = match args.get("args") {
+                    None | Some(Value::Null) => json!({}),
+                    Some(Value::Object(o)) => Value::Object(o.clone()),
+                    Some(other) => {
+                        return Err(VerbError::BadArgs {
+                            why: format!("args must be an object, got {other}"),
+                        });
+                    }
+                };
+                // Watching starts from now: prime the cursor by asking for
+                // the position past everything current (cursored reads
+                // clamp to their end).
+                let mut prime = sub_args.clone();
+                if let Some(obj) = prime.as_object_mut() {
+                    obj.insert("from".into(), json!(u64::MAX));
+                }
+                let cursor = self
+                    .pool
+                    .call(caller, target, &verb, prime)
+                    .await
+                    .ok()
+                    .and_then(|page| page.get("next").cloned());
+                let mark = self.pool.watermark(target).unwrap_or(0);
+                {
+                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                    t.subs.retain(|sub| sub.instance != target);
+                    t.subs.push(Subscription {
+                        instance: target.to_string(),
+                        verb: verb.clone(),
+                        args: sub_args,
+                        cursor,
+                        mark,
+                    });
+                }
+                signals.bump();
+                Ok(json!({"watching": target, "verb": verb}))
+            }
+            "unwatch" => {
+                let target = args
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| VerbError::BadArgs {
+                        why: "unwatch needs {instance}".into(),
+                    })?;
+                let dropped = {
+                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                    let before = t.subs.len();
+                    t.subs.retain(|sub| sub.instance != target);
+                    before != t.subs.len()
+                };
+                signals.bump();
+                Ok(json!({"dropped": dropped}))
+            }
             "about" => {
-                let len = {
+                let (len, watching) = {
                     let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
-                    t.entries.len() as u64
+                    (
+                        t.entries.len() as u64,
+                        serde_json::to_value(&t.subs).expect("subs serialize"),
+                    )
                 };
                 Ok(json!({
                     "parent": self.parent,
                     "model": self.model.as_ref().map(|(key, _)| key.clone()),
                     "len": len,
                     "turn_running": self.turn_running(),
+                    "watching": watching,
                 }))
             }
             other => Err(VerbError::UnknownVerb { verb: other.into() }),

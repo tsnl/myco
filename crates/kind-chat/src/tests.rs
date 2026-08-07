@@ -673,6 +673,173 @@ async fn subagents_two_deep_may_not_spawn_deeper() {
     assert!(why.contains("deep"), "{why}");
 }
 
+// ---------------------------------------------------------------------------
+// Standing subscriptions
+// ---------------------------------------------------------------------------
+
+/// The full loop: watch a tty, feed it, post — the turn splices the fresh
+/// output as a watched entry *before* the assistant's, and the cursor
+/// advances so the next turn sees only what is new.
+#[tokio::test]
+async fn a_watched_terminal_splices_deltas_into_turns_exactly_once() {
+    let scripted = ScriptedModel::replying(&["saw it", "saw the rest"]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+    let tty = pool
+        .create(&ada(), "tty", "", "cat", json!({"command": "cat"}))
+        .expect("tty");
+
+    let watching = pool
+        .call(&ada(), &id, "watch", json!({"instance": tty.id}))
+        .await
+        .expect("watch");
+    assert_eq!(watching["verb"], "tail", "the first cursored verb");
+
+    // Feed the terminal, then wait until its echo is in the scrollback
+    // (the watch must have something to see before the post).
+    pool.call(&ada(), &tty.id, "input", json!({"data": "first line\n"}))
+        .await
+        .expect("input");
+    let mut mark = 0;
+    loop {
+        let text = pool.call(&ada(), &tty.id, "text", Value::Null).await.unwrap();
+        if text["text"].as_str().unwrap_or("").contains("first line") {
+            break;
+        }
+        mark = pool.changed(&tty.id, mark).await.expect("changed");
+    }
+
+    pool.call(&ada(), &id, "post", json!({"text": "what do you see?"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 1).await;
+    let entries = tail["entries"].as_array().unwrap();
+    // post · watched · assistant — the splice lands before the reply.
+    assert_eq!(entries[1]["t"], "watched");
+    assert_eq!(entries[1]["instance"], json!(tty.id));
+    assert!(
+        entries[1]["data"].as_str().unwrap().contains("first line"),
+        "{}",
+        entries[1]["data"]
+    );
+    assert_eq!(entries[2]["t"], "assistant");
+
+    // Round two: only the new bytes appear.
+    pool.call(&ada(), &tty.id, "input", json!({"data": "second line\n"}))
+        .await
+        .expect("input");
+    let mut mark = 0;
+    loop {
+        let text = pool.call(&ada(), &tty.id, "text", Value::Null).await.unwrap();
+        if text["text"].as_str().unwrap_or("").contains("second line") {
+            break;
+        }
+        mark = pool.changed(&tty.id, mark).await.expect("changed");
+    }
+    pool.call(&ada(), &id, "post", json!({"text": "and now?"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let second_watch = entries
+        .iter()
+        .rev()
+        .find(|e| e["t"] == "watched")
+        .expect("second watched entry");
+    let data = second_watch["data"].as_str().unwrap();
+    assert!(data.contains("second line"), "{data}");
+    assert!(
+        !data.contains("first line"),
+        "the cursor advanced — no replay: {data}"
+    );
+}
+
+#[tokio::test]
+async fn watch_validates_its_target_and_verb() {
+    let (pool, id) = modeled_pool(Arc::new(|_| Ok(Arc::new(HangingModel) as _)));
+    let tty = pool
+        .create(&ada(), "tty", "", "", json!({"command": "cat"}))
+        .expect("tty");
+
+    // Unknown instance passes the bus error through.
+    let err = pool
+        .call(&ada(), &id, "watch", json!({"instance": "nope"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VerbError::UnknownInstance { .. }), "{err}");
+
+    // A non-cursored verb is refused by name.
+    let err = pool
+        .call(
+            &ada(),
+            &id,
+            "watch",
+            json!({"instance": tty.id, "verb": "screen"}),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        VerbError::BadArgs { why } => assert!(why.contains("cursored"), "{why}"),
+        other => panic!("expected BadArgs, got {other}"),
+    }
+
+    // Watching yourself is refused.
+    let err = pool
+        .call(&ada(), &id, "watch", json!({"instance": id}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VerbError::BadArgs { .. }), "{err}");
+
+    // about lists the live subscriptions.
+    pool.call(&ada(), &id, "watch", json!({"instance": tty.id}))
+        .await
+        .expect("watch");
+    let about = pool.call(&ada(), &id, "about", Value::Null).await.unwrap();
+    assert_eq!(about["watching"][0]["instance"], json!(tty.id));
+
+    // unwatch drops it; a second unwatch is a polite no-op.
+    let dropped = pool
+        .call(&ada(), &id, "unwatch", json!({"instance": tty.id}))
+        .await
+        .unwrap();
+    assert_eq!(dropped["dropped"], json!(true));
+    let again = pool
+        .call(&ada(), &id, "unwatch", json!({"instance": tty.id}))
+        .await
+        .unwrap();
+    assert_eq!(again["dropped"], json!(false));
+}
+
+/// A watched instance that dies mid-subscription unsubscribes itself with
+/// a final note instead of erroring every future turn.
+#[tokio::test]
+async fn a_dead_watch_target_drops_the_subscription_with_a_note() {
+    let scripted = ScriptedModel::replying(&["ok", "ok again"]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+    let tty = pool
+        .create(&ada(), "tty", "", "", json!({"command": "cat"}))
+        .expect("tty");
+    pool.call(&ada(), &id, "watch", json!({"instance": tty.id}))
+        .await
+        .expect("watch");
+    pool.call(&ada(), &tty.id, "sys.remove", Value::Null)
+        .await
+        .expect("remove");
+
+    pool.call(&ada(), &id, "post", json!({"text": "hello"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 1).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let note = entries.iter().find(|e| e["t"] == "watched").expect("note");
+    assert!(
+        note["data"].as_str().unwrap().contains("gone"),
+        "{}",
+        note["data"]
+    );
+    let about = pool.call(&ada(), &id, "about", Value::Null).await.unwrap();
+    assert_eq!(about["watching"].as_array().unwrap().len(), 0);
+}
+
 /// Attribution in the projection: solo chats read as typed; multiplayer
 /// chats prefix every post with its speaker.
 #[test]
