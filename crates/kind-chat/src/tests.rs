@@ -684,8 +684,18 @@ async fn subagents_two_deep_may_not_spawn_deeper() {
 async fn a_watched_terminal_splices_deltas_into_turns_exactly_once() {
     let scripted = ScriptedModel::replying(&["saw it", "saw the rest"]);
     let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+    // `stty -echo` silences the pty's input echo, so every line appears in
+    // the scrollback exactly once (cat's copy) — without it, the echo and
+    // cat's output are two copies racing across refreshes, and a late
+    // first-round copy would masquerade as second-round delta.
     let tty = pool
-        .create(&ada(), "tty", "", "cat", json!({"command": "cat"}))
+        .create(
+            &ada(),
+            "tty",
+            "",
+            "cat",
+            json!({"command": "stty -echo; cat"}),
+        )
         .expect("tty");
 
     let watching = pool
