@@ -22,6 +22,14 @@ async fn main() {
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
 
+    // Interim identity until the roster + bearer auth land (stack PR 4):
+    // every request acts as the OS user. Loopback binding is what makes
+    // this safe in the meantime.
+    let user = std::env::var("MYCO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "local".into());
+    let local = myco_instance::Principal::Human(user);
+
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -31,7 +39,7 @@ async fn main() {
         }
     };
     eprintln!("myco: serving http://{addr}/api");
-    if let Err(e) = axum::serve(listener, myco_server::router(pool)).await {
+    if let Err(e) = axum::serve(listener, myco_server::router(pool, local)).await {
         eprintln!("myco: server error: {e}");
         std::process::exit(1);
     }

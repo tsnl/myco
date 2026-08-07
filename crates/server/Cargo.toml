@@ -13,6 +13,8 @@ tokio = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 http-body-util = { workspace = true }
 myco-kind-tty = { path = "../kind-tty" }
+myco-runtime = { path = "../runtime" }
 tower = { workspace = true }
