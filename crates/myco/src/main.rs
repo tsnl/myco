@@ -16,6 +16,10 @@ struct Args {
     /// Port to serve the API on (loopback only).
     #[arg(long, default_value_t = 7773)]
     port: u16,
+    /// Print a one-time sign-in code for the operator even if they have
+    /// passkeys enrolled — the lockout escape hatch (all passkeys lost).
+    #[arg(long)]
+    recover: bool,
 }
 
 fn fatal(message: impl std::fmt::Display) -> ! {
@@ -49,7 +53,8 @@ async fn main() {
     // The operator: the roster's local user. Their boot token goes to
     // operator.token (0600) so sibling processes on this machine can
     // authenticate; it dies with the server. The startup code is how a
-    // person signs in before any durable credential exists.
+    // person signs in before any durable credential exists — once a passkey
+    // is enrolled, boot goes quiet (unless --recover demands a code).
     let operator = roster.local().id.clone();
     match auth.issue_for(&operator) {
         Some(issued) => {
@@ -59,18 +64,22 @@ async fn main() {
         }
         None => eprintln!("myco: no store entry for {operator:?}; operator.token not written"),
     }
-    eprintln!("{}", myco_server::startup_code(&auth, &operator));
+    if let Some(banner) = myco_server::startup_code(&auth, &operator, args.recover) {
+        eprintln!("{banner}");
+    }
 
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
 
+    let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
+        .unwrap_or_else(|e| fatal(e));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => fatal(format!("cannot bind {addr}: {e}")),
     };
     eprintln!("myco: serving http://{addr}/api");
-    if let Err(e) = axum::serve(listener, myco_server::router(pool, auth, operator)).await {
+    if let Err(e) = axum::serve(listener, router).await {
         fatal(format!("server error: {e}"));
     }
 }

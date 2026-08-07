@@ -21,6 +21,7 @@
 
 mod admin;
 pub mod auth;
+mod passkey;
 pub mod roster;
 mod util;
 mod watch;
@@ -44,14 +45,33 @@ pub(crate) struct App {
     pub(crate) auth: Arc<AuthStore>,
     /// The roster's local user: possession of the process, spelled as an id.
     pub(crate) operator: String,
+    /// The WebAuthn relying party, built once from `[passkeys]` at startup.
+    pub(crate) webauthn: Arc<webauthn_rs::Webauthn>,
+}
+
+/// [`router_with`] under the default `[passkeys]` settings (localhost, any
+/// port) — the always-valid configuration, so this cannot fail. Tests and
+/// single-machine embedders use this; the binary goes through
+/// [`router_with`] so a configured relying party is honored.
+pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
+    router_with(pool, auth, operator, &roster::PasskeySettings::default())
+        .expect("the default passkey settings always build")
 }
 
 /// The `/api` router over a pool and a credential store. The caller owns
 /// kind registration and boot-time roster reconciliation; the server serves
 /// whatever the pool knows, to whoever the store recognizes, with the
-/// `/api/admin` surface reserved for `operator`.
-pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
-    Router::new()
+/// `/api/admin` surface reserved for `operator`. Fails only when the
+/// `[passkeys]` section names an unusable relying party — at startup, where
+/// the operator who mistyped it is still at the terminal.
+pub fn router_with(
+    pool: Pool,
+    auth: Arc<AuthStore>,
+    operator: impl Into<String>,
+    passkeys: &roster::PasskeySettings,
+) -> Result<Router, String> {
+    let webauthn = Arc::new(passkey::build_webauthn(passkeys)?);
+    Ok(Router::new()
         .route("/api/kinds", get(kinds))
         .route("/api/instances", post(create).get(list))
         .route("/api/instances/{id}/verbs/{verb}", post(call))
@@ -59,12 +79,29 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> 
         .route("/api/ws", get(watch::ws))
         .route("/api/auth/token", post(token))
         .route("/api/auth/logout", post(logout))
+        .route(
+            "/api/auth/passkey/register/start",
+            post(passkey::register_start),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(passkey::register_finish),
+        )
+        .route("/api/auth/passkey/login/start", post(passkey::login_start))
+        .route(
+            "/api/auth/passkey/login/finish",
+            post(passkey::login_finish),
+        )
         .route("/api/whoami", get(whoami))
         .route("/api/admin/users", get(admin::users))
         .route("/api/admin/users/{id}/code", post(admin::mint_code))
         .route("/api/admin/users/{id}/disable", post(admin::disable))
         .route("/api/admin/users/{id}/enable", post(admin::enable))
         .route("/api/admin/users/{id}/revoke", post(admin::revoke))
+        .route(
+            "/api/admin/users/{id}/passkeys/clear",
+            post(admin::clear_passkeys),
+        )
         .route(
             "/api/admin/users/{id}",
             axum::routing::delete(admin::remove),
@@ -73,6 +110,7 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> 
             pool,
             auth,
             operator: operator.into(),
+            webauthn,
         })
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-opener-policy"),
@@ -81,7 +119,7 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> 
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-embedder-policy"),
             HeaderValue::from_static("require-corp"),
-        ))
+        )))
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +130,7 @@ pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> 
 /// a handler parameter *is* the auth check: a route that asks for it cannot
 /// run without a live token.
 pub(crate) struct Caller {
-    user: auth::StoredUser,
+    pub(crate) user: auth::StoredUser,
 }
 
 impl Caller {
@@ -218,20 +256,35 @@ pub fn write_operator_token(token: &str) -> Result<(), String> {
 }
 
 /// The startup sign-in code: how a person first gets into a server that has
-/// no signup and no passwords. Until passkeys land (stack PRs 7–8), every
-/// boot mints one — restart-to-mint-another is the whole recovery story.
-pub fn startup_code(auth: &AuthStore, operator: &str) -> String {
-    match auth.mint_code(operator) {
+/// no signup and no passwords. Minted for the operator when they have no
+/// passkey to sign in with — a fresh install — or on demand with
+/// `--recover` (all passkeys lost). Returns the banner to print, or `None`
+/// when nothing needs minting.
+///
+/// This is the whole trust rule in one function: possession of the process
+/// is what makes someone the operator, so the code goes to the terminal the
+/// server was started from and nowhere else.
+pub fn startup_code(auth: &AuthStore, operator: &str, recover: bool) -> Option<String> {
+    if !recover && !auth.passkeys_for(operator).is_empty() {
+        return None;
+    }
+    let why = if recover {
+        "--recover"
+    } else {
+        "no passkey enrolled yet"
+    };
+    Some(match auth.mint_code(operator) {
         Ok(minted) => format!(
-            "myco: one-time sign-in code for {}: {}\n      \
-             single use, {} minutes — POST /api/auth/token with grant_type=code\n      \
-             (restart the server to mint another)",
+            "myco: one-time sign-in code for {} ({why}): {}\n      \
+             single use, {} minutes — POST /api/auth/token with grant_type=code, \
+             then enroll a passkey\n      \
+             (restart the server, or run with --recover, to mint another)",
             minted.user_id,
             minted.code,
             auth::CODE_TTL_MINUTES
         ),
         Err(e) => format!("myco: cannot mint a sign-in code: {e}"),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
