@@ -234,3 +234,8 @@ form {
     color: var(--attn);
     font-size: 12.5px;
 }
+
+.row-buttons {
+    display: flex;
+    gap: 8px;
+}
