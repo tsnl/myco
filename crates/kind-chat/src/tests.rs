@@ -253,11 +253,11 @@ async fn a_human_post_starts_a_turn_that_streams_into_the_transcript() {
     assert!(text["text"].as_str().unwrap().contains("hello ada"));
 }
 
-/// The model answers people. Its own entries, other agents' posts, and
-/// system posts must not start turns — the loop that would otherwise talk
-/// to itself forever.
+/// The chat never answers itself or the system — the loop that would
+/// otherwise talk to itself forever. (Other agents *do* trigger: that is
+/// how a parent tasks a subagent; see the subagent tests.)
 #[tokio::test]
-async fn only_human_posts_trigger_turns() {
+async fn the_chat_never_answers_itself_or_the_system() {
     let scripted = ScriptedModel::replying(&["one"]);
     let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
 
@@ -266,17 +266,17 @@ async fn only_human_posts_trigger_turns() {
         .expect("post");
     wait_for_settled_turns(&pool, &id, 1).await;
 
-    // An agent post and a system post land as entries, and nothing follows:
-    // the scripted model has no outputs left, so a triggered turn would
-    // fail loudly as an `error` turn_end.
+    // A post as the chat's own agent principal and a system post land as
+    // entries, and nothing follows: the scripted model has no outputs
+    // left, so a triggered turn would fail loudly as an `error` turn_end.
     pool.call(
-        &Principal::Agent("other".into()),
+        &Principal::Agent(id.clone()),
         &id,
         "post",
-        json!({"text": "agent aside"}),
+        json!({"text": "note to self"}),
     )
     .await
-    .expect("agent post");
+    .expect("self post");
     pool.call(
         &Principal::System("cron".into()),
         &id,
@@ -580,6 +580,97 @@ async fn cancel_mid_command_removes_the_workhorse_terminal() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subagents
+// ---------------------------------------------------------------------------
+
+fn subagent_turn(task: &str, id: &str) -> GenerateOutput {
+    GenerateOutput {
+        content: vec![],
+        tool_uses: vec![ToolUse {
+            id: id.into(),
+            name: "subagent".into(),
+            input: json!({"task": task}),
+        }],
+        turn_end_reason: TurnEndReason::ToolUse,
+        usage: None,
+    }
+}
+
+/// The whole delegation loop. The factory serves one shared script queue,
+/// so the order proves the sequencing: parent asks (pop 1), child answers
+/// (pop 2), parent summarizes (pop 3) — the parent demonstrably waited.
+#[tokio::test]
+async fn a_subagent_is_spawned_tasked_and_spliced_back() {
+    let scripted = ScriptedModel::new(vec![
+        subagent_turn("count to three", "t1"),
+        myco_models::test_support::text_output("one two three"),
+        myco_models::test_support::text_output("the child counted"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    pool.call(&ada(), &id, "post", json!({"text": "delegate this"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+
+    // The spliced result names the child and carries its answer.
+    let result = entries[2]["results"][0]["content"][0]["Text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(result.contains("one two three"), "{result}");
+    assert!(result.contains("subagent "), "{result}");
+
+    // The child remains: an ordinary chat, parented under this one, its
+    // task posted by the parent's agent principal.
+    let listing = pool.list(None);
+    assert_eq!(listing.len(), 2, "parent and child chats");
+    let child = listing.iter().find(|i| i.id != id).expect("child");
+    let about = pool
+        .call(&ada(), &child.id, "about", Value::Null)
+        .await
+        .expect("about");
+    assert_eq!(about["parent"], json!(id));
+    let child_tail = pool
+        .call(&ada(), &child.id, "tail", Value::Null)
+        .await
+        .expect("tail");
+    let task_post = &child_tail["entries"].as_array().unwrap()[0];
+    assert_eq!(task_post["author"], json!({"kind": "agent", "id": id}));
+    assert_eq!(task_post["text"], "count to three");
+}
+
+/// Depth two may exist; depth three may not. The refusal is a tool result
+/// the model reads, not a crash.
+#[tokio::test]
+async fn subagents_two_deep_may_not_spawn_deeper() {
+    let scripted = ScriptedModel::new(vec![
+        subagent_turn("go deeper", "t1"),
+        myco_models::test_support::text_output("stopped"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+
+    // Build the chain by hand: id ← mid ← leaf.
+    let mid = pool
+        .create(&ada(), "chat", "", "mid", json!({"parent": id}))
+        .expect("mid");
+    let leaf = pool
+        .create(&ada(), "chat", "", "leaf", json!({"parent": mid.id}))
+        .expect("leaf");
+
+    // The leaf's model tries to spawn: refused by depth.
+    pool.call(&ada(), &leaf.id, "post", json!({"text": "go"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &leaf.id, 2).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let result = &entries[2]["results"][0];
+    assert_eq!(result["is_error"], json!(true));
+    let why = result["content"][0]["Text"]["text"].as_str().unwrap();
+    assert!(why.contains("deep"), "{why}");
 }
 
 /// Attribution in the projection: solo chats read as typed; multiplayer
