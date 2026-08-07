@@ -1,18 +1,24 @@
 //! The framework, proven with the smallest possible kind: a counter whose
-//! `incr` is driver-gated and whose reads are free. Everything here is the
-//! contract every real kind inherits — driver policy, sys verbs, refusal
-//! semantics, events — pinned once, at the framework level.
+//! `incr` is driver-gated, whose `reset`/`peek` are owner-scoped, and whose
+//! plain reads are free. Everything here is the contract every real kind
+//! inherits — authority (driver and owner), refusal semantics, the sys
+//! verbs, events, and the two attack-derived guarantees: authority binds at
+//! apply time, and re-entrant self-calls refuse instead of deadlocking.
 
 use super::*;
-use myco_runtime::Ctx;
+use myco_runtime::Signals;
 
 struct CounterSpec;
 
 static COUNTER_SPEC: KindSpec = KindSpec {
     kind: "counter",
+    version: 1,
     doc: "a number that goes up",
     verbs: &[
         VerbSpec::driven("incr", "add {by} (default 1)"),
+        VerbSpec::driven("nap", "hold the mailbox for {ms} before incrementing"),
+        VerbSpec::owned("reset", "set the value to 0 (creator only)"),
+        VerbSpec::owned_read("peek", "the value, privately (creator only)"),
         VerbSpec::read("get", "the current value"),
         VerbSpec::read("text", "the value as plain text"),
     ],
@@ -24,16 +30,32 @@ struct Counter(i64);
 
 #[async_trait::async_trait]
 impl Instance for Counter {
-    async fn verb(&mut self, verb: &str, args: Value, cx: &mut Ctx) -> Result<Value, VerbError> {
+    async fn verb(
+        &mut self,
+        verb: &str,
+        args: Value,
+        signals: &Signals,
+    ) -> Result<Value, VerbError> {
         match verb {
             "incr" => {
                 self.0 += args.get("by").and_then(Value::as_i64).unwrap_or(1);
-                cx.bump();
+                signals.bump();
                 Ok(json!(self.0))
             }
-            "get" => Ok(json!(self.0)),
+            "nap" => {
+                let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(100);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                self.0 += 1;
+                signals.bump();
+                Ok(json!(self.0))
+            }
+            "reset" => {
+                self.0 = 0;
+                signals.bump();
+                Ok(json!(0))
+            }
+            "peek" | "get" => Ok(json!(self.0)),
             "text" => Ok(json!(self.0.to_string())),
-            "boom" => panic!("kind bug"),
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }
     }
@@ -44,11 +66,7 @@ impl Kind for CounterSpec {
         &COUNTER_SPEC
     }
 
-    fn create(
-        &self,
-        args: Value,
-        _signals: myco_runtime::Signals,
-    ) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(&self, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
         let start = args.get("start").and_then(Value::as_i64).unwrap_or(0);
         Ok(Box::new(Counter(start)))
     }
@@ -72,8 +90,21 @@ fn agent() -> Principal {
     Principal::Agent("chat-1".into())
 }
 
+async fn meta(pool: &Pool, id: &str) -> InstanceInfo {
+    let v = pool
+        .call(
+            &Principal::System("test".into()),
+            id,
+            "sys.meta",
+            Value::Null,
+        )
+        .await
+        .expect("sys.meta");
+    serde_json::from_value(v).expect("info deserializes")
+}
+
 #[tokio::test]
-async fn verbs_dispatch_and_reads_are_free_for_everyone() {
+async fn verbs_dispatch_and_plain_reads_are_free_for_everyone() {
     let pool = pool();
     let info = pool
         .create(&ada(), "counter", "proj", "", json!({"start": 40}))
@@ -84,7 +115,7 @@ async fn verbs_dispatch_and_reads_are_free_for_everyone() {
     let n = pool.call(&ada(), &info.id, "incr", json!({"by": 2})).await;
     assert_eq!(n.unwrap(), json!(42));
 
-    // Reads are never driver-gated: the agent and another human both read.
+    // Plain reads are never gated: the agent and another human both read.
     for p in [agent(), grace()] {
         assert_eq!(
             pool.call(&p, &info.id, "get", Value::Null).await.unwrap(),
@@ -117,9 +148,126 @@ async fn driver_gated_verbs_refuse_non_drivers_by_name() {
     );
 }
 
-/// The whole policy matrix: humans outrank agents, nobody takes from a
-/// human, release returns the seat to the default driver (the creator) —
-/// or empties it when the creator releases.
+/// The concurrency reviewer's emergency-stop scenario: a verb the old
+/// driver queued before losing the seat must be refused when it lands, not
+/// applied. Authority binds at apply time.
+#[tokio::test]
+async fn taking_the_seat_fences_the_old_drivers_queued_verbs() {
+    let pool = pool();
+    // The agent creates and drives.
+    let info = pool
+        .create(&agent(), "counter", "proj", "", Value::Null)
+        .unwrap();
+
+    // In-flight: the agent's `nap` holds the mailbox.
+    let napping = {
+        let pool = pool.clone();
+        let id = info.id.clone();
+        tokio::spawn(async move { pool.call(&agent(), &id, "nap", json!({"ms": 250})).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Queued behind it: an `incr` that passes the enqueue check (the agent
+    // still drives at this instant).
+    let queued = {
+        let pool = pool.clone();
+        let id = info.id.clone();
+        tokio::spawn(async move { pool.call(&agent(), &id, "incr", Value::Null).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The human seizes the seat while both are outstanding.
+    pool.call(&ada(), &info.id, "sys.take", Value::Null)
+        .await
+        .unwrap();
+
+    // The in-flight verb completes (a take is a fence, not an interrupt)…
+    assert_eq!(napping.await.unwrap().unwrap(), json!(1));
+    // …but the queued one is refused at apply time: the emergency stop
+    // actually stopped.
+    assert_eq!(
+        queued.await.unwrap(),
+        Err(VerbError::NotDriver {
+            held_by: Some(ada())
+        })
+    );
+    assert_eq!(
+        pool.call(&ada(), &info.id, "get", Value::Null)
+            .await
+            .unwrap(),
+        json!(1),
+        "the fenced incr never landed"
+    );
+}
+
+/// A verb handler calling back into its own instance would deadlock the
+/// mailbox; the dispatch refuses it instead.
+#[tokio::test]
+async fn a_self_call_is_refused_not_deadlocked() {
+    struct Selfie {
+        pool: Pool,
+    }
+    static SELFIE_SPEC: KindSpec = KindSpec {
+        kind: "selfie",
+        version: 1,
+        doc: "calls itself, to prove it cannot",
+        verbs: &[
+            VerbSpec::write("recurse", "call {id}'s get from inside a handler"),
+            VerbSpec::read("get", "unit"),
+        ],
+        primary_render: "get",
+        recommended_context: "get",
+    };
+    struct SelfieInstance {
+        pool: Pool,
+    }
+    #[async_trait::async_trait]
+    impl Instance for SelfieInstance {
+        async fn verb(&mut self, verb: &str, args: Value, _: &Signals) -> Result<Value, VerbError> {
+            match verb {
+                "recurse" => {
+                    let id = args["id"].as_str().unwrap_or_default();
+                    // The inner call is refused; surface its error verbatim.
+                    self.pool
+                        .call(&Principal::System("selfie".into()), id, "get", Value::Null)
+                        .await
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+    }
+    impl Kind for Selfie {
+        fn spec(&self) -> &'static KindSpec {
+            &SELFIE_SPEC
+        }
+        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+            Ok(Box::new(SelfieInstance {
+                pool: self.pool.clone(),
+            }))
+        }
+    }
+
+    let pool = pool();
+    pool.register(Arc::new(Selfie { pool: pool.clone() }));
+    let info = pool
+        .create(&ada(), "selfie", "proj", "", Value::Null)
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pool.call(&ada(), &info.id, "recurse", json!({"id": info.id})),
+    )
+    .await
+    .expect("refused, not deadlocked");
+    assert!(
+        matches!(result, Err(VerbError::Denied { ref why }) if why.contains("re-entrant")),
+        "{result:?}"
+    );
+}
+
+/// The whole seat policy: humans outrank agents, nobody else takes an
+/// occupied seat, release returns it to the creator — or empties it when
+/// the creator releases.
 #[tokio::test]
 async fn the_driver_seat_changes_hands_by_policy() {
     let pool = pool();
@@ -147,9 +295,9 @@ async fn the_driver_seat_changes_hands_by_policy() {
         Err(VerbError::NotDriver { .. })
     ));
 
-    // The creator releases: the seat empties (they are the default).
+    // The creator releases: the seat empties.
     release(ada()).await.unwrap();
-    assert_eq!(pool.info(&info.id).unwrap().driver, None);
+    assert_eq!(meta(&pool, &info.id).await.driver, None);
 
     // An empty seat is anyone's; the agent takes it and drives.
     take(agent()).await.unwrap();
@@ -159,17 +307,63 @@ async fn the_driver_seat_changes_hands_by_policy() {
 
     // A human takes from an agent without asking.
     take(grace()).await.unwrap();
-    assert_eq!(pool.info(&info.id).unwrap().driver, Some(grace()));
+    assert_eq!(meta(&pool, &info.id).await.driver, Some(grace()));
 
-    // Grace releases: the seat returns to the default driver, ada.
+    // Grace releases: the seat returns home, to the creator.
     release(grace()).await.unwrap();
-    assert_eq!(pool.info(&info.id).unwrap().driver, Some(ada()));
+    assert_eq!(meta(&pool, &info.id).await.driver, Some(ada()));
 
     // Only the holder can release.
     assert!(matches!(
         release(agent()).await,
         Err(VerbError::NotDriver { .. })
     ));
+}
+
+/// Owner scoping is the second authority axis, orthogonal to the seat: the
+/// creator keeps owned verbs even while someone else drives, and the driver
+/// does not gain them.
+#[tokio::test]
+async fn owned_verbs_belong_to_the_creator_regardless_of_the_seat() {
+    let pool = pool();
+    let info = pool
+        .create(&ada(), "counter", "proj", "", json!({"start": 7}))
+        .unwrap();
+
+    // Hand the seat to grace (ada releases, grace takes the empty seat).
+    pool.call(&ada(), &info.id, "sys.release", Value::Null)
+        .await
+        .unwrap();
+    pool.call(&grace(), &info.id, "sys.take", Value::Null)
+        .await
+        .unwrap();
+
+    // The driver does not own: grace may drive incr, but not reset or peek.
+    pool.call(&grace(), &info.id, "incr", Value::Null)
+        .await
+        .unwrap();
+    assert!(matches!(
+        pool.call(&grace(), &info.id, "reset", Value::Null).await,
+        Err(VerbError::Denied { .. })
+    ));
+    assert!(matches!(
+        pool.call(&agent(), &info.id, "peek", Value::Null).await,
+        Err(VerbError::Denied { .. })
+    ));
+
+    // The owner keeps owned verbs without the seat.
+    assert_eq!(
+        pool.call(&ada(), &info.id, "peek", Value::Null)
+            .await
+            .unwrap(),
+        json!(8)
+    );
+    assert_eq!(
+        pool.call(&ada(), &info.id, "reset", Value::Null)
+            .await
+            .unwrap(),
+        json!(0)
+    );
 }
 
 #[tokio::test]
@@ -184,6 +378,7 @@ async fn sys_verbs_expose_spec_meta_and_the_verb_log() {
         .await
         .unwrap();
     assert_eq!(spec["kind"], "counter");
+    assert_eq!(spec["version"], 1);
     assert_eq!(spec["recommended_context"], "text");
     assert!(
         spec["verbs"]
@@ -193,14 +388,12 @@ async fn sys_verbs_expose_spec_meta_and_the_verb_log() {
             .any(|v| v["name"] == "incr" && v["requires_driver"] == true)
     );
 
-    let meta = pool
-        .call(&agent(), &info.id, "sys.meta", Value::Null)
-        .await
-        .unwrap();
-    assert_eq!(meta["title"], "the count");
-    assert_eq!(meta["project"], "proj");
+    let m = meta(&pool, &info.id).await;
+    assert_eq!(m.title, "the count");
+    assert_eq!(m.project, "proj");
 
-    // The log records refusals too — that is what makes it a debugger.
+    // The log records refusals — that is what makes it a debugger — and its
+    // error names come from the serde tag, so they cannot drift.
     let _ = pool.call(&agent(), &info.id, "incr", Value::Null).await;
     let log = pool
         .call(&ada(), &info.id, "sys.log", json!({"limit": 8}))
@@ -213,11 +406,18 @@ async fn sys_verbs_expose_spec_meta_and_the_verb_log() {
             .any(|e| e["verb"] == "incr" && e["ok"] == false && e["error"] == "not_driver"),
         "{entries:?}"
     );
+    // Introspection does not log itself: reading the log must not erase it.
+    assert!(
+        !entries.iter().any(|e| e["verb"]
+            .as_str()
+            .is_some_and(|v| matches!(v, "sys.log" | "sys.meta" | "sys.spec"))),
+        "{entries:?}"
+    );
 
     pool.call(&ada(), &info.id, "sys.rename", json!({"title": "renamed"}))
         .await
         .unwrap();
-    assert_eq!(pool.info(&info.id).unwrap().title, "renamed");
+    assert_eq!(meta(&pool, &info.id).await.title, "renamed");
 }
 
 #[tokio::test]
@@ -238,7 +438,7 @@ async fn unknown_things_fail_by_name() {
     // A verb outside the spec is refused *before* reaching the kind — the
     // spec is the contract, not the implementation's match arms.
     assert!(matches!(
-        pool.call(&ada(), &info.id, "boom", Value::Null).await,
+        pool.call(&ada(), &info.id, "explode", Value::Null).await,
         Err(VerbError::UnknownVerb { .. })
     ));
     assert!(matches!(
@@ -247,6 +447,9 @@ async fn unknown_things_fail_by_name() {
     ));
 }
 
+/// Watermarks wake watchers for kind-state changes, meta changes, and
+/// removal alike — a `changed` wait always resolves to something readable
+/// (or to the discovery that the instance is gone).
 #[tokio::test]
 async fn watermarks_wake_watchers_and_removal_forgets() {
     let pool = pool();
@@ -263,14 +466,35 @@ async fn watermarks_wake_watchers_and_removal_forgets() {
     pool.call(&ada(), &info.id, "incr", Value::Null)
         .await
         .unwrap();
-    assert!(watcher.await.unwrap().unwrap() > seen);
+    let seen = watcher.await.unwrap().unwrap();
+    assert!(seen > 0);
+
+    // Meta changes bump too: a title watcher re-reads without the feed.
+    let watcher = {
+        let pool = pool.clone();
+        let id = info.id.clone();
+        tokio::spawn(async move { pool.changed(&id, seen).await })
+    };
+    pool.call(&ada(), &info.id, "sys.rename", json!({"title": "t"}))
+        .await
+        .unwrap();
+    let seen = watcher.await.unwrap().unwrap();
 
     // An agent that neither created nor drives may not remove.
     assert!(matches!(
-        pool.remove(&agent(), &info.id),
+        pool.call(&agent(), &info.id, "sys.remove", Value::Null)
+            .await,
         Err(VerbError::Denied { .. })
     ));
-    pool.remove(&ada(), &info.id).unwrap();
+
+    // Removal wakes a parked watcher, then the instance is forgotten. The
+    // join polls the wait first, so it is parked before the remove runs.
+    let (woken, removed) = tokio::join!(pool.changed(&info.id, seen), async {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pool.call(&ada(), &info.id, "sys.remove", Value::Null).await
+    });
+    removed.unwrap();
+    assert!(woken.is_ok(), "removal resolves the wait");
     assert!(matches!(
         pool.call(&ada(), &info.id, "get", Value::Null).await,
         Err(VerbError::UnknownInstance { .. })
@@ -288,11 +512,16 @@ async fn the_global_feed_carries_lifecycle_driver_and_kind_events() {
     pool.call(&ada(), &info.id, "sys.release", Value::Null)
         .await
         .unwrap();
-    pool.remove(&ada(), &info.id).unwrap();
+    pool.call(&ada(), &info.id, "sys.remove", Value::Null)
+        .await
+        .unwrap();
 
     let mut names = Vec::new();
     while let Ok((id, event)) = feed.try_recv() {
         assert_eq!(id, info.id);
+        if event.name == "created" {
+            assert_eq!(event.data["creator"]["id"], "ada");
+        }
         names.push(event.name);
     }
     assert_eq!(names, ["created", "driver", "removed"]);
@@ -315,26 +544,26 @@ async fn listing_scopes_by_project() {
 }
 
 /// A panicking kind takes down its own instance and nothing else; the
-/// corpse answers `Gone`, and its `sys.meta` (framework state, not cell
-/// state) still reports `crashed` for the tree UI.
+/// corpse answers `Gone`, and its `sys.meta` (entry state, not cell state)
+/// still reports `crashed` for the tree UI.
 #[tokio::test]
 async fn a_kind_bug_crashes_one_instance_only() {
     struct Buggy;
     static BUGGY_SPEC: KindSpec = KindSpec {
         kind: "buggy",
+        version: 1,
         doc: "panics on demand",
         verbs: &[
             VerbSpec::write("boom", "panic"),
             VerbSpec::read("get", "value"),
-            VerbSpec::read("text", "value as text"),
         ],
         primary_render: "get",
-        recommended_context: "text",
+        recommended_context: "get",
     };
     struct BuggyInstance;
     #[async_trait::async_trait]
     impl Instance for BuggyInstance {
-        async fn verb(&mut self, verb: &str, _: Value, _: &mut Ctx) -> Result<Value, VerbError> {
+        async fn verb(&mut self, verb: &str, _: Value, _: &Signals) -> Result<Value, VerbError> {
             match verb {
                 "boom" => panic!("kind bug"),
                 _ => Ok(json!(1)),
@@ -345,11 +574,7 @@ async fn a_kind_bug_crashes_one_instance_only() {
         fn spec(&self) -> &'static KindSpec {
             &BUGGY_SPEC
         }
-        fn create(
-            &self,
-            _: Value,
-            _: myco_runtime::Signals,
-        ) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(BuggyInstance))
         }
     }
@@ -371,13 +596,14 @@ async fn a_kind_bug_crashes_one_instance_only() {
         pool.call(&ada(), &victim.id, "get", Value::Null).await,
         Err(VerbError::Gone)
     );
-    // wait for the monitor to mark the corpse
+    // The crashed flag is eventually-true; Gone above was the definitive
+    // signal. Wait for the monitor to mark the corpse for listings.
     let mut tries = 0;
-    while !pool.info(&victim.id).unwrap().crashed && tries < 200 {
+    while !meta(&pool, &victim.id).await.crashed && tries < 200 {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         tries += 1;
     }
-    assert!(pool.info(&victim.id).unwrap().crashed);
+    assert!(meta(&pool, &victim.id).await.crashed);
 
     // The bystander never noticed.
     assert_eq!(
@@ -386,4 +612,18 @@ async fn a_kind_bug_crashes_one_instance_only() {
             .unwrap(),
         json!(0)
     );
+}
+
+/// The attention envelope round-trips — the pinned convention notifiers and
+/// standing subscriptions will share.
+#[test]
+fn the_attention_envelope_round_trips() {
+    let a = events::Attention {
+        for_: vec![ada()],
+        title: "turn finished".into(),
+        body: "the build is green".into(),
+    };
+    let data = a.data();
+    assert_eq!(data["for"][0]["id"], "ada");
+    assert_eq!(events::Attention::from_data(&data), Some(a));
 }

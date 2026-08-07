@@ -204,7 +204,9 @@ async fn removal_forgets_the_terminal() {
     let tty = pool
         .create(&ada(), "tty", "proj", "", json!({"command": "sleep 100"}))
         .unwrap();
-    pool.remove(&ada(), &tty.id).unwrap();
+    pool.call(&ada(), &tty.id, "sys.remove", Value::Null)
+        .await
+        .unwrap();
     assert!(matches!(
         pool.call(&ada(), &tty.id, "screen", Value::Null).await,
         Err(VerbError::UnknownInstance { .. })

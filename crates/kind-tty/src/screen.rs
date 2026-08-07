@@ -6,7 +6,7 @@
 /// One run of same-styled characters on one row. Rows are addressed, so
 /// renderers keep alignment without trailing blanks.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ScreenRun {
+pub(crate) struct ScreenRun {
     pub row: u16,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,7 +21,7 @@ pub struct ScreenRun {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Screen {
+pub(crate) struct Screen {
     pub cols: u16,
     pub rows: u16,
     pub cursor_row: u16,

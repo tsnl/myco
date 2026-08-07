@@ -13,17 +13,16 @@
 use std::sync::{Arc, Mutex};
 
 use myco_instance::{Instance, Kind, KindSpec, VerbError, VerbSpec};
-use myco_runtime::{Ctx, Signals};
+use myco_runtime::Signals;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
 
 mod pty;
 mod screen;
 
-pub use screen::{Screen, ScreenRun};
-
 static TTY_SPEC: KindSpec = KindSpec {
     kind: "tty",
+    version: 1,
     doc: "a terminal: a pty running a command, watched by anyone, typed into by its driver",
     verbs: &[
         VerbSpec::driven("input", "write {data} to the terminal as keystrokes"),
@@ -33,7 +32,13 @@ static TTY_SPEC: KindSpec = KindSpec {
             "text",
             "the screen as plain text, plus whether the child runs",
         ),
-        VerbSpec::cursored_read("tail", "raw output from byte offset {from}; returns {next}"),
+        VerbSpec::cursored_read(
+            "tail",
+            "output from byte offset {from}, at most {max_bytes}; returns {next}. Offsets are \
+             raw-byte positions: compare the returned {from} to what you sent to detect \
+             scrollback trimming, and never derive cursors from the decoded string's length \
+             (decoding is lossy at chunk boundaries)",
+        ),
     ],
     primary_render: "screen",
     recommended_context: "text",
@@ -64,8 +69,7 @@ impl Kind for TtyKind {
         let command = args
             .get("command")
             .and_then(Value::as_str)
-            .unwrap_or("bash -i")
-            .to_string();
+            .map(str::to_string);
         let cols = dimension(&args, "cols", DEFAULT_COLS, 20, 500)?;
         let rows = dimension(&args, "rows", DEFAULT_ROWS, 5, 200)?;
         let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -76,8 +80,13 @@ impl Kind for TtyKind {
             (Err(e), _) | (_, Err(e)) => return Err(failed(format!("pty slave dup: {e}"))),
         };
         let mut cmd = tokio::process::Command::new("bash");
-        cmd.args(["-c", &command])
-            .stdin(std::process::Stdio::from(sin))
+        // An explicit command runs under `bash -c`; the default is a plain
+        // interactive shell, not a shell running a shell.
+        match &command {
+            Some(c) => cmd.args(["-c", c]),
+            None => cmd.arg("-i"),
+        };
+        cmd.stdin(std::process::Stdio::from(sin))
             .stdout(std::process::Stdio::from(sout))
             .stderr(std::process::Stdio::from(slave))
             .kill_on_drop(true)
@@ -91,9 +100,10 @@ impl Kind for TtyKind {
         if let Some(dir) = &cwd {
             cmd.current_dir(dir);
         }
+        let shown = command.as_deref().unwrap_or("bash -i");
         let child = cmd
             .spawn()
-            .map_err(|e| failed(format!("spawn {command:?}: {e}")))?;
+            .map_err(|e| failed(format!("spawn {shown:?}: {e}")))?;
 
         let term = Arc::new(Mutex::new(Term {
             parser: vt100::Parser::new(rows, cols, 0),
@@ -147,7 +157,12 @@ struct Tty {
 
 #[async_trait::async_trait]
 impl Instance for Tty {
-    async fn verb(&mut self, verb: &str, args: Value, cx: &mut Ctx) -> Result<Value, VerbError> {
+    async fn verb(
+        &mut self,
+        verb: &str,
+        args: Value,
+        signals: &Signals,
+    ) -> Result<Value, VerbError> {
         match verb {
             "input" => {
                 let data = args
@@ -169,7 +184,7 @@ impl Instance for Tty {
                     .unwrap_or_else(|e| e.into_inner())
                     .parser
                     .set_size(rows, cols);
-                cx.bump();
+                signals.bump();
                 Ok(Value::Null)
             }
             "screen" => {
@@ -184,13 +199,23 @@ impl Instance for Tty {
                 }))
             }
             "tail" => {
+                // The budget doctrine made real: the caller bounds its own
+                // read; `next` reports how far this reply actually got.
                 let from = args.get("from").and_then(Value::as_u64).unwrap_or(0);
+                let max = args
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
                 let t = self.term.lock().unwrap_or_else(|e| e.into_inner());
                 let end = t.scroll_start + t.scroll.len() as u64;
                 let from = from.clamp(t.scroll_start, end);
-                let data = String::from_utf8_lossy(&t.scroll[(from - t.scroll_start) as usize..])
-                    .into_owned();
-                Ok(json!({ "from": from, "data": data, "next": end }))
+                let upto = end.min(from.saturating_add(max));
+                let slice =
+                    &t.scroll[(from - t.scroll_start) as usize..(upto - t.scroll_start) as usize];
+                // Best-effort UTF-8: a cursor or trim landing mid-codepoint
+                // decodes as U+FFFD at the seam. Cursor math stays in bytes.
+                let data = String::from_utf8_lossy(slice).into_owned();
+                Ok(json!({ "from": from, "data": data, "next": upto }))
             }
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }

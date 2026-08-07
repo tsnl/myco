@@ -1,24 +1,31 @@
 //! L1: the instance framework — kinds, verbs, principals, drivers, and the
 //! [`Pool`] that fronts them as one bus.
 //!
-//! Everything is a verb. Reads are verbs (`read_only`, always concurrent,
-//! never driver-gated); writes are verbs; driver transfer and introspection
-//! are the `sys.*` verbs the framework answers itself so kinds cannot get
-//! them wrong. Authorization is one function of (principal, verb spec,
-//! driver state): where a kind declares `requires_driver`, the check is
-//! `driver == principal`, enforced by refusal — never by blocking.
+//! Everything is a verb. Reads are verbs (never driver-gated, refused to
+//! nobody unless owner-scoped); writes are verbs; driver transfer,
+//! introspection, rename, and removal are the `sys.*` verbs the framework
+//! answers itself so kinds cannot get them wrong. Authorization is one
+//! function of (principal, verb spec, entry state), enforced by refusal —
+//! never by blocking — and for driver-gated verbs it is enforced **twice**:
+//! once at enqueue (fast refusal, ahead of the queue) and again at apply
+//! (inside the mailbox, so authority is bound to effect: a `sys.take`
+//! fences every not-yet-applied verb from the old driver).
 //!
 //! The driver is authority, not a mutex: durable, visible state on the
 //! instance, changed by `sys.take`/`sys.release` under one policy — humans
 //! may take from agents or from nobody; an agent may never take from a
-//! human; release returns the instance to its default driver (its creator),
-//! or to nobody when the default driver itself releases.
+//! human; release returns the instance to its creator, or to nobody when
+//! the creator releases. `owner_only` is the second, immutable authority
+//! axis: a verb scoped to the instance's creator (a per-user inbox's reads,
+//! its ack), checkable before the queue because the creator never changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
-use myco_runtime::{Cell, CellGone, Ctx, Event, Watermark};
+use myco_runtime::{Cell, CellGone, Event, Signals, Watermark};
 use serde_json::{Value, json};
+
+pub mod events;
 
 /// Who is asking. An agent is named by the chat instance it drives — both
 /// adapters (HTTP for humans, the model loop for agents) resolve to this
@@ -41,17 +48,25 @@ impl std::fmt::Display for Principal {
     }
 }
 
-/// One verb in a kind's vocabulary.
+/// One verb in a kind's vocabulary. The flags are schema — promises to
+/// consumers, some enforced by the framework (`requires_driver`,
+/// `owner_only`), some contracts the kind must honor (`read_only` purity,
+/// `cursored` delta-reads for M2's standing subscriptions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct VerbSpec {
     pub name: &'static str,
     pub doc: &'static str,
-    /// Pure: no state change, never driver-gated, any number of concurrent
-    /// callers.
+    /// Pure: no state change. A schema promise (the framework cannot verify
+    /// purity), consumed by clients that call reads speculatively.
     pub read_only: bool,
-    /// Only the current driver may call it.
+    /// Only the current driver may call it. Enforced at enqueue and again
+    /// at apply.
     pub requires_driver: bool,
+    /// Only the instance's creator may call it. Enforced at enqueue; the
+    /// creator is immutable, so no apply-time re-check is needed.
+    pub owner_only: bool,
     /// Takes a cursor and returns the next one, so callers read deltas.
+    /// Consumer: an agent's standing subscriptions (M2).
     pub cursored: bool,
 }
 
@@ -62,37 +77,48 @@ impl VerbSpec {
             doc,
             read_only: true,
             requires_driver: false,
+            owner_only: false,
             cursored: false,
         }
     }
 
     pub const fn cursored_read(name: &'static str, doc: &'static str) -> Self {
         Self {
-            name,
-            doc,
             read_only: true,
-            requires_driver: false,
             cursored: true,
+            ..Self::read(name, doc)
         }
     }
 
     pub const fn driven(name: &'static str, doc: &'static str) -> Self {
         Self {
-            name,
-            doc,
             read_only: false,
             requires_driver: true,
-            cursored: false,
+            ..Self::read(name, doc)
         }
     }
 
     pub const fn write(name: &'static str, doc: &'static str) -> Self {
         Self {
-            name,
-            doc,
             read_only: false,
-            requires_driver: false,
-            cursored: false,
+            ..Self::read(name, doc)
+        }
+    }
+
+    /// A write only the creator may perform (a private instance's `ack`).
+    pub const fn owned(name: &'static str, doc: &'static str) -> Self {
+        Self {
+            read_only: false,
+            owner_only: true,
+            ..Self::read(name, doc)
+        }
+    }
+
+    /// A read only the creator may perform (a private instance's state).
+    pub const fn owned_read(name: &'static str, doc: &'static str) -> Self {
+        Self {
+            owner_only: true,
+            ..Self::read(name, doc)
         }
     }
 }
@@ -100,11 +126,17 @@ impl VerbSpec {
 /// A kind's contract: its verb vocabulary plus the two hints consumers use
 /// to pick a default read — `primary_render` for pane renderers,
 /// `recommended_context` for an agent's context assembly. Every kind must
-/// include at least one plain-text read (the acme escape hatch; see
-/// DESIGN.md).
+/// have at least one plain read, and each hint must name a real verb —
+/// [`Pool::register`] asserts both. The escape-hatch rule: the
+/// `recommended_context` verb's payload must contain a canonical plain-text
+/// field (see DESIGN.md), so every instance stays greppable.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct KindSpec {
     pub kind: &'static str,
+    /// Schema version, serialized into `sys.spec` — bump on any change to
+    /// verb names, argument shapes, or payloads once protocol providers
+    /// (M4) can be older than the pool.
+    pub version: u32,
     pub doc: &'static str,
     pub verbs: &'static [VerbSpec],
     pub primary_render: &'static str,
@@ -179,24 +211,36 @@ impl From<CellGone> for VerbError {
 /// own vocabulary. Runs inside the instance's cell — serialized, may await.
 #[async_trait::async_trait]
 pub trait Instance: Send {
-    async fn verb(&mut self, verb: &str, args: Value, cx: &mut Ctx) -> Result<Value, VerbError>;
+    async fn verb(
+        &mut self,
+        verb: &str,
+        args: Value,
+        signals: &Signals,
+    ) -> Result<Value, VerbError>;
 }
 
 /// A kind: the factory plus the spec. Registered once at startup. `create`
-/// receives the cell's [`Signals`](myco_runtime::Signals) up front, so a
-/// kind that runs side-feed tasks (a pty reader) wires them inline — there
-/// is no second post-construction step.
+/// receives the cell's [`Signals`] up front, so a kind that runs side-feed
+/// tasks (a pty reader) wires them inline.
+///
+/// Kinds that consume the bus itself (an event-fed notifier) hold a
+/// [`Pool`] clone as a factory field — blessed dependency injection, with
+/// three rules that keep it safe:
+/// - side-feed tasks may call the pool freely;
+/// - a verb handler must never call a verb on its own instance (the
+///   framework refuses the direct case) nor on instances that may call
+///   back — call cycles deadlock, undetectably past one hop;
+/// - a side-feed whose input does not die with the instance (a pool event
+///   feed, unlike a pty) must be cancelled by the instance's `Drop`.
 pub trait Kind: Send + Sync {
     fn spec(&self) -> &'static KindSpec;
-    fn create(
-        &self,
-        args: Value,
-        signals: myco_runtime::Signals,
-    ) -> Result<Box<dyn Instance>, VerbError>;
+    fn create(&self, args: Value, signals: Signals) -> Result<Box<dyn Instance>, VerbError>;
 }
 
 /// One `sys.log` entry: who called what, and how it went. The acme `event`
 /// file reborn — every instance carries its own recent history for free.
+/// Introspection reads (`sys.spec`/`sys.meta`/`sys.log`) are not recorded,
+/// so watching the debugger does not erase the evidence.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VerbLog {
     pub at: chrono::DateTime<chrono::Utc>,
@@ -216,18 +260,20 @@ struct Entry {
     kind: &'static KindSpec,
     project: String,
     title: RwLock<String>,
+    /// Immutable; doubles as the owner (`owner_only` verbs) and the default
+    /// driver the seat returns to on release.
     creator: Principal,
-    /// Where `sys.release` returns the seat: the creator.
-    default_driver: Principal,
-    driver: RwLock<Option<Principal>>,
+    /// Shared with apply-time closures, so authority is re-checked when a
+    /// queued verb actually runs — not just when it was admitted.
+    driver: Arc<RwLock<Option<Principal>>>,
     log: Mutex<VecDeque<VerbLog>>,
     cell: Cell<Box<dyn Instance>>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A listing row — everything the tree UI needs, nothing that requires
-/// entering the cell.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// entering the cell (a wedged instance must not wedge the tree).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceInfo {
     pub id: String,
     pub kind: String,
@@ -236,8 +282,17 @@ pub struct InstanceInfo {
     pub creator: Principal,
     pub driver: Option<Principal>,
     pub watermark: Watermark,
+    /// Eventually-true after a kind panic. `false` means "not known dead" —
+    /// a `Gone` from a verb call is the definitive signal.
     pub crashed: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+tokio::task_local! {
+    /// The instance id whose verb handler is currently applying on this
+    /// task — the re-entrancy tripwire: a handler calling back into its own
+    /// instance would deadlock the mailbox, so the dispatch refuses it.
+    static APPLYING: String;
 }
 
 /// The bus: every kind, every instance, one dispatch surface. L2 exposes
@@ -252,7 +307,10 @@ struct PoolInner {
     kinds: RwLock<HashMap<&'static str, Arc<dyn Kind>>>,
     instances: RwLock<HashMap<String, Arc<Entry>>>,
     /// The global feed: lifecycle plus every instance's events, tagged by
-    /// id. The tree UI and the debugger both hang off this.
+    /// id. Best-effort by design — a lagging consumer skips and recovers by
+    /// re-reading state (`list`, watermarks), never by trusting the feed to
+    /// be complete. Not causally ordered across instances or with removal:
+    /// a side-feed's last words ("exited") can trail "removed".
     events: tokio::sync::broadcast::Sender<(String, Event)>,
 }
 
@@ -274,10 +332,34 @@ impl Pool {
         }
     }
 
-    /// Register a kind. Startup-time; a duplicate name is a programming
-    /// error worth dying loudly for.
+    /// Register a kind. Startup-time; a malformed spec is a programming
+    /// error worth dying loudly for, so the contract is asserted here:
+    /// both hints name real verbs, at least one plain read exists, and no
+    /// verb claims to be a driver-gated read.
     pub fn register(&self, kind: Arc<dyn Kind>) {
-        let name = kind.spec().kind;
+        let spec = kind.spec();
+        let name = spec.kind;
+        assert!(
+            spec.verb(spec.primary_render).is_some(),
+            "kind {name:?}: primary_render {:?} is not a verb",
+            spec.primary_render
+        );
+        assert!(
+            spec.verb(spec.recommended_context).is_some(),
+            "kind {name:?}: recommended_context {:?} is not a verb",
+            spec.recommended_context
+        );
+        assert!(
+            spec.verbs.iter().any(|v| v.read_only),
+            "kind {name:?} declares no read verb"
+        );
+        for v in spec.verbs {
+            assert!(
+                !(v.read_only && v.requires_driver),
+                "kind {name:?}: verb {:?} cannot be a driver-gated read",
+                v.name
+            );
+        }
         let mut kinds = self.inner.kinds.write().unwrap_or_else(|e| e.into_inner());
         assert!(
             kinds.insert(name, kind).is_none(),
@@ -295,8 +377,8 @@ impl Pool {
             .collect()
     }
 
-    /// Create an instance. The creator starts as driver and remains the
-    /// default the seat returns to on release.
+    /// Create an instance. The creator becomes owner (immutable), first
+    /// driver, and the seat's home on release.
     pub fn create(
         &self,
         creator: &Principal,
@@ -312,7 +394,14 @@ impl Pool {
                 .cloned()
                 .ok_or_else(|| VerbError::UnknownKind { kind: kind.into() })?
         };
-        let cell = Cell::try_spawn_with(|signals| factory.create(args, signals))?;
+        // Subscribe inside the builder, before `create` can spawn side-feed
+        // tasks: nothing the instance ever emits predates the subscription.
+        let mut cell_events = None;
+        let cell = Cell::try_spawn_with(|signals| {
+            cell_events = Some(signals.subscribe());
+            factory.create(args, signals)
+        })?;
+        let mut rx = cell_events.expect("builder ran");
 
         let id = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(Entry {
@@ -325,21 +414,26 @@ impl Pool {
                 title.to_string()
             }),
             creator: creator.clone(),
-            default_driver: creator.clone(),
-            driver: RwLock::new(Some(creator.clone())),
+            driver: Arc::new(RwLock::new(Some(creator.clone()))),
             log: Mutex::new(VecDeque::new()),
             cell,
             created_at: chrono::Utc::now(),
         });
 
         // Forward the instance's own events onto the global feed, id-tagged.
+        // Lag is survivable (skip and continue); only closure ends the task.
         {
-            let mut rx = entry.cell.subscribe();
             let global = self.inner.events.clone();
             let tag = id.clone();
             tokio::spawn(async move {
-                while let Ok(event) = rx.recv().await {
-                    let _ = global.send((tag.clone(), event));
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let _ = global.send((tag.clone(), event));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
         }
@@ -354,7 +448,11 @@ impl Pool {
             id,
             Event {
                 name: "created".into(),
-                data: json!({"kind": kind, "project": project}),
+                data: json!({
+                    "kind": kind,
+                    "project": project,
+                    "creator": creator,
+                }),
             },
         ));
         Ok(info)
@@ -372,17 +470,21 @@ impl Pool {
     ) -> Result<Value, VerbError> {
         let entry = self.entry(id)?;
         let result = self.call_inner(principal, &entry, verb, args).await;
-        let mut log = entry.log.lock().unwrap_or_else(|e| e.into_inner());
-        if log.len() == VERB_LOG_CAP {
-            log.pop_front();
+        // Introspection is free: reading the debugger must not erase the
+        // evidence it exists to keep.
+        if !matches!(verb, "sys.spec" | "sys.meta" | "sys.log") {
+            let mut log = entry.log.lock().unwrap_or_else(|e| e.into_inner());
+            if log.len() == VERB_LOG_CAP {
+                log.pop_front();
+            }
+            log.push_back(VerbLog {
+                at: chrono::Utc::now(),
+                principal: principal.clone(),
+                verb: verb.to_string(),
+                ok: result.is_ok(),
+                error: result.as_ref().err().map(error_name),
+            });
         }
-        log.push_back(VerbLog {
-            at: chrono::Utc::now(),
-            principal: principal.clone(),
-            verb: verb.to_string(),
-            ok: result.is_ok(),
-            error: result.as_ref().err().map(error_name),
-        });
         result
     }
 
@@ -400,6 +502,14 @@ impl Pool {
             .kind
             .verb(verb)
             .ok_or_else(|| VerbError::UnknownVerb { verb: verb.into() })?;
+        if spec.owner_only && entry.creator != *principal {
+            return Err(VerbError::Denied {
+                why: format!("owner only ({})", entry.creator),
+            });
+        }
+        // Enqueue-time check: refuse ahead of the queue, so a non-driver
+        // never waits behind the very verbs it should have been refused
+        // before.
         if spec.requires_driver {
             let driver = entry.driver.read().unwrap_or_else(|e| e.into_inner());
             if driver.as_ref() != Some(principal) {
@@ -408,14 +518,46 @@ impl Pool {
                 });
             }
         }
-        let verb = verb.to_string();
+        // A verb handler calling back into its own instance would wait on a
+        // reply only its own return can produce. Refuse, don't deadlock.
+        let self_call = APPLYING.try_with(|cur| *cur == entry.id).unwrap_or(false);
+        if self_call {
+            return Err(VerbError::Denied {
+                why: "re-entrant call: a verb handler may not call its own instance".into(),
+            });
+        }
+
+        let verb_name = verb.to_string();
+        let requires_driver = spec.requires_driver;
+        let driver_slot = Arc::clone(&entry.driver);
+        let caller = principal.clone();
+        let applying_id = entry.id.clone();
         entry
             .cell
-            .call(move |instance, cx| Box::pin(async move { instance.verb(&verb, args, cx).await }))
+            .call(move |instance, signals| {
+                Box::pin(APPLYING.scope(applying_id, async move {
+                    // Apply-time re-check binds authority to effect: a
+                    // sys.take fences every verb the old driver had queued
+                    // but not yet landed. (Synchronous read; the guard drops
+                    // before any await.)
+                    if requires_driver {
+                        let held = driver_slot
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        if held.as_ref() != Some(&caller) {
+                            return Err(VerbError::NotDriver { held_by: held });
+                        }
+                    }
+                    instance.verb(&verb_name, args, signals).await
+                }))
+            })
             .await?
     }
 
-    /// The uniform verbs: introspection and the driver seat.
+    /// The uniform verbs: introspection, identity, the driver seat, and
+    /// removal — entry/pool-level, never entering the mailbox, so they work
+    /// on a wedged or crashed instance (that is the rescue path).
     fn sys_verb(
         &self,
         principal: &Principal,
@@ -443,13 +585,7 @@ impl Pool {
                     }
                 })?;
                 *entry.title.write().unwrap_or_else(|e| e.into_inner()) = title.to_string();
-                let _ = self.inner.events.send((
-                    entry.id.clone(),
-                    Event {
-                        name: "renamed".into(),
-                        data: json!({ "title": title }),
-                    },
-                ));
+                self.meta_changed(entry, "renamed", json!({ "title": title }));
                 Ok(Value::Null)
             }
             "take" => {
@@ -457,8 +593,9 @@ impl Pool {
                 let allowed = match (&*driver, principal) {
                     (None, _) => true,
                     (Some(held), p) if held == p => true,
-                    // Humans outrank agents; nobody takes from a human, and
-                    // agents do not wrestle each other for the seat.
+                    // Humans outrank agents; nobody takes an occupied seat
+                    // otherwise — not from a human, not System, and agents
+                    // do not wrestle each other for it.
                     (Some(Principal::Agent(_)), Principal::Human(_)) => true,
                     (Some(_), _) => false,
                 };
@@ -468,8 +605,13 @@ impl Pool {
                     });
                 }
                 *driver = Some(principal.clone());
+                let now = driver.clone();
                 drop(driver);
-                self.driver_event(entry);
+                self.meta_changed(
+                    entry,
+                    "driver",
+                    serde_json::to_value(&now).expect("principal"),
+                );
                 Ok(Value::Null)
             }
             "release" => {
@@ -479,13 +621,57 @@ impl Pool {
                         held_by: driver.clone(),
                     });
                 }
-                *driver = if *principal == entry.default_driver {
+                *driver = if *principal == entry.creator {
                     None
                 } else {
-                    Some(entry.default_driver.clone())
+                    Some(entry.creator.clone())
                 };
+                let now = driver.clone();
                 drop(driver);
-                self.driver_event(entry);
+                self.meta_changed(
+                    entry,
+                    "driver",
+                    serde_json::to_value(&now).expect("principal"),
+                );
+                Ok(Value::Null)
+            }
+            "remove" => {
+                // Humans and system may remove anything; an agent only what
+                // it created or currently drives.
+                let allowed = match principal {
+                    Principal::Human(_) | Principal::System(_) => true,
+                    Principal::Agent(_) => {
+                        let driving = entry
+                            .driver
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            == Some(principal);
+                        entry.creator == *principal || driving
+                    }
+                };
+                if !allowed {
+                    return Err(VerbError::Denied {
+                        why: "an agent may remove only instances it created or drives".into(),
+                    });
+                }
+                self.inner
+                    .instances
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&entry.id);
+                let _ = self.inner.events.send((
+                    entry.id.clone(),
+                    Event {
+                        name: "removed".into(),
+                        data: Value::Null,
+                    },
+                ));
+                // Wake watermark watchers so a `changed` wait resolves; the
+                // next call answers UnknownInstance. (The cell itself ends
+                // when its last handle drops — the state drop is where kinds
+                // kill their children.)
+                entry.cell.signals().bump();
                 Ok(Value::Null)
             }
             other => Err(VerbError::UnknownVerb {
@@ -494,56 +680,18 @@ impl Pool {
         }
     }
 
-    fn driver_event(&self, entry: &Arc<Entry>) {
-        let driver = entry
-            .driver
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+    /// Meta changes (driver, title) are observable state: they travel the
+    /// event feed as history *and* bump the watermark so meta watchers
+    /// re-read — the same contract kind-state changes honor.
+    fn meta_changed(&self, entry: &Arc<Entry>, event: &str, data: Value) {
         let _ = self.inner.events.send((
             entry.id.clone(),
             Event {
-                name: "driver".into(),
-                data: serde_json::to_value(&driver).expect("principal serializes"),
+                name: event.into(),
+                data,
             },
         ));
-    }
-
-    /// Forget an instance: its cell's last handle drops, queued verbs drain,
-    /// the state drops (kinds kill their children there). Creator, current
-    /// driver, any human, and system may remove; an agent may remove only
-    /// what it created.
-    pub fn remove(&self, principal: &Principal, id: &str) -> Result<(), VerbError> {
-        let entry = self.entry(id)?;
-        let driver = entry
-            .driver
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let allowed = match principal {
-            Principal::Human(_) | Principal::System(_) => true,
-            Principal::Agent(_) => {
-                entry.creator == *principal || driver.as_ref() == Some(principal)
-            }
-        };
-        if !allowed {
-            return Err(VerbError::Denied {
-                why: "an agent may remove only instances it created or drives".into(),
-            });
-        }
-        self.inner
-            .instances
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        let _ = self.inner.events.send((
-            id.to_string(),
-            Event {
-                name: "removed".into(),
-                data: Value::Null,
-            },
-        ));
-        Ok(())
+        entry.cell.signals().bump();
     }
 
     pub fn list(&self, project: Option<&str>) -> Vec<InstanceInfo> {
@@ -561,25 +709,21 @@ impl Pool {
         rows
     }
 
-    pub fn info(&self, id: &str) -> Result<InstanceInfo, VerbError> {
-        let entry = self.entry(id)?;
-        Ok(self.info_of(&entry))
-    }
-
     /// Current watermark, for starting a watch loop.
     pub fn watermark(&self, id: &str) -> Result<Watermark, VerbError> {
         Ok(self.entry(id)?.cell.watermark())
     }
 
-    /// Wait until the instance's watermark exceeds `since`. Removal or crash
-    /// resolves the wait rather than hanging it.
+    /// Wait until the instance's watermark exceeds `since`. Removal and
+    /// crash both bump, so the wait resolves rather than hanging; the next
+    /// call reports what happened.
     pub async fn changed(&self, id: &str, since: Watermark) -> Result<Watermark, VerbError> {
         let entry = self.entry(id)?;
         Ok(entry.cell.changed(since).await?)
     }
 
-    /// The global feed: `(instance id, event)` for lifecycle, driver
-    /// changes, and every instance's own events.
+    /// The global feed: `(instance id, event)` for lifecycle, meta changes,
+    /// and every instance's own events. Best-effort — see [`PoolInner`].
     pub fn events(&self) -> tokio::sync::broadcast::Receiver<(String, Event)> {
         self.inner.events.subscribe()
     }
@@ -617,18 +761,13 @@ impl Pool {
     }
 }
 
+/// The error's wire name, taken from its own serde tag so the verb log and
+/// the serialized error can never disagree.
 fn error_name(e: &VerbError) -> String {
-    match e {
-        VerbError::UnknownKind { .. } => "unknown_kind",
-        VerbError::UnknownInstance { .. } => "unknown_instance",
-        VerbError::UnknownVerb { .. } => "unknown_verb",
-        VerbError::NotDriver { .. } => "not_driver",
-        VerbError::Denied { .. } => "denied",
-        VerbError::BadArgs { .. } => "bad_args",
-        VerbError::Failed { .. } => "failed",
-        VerbError::Gone => "gone",
-    }
-    .to_string()
+    serde_json::to_value(e)
+        .ok()
+        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]

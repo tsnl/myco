@@ -2,145 +2,343 @@
 
 This branch is a from-scratch rebuild. v2 lives on `main-v2` and remains the
 reference implementation; code crosses over only when it earns its keep (the
-ledger at the bottom tracks every piece). This document is the contract the
-rebuild is held to.
+ledger near the bottom tracks every piece). This document is the contract
+the rebuild is held to. It has survived one adversarial review round (three
+independent reviewers: reducibility, concurrency, requirement-fit); the
+findings that survived are folded in below and marked where they changed
+the design.
 
 ## The model in one paragraph
 
 A **workspace** is a pool of **instances** — a chat, a terminal, a browser
-page, a cron table — each an actor holding canonical structured state.
-Every interaction with an instance is a **verb**: reads are verbs, writes
-are verbs, and what used to be "projections" are just differently-shaped
-read verbs (`screen` vs `tail`, `screenshot` vs `a11y_tree`). **Principals**
-— humans, agents, system — drive instances through one bus with one
-authorization rule, so the agent is a peer, not a privileged channel. Panes
-in the client are projections of instances; the workspace is the model
-being projected. Sessions as v2 knew them dissolve: a "session" is a chat
-instance, and a subagent is a chat instance parented under another.
+page, a cron table, a user's notification inbox — each an actor holding
+canonical structured state. Every interaction with an instance is a
+**verb**: reads are verbs, writes are verbs, and what would elsewhere be
+"projections" are just differently-shaped read verbs (`screen` vs `tail`,
+`screenshot` vs `a11y_tree`). **Principals** — humans, agents, system —
+drive instances through one bus with one authorization rule, so the agent
+is a peer, not a privileged channel. Panes in the client are projections of
+instances; the workspace is the model being projected. Sessions as v2 knew
+them dissolve: a "session" is a chat instance, and a subagent is a chat
+instance parented under another.
 
-## Concepts
+## The layers, explained opaquely
 
-**Instance.** Identity (`id`, `kind`, `project`, `title`), canonical state,
-a monotonically increasing **watermark** bumped on every observable change,
-an **event** stream for significant moments (exited, navigated, turn
-finished), and a bounded **verb log** (who called what — acme's `event`
-file, reborn). Instances outlive any viewer; attachment is never ownership.
+Each layer is described only in terms of the contract of the layer below
+it. If a sentence here needs to mention a neighbor's internals, the
+boundary is wrong.
 
-**Kind.** The type of an instance: a verb vocabulary with per-verb flags
-(`read_only`, `requires_driver`, `cursored`), a `create` recipe, and two
-hints — `primary_render` (which read the default pane renderer consumes)
-and `recommended_context` (which read an agent's context assembly should
-prefer, with default arguments). Kind schemas are versioned, typed, and the
-smell test is: a kind wanting one more verb had better argue for it.
+### L0 — runtime (`crates/runtime`)
 
-**Verb.** A typed command. Reads are pure and always concurrent; cursored
-reads take a cursor (`from`, `since`) and return the next one, so
-consumers read deltas, not worlds. Budgets are verb *parameters*
-(`max_bytes`, `max_entries`) — the caller owns its budget, because the
-caller knows its economy (a GUI paginating, an agent guarding context).
-Every kind must include at least one plain-text read — the acme escape
-hatch that keeps all state greppable and pipeable, and, not by
-coincidence, usually the read an LLM wants.
+**Contract offered:** `Cell<S>` — spawn state with a fallible builder that
+receives `Signals` first; `call` a closure over `(&mut S, &Signals)` that
+runs strictly after every earlier call and strictly before every later
+one, may await, and returns its value to you; read a monotone `watermark`;
+`changed(since)` — sleep until the watermark exceeds a value you name;
+subscribe to an `Event` stream; `is_crashed` (eventually-true; a `CellGone`
+from `call` is the definitive death signal). `Signals` — `bump`, `emit`,
+`subscribe` — cloneable, usable from any task.
 
-**Principal.** `Human(id)`, `Agent(chat instance id)`, `System(name)`. An
-agent is named by the chat it drives. Both adapters translate an outside
-intelligence's native I/O into bus verbs: the API server adapts HTTP for
-humans exactly as the agent loop adapts model tool-calls — the design's
-central symmetry.
+**How it works, opaquely:** you hand L0 state and closures; it hands back
+ordering, wake-ups, and fault isolation. Nothing else. It does not know
+what the state is, what the closures do, who is calling, or why. Two
+delivery disciplines are exposed because observers need both and they are
+mutually exclusive in one channel: the watermark **coalesces** (any burst
+collapses to one wake carrying the latest value — lag is impossible by
+construction) and events **do not** (history must arrive item by item, so
+it is bounded and best-effort instead). A cell whose closure panics
+becomes a marked corpse that refuses further commands and wakes its
+watchers; it never hangs a caller and never leaks torn state (the state
+drops with the task).
 
-**Driver.** Not a lock. Some verbs on some kinds are single-driver
-(`input`, `resize`, `click`); the driver is durable, visible state on the
-instance, changed by `sys.take` / `sys.release`, enforced by *refusal* —
-nobody acquires, waits, or deadlocks. Policy: humans may take from agents
-or from nobody; an agent may never take from a human; releasing returns
-the instance to its default driver (its creator), or to nobody if the
-default driver releases. Reads never require the driver.
+### L1 — instances (`crates/instance`)
 
-**Concurrency** is three orthogonal mechanisms, none a mutex in the
-client-visible sense:
-1. *Consistency* — each instance is an actor; verbs apply serially.
-2. *Authority* — the driver bit, per-verb, as above.
-3. *Observation* — unlimited concurrent watchers via watermark + reads.
+**Contract offered (consuming only L0's):** register `Kind`s (a static
+spec: named verbs with four schema flags, a version, two default-read
+hints); `create` instances of them; `call(principal, id, verb, args)`;
+`list`/`watermark`/`changed`; a global `(id, Event)` feed. Every instance
+answers the `sys.*` verbs — `spec`, `meta`, `log`, `rename`, `take`,
+`release`, `remove` — without its kind writing a line.
 
-High-throughput kinds (a pty pumping bytes) may feed internal state from
-an I/O task outside the mailbox, publishing through the cell's signals
-(bump/emit); the mailbox still serializes all *verbs*. This is the
-sanctioned side-feed pattern, not a loophole: commands serialize, streams
-flow.
+**How it works, opaquely:** L1 turns L0's "ordered closures over opaque
+state" into "authorized verbs over named instances". Each instance is one
+cell whose state is the kind's `Instance` object; dispatch wraps a verb
+into a closure and authority into two checks — at enqueue (refuse ahead of
+the queue) and again at apply (inside the ordering, so authority is bound
+to effect: after `sys.take` returns, no verb the old driver had queued
+will land). Identity, title, driver, and the verb log live *beside* the
+cell, not inside it, so listing, introspection, seat transfer, and removal
+work on a wedged or crashed instance — the rescue path never enters a
+mailbox. Kind events are forwarded onto the global feed tagged with the
+instance id; the forwarder subscribes before the kind's `create` can spawn
+anything, so nothing an instance ever emits predates its subscription.
+Re-entrant dispatch (a verb handler calling its own instance) is refused
+by name, because in L0's contract it can only deadlock.
 
-**Observation is agent-side policy, not kind-side machinery.** An agent's
-situational awareness is a set of standing subscriptions — (instance, read
-verb, args, budget) — refreshed at turn boundaries only where the
-watermark moved, then spliced into context. Kinds publish reads; drivers
-compose awareness. v2's shell "observer notes" dissolve into this.
+**What L1 adds that L0 lacks, and nothing more:** names, kinds,
+principals, authority, uniform introspection, and one feed. Consistency,
+waking, and fault isolation are consumed, not reimplemented.
 
-**Events vs reads.** Read verbs report *current state*; events record
-*what happened*; the chat transcript stores only the latter. (Jupyter's
-hidden-state problem is the cautionary tale: never let a transcript imply
-state it doesn't have.)
+### L2 — API server (M1, not yet built)
 
-## Layers
+**Contract offered (consuming only L1's):** authentication (ported from
+v2: one-time codes, passkeys, operator), principal resolution
+(token → `Principal`), then a generic gateway: `POST
+/instances/<id>/<verb>`, `GET /instances`, one multiplexed watch/event
+stream, `GET /kinds` for capability discovery. **L2 is the human's adapter
+to the bus exactly as the agent loop is the model's adapter** — both
+translate an outside intelligence's native I/O into `Pool::call`. The
+razor: anything in L2 that is not authentication or translation is in the
+wrong layer.
 
-```
-L0  runtime    crates/runtime   actor cells: mailbox, serialized async verb
-                                application, watermark/watch, events, panic
-                                supervision. Knows nothing of kinds.
-L1  instances  crates/instance  Kind/Instance traits, VerbSpec, Principal,
-                                driver policy, sys.* verbs, authorization,
-                                Pool (registry, projects, global events).
-                                Providers: in-process kinds now; protocol
-                                kinds (toolds/remote hosts) later — the wire
-                                format is the bus envelope serialized, so
-                                in/out-of-process is a transport choice.
-L2  api server (later)          auth (ported from v2), principal resolution,
-                                one generic verb gateway, one event stream,
-                                capability discovery. Anything in L2 that is
-                                not authentication or translation is in the
-                                wrong layer.
-L3  clients    (later)          GUI: tree (projects → instances), split-tree
-                                panes (not a free grid), renderer registry
-                                keyed by kind; myco.py; -p CLI.
-```
+### L3 — clients (M3)
 
-The model-facing surface keeps *named tools* (`bash`, `subagent`, …): the
-dispatcher maps them to kinds internally. Unification is for the
-substrate, never the prompt — meta-tools hurt model ergonomics.
+**Contract offered (consuming only L2's):** a tree (projects →
+instances), split-tree panes, and a renderer registry keyed by kind — each
+renderer consumes its kind's `primary_render` verb payload and re-reads on
+watermark advance. Clients hold layout (per project, per user, client-side)
+and zero instance state.
+
+### The agent (M2) — beside L2, not inside any layer
+
+The agent loop is a bus client: it holds standing subscriptions
+((instance, cursored read, args, budget) refreshed where watermarks
+moved), splices results into model context, and dispatches the model's
+named tools (`bash`, `subagent`, …) to verbs. The model never sees a
+generic `call` — unification is for the substrate, never the prompt.
+
+## Concepts (the contract, post-review)
+
+**Instance.** Identity (`id`, `kind`, `project`, `title`), canonical
+state, a watermark bumped on **every** observable change — kind-state
+writes, driver transfer, rename, and removal alike (review finding: meta
+changes must wake meta watchers) — an event stream for significant
+moments, and a bounded verb log (who called what; introspection reads are
+not recorded, so watching the debugger does not erase the evidence).
+Instances outlive any viewer; attachment is never ownership.
+
+**Verb.** A typed command with four schema flags:
+- `read_only` — pure; a promise to consumers (the framework cannot verify
+  purity), never driver-gated (`register` asserts the combination away);
+- `requires_driver` — enforced twice, enqueue and apply;
+- `owner_only` — scoped to the instance's immutable creator; the privacy
+  axis, orthogonal to the seat (a driver does not gain owned verbs; the
+  owner keeps them without the seat). Added by review: the first per-user
+  kind (a notification inbox) is unshippable without it;
+- `cursored` — takes a cursor, returns the next; consumers read deltas.
+
+Budgets are verb *parameters* (`tail`'s `max_bytes`; `sys.log`'s
+`limit`) — the caller owns its budget because the caller knows its
+economy. Every kind's `recommended_context` read must carry a canonical
+plain-text field in its payload — the acme escape hatch, and the model's
+native notation; the payload may carry more (tty's `text` also reports
+`running`), but the text must be there.
+
+**Principal.** `Human(id)`, `Agent(chat instance id)`, `System(name)`.
+
+**Driver.** Not a mutex: durable, visible state, changed by
+`sys.take`/`sys.release`, enforced by refusal. The policy, complete:
+humans may take from agents or from nobody; **nobody else takes an
+occupied seat** (not another human's, and System never takes at all —
+agents do not wrestle each other either); release returns the seat to the
+creator, or empties it when the creator releases. A take **fences**: every
+verb the old driver had queued but not yet applied is refused at apply
+time. A take does not interrupt the verb already mid-application — a
+fence, not an abort.
+
+**Removal.** `sys.remove`: humans and system may remove anything; an
+agent only what it created or currently drives. Removal wakes watermark
+watchers (their next call answers `unknown_instance`), emits `removed` on
+the feed, and forgets the cell — child processes die with the dropped
+state (`kill_on_drop`).
+
+**Concurrency** is three mechanisms, none a client-visible lock:
+1. *Consistency* — per-instance serialization: every verb, reads
+   included, applies in mailbox order. Stated honestly (review finding):
+   reads are unrestricted and cheap but **serialize with writes**; the
+   claim is "no read ever needs permission or blocks on *authority*", not
+   parallel read execution. If a kind ever needs truly concurrent reads,
+   the side-feed shape (state in an `Arc<Mutex>` beside the cell) already
+   permits serving them off-mailbox — a future contract extension, not a
+   present promise.
+2. *Authority* — driver (mutable, fenced) and owner (immutable), per
+   verb.
+3. *Observation* — unlimited watchers on a coalescing watermark, plus
+   reads.
+
+**Events vs reads, and the feed doctrine.** Read verbs report current
+state; events record what happened; a chat transcript stores only the
+latter. The global feed is **best-effort by design**: bounded broadcast,
+lossy under lag, not causally ordered across instances or with removal (a
+side-feed's dying words — tty's `exited` — can trail `removed`; consumers
+ignore events for ids they saw removed). The recovery rule for any
+consumer that must not miss: treat the feed as a wake-up hint, and on lag
+re-`list()` (which carries every watermark) and re-read cursored state.
+Corollary, pinned as a convention: **any kind that emits
+attention-shaped events must keep the underlying moments re-readable
+behind a cursored read** — an event nothing can re-read is an event that
+can be silently lost.
+
+**Side-feeds.** A kind may mutate internal shared state from I/O tasks
+and publish via `Signals` (commands serialize, streams flow). Two rules,
+review-hardened: a side-feed whose input source does not die with the
+instance (a pool event feed, unlike a pty) must be cancelled by the
+instance's `Drop`; and side-feed tasks may call the pool freely, but verb
+handlers must not call verbs on instances that may call back — the
+framework refuses the direct self-call, cycles past one hop are the
+kind-author's contract to avoid.
+
+**Kinds that consume the bus** (notifiers, future debuggers) hold a
+`Pool` clone as a factory field — blessed dependency injection, wired at
+startup.
+
+## Irreducibility: what review tried to kill, and what saved it
+
+Every piece below was attacked by name; these are the arguments that
+survived. (Eight pieces did not survive and are gone: an internal duplicate
+of `Signals`, a redundant constructor, a `default_driver` field that
+permanently aliased `creator`, a third meta surface, hand-maintained error
+names, a dead panic arm, public re-exports with no consumer, and removal
+as a method instead of a verb.)
+
+- **Two channels per cell.** Merging events into the watermark loses
+  history (watch keeps only the latest value); merging the watermark into
+  events makes a byte-storming pty lag every subscriber (broadcast cannot
+  coalesce). One channel must coalesce, the other must not: the
+  transport-level image of "reads answer what is, events what happened".
+- **The mailbox itself** (vs. state-behind-a-lock). Three properties fall
+  without it: fault isolation (a panicking handler poisons a lock but
+  only kills a task), await-capable handlers without holding locks across
+  await, and a single dispatch point where authority, logging, and
+  re-entrancy refusal happen once instead of per-kind.
+- **Entry beside the cell** (meta outside the mailbox). Fold it in and:
+  `list` enters N mailboxes, so one wedged instance freezes the tree;
+  driver refusal happens *after* queueing — refusal becomes waiting,
+  which the contract forbids; and the rescue path dies — today a human
+  can `sys.meta` a wedged terminal, `sys.take` the seat, and `sys.remove`
+  it without ever touching the mailbox. The one duplication this split
+  had grown (`default_driver` ≡ `creator`) was found and deleted; what
+  remains holds no field on both sides.
+- **The two-phase driver check.** Enqueue-only is provably
+  non-linearizable (review: a "stopped" agent's queued keystrokes land
+  after a human seizes the seat — the emergency stop that doesn't stop);
+  apply-only makes refusal a wait. Both, in that order, are the minimum
+  that delivers refuse-ahead-of-queue *and* authority-bound-to-effect.
+- **The side-feed path.** Route pty bytes through the mailbox and the
+  byte stream competes with keystrokes for a 64-slot queue of boxed
+  closures — input latency coupled to output throughput. `Signals` is
+  the narrowest possible side door: publish-only, no state access.
+- **The per-entry verb log.** Derive it from the event feed and it dies
+  three ways: the feed is live, not storage (a late debugger sees
+  nothing); a global buffer is unbounded or unfair (one chatty instance
+  evicts everyone); and refusals are born at the dispatch point, pre-
+  mailbox — only the dispatcher can record them, and "the log records
+  refusals" is what makes it a debugger.
+- **The forwarder task per instance.** Tag events at the source instead
+  and L0 must learn instance ids — the layer whose value is knowing
+  nothing. Subscribe-per-instance instead and every consumer re-implements
+  create-race handling. One task per instance, subscribed before birth
+  completes, is the toll the boundary charges; it is paid in exactly one
+  place.
+- **`requires_driver` as framework schema** (vs. in-kind checks). Every
+  kind re-implementing seat policy is the bug class `sys.*` exists to
+  prevent, and a kind-side check runs post-queue — blocking again. One
+  bool read twice is the whole cost.
+- **The KindSpec hints.** Without `recommended_context`, M2's dispatcher
+  hardcodes per-kind read choices — the exact kind-knowledge leak L1
+  exists to prevent. Two static strings, validated at registration, are
+  the cheapest insurance in the codebase.
+- **What is knowingly *not* minimal** — schema fields whose consumers
+  are one milestone away (`cursored` → M2 subscriptions, `version` → M4
+  protocol providers, `read_only` → speculative-read clients). Cutting
+  fields that wire consumers re-add next milestone is churn wearing
+  minimalism's clothes; each names its consumer in its doc comment, and
+  the ledger holds the receipt.
+
+## Worked requirement: push notifications
+
+The test the design was given: add push notifications, prove
+decoupledness. Result — **a kind, not a feature**, and the exercise
+changed the framework in exactly two ways (the `owner_only` flag; a
+lag-survivable forwarder), both defects it exposed rather than mechanisms
+it demanded.
+
+The `notifier` kind, one instance per human, created by L2 *as that
+human* at first login (find-or-create keyed on `kind + creator`;
+provisioning-as-the-user is principal resolution doing its job):
+
+- **State:** pending attention items (absolute sequence numbers, the
+  tty-scrollback idiom), mute rules, web-push subscriptions, per-source
+  cursors.
+- **Verbs:** `pending` (cursored, owner-only — attention is private),
+  `text` (owner-only plain-text projection; doubles as the agent's
+  window into what its human has not seen), `ack`, `mute`, `register` /
+  `unregister` (owned writes; push endpoints are write-only state no
+  read returns).
+- **Ingest:** a side-feed consuming `Pool::events()` — the first
+  side-feed whose input outlives its instance, hence the Drop-cancel
+  rule. Routing is the pinned attention envelope
+  (`myco_instance::events::Attention` — `for`, `title`, `body`): kinds
+  emit facts, the notifier turns facts addressed to its owner into
+  items, bumps its watermark (badge watchers re-read `pending`; the
+  *watermark* is not the badge — acks bump too; `unacked` in the payload
+  is), and hands delivery to a queue.
+- **Delivery:** a second side-feed POSTing web-push (VAPID keys live in
+  the factory struct, invisible to Value-land), backing off on 5xx,
+  dropping dead endpoints.
+- **Loss:** the feed is a hint, not the ledger. On `Lagged`, reconcile:
+  re-`list()`, compare watermarks to per-source cursors, re-read the
+  cursored attention reads of whatever moved. "You were mentioned" must
+  not vanish because a chat burst-emitted — and with the reconcile rule
+  it cannot, because mentions are re-readable in the transcript.
+
+Why not an L2 feature: pending/ack/mute/subscriptions are state with
+reads and writes — the definition of an instance. In L2 it would resurrect
+per-op routes and bespoke storage (the `MycoApi` disease the ledger
+executed), be invisible to every principal but the browser (breaking the
+peer symmetry: the agent could not see its human's unread pile), and
+forfeit the free panes/badge/audit that fall out of being an instance.
+What stays in L2 regardless: identity, and the find-or-create trigger.
+
+The symmetry worth keeping: **wake-the-human (notifier) and
+wake-the-agent (standing subscriptions) are the same shape** — a
+per-principal reducer over events and cursored reads. One mechanism,
+two consumers, no new concepts.
 
 ## sys.* — the uniform verbs every instance answers
 
-`sys.spec` (kind schema), `sys.meta` (identity, driver, watermark),
-`sys.log` (recent verb calls), `sys.take` / `sys.release` (driver
-transfer). Handled by the framework so kinds cannot get them wrong.
-Debugging doctrine: the runtime eventually exports *itself* as read-only
-kinds (actor table, bus traffic, an agent's context assembly as an
-inspectable instance — "watch what the model saw"). The debugger is the
-product.
+`sys.spec` (kind schema, versioned), `sys.meta` (identity, driver,
+watermark, crashed), `sys.log` (recent verb calls; `limit`),
+`sys.rename`, `sys.take` / `sys.release` (the seat), `sys.remove`.
+Framework-answered so kinds cannot get them wrong; entry-level so they
+work on wedged and crashed instances. Debugging doctrine: the runtime
+eventually exports *itself* as read-only kinds (actor table, bus traffic,
+an agent's context assembly as an inspectable instance — "watch what the
+model saw"). The debugger is the product.
 
 ## Prior art, and what each contributes
 
-- **Erlang/OTP** — the five-op behavior interface, supervision as the
-  lifetime answer, the registry. L0 is gen_server minus the parts we
-  don't need.
+- **Erlang/OTP** — the behavior interface, supervision as the lifetime
+  answer, the registry. L0 is gen_server minus what we don't need.
 - **tmux** — pool ≠ attachment; layouts as serializable split trees;
-  control mode proves one machine channel can serve human GUIs.
-- **Emacs** — buffer/mode/window ≈ instance/kind/pane, forty years
-  proven; comint is chat≈tty; its single-threaded core is the failure
-  mode our actor-per-instance avoids.
-- **acme / Plan 9** — uniform verbs breed composability; per-window
-  files are reads-as-verbs; the text escape hatch. The trap (text as the
-  *only* notation) is fixed by typed payloads.
+  control mode proves one machine channel serves human GUIs.
+- **Emacs** — buffer/mode/window ≈ instance/kind/pane; comint is
+  chat≈tty; its single-threaded core is the failure mode
+  actor-per-instance avoids.
+- **acme / Plan 9** — uniform verbs breed composability; per-window files
+  are reads-as-verbs; the text escape hatch. The trap (text as the *only*
+  notation) is fixed by typed payloads.
 - **JetBrains MPS** — the workspace is projectional: canonical structure,
   many projections, gestures routed back to the model. Its trap
-  (projection lock-in) is fixed by the mandatory plain-text read.
-- **Kubernetes** — kinds + uniform verbs + `watch` with versions
-  (independently our watermark); subresources are reads-as-verbs at
-  scale; ownerReferences + cascading GC is the template for instance
-  lifetime once projects arrive.
-- **Jupyter** — kernels survive clients; MIME bundles are
-  multi-consumer projections (the model is just another consumer);
-  hidden-state is the sin.
+  (projection lock-in) is fixed by the mandatory plain-text field.
+- **Kubernetes** — kinds + uniform verbs + watch-with-versions (our
+  watermark); subresources are reads-as-verbs at scale; ownerReferences +
+  cascading GC is the template for lifetime once projects arrive.
+- **Jupyter** — kernels survive clients; MIME bundles are multi-consumer
+  projections (the model is just another consumer); hidden-state is the
+  sin our events/reads split exists to avoid.
 - **VSCode/LSP, Zellij** — process-isolate plugins; negotiate
-  capabilities; version the schemas from day one.
+  capabilities; version the schemas (now a field, not a vow).
 
 ## The ledger
 
@@ -149,36 +347,38 @@ Functionality crosses from v2 only with a verdict recorded here.
 | v2 piece | verdict | notes |
 |---|---|---|
 | `pty.rs` (openpty, AsyncFd halves, TIOCSWINSZ) | **ported (M0)** | verbatim into `kind-tty` |
-| vt100 screen → styled runs renderer | **ported (M0)** | one renderer served agent/REST/WS in v2; same shape here |
-| shell scrollback + `tail(from)` | **re-derived (M0)** | cursored read verb |
-| shell/subagent locks | **re-derived (M0)** | driver, per-verb |
+| vt100 screen → styled runs renderer | **ported (M0)** | minus the embedded plain-text copy (now the `text` verb) |
+| shell scrollback + `tail(from)` | **re-derived (M0)** | cursored + budgeted (`max_bytes`) |
+| shell/subagent locks | **re-derived (M0)** | driver per-verb, apply-time fenced; + `owner_only` axis |
 | auth (codes, passkeys, tokens, admin routes, operator) | **port (M1)** | v2 got this right; lands in L2 nearly verbatim |
 | SSE + shell WebSocket | **drop** | one multiplexed event/watch stream (M1) |
 | `MycoApi` trait + `HttpClient` + per-op routes | **drop** | generic verb gateway; four parallel op lists become one |
-| agent loop, models/providers, session store | **port + reshape (M2)** | becomes the chat kind + the model-side adapter (dispatcher, subscriptions) |
+| agent loop, models/providers, session store | **port + reshape (M2)** | the chat kind + the model-side adapter (dispatcher, standing subscriptions) |
 | `subagent` tool + child routes | **drop** | chat instances with a parent ref |
-| NDJSON host protocol | **re-derive (M4)** | becomes the bus envelope over stdio; hosts/toolds are protocol providers |
+| NDJSON host protocol | **re-derive (M4)** | the bus envelope over stdio; hosts/toolds are protocol providers |
 | GUI terminal renderer, transcript renderer | **port (M3)** | into the renderer registry |
 | GUI browser/draft/conversation pages | **drop** | tree + panes replace page navigation |
 | observer notes machinery | **drop** | standing subscriptions |
+| notifications (v2 never had them) | **new: notifier kind (M2/M4)** | see the worked requirement |
 | piped (non-pty) bash mode, signals, screenshot action | **pending** | port into kind-tty when the agent arrives (M2) |
 | README/TOUR | **rewrite as they become true** | |
 
 ## Milestones
 
-- **M0 (this commit)** — `runtime`, `instance`, `kind-tty`; tests prove
-  serialization, watermarks, driver policy, sys verbs, and a live pty
-  driven end-to-end through the bus.
+- **M0 (done, reviewed)** — `runtime`, `instance`, `kind-tty`; tests pin
+  serialization, the apply-time fence, re-entrancy refusal, owner
+  scoping, watermark semantics including removal, crash containment, and
+  a live pty driven end-to-end through the bus.
 - **M1** — L2: auth port, generic verb gateway, one event stream,
   capability discovery; `myco.py` rewritten thin.
 - **M2** — chat kind (agent loop + providers ported), named-tool
-  dispatcher, standing subscriptions; user-created chats and
-  chat-parenting (subagents) fall out.
+  dispatcher, standing subscriptions, notifier kind; user-created chats
+  and chat-parenting (subagents) fall out.
 - **M3** — GUI: tree sidebar, split-tree panes, renderer registry (tty +
   chat renderers ported).
 - **M4** — protocol providers (toolds/hosts as bus-over-stdio); cron
   kind; browser kind (`a11y_tree` + `screenshot`, computer-use verb
-  vocabulary).
+  vocabulary); web-push delivery for the notifier.
 - **M5** — self-describing debugging kinds; agent-to-agent messaging
   behind explicit grants with loop budgets.
 
