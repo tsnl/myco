@@ -291,6 +291,46 @@ impl From<Identity> for Author {
     }
 }
 
+/// `GET /api/admin/users` — the roster as the operator sees it. Operator-only,
+/// like everything under `/api/admin`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUsers {
+    /// The operator's own id, so a client can mark the row that cannot be
+    /// disabled or removed.
+    pub operator: String,
+    pub users: Vec<AdminUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUser {
+    pub id: String,
+    pub name: String,
+    pub disabled: bool,
+    /// Enrolled passkeys. Zero and not disabled means "cannot sign in until
+    /// someone mints them a code".
+    pub passkeys: usize,
+    /// Live access tokens.
+    pub sessions: usize,
+}
+
+/// `POST /api/admin/users/<id>/code` — an operator-minted one-time sign-in
+/// code. The only reply that ever carries the code in the clear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintedLoginCode {
+    pub username: String,
+    pub code: String,
+    /// RFC 3339. Codes are single-use and short-lived; minting again for the
+    /// same user replaces this one.
+    pub expires_at: String,
+}
+
+/// Reply to the admin actions that count what they affected (revoke,
+/// clear-passkeys, remove).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminActionCount {
+    pub affected: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {

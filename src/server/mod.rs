@@ -162,9 +162,9 @@ impl Server {
         factory: ModelFactory,
         auth: Arc<AuthStore>,
     ) -> Arc<Self> {
-        // The roster declares who exists; the store holds what they know.
+        // The roster declares who exists; the store holds what they hold.
         // Reconciling here means adding a name to `server.toml` is enough to
-        // make `myco auth passwd <id>` work, with no second registration step.
+        // mint that person a sign-in code, with no second registration step.
         for user in config.roster.users() {
             if auth.get(&user.id).is_none() {
                 let _ = auth.add_user(&user.id, user.display_name());

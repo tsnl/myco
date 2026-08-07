@@ -101,10 +101,10 @@ the edge (`server/`, `web`, `cli`). Inside `myco`:
 | `src/prompts/` | System prompt fragments + prelude / project-guidance injection + the session stamp |
 | `src/machines/` | The hands: `Harness` (host pool), `HostController`/`HostWorker` + NDJSON protocol (tool calls **and** the shell observer surface), every `ToolService` (bash with pty/screen/locks, editor, view_image) |
 | `src/agent/` | The turn loop: `Agent::interact`, `AgentEvent`/`EventSink`, cancellation, the compact worker |
-| `src/auth/` | Credentials and access tokens behind the OAuth2 password grant |
+| `src/auth/` | Credentials and access tokens: one-time codes + passkeys (no passwords) |
 | `src/server/` | The session runtime: `Live` handles + the agent task (`mod.rs`), the `Room` (`room.rs`), the shells/subagent observer surface (`observer.rs`), `UserApi` — the `MycoApi` impl (`user_api.rs`) |
 | `src/web.rs` | Rocket adapter: REST one-liners over `MycoApi`, SSE events, the shell WebSocket, operator token |
-| `src/cli.rs`, `src/client.rs`, `src/admin.rs`, `src/subagent.rs` | The `-p` client; `MycoApi` over HTTP; `myco auth`; the `subagent` tool |
+| `src/cli.rs`, `src/client.rs`, `src/subagent.rs` | The `-p` client; `MycoApi` over HTTP; the `subagent` tool |
 | `tests/` | Integration tests (multiplayer, shells, subagents, cancel, host desync, …) |
 
 **Invariants worth protecting**

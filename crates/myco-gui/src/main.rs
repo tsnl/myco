@@ -127,31 +127,35 @@ struct LoginProps {
 }
 
 /// Sign-in. Deliberately the whole page and nothing else: there is no
-/// anonymous view of this server to decorate, and no signup — accounts are
-/// created by an administrator with `myco auth`.
+/// anonymous view of this server to decorate, and no signup — the operator
+/// mints one-time codes from the admin panel (or the server prints one at
+/// startup), and a code bootstraps a passkey.
+///
+/// One submit handles both ways in: a filled code box redeems the code, an
+/// empty one asks for the passkey.
 #[function_component(Login)]
 fn login(props: &LoginProps) -> Html {
     let username = use_node_ref();
-    let password = use_node_ref();
+    let code = use_node_ref();
     let error = use_state(|| Option::<String>::None);
     let busy = use_state(|| false);
 
     let submit: Callback<()> = {
         let username = username.clone();
-        let password = password.clone();
+        let code = code.clone();
         let error = error.clone();
         let busy = busy.clone();
         let on_signed_in = props.on_signed_in.clone();
         Callback::from(move |_| {
-            let (Some(u), Some(p)) = (
+            let (Some(u), Some(c)) = (
                 username.cast::<HtmlInputElement>(),
-                password.cast::<HtmlInputElement>(),
+                code.cast::<HtmlInputElement>(),
             ) else {
                 return;
             };
-            let (u, p) = (u.value(), p.value());
-            if u.trim().is_empty() || p.is_empty() {
-                error.set(Some("username and password are required".into()));
+            let (u, c) = (u.value(), c.value());
+            if u.trim().is_empty() {
+                error.set(Some("username is required".into()));
                 return;
             }
             busy.set(true);
@@ -159,7 +163,12 @@ fn login(props: &LoginProps) -> Html {
             let busy = busy.clone();
             let on_signed_in = on_signed_in.clone();
             spawn_local(async move {
-                match auth::login(&u, &p).await {
+                let result = if c.trim().is_empty() {
+                    auth::passkey_login(&u).await
+                } else {
+                    auth::code_login(&u, &c).await
+                };
+                match result {
                     Ok(who) => {
                         error.set(None);
                         busy.set(false);
@@ -169,7 +178,7 @@ fn login(props: &LoginProps) -> Html {
                         busy.set(false);
                         // The server does not say which half was wrong, and
                         // neither do we.
-                        error.set(Some("incorrect username or password".into()));
+                        error.set(Some("incorrect username or code".into()));
                     }
                     Err(e) => {
                         busy.set(false);
@@ -190,82 +199,6 @@ fn login(props: &LoginProps) -> Html {
         })
     };
 
-    // A passkey needs only the username; the authenticator is the secret.
-    let on_passkey = {
-        let username = username.clone();
-        let error = error.clone();
-        let busy = busy.clone();
-        let on_signed_in = props.on_signed_in.clone();
-        Callback::from(move |_: MouseEvent| {
-            let Some(u) = username.cast::<HtmlInputElement>() else {
-                return;
-            };
-            let u = u.value();
-            if u.trim().is_empty() {
-                error.set(Some("enter your username, then use your passkey".into()));
-                return;
-            }
-            busy.set(true);
-            let error = error.clone();
-            let busy = busy.clone();
-            let on_signed_in = on_signed_in.clone();
-            spawn_local(async move {
-                match auth::passkey_login(&u).await {
-                    Ok(who) => {
-                        error.set(None);
-                        busy.set(false);
-                        on_signed_in.emit(who);
-                    }
-                    Err(e) => {
-                        busy.set(false);
-                        error.set(Some(e.to_string()));
-                    }
-                }
-            });
-        })
-    };
-
-    // A one-time code rides the password field: same box, different grant.
-    let on_code = {
-        let username = username.clone();
-        let password = password.clone();
-        let error = error.clone();
-        let busy = busy.clone();
-        let on_signed_in = props.on_signed_in.clone();
-        Callback::from(move |_: MouseEvent| {
-            let (Some(u), Some(c)) = (
-                username.cast::<HtmlInputElement>(),
-                password.cast::<HtmlInputElement>(),
-            ) else {
-                return;
-            };
-            let (u, c) = (u.value(), c.value());
-            if u.trim().is_empty() || c.trim().is_empty() {
-                error.set(Some(
-                    "enter your username and the one-time code (in the password box)".into(),
-                ));
-                return;
-            }
-            busy.set(true);
-            let error = error.clone();
-            let busy = busy.clone();
-            let on_signed_in = on_signed_in.clone();
-            spawn_local(async move {
-                match auth::code_login(&u, &c).await {
-                    Ok(who) => {
-                        error.set(None);
-                        busy.set(false);
-                        on_signed_in.emit(who);
-                    }
-                    Err(e) => {
-                        busy.set(false);
-                        error.set(Some(e.to_string()));
-                    }
-                }
-            });
-        })
-    };
-
     html! {
         <div class="app">
             <div class="pane">
@@ -276,20 +209,18 @@ fn login(props: &LoginProps) -> Html {
                                onkeydown={on_keydown.clone()} placeholder="username" />
                     </div>
                     <div class="login-row">
-                        <input ref={password} type="password" autocomplete="current-password"
-                               onkeydown={on_keydown} placeholder="password or one-time code" />
+                        <input ref={code} type="text" autocomplete="one-time-code"
+                               onkeydown={on_keydown}
+                               placeholder="one-time code (only if you have one)" />
                     </div>
                     <div class="login-row">
-                        <button onclick={on_click} disabled={*busy}>
+                        <button onclick={on_click} disabled={*busy}
+                                title="passkey sign-in; with a code entered, redeems the code instead">
                             { if *busy { "signing in…" } else { "sign in" } }
                         </button>
-                        { " " }
-                        <button onclick={on_passkey} disabled={*busy}>{ "passkey" }</button>
-                        { " " }
-                        <button onclick={on_code} disabled={*busy}
-                                title="redeem a one-time code from the operator (typed in the password box)">
-                            { "use code" }
-                        </button>
+                    </div>
+                    <div class="login-row dim">
+                        { "no code and no passkey? ask the operator for a code" }
                     </div>
                     { if let Some(e) = &*error { html! {
                         <div class="err"><pre>{ e }</pre></div>
@@ -340,9 +271,212 @@ fn whoami_line(who: &Option<Session>) -> Html {
                 { "add passkey" }
             </button>
             { " " }
+            <AdminMenu />
             <button class="linkish" onclick={sign_out}>{ "sign out" }</button>
         </span>
     }
+}
+
+/// The operator's roster panel — everything the retired `myco auth` CLI did,
+/// behind the `/api/admin` routes. Renders nothing for everyone else: the
+/// probe fetch on mount is also the authorization check, since the routes
+/// themselves refuse non-operators.
+#[function_component(AdminMenu)]
+fn admin_menu() -> Html {
+    let users = use_state(|| Option::<api::AdminUsers>::None);
+    let open = use_state(|| false);
+    let minted = use_state(|| Option::<api::MintedLoginCode>::None);
+    let error = use_state(|| Option::<String>::None);
+
+    let refresh = {
+        let users = users.clone();
+        let error = error.clone();
+        Callback::from(move |_: ()| {
+            let users = users.clone();
+            let error = error.clone();
+            spawn_local(async move {
+                match auth::get::<api::AdminUsers>("/api/admin/users").await {
+                    Ok(list) => users.set(Some(list)),
+                    // Unauthorized just means "not the operator" — silence,
+                    // not an error state.
+                    Err(Failure::Unauthorized) => users.set(None),
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        })
+    };
+
+    {
+        let refresh = refresh.clone();
+        use_effect_with((), move |_| refresh.emit(()));
+    }
+
+    let Some(list) = (*users).clone() else {
+        return html! {};
+    };
+    if !*open {
+        let open = open.clone();
+        return html! { <>
+            <button class="linkish" onclick={Callback::from(move |_: MouseEvent| open.set(true))}
+                    title="manage who can sign in">
+                { "admin" }
+            </button>
+            { " " }
+        </> };
+    }
+
+    // One closure per (action, user) button: run the request, then refetch —
+    // the table always shows the server's state, never an optimistic guess.
+    let act = |method: &'static str, path: String, confirm: Option<String>| {
+        let refresh = refresh.clone();
+        let error = error.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(q) = &confirm
+                && !web_sys::window()
+                    .map(|w| w.confirm_with_message(q).unwrap_or(false))
+                    .unwrap_or(false)
+            {
+                return;
+            }
+            let path = path.clone();
+            let refresh = refresh.clone();
+            let error = error.clone();
+            spawn_local(async move {
+                let result: Result<serde_json::Value, _> = if method == "DELETE" {
+                    auth::delete(&path).await
+                } else {
+                    auth::post(&path).await
+                };
+                match result {
+                    Ok(_) => {
+                        error.set(None);
+                        refresh.emit(());
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        })
+    };
+    let mint = {
+        let minted = minted.clone();
+        let error = error.clone();
+        let refresh = refresh.clone();
+        move |id: String| {
+            let minted = minted.clone();
+            let error = error.clone();
+            let refresh = refresh.clone();
+            Callback::from(move |_: MouseEvent| {
+                let path = format!("/api/admin/users/{id}/code");
+                let minted = minted.clone();
+                let error = error.clone();
+                let refresh = refresh.clone();
+                spawn_local(async move {
+                    match auth::post::<api::MintedLoginCode>(&path).await {
+                        Ok(code) => {
+                            error.set(None);
+                            minted.set(Some(code));
+                            refresh.emit(());
+                        }
+                        Err(e) => error.set(Some(e.to_string())),
+                    }
+                });
+            })
+        }
+    };
+
+    let close = {
+        let open = open.clone();
+        let minted = minted.clone();
+        Callback::from(move |_: MouseEvent| {
+            open.set(false);
+            minted.set(None);
+        })
+    };
+
+    html! { <>
+        <button class="linkish" onclick={close.clone()}>{ "admin" }</button>
+        { " " }
+        <div class="admin-overlay" onclick={close.clone()}>
+            <div class="admin-panel"
+                 onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
+                <div class="admin-head">
+                    <b>{ "who can sign in" }</b>
+                    <span class="spacer" />
+                    <button class="linkish" onclick={close}>{ "close" }</button>
+                </div>
+                <table>
+                    <thead><tr>
+                        <th>{ "user" }</th><th>{ "state" }</th>
+                        <th>{ "passkeys" }</th><th>{ "sessions" }</th><th />
+                    </tr></thead>
+                    <tbody>
+                    { for list.users.iter().map(|u| {
+                        let is_operator = u.id == list.operator;
+                        let state = if u.disabled { "disabled" }
+                            else if u.passkeys == 0 { "no passkey" }
+                            else { "ok" };
+                        let base = format!("/api/admin/users/{}", u.id);
+                        html! { <tr>
+                            <td title={u.name.clone()}>
+                                { &u.id }
+                                { if is_operator { html!{ <span class="dim">{ " (operator)" }</span> } }
+                                  else { html!{} } }
+                            </td>
+                            <td>{ state }</td>
+                            <td>{ u.passkeys }</td>
+                            <td>{ u.sessions }</td>
+                            <td class="row-actions">
+                                <button onclick={mint(u.id.clone())} disabled={u.disabled}
+                                        title="one-time sign-in code (single use, 15 minutes)">
+                                    { "code" }
+                                </button>
+                                <button onclick={act("POST", format!("{base}/revoke"), None)}
+                                        disabled={u.sessions == 0}
+                                        title="end every live session">
+                                    { "revoke" }
+                                </button>
+                                <button onclick={act("POST", format!("{base}/passkeys/clear"),
+                                            Some(format!("forget all of {}'s passkeys? they will need a fresh code to re-enroll", u.id)))}
+                                        disabled={u.passkeys == 0}>
+                                    { "clear passkeys" }
+                                </button>
+                                { if is_operator { html!{} } else if u.disabled { html! { <>
+                                    <button onclick={act("POST", format!("{base}/enable"), None)}>
+                                        { "enable" }
+                                    </button>
+                                    <button onclick={act("DELETE", base.clone(),
+                                                Some(format!("forget {} entirely — sessions, codes, passkeys? (their name stays in server.toml until you edit it)", u.id)))}
+                                            title="forget every credential; the roster entry in server.toml is yours to edit">
+                                        { "remove" }
+                                    </button>
+                                </> } } else { html! {
+                                    <button onclick={act("POST", format!("{base}/disable"),
+                                                Some(format!("disable {} and end their sessions?", u.id)))}>
+                                        { "disable" }
+                                    </button>
+                                } } }
+                            </td>
+                        </tr> }
+                    }) }
+                    </tbody>
+                </table>
+                { if let Some(m) = &*minted { html! {
+                    <div class="admin-code">
+                        { format!("code for {}: ", m.username) }
+                        <code>{ &m.code }</code>
+                        { " — single use, 15 minutes; send it to them over something you trust" }
+                    </div>
+                } } else { html!{} } }
+                { if let Some(e) = &*error { html! {
+                    <div class="err"><pre>{ e }</pre></div>
+                } } else { html!{} } }
+                <div class="dim admin-foot">
+                    { "the roster (who exists) lives in server.toml; \
+                       locked out entirely? restart with --recover" }
+                </div>
+            </div>
+        </div>
+    </> }
 }
 
 /// Click and Enter both mean "send": one action, two bindings. Enter submits

@@ -6,8 +6,11 @@ HTTP call with the same names the server uses.
 
 Auth: pass a bearer token, or let it find one — $MYCO_API_TOKEN (set inside
 agent-spawned tools), then $MYCO_HOME/v2/operator.token (written by
-`--mode serve` for local scripts). Remote users sign in with a password via
-`Myco.login(...)`.
+`--mode serve` for local scripts). Remote users sign in by redeeming an
+operator-minted one-time code via `Myco.login_with_code(...)`; the browser
+GUI additionally does passkeys, which need WebAuthn and are out of scope
+here. Holders of the operator token also get the `/api/admin` surface
+(`admin_users`, `mint_code`, ...).
 
     from myco import Myco
     m = Myco()                            # local server, operator token
@@ -62,14 +65,9 @@ class Myco:
         self.token = token if token is not None else _default_token()
 
     @classmethod
-    def login(cls, username: str, password: str, base: str | None = None) -> "Myco":
-        """OAuth password grant → an authenticated client."""
-        return cls._grant({"grant_type": "password", "username": username,
-                           "password": password}, base)
-
-    @classmethod
     def login_with_code(cls, username: str, code: str, base: str | None = None) -> "Myco":
-        """Redeem an operator-minted one-time code (`myco auth code <user>`)."""
+        """Redeem a one-time code (minted in the admin panel, by
+        `Myco.mint_code`, or printed by the server at startup)."""
         return cls._grant({"grant_type": "code", "username": username,
                            "code": code}, base)
 
@@ -166,6 +164,35 @@ class Myco:
                 if texts:
                     return "\n".join(texts)
         return ""
+
+    # -- administration (operator token only) ------------------------------
+
+    def admin_users(self):
+        """The roster: id, name, disabled, passkeys, sessions per user."""
+        return self._get("/admin/users")
+
+    def mint_code(self, username: str):
+        """One-time sign-in code for `username` — single use, 15 minutes,
+        replaces any earlier unredeemed code for them."""
+        return self._call("POST", f"/admin/users/{username}/code")
+
+    def disable_user(self, username: str):
+        return self._call("POST", f"/admin/users/{username}/disable")
+
+    def enable_user(self, username: str):
+        return self._call("POST", f"/admin/users/{username}/enable")
+
+    def revoke_sessions(self, username: str):
+        """End every live session; credentials survive."""
+        return self._call("POST", f"/admin/users/{username}/revoke")
+
+    def clear_passkeys(self, username: str):
+        return self._call("POST", f"/admin/users/{username}/passkeys/clear")
+
+    def remove_user(self, username: str):
+        """Forget credentials entirely (the roster entry in server.toml is
+        edited by hand; a restart re-adds the bare name)."""
+        return self._call("DELETE", f"/admin/users/{username}")
 
     # -- shells ------------------------------------------------------------
 

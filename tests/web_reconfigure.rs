@@ -66,7 +66,7 @@ fn echo_server() -> Arc<Server> {
             };
             Ok(ScriptedModel::new(vec![reply; 4]) as Arc<dyn GenerativeModel>)
         }),
-        Arc::new(AuthStore::in_memory().with_work_factor(1)),
+        Arc::new(AuthStore::in_memory()),
     )
 }
 

@@ -28,7 +28,11 @@ use webauthn_rs::prelude as webauthn;
 
 /// Resolve config, run preflight (warnings to stderr), and launch Rocket on
 /// `127.0.0.1:<port>` serving `/api`.
-pub async fn serve(config: Config, port: u16) -> Result<(), String> {
+///
+/// `recover` forces a one-time sign-in code for the operator onto stderr even
+/// when they have passkeys enrolled — the lockout escape hatch. Restarting
+/// the process is what proves the right to it.
+pub async fn serve(config: Config, port: u16, recover: bool) -> Result<(), String> {
     // Fatal checks first: they end the process, so run them before anything
     // that would leave a half-built session behind.
     if let Some(fatal) = fatal_startup_check(config.max_prelude_bytes) {
@@ -73,6 +77,10 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
         ),
     }
 
+    if let Some(banner) = startup_code(&server, recover) {
+        eprintln!("{banner}");
+    }
+
     rocket(server, figment)
         .launch()
         .await
@@ -83,6 +91,38 @@ pub async fn serve(config: Config, port: u16) -> Result<(), String> {
 /// Path of the local operator's bearer token: `$MYCO_HOME/v2/operator.token`.
 pub fn operator_token_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::core::data_root()?.join("operator.token"))
+}
+
+/// The startup sign-in code: how a person first gets into a server that has
+/// no signup and no passwords. Minted for the operator (the roster's local
+/// user) when they have no passkey to sign in with — a fresh install — or on
+/// demand with `--recover` (all passkeys lost). Returns the banner to print,
+/// or `None` when nothing needs minting.
+///
+/// This is the whole trust rule in one function: possession of the process
+/// is what makes someone the operator, so the code goes to the terminal the
+/// server was started from and nowhere else.
+pub fn startup_code(server: &Server, recover: bool) -> Option<String> {
+    let local = &server.config().roster.local().id;
+    if !recover && !server.auth().passkeys_for(local).is_empty() {
+        return None;
+    }
+    let why = if recover {
+        "--recover"
+    } else {
+        "no passkey enrolled yet"
+    };
+    match server.auth().mint_code(local) {
+        Ok(minted) => Some(format!(
+            "myco: one-time sign-in code for {} ({why}): {}\n      \
+             single use, {} minutes — enter it on the sign-in page, then add a \
+             passkey\n      (restart the server to mint another)",
+            minted.user_id,
+            minted.code,
+            crate::auth::CODE_TTL_MINUTES
+        )),
+        Err(e) => Some(format!("myco: cannot mint a sign-in code: {e}")),
+    }
 }
 
 /// Write the operator token where local clients can read it, `0600`.
@@ -162,7 +202,13 @@ pub fn rocket(
                 whoami,
                 auth_token,
                 auth_logout,
-                auth_mint_code,
+                admin_users,
+                admin_disable,
+                admin_enable,
+                admin_revoke,
+                admin_remove,
+                admin_clear_passkeys,
+                admin_mint_code,
                 passkey_register_start,
                 passkey_register_finish,
                 passkey_login_start,
@@ -588,7 +634,9 @@ async fn whoami(caller: Caller) -> ApiResult<api::Identity> {
     output(caller.whoami().await)
 }
 
-/// OAuth 2.0 password grant (RFC 6749 §4.3): credentials in, bearer token out.
+/// The token endpoint (RFC 6749's shape, one extension grant): a one-time
+/// code in, a bearer token out. There is no password grant — codes and
+/// passkeys are the only ways in.
 ///
 /// The request is `application/x-www-form-urlencoded` and the response uses
 /// the spec's field names, so a stock OAuth2 client works against it unchanged.
@@ -597,27 +645,18 @@ async fn auth_token(
     server: &State<Arc<Server>>,
     form: Form<TokenRequest>,
 ) -> ApiResult<api::AccessToken> {
-    // `grant_type` is required by the spec; refusing an unknown one keeps a
-    // future grant from silently being treated as this one.
-    let grant = form.grant_type.as_deref().unwrap_or("password");
-    if grant == "code" {
-        return match server.auth().redeem_code(&form.username, &form.code) {
-            Ok(issued) => output(Ok(api::AccessToken {
-                access_token: issued.access_token,
-                token_type: "bearer".into(),
-                expires_in: issued.expires_in_seconds,
-                user: issued.user.identity(),
-            })),
-            Err(e) => output(Err(ApiError::new(ErrorKind::Unauthorized, e.to_string()))),
-        };
-    }
-    if grant != "password" {
+    // `grant_type` is required by the spec but tolerated when absent, so
+    // `curl -d username -d code` works; anything else is refused by name —
+    // notably `password`, so a stale client learns the grant is gone rather
+    // than being told its credentials are wrong.
+    let grant = form.grant_type.as_deref().unwrap_or("code");
+    if grant != "code" {
         return output(Err(ApiError::new(
             ErrorKind::BadRequest,
-            format!("unsupported grant_type: {grant}"),
+            format!("unsupported grant_type: {grant} (sign in with a one-time code or a passkey)"),
         )));
     }
-    match server.auth().login(&form.username, &form.password) {
+    match server.auth().redeem_code(&form.username, &form.code) {
         Ok(issued) => output(Ok(api::AccessToken {
             access_token: issued.access_token,
             token_type: "bearer".into(),
@@ -639,52 +678,171 @@ async fn auth_logout(server: &State<Arc<Server>>, caller: Caller) -> ApiResult<a
     output(who)
 }
 
-/// The `POST /auth/token` form body. Two grants share it: `password`
-/// (the default) reads `password`; `code` redeems an operator-minted
-/// one-time code.
+/// The `POST /auth/token` form body: `grant_type=code` redeeming an
+/// operator-minted one-time code.
 #[derive(FromForm)]
 struct TokenRequest {
     username: String,
     #[field(default = String::new())]
-    password: String,
-    #[field(default = String::new())]
     code: String,
-    /// Spec-required, but tolerated when absent so `curl -d user -d pass` works.
+    /// Spec-required, but tolerated when absent so `curl -d user -d code` works.
     grant_type: Option<String>,
 }
 
-/// Mint a one-time login code for `username`. Operator-only: the caller must
-/// be the server's own identity (the roster's local user), which is who holds
-/// `operator.token` — this is `myco auth code` reaching the live server, not
-/// a self-service surface.
-#[derive(serde::Deserialize)]
-struct MintCodeRequest {
-    username: String,
-}
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+//
+// Everything the old `myco auth` CLI did, as `/api/admin` routes behind the
+// [`Operator`] guard. The server is the only writer of the credential files;
+// there is no other administrative surface.
 
-#[derive(serde::Serialize)]
-struct MintedCodeResponse {
-    username: String,
-    code: String,
-    expires_at: String,
-}
+/// An authenticated request from the *operator* — the roster's local user,
+/// the identity whose token the server writes to `operator.token` at boot.
+/// Possession of the machine is what makes someone the operator; this guard
+/// is how that authority reaches HTTP.
+struct Operator(#[allow(dead_code)] Caller);
 
-#[post("/auth/codes", data = "<req>")]
-async fn auth_mint_code(
-    server: &State<Arc<Server>>,
-    caller: Caller,
-    req: Json<MintCodeRequest>,
-) -> ApiResult<MintedCodeResponse> {
-    let operator = &server.config().roster.local().id;
-    let is_operator = matches!(caller.author(), api::Author::User { id, .. } if id == operator);
-    if !is_operator {
-        return output(Err(ApiError::new(
-            ErrorKind::Unauthorized,
-            "only the operator may mint codes",
-        )));
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Operator {
+    type Error = ApiError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ApiError> {
+        let caller = match Caller::from_request(req).await {
+            Outcome::Success(c) => c,
+            Outcome::Error(e) => return Outcome::Error(e),
+            Outcome::Forward(f) => return Outcome::Forward(f),
+        };
+        let Some(server) = req.rocket().state::<Arc<Server>>() else {
+            return Outcome::Error((
+                Status::InternalServerError,
+                ApiError::new(ErrorKind::Internal, "server missing from state"),
+            ));
+        };
+        let operator = &server.config().roster.local().id;
+        let held = matches!(caller.author(), api::Author::User { id, .. } if id == operator);
+        if held {
+            Outcome::Success(Operator(caller))
+        } else {
+            Outcome::Error((
+                Status::Unauthorized,
+                ApiError::new(ErrorKind::Unauthorized, "operator only"),
+            ))
+        }
     }
-    match server.auth().mint_code(&req.username) {
-        Ok(minted) => output(Ok(MintedCodeResponse {
+}
+
+/// The roster as the operator sees it: who exists, who can sign in with
+/// what, who is signed in now.
+#[get("/admin/users")]
+async fn admin_users(server: &State<Arc<Server>>, _op: Operator) -> ApiResult<api::AdminUsers> {
+    let sessions: std::collections::HashMap<String, usize> =
+        server.auth().session_counts().into_iter().collect();
+    let passkeys = server.auth().passkey_counts();
+    output(Ok(api::AdminUsers {
+        operator: server.config().roster.local().id.clone(),
+        users: server
+            .auth()
+            .users()
+            .into_iter()
+            .map(|u| api::AdminUser {
+                passkeys: passkeys.get(&u.id).copied().unwrap_or(0),
+                sessions: sessions.get(&u.id).copied().unwrap_or(0),
+                id: u.id,
+                name: u.name,
+                disabled: u.disabled,
+            })
+            .collect(),
+    }))
+}
+
+/// Refuse the one action that could orphan the server: the operator locking
+/// out the identity that mints codes. Every other account is fair game.
+fn not_the_operator(server: &Server, id: &str) -> Result<(), ApiError> {
+    if crate::auth::normalize_id(id) == server.config().roster.local().id {
+        return Err(ApiError::new(
+            ErrorKind::BadRequest,
+            "the operator account cannot be disabled or removed — it is what `--recover` signs in as",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse logins and end live sessions; the name stays, so history remains
+/// attributable. `enable` undoes it.
+#[post("/admin/users/<id>/disable")]
+async fn admin_disable(server: &State<Arc<Server>>, _op: Operator, id: &str) -> ApiResult<()> {
+    output(not_the_operator(server, id).and_then(|()| {
+        server
+            .auth()
+            .set_disabled(id, true)
+            .map_err(|e| ApiError::new(ErrorKind::BadRequest, e.to_string()))
+    }))
+}
+
+#[post("/admin/users/<id>/enable")]
+async fn admin_enable(server: &State<Arc<Server>>, _op: Operator, id: &str) -> ApiResult<()> {
+    output(
+        server
+            .auth()
+            .set_disabled(id, false)
+            .map_err(|e| ApiError::new(ErrorKind::BadRequest, e.to_string())),
+    )
+}
+
+/// End every live session for a user without touching their credentials.
+#[post("/admin/users/<id>/revoke")]
+async fn admin_revoke(
+    server: &State<Arc<Server>>,
+    _op: Operator,
+    id: &str,
+) -> ApiResult<api::AdminActionCount> {
+    output(Ok(api::AdminActionCount {
+        affected: server.auth().revoke_all_for(id),
+    }))
+}
+
+/// Forget a user's credentials entirely — sessions, codes, and passkeys.
+/// If they are still in the roster, the next restart re-adds the name with
+/// nothing attached, which is exactly "start them over with a fresh code".
+#[delete("/admin/users/<id>")]
+async fn admin_remove(server: &State<Arc<Server>>, _op: Operator, id: &str) -> ApiResult<()> {
+    output(not_the_operator(server, id).and_then(|()| {
+        server
+            .auth()
+            .remove_user(id)
+            .map_err(|e| ApiError::new(ErrorKind::BadRequest, e.to_string()))
+    }))
+}
+
+/// Forget every passkey for a user (lost or compromised authenticator). Live
+/// sessions survive — revoke separately if they must end now.
+#[post("/admin/users/<id>/passkeys/clear")]
+async fn admin_clear_passkeys(
+    server: &State<Arc<Server>>,
+    _op: Operator,
+    id: &str,
+) -> ApiResult<api::AdminActionCount> {
+    output(
+        server
+            .auth()
+            .clear_passkeys(id)
+            .map(|affected| api::AdminActionCount { affected })
+            .map_err(|e| ApiError::new(ErrorKind::BadRequest, e.to_string())),
+    )
+}
+
+/// Mint a one-time sign-in code for `id`. Minting must happen against the
+/// live server: the code is redeemed from this process's memory, so a file
+/// could never carry it.
+#[post("/admin/users/<id>/code")]
+async fn admin_mint_code(
+    server: &State<Arc<Server>>,
+    _op: Operator,
+    id: &str,
+) -> ApiResult<api::MintedLoginCode> {
+    match server.auth().mint_code(id) {
+        Ok(minted) => output(Ok(api::MintedLoginCode {
             username: minted.user_id,
             code: minted.code,
             expires_at: minted.expires_at.to_rfc3339(),
@@ -700,9 +858,9 @@ async fn auth_mint_code(
 // Standard WebAuthn ceremonies over the webauthn-rs types, which serialize
 // to the exact JSON `PublicKeyCredential.parse*OptionsFromJSON` and
 // `credential.toJSON()` speak — the GUI passes them through untouched.
-// Enrollment requires an authenticated session (password or code bootstrap);
-// login requires only a username, and answers uniformly for "no such user"
-// and "no passkeys enrolled".
+// Enrollment requires an authenticated session (a one-time code bootstraps
+// it); login requires only a username, and answers uniformly for "no such
+// user" and "no passkeys enrolled".
 
 /// Start enrolling a passkey for the signed-in user.
 #[post("/auth/passkey/register/start")]
@@ -833,7 +991,7 @@ struct PasskeyLoginFinish {
 
 /// Finish a passkey login: verify the assertion, update the stored
 /// credential's counters, and issue a token — the same response shape the
-/// password grant returns.
+/// code grant returns.
 #[post("/auth/passkey/login/finish", data = "<req>")]
 async fn passkey_login_finish(
     server: &State<Arc<Server>>,

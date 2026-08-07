@@ -1,11 +1,12 @@
 //! Sign-in for the browser client.
 //!
-//! [`login`] performs the OAuth 2.0 password grant against
-//! `POST /api/auth/token` and keeps the returned access token; every later
-//! `/api` request carries it as `Authorization: Bearer <token>`. The token
-//! lives in `localStorage` so a reload does not log you out, and in a
-//! thread-local so the fetch helpers can reach it without threading a context
-//! parameter through every component.
+//! Two ways in: [`passkey_login`] (the steady state) and [`code_login`]
+//! (redeeming an operator-minted one-time code — bootstrap and recovery).
+//! Both keep the returned access token; every later `/api` request carries
+//! it as `Authorization: Bearer <token>`. The token lives in `localStorage`
+//! so a reload does not log you out, and in a thread-local so the fetch
+//! helpers can reach it without threading a context parameter through every
+//! component.
 //!
 //! Tokens expire server-side, so a 401 is routine rather than exceptional:
 //! it clears the stored token and surfaces as [`Failure::Unauthorized`], which
@@ -181,6 +182,10 @@ pub async fn post_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
     run_json(format!("POST {path}"), Request::post(path), body).await
 }
 
+pub async fn delete<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Failure> {
+    run(format!("DELETE {path}"), Request::delete(path)).await
+}
+
 pub async fn patch_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
     path: &str,
     body: &B,
@@ -194,23 +199,6 @@ pub async fn whoami() -> Result<api::Identity, Failure> {
         return Err(Failure::Unauthorized);
     }
     get("/api/whoami").await
-}
-
-/// The password grant. On success the token is stored and the caller gets the
-/// identity it speaks for.
-pub async fn login(username: &str, password: &str) -> Result<api::Identity, Failure> {
-    let body = format!(
-        "grant_type=password&username={}&password={}",
-        encode(username.trim()),
-        encode(password)
-    );
-    let req = Request::post("/api/auth/token")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .map_err(|e| Failure::Other(format!("sign in: {e}")))?;
-    let issued: api::AccessToken = decode("sign in", req.send().await).await?;
-    set_token(&issued.access_token);
-    Ok(issued.user)
 }
 
 /// Redeem an operator-minted one-time code for a session.
