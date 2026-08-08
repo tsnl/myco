@@ -7,7 +7,9 @@ use std::cell::RefCell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::core::{Action, Effect, Session, State, reduce, wants_key};
+use crate::core::{
+    Action, Effect, Session, Stage, State, palette_rows, reduce, reserved_chord, wants_key,
+};
 
 const TOKEN_KEY: &str = "myco.token";
 
@@ -49,6 +51,32 @@ fn attach_keyboard() {
         move |event: web_sys::KeyboardEvent| {
             let (key, ctrl, alt, meta) =
                 (event.key(), event.ctrl_key(), event.alt_key(), event.meta_key());
+            if reserved_chord(&key, ctrl, meta) {
+                event.prevent_default();
+                dispatch(Action::PaletteToggled);
+                return;
+            }
+            let palette_open = STATE.with(|s| s.borrow().palette.is_some());
+            if palette_open {
+                // The palette owns the keyboard: navigation here, typing
+                // in its own input (ordinary DOM), the rest stays put.
+                match key.as_str() {
+                    "Escape" => {
+                        event.prevent_default();
+                        dispatch(Action::PaletteDismissed);
+                    }
+                    "ArrowDown" => {
+                        event.prevent_default();
+                        dispatch(Action::PaletteMoved { delta: 1 });
+                    }
+                    "ArrowUp" => {
+                        event.prevent_default();
+                        dispatch(Action::PaletteMoved { delta: -1 });
+                    }
+                    _ => {}
+                }
+                return;
+            }
             let wanted = STATE.with(|s| wants_key(&s.borrow(), &key, ctrl, meta));
             if wanted {
                 event.prevent_default();
@@ -172,6 +200,24 @@ fn run(effect: Effect) {
                     Err(what) => Action::NetworkFailed { what },
                 },
             );
+        }),
+        Effect::RunVerb {
+            token,
+            id,
+            verb,
+            args,
+        } => wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/instances/{id}/verbs/{verb}");
+            let body = (!args.is_empty()).then(|| (JSON, args));
+            dispatch(match fetch("POST", &url, Some(&token), body).await {
+                Ok((status, body)) => Action::VerbRan {
+                    id,
+                    verb,
+                    status,
+                    body,
+                },
+                Err(what) => Action::NetworkFailed { what },
+            });
         }),
         Effect::Watch { id } => send_op("watch", &id),
         Effect::Unwatch { id } => send_op("unwatch", &id),
@@ -545,6 +591,98 @@ fn wire(document: &web_sys::Document) {
     }
     measure_focused_tty(document);
 
+    if let Some(input) = document
+        .get_element_by_id("palette-input")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        let _ = input.focus();
+        // Put the caret at the end, not the start.
+        let len = input.value().len() as u32;
+        let _ = input.set_selection_range(len, len);
+        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Some(target) = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            {
+                dispatch(Action::PaletteQueried {
+                    query: target.value(),
+                });
+            }
+        });
+        let _ = input.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
+        on_input.forget();
+        let on_enter =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                if e.key() == "Enter" {
+                    e.prevent_default();
+                    dispatch(Action::PaletteCommitted);
+                }
+            });
+        let _ =
+            input.add_event_listener_with_callback("keydown", on_enter.as_ref().unchecked_ref());
+        on_enter.forget();
+    }
+    if let Some(well) = document
+        .get_element_by_id("palette-args")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+    {
+        let _ = well.focus();
+        let target = well.clone();
+        let on_enter =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                if e.key() == "Enter" && !e.shift_key() {
+                    e.prevent_default();
+                    dispatch(Action::PaletteArgsCommitted {
+                        draft: target.value(),
+                    });
+                }
+            });
+        let _ = well.add_event_listener_with_callback("keydown", on_enter.as_ref().unchecked_ref());
+        on_enter.forget();
+    }
+    if let Ok(rows) = document.query_selector_all("[data-commit]") {
+        for i in 0..rows.length() {
+            if let Some(row) = rows.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+                let index: usize = row
+                    .get_attribute("data-commit")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(
+                    move |event: web_sys::Event| {
+                        event.stop_propagation();
+                        // Land the selection on the clicked row, then
+                        // commit — two ordinary dispatches, no special
+                        // click path through the reducer.
+                        let current = STATE
+                            .with(|s| s.borrow().palette.as_ref().map(|p| p.selected))
+                            .unwrap_or(0);
+                        dispatch(Action::PaletteMoved {
+                            delta: index as i32 - current as i32,
+                        });
+                        dispatch(Action::PaletteCommitted);
+                    },
+                );
+                let _ = row
+                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+    if let Ok(Some(scrim)) = document.query_selector("[data-dismiss-palette]") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .is_some_and(|el| el.has_attribute("data-dismiss-palette"))
+            {
+                dispatch(Action::PaletteDismissed);
+            }
+        });
+        let _ =
+            scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+
     // Tree rows and create buttons: data attributes carry the action's
     // argument; the listener only dispatches.
     if let Ok(rows) = document.query_selector_all("[data-open]") {
@@ -664,8 +802,16 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
         })
         .collect();
 
+    let overlay = palette_overlay(state);
+    let notice = match &state.notice {
+        Some(notice) if state.palette.is_none() => format!(
+            r#"<div class="island notice mono">{}</div>"#,
+            escape(notice)
+        ),
+        _ => String::new(),
+    };
     format!(
-        r#"<div class="workspace">
+        r#"{overlay}{notice}<div class="workspace">
              <div class="island sidebar">
                <div class="shell-brand"><span class="spore">●</span> myco</div>
                <div class="tree">{tree}</div>
@@ -880,6 +1026,83 @@ fn tree_row(instance: &crate::core::InstanceInfo, ws: &crate::core::Workspace) -
         id = escape(&instance.id),
         kind = escape(&instance.kind),
         title = escape(title),
+    )
+}
+
+/// The summoned palette: one island over a scrim, the amethyst spec —
+/// grouped rows, gated rows visible with their reason, the args well as
+/// the second stage in the same island.
+fn palette_overlay(state: &State) -> String {
+    let Some(palette) = &state.palette else {
+        return String::new();
+    };
+    let inner = match &palette.stage {
+        Stage::List => {
+            let rows = palette_rows(state, &palette.query);
+            let mut html = format!(
+                r#"<input id="palette-input" placeholder="type a verb, an instance, a kind…"
+                     value="{}" autocomplete="off" />"#,
+                escape(&palette.query)
+            );
+            let mut group = "";
+            for (i, row) in rows.iter().enumerate() {
+                if row.group != group {
+                    group = row.group;
+                    html.push_str(&format!(
+                        r#"<div class="palette-group">{group}</div>"#
+                    ));
+                }
+                let classes = format!(
+                    "palette-row{}{}",
+                    if i == palette.selected { " selected" } else { "" },
+                    if row.gated.is_some() { " gated" } else { "" },
+                );
+                let right = match &row.gated {
+                    Some(reason) => format!(
+                        r#"<span class="palette-gate">{}</span>"#,
+                        escape(reason)
+                    ),
+                    None => format!(
+                        r#"<span class="palette-detail">{}</span>"#,
+                        escape(&row.detail)
+                    ),
+                };
+                html.push_str(&format!(
+                    r#"<div class="{classes}" data-commit="{i}">
+                         <span class="mono">{label}</span>{right}
+                       </div>"#,
+                    label = escape(&row.label),
+                ));
+            }
+            if rows.is_empty() {
+                html.push_str(r#"<div class="dim">no matches — try a kind name</div>"#);
+            }
+            html
+        }
+        Stage::Args {
+            verb,
+            draft,
+            error,
+            ..
+        } => {
+            let error = match error {
+                Some(why) => format!(r#"<div class="form-error">{}</div>"#, escape(why)),
+                None => String::new(),
+            };
+            format!(
+                r#"<div class="dim"><span class="mono">{verb}</span> wants arguments — JSON,
+                     enter to run, esc to go back</div>
+                   {error}
+                   <textarea id="palette-args" class="mono" rows="4">{draft}</textarea>"#,
+                verb = escape(verb),
+                draft = escape(draft),
+            )
+        }
+    };
+    format!(
+        r#"<div class="palette-scrim" data-dismiss-palette>
+             <div class="island palette" id="palette">{inner}</div>
+           </div>"#
     )
 }
 

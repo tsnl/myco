@@ -449,3 +449,105 @@ form {
     line-height: 1.25;
     white-space: pre;
 }
+
+/* The palette: one island, summoned; the room dims, the palette does not
+ * glow (STYLE.md). */
+.palette-scrim {
+    position: fixed;
+    inset: 0;
+    background: #1e1c2630;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: 14vh;
+    z-index: 10;
+}
+
+.palette {
+    width: min(560px, calc(100vw - 48px));
+    max-height: 60vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 12px;
+}
+
+.palette input,
+.palette textarea {
+    background: var(--sunken);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-row);
+    color: var(--ink);
+    font: inherit;
+    margin-bottom: 8px;
+    padding: 10px 14px;
+}
+
+.palette input:focus,
+.palette textarea:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.palette-group {
+    color: var(--faint);
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 8px 4px 2px;
+}
+
+.palette-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-radius: var(--radius-row);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 8px 12px;
+}
+
+.palette-row:hover {
+    background: var(--sunken);
+}
+
+.palette-row.selected {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.palette-row.gated {
+    color: var(--faint);
+}
+
+.palette-detail,
+.palette-gate {
+    color: var(--dim);
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.palette-gate {
+    color: var(--faint);
+    font-style: italic;
+}
+
+/* The notice: the last palette answer, quiet, bottom of the room. */
+.notice {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: min(680px, calc(100vw - 48px));
+    max-height: 30vh;
+    overflow: auto;
+    font-size: 11.5px;
+    padding: 10px 14px;
+    white-space: pre-wrap;
+    z-index: 9;
+}
