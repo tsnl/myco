@@ -29,6 +29,13 @@ pub struct State {
     /// The last palette-run verb's answer (or refusal) — a quiet line, not
     /// an ember; dismissed on the next palette open.
     pub notice: Option<String>,
+    /// A listing fetch is out and its answer has not landed. Bookkeeping,
+    /// not content — it lives outside [`Workspace`] so a burst of feed
+    /// events cannot make the tree look changed when nothing in it is.
+    pub listing_in_flight: bool,
+    /// Something happened while that fetch was out, so its answer is
+    /// already behind: re-list once when it lands.
+    pub listing_stale: bool,
     /// Recent actions, newest last, capped — the repro log.
     pub log: Vec<String>,
 }
@@ -118,6 +125,11 @@ pub struct InstanceInfo {
     #[serde(default)]
     pub title: String,
     pub creator: PrincipalRef,
+    /// What this instance was created under — a subagent chat names the
+    /// chat that spawned it. L1 identity, so the tree nests on it rather
+    /// than asking any kind where it came from.
+    #[serde(default)]
+    pub parent: Option<String>,
     #[serde(default)]
     pub driver: Option<PrincipalRef>,
     #[serde(default)]
@@ -226,18 +238,15 @@ pub fn palette_rows(state: &State, query: &str) -> Vec<Row> {
         && let Some(instance) = ws.instances.iter().find(|i| &i.id == selected)
         && let Some(kind) = ws.kinds.iter().find(|k| k.kind == instance.kind)
     {
+        let seat = seat_of(instance.driver.as_ref());
         for verb in &kind.verbs {
             let gated = if verb.requires_driver {
-                match &instance.driver {
-                    Some(d) if me == Some(d.id.as_str()) && d.kind == "human" => None,
-                    Some(d) if d.kind == "human" => Some(format!("{} driving", d.id)),
-                    Some(d) if d.kind == "agent" => Some("agent driving".into()),
-                    Some(_) => Some("system driving".into()),
-                    None => Some("seat open — take it first".into()),
+                match &seat {
+                    _ if seat.held_by(me) => None,
+                    Seat::Open => Some("seat open — take it first".into()),
+                    held => Some(held.phrase()),
                 }
-            } else if verb.owner_only
-                && me != Some(instance.creator.id.as_str())
-            {
+            } else if verb.owner_only && me != Some(instance.creator.id.as_str()) {
                 Some(format!("{} only", instance.creator.id))
             } else {
                 None
@@ -315,11 +324,117 @@ pub fn palette_rows(state: &State, query: &str) -> Vec<Row> {
     rows
 }
 
+/// What a palette-run verb's answer does: reopen as the JSON well when the
+/// server says the arguments were missing, otherwise leave a notice and
+/// treat the run as a hint that anything may have moved.
+fn palette_answered(
+    state: &mut State,
+    id: String,
+    verb: String,
+    status: u16,
+    body: String,
+) -> Vec<Effect> {
+    #[derive(Default, serde::Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        why: String,
+    }
+    let wire = serde_json::from_str::<Wire>(&body).unwrap_or_default();
+    if status == 400 && wire.error == "bad_args" {
+        // The error-driven second stage: the well opens with the server's
+        // own words about what was missing.
+        state.palette = Some(Palette {
+            query: String::new(),
+            selected: 0,
+            stage: Stage::Args {
+                id,
+                verb,
+                draft: "{}".into(),
+                error: Some(wire.why),
+            },
+        });
+        return vec![];
+    }
+    state.notice = Some(if status == 200 {
+        let pretty = serde_json::from_str::<serde_json::Value>(&body)
+            .and_then(|v| serde_json::to_string_pretty(&v))
+            .unwrap_or(body);
+        let mut line: String = format!("{verb} → {pretty}");
+        if line.len() > 600 {
+            line.truncate(600);
+            line.push('…');
+        }
+        line
+    } else if !wire.why.is_empty() {
+        format!("{verb} refused: {}", wire.why)
+    } else {
+        format!("{verb} answered {status}")
+    });
+    // A verb may have changed anything; the watched panes re-read on their
+    // marks, the listing on this.
+    relist(state)
+}
+
 /// Subsequence match: every query char appears, in order. Small, honest,
 /// and predictable — ranking games can come later if typing earns them.
 fn fuzzy(haystack: &str, needle: &str) -> bool {
     let mut chars = haystack.chars();
     needle.chars().all(|n| chars.any(|h| h == n))
+}
+
+/// Who holds the driver seat, as the client presents it.
+///
+/// The tree's row dot, a pane's chip, and the palette's reason for greying
+/// a driven verb are three views of one fact. Spelled three times, they are
+/// three chances for the client to contradict itself about who is driving —
+/// so the classification happens once, here, and each view asks it for the
+/// part it renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seat {
+    /// Nobody: the open ring, and the take is an invitation.
+    Open,
+    Human(String),
+    Agent,
+    System,
+}
+
+/// The seat an instance's driver puts it in.
+pub fn seat_of(driver: Option<&PrincipalRef>) -> Seat {
+    match driver {
+        None => Seat::Open,
+        Some(p) if p.kind == "human" => Seat::Human(p.id.clone()),
+        Some(p) if p.kind == "agent" => Seat::Agent,
+        Some(_) => Seat::System,
+    }
+}
+
+impl Seat {
+    /// STYLE.md's presence vocabulary, as a class suffix.
+    pub fn tone(&self) -> &'static str {
+        match self {
+            Seat::Open => "open",
+            Seat::Human(_) => "human",
+            Seat::Agent => "agent",
+            Seat::System => "system",
+        }
+    }
+
+    /// The seat in words: a pane chip's label, a palette row's reason.
+    pub fn phrase(&self) -> String {
+        match self {
+            Seat::Open => "seat open".into(),
+            Seat::Human(id) => format!("{id} driving"),
+            Seat::Agent => "agent driving".into(),
+            Seat::System => "system driving".into(),
+        }
+    }
+
+    /// Is `me` the person in the seat? The whole of "may I drive this".
+    pub fn held_by(&self, me: Option<&str>) -> bool {
+        matches!(self, Seat::Human(id) if me == Some(id.as_str()))
+    }
 }
 
 /// The sign-in island's own state: in flight, and the last refusal.
@@ -352,7 +467,11 @@ pub struct User {
 
 impl User {
     pub fn display(&self) -> &str {
-        if self.name.is_empty() { &self.id } else { &self.name }
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
     }
 }
 
@@ -397,22 +516,24 @@ pub enum Action {
     Marked { id: String },
     /// A watched instance is gone (removed or crashed).
     InstanceGone { id: String },
-    /// A pane's projection read answered.
-    PaneRead { id: String, status: u16, body: String },
     /// The person asked to take the seat on an instance.
     TakeRequested { id: String },
     /// The person asked to release the seat.
     ReleaseRequested { id: String },
-    /// A `sys.*` chrome verb answered.
-    VerbAnswered { id: String, verb: String, status: u16 },
+    /// A verb call answered. One action for every verb the client calls:
+    /// what differs between callers is what should happen next, and that
+    /// is exactly what `origin` says.
+    VerbReplied {
+        origin: Origin,
+        id: String,
+        verb: String,
+        status: u16,
+        body: String,
+    },
     /// A key went down while a tty pane was focused and drivable. The
     /// edge has already answered the synchronous preventDefault question
     /// via [`wants_key`]; this is the committed keystroke.
-    KeyPressed {
-        key: String,
-        ctrl: bool,
-        alt: bool,
-    },
+    KeyPressed { key: String, ctrl: bool, alt: bool },
     /// The edge measured the focused tty pane's usable cell grid.
     PaneMeasured { id: String, cols: u16, rows: u16 },
     /// A chat composer submitted its text.
@@ -444,19 +565,33 @@ pub enum Action {
         status: u16,
         body: String,
     },
-    /// A palette-run verb answered.
-    VerbRan {
-        id: String,
-        verb: String,
-        status: u16,
-        body: String,
-    },
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
     CreateAnswered { status: u16, body: String },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
+}
+
+/// Who asked for a verb call — the only thing that distinguished one
+/// answered-verb action from another. A pane's projection read, the pane
+/// chrome's seat verbs, and (above this PR) the palette's run all ask the
+/// gateway the same question; they differ in what they do with the answer,
+/// so the reducer matches on this rather than on a variant per caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A pane's projection read: the answer *is* the pane's view.
+    Pane,
+    /// A pane's chrome (`sys.take` / `sys.release`): the answer is only a
+    /// hint that the listing moved.
+    Chrome,
+    /// Driving a pane — a keystroke, a resize. These answer constantly and
+    /// move nothing anyone lists, so their answers are dropped on the
+    /// floor rather than costing a re-list per key.
+    Drive,
+    /// The palette ran a verb: the answer is a notice, or — on `bad_args` —
+    /// the second stage, the JSON well carrying the server's complaint.
+    Palette,
 }
 
 /// What the edge must do. Effects re-enter as actions; they never touch
@@ -497,42 +632,12 @@ pub enum Effect {
     Watch { id: String },
     /// Send `{"op":"unwatch","id"}` on the event socket.
     Unwatch { id: String },
-    /// Call the pane's projection verb →
-    /// [`Action::PaneRead`].
-    ReadPane {
-        token: String,
-        id: String,
-        verb: String,
-    },
-    /// Call a chrome verb (`sys.take` / `sys.release`) →
-    /// [`Action::VerbAnswered`].
+    /// Call a verb on an instance → [`Action::VerbReplied`], tagged with
+    /// the `origin` that asked. `args` is the JSON body, empty for none.
+    /// Every verb the client calls goes through here: one wire shape, one
+    /// place to get the headers and the error path right.
     CallVerb {
-        token: String,
-        id: String,
-        verb: String,
-    },
-    /// `input {data}` on a tty → [`Action::VerbAnswered`] (verb `input`).
-    Input {
-        token: String,
-        id: String,
-        data: String,
-    },
-    /// `post {text}` on a chat → [`Action::VerbAnswered`] (verb `post`).
-    Post {
-        token: String,
-        id: String,
-        text: String,
-    },
-    /// `resize {cols, rows}` on a tty → [`Action::VerbAnswered`].
-    Resize {
-        token: String,
-        id: String,
-        cols: u16,
-        rows: u16,
-    },
-    /// Run a palette verb with `args` (JSON text; empty = null) →
-    /// [`Action::VerbRan`].
-    RunVerb {
+        origin: Origin,
         token: String,
         id: String,
         verb: String,
@@ -657,24 +762,70 @@ pub fn encode_key(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Option<
     encoded.map(|data| if alt { format!("\x1b{data}") } else { data })
 }
 
+impl Effect {
+    /// A verb call with no arguments — the common case.
+    fn call(origin: Origin, token: &str, id: &str, verb: &str) -> Self {
+        Effect::CallVerb {
+            origin,
+            token: token.into(),
+            id: id.into(),
+            verb: verb.into(),
+            args: String::new(),
+        }
+    }
+
+    /// A verb call with an argument object.
+    fn call_with(
+        origin: Origin,
+        token: &str,
+        id: &str,
+        verb: &str,
+        args: serde_json::Value,
+    ) -> Self {
+        Effect::CallVerb {
+            origin,
+            token: token.into(),
+            id: id.into(),
+            verb: verb.into(),
+            args: args.to_string(),
+        }
+    }
+}
+
 /// What entering a session kicks off, from either door (whoami or a fresh
 /// token): the workspace loads and the feed opens.
-fn enter_workspace(token: &str) -> Vec<Effect> {
-    vec![
-        Effect::FetchKinds {
-            token: token.into(),
-        },
-        Effect::FetchInstances {
-            token: token.into(),
-        },
-        Effect::OpenFeed {
-            token: token.into(),
-        },
-        // The 403 most people get back is the answer, not an error.
-        Effect::FetchAdmin {
-            token: token.into(),
-        },
-    ]
+fn enter_workspace(state: &mut State, token: &str) -> Vec<Effect> {
+    let mut effects = vec![Effect::FetchKinds {
+        token: token.into(),
+    }];
+    effects.extend(relist(state));
+    effects.push(Effect::OpenFeed {
+        token: token.into(),
+    });
+    // The 403 most people get back is the answer, not an error.
+    effects.push(Effect::FetchAdmin {
+        token: token.into(),
+    });
+    effects
+}
+
+/// Ask for a fresh listing — at most one at a time.
+///
+/// The feed is a hint that fires per event, and events arrive in bursts (a
+/// chat's turn, a terminal's output). One fetch per hint is one fetch per
+/// byte of somebody else's work. So: if a fetch is already out, its answer
+/// is already behind — remember that, and send exactly one more when it
+/// lands. Any number of hints during a fetch cost one follow-up, never N.
+fn relist(state: &mut State) -> Vec<Effect> {
+    let Some(token) = state.token.clone() else {
+        return vec![];
+    };
+    if state.listing_in_flight {
+        state.listing_stale = true;
+        return vec![];
+    }
+    state.listing_in_flight = true;
+    vec![Effect::FetchInstances { token }]
 }
 
 impl Workspace {
@@ -726,8 +877,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 200 => match serde_json::from_str::<User>(&body) {
                     Ok(user) => {
                         state.session = Session::SignedIn(user);
-                        if let Some(token) = &state.token {
-                            return enter_workspace(token);
+                        if let Some(token) = state.token.clone() {
+                            return enter_workspace(state, &token);
                         }
                     }
                     Err(_) => {
@@ -772,7 +923,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                         state.session = Session::SignedIn(issued.user);
                         state.sign_in = SignIn::default();
                         let mut effects = vec![Effect::PersistToken(issued.access_token.clone())];
-                        effects.extend(enter_workspace(&issued.access_token));
+                        effects.extend(enter_workspace(state, &issued.access_token));
                         effects
                     }
                     Err(_) => {
@@ -848,6 +999,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.passkey_note = None;
             state.workspace = Workspace::default();
             state.admin = None;
+            state.listing_in_flight = false;
+            state.listing_stale = false;
             effects
         }
         Action::KindsAnswered { status, body } => {
@@ -859,6 +1012,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             vec![]
         }
         Action::InstancesAnswered { status, body } => {
+            state.listing_in_flight = false;
             if status == 200
                 && let Ok(mut instances) = serde_json::from_str::<Vec<InstanceInfo>>(&body)
             {
@@ -874,36 +1028,29 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     state.workspace.selected = None;
                 }
             }
+            // Whatever arrived while this fetch was out is owed exactly
+            // one more look.
+            if std::mem::take(&mut state.listing_stale) {
+                return relist(state);
+            }
             vec![]
         }
-        Action::FeedEvent => match &state.token {
-            // Any event is only a hint; the listing is the truth. Lossy
-            // feed + re-list is the doctrine's recovery, used as the
-            // ordinary path.
-            Some(token) => vec![Effect::FetchInstances {
-                token: token.clone(),
-            }],
-            None => vec![],
-        },
+        // Any event is only a hint; the listing is the truth. Lossy feed +
+        // re-list is the doctrine's recovery, used as the ordinary path —
+        // coalesced, because a hint is not worth a fetch of its own.
+        Action::FeedEvent => relist(state),
         Action::FeedOpened => {
             state.workspace.feed = Feed::Live;
             // Anything could have happened while the socket was down:
             // re-list, and re-arm every open pane's watch + re-read.
-            let mut effects = Vec::new();
+            let mut effects = relist(state);
             if let Some(token) = &state.token {
-                effects.push(Effect::FetchInstances {
-                    token: token.clone(),
-                });
                 for pane in &state.workspace.panes {
                     effects.push(Effect::Watch {
                         id: pane.id.clone(),
                     });
                     if let Some(verb) = state.workspace.render_verb(&pane.id) {
-                        effects.push(Effect::ReadPane {
-                            token: token.clone(),
-                            id: pane.id.clone(),
-                            verb,
-                        });
+                        effects.push(Effect::call(Origin::Pane, token, &pane.id, &verb));
                     }
                 }
             }
@@ -937,33 +1084,24 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 gone: false,
             });
             let mut effects = vec![Effect::Watch { id: id.clone() }];
-            if let (Some(token), Some(verb)) =
-                (&state.token, state.workspace.render_verb(&id))
-            {
-                effects.push(Effect::ReadPane {
-                    token: token.clone(),
-                    id,
-                    verb,
-                });
+            if let (Some(token), Some(verb)) = (&state.token, state.workspace.render_verb(&id)) {
+                effects.push(Effect::call(Origin::Pane, token, &id, &verb));
             }
             effects
         }
         Action::PaneClosed { id } => {
             state.workspace.panes.retain(|p| p.id != id);
             if state.workspace.selected.as_deref() == Some(id.as_str()) {
-                state.workspace.selected =
-                    state.workspace.panes.last().map(|p| p.id.clone());
+                state.workspace.selected = state.workspace.panes.last().map(|p| p.id.clone());
             }
             vec![Effect::Unwatch { id }]
         }
         Action::Marked { id } => {
             let watched = state.workspace.panes.iter().any(|p| p.id == id && !p.gone);
             match (watched, &state.token, state.workspace.render_verb(&id)) {
-                (true, Some(token), Some(verb)) => vec![Effect::ReadPane {
-                    token: token.clone(),
-                    id,
-                    verb,
-                }],
+                (true, Some(token), Some(verb)) => {
+                    vec![Effect::call(Origin::Pane, token, &id, &verb)]
+                }
                 _ => vec![],
             }
         }
@@ -978,44 +1116,39 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 None => vec![],
             }
         }
-        Action::PaneRead { id, status, body } => {
-            if status == 200
-                && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
-            {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-                    pane.app_cursor = value["application_cursor"] == serde_json::json!(true);
-                }
-                // Raw payload; renderers parse it by kind at draw time.
-                pane.view = Some(body);
-            }
-            vec![]
-        }
         Action::TakeRequested { id } => match &state.token {
-            Some(token) => vec![Effect::CallVerb {
-                token: token.clone(),
-                id,
-                verb: "sys.take".into(),
-            }],
+            Some(token) => vec![Effect::call(Origin::Chrome, token, &id, "sys.take")],
             None => vec![],
         },
         Action::ReleaseRequested { id } => match &state.token {
-            Some(token) => vec![Effect::CallVerb {
-                token: token.clone(),
-                id,
-                verb: "sys.release".into(),
-            }],
+            Some(token) => vec![Effect::call(Origin::Chrome, token, &id, "sys.release")],
             None => vec![],
         },
-        Action::VerbAnswered { id: _, verb, status: _ } => {
-            // Seat changes surface through the listing. Kind verbs
-            // (keystrokes!) answer constantly and move nothing there.
-            match (&state.token, verb.starts_with("sys.")) {
-                (Some(token), true) => vec![Effect::FetchInstances {
-                    token: token.clone(),
-                }],
-                _ => vec![],
+        Action::VerbReplied {
+            origin,
+            id,
+            verb,
+            status,
+            body,
+        } => match origin {
+            Origin::Pane => {
+                if status == 200
+                    && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
+                {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                        pane.app_cursor = value["application_cursor"] == serde_json::json!(true);
+                    }
+                    // Raw payload; renderers parse it by kind at draw time.
+                    pane.view = Some(body);
+                }
+                vec![]
             }
-        }
+            // Seat changes surface through the listing; a keystroke's
+            // answer moves nothing there.
+            Origin::Chrome => relist(state),
+            Origin::Drive => vec![],
+            Origin::Palette => palette_answered(state, id, verb, status, body),
+        },
         Action::KeyPressed { key, ctrl, alt } => {
             let Some(selected) = state.workspace.selected.clone() else {
                 return vec![];
@@ -1023,15 +1156,14 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             let Some(pane) = state.workspace.panes.iter().find(|p| p.id == selected) else {
                 return vec![];
             };
-            match (
-                &state.token,
-                encode_key(&key, ctrl, alt, pane.app_cursor),
-            ) {
-                (Some(token), Some(data)) => vec![Effect::Input {
-                    token: token.clone(),
-                    id: selected,
-                    data,
-                }],
+            match (&state.token, encode_key(&key, ctrl, alt, pane.app_cursor)) {
+                (Some(token), Some(data)) => vec![Effect::call_with(
+                    Origin::Drive,
+                    token,
+                    &selected,
+                    "input",
+                    serde_json::json!({ "data": data }),
+                )],
                 _ => vec![],
             }
         }
@@ -1041,20 +1173,18 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 pane.draft.clear();
             }
             match (&state.token, text.is_empty()) {
-                (Some(token), false) => vec![Effect::Post {
-                    token: token.clone(),
-                    id,
-                    text,
-                }],
+                (Some(token), false) => vec![Effect::call_with(
+                    Origin::Drive,
+                    token,
+                    &id,
+                    "post",
+                    serde_json::json!({ "text": text }),
+                )],
                 _ => vec![],
             }
         }
         Action::TurnCancelled { id } => match &state.token {
-            Some(token) => vec![Effect::CallVerb {
-                token: token.clone(),
-                id,
-                verb: "cancel".into(),
-            }],
+            Some(token) => vec![Effect::call(Origin::Drive, token, &id, "cancel")],
             None => vec![],
         },
         Action::PaneMeasured { id, cols, rows } => {
@@ -1067,12 +1197,13 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }
             pane.sent_size = Some((cols, rows));
             match &state.token {
-                Some(token) => vec![Effect::Resize {
-                    token: token.clone(),
-                    id,
-                    cols,
-                    rows,
-                }],
+                Some(token) => vec![Effect::call_with(
+                    Origin::Drive,
+                    token,
+                    &id,
+                    "resize",
+                    serde_json::json!({ "cols": cols, "rows": rows }),
+                )],
                 None => vec![],
             }
         }
@@ -1089,12 +1220,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             {
                 state.workspace.selected = Some(info.id);
             }
-            match &state.token {
-                Some(token) => vec![Effect::FetchInstances {
-                    token: token.clone(),
-                }],
-                None => vec![],
-            }
+            relist(state)
         }
         Action::AdminAnswered { status, body } => {
             #[derive(serde::Deserialize)]
@@ -1203,8 +1329,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 && rows > 0
             {
                 let max = rows as i32 - 1;
-                palette.selected =
-                    (palette.selected as i32 + delta).clamp(0, max) as usize;
+                palette.selected = (palette.selected as i32 + delta).clamp(0, max) as usize;
             }
             vec![]
         }
@@ -1233,21 +1358,14 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.palette = None;
             match commit {
                 Commit::Jump { id } => reduce_again(state, Action::Selected { id }),
-                Commit::Create { kind } => {
-                    reduce_again(state, Action::CreateRequested { kind })
-                }
+                Commit::Create { kind } => reduce_again(state, Action::CreateRequested { kind }),
                 Commit::ClosePane { id } => reduce_again(state, Action::PaneClosed { id }),
                 Commit::SignOut => reduce_again(state, Action::SignOutRequested),
                 Commit::AdminPanel => reduce_again(state, Action::AdminToggled),
                 Commit::Verb { id, verb } => match &state.token {
                     // Optimistic: run with null. bad_args reopens as the
                     // well, carrying the server's own complaint.
-                    Some(token) => vec![Effect::RunVerb {
-                        token: token.clone(),
-                        id,
-                        verb,
-                        args: String::new(),
-                    }],
+                    Some(token) => vec![Effect::call(Origin::Palette, token, &id, &verb)],
                     None => vec![],
                 },
             }
@@ -1264,7 +1382,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 Ok(_) => {
                     state.palette = None;
                     match &state.token {
-                        Some(token) => vec![Effect::RunVerb {
+                        Some(token) => vec![Effect::CallVerb {
+                            origin: Origin::Palette,
                             token: token.clone(),
                             id,
                             verb,
@@ -1275,7 +1394,9 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 }
                 Err(e) => {
                     if let Some(palette) = &mut state.palette
-                        && let Stage::Args { draft: d, error, .. } = &mut palette.stage
+                        && let Stage::Args {
+                            draft: d, error, ..
+                        } = &mut palette.stage
                     {
                         *d = draft;
                         *error = Some(format!("that is not JSON: {e}"));
@@ -1284,63 +1405,11 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 }
             }
         }
-        Action::VerbRan {
-            id,
-            verb,
-            status,
-            body,
-        } => {
-            #[derive(serde::Deserialize)]
-            struct Wire {
-                #[serde(default)]
-                error: String,
-                #[serde(default)]
-                why: String,
-            }
-            let wire = serde_json::from_str::<Wire>(&body).unwrap_or(Wire {
-                error: String::new(),
-                why: String::new(),
-            });
-            if status == 400 && wire.error == "bad_args" {
-                // The error-driven second stage: the well opens with the
-                // server's own words about what was missing.
-                state.palette = Some(Palette {
-                    query: String::new(),
-                    selected: 0,
-                    stage: Stage::Args {
-                        id,
-                        verb,
-                        draft: "{}".into(),
-                        error: Some(wire.why),
-                    },
-                });
-                return vec![];
-            }
-            state.notice = Some(if status == 200 {
-                let pretty = serde_json::from_str::<serde_json::Value>(&body)
-                    .and_then(|v| serde_json::to_string_pretty(&v))
-                    .unwrap_or(body);
-                let mut line: String = format!("{verb} → {pretty}");
-                if line.len() > 600 {
-                    line.truncate(600);
-                    line.push('…');
-                }
-                line
-            } else if !wire.why.is_empty() {
-                format!("{verb} refused: {}", wire.why)
-            } else {
-                format!("{verb} answered {status}")
-            });
-            // A verb may have changed anything; the watched panes re-read
-            // on their marks, the listing on this.
-            match &state.token {
-                Some(token) => vec![Effect::FetchInstances {
-                    token: token.clone(),
-                }],
-                None => vec![],
-            }
-        }
         Action::NetworkFailed { what } => {
+            // A call that never got a status cannot answer; releasing the
+            // listing latch here is what keeps one lost fetch from wedging
+            // the tree forever.
+            state.listing_in_flight = false;
             if state.sign_in.busy {
                 // A failed sign-in call lands on the form, not the shell.
                 state.sign_in.busy = false;
@@ -1601,7 +1670,14 @@ mod tests {
             },
         );
         assert!(!state.sign_in.busy);
-        assert!(state.sign_in.error.as_deref().unwrap().contains("cancelled"));
+        assert!(
+            state
+                .sign_in
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cancelled")
+        );
 
         // Signed in: under the button.
         let mut state = signed_in();
@@ -1641,6 +1717,13 @@ mod tests {
                 token: "tok-1".into()
             }]
         );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
 
         // A dropped feed shows honestly and reopening re-lists.
         reduce(&mut state, Action::FeedDropped);
@@ -1650,15 +1733,111 @@ mod tests {
         assert!(!effects.is_empty(), "reopening re-lists");
     }
 
+    /// The feed fires per event and events arrive in bursts. However many
+    /// land while a listing fetch is out, exactly one more fetch follows
+    /// it — two in total for the whole burst, not one per hint.
     #[test]
-    fn selection_follows_removals_and_creation_selects() {
+    fn a_burst_of_feed_events_costs_one_extra_listing_fetch() {
+        let mut state = signed_in();
+        assert!(state.listing_in_flight, "signing in lists once");
+
+        let fetches: usize = (0..20)
+            .map(|_| reduce(&mut state, Action::FeedEvent).len())
+            .sum();
+        assert_eq!(fetches, 0, "not one fetch per hint");
+        assert!(state.listing_stale, "but the hints are not forgotten");
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::FetchInstances {
+                token: "tok-1".into()
+            }],
+            "the burst is worth exactly one more look"
+        );
+        assert!(state.listing_in_flight && !state.listing_stale);
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert!(effects.is_empty(), "and then it settles");
+        assert!(!state.listing_in_flight);
+    }
+
+    /// Parentage is L1 identity, carried in the listing: the client mirrors
+    /// it so the tree can nest subagents under the chat that spawned them
+    /// without asking any kind where it came from.
+    #[test]
+    fn the_listing_carries_parentage_for_the_tree_to_nest_on() {
         let mut state = signed_in();
         reduce(
             &mut state,
-            Action::Selected {
-                id: "gone".into(),
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"root","kind":"chat","project":"p","title":"a",
+                           "creator":{"kind":"human","id":"ada"}},
+                          {"id":"kid","kind":"chat","project":"p","title":"b",
+                           "parent":"root",
+                           "creator":{"kind":"agent","id":"root"}}]"#
+                    .into(),
             },
         );
+        let by = |id: &str| {
+            state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.id == id)
+                .cloned()
+                .expect("listed")
+        };
+        assert_eq!(by("root").parent, None);
+        assert_eq!(by("kid").parent.as_deref(), Some("root"));
+    }
+
+    /// One classification of the seat, asked three different questions.
+    #[test]
+    fn the_seat_reads_the_same_however_it_is_asked() {
+        let human = PrincipalRef {
+            kind: "human".into(),
+            id: "ada".into(),
+        };
+        let agent = PrincipalRef {
+            kind: "agent".into(),
+            id: "chat-1".into(),
+        };
+
+        let seat = seat_of(Some(&human));
+        assert_eq!(seat.tone(), "human");
+        assert_eq!(seat.phrase(), "ada driving");
+        assert!(seat.held_by(Some("ada")));
+        assert!(!seat.held_by(Some("grace")));
+
+        let seat = seat_of(Some(&agent));
+        assert_eq!(seat.tone(), "agent");
+        assert_eq!(seat.phrase(), "agent driving");
+        assert!(!seat.held_by(Some("chat-1")), "an agent is not a person");
+
+        let seat = seat_of(None);
+        assert_eq!(seat, Seat::Open);
+        assert_eq!(seat.tone(), "open");
+        assert!(!seat.held_by(Some("ada")));
+    }
+
+    #[test]
+    fn selection_follows_removals_and_creation_selects() {
+        let mut state = signed_in();
+        reduce(&mut state, Action::Selected { id: "gone".into() });
         reduce(
             &mut state,
             Action::InstancesAnswered {
@@ -1668,12 +1847,7 @@ mod tests {
         );
         assert_eq!(state.workspace.selected, None, "a removed selection clears");
 
-        let effects = reduce(
-            &mut state,
-            Action::CreateRequested {
-                kind: "tty".into(),
-            },
-        );
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "tty".into() });
         assert_eq!(
             effects,
             vec![Effect::CreateInstance {
@@ -1723,11 +1897,7 @@ mod tests {
             effects,
             vec![
                 Effect::Watch { id: "t1".into() },
-                Effect::ReadPane {
-                    token: "tok-1".into(),
-                    id: "t1".into(),
-                    verb: "screen".into(),
-                }
+                Effect::call(Origin::Pane, "tok-1", "t1", "screen")
             ]
         );
         assert_eq!(state.workspace.panes.len(), 1);
@@ -1745,24 +1915,28 @@ mod tests {
         let effects = reduce(&mut state, Action::Marked { id: "t1".into() });
         assert_eq!(
             effects,
-            vec![Effect::ReadPane {
-                token: "tok-1".into(),
-                id: "t1".into(),
-                verb: "screen".into(),
-            }]
+            vec![Effect::call(Origin::Pane, "tok-1", "t1", "screen")]
         );
         // A mark for an unopened instance reads nothing.
         assert!(reduce(&mut state, Action::Marked { id: "other".into() }).is_empty());
 
         reduce(
             &mut state,
-            Action::PaneRead {
+            Action::VerbReplied {
+                origin: Origin::Pane,
                 id: "t1".into(),
+                verb: "screen".into(),
                 status: 200,
                 body: r#"{"rows": 24}"#.into(),
             },
         );
-        assert!(state.workspace.panes[0].view.as_deref().unwrap().contains("24"));
+        assert!(
+            state.workspace.panes[0]
+                .view
+                .as_deref()
+                .unwrap()
+                .contains("24")
+        );
     }
 
     #[test]
@@ -1770,7 +1944,10 @@ mod tests {
         let mut state = with_tty(signed_in());
         reduce(&mut state, Action::Selected { id: "t1".into() });
         reduce(&mut state, Action::InstanceGone { id: "t1".into() });
-        assert!(state.workspace.panes[0].gone, "the pane stays, honestly gone");
+        assert!(
+            state.workspace.panes[0].gone,
+            "the pane stays, honestly gone"
+        );
 
         let effects = reduce(&mut state, Action::PaneClosed { id: "t1".into() });
         assert_eq!(effects, vec![Effect::Unwatch { id: "t1".into() }]);
@@ -1785,7 +1962,14 @@ mod tests {
         reduce(&mut state, Action::FeedDropped);
         let effects = reduce(&mut state, Action::FeedOpened);
         assert!(effects.contains(&Effect::Watch { id: "t1".into() }));
-        assert!(effects.iter().any(|e| matches!(e, Effect::ReadPane { id, .. } if id == "t1")));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::CallVerb {
+                origin: Origin::Pane,
+                id,
+                ..
+            } if id == "t1"
+        )));
     }
 
     #[test]
@@ -1794,18 +1978,16 @@ mod tests {
         let effects = reduce(&mut state, Action::TakeRequested { id: "t1".into() });
         assert_eq!(
             effects,
-            vec![Effect::CallVerb {
-                token: "tok-1".into(),
-                id: "t1".into(),
-                verb: "sys.take".into(),
-            }]
+            vec![Effect::call(Origin::Chrome, "tok-1", "t1", "sys.take")]
         );
         let effects = reduce(
             &mut state,
-            Action::VerbAnswered {
+            Action::VerbReplied {
+                origin: Origin::Chrome,
                 id: "t1".into(),
                 verb: "sys.take".into(),
                 status: 200,
+                body: String::new(),
             },
         );
         assert_eq!(
@@ -1821,16 +2003,30 @@ mod tests {
     fn the_key_encoder_speaks_terminal() {
         assert_eq!(encode_key("a", false, false, false).unwrap(), "a");
         assert_eq!(encode_key("Enter", false, false, false).unwrap(), "\r");
-        assert_eq!(encode_key("Backspace", false, false, false).unwrap(), "\x7f");
+        assert_eq!(
+            encode_key("Backspace", false, false, false).unwrap(),
+            "\x7f"
+        );
         assert_eq!(encode_key("c", true, false, false).unwrap(), "\x03");
-        assert_eq!(encode_key("ArrowUp", false, false, false).unwrap(), "\x1b[A");
+        assert_eq!(
+            encode_key("ArrowUp", false, false, false).unwrap(),
+            "\x1b[A"
+        );
         assert_eq!(
             encode_key("ArrowUp", false, false, true).unwrap(),
             "\x1bOA",
             "DECCKM: application cursor sends SS3"
         );
-        assert_eq!(encode_key("b", false, true, false).unwrap(), "\x1bb", "alt is ESC");
-        assert_eq!(encode_key("Shift", false, false, false), None, "bare modifiers stay home");
+        assert_eq!(
+            encode_key("b", false, true, false).unwrap(),
+            "\x1bb",
+            "alt is ESC"
+        );
+        assert_eq!(
+            encode_key("Shift", false, false, false),
+            None,
+            "bare modifiers stay home"
+        );
     }
 
     #[test]
@@ -1866,11 +2062,13 @@ mod tests {
         );
         assert_eq!(
             effects,
-            vec![Effect::Input {
-                token: "tok-1".into(),
-                id: "t1".into(),
-                data: "\r".into(),
-            }],
+            vec![Effect::call_with(
+                Origin::Drive,
+                "tok-1",
+                "t1",
+                "input",
+                serde_json::json!({ "data": "\r" })
+            )],
             "the reducer encodes; the edge only carried the event"
         );
     }
@@ -1889,12 +2087,13 @@ mod tests {
         );
         assert_eq!(
             effects,
-            vec![Effect::Resize {
-                token: "tok-1".into(),
-                id: "t1".into(),
-                cols: 120,
-                rows: 32,
-            }]
+            vec![Effect::call_with(
+                Origin::Drive,
+                "tok-1",
+                "t1",
+                "resize",
+                serde_json::json!({ "cols": 120, "rows": 32 })
+            )]
         );
         // The same measurement again is a no-op — the measure/resize loop
         // cannot spin.
@@ -1909,28 +2108,23 @@ mod tests {
         assert!(effects.is_empty());
     }
 
-    /// A keystroke's answer must not re-list; a seat verb's must.
+    /// A keystroke's answer must not re-list; a seat verb's must. The
+    /// origin says which, so nobody has to test a verb name for a prefix.
     #[test]
-    fn only_sys_answers_move_the_listing() {
+    fn only_the_chrome_origin_moves_the_listing() {
         let mut state = with_tty(signed_in());
-        let effects = reduce(
-            &mut state,
-            Action::VerbAnswered {
-                id: "t1".into(),
-                verb: "input".into(),
-                status: 200,
-            },
+        let replied = |origin, verb: &str| Action::VerbReplied {
+            origin,
+            id: "t1".into(),
+            verb: verb.into(),
+            status: 200,
+            body: String::new(),
+        };
+        assert!(
+            reduce(&mut state, replied(Origin::Drive, "input")).is_empty(),
+            "a keystroke costs no listing"
         );
-        assert!(effects.is_empty());
-        let effects = reduce(
-            &mut state,
-            Action::VerbAnswered {
-                id: "t1".into(),
-                verb: "sys.take".into(),
-                status: 200,
-            },
-        );
-        assert!(!effects.is_empty());
+        assert!(!reduce(&mut state, replied(Origin::Chrome, "sys.take")).is_empty());
     }
 
     /// A tty workspace with verbs in the kind spec, pane open and focused.
@@ -1973,7 +2167,10 @@ mod tests {
             Some("agent driving"),
             "gated rows teach the seat"
         );
-        let screen = rows.iter().find(|r| r.label == "screen").expect("screen row");
+        let screen = rows
+            .iter()
+            .find(|r| r.label == "screen")
+            .expect("screen row");
         assert!(screen.gated.is_none(), "reads are never gated");
         assert!(rows.iter().any(|r| r.label == "open shell"));
         assert!(rows.iter().any(|r| r.label == "new tty"));
@@ -1997,19 +2194,15 @@ mod tests {
         let effects = reduce(&mut state, Action::PaletteCommitted);
         assert_eq!(
             effects,
-            vec![Effect::RunVerb {
-                token: "tok-1".into(),
-                id: "t1".into(),
-                verb: "screen".into(),
-                args: String::new(),
-            }]
+            vec![Effect::call(Origin::Palette, "tok-1", "t1", "screen")]
         );
         assert!(state.palette.is_none(), "commit closes the list");
 
         // The server wanted args: the well opens with its words.
         reduce(
             &mut state,
-            Action::VerbRan {
+            Action::VerbReplied {
+                origin: Origin::Palette,
                 id: "t1".into(),
                 verb: "screen".into(),
                 status: 400,
@@ -2039,7 +2232,14 @@ mod tests {
                 draft: r#"{"from": 0}"#.into(),
             },
         );
-        assert!(matches!(&effects[..], [Effect::RunVerb { args, .. }] if args.contains("from")));
+        assert!(matches!(
+            &effects[..],
+            [Effect::CallVerb {
+                origin: Origin::Palette,
+                args,
+                ..
+            }] if args.contains("from")
+        ));
         assert!(state.palette.is_none());
     }
 
@@ -2056,11 +2256,15 @@ mod tests {
         let effects = reduce(&mut state, Action::PaletteCommitted);
         assert!(effects.is_empty());
         assert!(state.notice.as_deref().unwrap().contains("agent driving"));
-        assert!(state.palette.is_some(), "a gated row does not close the palette");
+        assert!(
+            state.palette.is_some(),
+            "a gated row does not close the palette"
+        );
 
         reduce(
             &mut state,
-            Action::VerbRan {
+            Action::VerbReplied {
+                origin: Origin::Palette,
                 id: "t1".into(),
                 verb: "text".into(),
                 status: 200,
@@ -2110,7 +2314,11 @@ mod tests {
         );
         let admin = state.admin.as_ref().expect("operator");
         assert_eq!(admin.users.len(), 2);
-        assert!(palette_rows(&state, "admin").iter().any(|r| r.label == "admin panel"));
+        assert!(
+            palette_rows(&state, "admin")
+                .iter()
+                .any(|r| r.label == "admin panel")
+        );
 
         // A non-operator's 403 is the answer, not an error.
         reduce(
@@ -2121,7 +2329,11 @@ mod tests {
             },
         );
         assert!(state.admin.is_none());
-        assert!(!palette_rows(&state, "admin").iter().any(|r| r.label == "admin panel"));
+        assert!(
+            !palette_rows(&state, "admin")
+                .iter()
+                .any(|r| r.label == "admin panel")
+        );
     }
 
     #[test]
@@ -2244,11 +2456,13 @@ mod tests {
         );
         assert_eq!(
             effects,
-            vec![Effect::Post {
-                token: "tok-1".into(),
-                id: "c1".into(),
-                text: "hello agent".into(),
-            }]
+            vec![Effect::call_with(
+                Origin::Drive,
+                "tok-1",
+                "c1",
+                "post",
+                serde_json::json!({ "text": "hello agent" })
+            )]
         );
         assert!(state.workspace.panes[0].draft.is_empty());
 
@@ -2266,11 +2480,7 @@ mod tests {
         let effects = reduce(&mut state, Action::TurnCancelled { id: "c1".into() });
         assert_eq!(
             effects,
-            vec![Effect::CallVerb {
-                token: "tok-1".into(),
-                id: "c1".into(),
-                verb: "cancel".into(),
-            }]
+            vec![Effect::call(Origin::Drive, "tok-1", "c1", "cancel")]
         );
     }
 

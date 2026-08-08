@@ -26,6 +26,9 @@ use myco_runtime::{Cell, CellGone, Event, Signals, Watermark};
 use serde_json::{Value, json};
 
 pub mod events;
+mod shared;
+
+pub use shared::Shared;
 
 /// Who is asking. An agent is named by the chat instance it drives — both
 /// adapters (HTTP for humans, the model loop for agents) resolve to this
@@ -239,11 +242,18 @@ pub trait Instance: Send {
 /// factory. `id` lets a kind that acts on the bus speak as
 /// `Principal::Agent(id)`; `creator` lets a per-principal kind (a
 /// notifier) bind to its owner as a framework fact — args would be
-/// forgeable. Kinds that need neither ignore it.
+/// forgeable. Kinds that need none of it ignore it.
+///
+/// Every field here is *identity*: fixed at this instant and never edited
+/// afterwards, which is what makes it safe for a kind to copy.
 #[derive(Debug, Clone)]
 pub struct CreateCtx {
     pub id: String,
     pub creator: Principal,
+    /// The instance this one was created under, if any. The same value the
+    /// listing carries — a kind that wants it should read it here rather
+    /// than accept it in args, where a caller could name anything.
+    pub parent: Option<String>,
 }
 
 /// A kind: the factory plus the spec. Registered once at startup. `create`
@@ -264,8 +274,12 @@ pub struct CreateCtx {
 ///   feed, unlike a pty) must be cancelled by the instance's `Drop`.
 pub trait Kind: Send + Sync {
     fn spec(&self) -> &'static KindSpec;
-    fn create(&self, ctx: &CreateCtx, args: Value, signals: Signals)
-    -> Result<Box<dyn Instance>, VerbError>;
+    fn create(
+        &self,
+        ctx: &CreateCtx,
+        args: Value,
+        signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError>;
 }
 
 /// One `sys.log` entry: who called what, and how it went. The acme `event`
@@ -294,6 +308,9 @@ struct Entry {
     /// Immutable; doubles as the owner (`owner_only` verbs) and the default
     /// driver the seat returns to on release.
     creator: Principal,
+    /// The instance this one was created under, if any. Immutable, like the
+    /// creator, and for the same reason: identity is not state.
+    parent: Option<String>,
     /// Shared with apply-time closures, so authority is re-checked when a
     /// queued verb actually runs — not just when it was admitted.
     driver: Arc<RwLock<Option<Principal>>>,
@@ -311,6 +328,12 @@ pub struct InstanceInfo {
     pub project: String,
     pub title: String,
     pub creator: Principal,
+    /// Who this instance was created under — a subagent chat names the chat
+    /// that spawned it. Set at birth, never changed, and a soft reference:
+    /// a parent may be removed while its children live on, so a consumer
+    /// that cannot resolve it treats the row as a root.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub driver: Option<Principal>,
     pub watermark: Watermark,
     /// Eventually-true after a kind panic. `false` means "not known dead" —
@@ -418,6 +441,37 @@ impl Pool {
         title: &str,
         args: Value,
     ) -> Result<InstanceInfo, VerbError> {
+        self.create_under(creator, kind, project, title, args, None)
+    }
+
+    /// Create an instance under a parent — the chat a subagent was spawned
+    /// from. Parentage is L1 identity, not kind state: fixed at birth,
+    /// never edited, and present in every listing row, so "what spawned
+    /// this" is a framework fact no kind has to model and no consumer has
+    /// to reconstruct by reading kind-specific verbs.
+    ///
+    /// The parent must exist *now* — a birth certificate naming nobody is a
+    /// bug worth refusing — but nothing pins it alive afterwards.
+    pub fn create_under(
+        &self,
+        creator: &Principal,
+        kind: &str,
+        project: &str,
+        title: &str,
+        args: Value,
+        parent: Option<&str>,
+    ) -> Result<InstanceInfo, VerbError> {
+        if let Some(parent) = parent {
+            let known = self
+                .inner
+                .instances
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(parent);
+            if !known {
+                return Err(VerbError::UnknownInstance { id: parent.into() });
+            }
+        }
         let factory = {
             let kinds = self.inner.kinds.read().unwrap_or_else(|e| e.into_inner());
             kinds
@@ -430,6 +484,7 @@ impl Pool {
         let ctx = CreateCtx {
             id: uuid::Uuid::new_v4().to_string(),
             creator: creator.clone(),
+            parent: parent.map(str::to_string),
         };
         let id = ctx.id.clone();
         // Subscribe inside the builder, before `create` can spawn side-feed
@@ -450,6 +505,7 @@ impl Pool {
                 title.to_string()
             }),
             creator: creator.clone(),
+            parent: ctx.parent.clone(),
             driver: Arc::new(RwLock::new(Some(creator.clone()))),
             log: Mutex::new(VecDeque::new()),
             cell,
@@ -488,6 +544,7 @@ impl Pool {
                     "kind": kind,
                     "project": project,
                     "creator": creator,
+                    "parent": parent,
                 }),
             },
         ));
@@ -745,6 +802,27 @@ impl Pool {
         rows
     }
 
+    /// The chain of parents above `id`, nearest first — for the depth caps
+    /// and nesting views that would otherwise re-walk kind verbs to learn
+    /// what L1 already knows. The walk always terminates: a parent must
+    /// exist before its child, so the graph cannot contain a cycle. A
+    /// removed parent still appears (its children still name it) and ends
+    /// the chain there, since nothing remains to say what stood above it.
+    pub fn ancestors(&self, id: &str) -> Vec<String> {
+        let instances = self
+            .inner
+            .instances
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut chain = Vec::new();
+        let mut next = instances.get(id).and_then(|e| e.parent.clone());
+        while let Some(parent) = next {
+            next = instances.get(&parent).and_then(|e| e.parent.clone());
+            chain.push(parent);
+        }
+        chain
+    }
+
     /// Current watermark, for starting a watch loop.
     pub fn watermark(&self, id: &str) -> Result<Watermark, VerbError> {
         Ok(self.entry(id)?.cell.watermark())
@@ -756,6 +834,37 @@ impl Pool {
     pub async fn changed(&self, id: &str, since: Watermark) -> Result<Watermark, VerbError> {
         let entry = self.entry(id)?;
         Ok(entry.cell.changed(since).await?)
+    }
+
+    /// Read `verb` until the answer satisfies `settled`, waking on the
+    /// watermark. Answers `None` when `deadline` passes first.
+    ///
+    /// The wait-for-a-condition shape, once: read, check, wait for a
+    /// change, read again — never a sleep, because a sleep is either a
+    /// stall or a race and usually both. Callers that hand-rolled it kept
+    /// rediscovering the same two rules: check *before* the first wait (the
+    /// thing may already be true), and let a bumped watermark, not a timer,
+    /// decide when to look again.
+    pub async fn wait_until(
+        &self,
+        principal: &Principal,
+        id: &str,
+        verb: &str,
+        deadline: tokio::time::Instant,
+        settled: impl Fn(&Value) -> bool,
+    ) -> Result<Option<Value>, VerbError> {
+        let mut mark = 0;
+        loop {
+            let seen = self.call(principal, id, verb, Value::Null).await?;
+            if settled(&seen) {
+                return Ok(Some(seen));
+            }
+            match tokio::time::timeout_at(deadline, self.changed(id, mark)).await {
+                Ok(Ok(m)) => mark = m,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(None),
+            }
+        }
     }
 
     /// The global feed: `(instance id, event)` for lifecycle, meta changes,
@@ -785,6 +894,7 @@ impl Pool {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             creator: entry.creator.clone(),
+            parent: entry.parent.clone(),
             driver: entry
                 .driver
                 .read()

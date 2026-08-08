@@ -48,10 +48,14 @@ fn attach_keyboard() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
-    let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-        move |event: web_sys::KeyboardEvent| {
-            let (key, ctrl, alt, meta) =
-                (event.key(), event.ctrl_key(), event.alt_key(), event.meta_key());
+    let on_key =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
+            let (key, ctrl, alt, meta) = (
+                event.key(),
+                event.ctrl_key(),
+                event.alt_key(),
+                event.meta_key(),
+            );
             if reserved_chord(&key, ctrl, meta) {
                 event.prevent_default();
                 dispatch(Action::PaletteToggled);
@@ -83,10 +87,8 @@ fn attach_keyboard() {
                 event.prevent_default();
                 dispatch(Action::KeyPressed { key, ctrl, alt });
             }
-        },
-    );
-    let _ = document
-        .add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+        });
+    let _ = document.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
     on_key.forget();
 }
 
@@ -154,10 +156,12 @@ fn run(effect: Effect) {
             });
         }),
         Effect::FetchInstances { token } => wasm_bindgen_futures::spawn_local(async move {
-            dispatch(match fetch("GET", "/api/instances", Some(&token), None).await {
-                Ok((status, body)) => Action::InstancesAnswered { status, body },
-                Err(what) => Action::NetworkFailed { what },
-            });
+            dispatch(
+                match fetch("GET", "/api/instances", Some(&token), None).await {
+                    Ok((status, body)) => Action::InstancesAnswered { status, body },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
         }),
         Effect::OpenFeed { token } => open_feed(token),
         Effect::CreateInstance { token, kind } => wasm_bindgen_futures::spawn_local(async move {
@@ -169,49 +173,20 @@ fn run(effect: Effect) {
                 },
             );
         }),
-        Effect::Input { token, id, data } => wasm_bindgen_futures::spawn_local(async move {
-            let url = format!("/api/instances/{id}/verbs/input");
-            let body = serde_json::json!({ "data": data }).to_string();
-            dispatch(
-                match fetch("POST", &url, Some(&token), Some((JSON, body))).await {
-                    Ok((status, _)) => Action::VerbAnswered {
-                        id,
-                        verb: "input".into(),
-                        status,
-                    },
-                    Err(what) => Action::NetworkFailed { what },
-                },
-            );
-        }),
-        Effect::Resize {
-            token,
-            id,
-            cols,
-            rows,
-        } => wasm_bindgen_futures::spawn_local(async move {
-            let url = format!("/api/instances/{id}/verbs/resize");
-            let body = serde_json::json!({ "cols": cols, "rows": rows }).to_string();
-            dispatch(
-                match fetch("POST", &url, Some(&token), Some((JSON, body))).await {
-                    Ok((status, _)) => Action::VerbAnswered {
-                        id,
-                        verb: "resize".into(),
-                        status,
-                    },
-                    Err(what) => Action::NetworkFailed { what },
-                },
-            );
-        }),
-        Effect::RunVerb {
+        Effect::Watch { id } => send_op("watch", &id),
+        Effect::Unwatch { id } => send_op("unwatch", &id),
+        Effect::CallVerb {
+            origin,
             token,
             id,
             verb,
             args,
         } => wasm_bindgen_futures::spawn_local(async move {
             let url = format!("/api/instances/{id}/verbs/{verb}");
-            let body = (!args.is_empty()).then(|| (JSON, args));
+            let body = (!args.is_empty()).then_some((JSON, args));
             dispatch(match fetch("POST", &url, Some(&token), body).await {
-                Ok((status, body)) => Action::VerbRan {
+                Ok((status, body)) => Action::VerbReplied {
+                    origin,
                     id,
                     verb,
                     status,
@@ -221,10 +196,12 @@ fn run(effect: Effect) {
             });
         }),
         Effect::FetchAdmin { token } => wasm_bindgen_futures::spawn_local(async move {
-            dispatch(match fetch("GET", "/api/admin/users", Some(&token), None).await {
-                Ok((status, body)) => Action::AdminAnswered { status, body },
-                Err(what) => Action::NetworkFailed { what },
-            });
+            dispatch(
+                match fetch("GET", "/api/admin/users", Some(&token), None).await {
+                    Ok((status, body)) => Action::AdminAnswered { status, body },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
         }),
         Effect::AdminAct { token, user, act } => wasm_bindgen_futures::spawn_local(async move {
             let (method, path) = match act {
@@ -244,36 +221,6 @@ fn run(effect: Effect) {
                     status,
                     body,
                 },
-                Err(what) => Action::NetworkFailed { what },
-            });
-        }),
-        Effect::Post { token, id, text } => wasm_bindgen_futures::spawn_local(async move {
-            let url = format!("/api/instances/{id}/verbs/post");
-            let body = serde_json::json!({ "text": text }).to_string();
-            dispatch(
-                match fetch("POST", &url, Some(&token), Some((JSON, body))).await {
-                    Ok((status, _)) => Action::VerbAnswered {
-                        id,
-                        verb: "post".into(),
-                        status,
-                    },
-                    Err(what) => Action::NetworkFailed { what },
-                },
-            );
-        }),
-        Effect::Watch { id } => send_op("watch", &id),
-        Effect::Unwatch { id } => send_op("unwatch", &id),
-        Effect::ReadPane { token, id, verb } => wasm_bindgen_futures::spawn_local(async move {
-            let url = format!("/api/instances/{id}/verbs/{verb}");
-            dispatch(match fetch("POST", &url, Some(&token), None).await {
-                Ok((status, body)) => Action::PaneRead { id, status, body },
-                Err(what) => Action::NetworkFailed { what },
-            });
-        }),
-        Effect::CallVerb { token, id, verb } => wasm_bindgen_futures::spawn_local(async move {
-            let url = format!("/api/instances/{id}/verbs/{verb}");
-            dispatch(match fetch("POST", &url, Some(&token), None).await {
-                Ok((status, _body)) => Action::VerbAnswered { id, verb, status },
                 Err(what) => Action::NetworkFailed { what },
             });
         }),
@@ -338,10 +285,8 @@ fn open_feed(token: String) {
             }
         });
         if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                retry.unchecked_ref(),
-                2000,
-            );
+            let _ = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(retry.unchecked_ref(), 2000);
         }
     });
     socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -360,11 +305,17 @@ fn open_feed(token: String) {
 // ---------------------------------------------------------------------------
 
 async fn enroll_passkey(token: &str) -> Action {
-    let (status, challenge) =
-        match fetch("POST", "/api/auth/passkey/register/start", Some(token), None).await {
-            Ok(answer) => answer,
-            Err(what) => return Action::NetworkFailed { what },
-        };
+    let (status, challenge) = match fetch(
+        "POST",
+        "/api/auth/passkey/register/start",
+        Some(token),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(what) => return Action::NetworkFailed { what },
+    };
     if status != 200 {
         return Action::PasskeyEnrollAnswered {
             status,
@@ -509,7 +460,9 @@ fn storage() -> Option<web_sys::Storage> {
 }
 
 fn url_encode(text: &str) -> String {
-    js_sys::encode_uri_component(text).as_string().unwrap_or_default()
+    js_sys::encode_uri_component(text)
+        .as_string()
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -594,8 +547,7 @@ fn wire(document: &web_sys::Document) {
                 code: value("code"),
             });
         });
-        let _ = form
-            .add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
+        let _ = form.add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
         on_submit.forget();
     }
     if let Some(button) = document.get_element_by_id("passkey-sign-in") {
@@ -620,13 +572,16 @@ fn wire(document: &web_sys::Document) {
     }
     if let Ok(panes) = document.query_selector_all("[data-focus]") {
         for i in 0..panes.length() {
-            if let Some(el) = panes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(el) = panes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let id = el.get_attribute("data-focus").unwrap_or_default();
                 let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
                     dispatch(Action::Selected { id: id.clone() });
                 });
-                let _ = el
-                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
                 on_click.forget();
             }
         }
@@ -635,12 +590,15 @@ fn wire(document: &web_sys::Document) {
 
     if let Ok(nodes) = document.query_selector_all("[data-chat]") {
         for i in 0..nodes.length() {
-            if let Some(form) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(form) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let id = form.get_attribute("data-chat").unwrap_or_default();
                 let doc = document.clone();
                 let submit_id = id.clone();
-                let on_submit = Closure::<dyn FnMut(web_sys::Event)>::new(
-                    move |event: web_sys::Event| {
+                let on_submit =
+                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
                         event.prevent_default();
                         let text = doc
                             .get_element_by_id(&format!("composer-{submit_id}"))
@@ -651,8 +609,7 @@ fn wire(document: &web_sys::Document) {
                             id: submit_id.clone(),
                             text,
                         });
-                    },
-                );
+                    });
                 let _ = form
                     .add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
                 on_submit.forget();
@@ -667,21 +624,23 @@ fn wire(document: &web_sys::Document) {
                         move |e: web_sys::KeyboardEvent| {
                             if e.key() == "Enter" && !e.shift_key() {
                                 e.prevent_default();
-                                let _ = form2
-                                    .dyn_ref::<web_sys::HtmlElement>()
-                                    .map(|f| f.click());
+                                let _ = form2.dyn_ref::<web_sys::HtmlElement>().map(|f| f.click());
                             }
                         },
                     );
-                    let _ = area
-                        .add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+                    let _ = area.add_event_listener_with_callback(
+                        "keydown",
+                        on_key.as_ref().unchecked_ref(),
+                    );
                     on_key.forget();
                 }
             }
         }
     }
     if let Ok(Some(cancel)) = document.query_selector("[data-cancel-turn]") {
-        let id = STATE.with(|s| s.borrow().workspace.selected.clone()).unwrap_or_default();
+        let id = STATE
+            .with(|s| s.borrow().workspace.selected.clone())
+            .unwrap_or_default();
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
             event.stop_propagation();
             dispatch(Action::TurnCancelled { id: id.clone() });
@@ -741,13 +700,16 @@ fn wire(document: &web_sys::Document) {
     }
     if let Ok(rows) = document.query_selector_all("[data-commit]") {
         for i in 0..rows.length() {
-            if let Some(row) = rows.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(row) = rows
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let index: usize = row
                     .get_attribute("data-commit")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(
-                    move |event: web_sys::Event| {
+                let on_click =
+                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
                         event.stop_propagation();
                         // Land the selection on the clicked row, then
                         // commit — two ordinary dispatches, no special
@@ -759,8 +721,7 @@ fn wire(document: &web_sys::Document) {
                             delta: index as i32 - current as i32,
                         });
                         dispatch(Action::PaletteCommitted);
-                    },
-                );
+                    });
                 let _ = row
                     .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
                 on_click.forget();
@@ -776,7 +737,10 @@ fn wire(document: &web_sys::Document) {
     }
     if let Ok(nodes) = document.query_selector_all("[data-admin-act]") {
         for i in 0..nodes.length() {
-            if let Some(el) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(el) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let (Some(name), Some(user)) = (
                     el.get_attribute("data-admin-act"),
                     el.get_attribute("data-admin-user"),
@@ -794,8 +758,8 @@ fn wire(document: &web_sys::Document) {
                             act,
                         });
                     });
-                let _ = el
-                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
                 on_click.forget();
             }
         }
@@ -823,8 +787,7 @@ fn wire(document: &web_sys::Document) {
                 dispatch(Action::PaletteDismissed);
             }
         });
-        let _ =
-            scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        let _ = scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
         on_click.forget();
     }
 
@@ -832,13 +795,16 @@ fn wire(document: &web_sys::Document) {
     // argument; the listener only dispatches.
     if let Ok(rows) = document.query_selector_all("[data-open]") {
         for i in 0..rows.length() {
-            if let Some(row) = rows.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(row) = rows
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let id = row.get_attribute("data-open").unwrap_or_default();
                 let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
                     dispatch(Action::Selected { id: id.clone() });
                 });
-                let _ =
-                    row.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                let _ = row
+                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
                 on_click.forget();
             }
         }
@@ -860,23 +826,27 @@ fn wire(document: &web_sys::Document) {
         }
     }
     for (attr, make) in [
-        ("data-take", (|id: String| Action::TakeRequested { id }) as fn(String) -> Action),
+        (
+            "data-take",
+            (|id: String| Action::TakeRequested { id }) as fn(String) -> Action,
+        ),
         ("data-release", |id| Action::ReleaseRequested { id }),
         ("data-close", |id| Action::PaneClosed { id }),
     ] {
         if let Ok(nodes) = document.query_selector_all(&format!("[{attr}]")) {
             for i in 0..nodes.length() {
-                if let Some(el) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                if let Some(el) = nodes
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
                 {
                     let id = el.get_attribute(attr).unwrap_or_default();
-                    let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(
-                        move |event: web_sys::Event| {
+                    let on_click =
+                        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
                             // Pane buttons live inside clickable chrome;
                             // don't also select the row behind them.
                             event.stop_propagation();
                             dispatch(make(id.clone()));
-                        },
-                    );
+                        });
                     let _ = el.add_event_listener_with_callback(
                         "click",
                         on_click.as_ref().unchecked_ref(),
@@ -928,10 +898,10 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
     let tree: String = groups
         .iter()
         .map(|(project, list)| {
-            let rows: String = list.iter().map(|i| tree_row(i, ws)).collect();
             format!(
-                r#"<div class="tree-project">{}</div>{rows}"#,
-                escape(project)
+                r#"<div class="tree-project">{}</div>{}"#,
+                escape(project),
+                tree_rows(list, ws)
             )
         })
         .collect();
@@ -963,9 +933,12 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
                <div class="row-buttons creates">{creates}</div>
                <div class="sidebar-foot">
                  <span class="dim">{user}</span>
-                 <span class="row-buttons">{admin_button}
-                 <button id="sign-out" class="quiet-button">sign out</button></span>
+                 <div class="row-buttons">{admin_button}
+                   <button id="enroll-passkey" class="quiet-button">add a passkey</button>
+                   <button id="sign-out" class="quiet-button">sign out</button>
+                 </div>
                </div>
+               {note}
                <div class="status-line">{feed}</div>
              </div>
              <div class="stage{split}">{stage}</div>
@@ -975,6 +948,10 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             r#"<button id="admin-toggle" class="quiet-button">admin</button>"#
         } else {
             ""
+        },
+        note = match &state.passkey_note {
+            Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
+            None => String::new(),
         },
         split = if ws.panes.is_empty() { "" } else { " split" },
         stage = if ws.panes.is_empty() {
@@ -999,30 +976,30 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
             }
         })
         .unwrap_or_else(|| pane.id.clone());
-    let chip = match instance.and_then(|i| i.driver.as_ref()) {
-        Some(p) if p.kind == "human" => format!(
-            r#"<span class="chip human">{} driving</span>
-               <button class="quiet-button" data-take="{id}">take</button>"#,
-            escape(&p.id),
-            id = escape(&pane.id),
-        ),
-        Some(p) if p.kind == "agent" => format!(
-            r#"<span class="chip agent">agent driving</span>
-               <button class="quiet-button" data-take="{id}">take</button>"#,
-            id = escape(&pane.id),
-        ),
-        Some(_) => r#"<span class="chip system">system driving</span>"#.to_string(),
-        None => format!(
+    let seat = crate::core::seat_of(instance.and_then(|i| i.driver.as_ref()));
+    let chip = match &seat {
+        crate::core::Seat::Open => format!(
             r#"<button class="chip open" data-take="{id}">seat open — take</button>"#,
             id = escape(&pane.id),
         ),
+        crate::core::Seat::System => {
+            format!(r#"<span class="chip system">{}</span>"#, seat.phrase())
+        }
+        held => format!(
+            r#"<span class="chip {tone}">{who}</span>
+               <button class="quiet-button" data-take="{id}">take</button>"#,
+            tone = held.tone(),
+            who = escape(&held.phrase()),
+            id = escape(&pane.id),
+        ),
     };
-    let release = match instance.and_then(|i| i.driver.as_ref()) {
-        Some(_) => format!(
+    let release = if seat == crate::core::Seat::Open {
+        String::new()
+    } else {
+        format!(
             r#"<button class="quiet-button" data-release="{id}">release</button>"#,
             id = escape(&pane.id)
-        ),
-        None => String::new(),
+        )
     };
     let body = if pane.gone {
         r#"<div class="dim">gone — the instance was removed. last state below.</div>"#.to_string()
@@ -1092,7 +1069,10 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
         entries: Vec<Entry>,
     }
     let Ok(tail) = serde_json::from_str::<Tail>(raw) else {
-        return format!(r#"<pre class="mono pane-body">{}</pre>"#, escape(&pretty(raw)));
+        return format!(
+            r#"<pre class="mono pane-body">{}</pre>"#,
+            escape(&pretty(raw))
+        );
     };
     let mut running = false;
     let body: String = tail
@@ -1123,12 +1103,7 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
                     } else {
                         ""
                     };
-                    bubble(
-                        dot,
-                        "agent",
-                        &format!("{}{cursor}", escape(&text)),
-                        &tools,
-                    )
+                    bubble(dot, "agent", &format!("{}{cursor}", escape(&text)), &tools)
                 }
                 "tool_results" => {
                     let text = e
@@ -1136,8 +1111,10 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
                         .iter()
                         .filter_map(|r| r.get("content").and_then(content_of))
                         .collect::<Vec<_>>()
-                        .join("
-");
+                        .join(
+                            "
+",
+                        );
                     format!(
                         r#"<details class="tool-result"><summary class="dim">tool result</summary>
                              <pre class="mono">{}</pre></details>"#,
@@ -1207,20 +1184,32 @@ fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {
 fn content_text(content: &[serde_json::Value]) -> String {
     content
         .iter()
-        .filter_map(|c| c.get("Text").and_then(|t| t.get("text")).and_then(|t| t.as_str()))
+        .filter_map(|c| {
+            c.get("Text")
+                .and_then(|t| t.get("text"))
+                .and_then(|t| t.as_str())
+        })
         .collect::<Vec<_>>()
-        .join("
-")
+        .join(
+            "
+",
+        )
 }
 
 fn content_of(content: &serde_json::Value) -> Option<String> {
     content.as_array().map(|blocks| {
         blocks
             .iter()
-            .filter_map(|b| b.get("Text").and_then(|t| t.get("text")).and_then(|t| t.as_str()))
+            .filter_map(|b| {
+                b.get("Text")
+                    .and_then(|t| t.get("text"))
+                    .and_then(|t| t.as_str())
+            })
             .collect::<Vec<_>>()
-            .join("
-")
+            .join(
+                "
+",
+            )
     })
 }
 
@@ -1263,7 +1252,10 @@ fn tty_screen(raw: &str) -> String {
         runs: Vec<Run>,
     }
     let Ok(screen) = serde_json::from_str::<Screen>(raw) else {
-        return format!(r#"<pre class="mono pane-body">{}</pre>"#, escape(&pretty(raw)));
+        return format!(
+            r#"<pre class="mono pane-body">{}</pre>"#,
+            escape(&pretty(raw))
+        );
     };
     let mut rows: Vec<String> = (0..screen.rows).map(|_| String::new()).collect();
     for run in &screen.runs {
@@ -1321,30 +1313,69 @@ fn ok_color(c: &str) -> bool {
     c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-/// One tree row: presence dot for the seat, kind glyph, title. An open
-/// seat is an open ring (the STYLE.md vocabulary); crashed dims the row.
-fn tree_row(instance: &crate::core::InstanceInfo, ws: &crate::core::Workspace) -> String {
+/// How deep the tree will indent before it gives up. Parentage is acyclic
+/// by construction at L1, so this can only ever fire on a server the client
+/// should not have trusted — and a bounded lie renders better than a hang.
+const MAX_TREE_DEPTH: usize = 8;
+
+/// One project's rows: roots first, each followed by whatever hangs under
+/// it. A row whose parent is not in this group renders as a root, because
+/// an indent under nothing is a lie.
+fn tree_rows(list: &[&crate::core::InstanceInfo], ws: &crate::core::Workspace) -> String {
+    let mut out = String::new();
+    for instance in list {
+        let orphan = instance
+            .parent
+            .as_deref()
+            .is_none_or(|p| !list.iter().any(|i| i.id == p));
+        if orphan {
+            out.push_str(&tree_row(instance, ws, 0));
+            push_children(&mut out, list, &instance.id, ws, 1);
+        }
+    }
+    out
+}
+
+fn push_children(
+    out: &mut String,
+    list: &[&crate::core::InstanceInfo],
+    parent: &str,
+    ws: &crate::core::Workspace,
+    depth: usize,
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    for child in list.iter().filter(|i| i.parent.as_deref() == Some(parent)) {
+        out.push_str(&tree_row(child, ws, depth));
+        push_children(out, list, &child.id, ws, depth + 1);
+    }
+}
+
+/// One tree row: presence dot for the seat, kind glyph, title, indented by
+/// its parentage. An open seat is an open ring (the STYLE.md vocabulary);
+/// crashed dims the row.
+fn tree_row(
+    instance: &crate::core::InstanceInfo,
+    ws: &crate::core::Workspace,
+    depth: usize,
+) -> String {
     let selected = ws.selected.as_deref() == Some(instance.id.as_str());
-    let seat = match &instance.driver {
-        Some(p) if p.kind == "human" => "seat human",
-        Some(p) if p.kind == "agent" => "seat agent",
-        Some(_) => "seat system",
-        None => "seat open",
-    };
     let title = if instance.title.is_empty() {
         &instance.kind
     } else {
         &instance.title
     };
     format!(
-        r#"<div class="tree-row{sel}{crashed}" data-open="{id}">
-             <span class="{seat}"></span>
+        r#"<div class="tree-row{sel}{crashed}" data-open="{id}" style="--depth:{depth}">
+             <span class="seat {seat}"></span>
              <span class="kind-tag mono">{kind}</span>
              <span class="row-title">{title}</span>
            </div>"#,
         sel = if selected { " selected" } else { "" },
         crashed = if instance.crashed { " crashed" } else { "" },
         id = escape(&instance.id),
+        seat = crate::core::seat_of(instance.driver.as_ref()).tone(),
         kind = escape(&instance.kind),
         title = escape(title),
     )
@@ -1451,20 +1482,21 @@ fn palette_overlay(state: &State) -> String {
             for (i, row) in rows.iter().enumerate() {
                 if row.group != group {
                     group = row.group;
-                    html.push_str(&format!(
-                        r#"<div class="palette-group">{group}</div>"#
-                    ));
+                    html.push_str(&format!(r#"<div class="palette-group">{group}</div>"#));
                 }
                 let classes = format!(
                     "palette-row{}{}",
-                    if i == palette.selected { " selected" } else { "" },
+                    if i == palette.selected {
+                        " selected"
+                    } else {
+                        ""
+                    },
                     if row.gated.is_some() { " gated" } else { "" },
                 );
                 let right = match &row.gated {
-                    Some(reason) => format!(
-                        r#"<span class="palette-gate">{}</span>"#,
-                        escape(reason)
-                    ),
+                    Some(reason) => {
+                        format!(r#"<span class="palette-gate">{}</span>"#, escape(reason))
+                    }
                     None => format!(
                         r#"<span class="palette-detail">{}</span>"#,
                         escape(&row.detail)
@@ -1483,10 +1515,7 @@ fn palette_overlay(state: &State) -> String {
             html
         }
         Stage::Args {
-            verb,
-            draft,
-            error,
-            ..
+            verb, draft, error, ..
         } => {
             let error = match error {
                 Some(why) => format!(r#"<div class="form-error">{}</div>"#, escape(why)),
@@ -1532,9 +1561,13 @@ fn measure_focused_tty(document: &web_sys::Document) {
     let Some((cw, ch)) = char_cell(document) else {
         return;
     };
-    let cols = ((el.client_width() as f64 - 8.0) / cw).floor().clamp(20.0, 500.0) as u16;
+    let cols = ((el.client_width() as f64 - 8.0) / cw)
+        .floor()
+        .clamp(20.0, 500.0) as u16;
     let rows = ((el.client_height() as f64) / ch).floor().clamp(5.0, 200.0) as u16;
-    let id = STATE.with(|s| s.borrow().workspace.selected.clone()).unwrap_or_default();
+    let id = STATE
+        .with(|s| s.borrow().workspace.selected.clone())
+        .unwrap_or_default();
     let fresh = LAST.with(|last| {
         let mut last = last.borrow_mut();
         if *last == Some((id.clone(), cols, rows)) {
