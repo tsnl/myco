@@ -5,12 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 myco-instance = { path = "../instance" }
 myco-runtime = { path = "../runtime" }
 myco-wire = { path = "../wire" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
-async-trait = { workspace = true }
-serde = { workspace = true }

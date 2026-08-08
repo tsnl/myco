@@ -1154,8 +1154,10 @@ dependencies = [
  "myco-kind-notifier",
  "myco-kind-tty",
  "myco-models",
+ "myco-provider",
  "myco-server",
  "rust-embed",
+ "serde_json",
  "tokio",
 ]
 
@@ -1180,6 +1182,7 @@ dependencies = [
  "myco-instance",
  "myco-kind-tty",
  "myco-provider",
+ "serde_json",
  "tokio",
 ]
 
@@ -1263,7 +1266,6 @@ dependencies = [
  "myco-instance",
  "myco-runtime",
  "myco-wire",
- "serde",
  "serde_json",
  "tokio",
 ]

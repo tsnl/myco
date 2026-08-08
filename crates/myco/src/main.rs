@@ -89,6 +89,20 @@ async fn main() {
         default_model,
     )));
     pool.register(Arc::new(myco_kind_notifier::NotifierKind::new(pool.clone())));
+    pool.register(Arc::new(myco_provider::HostKind::new(pool.clone())));
+    // Configured machines dial from boot; each is an ordinary instance the
+    // operator owns, and its remote instances nest under it in every tree.
+    for host in &roster.hosts {
+        if let Err(e) = pool.create(
+            &myco_instance::Principal::Human(operator.clone()),
+            "host",
+            "",
+            &host.name,
+            serde_json::json!({ "command": host.command }),
+        ) {
+            eprintln!("myco: host {:?} not created: {e}", host.name);
+        }
+    }
     // The operator signs in via operator.token without touching the token
     // endpoint, so their inbox is provisioned here.
     myco_server::ensure_notifier(&pool, &operator);

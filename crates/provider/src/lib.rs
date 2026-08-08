@@ -14,6 +14,12 @@
 
 use std::collections::HashMap;
 
+pub mod attach;
+pub mod host;
+
+pub use attach::{Attached, Link, attach};
+pub use host::HostKind;
+
 use myco_instance::{Pool, Principal};
 use myco_wire as wire;
 use serde_json::Value;
