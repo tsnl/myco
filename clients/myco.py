@@ -116,9 +116,12 @@ class Myco:
         """Every kind's spec: verbs, flags, version, default-read hints."""
         return self._get("/kinds")
 
-    def create(self, kind: str, project: str = "", title: str = "", args: dict | None = None):
+    def create(self, kind: str, project: str = "", title: str = "",
+               args: dict | None = None, parent: str | None = None):
+        """`parent` is identity, fixed at birth: the instance this one hangs under."""
         return self._call("POST", "/instances", {
-            "kind": kind, "project": project, "title": title, "args": args or {},
+            "kind": kind, "project": project, "title": title,
+            "parent": parent, "args": args or {},
         })
 
     def list(self, project: str | None = None):
