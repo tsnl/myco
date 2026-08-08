@@ -12,6 +12,7 @@ path = "src/main.rs"
 axum = { workspace = true }
 clap = { workspace = true }
 myco-instance = { path = "../instance" }
+myco-kind-chat = { path = "../kind-chat" }
 myco-kind-tty = { path = "../kind-tty" }
 myco-server = { path = "../server" }
 tokio = { workspace = true }

@@ -4,6 +4,7 @@ members = [
     "crates/runtime",
     "crates/instance",
     "crates/kind-tty",
+    "crates/kind-chat",
     "crates/server",
     "crates/myco",
 ]

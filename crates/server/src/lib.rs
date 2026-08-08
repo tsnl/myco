@@ -306,6 +306,10 @@ struct CreateInstance {
     project: String,
     #[serde(default)]
     title: String,
+    /// The instance this one is created under, immutably. Absent means a
+    /// root; an id nothing answers to is refused.
+    #[serde(default)]
+    parent: Option<String>,
     #[serde(default)]
     args: Value,
 }
@@ -317,12 +321,13 @@ async fn create(
 ) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
     let info = app
         .pool
-        .create(
+        .create_under(
             &caller.principal(),
             &req.kind,
             &req.project,
             &req.title,
             req.args,
+            req.parent.as_deref(),
         )
         .map_err(refusal)?;
     Ok(Json(serde_json::to_value(info).expect("info serializes")))
