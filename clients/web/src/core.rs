@@ -188,14 +188,32 @@ pub struct Palette {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
     List,
-    /// A verb refused for want of arguments: the well, pre-filled, with
+    /// A run refused for want of arguments: the well, pre-filled, with
     /// the server's own words about what was missing.
     Args {
-        id: String,
-        verb: String,
+        target: Target,
         draft: String,
         error: Option<String>,
     },
+}
+
+/// What the well's arguments are for. Verbs and creates share the same
+/// error-driven second stage — a `host` refusing to exist without
+/// `{command}` reads exactly like a verb refusing to run without args.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Verb { id: String, verb: String },
+    Create { kind: String },
+}
+
+impl Target {
+    /// The word the well shows for what it is arguing about.
+    pub fn label(&self) -> String {
+        match self {
+            Target::Verb { verb, .. } => verb.clone(),
+            Target::Create { kind } => format!("new {kind}"),
+        }
+    }
 }
 
 /// One palette row: what it says, whether it can run, and what committing
@@ -349,8 +367,7 @@ fn palette_answered(
             query: String::new(),
             selected: 0,
             stage: Stage::Args {
-                id,
-                verb,
+                target: Target::Verb { id, verb },
                 draft: "{}".into(),
                 error: Some(wire.why),
             },
@@ -568,7 +585,11 @@ pub enum Action {
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
-    CreateAnswered { status: u16, body: String },
+    CreateAnswered {
+        kind: String,
+        status: u16,
+        body: String,
+    },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
 }
@@ -626,8 +647,13 @@ pub enum Effect {
     /// Open (or reopen) the event socket; delivers [`Action::FeedOpened`],
     /// [`Action::FeedEvent`]s, and one [`Action::FeedDropped`] at close.
     OpenFeed { token: String },
-    /// `POST /api/instances` with `{kind}` → [`Action::CreateAnswered`].
-    CreateInstance { token: String, kind: String },
+    /// `POST /api/instances` with `{kind, args}` →
+    /// [`Action::CreateAnswered`].
+    CreateInstance {
+        token: String,
+        kind: String,
+        args: String,
+    },
     /// Send `{"op":"watch","id"}` on the event socket.
     Watch { id: String },
     /// Send `{"op":"unwatch","id"}` on the event socket.
@@ -1208,17 +1234,43 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }
         }
         Action::CreateRequested { kind } => match &state.token {
+            // Optimistic, like a palette verb: try with nothing, and let
+            // a bad_args answer open the well with the kind's own words.
             Some(token) => vec![Effect::CreateInstance {
                 token: token.clone(),
                 kind,
+                args: "{}".into(),
             }],
             None => vec![],
         },
-        Action::CreateAnswered { status, body } => {
-            if status == 200
-                && let Ok(info) = serde_json::from_str::<InstanceInfo>(&body)
-            {
-                state.workspace.selected = Some(info.id);
+        Action::CreateAnswered { kind, status, body } => {
+            #[derive(Default, serde::Deserialize)]
+            struct Wire {
+                #[serde(default)]
+                error: String,
+                #[serde(default)]
+                why: String,
+            }
+            let wire = serde_json::from_str::<Wire>(&body).unwrap_or_default();
+            if status == 400 && wire.error == "bad_args" {
+                state.palette = Some(Palette {
+                    query: String::new(),
+                    selected: 0,
+                    stage: Stage::Args {
+                        target: Target::Create { kind },
+                        draft: "{}".into(),
+                        error: Some(wire.why),
+                    },
+                });
+                return vec![];
+            }
+            if status == 200 {
+                if let Ok(info) = serde_json::from_str::<InstanceInfo>(&body) {
+                    state.workspace.selected = Some(info.id);
+                }
+            } else {
+                let why = if wire.why.is_empty() { wire.error } else { wire.why };
+                state.notice = Some(format!("new {kind}: {why}"));
             }
             relist(state)
         }
@@ -1374,20 +1426,27 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             let Some(palette) = &mut state.palette else {
                 return vec![];
             };
-            let Stage::Args { id, verb, .. } = &palette.stage else {
+            let Stage::Args { target, .. } = &palette.stage else {
                 return vec![];
             };
-            let (id, verb) = (id.clone(), verb.clone());
+            let target = target.clone();
             match serde_json::from_str::<serde_json::Value>(&draft) {
                 Ok(_) => {
                     state.palette = None;
                     match &state.token {
-                        Some(token) => vec![Effect::CallVerb {
-                            origin: Origin::Palette,
-                            token: token.clone(),
-                            id,
-                            verb,
-                            args: draft,
+                        Some(token) => vec![match target {
+                            Target::Verb { id, verb } => Effect::CallVerb {
+                                origin: Origin::Palette,
+                                token: token.clone(),
+                                id,
+                                verb,
+                                args: draft,
+                            },
+                            Target::Create { kind } => Effect::CreateInstance {
+                                token: token.clone(),
+                                kind,
+                                args: draft,
+                            },
                         }],
                         None => vec![],
                     }
@@ -1852,12 +1911,14 @@ mod tests {
             effects,
             vec![Effect::CreateInstance {
                 token: "tok-1".into(),
-                kind: "tty".into()
+                kind: "tty".into(),
+                args: "{}".into(),
             }]
         );
         reduce(
             &mut state,
             Action::CreateAnswered {
+                kind: "tty".into(),
                 status: 200,
                 body: r#"{"id":"new-1","kind":"tty","project":"",
                           "title":"tty","creator":{"kind":"human","id":"ada"}}"#
@@ -1865,6 +1926,65 @@ mod tests {
             },
         );
         assert_eq!(state.workspace.selected.as_deref(), Some("new-1"));
+    }
+
+    /// "new host" from the palette: the optimistic create meets bad_args,
+    /// the well opens targeted at the kind with the server's own words,
+    /// and committing the well creates with the drafted args.
+    #[test]
+    fn a_refused_create_opens_the_well_and_the_well_creates() {
+        let mut state = signed_in();
+        let effects = reduce(
+            &mut state,
+            Action::CreateRequested {
+                kind: "host".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "host".into(),
+                args: "{}".into(),
+            }]
+        );
+
+        let effects = reduce(
+            &mut state,
+            Action::CreateAnswered {
+                kind: "host".into(),
+                status: 400,
+                body: r#"{"error":"bad_args","why":"a host needs {command}"}"#.into(),
+            },
+        );
+        assert!(effects.is_empty(), "the refusal opens the well, not a fetch");
+        let palette = state.palette.as_ref().expect("the well opened");
+        let Stage::Args { target, error, .. } = &palette.stage else {
+            panic!("expected the args stage, got {:?}", palette.stage);
+        };
+        assert_eq!(
+            *target,
+            Target::Create {
+                kind: "host".into()
+            }
+        );
+        assert_eq!(error.as_deref(), Some("a host needs {command}"));
+
+        let effects = reduce(
+            &mut state,
+            Action::PaletteArgsCommitted {
+                draft: r#"{"command":"ssh box myco-hostd"}"#.into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "host".into(),
+                args: r#"{"command":"ssh box myco-hostd"}"#.into(),
+            }]
+        );
+        assert!(state.palette.is_none(), "the well closes on commit");
     }
 
     /// A workspace with one tty instance listed and its kind known.
@@ -2211,8 +2331,8 @@ mod tests {
         );
         let palette = state.palette.as_ref().expect("the well is open");
         match &palette.stage {
-            Stage::Args { verb, error, .. } => {
-                assert_eq!(verb, "screen");
+            Stage::Args { target, error, .. } => {
+                assert_eq!(target.label(), "screen");
                 assert_eq!(error.as_deref(), Some("needs {from}"));
             }
             other => panic!("expected the args stage, got {other:?}"),

@@ -214,15 +214,19 @@ fn run(effect: Effect) {
             );
         }),
         Effect::OpenFeed { token } => open_feed(token),
-        Effect::CreateInstance { token, kind } => wasm_bindgen_futures::spawn_local(async move {
-            let body = serde_json::json!({ "kind": kind }).to_string();
-            dispatch(
-                match fetch("POST", "/api/instances", Some(&token), Some((JSON, body))).await {
-                    Ok((status, body)) => Action::CreateAnswered { status, body },
-                    Err(what) => Action::NetworkFailed { what },
-                },
-            );
-        }),
+        Effect::CreateInstance { token, kind, args } => {
+            wasm_bindgen_futures::spawn_local(async move {
+                let args: serde_json::Value =
+                    serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                let body = serde_json::json!({ "kind": kind, "args": args }).to_string();
+                dispatch(
+                    match fetch("POST", "/api/instances", Some(&token), Some((JSON, body))).await {
+                        Ok((status, body)) => Action::CreateAnswered { kind, status, body },
+                        Err(what) => Action::NetworkFailed { what },
+                    },
+                );
+            })
+        }
         Effect::Watch { id } => send_op("watch", &id),
         Effect::Unwatch { id } => send_op("unwatch", &id),
         Effect::CallVerb {
@@ -1064,6 +1068,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     let view = match &pane.view {
         Some(view) if pane.kind == "tty" => tty_screen(view),
         Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
+        Some(view) if pane.kind == "host" => host_card(view),
         Some(view) => format!(
             r#"<pre class="mono pane-body">{}</pre>"#,
             escape(&pretty(view))
@@ -1439,6 +1444,65 @@ fn tree_row(
     )
 }
 
+/// A host pane: the connection's status (its `about`, kept live by the
+/// ordinary watch), what the far side offers, and where the actions live
+/// — the palette, because host verbs are palette rows like any others.
+fn host_card(view: &str) -> String {
+    let about: serde_json::Value = serde_json::from_str(view).unwrap_or_default();
+    let status = about["status"].as_str().unwrap_or("dialing");
+    let tone = match status {
+        "up" => "agent",
+        "dialing" => "human",
+        _ => "system",
+    };
+    let name = about["name"].as_str().unwrap_or("(not yet announced)");
+    let command = about["command"].as_str().unwrap_or("");
+    let detail = about["detail"].as_str().unwrap_or("");
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="form-error">{}</div>"#, escape(detail))
+    };
+    let offers = about["kinds"]
+        .as_array()
+        .map(|kinds| {
+            kinds
+                .iter()
+                .filter_map(|k| {
+                    Some(format!(
+                        "{} v{}",
+                        k["kind"].as_str()?,
+                        k["version"].as_u64().unwrap_or(0)
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_default();
+    let offers = if offers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim">offers <span class="mono">{}</span></div>"#,
+            escape(&offers)
+        )
+    };
+    format!(
+        r#"<div class="host-card">
+             <div class="host-status"><span class="seat {tone}"></span>
+               {status} as <b>{name}</b></div>
+             <div class="dim mono">{command}</div>
+             {detail}
+             {offers}
+             <div class="dim">create over there with the host's
+               <span class="mono">new</span> verb — it is in the palette</div>
+           </div>"#,
+        status = escape(status),
+        name = escape(name),
+        command = escape(command),
+    )
+}
+
 /// The operator's panel: the roster as rows with the v2 panel's actions,
 /// the freshly minted code shown large (its only plaintext moment), and
 /// refusals in the server's words. Summoned like the palette; forgets the
@@ -1573,18 +1637,20 @@ fn palette_overlay(state: &State) -> String {
             html
         }
         Stage::Args {
-            verb, draft, error, ..
+            target,
+            draft,
+            error,
         } => {
             let error = match error {
                 Some(why) => format!(r#"<div class="form-error">{}</div>"#, escape(why)),
                 None => String::new(),
             };
             format!(
-                r#"<div class="dim"><span class="mono">{verb}</span> wants arguments — JSON,
+                r#"<div class="dim"><span class="mono">{label}</span> wants arguments — JSON,
                      enter to run, esc to go back</div>
                    {error}
                    <textarea id="palette-args" class="mono" rows="4">{draft}</textarea>"#,
-                verb = escape(verb),
+                label = escape(&target.label()),
                 draft = escape(draft),
             )
         }
