@@ -126,6 +126,14 @@ impl VerbSpec {
             ..Self::read(name, doc)
         }
     }
+
+    /// A cursored read only the creator may perform (a private inbox).
+    pub const fn owned_cursored_read(name: &'static str, doc: &'static str) -> Self {
+        Self {
+            cursored: true,
+            ..Self::owned_read(name, doc)
+        }
+    }
 }
 
 /// A kind's contract: its verb vocabulary plus the two hints consumers use
@@ -230,6 +238,24 @@ pub trait Instance: Send {
     ) -> Result<Value, VerbError>;
 }
 
+/// What the framework knows about an instance at birth, handed to the
+/// factory. `id` lets a kind that acts on the bus speak as
+/// `Principal::Agent(id)`; `creator` lets a per-principal kind (a
+/// notifier) bind to its owner as a framework fact — args would be
+/// forgeable. Kinds that need none of it ignore it.
+///
+/// Every field here is *identity*: fixed at this instant and never edited
+/// afterwards, which is what makes it safe for a kind to copy.
+#[derive(Debug, Clone)]
+pub struct CreateCtx {
+    pub id: String,
+    pub creator: Principal,
+    /// The instance this one was created under, if any. The same value the
+    /// listing carries — a kind that wants it should read it here rather
+    /// than accept it in args, where a caller could name anything.
+    pub parent: Option<String>,
+}
+
 /// A kind: the factory plus the spec. Registered once at startup. `create`
 /// receives the cell's [`Signals`] up front, so a kind that runs side-feed
 /// tasks (a pty reader) wires them inline.
@@ -248,13 +274,9 @@ pub trait Instance: Send {
 ///   feed, unlike a pty) must be cancelled by the instance's `Drop`.
 pub trait Kind: Send + Sync {
     fn spec(&self) -> &'static KindSpec;
-    /// `id` is the instance's own name in the pool — handed in so a kind
-    /// that acts on the bus (a chat dispatching tools) can speak as
-    /// `Principal::Agent(id)` and introspect itself; kinds that don't need
-    /// an identity ignore it.
     fn create(
         &self,
-        id: &str,
+        ctx: &CreateCtx,
         args: Value,
         signals: Signals,
     ) -> Result<Box<dyn Instance>, VerbError>;
@@ -457,15 +479,20 @@ impl Pool {
                 .cloned()
                 .ok_or_else(|| VerbError::UnknownKind { kind: kind.into() })?
         };
-        // The id exists before the instance does, so `create` can hand its
-        // kind a usable self-name.
-        let id = uuid::Uuid::new_v4().to_string();
+        // The context exists before the instance does, so `create` can hand
+        // its kind a usable self-name and owner.
+        let ctx = CreateCtx {
+            id: uuid::Uuid::new_v4().to_string(),
+            creator: creator.clone(),
+            parent: parent.map(str::to_string),
+        };
+        let id = ctx.id.clone();
         // Subscribe inside the builder, before `create` can spawn side-feed
         // tasks: nothing the instance ever emits predates the subscription.
         let mut cell_events = None;
         let cell = Cell::try_spawn_with(|signals| {
             cell_events = Some(signals.subscribe());
-            factory.create(&id, args, signals)
+            factory.create(&ctx, args, signals)
         })?;
         let mut rx = cell_events.expect("builder ran");
         let entry = Arc::new(Entry {
@@ -478,7 +505,7 @@ impl Pool {
                 title.to_string()
             }),
             creator: creator.clone(),
-            parent: parent.map(str::to_string),
+            parent: ctx.parent.clone(),
             driver: Arc::new(RwLock::new(Some(creator.clone()))),
             log: Mutex::new(VecDeque::new()),
             cell,

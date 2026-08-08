@@ -5,6 +5,7 @@ members = [
     "crates/instance",
     "crates/kind-tty",
     "crates/kind-chat",
+    "crates/kind-notifier",
     "crates/models",
     "crates/server",
     "crates/myco",
