@@ -7,8 +7,9 @@
 //! **Ingest** is a side-feed consuming the pool's global event feed — the
 //! first side-feed whose input outlives its instance, hence the
 //! Drop-cancel. It turns [`Attention`] events addressed to the owner into
-//! items and bumps; the watermark is not the badge (acks bump too) — the
-//! `unacked` count in the payload is.
+//! items, writing through the framework's [`Shared`] so every landing
+//! wakes the watchers; the watermark is not the badge (acks bump too) —
+//! the `unacked` count in the payload is.
 //!
 //! **Loss:** the feed is a hint, not the ledger. On `Lagged` — and once at
 //! birth — the notifier reconciles: list the pool, re-read the cursored
@@ -22,12 +23,11 @@
 //! endpoints as write-only state no read returns.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use myco_instance::events::{ATTENTION, Attention};
 use myco_instance::{
-    CreateCtx, Instance, Kind, KindSpec, Pool, Principal, VerbError, VerbSpec,
+    CreateCtx, Instance, Kind, KindSpec, Pool, Principal, Shared, VerbError, VerbSpec,
 };
 use myco_runtime::Signals;
 use serde_json::{Value, json};
@@ -56,7 +56,10 @@ static NOTIFIER_SPEC: KindSpec = KindSpec {
             "register",
             "store a web-push {subscription} (delivery lands in M4); write-only state",
         ),
-        VerbSpec::owned("unregister", "forget the web-push subscription with {endpoint}"),
+        VerbSpec::owned(
+            "unregister",
+            "forget the web-push subscription with {endpoint}",
+        ),
         VerbSpec::owned(
             "reconcile",
             "re-derive items from the re-readable record (also runs on feed lag and at birth)",
@@ -149,13 +152,12 @@ impl Kind for NotifierKind {
         // Subscribe before the task spawns: events during startup wait in
         // the channel rather than being missed.
         let feed = self.pool.events();
-        let inbox = Arc::new(Mutex::new(Inbox::default()));
+        let inbox = Shared::new(Inbox::default(), signals);
         let ingest = tokio::spawn(ingest(
             self.pool.clone(),
             ctx.creator.clone(),
-            Arc::clone(&inbox),
+            inbox.clone(),
             feed,
-            signals,
         ));
         Ok(Box::new(Notifier {
             owner: ctx.creator.clone(),
@@ -169,7 +171,7 @@ impl Kind for NotifierKind {
 struct Notifier {
     owner: Principal,
     pool: Pool,
-    inbox: Arc<Mutex<Inbox>>,
+    inbox: Shared<Inbox>,
     ingest: tokio::task::JoinHandle<()>,
 }
 
@@ -182,17 +184,15 @@ impl Drop for Notifier {
 }
 
 /// The reducer over the feed: birth reconcile, then events; on lag,
-/// reconcile again. Bumps only when something changed.
+/// reconcile again. The side-feed writes through the [`Shared`], so every
+/// item that lands wakes the badge's watchers without a bump written here.
 async fn ingest(
     pool: Pool,
     owner: Principal,
-    inbox: Arc<Mutex<Inbox>>,
+    inbox: Shared<Inbox>,
     mut feed: tokio::sync::broadcast::Receiver<(String, myco_runtime::Event)>,
-    signals: Signals,
 ) {
-    if reconcile(&pool, &owner, &inbox).await {
-        signals.bump();
-    }
+    reconcile(&pool, &owner, &inbox).await;
     loop {
         match feed.recv().await {
             Ok((source, event)) => {
@@ -205,18 +205,10 @@ async fn ingest(
                 if !attention.for_.contains(&owner) {
                     continue;
                 }
-                let added = {
-                    let mut i = inbox.lock().unwrap_or_else(|e| e.into_inner());
-                    i.add(&source, &attention)
-                };
-                if added {
-                    signals.bump();
-                }
+                inbox.with(|i| i.add(&source, &attention));
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                if reconcile(&pool, &owner, &inbox).await {
-                    signals.bump();
-                }
+                reconcile(&pool, &owner, &inbox).await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
@@ -227,19 +219,15 @@ async fn ingest(
 /// watermark moved past our cursor, re-read its transcript from the
 /// cursor and itemize mentions of the owner. Idempotent by construction
 /// (the (source, seq) dedupe), so racing the live feed is harmless.
-async fn reconcile(pool: &Pool, owner: &Principal, inbox: &Arc<Mutex<Inbox>>) -> bool {
+async fn reconcile(pool: &Pool, owner: &Principal, inbox: &Shared<Inbox>) {
     let Principal::Human(owner_id) = owner else {
-        return false;
+        return;
     };
-    let mut changed = false;
     for info in pool.list(None) {
         if info.kind != "chat" {
             continue;
         }
-        let cursor = {
-            let i = inbox.lock().unwrap_or_else(|e| e.into_inner());
-            i.cursors.get(&info.id).copied().unwrap_or(0)
-        };
+        let cursor = inbox.read(|i| i.cursors.get(&info.id).copied().unwrap_or(0));
         let Ok(page) = pool
             .call(
                 owner,
@@ -253,26 +241,30 @@ async fn reconcile(pool: &Pool, owner: &Principal, inbox: &Arc<Mutex<Inbox>>) ->
         };
         let next = page["next"].as_u64().unwrap_or(cursor);
         let needle = format!("@{owner_id}");
-        let mut i = inbox.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in page["entries"].as_array().into_iter().flatten() {
-            let (Some(text), Some(seq)) = (entry["text"].as_str(), entry["seq"].as_u64()) else {
-                continue;
-            };
-            if !text.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()) {
-                continue;
+        inbox.with(|i| {
+            for entry in page["entries"].as_array().into_iter().flatten() {
+                let (Some(text), Some(seq)) = (entry["text"].as_str(), entry["seq"].as_u64())
+                else {
+                    continue;
+                };
+                if !text
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+                {
+                    continue;
+                }
+                let author = entry["author"]["id"].as_str().unwrap_or("someone");
+                let attention = Attention {
+                    for_: vec![owner.clone()],
+                    title: format!("mentioned by {author}"),
+                    body: text.chars().take(120).collect(),
+                    seq: Some(seq),
+                };
+                i.add(&info.id, &attention);
             }
-            let author = entry["author"]["id"].as_str().unwrap_or("someone");
-            let attention = Attention {
-                for_: vec![owner.clone()],
-                title: format!("mentioned by {author}"),
-                body: text.chars().take(120).collect(),
-                seq: Some(seq),
-            };
-            changed |= i.add(&info.id, &attention);
-        }
-        i.cursors.insert(info.id.clone(), next);
+            i.cursors.insert(info.id.clone(), next);
+        });
     }
-    changed
 }
 
 #[async_trait::async_trait]
@@ -282,13 +274,12 @@ impl Instance for Notifier {
         _caller: &Principal,
         verb: &str,
         args: Value,
-        signals: &Signals,
+        _signals: &Signals,
     ) -> Result<Value, VerbError> {
         // owner_only is enforced by the framework before we run; `_caller`
         // here is always the owner.
         match verb {
-            "pending" => {
-                let i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+            "pending" => Ok(self.inbox.read(|i| {
                 let len = i.items.len() as u64;
                 let from = args
                     .get("from")
@@ -308,41 +299,34 @@ impl Instance for Notifier {
                         v
                     })
                     .collect();
-                Ok(json!({
+                json!({
                     "items": items,
                     "next": upto,
                     "unacked": i.unacked(),
                     "len": len,
-                }))
-            }
-            "text" => {
-                let i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                })
+            })),
+            "text" => Ok(self.inbox.read(|i| {
                 let mut out = String::new();
                 for item in i.items.iter().filter(|it| it.seq >= i.acked_upto) {
                     out.push_str(&format!("{} — {}\n", item.title, item.body));
                 }
-                Ok(json!({ "text": out, "unacked": i.unacked() }))
-            }
+                json!({ "text": out, "unacked": i.unacked() })
+            })),
             "ack" => {
-                let upto = args.get("upto").and_then(Value::as_u64).ok_or_else(|| {
-                    VerbError::BadArgs {
-                        why: "ack needs {upto}: the highest seq you have seen".into(),
-                    }
-                })?;
-                let changed = {
-                    let mut i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                let upto =
+                    args.get("upto")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "ack needs {upto}: the highest seq you have seen".into(),
+                        })?;
+                // Acks are observable: the badge is the payload's
+                // `unacked`, and its watchers re-read to see it fall.
+                Ok(self.inbox.with(|i| {
                     let target = (upto + 1).min(i.items.len() as u64);
-                    let changed = target > i.acked_upto;
                     i.acked_upto = i.acked_upto.max(target);
-                    changed
-                };
-                if changed {
-                    // Acks bump too: the badge is the payload's `unacked`,
-                    // and its watchers need to re-read to see it fall.
-                    signals.bump();
-                }
-                let i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(json!({ "unacked": i.unacked() }))
+                    json!({ "unacked": i.unacked() })
+                }))
             }
             "mute" => {
                 let source = args
@@ -353,30 +337,35 @@ impl Instance for Notifier {
                         why: "mute needs {source}: an instance id".into(),
                     })?;
                 let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
-                let mut i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-                if on {
-                    i.muted.insert(source.to_string());
-                } else {
-                    i.muted.remove(source);
-                }
-                signals.bump();
-                Ok(json!({ "muted": i.muted }))
+                Ok(self.inbox.with(|i| {
+                    if on {
+                        i.muted.insert(source.to_string());
+                    } else {
+                        i.muted.remove(source);
+                    }
+                    json!({ "muted": i.muted })
+                }))
             }
             "register" => {
-                let sub = args.get("subscription").cloned().ok_or_else(|| {
-                    VerbError::BadArgs {
+                let sub = args
+                    .get("subscription")
+                    .cloned()
+                    .ok_or_else(|| VerbError::BadArgs {
                         why: "register needs {subscription}: the browser's PushSubscription JSON"
                             .into(),
+                    })?;
+                let endpoint = sub
+                    .get("endpoint")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                Ok(self.inbox.with(|i| {
+                    if let Some(e) = &endpoint {
+                        i.endpoints
+                            .retain(|s| s.get("endpoint").and_then(Value::as_str) != Some(e));
                     }
-                })?;
-                let endpoint = sub.get("endpoint").and_then(Value::as_str).map(String::from);
-                let mut i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(e) = &endpoint {
-                    i.endpoints
-                        .retain(|s| s.get("endpoint").and_then(Value::as_str) != Some(e));
-                }
-                i.endpoints.push(sub);
-                Ok(json!({ "registered": true }))
+                    i.endpoints.push(sub);
+                    json!({ "registered": true })
+                }))
             }
             "unregister" => {
                 let endpoint = args
@@ -385,19 +374,18 @@ impl Instance for Notifier {
                     .ok_or_else(|| VerbError::BadArgs {
                         why: "unregister needs {endpoint}".into(),
                     })?;
-                let mut i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-                let before = i.endpoints.len();
-                i.endpoints
-                    .retain(|s| s.get("endpoint").and_then(Value::as_str) != Some(endpoint));
-                Ok(json!({ "dropped": before != i.endpoints.len() }))
+                Ok(self.inbox.with(|i| {
+                    let before = i.endpoints.len();
+                    i.endpoints
+                        .retain(|s| s.get("endpoint").and_then(Value::as_str) != Some(endpoint));
+                    json!({ "dropped": before != i.endpoints.len() })
+                }))
             }
             "reconcile" => {
-                let changed = reconcile(&self.pool, &self.owner, &self.inbox).await;
-                if changed {
-                    signals.bump();
-                }
-                let i = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(json!({ "unacked": i.unacked(), "len": i.items.len() as u64 }))
+                reconcile(&self.pool, &self.owner, &self.inbox).await;
+                Ok(self
+                    .inbox
+                    .read(|i| json!({ "unacked": i.unacked(), "len": i.items.len() as u64 })))
             }
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }
