@@ -45,9 +45,16 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pane {
     pub id: String,
-    /// The `primary_render` payload, pretty-printed; `None` until the
-    /// first read answers.
+    /// The instance's kind at open time — the renderer registry's key.
+    pub kind: String,
+    /// The raw `primary_render` payload; `None` until the first read
+    /// answers. Renderers parse it; the generic view pretty-prints it.
     pub view: Option<String>,
+    /// DECCKM from the last tty screen read: arrows send SS3, not CSI.
+    pub app_cursor: bool,
+    /// The last size this client asked the tty for — the loop-breaker
+    /// between measure and resize.
+    pub sent_size: Option<(u16, u16)>,
     /// The instance was removed or crashed while open. The pane stays —
     /// showing last state honestly beats vanishing work.
     pub gone: bool,
@@ -177,6 +184,16 @@ pub enum Action {
     ReleaseRequested { id: String },
     /// A `sys.*` chrome verb answered.
     VerbAnswered { id: String, verb: String, status: u16 },
+    /// A key went down while a tty pane was focused and drivable. The
+    /// edge has already answered the synchronous preventDefault question
+    /// via [`wants_key`]; this is the committed keystroke.
+    KeyPressed {
+        key: String,
+        ctrl: bool,
+        alt: bool,
+    },
+    /// The edge measured the focused tty pane's usable cell grid.
+    PaneMeasured { id: String, cols: u16, rows: u16 },
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
@@ -237,6 +254,103 @@ pub enum Effect {
         id: String,
         verb: String,
     },
+    /// `input {data}` on a tty → [`Action::VerbAnswered`] (verb `input`).
+    Input {
+        token: String,
+        id: String,
+        data: String,
+    },
+    /// `resize {cols, rows}` on a tty → [`Action::VerbAnswered`].
+    Resize {
+        token: String,
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+}
+
+/// Chords the room keeps for itself — the terminal must lose only what
+/// the workspace absolutely needs (DESIGN.md L3). `Cmd/Ctrl+P` is the
+/// palette (next PR); the rest of the keyboard belongs to the tty.
+pub fn reserved_chord(key: &str, ctrl: bool, meta: bool) -> bool {
+    (ctrl || meta) && key.eq_ignore_ascii_case("p")
+}
+
+/// The synchronous question the edge must answer before preventDefault:
+/// does this keystroke belong to the focused terminal? True exactly when
+/// the focused pane is a live tty whose seat this person holds and the
+/// chord is not reserved.
+pub fn wants_key(state: &State, key: &str, ctrl: bool, meta: bool) -> bool {
+    if reserved_chord(key, ctrl, meta) || meta {
+        return false;
+    }
+    let Session::SignedIn(user) = &state.session else {
+        return false;
+    };
+    let Some(selected) = &state.workspace.selected else {
+        return false;
+    };
+    let Some(pane) = state
+        .workspace
+        .panes
+        .iter()
+        .find(|p| &p.id == selected && p.kind == "tty" && !p.gone)
+    else {
+        return false;
+    };
+    state
+        .workspace
+        .instances
+        .iter()
+        .find(|i| i.id == pane.id)
+        .and_then(|i| i.driver.as_ref())
+        .is_some_and(|d| d.kind == "human" && d.id == user.id)
+}
+
+/// DOM `KeyboardEvent.key` → the bytes a terminal expects. `None` for
+/// keys that are not the terminal's to hear (bare modifiers, F-keys we
+/// don't map). `app_cursor` is DECCKM: arrows send SS3 instead of CSI.
+pub fn encode_key(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Option<String> {
+    let esc = |suffix: &str| {
+        Some(if app_cursor {
+            format!("\x1bO{suffix}")
+        } else {
+            format!("\x1b[{suffix}")
+        })
+    };
+    let encoded = match key {
+        "Enter" => Some("\r".to_string()),
+        "Backspace" => Some("\x7f".to_string()),
+        "Tab" => Some("\t".to_string()),
+        "Escape" => Some("\x1b".to_string()),
+        "ArrowUp" => return esc("A"),
+        "ArrowDown" => return esc("B"),
+        "ArrowRight" => return esc("C"),
+        "ArrowLeft" => return esc("D"),
+        "Home" => return esc("H"),
+        "End" => return esc("F"),
+        "Delete" => Some("\x1b[3~".to_string()),
+        "PageUp" => Some("\x1b[5~".to_string()),
+        "PageDown" => Some("\x1b[6~".to_string()),
+        printable if printable.chars().count() == 1 => {
+            let c = printable.chars().next().expect("one char");
+            if ctrl {
+                // Ctrl+letter → C0 control byte; anything else with Ctrl
+                // is not the terminal's.
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    Some(((lower as u8 - b'a' + 1) as char).to_string())
+                } else {
+                    None
+                }
+            } else {
+                Some(c.to_string())
+            }
+        }
+        _ => None,
+    };
+    // Alt prefixes ESC — the meta convention every terminal speaks.
+    encoded.map(|data| if alt { format!("\x1b{data}") } else { data })
 }
 
 /// What entering a session kicks off, from either door (whoami or a fresh
@@ -490,9 +604,19 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             if state.workspace.panes.iter().any(|p| p.id == id) {
                 return vec![];
             }
+            let kind = state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.kind.clone())
+                .unwrap_or_default();
             state.workspace.panes.push(Pane {
                 id: id.clone(),
+                kind,
                 view: None,
+                app_cursor: false,
+                sent_size: None,
                 gone: false,
             });
             let mut effects = vec![Effect::Watch { id: id.clone() }];
@@ -541,13 +665,11 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             if status == 200
                 && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
             {
-                // Pretty when it parses; verbatim when it doesn't — the
-                // generic projection until kind renderers land.
-                pane.view = Some(
-                    serde_json::from_str::<serde_json::Value>(&body)
-                        .and_then(|v| serde_json::to_string_pretty(&v))
-                        .unwrap_or(body),
-                );
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                    pane.app_cursor = value["application_cursor"] == serde_json::json!(true);
+                }
+                // Raw payload; renderers parse it by kind at draw time.
+                pane.view = Some(body);
             }
             vec![]
         }
@@ -567,12 +689,50 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }],
             None => vec![],
         },
-        Action::VerbAnswered { id: _, verb: _, status: _ } => {
-            // Seat changes surface through the listing; any answer means
-            // the listing may have moved.
-            match &state.token {
-                Some(token) => vec![Effect::FetchInstances {
+        Action::VerbAnswered { id: _, verb, status: _ } => {
+            // Seat changes surface through the listing. Kind verbs
+            // (keystrokes!) answer constantly and move nothing there.
+            match (&state.token, verb.starts_with("sys.")) {
+                (Some(token), true) => vec![Effect::FetchInstances {
                     token: token.clone(),
+                }],
+                _ => vec![],
+            }
+        }
+        Action::KeyPressed { key, ctrl, alt } => {
+            let Some(selected) = state.workspace.selected.clone() else {
+                return vec![];
+            };
+            let Some(pane) = state.workspace.panes.iter().find(|p| p.id == selected) else {
+                return vec![];
+            };
+            match (
+                &state.token,
+                encode_key(&key, ctrl, alt, pane.app_cursor),
+            ) {
+                (Some(token), Some(data)) => vec![Effect::Input {
+                    token: token.clone(),
+                    id: selected,
+                    data,
+                }],
+                _ => vec![],
+            }
+        }
+        Action::PaneMeasured { id, cols, rows } => {
+            let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) else {
+                return vec![];
+            };
+            // The loop-breaker: ask once per size, not once per render.
+            if pane.sent_size == Some((cols, rows)) || pane.kind != "tty" || pane.gone {
+                return vec![];
+            }
+            pane.sent_size = Some((cols, rows));
+            match &state.token {
+                Some(token) => vec![Effect::Resize {
+                    token: token.clone(),
+                    id,
+                    cols,
+                    rows,
                 }],
                 None => vec![],
             }
@@ -1072,6 +1232,122 @@ mod tests {
             }],
             "the chip refreshes from the listing, the one source of seat truth"
         );
+    }
+
+    #[test]
+    fn the_key_encoder_speaks_terminal() {
+        assert_eq!(encode_key("a", false, false, false).unwrap(), "a");
+        assert_eq!(encode_key("Enter", false, false, false).unwrap(), "\r");
+        assert_eq!(encode_key("Backspace", false, false, false).unwrap(), "\x7f");
+        assert_eq!(encode_key("c", true, false, false).unwrap(), "\x03");
+        assert_eq!(encode_key("ArrowUp", false, false, false).unwrap(), "\x1b[A");
+        assert_eq!(
+            encode_key("ArrowUp", false, false, true).unwrap(),
+            "\x1bOA",
+            "DECCKM: application cursor sends SS3"
+        );
+        assert_eq!(encode_key("b", false, true, false).unwrap(), "\x1bb", "alt is ESC");
+        assert_eq!(encode_key("Shift", false, false, false), None, "bare modifiers stay home");
+    }
+
+    #[test]
+    fn keys_go_to_the_terminal_only_from_its_driver() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        assert!(wants_key(&state, "a", false, false), "driver, focused tty");
+        assert!(
+            !wants_key(&state, "p", true, false),
+            "the palette chord is the room's"
+        );
+
+        // Someone else takes the seat: the keyboard goes quiet.
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"t1","kind":"tty","project":"","title":"shell",
+                           "creator":{"kind":"human","id":"ada"},
+                           "driver":{"kind":"agent","id":"c9"}}]"#
+                    .into(),
+            },
+        );
+        assert!(!wants_key(&state, "a", false, false), "not the driver");
+
+        let effects = reduce(
+            &mut state,
+            Action::KeyPressed {
+                key: "Enter".into(),
+                ctrl: false,
+                alt: false,
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Input {
+                token: "tok-1".into(),
+                id: "t1".into(),
+                data: "\r".into(),
+            }],
+            "the reducer encodes; the edge only carried the event"
+        );
+    }
+
+    #[test]
+    fn measuring_asks_for_a_resize_exactly_once_per_size() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        let effects = reduce(
+            &mut state,
+            Action::PaneMeasured {
+                id: "t1".into(),
+                cols: 120,
+                rows: 32,
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Resize {
+                token: "tok-1".into(),
+                id: "t1".into(),
+                cols: 120,
+                rows: 32,
+            }]
+        );
+        // The same measurement again is a no-op — the measure/resize loop
+        // cannot spin.
+        let effects = reduce(
+            &mut state,
+            Action::PaneMeasured {
+                id: "t1".into(),
+                cols: 120,
+                rows: 32,
+            },
+        );
+        assert!(effects.is_empty());
+    }
+
+    /// A keystroke's answer must not re-list; a seat verb's must.
+    #[test]
+    fn only_sys_answers_move_the_listing() {
+        let mut state = with_tty(signed_in());
+        let effects = reduce(
+            &mut state,
+            Action::VerbAnswered {
+                id: "t1".into(),
+                verb: "input".into(),
+                status: 200,
+            },
+        );
+        assert!(effects.is_empty());
+        let effects = reduce(
+            &mut state,
+            Action::VerbAnswered {
+                id: "t1".into(),
+                verb: "sys.take".into(),
+                status: 200,
+            },
+        );
+        assert!(!effects.is_empty());
     }
 
     /// The log is the repro: every action lands in order, capped.
