@@ -1150,6 +1150,7 @@ dependencies = [
  "clap",
  "mime_guess",
  "myco-instance",
+ "myco-kind-browser",
  "myco-kind-chat",
  "myco-kind-cron",
  "myco-kind-notifier",
@@ -1199,6 +1200,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "myco-kind-browser"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "myco-instance",
+ "myco-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
 ]
 
 [[package]]

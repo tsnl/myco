@@ -91,6 +91,7 @@ async fn main() {
     pool.register(Arc::new(myco_kind_notifier::NotifierKind::new(pool.clone())));
     pool.register(Arc::new(myco_provider::HostKind::new(pool.clone())));
     pool.register(Arc::new(myco_kind_cron::CronKind::new(pool.clone())));
+    pool.register(Arc::new(myco_kind_browser::BrowserKind));
     // Configured machines dial from boot; each is an ordinary instance the
     // operator owns, and its remote instances nest under it in every tree.
     for host in &roster.hosts {
