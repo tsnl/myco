@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use webauthn_rs::prelude as webauthn;
 
-use crate::roster::PasskeySettings;
+use crate::config::PasskeySettings;
 use crate::{App, Caller};
 
 /// Build the relying party from `[passkeys]` in server.toml. With the
@@ -90,7 +90,10 @@ pub(crate) async fn register_finish(
             "no registration in progress (it may have expired — start again)",
         ));
     };
-    match app.webauthn.finish_passkey_registration(&credential, &state) {
+    match app
+        .webauthn
+        .finish_passkey_registration(&credential, &state)
+    {
         Ok(passkey) => match app.auth.add_passkey(&id, passkey) {
             Ok(count) => Ok(Json(json!({"passkeys": count}))),
             Err(e) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
