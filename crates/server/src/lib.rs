@@ -21,8 +21,8 @@
 
 mod admin;
 pub mod auth;
+pub mod config;
 mod passkey;
-pub mod roster;
 mod util;
 mod watch;
 
@@ -54,7 +54,7 @@ pub(crate) struct App {
 /// single-machine embedders use this; the binary goes through
 /// [`router_with`] so a configured relying party is honored.
 pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
-    router_with(pool, auth, operator, &roster::PasskeySettings::default())
+    router_with(pool, auth, operator, &config::PasskeySettings::default())
         .expect("the default passkey settings always build")
 }
 
@@ -68,7 +68,7 @@ pub fn router_with(
     pool: Pool,
     auth: Arc<AuthStore>,
     operator: impl Into<String>,
-    passkeys: &roster::PasskeySettings,
+    passkeys: &config::PasskeySettings,
 ) -> Result<Router, String> {
     let webauthn = Arc::new(passkey::build_webauthn(passkeys)?);
     Ok(Router::new()
@@ -306,6 +306,10 @@ struct CreateInstance {
     project: String,
     #[serde(default)]
     title: String,
+    /// The instance this one is created under, immutably. Absent means a
+    /// root; an id nothing answers to is refused.
+    #[serde(default)]
+    parent: Option<String>,
     #[serde(default)]
     args: Value,
 }
@@ -317,12 +321,13 @@ async fn create(
 ) -> Result<Json<Value>, (StatusCode, Json<VerbError>)> {
     let info = app
         .pool
-        .create(
+        .create_under(
             &caller.principal(),
             &req.kind,
             &req.project,
             &req.title,
             req.args,
+            req.parent.as_deref(),
         )
         .map_err(refusal)?;
     Ok(Json(serde_json::to_value(info).expect("info serializes")))

@@ -2,11 +2,13 @@
 //!
 //! v2's "session" dissolves here — a chat is an ordinary instance in the
 //! pool, created by anyone, watched like anything else. A **subagent** is
-//! nothing but a chat whose `parent` names another chat; there is no child
-//! machinery anywhere. The transcript is shared, attributed, and
-//! multiplayer: `post` appends, `tail` cursors, and the author is always
-//! the authenticated [`Principal`] the bus resolved — never anything the
-//! arguments claim.
+//! nothing but a chat created under another chat; parentage is L1 identity
+//! ([`InstanceInfo::parent`](myco_instance::InstanceInfo)), fixed at birth
+//! and readable from the listing, so there is no child machinery here and
+//! no parent field for this kind to keep in sync. The transcript is
+//! shared, attributed, and multiplayer: `post` appends, `tail` cursors,
+//! and the author is always the authenticated [`Principal`] the bus
+//! resolved — never anything the arguments claim.
 //!
 //! **The turn engine.** A chat created with a `model` answers human posts.
 //! A model *turn* is not a mailbox command (DESIGN.md): it runs as a
@@ -19,10 +21,10 @@
 //! partial entry stays: state is not history, and a cancelled thought
 //! visibly happened.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, Shared, VerbError, VerbSpec};
 use myco_models::{
     Content, GenerateOutput, GenerativeModel, GenerativeModelConfig, MessagePart, ModelCatalog,
     ToolResult, ToolUse, TurnEndReason,
@@ -59,7 +61,7 @@ static CHAT_SPEC: KindSpec = KindSpec {
             "text",
             "the transcript as plain text, one `author: message` line per entry",
         ),
-        VerbSpec::read("about", "the chat's shape: {parent, model, len, turn_running}"),
+        VerbSpec::read("about", "the chat's shape: {model, len, turn_running}"),
     ],
     primary_render: "tail",
     recommended_context: "text",
@@ -176,16 +178,12 @@ impl Kind for ChatKind {
         &CHAT_SPEC
     }
 
-    fn create(&self, id: &str, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
-        let parent = match args.get("parent") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
-            Some(other) => {
-                return Err(VerbError::BadArgs {
-                    why: format!("parent must be an instance id string, got {other}"),
-                });
-            }
-        };
+    fn create(
+        &self,
+        id: &str,
+        args: Value,
+        signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError> {
         let requested = match args.get("model") {
             None | Some(Value::Null) => None,
             Some(Value::String(key)) if !key.trim().is_empty() => Some(key.clone()),
@@ -215,9 +213,8 @@ impl Kind for ChatKind {
         Ok(Box::new(Chat {
             agent: Principal::Agent(id.to_string()),
             pool: self.pool.clone(),
-            parent,
             model,
-            transcript: Arc::new(Mutex::new(Transcript::default())),
+            transcript: Shared::new(Transcript::default(), signals),
             turn: None,
         }))
     }
@@ -227,9 +224,10 @@ impl Kind for ChatKind {
 // The instance
 // ---------------------------------------------------------------------------
 
-/// The shared transcript: verbs mutate it inside the cell, the turn task
-/// streams into it from outside — the tty's pump pattern. The lock is never
-/// held across an await.
+/// The transcript: verbs mutate it inside the cell, the turn task streams
+/// into it from outside. It is held in a [`Shared`] — the framework's
+/// spelling of that arrangement, so the bump that wakes watchers cannot be
+/// forgotten and the lock cannot be held across an await.
 #[derive(Default)]
 struct Transcript {
     entries: Vec<Entry>,
@@ -370,9 +368,8 @@ struct Chat {
     /// doctrine's naming, and the transcript's author for model entries.
     agent: Principal,
     pool: Pool,
-    parent: Option<String>,
     model: Option<(String, Arc<dyn GenerativeModel>)>,
-    transcript: Arc<Mutex<Transcript>>,
+    transcript: Shared<Transcript>,
     turn: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -385,41 +382,39 @@ impl Chat {
         let Some(handle) = self.turn.take() else {
             return false;
         };
-        let was_running = !handle.is_finished();
-        handle.abort();
-        let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
-        t.fail_pending(reason);
-        drop(t);
-        if was_running {
-            signals.emit("turn_ended", json!({ "reason": reason }));
-            signals.bump();
+        if handle.is_finished() {
+            // The task already closed its own entry; there is nothing left
+            // to fail and nobody to wake.
+            return false;
         }
-        was_running
+        handle.abort();
+        self.transcript.with(|t| t.fail_pending(reason));
+        signals.emit("turn_ended", json!({ "reason": reason }));
+        true
     }
 
-    fn start_turn(&mut self, signals: &Signals) {
+    fn start_turn(&mut self) {
         let Some((model, generator)) = &self.model else {
             return;
         };
         self.turn = Some(tokio::spawn(run_turn(TurnCtx {
-            transcript: Arc::clone(&self.transcript),
+            transcript: self.transcript.clone(),
             generator: Arc::clone(generator),
             pool: self.pool.clone(),
             agent: self.agent.clone(),
             model: model.clone(),
-            signals: signals.clone(),
         })));
     }
 }
 
-/// Everything one turn needs, handed to the side-feed task.
+/// Everything one turn needs, handed to the side-feed task. The transcript
+/// carries the cell's signals, so the task needs no second handle on them.
 struct TurnCtx {
-    transcript: Arc<Mutex<Transcript>>,
+    transcript: Shared<Transcript>,
     generator: Arc<dyn GenerativeModel>,
     pool: Pool,
     agent: Principal,
     model: String,
-    signals: Signals,
 }
 
 /// One turn, as a side-feed: project the transcript, open the streaming
@@ -440,8 +435,8 @@ async fn run_turn(ctx: TurnCtx) {
         pool,
         agent,
         model,
-        signals,
     } = ctx;
+    let signals = transcript.signals().clone();
     let chat_id = match &agent {
         Principal::Agent(id) => id.clone(),
         _ => unreachable!("the chat speaks as an agent"),
@@ -452,32 +447,23 @@ async fn run_turn(ctx: TurnCtx) {
         .call(&agent, &chat_id, "sys.meta", Value::Null)
         .await
         .ok()
-        .and_then(|meta| meta.get("project").and_then(Value::as_str).map(String::from))
+        .and_then(|meta| {
+            meta.get("project")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
         .unwrap_or_default();
 
     signals.emit("turn_started", Value::Null);
-    signals.bump();
 
     let reason = loop {
-        let messages = {
-            let t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-            project::project(&t.entries)
-        };
-        {
-            let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-            t.open_assistant(agent.clone(), model.clone());
-        }
-        signals.bump();
+        let messages = transcript.read(|t| project::project(&t.entries));
+        transcript.with(|t| t.open_assistant(agent.clone(), model.clone()));
 
         let stream = generator.generate(&messages);
-        let hook_transcript = Arc::clone(&transcript);
-        let hook_signals = signals.clone();
+        let hook = transcript.clone();
         let result = GenerateOutput::from_stream_with_hook(stream, move |part| {
-            hook_transcript
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .apply_part(part);
-            hook_signals.bump();
+            hook.with(|t| t.apply_part(part))
         })
         .await;
 
@@ -485,36 +471,24 @@ async fn run_turn(ctx: TurnCtx) {
             Ok(output) => {
                 let tool_uses = output.tool_uses.clone();
                 let end = output.turn_end_reason.clone();
-                transcript
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .finalize(output);
-                signals.bump();
+                transcript.with(|t| t.finalize(output));
                 if end == TurnEndReason::ToolUse && !tool_uses.is_empty() {
                     let mut results = Vec::with_capacity(tool_uses.len());
                     for tool in &tool_uses {
                         results.push(tools::dispatch(&pool, &agent, &project, tool).await);
                     }
-                    {
-                        let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-                        t.push(agent.clone(), Body::ToolResults { results });
-                    }
-                    signals.bump();
+                    transcript.with(|t| t.push(agent.clone(), Body::ToolResults { results }));
                     continue;
                 }
                 break turn_end_name(&end);
             }
             Err(e) => {
-                transcript
-                    .lock()
-                    .unwrap_or_else(|e2| e2.into_inner())
-                    .fail_pending(&format!("error: {e}"));
+                transcript.with(|t| t.fail_pending(&format!("error: {e}")));
                 break "error".to_string();
             }
         }
     };
     signals.emit("turn_ended", json!({ "reason": reason }));
-    signals.bump();
 }
 
 fn turn_end_name(reason: &TurnEndReason) -> String {
@@ -555,23 +529,21 @@ impl Instance for Chat {
                     .ok_or_else(|| VerbError::BadArgs {
                         why: "post needs a non-empty {text}".into(),
                     })?;
-                let entry = {
-                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = self.transcript.with(|t| {
                     t.push(
                         caller.clone(),
                         Body::Message {
                             text: text.to_string(),
                         },
                     )
-                };
-                signals.bump();
+                });
                 // Only a person starts (or interrupts) a turn: the model
                 // answers humans, not itself and not the system.
                 if matches!(caller, Principal::Human(_)) && self.model.is_some() {
                     if self.turn_running() {
                         self.abort_turn("interrupted", signals);
                     }
-                    self.start_turn(signals);
+                    self.start_turn();
                 }
                 Ok(serde_json::to_value(entry).expect("entry serializes"))
             }
@@ -579,8 +551,7 @@ impl Instance for Chat {
                 let cancelled = self.abort_turn("cancelled", signals);
                 Ok(json!({ "cancelled": cancelled }))
             }
-            "tail" => {
-                let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+            "tail" => Ok(self.transcript.read(|t| {
                 let len = t.entries.len() as u64;
                 let from = args
                     .get("from")
@@ -593,23 +564,18 @@ impl Instance for Chat {
                     .unwrap_or(DEFAULT_TAIL);
                 let upto = len.min(from.saturating_add(max));
                 let slice = &t.entries[from as usize..upto as usize];
-                Ok(json!({ "entries": slice, "next": upto, "len": len }))
-            }
-            "text" => {
-                let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                json!({ "entries": slice, "next": upto, "len": len })
+            })),
+            "text" => Ok(self.transcript.read(|t| {
                 let mut out = String::new();
                 for e in &t.entries {
                     out.push_str(&format!("{}: {}\n", e.author, e.body.plain()));
                 }
-                Ok(json!({ "text": out, "len": t.entries.len() as u64 }))
-            }
+                json!({ "text": out, "len": t.entries.len() as u64 })
+            })),
             "about" => {
-                let len = {
-                    let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
-                    t.entries.len() as u64
-                };
+                let len = self.transcript.read(|t| t.entries.len() as u64);
                 Ok(json!({
-                    "parent": self.parent,
                     "model": self.model.as_ref().map(|(key, _)| key.clone()),
                     "len": len,
                     "turn_running": self.turn_running(),
