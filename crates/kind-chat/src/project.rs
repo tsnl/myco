@@ -46,6 +46,14 @@ pub fn project(entries: &[Entry]) -> Vec<Message> {
             Body::ToolResults { results } => Message::ToolResults {
                 tool_use_results: results.clone(),
             },
+            // What a subscription saw reads to the model like the room
+            // speaking: an unattributed user message, tagged with where it
+            // came from.
+            Body::Watched { instance, data } => Message::UserMessage {
+                content: vec![Content::Text {
+                    text: format!("[watched {instance}]\n{data}"),
+                }],
+            },
         })
         .collect()
 }
