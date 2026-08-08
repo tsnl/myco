@@ -1,0 +1,9 @@
+# Dev loop only — never the deployed topology (DESIGN.md: one origin, one
+# binary). `trunk serve` proxies /api to a locally running `myco`; the
+# production bundle is `trunk build`, embedded into the binary on the next
+# `cargo build`.
+[[proxy]]
+backend = "http://127.0.0.1:7773/api"
+
+[build]
+release = true
