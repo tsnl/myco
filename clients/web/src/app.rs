@@ -8,7 +8,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::core::{
-    Action, Effect, Session, Stage, State, palette_rows, reduce, reserved_chord, wants_key,
+    Action, AdminAct, Effect, Session, Stage, State, palette_rows, reduce, reserved_chord,
+    wants_key,
 };
 
 const TOKEN_KEY: &str = "myco.token";
@@ -188,6 +189,35 @@ fn run(effect: Effect) {
                     origin,
                     id,
                     verb,
+                    status,
+                    body,
+                },
+                Err(what) => Action::NetworkFailed { what },
+            });
+        }),
+        Effect::FetchAdmin { token } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(
+                match fetch("GET", "/api/admin/users", Some(&token), None).await {
+                    Ok((status, body)) => Action::AdminAnswered { status, body },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
+        }),
+        Effect::AdminAct { token, user, act } => wasm_bindgen_futures::spawn_local(async move {
+            let (method, path) = match act {
+                AdminAct::Mint => ("POST", format!("/api/admin/users/{user}/code")),
+                AdminAct::Disable => ("POST", format!("/api/admin/users/{user}/disable")),
+                AdminAct::Enable => ("POST", format!("/api/admin/users/{user}/enable")),
+                AdminAct::Revoke => ("POST", format!("/api/admin/users/{user}/revoke")),
+                AdminAct::ClearPasskeys => {
+                    ("POST", format!("/api/admin/users/{user}/passkeys/clear"))
+                }
+                AdminAct::Remove => ("DELETE", format!("/api/admin/users/{user}")),
+            };
+            dispatch(match fetch(method, &path, Some(&token), None).await {
+                Ok((status, body)) => Action::AdminActAnswered {
+                    user,
+                    act,
                     status,
                     body,
                 },
@@ -637,6 +667,55 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
+    if let Some(button) = document.get_element_by_id("admin-toggle") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            dispatch(Action::AdminToggled);
+        });
+        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+    if let Ok(nodes) = document.query_selector_all("[data-admin-act]") {
+        for i in 0..nodes.length() {
+            if let Some(el) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let (Some(name), Some(user)) = (
+                    el.get_attribute("data-admin-act"),
+                    el.get_attribute("data-admin-user"),
+                ) else {
+                    continue;
+                };
+                let Some(act) = AdminAct::from_name(&name) else {
+                    continue;
+                };
+                let on_click =
+                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+                        event.stop_propagation();
+                        dispatch(Action::AdminActed {
+                            user: user.clone(),
+                            act,
+                        });
+                    });
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+    if let Ok(Some(scrim)) = document.query_selector("[data-dismiss-admin]") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .is_some_and(|el| el.has_attribute("data-dismiss-admin"))
+            {
+                dispatch(Action::AdminToggled);
+            }
+        });
+        let _ = scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
     if let Ok(Some(scrim)) = document.query_selector("[data-dismiss-palette]") {
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
             if event
@@ -777,7 +856,7 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
         })
         .collect();
 
-    let overlay = palette_overlay(state);
+    let overlay = format!("{}{}", palette_overlay(state), admin_overlay(state));
     let notice = match &state.notice {
         Some(notice) if state.palette.is_none() => format!(
             r#"<div class="island notice mono">{}</div>"#,
@@ -793,7 +872,7 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
                <div class="row-buttons creates">{creates}</div>
                <div class="sidebar-foot">
                  <span class="dim">{user}</span>
-                 <div class="row-buttons">
+                 <div class="row-buttons">{admin_button}
                    <button id="enroll-passkey" class="quiet-button">add a passkey</button>
                    <button id="sign-out" class="quiet-button">sign out</button>
                  </div>
@@ -804,6 +883,11 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
              <div class="stage{split}">{stage}</div>
            </div>"#,
         user = escape(user.display()),
+        admin_button = if state.admin.is_some() {
+            r#"<button id="admin-toggle" class="quiet-button">admin</button>"#
+        } else {
+            ""
+        },
         note = match &state.passkey_note {
             Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
             None => String::new(),
@@ -1051,6 +1135,88 @@ fn tree_row(
         seat = crate::core::seat_of(instance.driver.as_ref()).tone(),
         kind = escape(&instance.kind),
         title = escape(title),
+    )
+}
+
+/// The operator's panel: the roster as rows with the v2 panel's actions,
+/// the freshly minted code shown large (its only plaintext moment), and
+/// refusals in the server's words. Summoned like the palette; forgets the
+/// code when closed.
+fn admin_overlay(state: &State) -> String {
+    let Some(admin) = &state.admin else {
+        return String::new();
+    };
+    if !admin.open {
+        return String::new();
+    }
+    let minted = match &admin.minted {
+        Some(minted) => format!(
+            r#"<div class="minted island">
+                 <div class="dim">one-time code for <b>{user}</b> — single use, it will not
+                   be shown again</div>
+                 <div class="minted-code mono">{code}</div>
+               </div>"#,
+            user = escape(&minted.username),
+            code = escape(&minted.code),
+        ),
+        None => String::new(),
+    };
+    let error = match &admin.error {
+        Some(why) => format!(r#"<div class="form-error">{}</div>"#, escape(why)),
+        None => String::new(),
+    };
+    let rows: String = admin
+        .users
+        .iter()
+        .map(|user| {
+            let flags = format!(
+                "{}{} · {} session{} · {} passkey{}",
+                if user.operator { "operator · " } else { "" },
+                if user.disabled { "disabled" } else { "active" },
+                user.sessions,
+                if user.sessions == 1 { "" } else { "s" },
+                user.passkeys,
+                if user.passkeys == 1 { "" } else { "s" },
+            );
+            let act = |name: &str, label: &str| {
+                format!(
+                    r#"<button class="quiet-button" data-admin-act="{name}"
+                        data-admin-user="{id}">{label}</button>"#,
+                    id = escape(&user.id),
+                )
+            };
+            let mut actions = act("mint", "mint code");
+            if !user.operator {
+                actions += &if user.disabled {
+                    act("enable", "enable")
+                } else {
+                    act("disable", "disable")
+                };
+            }
+            actions += &act("revoke", "revoke");
+            actions += &act("clear-passkeys", "clear passkeys");
+            if !user.operator {
+                actions += &act("remove", "remove");
+            }
+            format!(
+                r#"<div class="admin-row">
+                     <div><b>{id}</b> <span class="dim">{name}</span>
+                       <div class="dim admin-flags">{flags}</div></div>
+                     <div class="row-buttons admin-actions">{actions}</div>
+                   </div>"#,
+                id = escape(&user.id),
+                name = escape(&user.name),
+                flags = escape(&flags),
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="palette-scrim" data-dismiss-admin>
+             <div class="island palette admin-panel">
+               <div class="palette-group">the roster</div>
+               {error}{minted}{rows}
+             </div>
+           </div>"#
     )
 }
 
