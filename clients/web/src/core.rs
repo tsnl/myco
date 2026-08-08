@@ -71,6 +71,9 @@ pub struct Pane {
     /// The last size this client asked the tty for — the loop-breaker
     /// between measure and resize.
     pub sent_size: Option<(u16, u16)>,
+    /// A chat pane's composer draft (uncontrolled in the DOM; mirrored
+    /// here only so a submit can read it and a send can clear it).
+    pub draft: String,
     /// The instance was removed or crashed while open. The pane stays —
     /// showing last state honestly beats vanishing work.
     pub gone: bool,
@@ -533,6 +536,10 @@ pub enum Action {
     KeyPressed { key: String, ctrl: bool, alt: bool },
     /// The edge measured the focused tty pane's usable cell grid.
     PaneMeasured { id: String, cols: u16, rows: u16 },
+    /// A chat composer submitted its text.
+    ChatPosted { id: String, text: String },
+    /// The person asked to cancel a chat's running turn.
+    TurnCancelled { id: String },
     /// `Cmd/Ctrl+P` — summon (or dismiss, when already up) the palette.
     PaletteToggled,
     /// The palette input changed.
@@ -1073,6 +1080,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 view: None,
                 app_cursor: false,
                 sent_size: None,
+                draft: String::new(),
                 gone: false,
             });
             let mut effects = vec![Effect::Watch { id: id.clone() }];
@@ -1159,6 +1167,26 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 _ => vec![],
             }
         }
+        Action::ChatPosted { id, text } => {
+            let text = text.trim().to_string();
+            if let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) {
+                pane.draft.clear();
+            }
+            match (&state.token, text.is_empty()) {
+                (Some(token), false) => vec![Effect::call_with(
+                    Origin::Drive,
+                    token,
+                    &id,
+                    "post",
+                    serde_json::json!({ "text": text }),
+                )],
+                _ => vec![],
+            }
+        }
+        Action::TurnCancelled { id } => match &state.token {
+            Some(token) => vec![Effect::call(Origin::Drive, token, &id, "cancel")],
+            None => vec![],
+        },
         Action::PaneMeasured { id, cols, rows } => {
             let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) else {
                 return vec![];
@@ -2396,6 +2424,83 @@ mod tests {
                 .unwrap()
                 .contains("cannot be disabled")
         );
+    }
+
+    #[test]
+    fn a_chat_post_sends_the_trimmed_text_and_clears_the_draft() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::KindsAnswered {
+                status: 200,
+                body: r#"[{"kind":"chat","doc":"","primary_render":"tail"}]"#.into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"c1","kind":"chat","project":"","title":"chat",
+                           "creator":{"kind":"human","id":"ada"},"driver":null}]"#
+                    .into(),
+            },
+        );
+        reduce(&mut state, Action::Selected { id: "c1".into() });
+
+        let effects = reduce(
+            &mut state,
+            Action::ChatPosted {
+                id: "c1".into(),
+                text: "  hello agent  ".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::call_with(
+                Origin::Drive,
+                "tok-1",
+                "c1",
+                "post",
+                serde_json::json!({ "text": "hello agent" })
+            )]
+        );
+        assert!(state.workspace.panes[0].draft.is_empty());
+
+        // Empty (or whitespace) posts send nothing.
+        let effects = reduce(
+            &mut state,
+            Action::ChatPosted {
+                id: "c1".into(),
+                text: "   ".into(),
+            },
+        );
+        assert!(effects.is_empty());
+
+        // Cancel maps to the chat's cancel verb.
+        let effects = reduce(&mut state, Action::TurnCancelled { id: "c1".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::call(Origin::Drive, "tok-1", "c1", "cancel")]
+        );
+    }
+
+    /// Selecting a pane that is already open and selected moves nothing
+    /// the renderer reads. That is what lets the edge skip the region —
+    /// and what lets a caret in that pane's composer survive the click
+    /// that put it there.
+    #[test]
+    fn reselecting_an_open_pane_leaves_the_rendered_state_alone() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        let before = state.clone();
+
+        let effects = reduce(&mut state, Action::Selected { id: "t1".into() });
+        assert!(effects.is_empty(), "no re-watch, no re-read");
+
+        // The action log is the one thing that moves, and nothing renders it.
+        let mut after = state.clone();
+        after.log = before.log.clone();
+        assert_eq!(after, before);
     }
 
     /// The log is the repro: every action lands in order, capped.

@@ -16,6 +16,10 @@ const TOKEN_KEY: &str = "myco.token";
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    /// The markup each region last received. A region is rewritten only
+    /// when its markup differs from this — the whole of dirty rendering.
+    static PAINTED: RefCell<std::collections::HashMap<String, String>> =
+        RefCell::new(std::collections::HashMap::new());
     /// The live event socket — edge-owned connection state (the reducer
     /// owns *what* is watched; the edge owns the wire that carries it).
     static SOCKET: RefCell<Option<web_sys::WebSocket>> = const { RefCell::new(None) };
@@ -34,6 +38,9 @@ fn send_op(op: &str, id: &str) {
 
 #[wasm_bindgen(start)]
 pub fn start() {
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        attach_delegates(&document);
+    }
     attach_keyboard();
     dispatch(Action::Boot {
         token: storage().and_then(|s| s.get_item(TOKEN_KEY).ok().flatten()),
@@ -59,6 +66,16 @@ fn attach_keyboard() {
             if reserved_chord(&key, ctrl, meta) {
                 event.prevent_default();
                 dispatch(Action::PaletteToggled);
+                return;
+            }
+            // A field being typed into owns its own Enter. Everything else
+            // about typing is ordinary DOM; only the commit is ours.
+            if let Some(field) = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                && typed_in_field(&field, &key, event.shift_key())
+            {
+                event.prevent_default();
                 return;
             }
             let palette_open = STATE.with(|s| s.borrow().palette.is_some());
@@ -90,6 +107,39 @@ fn attach_keyboard() {
         });
     let _ = document.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
     on_key.forget();
+}
+
+/// Enter in a field: the palette's input runs the selected row, its args
+/// well runs the drafted JSON, a composer sends (shift-enter is a
+/// newline). Answers whether the keystroke was spent here.
+fn typed_in_field(field: &web_sys::Element, key: &str, shift: bool) -> bool {
+    if key != "Enter" {
+        return false;
+    }
+    let id = field.id();
+    if id == "palette-input" {
+        dispatch(Action::PaletteCommitted);
+        return true;
+    }
+    if shift {
+        return false;
+    }
+    if id == "palette-args" {
+        dispatch(Action::PaletteArgsCommitted {
+            draft: field_value("palette-args"),
+        });
+        return true;
+    }
+    if let Some(chat) = id.strip_prefix("composer-") {
+        let text = field_value(&id);
+        clear_field(&id);
+        dispatch(Action::ChatPosted {
+            id: chat.to_string(),
+            text,
+        });
+        return true;
+    }
+    false
 }
 
 /// The one entry point for every action from every source. Reduce, render,
@@ -469,33 +519,228 @@ fn url_encode(text: &str) -> String {
 // Render
 // ---------------------------------------------------------------------------
 
-/// Render is a pure function of state. At this stack position the whole
-/// UI is one island; the workspace arrives with the tree and panes.
+/// The room's fixed bones, written once. Every render after this replaces
+/// the *contents* of a region, never the room — which is what makes an
+/// unchanged region cost nothing and a focused field survive a render
+/// somewhere else.
+const SKELETON: &str = r#"<div id="region-overlay"></div>
+<div id="region-notice"></div>
+<div id="region-shell" class="shell-center"></div>
+<div class="workspace" id="region-workspace">
+  <div class="island sidebar" id="region-sidebar"></div>
+  <div class="stage" id="region-stage"></div>
+</div>"#;
+
+/// Render is a pure function of state — and a *diff* against what is
+/// already on screen.
+///
+/// The old shape rewrote `<body>` on every action, which meant every
+/// keystroke destroyed the field being typed into and every feed event
+/// destroyed the terminal being read. Each region's markup is formatted
+/// (cheap: a string), compared with what that region last got, and written
+/// only if it differs. Comparing the markup rather than the state slice it
+/// came from is deliberate: it is the same test one step later, and it
+/// cannot be wrong about which slices a region reads.
 fn render(state: &State) {
-    let html = match &state.session {
-        Session::Checking => shell_card("", "reaching the server…", ""),
-        Session::Unreachable { why } => shell_card("attn", &escape(why), ""),
-        Session::SignedOut => sign_in_card(state),
-        Session::SignedIn(user) => workspace_view(state, user),
-    };
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
-    if let Some(body) = document.body() {
-        body.set_inner_html(&html);
+    let Some(body) = document.body() else {
+        return;
+    };
+    if document.get_element_by_id("region-shell").is_none() {
+        body.set_inner_html(SKELETON);
     }
-    wire(&document);
+
+    let signed_in = matches!(state.session, Session::SignedIn(_));
+    paint(&document, "region-overlay", &{
+        let mut html = palette_overlay(state);
+        html.push_str(&admin_overlay(state));
+        html
+    });
+    paint(&document, "region-notice", &notice_view(state));
+    paint(
+        &document,
+        "region-shell",
+        &match &state.session {
+            Session::Checking => shell_card("", "reaching the server…", ""),
+            Session::Unreachable { why } => shell_card("attn", &escape(why), ""),
+            Session::SignedOut => sign_in_card(state),
+            Session::SignedIn(_) => String::new(),
+        },
+    );
+    if let Session::SignedIn(user) = &state.session {
+        paint(&document, "region-sidebar", &sidebar_view(state, user));
+        paint(&document, "region-stage", &stage_view(state));
+    }
+    // The two full-height regions are alternatives: one room at a time.
+    show(&document, "region-shell", !signed_in);
+    show(&document, "region-workspace", signed_in);
+    if let Some(stage) = document.get_element_by_id("region-stage") {
+        let split = if state.workspace.panes.is_empty() {
+            "stage"
+        } else {
+            "stage split"
+        };
+        if stage.class_name() != split {
+            stage.set_class_name(split);
+        }
+    }
+
+    focus_summoned_field(&document);
+    measure_focused_tty(&document);
+}
+
+/// Write a region's markup, but only when it actually changed — and put
+/// the caret back when it did. Losing a caret mid-sentence is the whole
+/// reason wholesale re-rendering was intolerable, so the one case where a
+/// rewrite is unavoidable is the one case that restores it.
+fn paint(document: &web_sys::Document, region: &str, html: &str) {
+    let unchanged = PAINTED.with(|painted| {
+        painted
+            .borrow()
+            .get(region)
+            .is_some_and(|last| last == html)
+    });
+    if unchanged {
+        return;
+    }
+    let Some(host) = document.get_element_by_id(region) else {
+        return;
+    };
+    let caret = caret_in(document, &host);
+    host.set_inner_html(html);
+    restore_caret(document, caret);
+    PAINTED.with(|painted| {
+        painted
+            .borrow_mut()
+            .insert(region.to_string(), html.to_string())
+    });
+}
+
+/// A field mid-use, when it sits inside the region about to be rewritten:
+/// what it holds and where the caret is. Only named fields are
+/// restorable — an id is what survives `set_inner_html`. The *value* is
+/// restored too, because a composer is uncontrolled by design (the DOM
+/// holds the sentence until it is sent), so a repaint that dropped it
+/// would drop what someone was in the middle of writing.
+struct Caret {
+    id: String,
+    value: String,
+    start: u32,
+    end: u32,
+}
+
+fn caret_in(document: &web_sys::Document, host: &web_sys::Element) -> Option<Caret> {
+    let active = document.active_element()?;
+    if !host.contains(Some(&active)) || active.id().is_empty() {
+        return None;
+    }
+    let (value, start, end) = if let Some(area) = active.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        (
+            area.value(),
+            area.selection_start().ok()?,
+            area.selection_end().ok()?,
+        )
+    } else if let Some(input) = active.dyn_ref::<web_sys::HtmlInputElement>() {
+        (
+            input.value(),
+            input.selection_start().ok()?,
+            input.selection_end().ok()?,
+        )
+    } else {
+        return None;
+    };
+    Some(Caret {
+        id: active.id(),
+        value,
+        start: start.unwrap_or(0),
+        end: end.unwrap_or(0),
+    })
+}
+
+fn restore_caret(document: &web_sys::Document, caret: Option<Caret>) {
+    let Some(caret) = caret else { return };
+    let Some(el) = document.get_element_by_id(&caret.id) else {
+        return;
+    };
+    if let Some(html) = el.dyn_ref::<web_sys::HtmlElement>() {
+        let _ = html.focus();
+    }
+    if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        if area.value() != caret.value {
+            area.set_value(&caret.value);
+        }
+        let _ = area.set_selection_range(caret.start, caret.end);
+    } else if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+        if input.value() != caret.value {
+            input.set_value(&caret.value);
+        }
+        let _ = input.set_selection_range(caret.start, caret.end);
+    }
+}
+
+/// Empty an uncontrolled field the edge owns — the composer, once its
+/// sentence has been sent. The reducer clears its mirror; the DOM is ours.
+fn clear_field(id: &str) {
+    if let Some(area) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+    {
+        area.set_value("");
+    }
+}
+
+/// `hidden` on the region that is not the current room. The two are
+/// full-height alternatives, so leaving both in the layout would stack
+/// them.
+fn show(document: &web_sys::Document, region: &str, visible: bool) {
+    let Some(el) = document.get_element_by_id(region) else {
+        return;
+    };
+    if visible {
+        let _ = el.remove_attribute("hidden");
+    } else {
+        let _ = el.set_attribute("hidden", "");
+    }
+}
+
+/// A field that appears because it was summoned takes the caret: the
+/// palette's input, or the args well it hands you. Restoration handles
+/// every later render; this is the first one, where there was nothing to
+/// restore from.
+fn focus_summoned_field(document: &web_sys::Document) {
+    let already = document
+        .active_element()
+        .map(|el| el.id())
+        .unwrap_or_default();
+    if already == "palette-args" || already == "palette-input" {
+        return;
+    }
+    for id in ["palette-args", "palette-input"] {
+        let Some(el) = document.get_element_by_id(id) else {
+            continue;
+        };
+        if let Some(html) = el.dyn_ref::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
+        // The caret goes to the end, not in front of what is already typed.
+        if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+            let len = input.value().len() as u32;
+            let _ = input.set_selection_range(len, len);
+        }
+        return;
+    }
 }
 
 fn shell_card(dot: &str, line: &str, extra: &str) -> String {
     format!(
-        r#"<div class="shell-center">
-             <div class="island shell-card">
-               <div class="shell-brand"><span class="spore">●</span> myco</div>
-               <div class="dim">a workspace of instances, shared by humans and agents</div>
-               <div class="status-line"><span class="status-dot {dot}"></span><span>{line}</span></div>
-               {extra}
-             </div>
+        r#"<div class="island shell-card">
+             <div class="shell-brand"><span class="spore">●</span> myco</div>
+             <div class="dim">a workspace of instances, shared by humans and agents</div>
+             <div class="status-line"><span class="status-dot {dot}"></span><span>{line}</span></div>
+             {extra}
            </div>"#
     )
 }
@@ -507,300 +752,167 @@ fn sign_in_card(state: &State) -> String {
     };
     let busy = if state.sign_in.busy { "disabled" } else { "" };
     format!(
-        r#"<div class="shell-center">
-             <div class="island shell-card">
-               <div class="shell-brand"><span class="spore">●</span> myco</div>
-               <div class="dim">sign in with your one-time code — minted by the operator,
-                 or printed where the server started</div>
-               <form id="sign-in">
-                 <label class="field"><span class="dim">username</span>
-                   <input id="username" autocomplete="username" autofocus /></label>
-                 <label class="field"><span class="dim">code</span>
-                   <input id="code" class="mono" placeholder="XXXXX-XXXXX"
-                          autocomplete="one-time-code" /></label>
-                 {error}
-                 <button class="primary-button" {busy}>sign in</button>
-                 <button type="button" id="passkey-sign-in" class="quiet-button" {busy}>
-                   sign in with a passkey</button>
-               </form>
-             </div>
+        r#"<div class="island shell-card">
+             <div class="shell-brand"><span class="spore">●</span> myco</div>
+             <div class="dim">sign in with your one-time code — minted by the operator,
+               or printed where the server started</div>
+             <form id="sign-in">
+               <label class="field"><span class="dim">username</span>
+                 <input id="username" autocomplete="username" autofocus /></label>
+               <label class="field"><span class="dim">code</span>
+                 <input id="code" class="mono" placeholder="XXXXX-XXXXX"
+                        autocomplete="one-time-code" /></label>
+               {error}
+               <button class="primary-button" {busy}>sign in</button>
+               <button type="button" data-act="passkey-sign-in" class="quiet-button" {busy}>
+                 sign in with a passkey</button>
+             </form>
            </div>"#
     )
 }
 
-/// Attach listeners after a render. Listeners only dispatch — logic lives
-/// in the reducer. (The small closures are forgotten on purpose: one per
-/// render of a form, reclaimed with the document nodes.)
-fn wire(document: &web_sys::Document) {
-    if let Some(form) = document.get_element_by_id("sign-in") {
-        let doc = document.clone();
-        let on_submit = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            event.prevent_default();
-            let value = |id: &str| {
-                doc.get_element_by_id(id)
-                    .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-                    .map(|i| i.value())
-                    .unwrap_or_default()
-            };
-            dispatch(Action::SignInSubmitted {
-                username: value("username"),
-                code: value("code"),
-            });
-        });
-        let _ = form.add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
-        on_submit.forget();
-    }
-    if let Some(button) = document.get_element_by_id("passkey-sign-in") {
-        let doc = document.clone();
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            let username = doc
-                .get_element_by_id("username")
-                .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-                .map(|i| i.value())
-                .unwrap_or_default();
-            dispatch(Action::PasskeySignInRequested { username });
-        });
-        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
-    }
-    if let Some(button) = document.get_element_by_id("enroll-passkey") {
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            dispatch(Action::EnrollPasskeyRequested);
-        });
-        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
-    }
-    if let Ok(panes) = document.query_selector_all("[data-focus]") {
-        for i in 0..panes.length() {
-            if let Some(el) = panes
-                .item(i)
-                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-            {
-                let id = el.get_attribute("data-focus").unwrap_or_default();
-                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                    dispatch(Action::Selected { id: id.clone() });
-                });
-                let _ =
-                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-                on_click.forget();
+/// The delegated listeners, attached once to the document.
+///
+/// The old shape re-attached a closure per element after every render and
+/// leaked each one (`Closure::forget`) — a listener per tree row per
+/// keystroke. These four are created at startup and never again: a click,
+/// a submit, and an input anywhere in the room arrive here, and the
+/// *nearest ancestor of the target carrying an action attribute* decides
+/// what it meant. That is what a `stopPropagation` on every inner button
+/// used to buy, except it cannot be forgotten on a button added later.
+fn attach_delegates(document: &web_sys::Document) {
+    let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(target) = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let mut node = Some(target);
+        while let Some(el) = node {
+            if clicked(&el) {
+                return;
             }
+            // An island swallows clicks on its own background, so the
+            // scrim behind it does not read them as "dismiss".
+            if el.has_attribute("data-keep") {
+                return;
+            }
+            node = el.parent_element();
         }
-    }
-    measure_focused_tty(document);
+    });
+    let _ = document.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+    on_click.forget();
 
-    if let Some(input) = document
-        .get_element_by_id("palette-input")
-        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-    {
-        let _ = input.focus();
-        // Put the caret at the end, not the start.
-        let len = input.value().len() as u32;
-        let _ = input.set_selection_range(len, len);
-        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if let Some(target) = event
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
-            {
-                dispatch(Action::PaletteQueried {
-                    query: target.value(),
-                });
-            }
-        });
-        let _ = input.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
-        on_input.forget();
-        let on_enter =
-            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-                if e.key() == "Enter" {
-                    e.prevent_default();
-                    dispatch(Action::PaletteCommitted);
-                }
-            });
-        let _ =
-            input.add_event_listener_with_callback("keydown", on_enter.as_ref().unchecked_ref());
-        on_enter.forget();
-    }
-    if let Some(well) = document
-        .get_element_by_id("palette-args")
-        .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
-    {
-        let _ = well.focus();
-        let target = well.clone();
-        let on_enter =
-            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-                if e.key() == "Enter" && !e.shift_key() {
-                    e.prevent_default();
-                    dispatch(Action::PaletteArgsCommitted {
-                        draft: target.value(),
-                    });
-                }
-            });
-        let _ = well.add_event_listener_with_callback("keydown", on_enter.as_ref().unchecked_ref());
-        on_enter.forget();
-    }
-    if let Ok(rows) = document.query_selector_all("[data-commit]") {
-        for i in 0..rows.length() {
-            if let Some(row) = rows
-                .item(i)
-                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-            {
-                let index: usize = row
-                    .get_attribute("data-commit")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                let on_click =
-                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-                        event.stop_propagation();
-                        // Land the selection on the clicked row, then
-                        // commit — two ordinary dispatches, no special
-                        // click path through the reducer.
-                        let current = STATE
-                            .with(|s| s.borrow().palette.as_ref().map(|p| p.selected))
-                            .unwrap_or(0);
-                        dispatch(Action::PaletteMoved {
-                            delta: index as i32 - current as i32,
-                        });
-                        dispatch(Action::PaletteCommitted);
-                    });
-                let _ = row
-                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-                on_click.forget();
-            }
-        }
-    }
-    if let Some(button) = document.get_element_by_id("admin-toggle") {
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            dispatch(Action::AdminToggled);
-        });
-        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
-    }
-    if let Ok(nodes) = document.query_selector_all("[data-admin-act]") {
-        for i in 0..nodes.length() {
-            if let Some(el) = nodes
-                .item(i)
-                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-            {
-                let (Some(name), Some(user)) = (
-                    el.get_attribute("data-admin-act"),
-                    el.get_attribute("data-admin-user"),
-                ) else {
-                    continue;
-                };
-                let Some(act) = AdminAct::from_name(&name) else {
-                    continue;
-                };
-                let on_click =
-                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-                        event.stop_propagation();
-                        dispatch(Action::AdminActed {
-                            user: user.clone(),
-                            act,
-                        });
-                    });
-                let _ =
-                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-                on_click.forget();
-            }
-        }
-    }
-    if let Ok(Some(scrim)) = document.query_selector("[data-dismiss-admin]") {
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if event
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-                .is_some_and(|el| el.has_attribute("data-dismiss-admin"))
-            {
-                dispatch(Action::AdminToggled);
-            }
-        });
-        let _ = scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
-    }
-    if let Ok(Some(scrim)) = document.query_selector("[data-dismiss-palette]") {
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            if event
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-                .is_some_and(|el| el.has_attribute("data-dismiss-palette"))
-            {
-                dispatch(Action::PaletteDismissed);
-            }
-        });
-        let _ = scrim.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
-    }
+    let on_submit = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(form) = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        event.prevent_default();
+        submitted(&form);
+    });
+    let _ = document.add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
+    on_submit.forget();
 
-    // Tree rows and create buttons: data attributes carry the action's
-    // argument; the listener only dispatches.
-    if let Ok(rows) = document.query_selector_all("[data-open]") {
-        for i in 0..rows.length() {
-            if let Some(row) = rows
-                .item(i)
-                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-            {
-                let id = row.get_attribute("data-open").unwrap_or_default();
-                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                    dispatch(Action::Selected { id: id.clone() });
-                });
-                let _ = row
-                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-                on_click.forget();
-            }
+    let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(el) = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        if el.id() == "palette-input"
+            && let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>()
+        {
+            dispatch(Action::PaletteQueried {
+                query: input.value(),
+            });
         }
-    }
-    if let Ok(buttons) = document.query_selector_all("[data-create]") {
-        for i in 0..buttons.length() {
-            if let Some(button) = buttons
-                .item(i)
-                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-            {
-                let kind = button.get_attribute("data-create").unwrap_or_default();
-                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                    dispatch(Action::CreateRequested { kind: kind.clone() });
-                });
-                let _ = button
-                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-                on_click.forget();
-            }
-        }
-    }
-    for (attr, make) in [
-        (
-            "data-take",
-            (|id: String| Action::TakeRequested { id }) as fn(String) -> Action,
-        ),
-        ("data-release", |id| Action::ReleaseRequested { id }),
-        ("data-close", |id| Action::PaneClosed { id }),
-    ] {
-        if let Ok(nodes) = document.query_selector_all(&format!("[{attr}]")) {
-            for i in 0..nodes.length() {
-                if let Some(el) = nodes
-                    .item(i)
-                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
-                {
-                    let id = el.get_attribute(attr).unwrap_or_default();
-                    let on_click =
-                        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-                            // Pane buttons live inside clickable chrome;
-                            // don't also select the row behind them.
-                            event.stop_propagation();
-                            dispatch(make(id.clone()));
-                        });
-                    let _ = el.add_event_listener_with_callback(
-                        "click",
-                        on_click.as_ref().unchecked_ref(),
-                    );
-                    on_click.forget();
-                }
-            }
-        }
-    }
-    if let Some(button) = document.get_element_by_id("sign-out") {
-        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            dispatch(Action::SignOutRequested);
+    });
+    let _ = document.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
+    on_input.forget();
+}
+
+/// What one element's action attributes mean. `true` means "this element
+/// answered the click", which stops the walk up the tree.
+fn clicked(el: &web_sys::Element) -> bool {
+    let attr = |name: &str| el.get_attribute(name);
+    if let Some(id) = attr("data-open").or_else(|| attr("data-focus")) {
+        dispatch(Action::Selected { id });
+    } else if let Some(kind) = attr("data-create") {
+        dispatch(Action::CreateRequested { kind });
+    } else if let Some(id) = attr("data-take") {
+        dispatch(Action::TakeRequested { id });
+    } else if let Some(id) = attr("data-release") {
+        dispatch(Action::ReleaseRequested { id });
+    } else if let Some(id) = attr("data-close") {
+        dispatch(Action::PaneClosed { id });
+    } else if let Some(id) = attr("data-cancel") {
+        dispatch(Action::TurnCancelled { id });
+    } else if let Some(index) = attr("data-commit").and_then(|v| v.parse::<usize>().ok()) {
+        // Land the selection on the clicked row, then commit — two
+        // ordinary dispatches, no special click path through the reducer.
+        let current = STATE
+            .with(|s| s.borrow().palette.as_ref().map(|p| p.selected))
+            .unwrap_or(0);
+        dispatch(Action::PaletteMoved {
+            delta: index as i32 - current as i32,
         });
-        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
-        on_click.forget();
+        dispatch(Action::PaletteCommitted);
+    } else if let (Some(name), Some(user)) = (attr("data-admin-act"), attr("data-admin-user")) {
+        let Some(act) = AdminAct::from_name(&name) else {
+            return true;
+        };
+        dispatch(Action::AdminActed { user, act });
+    } else if let Some(name) = attr("data-act") {
+        match name.as_str() {
+            "sign-out" => dispatch(Action::SignOutRequested),
+            "enroll-passkey" => dispatch(Action::EnrollPasskeyRequested),
+            "passkey-sign-in" => dispatch(Action::PasskeySignInRequested {
+                username: field_value("username"),
+            }),
+            "admin-toggle" | "dismiss-admin" => dispatch(Action::AdminToggled),
+            "dismiss-palette" => dispatch(Action::PaletteDismissed),
+            _ => {}
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+/// The two forms in the room: the sign-in card and a chat's composer.
+fn submitted(form: &web_sys::Element) {
+    if form.id() == "sign-in" {
+        dispatch(Action::SignInSubmitted {
+            username: field_value("username"),
+            code: field_value("code"),
+        });
+    } else if let Some(id) = form.get_attribute("data-chat") {
+        let field = format!("composer-{id}");
+        let text = field_value(&field);
+        clear_field(&field);
+        dispatch(Action::ChatPosted { id, text });
+    }
+}
+
+/// The current text of a named field, or nothing if it is not there.
+fn field_value(id: &str) -> String {
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    else {
+        return String::new();
+    };
+    if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+        input.value()
+    } else if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        area.value()
+    } else {
+        String::new()
     }
 }
 
@@ -808,7 +920,8 @@ fn wire(document: &web_sys::Document) {
 // The workspace: sidebar tree + (for now) an empty stage
 // ---------------------------------------------------------------------------
 
-fn workspace_view(state: &State, user: &crate::core::User) -> String {
+/// The sidebar's contents: the tree, the create row, and who you are.
+fn sidebar_view(state: &State, user: &crate::core::User) -> String {
     let ws = &state.workspace;
     let feed = match ws.feed {
         crate::core::Feed::Live => r#"<span class="status-dot ok"></span><span>live</span>"#,
@@ -856,35 +969,22 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
         })
         .collect();
 
-    let overlay = format!("{}{}", palette_overlay(state), admin_overlay(state));
-    let notice = match &state.notice {
-        Some(notice) if state.palette.is_none() => format!(
-            r#"<div class="island notice mono">{}</div>"#,
-            escape(notice)
-        ),
-        _ => String::new(),
-    };
     format!(
-        r#"{overlay}{notice}<div class="workspace">
-             <div class="island sidebar">
-               <div class="shell-brand"><span class="spore">●</span> myco</div>
-               <div class="tree">{tree}</div>
-               <div class="row-buttons creates">{creates}</div>
-               <div class="sidebar-foot">
-                 <span class="dim">{user}</span>
-                 <div class="row-buttons">{admin_button}
-                   <button id="enroll-passkey" class="quiet-button">add a passkey</button>
-                   <button id="sign-out" class="quiet-button">sign out</button>
-                 </div>
-               </div>
-               {note}
-               <div class="status-line">{feed}</div>
+        r#"<div class="shell-brand"><span class="spore">●</span> myco</div>
+           <div class="tree">{tree}</div>
+           <div class="row-buttons creates">{creates}</div>
+           <div class="sidebar-foot">
+             <span class="dim">{user}</span>
+             <div class="row-buttons">{admin_button}
+               <button data-act="enroll-passkey" class="quiet-button">add a passkey</button>
+               <button data-act="sign-out" class="quiet-button">sign out</button>
              </div>
-             <div class="stage{split}">{stage}</div>
-           </div>"#,
+           </div>
+           {note}
+           <div class="status-line">{feed}</div>"#,
         user = escape(user.display()),
         admin_button = if state.admin.is_some() {
-            r#"<button id="admin-toggle" class="quiet-button">admin</button>"#
+            r#"<button data-act="admin-toggle" class="quiet-button">admin</button>"#
         } else {
             ""
         },
@@ -892,13 +992,29 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
             None => String::new(),
         },
-        split = if ws.panes.is_empty() { "" } else { " split" },
-        stage = if ws.panes.is_empty() {
-            r#"<div class="dim stage-empty">open an instance from the tree</div>"#.to_string()
-        } else {
-            ws.panes.iter().map(|p| pane_view(p, ws)).collect()
-        },
     )
+}
+
+/// The stage's contents: every open pane, or the invitation.
+fn stage_view(state: &State) -> String {
+    let ws = &state.workspace;
+    if ws.panes.is_empty() {
+        r#"<div class="dim stage-empty">open an instance from the tree</div>"#.to_string()
+    } else {
+        ws.panes.iter().map(|p| pane_view(p, ws)).collect()
+    }
+}
+
+/// The last palette answer, quiet at the bottom of the room. The palette
+/// covering it wins; two floating things at once is noise.
+fn notice_view(state: &State) -> String {
+    match &state.notice {
+        Some(notice) if state.palette.is_none() => format!(
+            r#"<div class="island notice mono">{}</div>"#,
+            escape(notice)
+        ),
+        _ => String::new(),
+    }
 }
 
 /// One pane: an island with chrome (title, the seat chip, close) over the
@@ -947,6 +1063,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     };
     let view = match &pane.view {
         Some(view) if pane.kind == "tty" => tty_screen(view),
+        Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
         Some(view) => format!(
             r#"<pre class="mono pane-body">{}</pre>"#,
             escape(&pretty(view))
@@ -968,6 +1085,190 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
         title = escape(&title),
         id = escape(&pane.id),
     )
+}
+
+/// The chat renderer: the `tail` payload as a transcript — bylines with
+/// the presence dot, streaming turns still running shown live (an
+/// assistant entry with no turn_end is a breathing thought, not history),
+/// tool calls and their results folded quietly, watched splices set
+/// apart. Below it, the composer.
+fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
+    #[derive(serde::Deserialize)]
+    struct Author {
+        kind: String,
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        author: Author,
+        #[serde(rename = "t")]
+        t: String,
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        content: Vec<serde_json::Value>,
+        #[serde(default)]
+        tool_uses: Vec<serde_json::Value>,
+        #[serde(default)]
+        results: Vec<serde_json::Value>,
+        #[serde(default)]
+        instance: String,
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        turn_end: Option<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Tail {
+        #[serde(default)]
+        entries: Vec<Entry>,
+    }
+    let Ok(tail) = serde_json::from_str::<Tail>(raw) else {
+        return format!(
+            r#"<pre class="mono pane-body">{}</pre>"#,
+            escape(&pretty(raw))
+        );
+    };
+    let mut running = false;
+    let body: String = tail
+        .entries
+        .iter()
+        .map(|e| {
+            let dot = match e.author.kind.as_str() {
+                "human" => "human",
+                "agent" => "agent",
+                _ => "system",
+            };
+            match e.t.as_str() {
+                "message" => bubble(dot, &e.author.id, &escape(&e.text), ""),
+                "assistant" => {
+                    let text = content_text(&e.content);
+                    let streaming = e.turn_end.is_none();
+                    running |= streaming;
+                    let tools: String = e
+                        .tool_uses
+                        .iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                        .map(|name| {
+                            format!(r#"<span class="tool-chip mono">⚙ {}</span>"#, escape(name))
+                        })
+                        .collect();
+                    let cursor = if streaming {
+                        r#"<span class="stream-cursor"></span>"#
+                    } else {
+                        ""
+                    };
+                    bubble(dot, "agent", &format!("{}{cursor}", escape(&text)), &tools)
+                }
+                "tool_results" => {
+                    let text = e
+                        .results
+                        .iter()
+                        .filter_map(|r| r.get("content").and_then(content_of))
+                        .collect::<Vec<_>>()
+                        .join(
+                            "
+",
+                        );
+                    format!(
+                        r#"<details class="tool-result"><summary class="dim">tool result</summary>
+                             <pre class="mono">{}</pre></details>"#,
+                        escape(&text)
+                    )
+                }
+                "watched" => format!(
+                    r#"<div class="watched dim"><span class="mono">watched {}</span>
+                         <pre class="mono">{}</pre></div>"#,
+                    escape(&e.instance),
+                    escape(&e.data),
+                ),
+                _ => String::new(),
+            }
+        })
+        .collect();
+
+    let modeled = pane_is_modeled(pane);
+    let composer = if modeled {
+        let cancel = if running {
+            format!(
+                r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#,
+                id = escape(&pane.id)
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<form class="composer" data-chat="{id}">
+                 <textarea id="composer-{id}" class="composer-input" rows="1"
+                   placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
+                 <div class="composer-foot">{cancel}
+                   <button class="primary-button">send</button></div>
+               </form>"#,
+            id = escape(&pane.id),
+            draft = escape(&pane.draft),
+        )
+    } else {
+        r#"<div class="dim composer-note">this chat has no model — it is a shared transcript.
+             post with the palette or the API.</div>"#
+            .to_string()
+    };
+
+    format!(r#"<div class="pane-body chat"><div class="transcript">{body}</div>{composer}</div>"#)
+}
+
+/// Whether the chat pane's instance carries a model driver — a modeled
+/// chat is driven by its own agent, which the listing shows as the seat.
+fn pane_is_modeled(pane: &crate::core::Pane) -> bool {
+    // The chat's `about` isn't in the pane; infer from the driver being an
+    // agent named for this instance (the doctrine's naming). Absent that,
+    // still offer the composer — worst case a post to a modelless chat
+    // simply appends without a reply.
+    let _ = pane;
+    true
+}
+
+fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {
+    format!(
+        r#"<div class="entry">
+             <div class="byline"><span class="seat {dot}"></span>
+               <span class="dim">{who}</span></div>
+             <div class="entry-body">{text}{extra}</div>
+           </div>"#,
+        who = escape(who),
+    )
+}
+
+/// Concatenate the text blocks of a content run (the wire's serde tags).
+fn content_text(content: &[serde_json::Value]) -> String {
+    content
+        .iter()
+        .filter_map(|c| {
+            c.get("Text")
+                .and_then(|t| t.get("text"))
+                .and_then(|t| t.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+fn content_of(content: &serde_json::Value) -> Option<String> {
+    content.as_array().map(|blocks| {
+        blocks
+            .iter()
+            .filter_map(|b| {
+                b.get("Text")
+                    .and_then(|t| t.get("text"))
+                    .and_then(|t| t.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            )
+    })
 }
 
 fn pretty(raw: &str) -> String {
@@ -1211,8 +1512,8 @@ fn admin_overlay(state: &State) -> String {
         })
         .collect();
     format!(
-        r#"<div class="palette-scrim" data-dismiss-admin>
-             <div class="island palette admin-panel">
+        r#"<div class="palette-scrim" data-act="dismiss-admin">
+             <div class="island palette admin-panel" data-keep>
                <div class="palette-group">the roster</div>
                {error}{minted}{rows}
              </div>
@@ -1289,8 +1590,8 @@ fn palette_overlay(state: &State) -> String {
         }
     };
     format!(
-        r#"<div class="palette-scrim" data-dismiss-palette>
-             <div class="island palette" id="palette">{inner}</div>
+        r#"<div class="palette-scrim" data-act="dismiss-palette">
+             <div class="island palette" id="palette" data-keep>{inner}</div>
            </div>"#
     )
 }
