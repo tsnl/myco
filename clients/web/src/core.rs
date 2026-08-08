@@ -64,6 +64,9 @@ pub struct Pane {
     /// The last size this client asked the tty for — the loop-breaker
     /// between measure and resize.
     pub sent_size: Option<(u16, u16)>,
+    /// A chat pane's composer draft (uncontrolled in the DOM; mirrored
+    /// here only so a submit can read it and a send can clear it).
+    pub draft: String,
     /// The instance was removed or crashed while open. The pane stays —
     /// showing last state honestly beats vanishing work.
     pub gone: bool,
@@ -412,6 +415,10 @@ pub enum Action {
     },
     /// The edge measured the focused tty pane's usable cell grid.
     PaneMeasured { id: String, cols: u16, rows: u16 },
+    /// A chat composer submitted its text.
+    ChatPosted { id: String, text: String },
+    /// The person asked to cancel a chat's running turn.
+    TurnCancelled { id: String },
     /// `Cmd/Ctrl+P` — summon (or dismiss, when already up) the palette.
     PaletteToggled,
     /// The palette input changed.
@@ -509,6 +516,12 @@ pub enum Effect {
         token: String,
         id: String,
         data: String,
+    },
+    /// `post {text}` on a chat → [`Action::VerbAnswered`] (verb `post`).
+    Post {
+        token: String,
+        id: String,
+        text: String,
     },
     /// `resize {cols, rows}` on a tty → [`Action::VerbAnswered`].
     Resize {
@@ -920,6 +933,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 view: None,
                 app_cursor: false,
                 sent_size: None,
+                draft: String::new(),
                 gone: false,
             });
             let mut effects = vec![Effect::Watch { id: id.clone() }];
@@ -1021,6 +1035,28 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 _ => vec![],
             }
         }
+        Action::ChatPosted { id, text } => {
+            let text = text.trim().to_string();
+            if let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) {
+                pane.draft.clear();
+            }
+            match (&state.token, text.is_empty()) {
+                (Some(token), false) => vec![Effect::Post {
+                    token: token.clone(),
+                    id,
+                    text,
+                }],
+                _ => vec![],
+            }
+        }
+        Action::TurnCancelled { id } => match &state.token {
+            Some(token) => vec![Effect::CallVerb {
+                token: token.clone(),
+                id,
+                verb: "cancel".into(),
+            }],
+            None => vec![],
+        },
         Action::PaneMeasured { id, cols, rows } => {
             let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) else {
                 return vec![];
@@ -2175,6 +2211,66 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("cannot be disabled")
+        );
+    }
+
+    #[test]
+    fn a_chat_post_sends_the_trimmed_text_and_clears_the_draft() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::KindsAnswered {
+                status: 200,
+                body: r#"[{"kind":"chat","doc":"","primary_render":"tail"}]"#.into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"c1","kind":"chat","project":"","title":"chat",
+                           "creator":{"kind":"human","id":"ada"},"driver":null}]"#
+                    .into(),
+            },
+        );
+        reduce(&mut state, Action::Selected { id: "c1".into() });
+
+        let effects = reduce(
+            &mut state,
+            Action::ChatPosted {
+                id: "c1".into(),
+                text: "  hello agent  ".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Post {
+                token: "tok-1".into(),
+                id: "c1".into(),
+                text: "hello agent".into(),
+            }]
+        );
+        assert!(state.workspace.panes[0].draft.is_empty());
+
+        // Empty (or whitespace) posts send nothing.
+        let effects = reduce(
+            &mut state,
+            Action::ChatPosted {
+                id: "c1".into(),
+                text: "   ".into(),
+            },
+        );
+        assert!(effects.is_empty());
+
+        // Cancel maps to the chat's cancel verb.
+        let effects = reduce(&mut state, Action::TurnCancelled { id: "c1".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CallVerb {
+                token: "tok-1".into(),
+                id: "c1".into(),
+                verb: "cancel".into(),
+            }]
         );
     }
 

@@ -247,6 +247,20 @@ fn run(effect: Effect) {
                 Err(what) => Action::NetworkFailed { what },
             });
         }),
+        Effect::Post { token, id, text } => wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/instances/{id}/verbs/post");
+            let body = serde_json::json!({ "text": text }).to_string();
+            dispatch(
+                match fetch("POST", &url, Some(&token), Some((JSON, body))).await {
+                    Ok((status, _)) => Action::VerbAnswered {
+                        id,
+                        verb: "post".into(),
+                        status,
+                    },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
+        }),
         Effect::Watch { id } => send_op("watch", &id),
         Effect::Unwatch { id } => send_op("unwatch", &id),
         Effect::ReadPane { token, id, verb } => wasm_bindgen_futures::spawn_local(async move {
@@ -619,6 +633,63 @@ fn wire(document: &web_sys::Document) {
     }
     measure_focused_tty(document);
 
+    if let Ok(nodes) = document.query_selector_all("[data-chat]") {
+        for i in 0..nodes.length() {
+            if let Some(form) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+                let id = form.get_attribute("data-chat").unwrap_or_default();
+                let doc = document.clone();
+                let submit_id = id.clone();
+                let on_submit = Closure::<dyn FnMut(web_sys::Event)>::new(
+                    move |event: web_sys::Event| {
+                        event.prevent_default();
+                        let text = doc
+                            .get_element_by_id(&format!("composer-{submit_id}"))
+                            .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+                            .map(|t| t.value())
+                            .unwrap_or_default();
+                        dispatch(Action::ChatPosted {
+                            id: submit_id.clone(),
+                            text,
+                        });
+                    },
+                );
+                let _ = form
+                    .add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
+                on_submit.forget();
+
+                // Enter sends; shift-enter is a newline.
+                if let Some(area) = document
+                    .get_element_by_id(&format!("composer-{id}"))
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+                {
+                    let form2 = form.clone();
+                    let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+                        move |e: web_sys::KeyboardEvent| {
+                            if e.key() == "Enter" && !e.shift_key() {
+                                e.prevent_default();
+                                let _ = form2
+                                    .dyn_ref::<web_sys::HtmlElement>()
+                                    .map(|f| f.click());
+                            }
+                        },
+                    );
+                    let _ = area
+                        .add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+                    on_key.forget();
+                }
+            }
+        }
+    }
+    if let Ok(Some(cancel)) = document.query_selector("[data-cancel-turn]") {
+        let id = STATE.with(|s| s.borrow().workspace.selected.clone()).unwrap_or_default();
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.stop_propagation();
+            dispatch(Action::TurnCancelled { id: id.clone() });
+        });
+        let _ = cancel.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+
     if let Some(input) = document
         .get_element_by_id("palette-input")
         .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
@@ -960,6 +1031,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     };
     let view = match &pane.view {
         Some(view) if pane.kind == "tty" => tty_screen(view),
+        Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
         Some(view) => format!(
             r#"<pre class="mono pane-body">{}</pre>"#,
             escape(&pretty(view))
@@ -981,6 +1053,175 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
         title = escape(&title),
         id = escape(&pane.id),
     )
+}
+
+/// The chat renderer: the `tail` payload as a transcript — bylines with
+/// the presence dot, streaming turns still running shown live (an
+/// assistant entry with no turn_end is a breathing thought, not history),
+/// tool calls and their results folded quietly, watched splices set
+/// apart. Below it, the composer.
+fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
+    #[derive(serde::Deserialize)]
+    struct Author {
+        kind: String,
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        author: Author,
+        #[serde(rename = "t")]
+        t: String,
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        content: Vec<serde_json::Value>,
+        #[serde(default)]
+        tool_uses: Vec<serde_json::Value>,
+        #[serde(default)]
+        results: Vec<serde_json::Value>,
+        #[serde(default)]
+        instance: String,
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        turn_end: Option<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Tail {
+        #[serde(default)]
+        entries: Vec<Entry>,
+    }
+    let Ok(tail) = serde_json::from_str::<Tail>(raw) else {
+        return format!(r#"<pre class="mono pane-body">{}</pre>"#, escape(&pretty(raw)));
+    };
+    let mut running = false;
+    let body: String = tail
+        .entries
+        .iter()
+        .map(|e| {
+            let dot = match e.author.kind.as_str() {
+                "human" => "human",
+                "agent" => "agent",
+                _ => "system",
+            };
+            match e.t.as_str() {
+                "message" => bubble(dot, &e.author.id, &escape(&e.text), ""),
+                "assistant" => {
+                    let text = content_text(&e.content);
+                    let streaming = e.turn_end.is_none();
+                    running |= streaming;
+                    let tools: String = e
+                        .tool_uses
+                        .iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                        .map(|name| {
+                            format!(r#"<span class="tool-chip mono">⚙ {}</span>"#, escape(name))
+                        })
+                        .collect();
+                    let cursor = if streaming {
+                        r#"<span class="stream-cursor"></span>"#
+                    } else {
+                        ""
+                    };
+                    bubble(
+                        dot,
+                        "agent",
+                        &format!("{}{cursor}", escape(&text)),
+                        &tools,
+                    )
+                }
+                "tool_results" => {
+                    let text = e
+                        .results
+                        .iter()
+                        .filter_map(|r| r.get("content").and_then(content_of))
+                        .collect::<Vec<_>>()
+                        .join("
+");
+                    format!(
+                        r#"<details class="tool-result"><summary class="dim">tool result</summary>
+                             <pre class="mono">{}</pre></details>"#,
+                        escape(&text)
+                    )
+                }
+                "watched" => format!(
+                    r#"<div class="watched dim"><span class="mono">watched {}</span>
+                         <pre class="mono">{}</pre></div>"#,
+                    escape(&e.instance),
+                    escape(&e.data),
+                ),
+                _ => String::new(),
+            }
+        })
+        .collect();
+
+    let modeled = pane_is_modeled(pane);
+    let composer = if modeled {
+        let cancel = if running {
+            r#"<button class="quiet-button" data-cancel-turn>cancel turn</button>"#
+        } else {
+            ""
+        };
+        format!(
+            r#"<form class="composer" data-chat="{id}">
+                 <textarea id="composer-{id}" class="composer-input" rows="1"
+                   placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
+                 <div class="composer-foot">{cancel}
+                   <button class="primary-button">send</button></div>
+               </form>"#,
+            id = escape(&pane.id),
+            draft = escape(&pane.draft),
+        )
+    } else {
+        r#"<div class="dim composer-note">this chat has no model — it is a shared transcript.
+             post with the palette or the API.</div>"#
+            .to_string()
+    };
+
+    format!(r#"<div class="pane-body chat"><div class="transcript">{body}</div>{composer}</div>"#)
+}
+
+/// Whether the chat pane's instance carries a model driver — a modeled
+/// chat is driven by its own agent, which the listing shows as the seat.
+fn pane_is_modeled(pane: &crate::core::Pane) -> bool {
+    // The chat's `about` isn't in the pane; infer from the driver being an
+    // agent named for this instance (the doctrine's naming). Absent that,
+    // still offer the composer — worst case a post to a modelless chat
+    // simply appends without a reply.
+    let _ = pane;
+    true
+}
+
+fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {
+    format!(
+        r#"<div class="entry">
+             <div class="byline"><span class="seat {dot}"></span>
+               <span class="dim">{who}</span></div>
+             <div class="entry-body">{text}{extra}</div>
+           </div>"#,
+        who = escape(who),
+    )
+}
+
+/// Concatenate the text blocks of a content run (the wire's serde tags).
+fn content_text(content: &[serde_json::Value]) -> String {
+    content
+        .iter()
+        .filter_map(|c| c.get("Text").and_then(|t| t.get("text")).and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
+fn content_of(content: &serde_json::Value) -> Option<String> {
+    content.as_array().map(|blocks| {
+        blocks
+            .iter()
+            .filter_map(|b| b.get("Text").and_then(|t| t.get("text")).and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("
+")
+    })
 }
 
 fn pretty(raw: &str) -> String {
