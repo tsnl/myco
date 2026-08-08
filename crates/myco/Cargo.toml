@@ -16,7 +16,9 @@ myco-kind-chat = { path = "../kind-chat" }
 myco-kind-notifier = { path = "../kind-notifier" }
 myco-models = { path = "../models" }
 myco-kind-tty = { path = "../kind-tty" }
+myco-provider = { path = "../provider" }
 myco-server = { path = "../server" }
 mime_guess = { workspace = true }
 rust-embed = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }

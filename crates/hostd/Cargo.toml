@@ -11,3 +11,7 @@ myco-instance = { path = "../instance" }
 myco-kind-tty = { path = "../kind-tty" }
 myco-provider = { path = "../provider" }
 tokio = { workspace = true }
+
+[dev-dependencies]
+myco-provider = { path = "../provider" }
+serde_json = { workspace = true }

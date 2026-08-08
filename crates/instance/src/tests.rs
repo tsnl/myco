@@ -753,3 +753,138 @@ fn the_attention_envelope_round_trips() {
     assert_eq!(data["for"][0]["id"], "ada");
     assert_eq!(events::Attention::from_data(&data), Some(a));
 }
+
+/// A fake far end for the adoption surface: answers every forwarded verb
+/// with its name and remembers the callers — enough to prove routing,
+/// not law (law lives with the cell, which in these tests is elsewhere).
+struct FakeRemote {
+    calls: std::sync::Mutex<Vec<(Principal, String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl RemoteCall for FakeRemote {
+    async fn call(
+        &self,
+        caller: &Principal,
+        id: &str,
+        verb: &str,
+        _args: Value,
+    ) -> Result<Value, VerbError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((caller.clone(), id.to_string(), verb.to_string()));
+        Ok(json!({ "answered": verb }))
+    }
+}
+
+fn adopted_row(id: &str, parent: Option<&str>) -> InstanceInfo {
+    InstanceInfo {
+        id: id.into(),
+        kind: "tty".into(),
+        project: "default".into(),
+        title: id.into(),
+        creator: ada(),
+        parent: parent.map(str::to_string),
+        driver: Some(ada()),
+        watermark: 3,
+        crashed: false,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// Adoption is a listing fact: the row appears, nests under its origin
+/// when the provider reported no parent, and every verb — sys.* included
+/// — forwards to the far end untouched.
+#[tokio::test]
+async fn adopted_rows_list_nest_and_forward_whole() {
+    let pool = pool();
+    let host = pool
+        .create(&ada(), "counter", "default", "the host", json!({}))
+        .unwrap();
+    let far = Arc::new(FakeRemote {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+
+    pool.adopt(&host.id, adopted_row("r-1", None), far.clone());
+
+    let rows = pool.list(None);
+    let row = rows.iter().find(|r| r.id == "r-1").expect("adopted row listed");
+    assert_eq!(row.parent.as_deref(), Some(host.id.as_str()));
+    assert_eq!(pool.ancestors("r-1"), vec![host.id.clone()]);
+
+    let answer = pool.call(&ada(), "r-1", "sys.take", Value::Null).await.unwrap();
+    assert_eq!(answer, json!({ "answered": "sys.take" }));
+    let calls = far.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0], (ada(), "r-1".into(), "sys.take".into()));
+}
+
+/// Relayed marks keep the watermark contract: monotone folds, level-
+/// triggered waits, and a dropped row bumps first so waiters wake into
+/// the miss instead of hanging.
+#[tokio::test]
+async fn remote_marks_fold_monotonically_and_dropping_wakes_waiters() {
+    let pool = pool();
+    let host = pool
+        .create(&ada(), "counter", "default", "the host", json!({}))
+        .unwrap();
+    let far = Arc::new(FakeRemote {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    pool.adopt(&host.id, adopted_row("r-1", None), far);
+
+    // The row snapshot said 3; a stale relayed 2 must not rewind.
+    pool.remote_mark("r-1", 2);
+    assert_eq!(pool.watermark("r-1").unwrap(), 3);
+    pool.remote_mark("r-1", 9);
+    assert_eq!(pool.changed("r-1", 3).await.unwrap(), 9);
+
+    let waiter = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.changed("r-1", 9).await })
+    };
+    tokio::task::yield_now().await;
+    pool.drop_remote("r-1");
+    assert!(waiter.await.unwrap().is_ok(), "removal bumps, waiters wake");
+    assert!(matches!(
+        pool.changed("r-1", 0).await,
+        Err(VerbError::UnknownInstance { .. })
+    ));
+}
+
+/// A dead provider stream owes the pool its rows back — by origin, in one
+/// synchronous sweep, each departure indistinguishable from a removal.
+#[tokio::test]
+async fn drop_remotes_from_sweeps_an_origin() {
+    let pool = pool();
+    let host_a = pool
+        .create(&ada(), "counter", "default", "host a", json!({}))
+        .unwrap();
+    let host_b = pool
+        .create(&ada(), "counter", "default", "host b", json!({}))
+        .unwrap();
+    let far = Arc::new(FakeRemote {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    pool.adopt(&host_a.id, adopted_row("a-1", None), far.clone());
+    pool.adopt(&host_a.id, adopted_row("a-2", None), far.clone());
+    pool.adopt(&host_b.id, adopted_row("b-1", None), far);
+
+    let mut feed = pool.events();
+    pool.drop_remotes_from(&host_a.id);
+
+    let ids: Vec<String> = pool.list(None).into_iter().map(|r| r.id).collect();
+    assert!(!ids.contains(&"a-1".to_string()));
+    assert!(!ids.contains(&"a-2".to_string()));
+    assert!(ids.contains(&"b-1".to_string()), "other origins untouched");
+
+    let mut removed = Vec::new();
+    while let Ok((id, event)) = feed.try_recv() {
+        if event.name == "removed" {
+            removed.push(id);
+        }
+    }
+    removed.sort();
+    assert_eq!(removed, vec!["a-1".to_string(), "a-2".to_string()]);
+}

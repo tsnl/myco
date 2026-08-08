@@ -238,6 +238,23 @@ pub trait Instance: Send {
     ) -> Result<Value, VerbError>;
 }
 
+/// The far half of an adopted instance: how the pool forwards a verb to
+/// wherever the cell actually lives. Implemented by a provider's attach
+/// loop (the bus envelope over a byte stream); the pool neither knows nor
+/// cares about the transport. Everything forwards — `sys.*` included —
+/// because seat law, ownership, and the verb log all live where the cell
+/// lives: the pool is a relay, never a second judge.
+#[async_trait::async_trait]
+pub trait RemoteCall: Send + Sync {
+    async fn call(
+        &self,
+        caller: &Principal,
+        id: &str,
+        verb: &str,
+        args: Value,
+    ) -> Result<Value, VerbError>;
+}
+
 /// What the framework knows about an instance at birth, handed to the
 /// factory. `id` lets a kind that acts on the bus speak as
 /// `Principal::Agent(id)`; `creator` lets a per-principal kind (a
@@ -342,6 +359,20 @@ pub struct InstanceInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// An adopted row: an instance whose cell lives behind a [`RemoteCall`].
+/// The pool holds what a listing and a watch need — the relayed info and
+/// a local watch channel the attach loop feeds — and forwards everything
+/// else. No verb log here: the provider keeps it where the verbs run,
+/// and `sys.log` forwards like any other verb.
+struct Remote {
+    info: RwLock<InstanceInfo>,
+    /// Which adoption this row came through — a host instance's id, the
+    /// unit of cleanup when a provider's stream dies.
+    origin: String,
+    call: Arc<dyn RemoteCall>,
+    mark: tokio::sync::watch::Sender<Watermark>,
+}
+
 tokio::task_local! {
     /// The instance id whose verb handler is currently applying on this
     /// task — the re-entrancy tripwire: a handler calling back into its own
@@ -360,6 +391,10 @@ pub struct Pool {
 struct PoolInner {
     kinds: RwLock<HashMap<&'static str, Arc<dyn Kind>>>,
     instances: RwLock<HashMap<String, Arc<Entry>>>,
+    /// Adopted rows, disjoint from `instances` (ids are uuids minted where
+    /// the cell lives). Kept separate because they share none of a local
+    /// entry's machinery — no cell, no log, no locally-enforced law.
+    remotes: RwLock<HashMap<String, Arc<Remote>>>,
     /// The global feed: lifecycle plus every instance's events, tagged by
     /// id. Best-effort by design — a lagging consumer skips and recovers by
     /// re-reading state (`list`, watermarks), never by trusting the feed to
@@ -381,6 +416,7 @@ impl Pool {
             inner: Arc::new(PoolInner {
                 kinds: RwLock::new(HashMap::new()),
                 instances: RwLock::new(HashMap::new()),
+                remotes: RwLock::new(HashMap::new()),
                 events,
             }),
         }
@@ -467,7 +503,13 @@ impl Pool {
                 .instances
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains_key(parent);
+                .contains_key(parent)
+                || self
+                    .inner
+                    .remotes
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(parent);
             if !known {
                 return Err(VerbError::UnknownInstance { id: parent.into() });
             }
@@ -561,7 +603,17 @@ impl Pool {
         verb: &str,
         args: Value,
     ) -> Result<Value, VerbError> {
-        let entry = self.entry(id)?;
+        let entry = match self.entry(id) {
+            Ok(entry) => entry,
+            // Adopted: forward whole — spec lookup, law, log, and `sys.*`
+            // all happen where the cell lives.
+            Err(miss) => {
+                return match self.remote(id) {
+                    Some(remote) => remote.call.call(principal, id, verb, args).await,
+                    None => Err(miss),
+                };
+            }
+        };
         let result = self.call_inner(principal, &entry, verb, args).await;
         // Introspection is free: reading the debugger must not erase the
         // evidence it exists to keep.
@@ -798,6 +850,13 @@ impl Pool {
             .filter(|e| project.is_none_or(|p| e.project == p))
             .map(|e| self.info_of(e))
             .collect();
+        let remotes = self.inner.remotes.read().unwrap_or_else(|e| e.into_inner());
+        rows.extend(
+            remotes
+                .values()
+                .map(|r| Self::remote_info(r))
+                .filter(|info| project.is_none_or(|p| info.project == p)),
+        );
         rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         rows
     }
@@ -814,10 +873,21 @@ impl Pool {
             .instances
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        let remotes = self.inner.remotes.read().unwrap_or_else(|e| e.into_inner());
+        // Parentage crosses the adoption boundary in one walk: a remote
+        // tty's parent is its host instance, which is local.
+        let parent_of = |id: &str| -> Option<Option<String>> {
+            if let Some(e) = instances.get(id) {
+                return Some(e.parent.clone());
+            }
+            remotes
+                .get(id)
+                .map(|r| r.info.read().unwrap_or_else(|e| e.into_inner()).parent.clone())
+        };
         let mut chain = Vec::new();
-        let mut next = instances.get(id).and_then(|e| e.parent.clone());
+        let mut next = parent_of(id).flatten();
         while let Some(parent) = next {
-            next = instances.get(&parent).and_then(|e| e.parent.clone());
+            next = parent_of(&parent).flatten();
             chain.push(parent);
         }
         chain
@@ -825,15 +895,32 @@ impl Pool {
 
     /// Current watermark, for starting a watch loop.
     pub fn watermark(&self, id: &str) -> Result<Watermark, VerbError> {
-        Ok(self.entry(id)?.cell.watermark())
+        match self.entry(id) {
+            Ok(entry) => Ok(entry.cell.watermark()),
+            Err(miss) => match self.remote(id) {
+                Some(remote) => Ok(*remote.mark.borrow()),
+                None => Err(miss),
+            },
+        }
     }
 
     /// Wait until the instance's watermark exceeds `since`. Removal and
     /// crash both bump, so the wait resolves rather than hanging; the next
-    /// call reports what happened.
+    /// call reports what happened. Adopted rows keep the same contract:
+    /// the attach loop feeds their local watch channel from relayed marks,
+    /// and dropping the row bumps first, so waiters wake into the miss.
     pub async fn changed(&self, id: &str, since: Watermark) -> Result<Watermark, VerbError> {
-        let entry = self.entry(id)?;
-        Ok(entry.cell.changed(since).await?)
+        match self.entry(id) {
+            Ok(entry) => Ok(entry.cell.changed(since).await?),
+            Err(miss) => match self.remote(id) {
+                Some(remote) => {
+                    let mut rx = remote.mark.subscribe();
+                    let seen = rx.wait_for(|w| *w > since).await.map_err(|_| VerbError::Gone)?;
+                    Ok(*seen)
+                }
+                None => Err(miss),
+            },
+        }
     }
 
     /// Read `verb` until the answer satisfies `settled`, waking on the
@@ -871,6 +958,126 @@ impl Pool {
     /// and every instance's own events. Best-effort — see [`PoolInner`].
     pub fn events(&self) -> tokio::sync::broadcast::Receiver<(String, Event)> {
         self.inner.events.subscribe()
+    }
+
+    /// Adopt (or refresh) a remotely-hosted row. `origin` is the local
+    /// instance that owns the connection — a host — and doubles as the
+    /// adopted row's parent when the provider reports none, which is what
+    /// nests a remote tty under its machine in every tree. Upserts by id:
+    /// births and meta refreshes are the same motion, mirroring the wire's
+    /// `row` frame.
+    pub fn adopt(&self, origin: &str, mut info: InstanceInfo, call: Arc<dyn RemoteCall>) {
+        if info.parent.is_none() {
+            info.parent = Some(origin.to_string());
+        }
+        let mut remotes = self
+            .inner
+            .remotes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match remotes.get(&info.id) {
+            Some(existing) => {
+                // The row's watermark is a snapshot; fold it in monotonically
+                // so a refresh can never rewind a watcher.
+                existing
+                    .mark
+                    .send_modify(|w| *w = (*w).max(info.watermark));
+                *existing.info.write().unwrap_or_else(|e| e.into_inner()) = info;
+            }
+            None => {
+                let id = info.id.clone();
+                let (mark, _) = tokio::sync::watch::channel(info.watermark);
+                remotes.insert(
+                    id.clone(),
+                    Arc::new(Remote {
+                        info: RwLock::new(info),
+                        origin: origin.to_string(),
+                        call,
+                        mark,
+                    }),
+                );
+                drop(remotes);
+                let _ = self.inner.events.send((
+                    id,
+                    Event {
+                        name: "adopted".into(),
+                        data: json!({ "origin": origin }),
+                    },
+                ));
+            }
+        }
+    }
+
+    /// A relayed watermark for an adopted row. Monotone fold, same reason
+    /// as [`Pool::adopt`]'s.
+    pub fn remote_mark(&self, id: &str, watermark: Watermark) {
+        if let Some(remote) = self.remote(id) {
+            remote.mark.send_modify(|w| *w = (*w).max(watermark));
+        }
+    }
+
+    /// A relayed event for an adopted row, onto the global feed verbatim.
+    pub fn remote_event(&self, id: &str, event: Event) {
+        let _ = self.inner.events.send((id.to_string(), event));
+    }
+
+    /// Forget one adopted row: removal semantics, exactly like a local
+    /// remove — the event travels, the watermark bumps so waiters wake
+    /// into the miss.
+    pub fn drop_remote(&self, id: &str) {
+        let removed = self
+            .inner
+            .remotes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Some(remote) = removed {
+            let _ = self.inner.events.send((
+                id.to_string(),
+                Event {
+                    name: "removed".into(),
+                    data: Value::Null,
+                },
+            ));
+            remote.mark.send_modify(|w| *w += 1);
+        }
+    }
+
+    /// Forget every row adopted through `origin` — the cleanup a dead
+    /// provider stream owes the pool. Synchronous on purpose, so a host's
+    /// `Drop` can call it directly.
+    pub fn drop_remotes_from(&self, origin: &str) {
+        let ids: Vec<String> = {
+            let remotes = self.inner.remotes.read().unwrap_or_else(|e| e.into_inner());
+            remotes
+                .values()
+                .filter(|r| r.origin == origin)
+                .map(|r| r.info.read().unwrap_or_else(|e| e.into_inner()).id.clone())
+                .collect()
+        };
+        for id in ids {
+            self.drop_remote(&id);
+        }
+    }
+
+    fn remote(&self, id: &str) -> Option<Arc<Remote>> {
+        self.inner
+            .remotes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    fn remote_info(remote: &Remote) -> InstanceInfo {
+        let mut info = remote
+            .info
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // The live mark outruns the row snapshot; listings show the truth.
+        info.watermark = info.watermark.max(*remote.mark.borrow());
+        info
     }
 
     fn entry(&self, id: &str) -> Result<Arc<Entry>, VerbError> {
