@@ -261,3 +261,159 @@ async fn push_endpoints_are_write_only() {
         .expect("unregister");
     assert_eq!(dropped["dropped"], json!(true));
 }
+
+/// A push service small enough to read: raw TCP, one request per
+/// connection, scripted status. Records (headers, body) pairs.
+async fn mock_push_service(
+    status: Arc<std::sync::atomic::AtomicU16>,
+    hits: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let status = status.clone();
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, need) = loop {
+                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while buf.len() < head_end + need {
+                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let body = buf[head_end..].to_vec();
+                hits.lock().unwrap().push((head, body));
+                let code = status.load(std::sync::atomic::Ordering::SeqCst);
+                let _ = sock
+                    .write_all(
+                        format!("HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}/wpush/v1/sub-1")
+}
+
+/// The whole delivery story: a live mention pushes a sealed payload the
+/// receiver's keys open; reconcile's backfill pushes nothing; a 410
+/// prunes the endpoint so later items stop knocking.
+#[tokio::test]
+async fn live_items_push_sealed_payloads_and_dead_endpoints_prune() {
+    use base64::Engine as _;
+    let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(201));
+    let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = mock_push_service(status.clone(), hits.clone()).await;
+
+    // The pusher speaks plain HTTP to localhost; no proxy may interfere.
+    let pusher = crate::push::Pusher::for_tests(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    );
+    let pool = Pool::new();
+    pool.register(Arc::new(myco_kind_chat::ChatKind::transcript_only(
+        pool.clone(),
+    )));
+    pool.register(Arc::new(NotifierKind::with_push(
+        pool.clone(),
+        Arc::new(pusher),
+    )));
+
+    let notifier = pool
+        .create(&ada(), "notifier", "", "", Value::Null)
+        .expect("notifier");
+    let chat = pool
+        .create(&grace(), "chat", "", "planning", Value::Null)
+        .expect("chat");
+
+    // A browser-shaped subscription with keys we hold the other half of.
+    let ua_secret = crate::push::random_secret();
+    use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+    let ua_public = ua_secret.public_key().to_encoded_point(false);
+    let auth: Vec<u8> = (0..16u8).collect();
+    let subscription = json!({
+        "endpoint": endpoint,
+        "keys": {
+            "p256dh": b64.encode(ua_public.as_bytes()),
+            "auth": b64.encode(&auth),
+        },
+    });
+    pool.call(
+        &ada(),
+        &notifier.id,
+        "register",
+        json!({ "subscription": subscription }),
+    )
+    .await
+    .expect("registers");
+
+    pool.call(&grace(), &chat.id, "post", json!({"text": "@ada the far box is up"}))
+        .await
+        .expect("posts");
+    wait_for_unacked(&pool, &notifier.id, &ada(), 1).await;
+
+    // The push is async beside the inbox; give it its moment.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hits.lock().unwrap().len() < 1 {
+        assert!(tokio::time::Instant::now() < deadline, "a push arrived");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (head, body) = hits.lock().unwrap()[0].clone();
+    assert!(head.contains("content-encoding: aes128gcm"));
+    assert!(head.contains("authorization: vapid t="));
+    let opened = crate::push::decrypt(&ua_secret, &auth, &body);
+    let payload: Value = serde_json::from_slice(&opened).expect("the payload is JSON");
+    assert!(
+        payload["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("far box")),
+        "the sealed payload carries the item, got {payload}"
+    );
+
+    // The service turns the subscription away for good; the next live
+    // item knocks once, then the endpoint is gone.
+    status.store(410, std::sync::atomic::Ordering::SeqCst);
+    pool.call(&grace(), &chat.id, "post", json!({"text": "@ada two"}))
+        .await
+        .expect("posts");
+    wait_for_unacked(&pool, &notifier.id, &ada(), 2).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hits.lock().unwrap().len() < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "the 410 knock arrived");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    pool.call(&grace(), &chat.id, "post", json!({"text": "@ada three"}))
+        .await
+        .expect("posts");
+    wait_for_unacked(&pool, &notifier.id, &ada(), 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        2,
+        "a pruned endpoint is not knocked again — the item still landed in the inbox"
+    );
+}

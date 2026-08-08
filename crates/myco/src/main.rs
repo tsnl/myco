@@ -88,7 +88,25 @@ async fn main() {
         catalog,
         default_model,
     )));
-    pool.register(Arc::new(myco_kind_notifier::NotifierKind::new(pool.clone())));
+    // Web push wants a durable VAPID identity: subscriptions bind to the
+    // public key the browser saw, so it lives beside server.toml. Failure
+    // to load one degrades to a notifier that stores endpoints silently.
+    let vapid = roster
+        .path
+        .parent()
+        .map(|dir| dir.join("vapid.key"))
+        .unwrap_or_else(|| std::path::PathBuf::from("vapid.key"));
+    let notifiers =
+        match myco_kind_notifier::Pusher::load_or_generate(&vapid, "mailto:operator@localhost") {
+            Ok(pusher) => {
+                myco_kind_notifier::NotifierKind::with_push(pool.clone(), Arc::new(pusher))
+            }
+            Err(e) => {
+                eprintln!("myco: web-push disabled: {e}");
+                myco_kind_notifier::NotifierKind::new(pool.clone())
+            }
+        };
+    pool.register(Arc::new(notifiers));
     pool.register(Arc::new(myco_provider::HostKind::new(pool.clone())));
     pool.register(Arc::new(myco_kind_cron::CronKind::new(pool.clone())));
     pool.register(Arc::new(myco_kind_browser::BrowserKind));

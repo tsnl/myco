@@ -32,6 +32,10 @@ use myco_instance::{
 use myco_runtime::Signals;
 use serde_json::{Value, json};
 
+pub mod push;
+
+pub use push::Pusher;
+
 static NOTIFIER_SPEC: KindSpec = KindSpec {
     kind: "notifier",
     version: 1,
@@ -54,7 +58,11 @@ static NOTIFIER_SPEC: KindSpec = KindSpec {
         ),
         VerbSpec::owned(
             "register",
-            "store a web-push {subscription} (delivery lands in M4); write-only state",
+            "store a web-push {subscription}; write-only state, delivery on live items",
+        ),
+        VerbSpec::owned_read(
+            "push_key",
+            "the VAPID public {key} a browser must subscribe with",
         ),
         VerbSpec::owned(
             "unregister",
@@ -130,11 +138,22 @@ impl Inbox {
 
 pub struct NotifierKind {
     pool: Pool,
+    pusher: Option<std::sync::Arc<Pusher>>,
 }
 
 impl NotifierKind {
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self { pool, pusher: None }
+    }
+
+    /// A kind that can also *wake* its owners: live items go out through
+    /// the pusher to every registered endpoint. Without one, register
+    /// still stores — delivery is the only thing missing.
+    pub fn with_push(pool: Pool, pusher: std::sync::Arc<Pusher>) -> Self {
+        Self {
+            pool,
+            pusher: Some(pusher),
+        }
     }
 }
 
@@ -158,12 +177,14 @@ impl Kind for NotifierKind {
             ctx.creator.clone(),
             inbox.clone(),
             feed,
+            self.pusher.clone(),
         ));
         Ok(Box::new(Notifier {
             owner: ctx.creator.clone(),
             pool: self.pool.clone(),
             inbox,
             ingest,
+            pusher: self.pusher.clone(),
         }))
     }
 }
@@ -173,6 +194,7 @@ struct Notifier {
     pool: Pool,
     inbox: Shared<Inbox>,
     ingest: tokio::task::JoinHandle<()>,
+    pusher: Option<std::sync::Arc<Pusher>>,
 }
 
 impl Drop for Notifier {
@@ -191,6 +213,7 @@ async fn ingest(
     owner: Principal,
     inbox: Shared<Inbox>,
     mut feed: tokio::sync::broadcast::Receiver<(String, myco_runtime::Event)>,
+    pusher: Option<std::sync::Arc<Pusher>>,
 ) {
     reconcile(&pool, &owner, &inbox).await;
     loop {
@@ -205,7 +228,14 @@ async fn ingest(
                 if !attention.for_.contains(&owner) {
                     continue;
                 }
-                inbox.with(|i| i.add(&source, &attention));
+                let added = inbox.with(|i| i.add(&source, &attention));
+                // Push wakes for the live moment only — reconcile's
+                // catch-up never pushes, so a booting notifier cannot
+                // replay history onto a phone. The inbox is the record;
+                // a push that misses costs a wake, not an item.
+                if added && let Some(pusher) = &pusher {
+                    deliver(pusher.clone(), inbox.clone(), &attention);
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 reconcile(&pool, &owner, &inbox).await;
@@ -213,6 +243,40 @@ async fn ingest(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// Fan one live item out to every registered endpoint, off-loop. A 404
+/// or 410 prunes the endpoint (the push service said it is dead); any
+/// other failure is logged by nobody — best-effort is the contract.
+fn deliver(
+    pusher: std::sync::Arc<Pusher>,
+    inbox: Shared<Inbox>,
+    attention: &myco_instance::events::Attention,
+) {
+    let endpoints = inbox.read(|i| i.endpoints.clone());
+    if endpoints.is_empty() {
+        return;
+    }
+    let payload =
+        json!({ "title": attention.title, "body": attention.body }).to_string();
+    tokio::spawn(async move {
+        for subscription in endpoints {
+            if let Ok(404 | 410) = pusher.send(&subscription, payload.as_bytes()).await {
+                let Some(dead) = subscription
+                    .get("endpoint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                inbox.with(|i| {
+                    i.endpoints.retain(|s| {
+                        s.get("endpoint").and_then(Value::as_str) != Some(dead.as_str())
+                    })
+                });
+            }
+        }
+    });
 }
 
 /// Re-derive items from the re-readable record: for every chat whose
@@ -346,6 +410,12 @@ impl Instance for Notifier {
                     json!({ "muted": i.muted })
                 }))
             }
+            "push_key" => match &self.pusher {
+                Some(pusher) => Ok(json!({ "key": pusher.public_key_b64() })),
+                None => Err(VerbError::Denied {
+                    why: "web-push is not configured on this server".into(),
+                }),
+            },
             "register" => {
                 let sub = args
                     .get("subscription")
