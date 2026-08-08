@@ -17,12 +17,16 @@ js-sys = { workspace = true }
 [dependencies.web-sys]
 workspace = true
 features = [
+    "Event",
+    "EventTarget",
     "Window",
     "Document",
     "Element",
     "HtmlElement",
     "Headers",
+    "HtmlInputElement",
     "Request",
     "RequestInit",
     "Response",
+    "Storage",
 ]
