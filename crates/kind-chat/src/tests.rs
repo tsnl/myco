@@ -132,36 +132,33 @@ async fn text_is_the_plain_transcript() {
     );
 }
 
+/// A subagent is a chat and nothing more: the parentage lives in L1's
+/// identity, so the kind has no field to set, no field to leak, and no way
+/// for the two answers to drift apart.
 #[tokio::test]
-async fn a_subagent_is_a_chat_with_a_parent_and_nothing_more() {
+async fn a_subagent_is_a_chat_created_under_another_chat() {
     let (pool, parent_id) = pool_with_chat(Value::Null);
     let child = pool
-        .create(&ada(), "chat", "", "", json!({"parent": parent_id}))
+        .create_under(&ada(), "chat", "", "", Value::Null, Some(&parent_id))
         .expect("create child");
+    assert_eq!(child.parent.as_deref(), Some(parent_id.as_str()));
 
     let about = pool
         .call(&ada(), &child.id, "about", Value::Null)
         .await
         .expect("about");
-    assert_eq!(about["parent"], json!(parent_id));
+    assert_eq!(about, json!({"len": 0}), "the kind knows only its own log");
 
-    let about_parent = pool
-        .call(&ada(), &parent_id, "about", Value::Null)
-        .await
-        .expect("about");
-    assert_eq!(about_parent["parent"], Value::Null);
+    let listed = pool.list(None);
+    let child_row = listed.iter().find(|i| i.id == child.id).expect("listed");
+    assert_eq!(child_row.parent.as_deref(), Some(parent_id.as_str()));
 }
 
 #[tokio::test]
-async fn empty_posts_and_bad_parents_are_refused_by_name() {
+async fn empty_posts_are_refused_by_name() {
     let (pool, id) = pool_with_chat(Value::Null);
     for bad in [json!({}), json!({"text": ""}), json!({"text": "   "})] {
         let err = pool.call(&ada(), &id, "post", bad).await.unwrap_err();
         assert!(matches!(err, VerbError::BadArgs { .. }), "{err}");
     }
-
-    let err = pool
-        .create(&ada(), "chat", "", "", json!({"parent": 7}))
-        .unwrap_err();
-    assert!(matches!(err, VerbError::BadArgs { .. }), "{err}");
 }

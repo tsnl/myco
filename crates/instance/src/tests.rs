@@ -550,6 +550,63 @@ async fn listing_scopes_by_project() {
     assert_eq!(pool.list(Some("gamma")).len(), 0);
 }
 
+/// Parentage is identity, not kind state: fixed at birth, carried by the
+/// listing without entering any cell, refused when it names nothing, and
+/// left standing when the parent is removed — a child that is orphaned is
+/// not a child that was lying about where it came from.
+#[tokio::test]
+async fn parentage_is_fixed_at_birth_and_carried_by_the_listing() {
+    let pool = pool();
+    let root = pool
+        .create(&ada(), "counter", "proj", "", Value::Null)
+        .unwrap();
+    assert_eq!(root.parent, None, "an unparented instance is a root");
+
+    let child = pool
+        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&root.id))
+        .unwrap();
+    let grandchild = pool
+        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&child.id))
+        .unwrap();
+    assert_eq!(child.parent.as_deref(), Some(root.id.as_str()));
+    assert_eq!(
+        meta(&pool, &child.id).await.parent,
+        child.parent,
+        "sys.meta and the create reply agree"
+    );
+    assert_eq!(
+        pool.list(Some("proj"))
+            .iter()
+            .filter(|i| i.parent.is_some())
+            .count(),
+        2
+    );
+
+    // Nearest first, so a depth cap is a length.
+    assert_eq!(
+        pool.ancestors(&grandchild.id),
+        vec![child.id.clone(), root.id.clone()]
+    );
+    assert!(pool.ancestors(&root.id).is_empty());
+
+    // A parent nothing answers to is a bad birth certificate, not a root.
+    assert_eq!(
+        pool.create_under(&ada(), "counter", "proj", "", Value::Null, Some("nobody")),
+        Err(VerbError::UnknownInstance {
+            id: "nobody".into()
+        })
+    );
+
+    pool.call(&ada(), &root.id, "sys.remove", Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta(&pool, &child.id).await.parent.as_deref(),
+        Some(root.id.as_str()),
+        "removal orphans; it does not rewrite history"
+    );
+}
+
 /// A panicking kind takes down its own instance and nothing else; the
 /// corpse answers `Gone`, and its `sys.meta` (entry state, not cell state)
 /// still reports `crashed` for the tree UI.
