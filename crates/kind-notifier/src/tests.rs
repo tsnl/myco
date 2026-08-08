@@ -25,17 +25,13 @@ fn fixture() -> Pool {
 }
 
 async fn wait_for_unacked(pool: &Pool, id: &str, owner: &Principal, n: u64) -> Value {
-    let mut mark = 0;
-    loop {
-        let pending = pool
-            .call(owner, id, "pending", Value::Null)
-            .await
-            .expect("pending");
-        if pending["unacked"] == json!(n) {
-            return pending;
-        }
-        mark = pool.changed(id, mark).await.expect("changed");
-    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    pool.wait_until(owner, id, "pending", deadline, |pending| {
+        pending["unacked"] == json!(n)
+    })
+    .await
+    .expect("pending")
+    .unwrap_or_else(|| panic!("the badge never reached {n} unacked"))
 }
 
 /// The live path: a mention in a chat becomes a private item, acking
@@ -62,10 +58,7 @@ async fn a_mention_becomes_a_private_item_until_acked() {
     let pending = wait_for_unacked(&pool, &notifier.id, &ada(), 1).await;
     let item = &pending["items"][0];
     assert_eq!(item["source"], json!(chat.id));
-    assert!(
-        item["title"].as_str().unwrap().contains("grace"),
-        "{item}"
-    );
+    assert!(item["title"].as_str().unwrap().contains("grace"), "{item}");
     assert!(item["body"].as_str().unwrap().contains("tests are green"));
     assert_eq!(item["acked"], json!(false));
 
@@ -104,7 +97,10 @@ async fn the_inbox_refuses_everyone_but_its_owner() {
         ("text", Value::Null),
         ("ack", json!({"upto": 0})),
         ("mute", json!({"source": "x"})),
-        ("register", json!({"subscription": {"endpoint": "https://p.example/x"}})),
+        (
+            "register",
+            json!({"subscription": {"endpoint": "https://p.example/x"}}),
+        ),
         ("unregister", json!({"endpoint": "https://p.example/x"})),
         ("reconcile", Value::Null),
     ] {
@@ -124,9 +120,14 @@ async fn a_mention_before_first_login_is_backfilled() {
     let chat = pool
         .create(&grace(), "chat", "", "", Value::Null)
         .expect("chat");
-    pool.call(&grace(), &chat.id, "post", json!({"text": "@ada early bird"}))
-        .await
-        .expect("post");
+    pool.call(
+        &grace(),
+        &chat.id,
+        "post",
+        json!({"text": "@ada early bird"}),
+    )
+    .await
+    .expect("post");
 
     let notifier = pool
         .create(&ada(), "notifier", "", "", Value::Null)
@@ -182,12 +183,22 @@ async fn muted_sources_are_skipped() {
     pool.call(&ada(), &notifier.id, "mute", json!({"source": noisy.id}))
         .await
         .expect("mute");
-    pool.call(&grace(), &noisy.id, "post", json!({"text": "@ada muted ping"}))
-        .await
-        .expect("post");
-    pool.call(&grace(), &quiet.id, "post", json!({"text": "@ada real ping"}))
-        .await
-        .expect("post");
+    pool.call(
+        &grace(),
+        &noisy.id,
+        "post",
+        json!({"text": "@ada muted ping"}),
+    )
+    .await
+    .expect("post");
+    pool.call(
+        &grace(),
+        &quiet.id,
+        "post",
+        json!({"text": "@ada real ping"}),
+    )
+    .await
+    .expect("post");
 
     // The feed is ordered: when the quiet chat's item has landed, the
     // noisy one's event has already been processed (and skipped).

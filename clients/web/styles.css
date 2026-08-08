@@ -281,6 +281,8 @@ form {
     border-radius: var(--radius-row);
     cursor: pointer;
     padding: 8px 12px;
+    /* Parentage as indent: a subagent sits under the chat that spawned it. */
+    padding-left: calc(12px + var(--depth, 0) * 14px);
 }
 
 .tree-row:hover {
@@ -323,6 +325,11 @@ form {
 
 .creates {
     flex-wrap: wrap;
+}
+
+.passkey-note {
+    font-size: 11px;
+    margin-top: 6px;
 }
 
 .sidebar-foot {
