@@ -20,6 +20,13 @@ pub struct State {
     pub passkey_note: Option<String>,
     /// The workspace: what the pool holds, kept fresh by list + feed.
     pub workspace: Workspace,
+    /// A listing fetch is out and its answer has not landed. Bookkeeping,
+    /// not content — it lives outside [`Workspace`] so a burst of feed
+    /// events cannot make the tree look changed when nothing in it is.
+    pub listing_in_flight: bool,
+    /// Something happened while that fetch was out, so its answer is
+    /// already behind: re-list once when it lands.
+    pub listing_stale: bool,
     /// Recent actions, newest last, capped — the repro log.
     pub log: Vec<String>,
 }
@@ -60,6 +67,11 @@ pub struct InstanceInfo {
     #[serde(default)]
     pub title: String,
     pub creator: PrincipalRef,
+    /// What this instance was created under — a subagent chat names the
+    /// chat that spawned it. L1 identity, so the tree nests on it rather
+    /// than asking any kind where it came from.
+    #[serde(default)]
+    pub parent: Option<String>,
     #[serde(default)]
     pub driver: Option<PrincipalRef>,
     #[serde(default)]
@@ -71,6 +83,59 @@ pub struct InstanceInfo {
 pub struct PrincipalRef {
     pub kind: String,
     pub id: String,
+}
+
+/// Who holds the driver seat, as the client presents it.
+///
+/// The tree's row dot, a pane's chip, and the palette's reason for greying
+/// a driven verb are three views of one fact. Spelled three times, they are
+/// three chances for the client to contradict itself about who is driving —
+/// so the classification happens once, here, and each view asks it for the
+/// part it renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seat {
+    /// Nobody: the open ring, and the take is an invitation.
+    Open,
+    Human(String),
+    Agent,
+    System,
+}
+
+/// The seat an instance's driver puts it in.
+pub fn seat_of(driver: Option<&PrincipalRef>) -> Seat {
+    match driver {
+        None => Seat::Open,
+        Some(p) if p.kind == "human" => Seat::Human(p.id.clone()),
+        Some(p) if p.kind == "agent" => Seat::Agent,
+        Some(_) => Seat::System,
+    }
+}
+
+impl Seat {
+    /// STYLE.md's presence vocabulary, as a class suffix.
+    pub fn tone(&self) -> &'static str {
+        match self {
+            Seat::Open => "open",
+            Seat::Human(_) => "human",
+            Seat::Agent => "agent",
+            Seat::System => "system",
+        }
+    }
+
+    /// The seat in words: a pane chip's label, a palette row's reason.
+    pub fn phrase(&self) -> String {
+        match self {
+            Seat::Open => "seat open".into(),
+            Seat::Human(id) => format!("{id} driving"),
+            Seat::Agent => "agent driving".into(),
+            Seat::System => "system driving".into(),
+        }
+    }
+
+    /// Is `me` the person in the seat? The whole of "may I drive this".
+    pub fn held_by(&self, me: Option<&str>) -> bool {
+        matches!(self, Seat::Human(id) if me == Some(id.as_str()))
+    }
 }
 
 /// The sign-in island's own state: in flight, and the last refusal.
@@ -188,18 +253,34 @@ pub enum Effect {
 
 /// What entering a session kicks off, from either door (whoami or a fresh
 /// token): the workspace loads and the feed opens.
-fn enter_workspace(token: &str) -> Vec<Effect> {
-    vec![
-        Effect::FetchKinds {
-            token: token.into(),
-        },
-        Effect::FetchInstances {
-            token: token.into(),
-        },
-        Effect::OpenFeed {
-            token: token.into(),
-        },
-    ]
+fn enter_workspace(state: &mut State, token: &str) -> Vec<Effect> {
+    let mut effects = vec![Effect::FetchKinds {
+        token: token.into(),
+    }];
+    effects.extend(relist(state));
+    effects.push(Effect::OpenFeed {
+        token: token.into(),
+    });
+    effects
+}
+
+/// Ask for a fresh listing — at most one at a time.
+///
+/// The feed is a hint that fires per event, and events arrive in bursts (a
+/// chat's turn, a terminal's output). One fetch per hint is one fetch per
+/// byte of somebody else's work. So: if a fetch is already out, its answer
+/// is already behind — remember that, and send exactly one more when it
+/// lands. Any number of hints during a fetch cost one follow-up, never N.
+fn relist(state: &mut State) -> Vec<Effect> {
+    let Some(token) = state.token.clone() else {
+        return vec![];
+    };
+    if state.listing_in_flight {
+        state.listing_stale = true;
+        return vec![];
+    }
+    state.listing_in_flight = true;
+    vec![Effect::FetchInstances { token }]
 }
 
 /// The token endpoint's 200 body (RFC 6749's shape).
@@ -234,8 +315,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 200 => match serde_json::from_str::<User>(&body) {
                     Ok(user) => {
                         state.session = Session::SignedIn(user);
-                        if let Some(token) = &state.token {
-                            return enter_workspace(token);
+                        if let Some(token) = state.token.clone() {
+                            return enter_workspace(state, &token);
                         }
                     }
                     Err(_) => {
@@ -280,7 +361,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                         state.session = Session::SignedIn(issued.user);
                         state.sign_in = SignIn::default();
                         let mut effects = vec![Effect::PersistToken(issued.access_token.clone())];
-                        effects.extend(enter_workspace(&issued.access_token));
+                        effects.extend(enter_workspace(state, &issued.access_token));
                         effects
                     }
                     Err(_) => {
@@ -355,6 +436,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.sign_in = SignIn::default();
             state.passkey_note = None;
             state.workspace = Workspace::default();
+            state.listing_in_flight = false;
+            state.listing_stale = false;
             effects
         }
         Action::KindsAnswered { status, body } => {
@@ -366,6 +449,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             vec![]
         }
         Action::InstancesAnswered { status, body } => {
+            state.listing_in_flight = false;
             if status == 200
                 && let Ok(mut instances) = serde_json::from_str::<Vec<InstanceInfo>>(&body)
             {
@@ -381,26 +465,21 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     state.workspace.selected = None;
                 }
             }
+            // Whatever arrived while this fetch was out is owed exactly
+            // one more look.
+            if std::mem::take(&mut state.listing_stale) {
+                return relist(state);
+            }
             vec![]
         }
-        Action::FeedEvent => match &state.token {
-            // Any event is only a hint; the listing is the truth. Lossy
-            // feed + re-list is the doctrine's recovery, used as the
-            // ordinary path.
-            Some(token) => vec![Effect::FetchInstances {
-                token: token.clone(),
-            }],
-            None => vec![],
-        },
+        // Any event is only a hint; the listing is the truth. Lossy feed +
+        // re-list is the doctrine's recovery, used as the ordinary path —
+        // coalesced, because a hint is not worth a fetch of its own.
+        Action::FeedEvent => relist(state),
         Action::FeedOpened => {
             state.workspace.feed = Feed::Live;
             // Anything could have happened while the socket was down.
-            match &state.token {
-                Some(token) => vec![Effect::FetchInstances {
-                    token: token.clone(),
-                }],
-                None => vec![],
-            }
+            relist(state)
         }
         Action::FeedDropped => {
             if matches!(state.session, Session::SignedIn(_)) {
@@ -425,14 +504,13 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             {
                 state.workspace.selected = Some(info.id);
             }
-            match &state.token {
-                Some(token) => vec![Effect::FetchInstances {
-                    token: token.clone(),
-                }],
-                None => vec![],
-            }
+            relist(state)
         }
         Action::NetworkFailed { what } => {
+            // A call that never got a status cannot answer; releasing the
+            // listing latch here is what keeps one lost fetch from wedging
+            // the tree forever.
+            state.listing_in_flight = false;
             if state.sign_in.busy {
                 // A failed sign-in call lands on the form, not the shell.
                 state.sign_in.busy = false;
@@ -733,6 +811,13 @@ mod tests {
                 token: "tok-1".into()
             }]
         );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
 
         // A dropped feed shows honestly and reopening re-lists.
         reduce(&mut state, Action::FeedDropped);
@@ -740,6 +825,107 @@ mod tests {
         let effects = reduce(&mut state, Action::FeedOpened);
         assert_eq!(state.workspace.feed, Feed::Live);
         assert!(!effects.is_empty(), "reopening re-lists");
+    }
+
+    /// The feed fires per event and events arrive in bursts. However many
+    /// land while a listing fetch is out, exactly one more fetch follows
+    /// it — two in total for the whole burst, not one per hint.
+    #[test]
+    fn a_burst_of_feed_events_costs_one_extra_listing_fetch() {
+        let mut state = signed_in();
+        assert!(state.listing_in_flight, "signing in lists once");
+
+        let fetches: usize = (0..20)
+            .map(|_| reduce(&mut state, Action::FeedEvent).len())
+            .sum();
+        assert_eq!(fetches, 0, "not one fetch per hint");
+        assert!(state.listing_stale, "but the hints are not forgotten");
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::FetchInstances {
+                token: "tok-1".into()
+            }],
+            "the burst is worth exactly one more look"
+        );
+        assert!(state.listing_in_flight && !state.listing_stale);
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert!(effects.is_empty(), "and then it settles");
+        assert!(!state.listing_in_flight);
+    }
+
+    /// Parentage is L1 identity, carried in the listing: the client mirrors
+    /// it so the tree can nest subagents under the chat that spawned them
+    /// without asking any kind where it came from.
+    #[test]
+    fn the_listing_carries_parentage_for_the_tree_to_nest_on() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"root","kind":"chat","project":"p","title":"a",
+                           "creator":{"kind":"human","id":"ada"}},
+                          {"id":"kid","kind":"chat","project":"p","title":"b",
+                           "parent":"root",
+                           "creator":{"kind":"agent","id":"root"}}]"#
+                    .into(),
+            },
+        );
+        let by = |id: &str| {
+            state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.id == id)
+                .cloned()
+                .expect("listed")
+        };
+        assert_eq!(by("root").parent, None);
+        assert_eq!(by("kid").parent.as_deref(), Some("root"));
+    }
+
+    /// One classification of the seat, asked three different questions.
+    #[test]
+    fn the_seat_reads_the_same_however_it_is_asked() {
+        let human = PrincipalRef {
+            kind: "human".into(),
+            id: "ada".into(),
+        };
+        let agent = PrincipalRef {
+            kind: "agent".into(),
+            id: "chat-1".into(),
+        };
+
+        let seat = seat_of(Some(&human));
+        assert_eq!(seat.tone(), "human");
+        assert_eq!(seat.phrase(), "ada driving");
+        assert!(seat.held_by(Some("ada")));
+        assert!(!seat.held_by(Some("grace")));
+
+        let seat = seat_of(Some(&agent));
+        assert_eq!(seat.tone(), "agent");
+        assert_eq!(seat.phrase(), "agent driving");
+        assert!(!seat.held_by(Some("chat-1")), "an agent is not a person");
+
+        let seat = seat_of(None);
+        assert_eq!(seat, Seat::Open);
+        assert_eq!(seat.tone(), "open");
+        assert!(!seat.held_by(Some("ada")));
     }
 
     #[test]

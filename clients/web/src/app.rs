@@ -500,10 +500,10 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
     let tree: String = groups
         .iter()
         .map(|(project, list)| {
-            let rows: String = list.iter().map(|i| tree_row(i, ws)).collect();
             format!(
-                r#"<div class="tree-project">{}</div>{rows}"#,
-                escape(project)
+                r#"<div class="tree-project">{}</div>{}"#,
+                escape(project),
+                tree_rows(list, ws)
             )
         })
         .collect();
@@ -527,8 +527,12 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
                <div class="row-buttons creates">{creates}</div>
                <div class="sidebar-foot">
                  <span class="dim">{user}</span>
-                 <button id="sign-out" class="quiet-button">sign out</button>
+                 <div class="row-buttons">
+                   <button id="enroll-passkey" class="quiet-button">add a passkey</button>
+                   <button id="sign-out" class="quiet-button">sign out</button>
+                 </div>
                </div>
+               {note}
                <div class="status-line">{feed}</div>
              </div>
              <div class="stage">
@@ -536,6 +540,10 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
              </div>
            </div>"#,
         user = escape(user.display()),
+        note = match &state.passkey_note {
+            Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
+            None => String::new(),
+        },
         stage = match &ws.selected {
             Some(id) => format!("selected {} — panes arrive with the next PR", escape(id)),
             None => "open an instance from the tree".to_string(),
@@ -543,30 +551,72 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
     )
 }
 
-/// One tree row: presence dot for the seat, kind glyph, title. An open
-/// seat is an open ring (the STYLE.md vocabulary); crashed dims the row.
-fn tree_row(instance: &crate::core::InstanceInfo, ws: &crate::core::Workspace) -> String {
+/// How deep the tree will indent before it gives up. Parentage is acyclic
+/// by construction at L1, so this can only ever fire on a server the client
+/// should not have trusted — and a bounded lie renders better than a hang.
+const MAX_TREE_DEPTH: usize = 8;
+
+/// One project's rows: roots first, each followed by whatever hangs under
+/// it. A row whose parent is not in this group renders as a root, because
+/// an indent under nothing is a lie.
+fn tree_rows(list: &[&crate::core::InstanceInfo], ws: &crate::core::Workspace) -> String {
+    let mut out = String::new();
+    for instance in list {
+        let orphan = instance
+            .parent
+            .as_deref()
+            .is_none_or(|p| !list.iter().any(|i| i.id == p));
+        if orphan {
+            out.push_str(&tree_row(instance, ws, 0));
+            push_children(&mut out, list, &instance.id, ws, 1);
+        }
+    }
+    out
+}
+
+fn push_children(
+    out: &mut String,
+    list: &[&crate::core::InstanceInfo],
+    parent: &str,
+    ws: &crate::core::Workspace,
+    depth: usize,
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    for child in list
+        .iter()
+        .filter(|i| i.parent.as_deref() == Some(parent))
+    {
+        out.push_str(&tree_row(child, ws, depth));
+        push_children(out, list, &child.id, ws, depth + 1);
+    }
+}
+
+/// One tree row: presence dot for the seat, kind glyph, title, indented by
+/// its parentage. An open seat is an open ring (the STYLE.md vocabulary);
+/// crashed dims the row.
+fn tree_row(
+    instance: &crate::core::InstanceInfo,
+    ws: &crate::core::Workspace,
+    depth: usize,
+) -> String {
     let selected = ws.selected.as_deref() == Some(instance.id.as_str());
-    let seat = match &instance.driver {
-        Some(p) if p.kind == "human" => "seat human",
-        Some(p) if p.kind == "agent" => "seat agent",
-        Some(_) => "seat system",
-        None => "seat open",
-    };
     let title = if instance.title.is_empty() {
         &instance.kind
     } else {
         &instance.title
     };
     format!(
-        r#"<div class="tree-row{sel}{crashed}" data-open="{id}">
-             <span class="{seat}"></span>
+        r#"<div class="tree-row{sel}{crashed}" data-open="{id}" style="--depth:{depth}">
+             <span class="seat {seat}"></span>
              <span class="kind-tag mono">{kind}</span>
              <span class="row-title">{title}</span>
            </div>"#,
         sel = if selected { " selected" } else { "" },
         crashed = if instance.crashed { " crashed" } else { "" },
         id = escape(&instance.id),
+        seat = crate::core::seat_of(instance.driver.as_ref()).tone(),
         kind = escape(&instance.kind),
         title = escape(title),
     )
