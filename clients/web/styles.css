@@ -421,3 +421,38 @@ form {
     border-color: var(--accent);
     color: var(--accent);
 }
+
+/* The terminal material: theme-constant graphite (STYLE.md). The console
+ * lives on inside the pane, in both themes, untouched by tokens. */
+.tty-screen {
+    background: #161420;
+    color: #d8d5e0;
+    border-radius: var(--radius-row);
+    padding: 10px 12px;
+    font-size: 12.5px;
+    line-height: 1.25;
+    overflow: hidden;
+    white-space: pre;
+}
+
+.tty-row {
+    min-height: 1.25em;
+}
+
+.tty-cursor {
+    background: #d8d5e0;
+    color: #161420;
+}
+
+.pane.focused {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.tty-probe {
+    position: absolute;
+    visibility: hidden;
+    font-size: 12.5px;
+    line-height: 1.25;
+    white-space: pre;
+}

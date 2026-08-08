@@ -30,6 +30,8 @@ features = [
     "HtmlElement",
     "Headers",
     "HtmlInputElement",
+    "KeyboardEvent",
+    "DomRect",
     "Request",
     "RequestInit",
     "Response",
