@@ -16,6 +16,8 @@ pub struct State {
     /// effects need it and the reducer owns what effects see.
     pub token: Option<String>,
     pub sign_in: SignIn,
+    /// Feedback under the signed-in card's passkey button.
+    pub passkey_note: Option<String>,
     /// Recent actions, newest last, capped — the repro log.
     pub log: Vec<String>,
 }
@@ -68,6 +70,14 @@ pub enum Action {
     TokenAnswered { status: u16, body: String },
     /// The person asked to sign out.
     SignOutRequested,
+    /// The person asked to enroll a passkey (signed in).
+    EnrollPasskeyRequested,
+    /// The whole enrollment ceremony answered (the finish call's status).
+    PasskeyEnrollAnswered { status: u16, body: String },
+    /// The person asked to sign in with a passkey.
+    PasskeySignInRequested { username: String },
+    /// A browser ceremony failed or was dismissed before any wire call.
+    PasskeyFailed { why: String },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
 }
@@ -89,6 +99,14 @@ pub enum Effect {
     /// `POST /api/auth/logout`, best-effort — signing out locally never
     /// waits on the wire.
     Logout { token: String },
+    /// The whole enrollment ceremony: register/start → the browser's
+    /// `credentials.create` → register/finish → [`Action::PasskeyEnrollAnswered`]
+    /// (or [`Action::PasskeyFailed`] if the browser bows out).
+    EnrollPasskey { token: String },
+    /// The whole login ceremony: login/start → `credentials.get` →
+    /// login/finish → [`Action::TokenAnswered`] — the finish answers in the
+    /// code grant's exact shape, so sign-in converges downstream.
+    PasskeySignIn { username: String },
 }
 
 /// The token endpoint's 200 body (RFC 6749's shape).
@@ -182,6 +200,52 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 }
             }
         }
+        Action::EnrollPasskeyRequested => {
+            state.passkey_note = None;
+            match &state.token {
+                Some(token) => vec![Effect::EnrollPasskey {
+                    token: token.clone(),
+                }],
+                None => vec![],
+            }
+        }
+        Action::PasskeyEnrollAnswered { status, body } => {
+            #[derive(serde::Deserialize)]
+            struct Enrolled {
+                passkeys: u64,
+            }
+            state.passkey_note = Some(match status {
+                200 => match serde_json::from_str::<Enrolled>(&body) {
+                    Ok(e) => format!("passkey added — {} on file", e.passkeys),
+                    Err(_) => "passkey added".into(),
+                },
+                _ => serde_json::from_str::<Refusal>(&body)
+                    .ok()
+                    .map(|r| r.why)
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or_else(|| "enrollment refused".into()),
+            });
+            vec![]
+        }
+        Action::PasskeySignInRequested { username } => {
+            let username = username.trim().to_string();
+            if username.is_empty() {
+                state.sign_in.error = Some("a passkey signs in a username — fill it in".into());
+                return vec![];
+            }
+            state.sign_in.busy = true;
+            state.sign_in.error = None;
+            vec![Effect::PasskeySignIn { username }]
+        }
+        Action::PasskeyFailed { why } => {
+            if state.sign_in.busy {
+                state.sign_in.busy = false;
+                state.sign_in.error = Some(why);
+            } else {
+                state.passkey_note = Some(why);
+            }
+            vec![]
+        }
         Action::SignOutRequested => {
             let mut effects = vec![Effect::ClearToken];
             if let Some(token) = state.token.take() {
@@ -189,6 +253,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }
             state.session = Session::SignedOut;
             state.sign_in = SignIn::default();
+            state.passkey_note = None;
             effects
         }
         Action::NetworkFailed { what } => {
@@ -356,6 +421,108 @@ mod tests {
         );
         assert_eq!(state.token, None);
         assert_eq!(state.session, Session::SignedOut);
+    }
+
+    fn signed_in() -> State {
+        let mut state = booted_signed_out();
+        reduce(
+            &mut state,
+            Action::TokenAnswered {
+                status: 200,
+                body: r#"{"access_token":"tok-1","user":{"id":"ada"}}"#.into(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn enrollment_is_one_effect_and_lands_a_note() {
+        let mut state = signed_in();
+        let effects = reduce(&mut state, Action::EnrollPasskeyRequested);
+        assert_eq!(
+            effects,
+            vec![Effect::EnrollPasskey {
+                token: "tok-1".into()
+            }]
+        );
+        reduce(
+            &mut state,
+            Action::PasskeyEnrollAnswered {
+                status: 200,
+                body: r#"{"passkeys":2}"#.into(),
+            },
+        );
+        assert_eq!(
+            state.passkey_note.as_deref(),
+            Some("passkey added — 2 on file")
+        );
+    }
+
+    #[test]
+    fn passkey_sign_in_needs_a_username_and_converges_on_token_answered() {
+        let mut state = booted_signed_out();
+        let effects = reduce(
+            &mut state,
+            Action::PasskeySignInRequested {
+                username: "  ".into(),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(state.sign_in.error.is_some());
+
+        let effects = reduce(
+            &mut state,
+            Action::PasskeySignInRequested {
+                username: "ada".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::PasskeySignIn {
+                username: "ada".into()
+            }]
+        );
+        // The ceremony's finish answers in the code grant's shape.
+        let effects = reduce(
+            &mut state,
+            Action::TokenAnswered {
+                status: 200,
+                body: r#"{"access_token":"tok-2","user":{"id":"ada"}}"#.into(),
+            },
+        );
+        assert_eq!(effects, vec![Effect::PersistToken("tok-2".into())]);
+        assert!(matches!(&state.session, Session::SignedIn(_)));
+    }
+
+    #[test]
+    fn a_dismissed_ceremony_lands_where_the_person_is() {
+        // Mid sign-in: on the form.
+        let mut state = booted_signed_out();
+        reduce(
+            &mut state,
+            Action::PasskeySignInRequested {
+                username: "ada".into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::PasskeyFailed {
+                why: "the browser cancelled the passkey prompt".into(),
+            },
+        );
+        assert!(!state.sign_in.busy);
+        assert!(state.sign_in.error.as_deref().unwrap().contains("cancelled"));
+
+        // Signed in: under the button.
+        let mut state = signed_in();
+        reduce(&mut state, Action::EnrollPasskeyRequested);
+        reduce(
+            &mut state,
+            Action::PasskeyFailed {
+                why: "dismissed".into(),
+            },
+        );
+        assert_eq!(state.passkey_note.as_deref(), Some("dismissed"));
     }
 
     /// The log is the repro: every action lands in order, capped.
