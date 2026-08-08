@@ -2,8 +2,11 @@
 //!
 //! v2's "session" dissolves here — a chat is an ordinary instance in the
 //! pool, created by anyone, watched like anything else. A **subagent** is
-//! nothing but a chat whose `parent` names another chat; there is no child
-//! machinery anywhere. At this stack position the kind is a shared,
+//! nothing but a chat created under another chat; parentage is L1 identity
+//! ([`InstanceInfo::parent`](myco_instance::InstanceInfo)), fixed at birth
+//! and readable from the listing, so there is no child machinery here and
+//! no parent field for this kind to keep in sync. At this stack position
+//! the kind is a shared,
 //! attributed transcript with no model attached: `post` appends, `tail`
 //! cursors, and multiple principals converse. The turn engine (a model
 //! answering posts) arrives two PRs up; its entries will be new [`Body`]
@@ -35,7 +38,7 @@ static CHAT_SPEC: KindSpec = KindSpec {
             "text",
             "the transcript as plain text, one `author: message` line per entry",
         ),
-        VerbSpec::read("about", "the chat's shape: {parent, len}"),
+        VerbSpec::read("about", "the chat's shape: {len}"),
     ],
     primary_render: "tail",
     recommended_context: "text",
@@ -77,29 +80,17 @@ impl Kind for ChatKind {
         &CHAT_SPEC
     }
 
-    fn create(&self, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
-        let parent = match args.get("parent") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
-            Some(other) => {
-                return Err(VerbError::BadArgs {
-                    why: format!("parent must be an instance id string, got {other}"),
-                });
-            }
-        };
+    fn create(&self, _args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
         Ok(Box::new(Chat {
-            parent,
             entries: Vec::new(),
         }))
     }
 }
 
-/// The canonical state: the transcript, plus the parent ref that makes a
-/// chat a subagent. The parent is a soft reference — the kind cannot see
-/// the pool, so a dangling parent reads as unparented; consumers resolve
-/// it against the listing.
+/// The canonical state: the transcript, and nothing else. What a chat *is*
+/// — who made it, what it hangs under — is L1's to know; a kind that also
+/// kept a copy would be a second answer to the same question.
 struct Chat {
-    parent: Option<String>,
     entries: Vec<Entry>,
 }
 
@@ -161,7 +152,6 @@ impl Instance for Chat {
                 Ok(json!({ "text": out, "len": self.entries.len() as u64 }))
             }
             "about" => Ok(json!({
-                "parent": self.parent,
                 "len": self.entries.len() as u64,
             })),
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
