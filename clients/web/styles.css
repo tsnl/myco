@@ -97,6 +97,11 @@ body {
     -webkit-font-smoothing: antialiased;
 }
 
+/* `hidden` means hidden, whatever display an element also carries. */
+[hidden] {
+    display: none !important;
+}
+
 /* Islands on quiet ground: the one card primitive everything floats in. */
 .island {
     background: var(--surface);

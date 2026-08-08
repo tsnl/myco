@@ -2484,6 +2484,25 @@ mod tests {
         );
     }
 
+    /// Selecting a pane that is already open and selected moves nothing
+    /// the renderer reads. That is what lets the edge skip the region —
+    /// and what lets a caret in that pane's composer survive the click
+    /// that put it there.
+    #[test]
+    fn reselecting_an_open_pane_leaves_the_rendered_state_alone() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        let before = state.clone();
+
+        let effects = reduce(&mut state, Action::Selected { id: "t1".into() });
+        assert!(effects.is_empty(), "no re-watch, no re-read");
+
+        // The action log is the one thing that moves, and nothing renders it.
+        let mut after = state.clone();
+        after.log = before.log.clone();
+        assert_eq!(after, before);
+    }
+
     /// The log is the repro: every action lands in order, capped.
     #[test]
     fn the_action_log_records_everything_and_stays_bounded() {
