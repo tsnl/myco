@@ -13,6 +13,20 @@ const TOKEN_KEY: &str = "myco.token";
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    /// The live event socket — edge-owned connection state (the reducer
+    /// owns *what* is watched; the edge owns the wire that carries it).
+    static SOCKET: RefCell<Option<web_sys::WebSocket>> = const { RefCell::new(None) };
+}
+
+/// Send one op frame on the live socket, if any. A closed socket is fine:
+/// FeedOpened re-arms every watch when it comes back.
+fn send_op(op: &str, id: &str) {
+    SOCKET.with(|socket| {
+        if let Some(socket) = socket.borrow().as_ref() {
+            let frame = serde_json::json!({ "op": op, "id": id }).to_string();
+            let _ = socket.send_with_str(&frame);
+        }
+    });
 }
 
 #[wasm_bindgen(start)]
@@ -101,6 +115,22 @@ fn run(effect: Effect) {
                 },
             );
         }),
+        Effect::Watch { id } => send_op("watch", &id),
+        Effect::Unwatch { id } => send_op("unwatch", &id),
+        Effect::ReadPane { token, id, verb } => wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/instances/{id}/verbs/{verb}");
+            dispatch(match fetch("POST", &url, Some(&token), None).await {
+                Ok((status, body)) => Action::PaneRead { id, status, body },
+                Err(what) => Action::NetworkFailed { what },
+            });
+        }),
+        Effect::CallVerb { token, id, verb } => wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/instances/{id}/verbs/{verb}");
+            dispatch(match fetch("POST", &url, Some(&token), None).await {
+                Ok((status, _body)) => Action::VerbAnswered { id, verb, status },
+                Err(what) => Action::NetworkFailed { what },
+            });
+        }),
     }
 }
 
@@ -131,9 +161,22 @@ fn open_feed(token: String) {
     socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     on_open.forget();
 
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_| {
-        dispatch(Action::FeedEvent);
-    });
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            let Some(text) = event.data().as_string() else {
+                return;
+            };
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return;
+            };
+            let id = || frame["id"].as_str().unwrap_or_default().to_string();
+            dispatch(match frame["t"].as_str() {
+                Some("mark") => Action::Marked { id: id() },
+                Some("gone") => Action::InstanceGone { id: id() },
+                // Events and lag both mean "the listing may be stale".
+                _ => Action::FeedEvent,
+            });
+        });
     socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
 
@@ -157,6 +200,8 @@ fn open_feed(token: String) {
     });
     socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
     on_close.forget();
+
+    SOCKET.with(|slot| *slot.borrow_mut() = Some(socket));
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +503,33 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
+    for (attr, make) in [
+        ("data-take", (|id: String| Action::TakeRequested { id }) as fn(String) -> Action),
+        ("data-release", |id| Action::ReleaseRequested { id }),
+        ("data-close", |id| Action::PaneClosed { id }),
+    ] {
+        if let Ok(nodes) = document.query_selector_all(&format!("[{attr}]")) {
+            for i in 0..nodes.length() {
+                if let Some(el) = nodes.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                {
+                    let id = el.get_attribute(attr).unwrap_or_default();
+                    let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(
+                        move |event: web_sys::Event| {
+                            // Pane buttons live inside clickable chrome;
+                            // don't also select the row behind them.
+                            event.stop_propagation();
+                            dispatch(make(id.clone()));
+                        },
+                    );
+                    let _ = el.add_event_listener_with_callback(
+                        "click",
+                        on_click.as_ref().unchecked_ref(),
+                    );
+                    on_click.forget();
+                }
+            }
+        }
+    }
     if let Some(button) = document.get_element_by_id("sign-out") {
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             dispatch(Action::SignOutRequested);
@@ -531,15 +603,78 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
                </div>
                <div class="status-line">{feed}</div>
              </div>
-             <div class="stage">
-               <div class="dim">{stage}</div>
-             </div>
+             <div class="stage{split}">{stage}</div>
            </div>"#,
         user = escape(user.display()),
-        stage = match &ws.selected {
-            Some(id) => format!("selected {} — panes arrive with the next PR", escape(id)),
-            None => "open an instance from the tree".to_string(),
+        split = if ws.panes.is_empty() { "" } else { " split" },
+        stage = if ws.panes.is_empty() {
+            r#"<div class="dim stage-empty">open an instance from the tree</div>"#.to_string()
+        } else {
+            ws.panes.iter().map(|p| pane_view(p, ws)).collect()
         },
+    )
+}
+
+/// One pane: an island with chrome (title, the seat chip, close) over the
+/// generic projection. The chip is STYLE.md's vocabulary: who drives, in
+/// their hue; an open seat invites the take.
+fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
+    let instance = ws.instances.iter().find(|i| i.id == pane.id);
+    let title = instance
+        .map(|i| {
+            if i.title.is_empty() {
+                i.kind.clone()
+            } else {
+                i.title.clone()
+            }
+        })
+        .unwrap_or_else(|| pane.id.clone());
+    let chip = match instance.and_then(|i| i.driver.as_ref()) {
+        Some(p) if p.kind == "human" => format!(
+            r#"<span class="chip human">{} driving</span>
+               <button class="quiet-button" data-take="{id}">take</button>"#,
+            escape(&p.id),
+            id = escape(&pane.id),
+        ),
+        Some(p) if p.kind == "agent" => format!(
+            r#"<span class="chip agent">agent driving</span>
+               <button class="quiet-button" data-take="{id}">take</button>"#,
+            id = escape(&pane.id),
+        ),
+        Some(_) => r#"<span class="chip system">system driving</span>"#.to_string(),
+        None => format!(
+            r#"<button class="chip open" data-take="{id}">seat open — take</button>"#,
+            id = escape(&pane.id),
+        ),
+    };
+    let release = match instance.and_then(|i| i.driver.as_ref()) {
+        Some(_) => format!(
+            r#"<button class="quiet-button" data-release="{id}">release</button>"#,
+            id = escape(&pane.id)
+        ),
+        None => String::new(),
+    };
+    let body = if pane.gone {
+        r#"<div class="dim">gone — the instance was removed. last state below.</div>"#.to_string()
+    } else {
+        String::new()
+    };
+    let view = match &pane.view {
+        Some(view) => format!(r#"<pre class="mono pane-body">{}</pre>"#, escape(view)),
+        None => r#"<div class="dim">reading…</div>"#.to_string(),
+    };
+    format!(
+        r#"<div class="island pane{gone}">
+             <div class="pane-header">
+               <span class="row-title">{title}</span>
+               <span class="pane-chrome">{chip}{release}
+                 <button class="quiet-button" data-close="{id}">close</button></span>
+             </div>
+             {body}{view}
+           </div>"#,
+        gone = if pane.gone { " pane-gone" } else { "" },
+        title = escape(&title),
+        id = escape(&pane.id),
     )
 }
 
