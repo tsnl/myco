@@ -32,8 +32,7 @@ pub use types::{
 
 mod catalog;
 pub use catalog::{
-    AuthEntry, CatalogFile, GatewayEntry, ModelEntry, RetryEntry, read_auth_file,
-    resolve_catalog, resolve_default_model,
+    AuthEntry, CatalogFile, GatewayEntry, ModelEntry, RetryEntry, read_auth_file, resolve_catalog,
 };
 
 /// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
@@ -125,16 +124,7 @@ pub trait GenerativeModel: Send + Sync {
 /// Wire protocol a model is served over.
 ///
 /// Serde strings are the config.toml `protocol` values.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Protocol {
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
@@ -159,16 +149,7 @@ impl std::fmt::Display for Protocol {
 /// Serde strings are the config.toml `thinking` values. Compatibility is
 /// per-protocol (validated at catalog resolution): Anthropic Messages takes
 /// `adaptive` | `budget` | `none`; OpenAI Responses takes `effort` | `none`.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
     /// Anthropic `thinking.type: "adaptive"` + `output_config.effort`
