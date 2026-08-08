@@ -262,12 +262,12 @@ async fn push_endpoints_are_write_only() {
     assert_eq!(dropped["dropped"], json!(true));
 }
 
+/// What the mock recorded: (headers, body) per push request.
+type Hits = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
 /// A push service small enough to read: raw TCP, one request per
 /// connection, scripted status. Records (headers, body) pairs.
-async fn mock_push_service(
-    status: Arc<std::sync::atomic::AtomicU16>,
-    hits: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
-) -> String {
+async fn mock_push_service(status: Arc<std::sync::atomic::AtomicU16>, hits: Hits) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -377,7 +377,7 @@ async fn live_items_push_sealed_payloads_and_dead_endpoints_prune() {
 
     // The push is async beside the inbox; give it its moment.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while hits.lock().unwrap().len() < 1 {
+    while hits.lock().unwrap().is_empty() {
         assert!(tokio::time::Instant::now() < deadline, "a push arrived");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
