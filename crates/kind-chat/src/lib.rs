@@ -398,9 +398,10 @@ async fn run_turn(
 
     let stream = generator.generate(&messages);
     let hook = transcript.clone();
-    let result =
-        GenerateOutput::from_stream_with_hook(stream, move |part| hook.with(|t| t.apply_part(part)))
-            .await;
+    let result = GenerateOutput::from_stream_with_hook(stream, move |part| {
+        hook.with(|t| t.apply_part(part))
+    })
+    .await;
 
     let reason = match result {
         Ok(output) => {

@@ -34,7 +34,9 @@ context_window = 100000
 "#,
     )
     .expect("catalog parses");
-    resolve_catalog(&file, &|_| None, &|_| Err("no files".into())).expect("resolves")
+    resolve_catalog(&file, &|_| None, &|_| Err("no files".into()))
+        .expect("resolves")
+        .0
 }
 
 fn modeled_pool(factory: ModelFactory) -> (Pool, String) {
@@ -289,7 +291,10 @@ async fn only_human_posts_trigger_turns() {
         .await
         .expect("about");
     assert_eq!(about["turn_running"], json!(false));
-    assert_eq!(about["len"], 4, "two posts appended, no new assistant entry");
+    assert_eq!(
+        about["len"], 4,
+        "two posts appended, no new assistant entry"
+    );
 }
 
 #[tokio::test]
