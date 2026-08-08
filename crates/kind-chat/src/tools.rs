@@ -68,8 +68,9 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
             name: "bash".into(),
             description: "Run a shell command on the workspace host. The command runs under \
                       `bash -c` in a fresh one-shot terminal; stdout and stderr come back \
-                      interleaved, and the terminal is removed afterwards — state does not \
-                      persist between calls, use files for that."
+                      interleaved, a non-zero exit code makes the result an error, and the \
+                      terminal is removed afterwards — state does not persist between \
+                      calls, use files for that."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -140,7 +141,13 @@ async fn bash(
         .take(48)
         .collect();
     let info = pool
-        .create(agent, "tty", project, &title, json!({"command": command}))
+        .create(
+            agent,
+            "tty",
+            project,
+            &title,
+            json!({"command": command, "mode": "piped"}),
+        )
         .map_err(|e| format!("cannot start a terminal: {e}"))?;
     // Removal is owed no matter how this function ends — normal return,
     // error, or the whole turn task aborted mid-await.
@@ -151,6 +158,9 @@ async fn bash(
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+    // The read that ended the wait is the read that carries the exit — one
+    // answer, so the status can never come from a different look than the
+    // one that saw the child stop.
     let exited = pool
         .wait_until(agent, &tty.id, "text", deadline, |text| {
             text.get("running") != Some(&json!(true))
@@ -166,12 +176,21 @@ async fn bash(
     if truncated {
         output = format!("[output truncated to the last {MAX_TOOL_OUTPUT_BYTES} bytes]\n{output}");
     }
-    if exited.is_none() {
+    let Some(text) = exited else {
         return Err(format!(
             "timed out after {timeout}s (the command was killed); output so far:\n{output}"
         ));
+    };
+    let exit = (
+        text.get("exit_code").and_then(Value::as_i64),
+        text.get("exit_signal").and_then(Value::as_i64),
+    );
+    match exit {
+        (Some(0), _) => Ok(output),
+        (Some(code), _) => Err(format!("exit code {code}\n{output}")),
+        (None, Some(sig)) => Err(format!("killed by signal {sig}\n{output}")),
+        (None, None) => Ok(output),
     }
-    Ok(output)
 }
 
 const SUBAGENT_DEFAULT_TIMEOUT_SECS: u64 = 600;
