@@ -67,7 +67,12 @@ impl Kind for CounterSpec {
         &COUNTER_SPEC
     }
 
-    fn create(&self, _id: &str, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(
+        &self,
+        _id: &str,
+        args: Value,
+        _signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError> {
         let start = args.get("start").and_then(Value::as_i64).unwrap_or(0);
         Ok(Box::new(Counter(start)))
     }
@@ -548,6 +553,103 @@ async fn listing_scopes_by_project() {
     assert_eq!(pool.list(Some("alpha")).len(), 2);
     assert_eq!(pool.list(Some("beta")).len(), 1);
     assert_eq!(pool.list(Some("gamma")).len(), 0);
+}
+
+/// The watermark-wait, once: it checks before it waits (the condition may
+/// already hold), wakes on a bump rather than a timer, and gives up at the
+/// deadline instead of hanging forever on something that will never be true.
+#[tokio::test]
+async fn wait_until_checks_first_wakes_on_a_bump_and_gives_up_at_the_deadline() {
+    let pool = pool();
+    let info = pool
+        .create(&ada(), "counter", "proj", "", json!({"start": 3}))
+        .unwrap();
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", far, |v| v == &json!(3))
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(json!(3)), "already true: no wait at all");
+
+    let bumper = pool.clone();
+    let id = info.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        bumper
+            .call(&ada(), &id, "incr", json!({"by": 1}))
+            .await
+            .unwrap();
+    });
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", far, |v| v == &json!(4))
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(json!(4)), "true later: the bump wakes the read");
+
+    let soon = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", soon, |v| v == &json!(99))
+        .await
+        .unwrap();
+    assert_eq!(seen, None, "never true: the deadline ends it");
+}
+
+/// Parentage is identity, not kind state: fixed at birth, carried by the
+/// listing without entering any cell, refused when it names nothing, and
+/// left standing when the parent is removed — a child that is orphaned is
+/// not a child that was lying about where it came from.
+#[tokio::test]
+async fn parentage_is_fixed_at_birth_and_carried_by_the_listing() {
+    let pool = pool();
+    let root = pool
+        .create(&ada(), "counter", "proj", "", Value::Null)
+        .unwrap();
+    assert_eq!(root.parent, None, "an unparented instance is a root");
+
+    let child = pool
+        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&root.id))
+        .unwrap();
+    let grandchild = pool
+        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&child.id))
+        .unwrap();
+    assert_eq!(child.parent.as_deref(), Some(root.id.as_str()));
+    assert_eq!(
+        meta(&pool, &child.id).await.parent,
+        child.parent,
+        "sys.meta and the create reply agree"
+    );
+    assert_eq!(
+        pool.list(Some("proj"))
+            .iter()
+            .filter(|i| i.parent.is_some())
+            .count(),
+        2
+    );
+
+    // Nearest first, so a depth cap is a length.
+    assert_eq!(
+        pool.ancestors(&grandchild.id),
+        vec![child.id.clone(), root.id.clone()]
+    );
+    assert!(pool.ancestors(&root.id).is_empty());
+
+    // A parent nothing answers to is a bad birth certificate, not a root.
+    assert_eq!(
+        pool.create_under(&ada(), "counter", "proj", "", Value::Null, Some("nobody")),
+        Err(VerbError::UnknownInstance {
+            id: "nobody".into()
+        })
+    );
+
+    pool.call(&ada(), &root.id, "sys.remove", Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta(&pool, &child.id).await.parent.as_deref(),
+        Some(root.id.as_str()),
+        "removal orphans; it does not rewrite history"
+    );
 }
 
 /// A panicking kind takes down its own instance and nothing else; the
