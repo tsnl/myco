@@ -2,11 +2,13 @@
 //!
 //! v2's "session" dissolves here — a chat is an ordinary instance in the
 //! pool, created by anyone, watched like anything else. A **subagent** is
-//! nothing but a chat whose `parent` names another chat; there is no child
-//! machinery anywhere. The transcript is shared, attributed, and
-//! multiplayer: `post` appends, `tail` cursors, and the author is always
-//! the authenticated [`Principal`] the bus resolved — never anything the
-//! arguments claim.
+//! nothing but a chat created under another chat; parentage is L1 identity
+//! ([`InstanceInfo::parent`](myco_instance::InstanceInfo)), fixed at birth
+//! and readable from the listing, so there is no child machinery here and
+//! no parent field for this kind to keep in sync. The transcript is
+//! shared, attributed, and multiplayer: `post` appends, `tail` cursors,
+//! and the author is always the authenticated [`Principal`] the bus
+//! resolved — never anything the arguments claim.
 //!
 //! **The turn engine.** A chat created with a `model` answers human posts.
 //! A model *turn* is not a mailbox command (DESIGN.md): it runs as a
@@ -19,10 +21,10 @@
 //! partial entry stays: state is not history, and a cancelled thought
 //! visibly happened.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, Shared, VerbError, VerbSpec};
 use myco_models::{
     Content, GenerateOutput, GenerativeModel, GenerativeModelConfig, MessagePart, ModelCatalog,
     ToolResult, ToolUse, TurnEndReason,
@@ -32,6 +34,8 @@ use serde_json::{Value, json};
 
 mod project;
 pub use project::project;
+
+mod tail;
 
 mod tools;
 
@@ -69,7 +73,7 @@ static CHAT_SPEC: KindSpec = KindSpec {
         VerbSpec::write("unwatch", "drop the standing subscription on {instance}"),
         VerbSpec::read(
             "about",
-            "the chat's shape: {parent, model, len, turn_running, watching}",
+            "the chat's shape: {model, len, turn_running, watching}",
         ),
     ],
     primary_render: "tail",
@@ -193,16 +197,12 @@ impl Kind for ChatKind {
         &CHAT_SPEC
     }
 
-    fn create(&self, id: &str, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
-        let parent = match args.get("parent") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
-            Some(other) => {
-                return Err(VerbError::BadArgs {
-                    why: format!("parent must be an instance id string, got {other}"),
-                });
-            }
-        };
+    fn create(
+        &self,
+        id: &str,
+        args: Value,
+        signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError> {
         let requested = match args.get("model") {
             None | Some(Value::Null) => None,
             Some(Value::String(key)) if !key.trim().is_empty() => Some(key.clone()),
@@ -232,9 +232,8 @@ impl Kind for ChatKind {
         Ok(Box::new(Chat {
             agent: Principal::Agent(id.to_string()),
             pool: self.pool.clone(),
-            parent,
             model,
-            transcript: Arc::new(Mutex::new(Transcript::default())),
+            transcript: Shared::new(Transcript::default(), signals),
             turn: None,
         }))
     }
@@ -244,9 +243,10 @@ impl Kind for ChatKind {
 // The instance
 // ---------------------------------------------------------------------------
 
-/// The shared transcript: verbs mutate it inside the cell, the turn task
-/// streams into it from outside — the tty's pump pattern. The lock is never
-/// held across an await.
+/// The transcript: verbs mutate it inside the cell, the turn task streams
+/// into it from outside. It is held in a [`Shared`] — the framework's
+/// spelling of that arrangement, so the bump that wakes watchers cannot be
+/// forgotten and the lock cannot be held across an await.
 #[derive(Default)]
 struct Transcript {
     entries: Vec<Entry>,
@@ -405,9 +405,8 @@ struct Chat {
     /// doctrine's naming, and the transcript's author for model entries.
     agent: Principal,
     pool: Pool,
-    parent: Option<String>,
     model: Option<(String, Arc<dyn GenerativeModel>)>,
-    transcript: Arc<Mutex<Transcript>>,
+    transcript: Shared<Transcript>,
     turn: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -420,41 +419,39 @@ impl Chat {
         let Some(handle) = self.turn.take() else {
             return false;
         };
-        let was_running = !handle.is_finished();
-        handle.abort();
-        let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
-        t.fail_pending(reason);
-        drop(t);
-        if was_running {
-            signals.emit("turn_ended", json!({ "reason": reason }));
-            signals.bump();
+        if handle.is_finished() {
+            // The task already closed its own entry; there is nothing left
+            // to fail and nobody to wake.
+            return false;
         }
-        was_running
+        handle.abort();
+        self.transcript.with(|t| t.fail_pending(reason));
+        signals.emit("turn_ended", json!({ "reason": reason }));
+        true
     }
 
-    fn start_turn(&mut self, signals: &Signals) {
+    fn start_turn(&mut self) {
         let Some((model, generator)) = &self.model else {
             return;
         };
         self.turn = Some(tokio::spawn(run_turn(TurnCtx {
-            transcript: Arc::clone(&self.transcript),
+            transcript: self.transcript.clone(),
             generator: Arc::clone(generator),
             pool: self.pool.clone(),
             agent: self.agent.clone(),
             model: model.clone(),
-            signals: signals.clone(),
         })));
     }
 }
 
-/// Everything one turn needs, handed to the side-feed task.
+/// Everything one turn needs, handed to the side-feed task. The transcript
+/// carries the cell's signals, so the task needs no second handle on them.
 struct TurnCtx {
-    transcript: Arc<Mutex<Transcript>>,
+    transcript: Shared<Transcript>,
     generator: Arc<dyn GenerativeModel>,
     pool: Pool,
     agent: Principal,
     model: String,
-    signals: Signals,
 }
 
 /// One turn, as a side-feed: project the transcript, open the streaming
@@ -475,8 +472,8 @@ async fn run_turn(ctx: TurnCtx) {
         pool,
         agent,
         model,
-        signals,
     } = ctx;
+    let signals = transcript.signals().clone();
     let chat_id = match &agent {
         Principal::Agent(id) => id.clone(),
         _ => unreachable!("the chat speaks as an agent"),
@@ -487,33 +484,24 @@ async fn run_turn(ctx: TurnCtx) {
         .call(&agent, &chat_id, "sys.meta", Value::Null)
         .await
         .ok()
-        .and_then(|meta| meta.get("project").and_then(Value::as_str).map(String::from))
+        .and_then(|meta| {
+            meta.get("project")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
         .unwrap_or_default();
 
     signals.emit("turn_started", Value::Null);
-    signals.bump();
 
     let reason = loop {
-        refresh_subscriptions(&pool, &agent, &transcript, &signals).await;
-        let messages = {
-            let t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-            project::project(&t.entries)
-        };
-        {
-            let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-            t.open_assistant(agent.clone(), model.clone());
-        }
-        signals.bump();
+        refresh_subscriptions(&pool, &agent, &transcript).await;
+        let messages = transcript.read(|t| project::project(&t.entries));
+        transcript.with(|t| t.open_assistant(agent.clone(), model.clone()));
 
         let stream = generator.generate(&messages);
-        let hook_transcript = Arc::clone(&transcript);
-        let hook_signals = signals.clone();
+        let hook = transcript.clone();
         let result = GenerateOutput::from_stream_with_hook(stream, move |part| {
-            hook_transcript
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .apply_part(part);
-            hook_signals.bump();
+            hook.with(|t| t.apply_part(part))
         })
         .await;
 
@@ -521,36 +509,24 @@ async fn run_turn(ctx: TurnCtx) {
             Ok(output) => {
                 let tool_uses = output.tool_uses.clone();
                 let end = output.turn_end_reason.clone();
-                transcript
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .finalize(output);
-                signals.bump();
+                transcript.with(|t| t.finalize(output));
                 if end == TurnEndReason::ToolUse && !tool_uses.is_empty() {
                     let mut results = Vec::with_capacity(tool_uses.len());
                     for tool in &tool_uses {
                         results.push(tools::dispatch(&pool, &agent, &project, &model, tool).await);
                     }
-                    {
-                        let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-                        t.push(agent.clone(), Body::ToolResults { results });
-                    }
-                    signals.bump();
+                    transcript.with(|t| t.push(agent.clone(), Body::ToolResults { results }));
                     continue;
                 }
                 break turn_end_name(&end);
             }
             Err(e) => {
-                transcript
-                    .lock()
-                    .unwrap_or_else(|e2| e2.into_inner())
-                    .fail_pending(&format!("error: {e}"));
+                transcript.with(|t| t.fail_pending(&format!("error: {e}")));
                 break "error".to_string();
             }
         }
     };
     signals.emit("turn_ended", json!({ "reason": reason }));
-    signals.bump();
 }
 
 /// Chat-side cap on one splice, kind-agnostic: whatever the verb returned,
@@ -561,32 +537,24 @@ const SPLICE_BUDGET_BYTES: usize = 16 * 1024;
 /// call the cursored verb from the stored cursor, append the delta as a
 /// watched entry, advance the cursor. Dead targets unsubscribe themselves
 /// with a final note — a watch on a corpse is a leak, not a vigil.
-async fn refresh_subscriptions(
-    pool: &Pool,
-    agent: &Principal,
-    transcript: &Arc<Mutex<Transcript>>,
-    signals: &Signals,
-) {
-    let subs: Vec<Subscription> = {
-        let t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-        t.subs.clone()
-    };
+async fn refresh_subscriptions(pool: &Pool, agent: &Principal, transcript: &Shared<Transcript>) {
+    let subs: Vec<Subscription> = transcript.read(|t| t.subs.clone());
     for sub in subs {
         let moved = match pool.watermark(&sub.instance) {
             Ok(mark) if mark > sub.mark => Some(mark),
             Ok(_) => None,
             Err(_) => {
                 // Target gone: drop the subscription, say so once.
-                let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-                t.subs.retain(|s| s.instance != sub.instance);
-                t.push(
-                    agent.clone(),
-                    Body::Watched {
-                        instance: sub.instance.clone(),
-                        data: "[the watched instance is gone — subscription dropped]".into(),
-                    },
-                );
-                signals.bump();
+                transcript.with(|t| {
+                    t.subs.retain(|s| s.instance != sub.instance);
+                    t.push(
+                        agent.clone(),
+                        Body::Watched {
+                            instance: sub.instance.clone(),
+                            data: "[the watched instance is gone — subscription dropped]".into(),
+                        },
+                    );
+                });
                 None
             }
         };
@@ -602,30 +570,28 @@ async fn refresh_subscriptions(
         };
         let next = page.get("next").cloned();
         let mut data = watched_text(&page);
-        if data.len() > SPLICE_BUDGET_BYTES {
-            let cut = (data.len() - SPLICE_BUDGET_BYTES..data.len())
-                .find(|i| data.is_char_boundary(*i))
-                .unwrap_or(0);
-            data = format!("[truncated]\n{}", &data[cut..]);
+        if tail::keep_freshest(&mut data, SPLICE_BUDGET_BYTES) {
+            data = format!("[truncated]\n{data}");
         }
-        let mut t = transcript.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(live) = t.subs.iter_mut().find(|s| s.instance == sub.instance) {
-            live.mark = mark;
-            if next.is_some() {
-                live.cursor = next;
+        // Cursor advance and splice under one lock: a reader must never
+        // see the cursor moved past a delta the transcript does not hold.
+        transcript.with(|t| {
+            if let Some(live) = t.subs.iter_mut().find(|s| s.instance == sub.instance) {
+                live.mark = mark;
+                if next.is_some() {
+                    live.cursor = next;
+                }
             }
-        }
-        if !data.trim().is_empty() {
-            t.push(
-                agent.clone(),
-                Body::Watched {
-                    instance: sub.instance.clone(),
-                    data,
-                },
-            );
-            drop(t);
-            signals.bump();
-        }
+            if !data.trim().is_empty() {
+                t.push(
+                    agent.clone(),
+                    Body::Watched {
+                        instance: sub.instance.clone(),
+                        data,
+                    },
+                );
+            }
+        });
     }
 }
 
@@ -692,16 +658,14 @@ impl Instance for Chat {
                     .ok_or_else(|| VerbError::BadArgs {
                         why: "post needs a non-empty {text}".into(),
                     })?;
-                let entry = {
-                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = self.transcript.with(|t| {
                     t.push(
                         caller.clone(),
                         Body::Message {
                             text: text.to_string(),
                         },
                     )
-                };
-                signals.bump();
+                });
                 // Humans and *other* agents (a parent tasking this chat as
                 // a subagent) start or interrupt turns. The chat never
                 // answers itself — its own posts and entries are not
@@ -715,7 +679,7 @@ impl Instance for Chat {
                     if self.turn_running() {
                         self.abort_turn("interrupted", signals);
                     }
-                    self.start_turn(signals);
+                    self.start_turn();
                 }
                 Ok(serde_json::to_value(entry).expect("entry serializes"))
             }
@@ -723,8 +687,7 @@ impl Instance for Chat {
                 let cancelled = self.abort_turn("cancelled", signals);
                 Ok(json!({ "cancelled": cancelled }))
             }
-            "tail" => {
-                let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+            "tail" => Ok(self.transcript.read(|t| {
                 let len = t.entries.len() as u64;
                 let from = args
                     .get("from")
@@ -737,16 +700,15 @@ impl Instance for Chat {
                     .unwrap_or(DEFAULT_TAIL);
                 let upto = len.min(from.saturating_add(max));
                 let slice = &t.entries[from as usize..upto as usize];
-                Ok(json!({ "entries": slice, "next": upto, "len": len }))
-            }
-            "text" => {
-                let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                json!({ "entries": slice, "next": upto, "len": len })
+            })),
+            "text" => Ok(self.transcript.read(|t| {
                 let mut out = String::new();
                 for e in &t.entries {
                     out.push_str(&format!("{}: {}\n", e.author, e.body.plain()));
                 }
-                Ok(json!({ "text": out, "len": t.entries.len() as u64 }))
-            }
+                json!({ "text": out, "len": t.entries.len() as u64 })
+            })),
             "watch" => {
                 let target = args
                     .get("instance")
@@ -763,11 +725,13 @@ impl Instance for Chat {
                 // sys.spec never enters a mailbox, and the priming read is
                 // on another instance that cannot call back — both safe
                 // from a verb handler.
-                let spec = self.pool.call(caller, target, "sys.spec", Value::Null).await?;
+                let spec = self
+                    .pool
+                    .call(caller, target, "sys.spec", Value::Null)
+                    .await?;
                 let empty = Vec::new();
                 let verbs = spec["verbs"].as_array().unwrap_or(&empty);
-                let cursored =
-                    |v: &&Value| v["cursored"] == json!(true);
+                let cursored = |v: &&Value| v["cursored"] == json!(true);
                 let verb = match args.get("verb").and_then(Value::as_str) {
                     Some(name) => {
                         let found = verbs.iter().find(|v| v["name"] == json!(name));
@@ -819,8 +783,7 @@ impl Instance for Chat {
                     .ok()
                     .and_then(|page| page.get("next").cloned());
                 let mark = self.pool.watermark(target).unwrap_or(0);
-                {
-                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                self.transcript.with(|t| {
                     t.subs.retain(|sub| sub.instance != target);
                     t.subs.push(Subscription {
                         instance: target.to_string(),
@@ -829,8 +792,7 @@ impl Instance for Chat {
                         cursor,
                         mark,
                     });
-                }
-                signals.bump();
+                });
                 Ok(json!({"watching": target, "verb": verb}))
             }
             "unwatch" => {
@@ -840,25 +802,21 @@ impl Instance for Chat {
                     .ok_or_else(|| VerbError::BadArgs {
                         why: "unwatch needs {instance}".into(),
                     })?;
-                let dropped = {
-                    let mut t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                let dropped = self.transcript.with(|t| {
                     let before = t.subs.len();
                     t.subs.retain(|sub| sub.instance != target);
                     before != t.subs.len()
-                };
-                signals.bump();
+                });
                 Ok(json!({"dropped": dropped}))
             }
             "about" => {
-                let (len, watching) = {
-                    let t = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+                let (len, watching) = self.transcript.read(|t| {
                     (
                         t.entries.len() as u64,
                         serde_json::to_value(&t.subs).expect("subs serialize"),
                     )
-                };
+                });
                 Ok(json!({
-                    "parent": self.parent,
                     "model": self.model.as_ref().map(|(key, _)| key.clone()),
                     "len": len,
                     "turn_running": self.turn_running(),
