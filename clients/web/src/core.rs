@@ -20,6 +20,10 @@ pub struct State {
     pub passkey_note: Option<String>,
     /// The workspace: what the pool holds, kept fresh by list + feed.
     pub workspace: Workspace,
+    /// The admin surface: `Some` exactly when the server said this person
+    /// is the operator (the 200 on the listing *is* the authorization —
+    /// the client never decides who operates).
+    pub admin: Option<Admin>,
     /// The command palette, when summoned.
     pub palette: Option<Palette>,
     /// The last palette-run verb's answer (or refusal) — a quiet line, not
@@ -124,6 +128,39 @@ pub struct PrincipalRef {
     pub id: String,
 }
 
+/// The operator's panel: the roster with live state, and the one-time
+/// code a mint just answered (the only moment its plaintext exists).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Admin {
+    pub open: bool,
+    pub users: Vec<AdminUser>,
+    pub minted: Option<Minted>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct AdminUser {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub sessions: u64,
+    #[serde(default)]
+    pub passkeys: u64,
+    #[serde(default)]
+    pub operator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Minted {
+    pub username: String,
+    pub code: String,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
 /// The palette: one fuzzy list over the whole registry, or the JSON-well
 /// second stage a verb that wanted args sent us to.
 #[derive(Debug, Clone, PartialEq)]
@@ -167,6 +204,7 @@ pub enum Commit {
     Verb { id: String, verb: String },
     ClosePane { id: String },
     SignOut,
+    AdminPanel,
 }
 
 /// The registry, filtered by the palette's query: the focused instance's
@@ -247,6 +285,15 @@ pub fn palette_rows(state: &State, query: &str) -> Vec<Row> {
             commit: Commit::Create {
                 kind: kind.kind.clone(),
             },
+        });
+    }
+    if state.admin.is_some() {
+        rows.push(Row {
+            label: "admin panel".into(),
+            detail: "the roster, codes, seats of power".into(),
+            group: "session",
+            gated: None,
+            commit: Commit::AdminPanel,
         });
     }
     rows.push(Row {
@@ -377,6 +424,19 @@ pub enum Action {
     PaletteArgsCommitted { draft: String },
     /// Escape — close the palette (args stage falls back to the list).
     PaletteDismissed,
+    /// `GET /api/admin/users` answered (403 = simply not the operator).
+    AdminAnswered { status: u16, body: String },
+    /// The operator opened or closed the panel.
+    AdminToggled,
+    /// The operator asked for an action on a user.
+    AdminActed { user: String, act: AdminAct },
+    /// An admin action answered.
+    AdminActAnswered {
+        user: String,
+        act: AdminAct,
+        status: u16,
+        body: String,
+    },
     /// A palette-run verb answered.
     VerbRan {
         id: String,
@@ -465,6 +525,39 @@ pub enum Effect {
         verb: String,
         args: String,
     },
+    /// `GET /api/admin/users` → [`Action::AdminAnswered`].
+    FetchAdmin { token: String },
+    /// One admin action on one user → [`Action::AdminActAnswered`].
+    AdminAct {
+        token: String,
+        user: String,
+        act: AdminAct,
+    },
+}
+
+/// The admin verbs, exactly the v2 panel's: each is one route.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AdminAct {
+    Mint,
+    Disable,
+    Enable,
+    Revoke,
+    ClearPasskeys,
+    Remove,
+}
+
+impl AdminAct {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "mint" => Self::Mint,
+            "disable" => Self::Disable,
+            "enable" => Self::Enable,
+            "revoke" => Self::Revoke,
+            "clear-passkeys" => Self::ClearPasskeys,
+            "remove" => Self::Remove,
+            _ => return None,
+        })
+    }
 }
 
 /// Chords the room keeps for itself — the terminal must lose only what
@@ -562,6 +655,10 @@ fn enter_workspace(token: &str) -> Vec<Effect> {
             token: token.into(),
         },
         Effect::OpenFeed {
+            token: token.into(),
+        },
+        // The 403 most people get back is the answer, not an error.
+        Effect::FetchAdmin {
             token: token.into(),
         },
     ]
@@ -737,6 +834,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.sign_in = SignIn::default();
             state.passkey_note = None;
             state.workspace = Workspace::default();
+            state.admin = None;
             effects
         }
         Action::KindsAnswered { status, body } => {
@@ -962,6 +1060,84 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 None => vec![],
             }
         }
+        Action::AdminAnswered { status, body } => {
+            #[derive(serde::Deserialize)]
+            struct Listing {
+                users: Vec<AdminUser>,
+            }
+            match (status, serde_json::from_str::<Listing>(&body)) {
+                (200, Ok(listing)) => {
+                    let open = state.admin.as_ref().is_some_and(|a| a.open);
+                    let minted = state.admin.take().and_then(|a| a.minted);
+                    state.admin = Some(Admin {
+                        open,
+                        users: listing.users,
+                        minted,
+                        error: None,
+                    });
+                }
+                // 403 is the ordinary answer: not the operator. Anything
+                // else leaves whatever we knew alone.
+                (403, _) => state.admin = None,
+                _ => {}
+            }
+            vec![]
+        }
+        Action::AdminToggled => {
+            if let Some(admin) = &mut state.admin {
+                admin.open = !admin.open;
+                if !admin.open {
+                    // Closing the panel forgets the plaintext code.
+                    admin.minted = None;
+                }
+            }
+            vec![]
+        }
+        Action::AdminActed { user, act } => match &state.token {
+            Some(token) => vec![Effect::AdminAct {
+                token: token.clone(),
+                user,
+                act,
+            }],
+            None => vec![],
+        },
+        Action::AdminActAnswered {
+            user: _,
+            act,
+            status,
+            body,
+        } => {
+            if let Some(admin) = &mut state.admin {
+                admin.error = None;
+                match (act, status) {
+                    (AdminAct::Mint, 200) => {
+                        admin.minted = serde_json::from_str::<Minted>(&body).ok();
+                    }
+                    (_, 200) => {}
+                    _ => {
+                        #[derive(serde::Deserialize)]
+                        struct Wire {
+                            #[serde(default)]
+                            why: String,
+                        }
+                        admin.error = Some(
+                            serde_json::from_str::<Wire>(&body)
+                                .ok()
+                                .map(|w| w.why)
+                                .filter(|w| !w.is_empty())
+                                .unwrap_or_else(|| format!("refused ({status})")),
+                        );
+                    }
+                }
+            }
+            // Whatever happened, the listing is the truth to re-read.
+            match &state.token {
+                Some(token) => vec![Effect::FetchAdmin {
+                    token: token.clone(),
+                }],
+                None => vec![],
+            }
+        }
         Action::PaletteToggled => {
             state.notice = None;
             state.palette = match state.palette {
@@ -1026,6 +1202,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 }
                 Commit::ClosePane { id } => reduce_again(state, Action::PaneClosed { id }),
                 Commit::SignOut => reduce_again(state, Action::SignOutRequested),
+                Commit::AdminPanel => reduce_again(state, Action::AdminToggled),
                 Commit::Verb { id, verb } => match &state.token {
                     // Optimistic: run with null. bad_args reopens as the
                     // well, carrying the server's own complaint.
@@ -1877,6 +2054,128 @@ mod tests {
         // Escape closes; the terminal gets its keys back.
         reduce(&mut state, Action::PaletteDismissed);
         assert!(wants_key(&state, "a", false, false));
+    }
+
+    const LISTING: &str = r#"{"operator":"ada","users":[
+        {"id":"ada","name":"Ada","disabled":false,"sessions":1,"passkeys":1,"operator":true},
+        {"id":"grace","name":"Grace","disabled":false,"sessions":2,"passkeys":0,"operator":false}
+    ]}"#;
+
+    #[test]
+    fn the_admin_surface_exists_exactly_when_the_server_says_operator() {
+        let mut state = signed_in();
+        // Entering the workspace probed the admin listing.
+        reduce(
+            &mut state,
+            Action::AdminAnswered {
+                status: 200,
+                body: LISTING.into(),
+            },
+        );
+        let admin = state.admin.as_ref().expect("operator");
+        assert_eq!(admin.users.len(), 2);
+        assert!(palette_rows(&state, "admin").iter().any(|r| r.label == "admin panel"));
+
+        // A non-operator's 403 is the answer, not an error.
+        reduce(
+            &mut state,
+            Action::AdminAnswered {
+                status: 403,
+                body: r#"{"error":"forbidden","why":"operator only"}"#.into(),
+            },
+        );
+        assert!(state.admin.is_none());
+        assert!(!palette_rows(&state, "admin").iter().any(|r| r.label == "admin panel"));
+    }
+
+    #[test]
+    fn minting_shows_the_code_once_and_closing_forgets_it() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::AdminAnswered {
+                status: 200,
+                body: LISTING.into(),
+            },
+        );
+        reduce(&mut state, Action::AdminToggled);
+        let effects = reduce(
+            &mut state,
+            Action::AdminActed {
+                user: "grace".into(),
+                act: AdminAct::Mint,
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::AdminAct {
+                token: "tok-1".into(),
+                user: "grace".into(),
+                act: AdminAct::Mint,
+            }]
+        );
+        let effects = reduce(
+            &mut state,
+            Action::AdminActAnswered {
+                user: "grace".into(),
+                act: AdminAct::Mint,
+                status: 200,
+                body: r#"{"username":"grace","code":"AAAAA-BBBBB","expires_at":"soon"}"#.into(),
+            },
+        );
+        assert!(
+            effects.contains(&Effect::FetchAdmin {
+                token: "tok-1".into()
+            }),
+            "every act re-reads the listing"
+        );
+        assert_eq!(
+            state.admin.as_ref().unwrap().minted.as_ref().unwrap().code,
+            "AAAAA-BBBBB"
+        );
+        // The re-read keeps the minted code on screen…
+        reduce(
+            &mut state,
+            Action::AdminAnswered {
+                status: 200,
+                body: LISTING.into(),
+            },
+        );
+        assert!(state.admin.as_ref().unwrap().minted.is_some());
+        // …and closing the panel forgets the plaintext.
+        reduce(&mut state, Action::AdminToggled);
+        assert!(state.admin.as_ref().unwrap().minted.is_none());
+    }
+
+    #[test]
+    fn a_refused_act_lands_in_the_servers_words() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::AdminAnswered {
+                status: 200,
+                body: LISTING.into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::AdminActAnswered {
+                user: "ada".into(),
+                act: AdminAct::Disable,
+                status: 400,
+                body: r#"{"error":"refused","why":"the operator account cannot be disabled or removed"}"#.into(),
+            },
+        );
+        assert!(
+            state
+                .admin
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot be disabled")
+        );
     }
 
     /// The log is the repro: every action lands in order, capped.
