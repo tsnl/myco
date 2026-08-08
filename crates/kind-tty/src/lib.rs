@@ -5,7 +5,9 @@
 //! master. **piped mode** (`{"mode": "piped"}`) is the one-shot workhorse:
 //! plain pipes, no line discipline, and — what a pty cannot give — the
 //! child's **exit status**, reported in `text` and the `exited` event.
-//! Both modes share one verb surface and one byte-stream state; the
+//! Both modes share one verb surface and one byte-stream state — held in
+//! the framework's [`Shared`], so the byte pumps mutate it and publish in
+//! one move while the read verbs observe without publishing. The
 //! exit-status authority is a waiter task that reaps the child, so
 //! `running: false` and the exit code land together, atomically.
 //!
@@ -17,9 +19,8 @@
 //! same reach a real terminal's Ctrl-C has.
 
 use std::os::unix::process::ExitStatusExt as _;
-use std::sync::{Arc, Mutex};
 
-use myco_instance::{Instance, Kind, KindSpec, Principal, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Principal, Shared, VerbError, VerbSpec};
 use myco_runtime::Signals;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -36,7 +37,10 @@ static TTY_SPEC: KindSpec = KindSpec {
             "input",
             "write {data} to the terminal as keystrokes; in piped mode {eof: true} closes stdin",
         ),
-        VerbSpec::driven("resize", "set the terminal to {cols}×{rows} (pty mode only)"),
+        VerbSpec::driven(
+            "resize",
+            "set the terminal to {cols}×{rows} (pty mode only)",
+        ),
         VerbSpec::driven(
             "signal",
             "send {signal} (INT, TERM, KILL, HUP, QUIT, USR1, USR2, STOP, CONT) to the \
@@ -104,7 +108,11 @@ impl Kind for TtyKind {
                 let command = command.ok_or_else(|| bad("piped mode needs {command}"))?;
                 return create_piped(command, cwd, cols, rows, signals);
             }
-            other => return Err(bad(&format!("mode must be \"pty\" or \"piped\", got {other:?}"))),
+            other => {
+                return Err(bad(&format!(
+                    "mode must be \"pty\" or \"piped\", got {other:?}"
+                )));
+            }
         }
 
         let (reader, writer, slave) = pty::open(cols, rows).map_err(failed)?;
@@ -139,9 +147,9 @@ impl Kind for TtyKind {
             .map_err(|e| failed(format!("spawn {shown:?}: {e}")))?;
         let pgid = child.id().map(|pid| pid as i32);
 
-        let term = Arc::new(Mutex::new(Term::new(rows, cols)));
-        let pumps = vec![tokio::spawn(pump(reader, Arc::clone(&term), signals.clone()))];
-        tokio::spawn(waiter(child, pumps, Arc::clone(&term), signals));
+        let term = Shared::new(Term::new(rows, cols), signals);
+        let pumps = vec![tokio::spawn(pump(reader, term.clone()))];
+        tokio::spawn(waiter(child, pumps, term.clone()));
 
         Ok(Box::new(Tty {
             input: InputSink::Pty(writer),
@@ -176,15 +184,21 @@ fn create_piped(
         .map_err(|e| failed(format!("spawn {command:?}: {e}")))?;
     let pgid = child.id().map(|pid| pid as i32);
     let stdin = child.stdin.take();
-    let stdout = child.stdout.take().ok_or_else(|| failed("no stdout pipe"))?;
-    let stderr = child.stderr.take().ok_or_else(|| failed("no stderr pipe"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| failed("no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| failed("no stderr pipe"))?;
 
-    let term = Arc::new(Mutex::new(Term::new(rows, cols)));
+    let term = Shared::new(Term::new(rows, cols), signals);
     let pumps = vec![
-        tokio::spawn(pipe_pump(stdout, Arc::clone(&term), signals.clone())),
-        tokio::spawn(pipe_pump(stderr, Arc::clone(&term), signals.clone())),
+        tokio::spawn(pipe_pump(stdout, term.clone())),
+        tokio::spawn(pipe_pump(stderr, term.clone())),
     ];
-    tokio::spawn(waiter(child, pumps, Arc::clone(&term), signals));
+    tokio::spawn(waiter(child, pumps, term.clone()));
 
     Ok(Box::new(Tty {
         input: InputSink::Piped(stdin),
@@ -224,8 +238,7 @@ impl Term {
 async fn waiter(
     mut child: tokio::process::Child,
     pumps: Vec<tokio::task::JoinHandle<()>>,
-    term: Arc<Mutex<Term>>,
-    signals: Signals,
+    term: Shared<Term>,
 ) {
     let status = child.wait().await;
     for pump in pumps {
@@ -235,30 +248,25 @@ async fn waiter(
         Ok(s) => (s.code(), s.signal()),
         Err(_) => (None, None),
     };
-    {
-        let mut t = term.lock().unwrap_or_else(|e| e.into_inner());
+    term.with(|t| {
         t.running = false;
         t.exit_code = code;
         t.exit_signal = signal;
-    }
-    signals.emit("exited", json!({ "code": code, "signal": signal }));
-    signals.bump();
+    });
+    term.signals()
+        .emit("exited", json!({ "code": code, "signal": signal }));
 }
 
 /// A pipe's half of the piped-mode stream.
 async fn pipe_pump(
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    term: Arc<Mutex<Term>>,
-    signals: Signals,
+    term: Shared<Term>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                term.lock().unwrap_or_else(|e| e.into_inner()).feed(&buf[..n]);
-                signals.bump();
-            }
+            Ok(n) => term.with(|t| t.feed(&buf[..n])),
         }
     }
 }
@@ -266,15 +274,12 @@ async fn pipe_pump(
 /// The pty side-feed: bytes → screen model + scrollback, one bump per
 /// chunk. EOF (or EIO, the pty spelling of it) ends the pump; the *waiter*
 /// owns `running` and the `exited` event, so status and bytes cannot race.
-async fn pump(mut reader: pty::PtyReader, term: Arc<Mutex<Term>>, signals: Signals) {
+async fn pump(mut reader: pty::PtyReader, term: Shared<Term>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                term.lock().unwrap_or_else(|e| e.into_inner()).feed(&buf[..n]);
-                signals.bump();
-            }
+            Ok(n) => term.with(|t| t.feed(&buf[..n])),
         }
     }
 }
@@ -291,7 +296,7 @@ struct Tty {
     /// The child's process group (setsid'd in pty mode, process_group(0)
     /// in piped mode) — `signal`'s target, and Drop's.
     pgid: Option<i32>,
-    term: Arc<Mutex<Term>>,
+    term: Shared<Term>,
 }
 
 impl Drop for Tty {
@@ -313,7 +318,7 @@ impl Instance for Tty {
         _caller: &Principal,
         verb: &str,
         args: Value,
-        signals: &Signals,
+        _signals: &Signals,
     ) -> Result<Value, VerbError> {
         match verb {
             "input" => {
@@ -325,7 +330,9 @@ impl Instance for Tty {
                             return Ok(Value::Null);
                         }
                         InputSink::Pty(_) => {
-                            return Err(bad("eof is a piped-mode concept; a pty closes with the child"));
+                            return Err(bad(
+                                "eof is a piped-mode concept; a pty closes with the child",
+                            ));
                         }
                     }
                 }
@@ -354,12 +361,7 @@ impl Instance for Tty {
                 let cols = dimension(&args, "cols", 0, 20, 500)?;
                 let rows = dimension(&args, "rows", 0, 5, 200)?;
                 writer.resize(cols, rows).map_err(failed)?;
-                self.term
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .parser
-                    .set_size(rows, cols);
-                signals.bump();
+                self.term.with(|t| t.parser.set_size(rows, cols));
                 Ok(Value::Null)
             }
             "signal" => {
@@ -372,19 +374,17 @@ impl Instance for Tty {
                 let delivered = unsafe { libc::kill(-pgid, sig) } == 0;
                 Ok(json!({ "delivered": delivered }))
             }
-            "screen" => {
-                let t = self.term.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(serde_json::to_value(screen::render(t.parser.screen())).expect("serializes"))
-            }
-            "text" => {
-                let t = self.term.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(json!({
+            "screen" => Ok(self.term.read(|t| {
+                serde_json::to_value(screen::render(t.parser.screen())).expect("serializes")
+            })),
+            "text" => Ok(self.term.read(|t| {
+                json!({
                     "text": t.parser.screen().contents(),
                     "running": t.running,
                     "exit_code": t.exit_code,
                     "exit_signal": t.exit_signal,
-                }))
-            }
+                })
+            })),
             "tail" => {
                 // The budget doctrine made real: the caller bounds its own
                 // read; `next` reports how far this reply actually got.
@@ -393,16 +393,17 @@ impl Instance for Tty {
                     .get("max_bytes")
                     .and_then(Value::as_u64)
                     .unwrap_or(u64::MAX);
-                let t = self.term.lock().unwrap_or_else(|e| e.into_inner());
-                let end = t.scroll_start + t.scroll.len() as u64;
-                let from = from.clamp(t.scroll_start, end);
-                let upto = end.min(from.saturating_add(max));
-                let slice =
-                    &t.scroll[(from - t.scroll_start) as usize..(upto - t.scroll_start) as usize];
-                // Best-effort UTF-8: a cursor or trim landing mid-codepoint
-                // decodes as U+FFFD at the seam. Cursor math stays in bytes.
-                let data = String::from_utf8_lossy(slice).into_owned();
-                Ok(json!({ "from": from, "data": data, "next": upto }))
+                Ok(self.term.read(|t| {
+                    let end = t.scroll_start + t.scroll.len() as u64;
+                    let from = from.clamp(t.scroll_start, end);
+                    let upto = end.min(from.saturating_add(max));
+                    let slice = &t.scroll
+                        [(from - t.scroll_start) as usize..(upto - t.scroll_start) as usize];
+                    // Best-effort UTF-8: a cursor or trim landing mid-codepoint
+                    // decodes as U+FFFD at the seam. Cursor math stays in bytes.
+                    let data = String::from_utf8_lossy(slice).into_owned();
+                    json!({ "from": from, "data": data, "next": upto })
+                }))
             }
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }
