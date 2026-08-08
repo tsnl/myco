@@ -24,16 +24,20 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use myco_instance::{Instance, Kind, KindSpec, Principal, Shared, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, Shared, VerbError, VerbSpec};
 use myco_models::{
     Content, GenerateOutput, GenerativeModel, GenerativeModelConfig, MessagePart, ModelCatalog,
-    ToolUse, TurnEndReason,
+    ToolResult, ToolUse, TurnEndReason,
 };
 use myco_runtime::Signals;
 use serde_json::{Value, json};
 
 mod project;
 pub use project::project;
+
+mod tail;
+
+mod tools;
 
 static CHAT_SPEC: KindSpec = KindSpec {
     kind: "chat",
@@ -100,6 +104,9 @@ pub enum Body {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_end: Option<TurnEndReason>,
     },
+    /// The answers to the preceding assistant entry's tool calls, paired
+    /// positionally (result j answers tool_use j).
+    ToolResults { results: Vec<ToolResult> },
 }
 
 impl Body {
@@ -107,6 +114,11 @@ impl Body {
         match self {
             Body::Message { text } => text.clone(),
             Body::Assistant { content, .. } => myco_models::content_text(content),
+            Body::ToolResults { results } => results
+                .iter()
+                .map(|r| myco_models::content_text(&r.content))
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 }
@@ -121,6 +133,10 @@ pub type ModelFactory =
     Arc<dyn Fn(GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, String> + Send + Sync>;
 
 pub struct ChatKind {
+    /// The bus, held as a factory field — the blessed dependency injection
+    /// for kinds that act on it (the tool dispatcher creates and drives
+    /// tty instances as the chat's agent principal).
+    pool: Pool,
     catalog: Arc<ModelCatalog>,
     /// Applied when create args omit `model`. `None` + empty catalog is the
     /// modelless workspace: chats are pure transcripts.
@@ -128,28 +144,30 @@ pub struct ChatKind {
     factory: ModelFactory,
 }
 
-impl Default for ChatKind {
-    fn default() -> Self {
-        Self::new(ModelCatalog::default(), None)
-    }
-}
-
 impl ChatKind {
-    pub fn new(catalog: ModelCatalog, default_model: Option<String>) -> Self {
+    pub fn new(pool: Pool, catalog: ModelCatalog, default_model: Option<String>) -> Self {
         Self::with_factory(
+            pool,
             catalog,
             default_model,
             Arc::new(|config| myco_models::new(config).map_err(|e| e.to_string())),
         )
     }
 
+    /// A modelless chat kind: every chat is a pure transcript.
+    pub fn transcript_only(pool: Pool) -> Self {
+        Self::new(pool, ModelCatalog::default(), None)
+    }
+
     /// The test seam: a factory that answers with a scripted model.
     pub fn with_factory(
+        pool: Pool,
         catalog: ModelCatalog,
         default_model: Option<String>,
         factory: ModelFactory,
     ) -> Self {
         Self {
+            pool,
             catalog: Arc::new(catalog),
             default_model,
             factory,
@@ -162,7 +180,12 @@ impl Kind for ChatKind {
         &CHAT_SPEC
     }
 
-    fn create(&self, args: Value, signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(
+        &self,
+        id: &str,
+        args: Value,
+        signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError> {
         let requested = match args.get("model") {
             None | Some(Value::Null) => None,
             Some(Value::String(key)) if !key.trim().is_empty() => Some(key.clone()),
@@ -181,7 +204,7 @@ impl Kind for ChatKind {
                     .map_err(|why| VerbError::BadArgs { why })?;
                 let config = GenerativeModelConfig {
                     model: entry.spec.clone(),
-                    tools: Vec::new(),
+                    tools: tools::tool_specs(),
                     system_prompt: SYSTEM_PROMPT.to_string(),
                     backend_config: entry.backend.clone(),
                 };
@@ -190,6 +213,8 @@ impl Kind for ChatKind {
             }
         };
         Ok(Box::new(Chat {
+            agent: Principal::Agent(id.to_string()),
+            pool: self.pool.clone(),
             model,
             transcript: Shared::new(Transcript::default(), signals),
             turn: None,
@@ -224,13 +249,10 @@ impl Transcript {
         entry
     }
 
-    /// Open the streaming assistant entry the turn writes into. The author
-    /// is `Agent(model key)` for now; it becomes `Agent(chat id)` — the
-    /// doctrine's naming — when the tool dispatcher gives the kind its own
-    /// instance id.
-    fn open_assistant(&mut self, model: String) {
+    /// Open the streaming assistant entry the turn writes into.
+    fn open_assistant(&mut self, author: Principal, model: String) {
         self.push(
-            Principal::Agent(model.clone()),
+            author,
             Body::Assistant {
                 model,
                 content: Vec::new(),
@@ -344,6 +366,10 @@ impl Transcript {
 }
 
 struct Chat {
+    /// The chat speaking for itself on the bus: `Agent(instance id)` — the
+    /// doctrine's naming, and the transcript's author for model entries.
+    agent: Principal,
+    pool: Pool,
     model: Option<(String, Arc<dyn GenerativeModel>)>,
     transcript: Shared<Transcript>,
     turn: Option<tokio::task::JoinHandle<()>>,
@@ -373,50 +399,98 @@ impl Chat {
         let Some((model, generator)) = &self.model else {
             return;
         };
-        self.turn = Some(tokio::spawn(run_turn(
-            self.transcript.clone(),
-            Arc::clone(generator),
-            model.clone(),
-        )));
+        self.turn = Some(tokio::spawn(run_turn(TurnCtx {
+            transcript: self.transcript.clone(),
+            generator: Arc::clone(generator),
+            pool: self.pool.clone(),
+            agent: self.agent.clone(),
+            model: model.clone(),
+        })));
     }
 }
 
-/// One turn, as a side-feed: project the transcript, open the streaming
-/// entry, drain the provider stream into it, finalize. Uses the canonical
-/// accumulator with a hook, so the live view and the final entry can never
-/// disagree about what the model said. Every write goes through the
-/// [`Shared`], so every delta wakes watchers without a single hand-written
-/// bump.
-async fn run_turn(
+/// Everything one turn needs, handed to the side-feed task. The transcript
+/// carries the cell's signals, so the task needs no second handle on them.
+struct TurnCtx {
     transcript: Shared<Transcript>,
     generator: Arc<dyn GenerativeModel>,
+    pool: Pool,
+    agent: Principal,
     model: String,
-) {
-    let messages = transcript.read(|t| project(&t.entries));
-    transcript.with(|t| t.open_assistant(model.clone()));
-    transcript.signals().emit("turn_started", Value::Null);
+}
 
-    let stream = generator.generate(&messages);
-    let hook = transcript.clone();
-    let result = GenerateOutput::from_stream_with_hook(stream, move |part| {
-        hook.with(|t| t.apply_part(part))
-    })
-    .await;
+/// One turn, as a side-feed: project the transcript, open the streaming
+/// entry, drain the provider stream into it, finalize — and when the model
+/// ends on `ToolUse`, dispatch the calls as the agent principal, append
+/// the results, and generate again. The canonical accumulator runs with a
+/// hook, so the live view and the finished entry can never disagree about
+/// what the model said.
+///
+/// The task calls the pool freely (it is not a verb handler) but never
+/// calls a verb on its own chat instance's mailbox — its writes go through
+/// the shared transcript, and its self-knowledge through `sys.meta`, which
+/// never enters a mailbox.
+async fn run_turn(ctx: TurnCtx) {
+    let TurnCtx {
+        transcript,
+        generator,
+        pool,
+        agent,
+        model,
+    } = ctx;
+    let signals = transcript.signals().clone();
+    let chat_id = match &agent {
+        Principal::Agent(id) => id.clone(),
+        _ => unreachable!("the chat speaks as an agent"),
+    };
+    // Tool instances land beside the chat: same project, visible in the
+    // same slice of the tree.
+    let project = pool
+        .call(&agent, &chat_id, "sys.meta", Value::Null)
+        .await
+        .ok()
+        .and_then(|meta| {
+            meta.get("project")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .unwrap_or_default();
 
-    let reason = match result {
-        Ok(output) => {
-            let reason = turn_end_name(&output.turn_end_reason);
-            transcript.with(|t| t.finalize(output));
-            reason
-        }
-        Err(e) => {
-            transcript.with(|t| t.fail_pending(&format!("error: {e}")));
-            "error".to_string()
+    signals.emit("turn_started", Value::Null);
+
+    let reason = loop {
+        let messages = transcript.read(|t| project::project(&t.entries));
+        transcript.with(|t| t.open_assistant(agent.clone(), model.clone()));
+
+        let stream = generator.generate(&messages);
+        let hook = transcript.clone();
+        let result = GenerateOutput::from_stream_with_hook(stream, move |part| {
+            hook.with(|t| t.apply_part(part))
+        })
+        .await;
+
+        match result {
+            Ok(output) => {
+                let tool_uses = output.tool_uses.clone();
+                let end = output.turn_end_reason.clone();
+                transcript.with(|t| t.finalize(output));
+                if end == TurnEndReason::ToolUse && !tool_uses.is_empty() {
+                    let mut results = Vec::with_capacity(tool_uses.len());
+                    for tool in &tool_uses {
+                        results.push(tools::dispatch(&pool, &agent, &project, tool).await);
+                    }
+                    transcript.with(|t| t.push(agent.clone(), Body::ToolResults { results }));
+                    continue;
+                }
+                break turn_end_name(&end);
+            }
+            Err(e) => {
+                transcript.with(|t| t.fail_pending(&format!("error: {e}")));
+                break "error".to_string();
+            }
         }
     };
-    transcript
-        .signals()
-        .emit("turn_ended", json!({ "reason": reason }));
+    signals.emit("turn_ended", json!({ "reason": reason }));
 }
 
 fn turn_end_name(reason: &TurnEndReason) -> String {
