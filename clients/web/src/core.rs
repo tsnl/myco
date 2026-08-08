@@ -20,6 +20,11 @@ pub struct State {
     pub passkey_note: Option<String>,
     /// The workspace: what the pool holds, kept fresh by list + feed.
     pub workspace: Workspace,
+    /// The command palette, when summoned.
+    pub palette: Option<Palette>,
+    /// The last palette-run verb's answer (or refusal) — a quiet line, not
+    /// an ember; dismissed on the next palette open.
+    pub notice: Option<String>,
     /// A listing fetch is out and its answer has not landed. Bookkeeping,
     /// not content — it lives outside [`Workspace`] so a burst of feed
     /// events cannot make the tree look changed when nothing in it is.
@@ -84,6 +89,24 @@ pub struct KindInfo {
     /// The default read a pane renders (the L1 spec hint).
     #[serde(default)]
     pub primary_render: String,
+    /// The kind's verb vocabulary — the palette's raw material.
+    #[serde(default)]
+    pub verbs: Vec<VerbInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct VerbInfo {
+    pub name: String,
+    #[serde(default)]
+    pub doc: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub requires_driver: bool,
+    #[serde(default)]
+    pub owner_only: bool,
+    #[serde(default)]
+    pub cursored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -111,6 +134,204 @@ pub struct InstanceInfo {
 pub struct PrincipalRef {
     pub kind: String,
     pub id: String,
+}
+
+/// The palette: one fuzzy list over the whole registry, or the JSON-well
+/// second stage a verb that wanted args sent us to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Palette {
+    pub query: String,
+    pub selected: usize,
+    pub stage: Stage,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stage {
+    List,
+    /// A verb refused for want of arguments: the well, pre-filled, with
+    /// the server's own words about what was missing.
+    Args {
+        id: String,
+        verb: String,
+        draft: String,
+        error: Option<String>,
+    },
+}
+
+/// One palette row: what it says, whether it can run, and what committing
+/// it dispatches. Derived, never authored — a button is a palette entry
+/// with coordinates, and this is the registry both read from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub label: String,
+    pub detail: String,
+    pub group: &'static str,
+    /// `None` runs; `Some(reason)` renders gated with the reason — the
+    /// palette never hides a capability, it explains it.
+    pub gated: Option<String>,
+    pub commit: Commit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Commit {
+    Jump { id: String },
+    Create { kind: String },
+    Verb { id: String, verb: String },
+    ClosePane { id: String },
+    SignOut,
+}
+
+/// The registry, filtered by the palette's query: the focused instance's
+/// verbs (from the kind specs the server serves — nothing authored), jump
+/// entries for every instance, create entries for every kind, and the few
+/// client commands. Gating names the seat-holder rather than hiding rows.
+pub fn palette_rows(state: &State, query: &str) -> Vec<Row> {
+    let ws = &state.workspace;
+    let me = match &state.session {
+        Session::SignedIn(user) => Some(user.id.as_str()),
+        _ => None,
+    };
+    let mut rows = Vec::new();
+
+    if let Some(selected) = &ws.selected
+        && let Some(instance) = ws.instances.iter().find(|i| &i.id == selected)
+        && let Some(kind) = ws.kinds.iter().find(|k| k.kind == instance.kind)
+    {
+        let seat = seat_of(instance.driver.as_ref());
+        for verb in &kind.verbs {
+            let gated = if verb.requires_driver {
+                match &seat {
+                    _ if seat.held_by(me) => None,
+                    Seat::Open => Some("seat open — take it first".into()),
+                    held => Some(held.phrase()),
+                }
+            } else if verb.owner_only && me != Some(instance.creator.id.as_str()) {
+                Some(format!("{} only", instance.creator.id))
+            } else {
+                None
+            };
+            rows.push(Row {
+                label: verb.name.clone(),
+                detail: verb.doc.clone(),
+                group: "verbs",
+                gated,
+                commit: Commit::Verb {
+                    id: instance.id.clone(),
+                    verb: verb.name.clone(),
+                },
+            });
+        }
+        rows.push(Row {
+            label: "close pane".into(),
+            detail: String::new(),
+            group: "workspace",
+            gated: None,
+            commit: Commit::ClosePane {
+                id: selected.clone(),
+            },
+        });
+    }
+    for instance in &ws.instances {
+        let title = if instance.title.is_empty() {
+            &instance.kind
+        } else {
+            &instance.title
+        };
+        rows.push(Row {
+            label: format!("open {title}"),
+            detail: instance.kind.clone(),
+            group: "instances",
+            gated: None,
+            commit: Commit::Jump {
+                id: instance.id.clone(),
+            },
+        });
+    }
+    for kind in &ws.kinds {
+        rows.push(Row {
+            label: format!("new {}", kind.kind),
+            detail: kind.doc.clone(),
+            group: "create",
+            gated: None,
+            commit: Commit::Create {
+                kind: kind.kind.clone(),
+            },
+        });
+    }
+    rows.push(Row {
+        label: "sign out".into(),
+        detail: String::new(),
+        group: "session",
+        gated: None,
+        commit: Commit::SignOut,
+    });
+
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return rows;
+    }
+    rows.retain(|row| fuzzy(&row.label.to_lowercase(), &query));
+    rows
+}
+
+/// What a palette-run verb's answer does: reopen as the JSON well when the
+/// server says the arguments were missing, otherwise leave a notice and
+/// treat the run as a hint that anything may have moved.
+fn palette_answered(
+    state: &mut State,
+    id: String,
+    verb: String,
+    status: u16,
+    body: String,
+) -> Vec<Effect> {
+    #[derive(Default, serde::Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        why: String,
+    }
+    let wire = serde_json::from_str::<Wire>(&body).unwrap_or_default();
+    if status == 400 && wire.error == "bad_args" {
+        // The error-driven second stage: the well opens with the server's
+        // own words about what was missing.
+        state.palette = Some(Palette {
+            query: String::new(),
+            selected: 0,
+            stage: Stage::Args {
+                id,
+                verb,
+                draft: "{}".into(),
+                error: Some(wire.why),
+            },
+        });
+        return vec![];
+    }
+    state.notice = Some(if status == 200 {
+        let pretty = serde_json::from_str::<serde_json::Value>(&body)
+            .and_then(|v| serde_json::to_string_pretty(&v))
+            .unwrap_or(body);
+        let mut line: String = format!("{verb} → {pretty}");
+        if line.len() > 600 {
+            line.truncate(600);
+            line.push('…');
+        }
+        line
+    } else if !wire.why.is_empty() {
+        format!("{verb} refused: {}", wire.why)
+    } else {
+        format!("{verb} answered {status}")
+    });
+    // A verb may have changed anything; the watched panes re-read on their
+    // marks, the listing on this.
+    relist(state)
+}
+
+/// Subsequence match: every query char appears, in order. Small, honest,
+/// and predictable — ranking games can come later if typing earns them.
+fn fuzzy(haystack: &str, needle: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle.chars().all(|n| chars.any(|h| h == n))
 }
 
 /// Who holds the driver seat, as the client presents it.
@@ -265,6 +486,18 @@ pub enum Action {
     KeyPressed { key: String, ctrl: bool, alt: bool },
     /// The edge measured the focused tty pane's usable cell grid.
     PaneMeasured { id: String, cols: u16, rows: u16 },
+    /// `Cmd/Ctrl+P` — summon (or dismiss, when already up) the palette.
+    PaletteToggled,
+    /// The palette input changed.
+    PaletteQueried { query: String },
+    /// Arrow movement in the list (`delta` is ±1).
+    PaletteMoved { delta: i32 },
+    /// Enter on the list: commit the selected row.
+    PaletteCommitted,
+    /// Enter in the args well: run with the drafted JSON.
+    PaletteArgsCommitted { draft: String },
+    /// Escape — close the palette (args stage falls back to the list).
+    PaletteDismissed,
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
@@ -289,6 +522,9 @@ pub enum Origin {
     /// move nothing anyone lists, so their answers are dropped on the
     /// floor rather than costing a re-list per key.
     Drive,
+    /// The palette ran a verb: the answer is a notice, or — on `bad_args` —
+    /// the second stage, the JSON well carrying the server's complaint.
+    Palette,
 }
 
 /// What the edge must do. Effects re-enter as actions; they never touch
@@ -354,7 +590,7 @@ pub fn reserved_chord(key: &str, ctrl: bool, meta: bool) -> bool {
 /// the focused pane is a live tty whose seat this person holds and the
 /// chord is not reserved.
 pub fn wants_key(state: &State, key: &str, ctrl: bool, meta: bool) -> bool {
-    if reserved_chord(key, ctrl, meta) || meta {
+    if reserved_chord(key, ctrl, meta) || meta || state.palette.is_some() {
         return false;
     }
     let Session::SignedIn(user) = &state.session else {
@@ -512,6 +748,13 @@ struct Refusal {
 }
 
 const LOG_CAP: usize = 256;
+
+/// A palette commit *is* the underlying action — same reducer, so a
+/// button and a palette row cannot diverge. (Logged as its own entry via
+/// the ordinary path.)
+fn reduce_again(state: &mut State, action: Action) -> Vec<Effect> {
+    reduce(state, action)
+}
 
 pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
     if state.log.len() == LOG_CAP {
@@ -778,7 +1021,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::VerbReplied {
             origin,
             id,
-            verb: _,
+            verb,
             status,
             body,
         } => match origin {
@@ -798,6 +1041,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             // answer moves nothing there.
             Origin::Chrome => relist(state),
             Origin::Drive => vec![],
+            Origin::Palette => palette_answered(state, id, verb, status, body),
         },
         Action::KeyPressed { key, ctrl, alt } => {
             let Some(selected) = state.workspace.selected.clone() else {
@@ -851,6 +1095,110 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 state.workspace.selected = Some(info.id);
             }
             relist(state)
+        }
+        Action::PaletteToggled => {
+            state.notice = None;
+            state.palette = match state.palette {
+                Some(_) => None,
+                None => Some(Palette {
+                    query: String::new(),
+                    selected: 0,
+                    stage: Stage::List,
+                }),
+            };
+            vec![]
+        }
+        Action::PaletteQueried { query } => {
+            if let Some(palette) = &mut state.palette {
+                palette.query = query;
+                palette.selected = 0;
+            }
+            vec![]
+        }
+        Action::PaletteMoved { delta } => {
+            let rows = state
+                .palette
+                .as_ref()
+                .map(|p| palette_rows(state, &p.query).len())
+                .unwrap_or(0);
+            if let Some(palette) = &mut state.palette
+                && rows > 0
+            {
+                let max = rows as i32 - 1;
+                palette.selected = (palette.selected as i32 + delta).clamp(0, max) as usize;
+            }
+            vec![]
+        }
+        Action::PaletteDismissed => {
+            if let Some(palette) = &mut state.palette {
+                match palette.stage {
+                    Stage::Args { .. } => palette.stage = Stage::List,
+                    Stage::List => state.palette = None,
+                }
+            }
+            vec![]
+        }
+        Action::PaletteCommitted => {
+            let Some(palette) = &state.palette else {
+                return vec![];
+            };
+            let rows = palette_rows(state, &palette.query);
+            let Some(row) = rows.get(palette.selected) else {
+                return vec![];
+            };
+            if let Some(reason) = &row.gated {
+                state.notice = Some(format!("gated: {reason}"));
+                return vec![];
+            }
+            let commit = row.commit.clone();
+            state.palette = None;
+            match commit {
+                Commit::Jump { id } => reduce_again(state, Action::Selected { id }),
+                Commit::Create { kind } => reduce_again(state, Action::CreateRequested { kind }),
+                Commit::ClosePane { id } => reduce_again(state, Action::PaneClosed { id }),
+                Commit::SignOut => reduce_again(state, Action::SignOutRequested),
+                Commit::Verb { id, verb } => match &state.token {
+                    // Optimistic: run with null. bad_args reopens as the
+                    // well, carrying the server's own complaint.
+                    Some(token) => vec![Effect::call(Origin::Palette, token, &id, &verb)],
+                    None => vec![],
+                },
+            }
+        }
+        Action::PaletteArgsCommitted { draft } => {
+            let Some(palette) = &mut state.palette else {
+                return vec![];
+            };
+            let Stage::Args { id, verb, .. } = &palette.stage else {
+                return vec![];
+            };
+            let (id, verb) = (id.clone(), verb.clone());
+            match serde_json::from_str::<serde_json::Value>(&draft) {
+                Ok(_) => {
+                    state.palette = None;
+                    match &state.token {
+                        Some(token) => vec![Effect::CallVerb {
+                            origin: Origin::Palette,
+                            token: token.clone(),
+                            id,
+                            verb,
+                            args: draft,
+                        }],
+                        None => vec![],
+                    }
+                }
+                Err(e) => {
+                    if let Some(palette) = &mut state.palette
+                        && let Stage::Args {
+                            draft: d, error, ..
+                        } = &mut palette.stage
+                    {
+                        *d = draft;
+                        *error = Some(format!("that is not JSON: {e}"));
+                    }
+                    vec![]
+                }
+            }
         }
         Action::NetworkFailed { what } => {
             // A call that never got a status cannot answer; releasing the
@@ -1572,6 +1920,175 @@ mod tests {
             "a keystroke costs no listing"
         );
         assert!(!reduce(&mut state, replied(Origin::Chrome, "sys.take")).is_empty());
+    }
+
+    /// A tty workspace with verbs in the kind spec, pane open and focused.
+    fn with_palette_world() -> State {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::KindsAnswered {
+                status: 200,
+                body: r#"[{"kind":"tty","doc":"a terminal","primary_render":"screen",
+                    "verbs":[
+                      {"name":"input","doc":"type","requires_driver":true},
+                      {"name":"screen","doc":"look","read_only":true},
+                      {"name":"signal","doc":"send a signal","requires_driver":true}
+                    ]}]"#
+                    .into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"t1","kind":"tty","project":"","title":"shell",
+                           "creator":{"kind":"human","id":"ada"},
+                           "driver":{"kind":"agent","id":"c9"}}]"#
+                    .into(),
+            },
+        );
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        state
+    }
+
+    #[test]
+    fn the_registry_derives_verbs_and_gates_them_by_seat() {
+        let state = with_palette_world();
+        let rows = palette_rows(&state, "");
+        let input = rows.iter().find(|r| r.label == "input").expect("input row");
+        assert_eq!(
+            input.gated.as_deref(),
+            Some("agent driving"),
+            "gated rows teach the seat"
+        );
+        let screen = rows
+            .iter()
+            .find(|r| r.label == "screen")
+            .expect("screen row");
+        assert!(screen.gated.is_none(), "reads are never gated");
+        assert!(rows.iter().any(|r| r.label == "open shell"));
+        assert!(rows.iter().any(|r| r.label == "new tty"));
+
+        // The fuzzy filter is a subsequence match.
+        let rows = palette_rows(&state, "sgn");
+        assert!(rows.iter().any(|r| r.label == "signal"));
+        assert!(!rows.iter().any(|r| r.label == "screen"));
+    }
+
+    #[test]
+    fn committing_a_verb_runs_optimistically_and_bad_args_opens_the_well() {
+        let mut state = with_palette_world();
+        reduce(&mut state, Action::PaletteToggled);
+        reduce(
+            &mut state,
+            Action::PaletteQueried {
+                query: "screen".into(),
+            },
+        );
+        let effects = reduce(&mut state, Action::PaletteCommitted);
+        assert_eq!(
+            effects,
+            vec![Effect::call(Origin::Palette, "tok-1", "t1", "screen")]
+        );
+        assert!(state.palette.is_none(), "commit closes the list");
+
+        // The server wanted args: the well opens with its words.
+        reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Palette,
+                id: "t1".into(),
+                verb: "screen".into(),
+                status: 400,
+                body: r#"{"error":"bad_args","why":"needs {from}"}"#.into(),
+            },
+        );
+        let palette = state.palette.as_ref().expect("the well is open");
+        match &palette.stage {
+            Stage::Args { verb, error, .. } => {
+                assert_eq!(verb, "screen");
+                assert_eq!(error.as_deref(), Some("needs {from}"));
+            }
+            other => panic!("expected the args stage, got {other:?}"),
+        }
+
+        // Bad JSON stays in the well with a local complaint; good JSON runs.
+        reduce(
+            &mut state,
+            Action::PaletteArgsCommitted {
+                draft: "not json".into(),
+            },
+        );
+        assert!(state.palette.is_some());
+        let effects = reduce(
+            &mut state,
+            Action::PaletteArgsCommitted {
+                draft: r#"{"from": 0}"#.into(),
+            },
+        );
+        assert!(matches!(
+            &effects[..],
+            [Effect::CallVerb {
+                origin: Origin::Palette,
+                args,
+                ..
+            }] if args.contains("from")
+        ));
+        assert!(state.palette.is_none());
+    }
+
+    #[test]
+    fn a_gated_commit_refuses_with_the_reason_and_a_result_lands_as_notice() {
+        let mut state = with_palette_world();
+        reduce(&mut state, Action::PaletteToggled);
+        reduce(
+            &mut state,
+            Action::PaletteQueried {
+                query: "input".into(),
+            },
+        );
+        let effects = reduce(&mut state, Action::PaletteCommitted);
+        assert!(effects.is_empty());
+        assert!(state.notice.as_deref().unwrap().contains("agent driving"));
+        assert!(
+            state.palette.is_some(),
+            "a gated row does not close the palette"
+        );
+
+        reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Palette,
+                id: "t1".into(),
+                verb: "text".into(),
+                status: 200,
+                body: r#"{"text":"hi"}"#.into(),
+            },
+        );
+        assert!(state.notice.as_deref().unwrap().contains("hi"));
+    }
+
+    #[test]
+    fn the_palette_owns_the_keyboard_while_open() {
+        let mut state = with_palette_world();
+        // Make ada the driver so keys would otherwise flow.
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"t1","kind":"tty","project":"","title":"shell",
+                           "creator":{"kind":"human","id":"ada"},
+                           "driver":{"kind":"human","id":"ada"}}]"#
+                    .into(),
+            },
+        );
+        assert!(wants_key(&state, "a", false, false));
+        reduce(&mut state, Action::PaletteToggled);
+        assert!(!wants_key(&state, "a", false, false));
+        // Escape closes; the terminal gets its keys back.
+        reduce(&mut state, Action::PaletteDismissed);
+        assert!(wants_key(&state, "a", false, false));
     }
 
     /// The log is the repro: every action lands in order, capped.
