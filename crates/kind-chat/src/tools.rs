@@ -6,8 +6,8 @@
 //! principal lives by.
 //!
 //! One tool so far. `bash` runs a command as a one-shot tty instance:
-//! create (the agent is creator and driver), watch the watermark until the
-//! child exits or the budget runs out, drain the scrollback, remove. The
+//! create (the agent is creator and driver), wait on the watermark until
+//! the child exits or the budget runs out, drain the scrollback, remove. The
 //! terminal is a real pool instance while it lives — visible in the tree,
 //! watchable by anyone, and cleaned up even when the turn is cancelled
 //! mid-command (the removal rides a drop guard).
@@ -15,6 +15,8 @@
 use std::time::Duration;
 
 use myco_instance::{Pool, Principal, VerbError};
+
+use crate::tail;
 use myco_models::{ToolResult, ToolSpec, ToolUse};
 use serde_json::{Value, json};
 
@@ -103,59 +105,22 @@ async fn bash(
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
-    let mut mark = 0;
-    let timed_out = loop {
-        let text = pool
-            .call(agent, &tty.id, "text", Value::Null)
-            .await
-            .map_err(|e| format!("terminal died: {e}"))?;
-        if text.get("running") != Some(&json!(true)) {
-            break false;
-        }
-        match tokio::time::timeout_at(deadline, pool.changed(&tty.id, mark)).await {
-            Ok(Ok(m)) => mark = m,
-            Ok(Err(e)) => return Err(format!("terminal died: {e}")),
-            Err(_) => break true,
-        }
-    };
+    let exited = pool
+        .wait_until(agent, &tty.id, "text", deadline, |text| {
+            text.get("running") != Some(&json!(true))
+        })
+        .await
+        .map_err(|e| format!("terminal died: {e}"))?;
 
-    // Drain the scrollback, keeping only the freshest budget's worth.
-    let mut output = String::new();
-    let mut truncated = false;
-    let mut from = 0;
-    loop {
-        let page = pool
-            .call(
-                agent,
-                &tty.id,
-                "tail",
-                json!({"from": from, "max_bytes": 65536}),
-            )
-            .await
-            .map_err(|e| format!("terminal died: {e}"))?;
-        let chunk = page["data"].as_str().unwrap_or("");
-        let next = page["next"].as_u64().unwrap_or(from);
-        if chunk.is_empty() || next <= from {
-            break;
-        }
-        output.push_str(chunk);
-        from = next;
-        if output.len() > MAX_TOOL_OUTPUT_BYTES {
-            let cut = output.len() - MAX_TOOL_OUTPUT_BYTES;
-            // Trim on a char boundary; exactness is not worth a panic.
-            let cut = (cut..output.len().min(cut + 4))
-                .find(|i| output.is_char_boundary(*i))
-                .unwrap_or(0);
-            output.drain(..cut);
-            truncated = true;
-        }
-    }
+    let (mut output, truncated) = tail::drain(pool, agent, &tty.id, MAX_TOOL_OUTPUT_BYTES)
+        .await
+        .map_err(|e| format!("terminal died: {e}"))?;
     drop(tty);
 
     if truncated {
         output = format!("[output truncated to the last {MAX_TOOL_OUTPUT_BYTES} bytes]\n{output}");
     }
-    if timed_out {
+    if exited.is_none() {
         return Err(format!(
             "timed out after {timeout}s (the command was killed); output so far:\n{output}"
         ));

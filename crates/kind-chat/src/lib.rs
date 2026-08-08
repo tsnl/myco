@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 mod project;
 pub use project::project;
 
+mod tail;
+
 mod tools;
 
 static CHAT_SPEC: KindSpec = KindSpec {

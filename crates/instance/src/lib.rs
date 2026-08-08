@@ -252,8 +252,12 @@ pub trait Kind: Send + Sync {
     /// that acts on the bus (a chat dispatching tools) can speak as
     /// `Principal::Agent(id)` and introspect itself; kinds that don't need
     /// an identity ignore it.
-    fn create(&self, id: &str, args: Value, signals: Signals)
-    -> Result<Box<dyn Instance>, VerbError>;
+    fn create(
+        &self,
+        id: &str,
+        args: Value,
+        signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError>;
 }
 
 /// One `sys.log` entry: who called what, and how it went. The acme `event`
@@ -803,6 +807,37 @@ impl Pool {
     pub async fn changed(&self, id: &str, since: Watermark) -> Result<Watermark, VerbError> {
         let entry = self.entry(id)?;
         Ok(entry.cell.changed(since).await?)
+    }
+
+    /// Read `verb` until the answer satisfies `settled`, waking on the
+    /// watermark. Answers `None` when `deadline` passes first.
+    ///
+    /// The wait-for-a-condition shape, once: read, check, wait for a
+    /// change, read again — never a sleep, because a sleep is either a
+    /// stall or a race and usually both. Callers that hand-rolled it kept
+    /// rediscovering the same two rules: check *before* the first wait (the
+    /// thing may already be true), and let a bumped watermark, not a timer,
+    /// decide when to look again.
+    pub async fn wait_until(
+        &self,
+        principal: &Principal,
+        id: &str,
+        verb: &str,
+        deadline: tokio::time::Instant,
+        settled: impl Fn(&Value) -> bool,
+    ) -> Result<Option<Value>, VerbError> {
+        let mut mark = 0;
+        loop {
+            let seen = self.call(principal, id, verb, Value::Null).await?;
+            if settled(&seen) {
+                return Ok(Some(seen));
+            }
+            match tokio::time::timeout_at(deadline, self.changed(id, mark)).await {
+                Ok(Ok(m)) => mark = m,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(None),
+            }
+        }
     }
 
     /// The global feed: `(instance id, event)` for lifecycle, meta changes,
