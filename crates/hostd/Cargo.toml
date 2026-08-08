@@ -1,0 +1,13 @@
+[package]
+name = "myco-hostd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+libc = { workspace = true }
+myco-instance = { path = "../instance" }
+myco-kind-tty = { path = "../kind-tty" }
+myco-provider = { path = "../provider" }
+tokio = { workspace = true }

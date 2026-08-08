@@ -1172,6 +1172,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "myco-hostd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "myco-instance",
+ "myco-kind-tty",
+ "myco-provider",
+ "tokio",
+]
+
+[[package]]
 name = "myco-instance"
 version = "0.1.0"
 dependencies = [
@@ -1241,6 +1253,19 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "myco-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "myco-instance",
+ "myco-runtime",
+ "myco-wire",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
