@@ -22,6 +22,10 @@ pub struct State {
     pub push_note: Option<String>,
     /// The workspace: what the pool holds, kept fresh by list + feed.
     pub workspace: Workspace,
+    /// The model catalog as the server listed it. Empty until the first
+    /// `/api/models` answer — and empty after that if the workspace is
+    /// modelless.
+    pub catalog: Catalog,
     /// The admin surface: `Some` exactly when the server said this person
     /// is the operator (the 200 on the listing *is* the authorization —
     /// the client never decides who operates).
@@ -76,9 +80,39 @@ pub struct Pane {
     /// A chat pane's composer draft (uncontrolled in the DOM; mirrored
     /// here only so a submit can read it and a send can clear it).
     pub draft: String,
+    /// Last `about` for a chat pane — model + effort, so the dials can
+    /// render without a second kind-specific parse of `tail`.
+    pub about: Option<ChatAbout>,
     /// The instance was removed or crashed while open. The pane stays —
     /// showing last state honestly beats vanishing work.
     pub gone: bool,
+}
+
+/// The catalog as a client may list it (`GET /api/models`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Catalog {
+    pub default: Option<String>,
+    pub models: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ModelInfo {
+    pub key: String,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub effort: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// `chat.about` — the dials a pane needs, nothing else.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ChatAbout {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -565,6 +599,14 @@ pub enum Action {
     NavCommitted { id: String, url: String },
     /// The person asked to cancel a chat's running turn.
     TurnCancelled { id: String },
+    /// A chat's model or effort dial moved.
+    ChatConfigured {
+        id: String,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// `GET /api/models` answered.
+    ModelsAnswered { status: u16, body: String },
     /// `Cmd/Ctrl+P` — summon (or dismiss, when already up) the palette.
     PaletteToggled,
     /// The palette input changed.
@@ -654,6 +696,8 @@ pub enum Effect {
     PasskeySignIn { username: String },
     /// `GET /api/kinds` → [`Action::KindsAnswered`].
     FetchKinds { token: String },
+    /// `GET /api/models` → [`Action::ModelsAnswered`].
+    FetchModels { token: String },
     /// `GET /api/instances` → [`Action::InstancesAnswered`].
     FetchInstances { token: String },
     /// Open (or reopen) the event socket; delivers [`Action::FeedOpened`],
@@ -833,9 +877,14 @@ impl Effect {
 /// What entering a session kicks off, from either door (whoami or a fresh
 /// token): the workspace loads and the feed opens.
 fn enter_workspace(state: &mut State, token: &str) -> Vec<Effect> {
-    let mut effects = vec![Effect::FetchKinds {
-        token: token.into(),
-    }];
+    let mut effects = vec![
+        Effect::FetchKinds {
+            token: token.into(),
+        },
+        Effect::FetchModels {
+            token: token.into(),
+        },
+    ];
     effects.extend(relist(state));
     effects.push(Effect::OpenFeed {
         token: token.into(),
@@ -845,6 +894,30 @@ fn enter_workspace(state: &mut State, token: &str) -> Vec<Effect> {
         token: token.into(),
     });
     effects
+}
+
+#[derive(serde::Deserialize)]
+struct ModelsWire {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    models: Vec<ModelInfo>,
+}
+
+/// Create args for a kind: a chat inherits the catalog default so a new
+/// conversation is modeled; everything else starts empty and lets the
+/// well ask if the kind needs more.
+fn create_args_for(kind: &str, catalog: &Catalog) -> String {
+    if kind == "chat"
+        && let Some(model) = catalog
+            .default
+            .clone()
+            .or_else(|| catalog.models.iter().find(|m| m.default).map(|m| m.key.clone()))
+            .or_else(|| catalog.models.first().map(|m| m.key.clone()))
+    {
+        return serde_json::json!({ "model": model }).to_string();
+    }
+    "{}".into()
 }
 
 /// Ask for a fresh listing — at most one at a time.
@@ -1065,6 +1138,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.sign_in = SignIn::default();
             state.passkey_note = None;
             state.workspace = Workspace::default();
+            state.catalog = Catalog::default();
             state.admin = None;
             state.listing_in_flight = false;
             state.listing_stale = false;
@@ -1075,6 +1149,17 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 && let Ok(kinds) = serde_json::from_str::<Vec<KindInfo>>(&body)
             {
                 state.workspace.kinds = kinds;
+            }
+            vec![]
+        }
+        Action::ModelsAnswered { status, body } => {
+            if status == 200
+                && let Ok(wire) = serde_json::from_str::<ModelsWire>(&body)
+            {
+                state.catalog = Catalog {
+                    default: wire.default,
+                    models: wire.models,
+                };
             }
             vec![]
         }
@@ -1143,16 +1228,22 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 .unwrap_or_default();
             state.workspace.panes.push(Pane {
                 id: id.clone(),
-                kind,
+                kind: kind.clone(),
                 view: None,
                 app_cursor: false,
                 sent_size: None,
                 draft: String::new(),
+                about: None,
                 gone: false,
             });
             let mut effects = vec![Effect::Watch { id: id.clone() }];
             if let (Some(token), Some(verb)) = (&state.token, state.workspace.render_verb(&id)) {
                 effects.push(Effect::call(Origin::Pane, token, &id, &verb));
+            }
+            if kind == "chat"
+                && let Some(token) = &state.token
+            {
+                effects.push(Effect::call(Origin::Chrome, token, &id, "about"));
             }
             effects
         }
@@ -1212,6 +1303,24 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }
             // Seat changes surface through the listing; a keystroke's
             // answer moves nothing there.
+            Origin::Chrome if verb == "about" => {
+                if status == 200
+                    && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
+                {
+                    pane.about = serde_json::from_str(&body).ok();
+                }
+                vec![]
+            }
+            Origin::Chrome if verb == "configure" => {
+                if status == 200
+                    && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
+                {
+                    pane.about = serde_json::from_str(&body).ok();
+                } else if status != 200 {
+                    state.notice = Some(format!("configure: {body}"));
+                }
+                vec![]
+            }
             Origin::Chrome => relist(state),
             Origin::Drive => vec![],
             Origin::Palette => palette_answered(state, id, verb, status, body),
@@ -1278,6 +1387,25 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             Some(token) => vec![Effect::call(Origin::Drive, token, &id, "cancel")],
             None => vec![],
         },
+        Action::ChatConfigured { id, model, effort } => match &state.token {
+            Some(token) => {
+                let mut args = serde_json::Map::new();
+                if let Some(model) = model {
+                    args.insert("model".into(), serde_json::Value::String(model));
+                }
+                if let Some(effort) = effort {
+                    args.insert("effort".into(), serde_json::Value::String(effort));
+                }
+                vec![Effect::call_with(
+                    Origin::Chrome,
+                    token,
+                    &id,
+                    "configure",
+                    serde_json::Value::Object(args),
+                )]
+            }
+            None => vec![],
+        },
         Action::PaneMeasured { id, cols, rows } => {
             let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) else {
                 return vec![];
@@ -1301,10 +1429,12 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::CreateRequested { kind } => match &state.token {
             // Optimistic, like a palette verb: try with nothing, and let
             // a bad_args answer open the well with the kind's own words.
+            // A chat carries the catalog default so a new conversation
+            // is modeled without a second trip through the well.
             Some(token) => vec![Effect::CreateInstance {
                 token: token.clone(),
-                kind,
-                args: "{}".into(),
+                kind: kind.clone(),
+                args: create_args_for(&kind, &state.catalog),
             }],
             None => vec![],
         },
@@ -2713,7 +2843,14 @@ mod tests {
                     .into(),
             },
         );
-        reduce(&mut state, Action::Selected { id: "c1".into() });
+        let effects = reduce(&mut state, Action::Selected { id: "c1".into() });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::CallVerb { verb, .. } if verb == "about"
+            )),
+            "opening a chat reads about so the dials have a value: {effects:?}"
+        );
 
         let effects = reduce(
             &mut state,
@@ -2749,6 +2886,95 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::call(Origin::Drive, "tok-1", "c1", "cancel")]
+        );
+    }
+
+    #[test]
+    fn a_new_chat_carries_the_catalog_default() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::ModelsAnswered {
+                status: 200,
+                body: r#"{"default":"grok-4-6","models":[
+                    {"key":"grok-4-6","ready":true,"effort":"high","default":true},
+                    {"key":"claude-opus-5","ready":true,"effort":"high","default":false}
+                ]}"#
+                .into(),
+            },
+        );
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "chat".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "chat".into(),
+                args: r#"{"model":"grok-4-6"}"#.into(),
+            }]
+        );
+        // A tty is still empty-args — the catalog is not its business.
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "tty".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "tty".into(),
+                args: "{}".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn configuring_a_chat_sends_only_the_dials_that_moved() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::KindsAnswered {
+                status: 200,
+                body: r#"[{"kind":"chat","doc":"","primary_render":"tail"}]"#.into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"c1","kind":"chat","project":"","title":"chat",
+                           "creator":{"kind":"human","id":"ada"},"driver":null}]"#
+                    .into(),
+            },
+        );
+        reduce(&mut state, Action::Selected { id: "c1".into() });
+        let effects = reduce(
+            &mut state,
+            Action::ChatConfigured {
+                id: "c1".into(),
+                model: Some("claude-opus-5".into()),
+                effort: None,
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::call_with(
+                Origin::Chrome,
+                "tok-1",
+                "c1",
+                "configure",
+                serde_json::json!({ "model": "claude-opus-5" })
+            )]
+        );
+        reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Chrome,
+                id: "c1".into(),
+                verb: "configure".into(),
+                status: 200,
+                body: r#"{"model":"claude-opus-5","effort":"high","len":0,"turn_running":false,"watching":[]}"#.into(),
+            },
+        );
+        assert_eq!(
+            state.workspace.panes[0].about.as_ref().map(|a| a.model.as_deref()),
+            Some(Some("claude-opus-5"))
         );
     }
 

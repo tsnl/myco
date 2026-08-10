@@ -72,7 +72,7 @@ fn bearing(req: Request<Body>, token: &str) -> Request<Body> {
 async fn no_route_answers_without_a_token() {
     let (router, _) = fixture();
 
-    for uri in ["/api/kinds", "/api/instances", "/api/whoami"] {
+    for uri in ["/api/kinds", "/api/models", "/api/instances", "/api/whoami"] {
         let (status, body) = send(
             &router,
             Request::builder().uri(uri).body(Body::empty()).unwrap(),

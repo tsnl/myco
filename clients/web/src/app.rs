@@ -210,6 +210,12 @@ fn run(effect: Effect) {
                 Err(what) => Action::NetworkFailed { what },
             });
         }),
+        Effect::FetchModels { token } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(match fetch("GET", "/api/models", Some(&token), None).await {
+                Ok((status, body)) => Action::ModelsAnswered { status, body },
+                Err(what) => Action::NetworkFailed { what },
+            });
+        }),
         Effect::FetchInstances { token } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(
                 match fetch("GET", "/api/instances", Some(&token), None).await {
@@ -902,6 +908,34 @@ fn attach_delegates(document: &web_sys::Document) {
     });
     let _ = document.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
     on_input.forget();
+
+    let on_change = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(el) = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let Some(id) = el.get_attribute("id") else {
+            return;
+        };
+        let value = field_value(&id);
+        if let Some(chat) = id.strip_prefix("model-") {
+            dispatch(Action::ChatConfigured {
+                id: chat.to_string(),
+                model: Some(value),
+                effort: None,
+            });
+        } else if let Some(chat) = id.strip_prefix("effort-") {
+            dispatch(Action::ChatConfigured {
+                id: chat.to_string(),
+                model: None,
+                effort: Some(value),
+            });
+        }
+    });
+    let _ = document.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+    on_change.forget();
 }
 
 /// What one element's action attributes mean. `true` means "this element
@@ -983,6 +1017,8 @@ fn field_value(id: &str) -> String {
         input.value()
     } else if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
         area.value()
+    } else if let Some(select) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+        select.value()
     } else {
         String::new()
     }
@@ -1266,44 +1302,70 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
         })
         .collect();
 
-    let modeled = pane_is_modeled(pane);
-    let composer = if modeled {
-        let cancel = if running {
-            format!(
-                r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#,
-                id = escape(&pane.id)
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            r#"<form class="composer" data-chat="{id}">
-                 <textarea id="composer-{id}" class="composer-input" rows="1"
-                   placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
-                 <div class="composer-foot">{cancel}
-                   <button class="primary-button">send</button></div>
-               </form>"#,
-            id = escape(&pane.id),
-            draft = escape(&pane.draft),
-        )
-    } else {
-        r#"<div class="dim composer-note">this chat has no model — it is a shared transcript.
-             post with the palette or the API.</div>"#
-            .to_string()
-    };
-
+    let composer = chat_composer(pane, running, &escape(&pane.draft));
     format!(r#"<div class="pane-body chat"><div class="transcript">{body}</div>{composer}</div>"#)
 }
 
-/// Whether the chat pane's instance carries a model driver — a modeled
-/// chat is driven by its own agent, which the listing shows as the seat.
-fn pane_is_modeled(pane: &crate::core::Pane) -> bool {
-    // The chat's `about` isn't in the pane; infer from the driver being an
-    // agent named for this instance (the doctrine's naming). Absent that,
-    // still offer the composer — worst case a post to a modelless chat
-    // simply appends without a reply.
-    let _ = pane;
-    true
+fn chat_composer(pane: &crate::core::Pane, running: bool, draft: &str) -> String {
+    let id = escape(&pane.id);
+    let cancel = if running {
+        format!(r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#)
+    } else {
+        String::new()
+    };
+    let catalog = STATE.with(|s| s.borrow().catalog.clone());
+    let current = pane.about.as_ref().and_then(|a| a.model.clone());
+    let effort = pane
+        .about
+        .as_ref()
+        .and_then(|a| a.effort.clone())
+        .unwrap_or_else(|| "high".into());
+    let dials = if catalog.models.is_empty() {
+        r#"<span class="dim">no models in server.toml — this post will not start a turn</span>"#
+            .to_string()
+    } else {
+        let none_sel = if current.is_none() { " selected" } else { "" };
+        let options: String = catalog
+            .models
+            .iter()
+            .map(|m| {
+                let selected = current.as_deref() == Some(m.key.as_str());
+                format!(
+                    r#"<option value="{key}"{sel}>{key}{ready}</option>"#,
+                    key = escape(&m.key),
+                    sel = if selected { " selected" } else { "" },
+                    ready = if m.ready { "" } else { " — unready" },
+                )
+            })
+            .collect();
+        let efforts = ["low", "medium", "high", "max"]
+            .into_iter()
+            .map(|e| {
+                format!(
+                    r#"<option value="{e}"{sel}>{e}</option>"#,
+                    sel = if effort == e { " selected" } else { "" },
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<div class="chat-dials">
+                 <label>model
+                   <select id="model-{id}"><option value=""{none_sel}>transcript only</option>{options}</select>
+                 </label>
+                 <label>effort
+                   <select id="effort-{id}">{efforts}</select>
+                 </label>
+               </div>"#
+        )
+    };
+    format!(
+        r#"<form class="composer" data-chat="{id}">
+             <textarea id="composer-{id}" class="composer-input" rows="1"
+               placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
+             <div class="composer-foot">{dials}{cancel}
+               <button class="primary-button">send</button></div>
+           </form>"#
+    )
 }
 
 fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {

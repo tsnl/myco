@@ -421,6 +421,60 @@ async fn an_unknown_model_is_refused_at_create_with_the_catalog_listed() {
     }
 }
 
+#[tokio::test]
+async fn create_and_configure_bind_model_and_effort() {
+    let pool = Pool::new();
+    pool.register(Arc::new(ChatKind::with_factory(
+        pool.clone(),
+        fake_catalog(),
+        None,
+        Arc::new(|_| Ok(Arc::new(HangingModel) as _)),
+    )));
+    let info = pool
+        .create(
+            &ada(),
+            "chat",
+            "",
+            "",
+            json!({"model": "fake", "effort": "low"}),
+        )
+        .expect("create");
+    let about = pool
+        .call(&ada(), &info.id, "about", Value::Null)
+        .await
+        .expect("about");
+    assert_eq!(about["model"], json!("fake"));
+    assert_eq!(about["effort"], json!("low"));
+
+    let about = pool
+        .call(
+            &ada(),
+            &info.id,
+            "configure",
+            json!({"effort": "max"}),
+        )
+        .await
+        .expect("configure");
+    assert_eq!(about["effort"], json!("max"));
+    assert_eq!(about["model"], json!("fake"));
+
+    let about = pool
+        .call(&ada(), &info.id, "configure", json!({"model": ""}))
+        .await
+        .expect("drop model");
+    assert_eq!(about["model"], Value::Null);
+    assert_eq!(about["effort"], Value::Null);
+
+    let err = pool
+        .call(&ada(), &info.id, "configure", json!({"effort": "high"}))
+        .await
+        .unwrap_err();
+    match err {
+        VerbError::BadArgs { why } => assert!(why.contains("model"), "{why}"),
+        other => panic!("expected BadArgs, got {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------

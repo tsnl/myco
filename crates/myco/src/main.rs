@@ -85,8 +85,8 @@ async fn main() {
     pool.register(Arc::new(myco_kind_tty::TtyKind));
     pool.register(Arc::new(myco_kind_chat::ChatKind::new(
         pool.clone(),
-        catalog,
-        default_model,
+        catalog.clone(),
+        default_model.clone(),
     )));
     // Web push wants a durable VAPID identity: subscriptions bind to the
     // public key the browser saw, so it lives beside server.toml. Failure
@@ -127,8 +127,15 @@ async fn main() {
     // endpoint, so their inbox is provisioned here.
     myco_server::ensure_notifier(&pool, &operator);
 
-    let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
-        .unwrap_or_else(|e| fatal(e))
+    let router = myco_server::router_with(
+        pool,
+        auth,
+        operator,
+        &roster.passkeys,
+        catalog,
+        default_model,
+    )
+    .unwrap_or_else(|e| fatal(e))
         // The delivery decision: the same origin serves the client. /api/*
         // wins; everything else answers the shell (or the honest
         // placeholder when the client was not built in).

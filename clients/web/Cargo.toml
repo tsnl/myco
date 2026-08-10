@@ -30,6 +30,7 @@ features = [
     "HtmlElement",
     "Headers",
     "HtmlInputElement",
+    "HtmlSelectElement",
     "HtmlTextAreaElement",
     "KeyboardEvent",
     "DomRect",

@@ -47,6 +47,10 @@ pub(crate) struct App {
     pub(crate) operator: String,
     /// The WebAuthn relying party, built once from `[passkeys]` at startup.
     pub(crate) webauthn: Arc<webauthn_rs::Webauthn>,
+    /// Resolved catalog — capability discovery for the client's model dial.
+    /// Empty is a modelless workspace, not an error.
+    pub(crate) catalog: myco_models::ModelCatalog,
+    pub(crate) default_model: Option<String>,
 }
 
 /// [`router_with`] under the default `[passkeys]` settings (localhost, any
@@ -54,8 +58,15 @@ pub(crate) struct App {
 /// single-machine embedders use this; the binary goes through
 /// [`router_with`] so a configured relying party is honored.
 pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
-    router_with(pool, auth, operator, &config::PasskeySettings::default())
-        .expect("the default passkey settings always build")
+    router_with(
+        pool,
+        auth,
+        operator,
+        &config::PasskeySettings::default(),
+        myco_models::ModelCatalog::default(),
+        None,
+    )
+    .expect("the default passkey settings always build")
 }
 
 /// The `/api` router over a pool and a credential store. The caller owns
@@ -69,10 +80,13 @@ pub fn router_with(
     auth: Arc<AuthStore>,
     operator: impl Into<String>,
     passkeys: &config::PasskeySettings,
+    catalog: myco_models::ModelCatalog,
+    default_model: Option<String>,
 ) -> Result<Router, String> {
     let webauthn = Arc::new(passkey::build_webauthn(passkeys)?);
     Ok(Router::new()
         .route("/api/kinds", get(kinds))
+        .route("/api/models", get(models))
         .route("/api/instances", post(create).get(list))
         .route("/api/instances/{id}/verbs/{verb}", post(call))
         .route("/api/instances/{id}/changed", get(watch::changed))
@@ -111,6 +125,8 @@ pub fn router_with(
             auth,
             operator: operator.into(),
             webauthn,
+            catalog,
+            default_model,
         })
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("cross-origin-opener-policy"),
@@ -314,6 +330,15 @@ pub fn startup_code(auth: &AuthStore, operator: &str, recover: bool) -> Option<S
 /// from this instead of hardcoding kind knowledge.
 async fn kinds(State(app): State<App>, _caller: Caller) -> Json<Value> {
     Json(serde_json::to_value(app.pool.kinds()).expect("specs serialize"))
+}
+
+/// The model catalog as a client may list it — keys, readiness, default
+/// effort. Credentials stay on the server. Empty is a modelless workspace.
+async fn models(State(app): State<App>, _caller: Caller) -> Json<Value> {
+    Json(json!({
+        "default": app.default_model,
+        "models": app.catalog.listing(app.default_model.as_deref()),
+    }))
 }
 
 #[derive(serde::Deserialize)]
