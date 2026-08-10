@@ -80,6 +80,32 @@ letter-spacing; body stays ≤ ~62ch. Digits in columns use
   (2.4s ease, disabled under `prefers-reduced-motion`). A dropped stream
   dims the pane and says `reconnecting — showing last state`.
 
+## The palette (`Cmd+P`)
+
+One island, summoned: a `surface` card (12px radius, the single shadow
+level, ~560px) floating in the top third over an `ink`-at-low-alpha
+scrim; the room dims, the palette does not glow. Fleet-spacious inside —
+input row ~12×16, result rows 8px-scale with real air.
+
+- **One list, grouped.** Jump entries (instances) and commands (verbs,
+  nav, admin) share the fuzzy field. Group headers are uppercase,
+  letter-spaced, `faint`. Verb names and ids render in the mono; labels
+  and docs in the sans; keyboard hints right-aligned, mono, `dim`.
+- **Selection is amethyst** — `accent-soft` wash, `accent` text. Never
+  ember: rule 5 applies inside the palette too. Ember appears only as
+  the attention pill on a jump row, where it genuinely means *wants you*.
+- **Gated rows teach the seat.** A driver-gated verb stays visible,
+  dimmed to `faint`, wearing the same seat chip as the pane (`ada
+  driving` clay, `agent driving` verdigris) with an inline `take` when
+  policy allows. The palette never hides a capability; it explains it.
+- **Presence dots and seat chips are the same components** as the tree
+  and pane headers — the palette introduces zero new vocabulary.
+- **Motion is causality**: ≤150ms fade + 2px rise on open; esc closes
+  instantly. Second-stage args slide in place of the list, they do not
+  stack a second window.
+- **The voice stays lowercase**: "no matches — try a kind name",
+  "held by agent — take the seat to input".
+
 ## Rules of the room
 
 1. **Chrome recedes, content leads.** The frame is neutral so unlike kinds
