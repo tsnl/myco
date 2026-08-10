@@ -6,12 +6,15 @@ agents drive through the same **verbs**. See `DESIGN.md` — it is the
 contract this tree is held to, including the ledger of what crosses over
 from v2 (`main-v2` branch) and why.
 
-Current state: **M0** — the actor runtime (`crates/runtime`), the
-instance framework (`crates/instance`), and the first real kind, a pty
-terminal (`crates/kind-tty`), all driven through the bus in tests.
+Current state: **M2** — the agent sits beside L2, not inside it. Chat is
+an instance (`post` / cursored `tail`); a subagent is a chat with a
+parent. Providers, a cancellable turn, the named-tool dispatcher (bash
+as verbs — including piped mode and signals), standing subscriptions,
+and the notifier kind (inbox; web-push delivery is M4). Still no GUI.
 
 ```
 cargo test --workspace
+printf '[[users]]\nid = "%s"\n' "$USER" > ~/.myco/server.toml
+# optional: [gateways.*] / [models.*] for the agent
+cargo run -p myco
 ```
-
-No server, no GUI yet; those are M1/M3 in the design doc.
