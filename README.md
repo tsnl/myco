@@ -6,12 +6,17 @@ agents drive through the same **verbs**. See `DESIGN.md` — it is the
 contract this tree is held to, including the ledger of what crosses over
 from v2 (`main-v2` branch) and why.
 
-Current state: **M0** — the actor runtime (`crates/runtime`), the
-instance framework (`crates/instance`), and the first real kind, a pty
-terminal (`crates/kind-tty`), all driven through the bus in tests.
+Current state: **M3** — the client is a fold (one reducer, one action
+stream; see DESIGN.md L3). Rust→wasm, one-origin delivery: the `myco`
+binary serves the bundle at `/`, `/api/*` wins. Tree, split panes, tty +
+chat renderers, `Cmd+P` over the derived registry, operator panel.
+Visual contract: `STYLE.md`.
 
 ```
 cargo test --workspace
+rustup target add wasm32-unknown-unknown && cargo install trunk
+(cd clients/web && trunk build)
+printf '[[users]]\nid = "%s"\n' "$USER" > ~/.myco/server.toml
+cargo run -p myco
+# → http://127.0.0.1:7773/
 ```
-
-No server, no GUI yet; those are M1/M3 in the design doc.
