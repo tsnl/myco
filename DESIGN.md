@@ -79,13 +79,14 @@ by name, because in L0's contract it can only deadlock.
 principals, authority, uniform introspection, and one feed. Consistency,
 waking, and fault isolation are consumed, not reimplemented.
 
-### L2 — API server (M1, not yet built)
+### L2 — API server (M1)
 
 **Contract offered (consuming only L1's):** authentication (ported from
 v2: one-time codes, passkeys, operator), principal resolution
 (token → `Principal`), then a generic gateway: `POST
-/instances/<id>/<verb>`, `GET /instances`, one multiplexed watch/event
-stream, `GET /kinds` for capability discovery. **L2 is the human's adapter
+/api/instances/{id}/verbs/{verb}`, `GET`/`POST /api/instances`, one
+multiplexed watch/event stream (`/api/instances/{id}/changed` +
+`/api/ws`), `GET /api/kinds` for capability discovery. **L2 is the human's adapter
 to the bus exactly as the agent loop is the model's adapter** — both
 translate an outside intelligence's native I/O into `Pool::call`. The
 razor: anything in L2 that is not authentication or translation is in the
@@ -98,6 +99,61 @@ instances), split-tree panes, and a renderer registry keyed by kind — each
 renderer consumes its kind's `primary_render` verb payload and re-reads on
 watermark advance. Clients hold layout (per project, per user, client-side)
 and zero instance state.
+
+**The client is a fold.** One store, one action stream, one reducer:
+`State × Action → (State, Effects)`. Three sources feed one dispatch
+queue — input surfaces (buttons, keybindings, the palette), the wire's
+answers (verb results and refusals), and the watch stream (marks,
+events, `gone`, `lagged`) — and the UI is a pure render of `State`.
+Effects (HTTP, WS sends, focus, clipboard) run at the edge and re-enter
+as actions. Nothing anywhere else holds state or contains logic; an
+`onClick` is a dispatch.
+
+The action vocabulary is small because the bus already is the API:
+
+- **Nav** — pure client state: pane focus/split/close, tree selection,
+  palette open/query. Handled synchronously.
+- **`Call {instance, verb, args}`** — every wire read and mutation is
+  this one shape, `sys.*` included. The answer re-enters as
+  `Settled {result | VerbError}`, and the server's serde error is the
+  payload *verbatim* — the client speaks the wire's refusal vocabulary
+  (`not_driver` with `held_by` renders as a seat prompt with a take
+  affordance, not a dead toast).
+- **Feed** — each watch frame is an action; the feed doctrine's recovery
+  (on `lagged`: re-list, re-read) is a reducer rule, not a special path.
+- **Session** — login, logout, reconnect.
+
+**The command registry is derived, not authored.** A command is
+`{label, doc, enabled(State), action}`. Sources: (a) the hand-written
+client commands (nav, layout, session) — the only authored list; (b) the
+focused instance's verbs, generated from `GET /api/kinds` — name, doc,
+and flags come from the spec, so a new verb on a kind appears in the
+palette and on pane chrome with zero client code (the four-places razor,
+applied to the client); (c) jump entries from the instance listing;
+(d) operator commands when `whoami` says so. **A button is a palette
+entry with coordinates**: pane-header buttons, context rows, keybindings,
+and palette rows are four projections of one registry entry, and
+`enabled(State)` is computed once — surfaces cannot disagree about
+whether a verb is available or who holds the seat.
+
+**The palette (`Cmd+P` / `Ctrl+P`)** is one fuzzy list over the whole
+registry — jump and command together, grouped, because instances are the
+client's files and verbs are its commands. Verbs without args execute on
+enter; a verb needing args opens a second stage (a JSON well pre-filled
+with `{}` in v1 — which makes the entire bus keyboard-reachable, the
+debugging story in one gesture). The palette shows driver-gated entries
+disabled with the holder named rather than hiding them: the palette
+teaches the seat model. Interception note: browsers allow `Cmd+P` on
+keydown-with-preventDefault (print stays reachable from the menu); a
+tiny **reserved-chord set** (palette, pane-focus cycling) never reaches
+a focused tty — every other key goes raw to the driven terminal, which
+must lose only what the room absolutely needs.
+
+The reducer shape is also DP-1 insurance: it is precisely iced's
+architecture and runs unchanged under egui, so a native client reuses
+the entire core — state, actions, registry, effects — and swaps only
+the render layer. And the action log *is* the repro: a client bug
+replays as a fold over recorded actions.
 
 ### The agent (M2) — beside L2, not inside any layer
 
@@ -264,12 +320,12 @@ as a method instead of a verb.)
   hardcodes per-kind read choices — the exact kind-knowledge leak L1
   exists to prevent. Two static strings, validated at registration, are
   the cheapest insurance in the codebase.
-- **What is knowingly *not* minimal** — schema fields whose consumers
-  are one milestone away (`cursored` → M2 subscriptions, `version` → M4
-  protocol providers, `read_only` → speculative-read clients). Cutting
-  fields that wire consumers re-add next milestone is churn wearing
-  minimalism's clothes; each names its consumer in its doc comment, and
-  the ledger holds the receipt.
+- **What is knowingly *not* minimal** — schema fields that named their
+  consumer before it existed (`cursored` → M2 subscriptions, now here;
+  `version` → M4 protocol providers; `read_only` → speculative-read
+  clients). Cutting fields that wire consumers re-add next milestone is
+  churn wearing minimalism's clothes; each names its consumer in its
+  doc comment, and the ledger holds the receipt.
 
 ## Worked requirement: push notifications
 
@@ -447,7 +503,7 @@ Functionality crosses from v2 only with a verdict recorded here.
 | vt100 screen → styled runs renderer | **ported (M0)** | minus the embedded plain-text copy (now the `text` verb) |
 | shell scrollback + `tail(from)` | **re-derived (M0)** | cursored + budgeted (`max_bytes`) |
 | shell/subagent locks | **re-derived (M0)** | driver per-verb, apply-time fenced; + `owner_only` axis |
-| auth (codes, passkeys, tokens, admin routes, operator) | **port (M1)** | v2 got this right; lands in L2 nearly verbatim |
+| auth (codes, passkeys, tokens, admin routes, operator) | **ported (M1)** | v2 got this right; landed in L2 nearly verbatim |
 | SSE + shell WebSocket | **drop** | one multiplexed event/watch stream (M1) |
 | `MycoApi` trait + `HttpClient` + per-op routes | **drop** | generic verb gateway; four parallel op lists become one |
 | agent loop, models/providers, session store | **port + reshape (M2)** | the chat kind + the model-side adapter (dispatcher, standing subscriptions) |
@@ -457,8 +513,10 @@ Functionality crosses from v2 only with a verdict recorded here.
 | GUI browser/draft/conversation pages | **drop** | tree + panes replace page navigation |
 | observer notes machinery | **drop** | standing subscriptions |
 | notifications (v2 never had them) | **new: notifier kind (M2/M4)** | see the worked requirement |
-| piped (non-pty) bash mode, signals, screenshot action | **pending** | port into kind-tty when the agent arrives (M2) |
-| README/TOUR | **rewrite as they become true** | |
+| command palette (v2 never had one) | **new: `Cmd+P` over the registry (M3)** | entries derived from kind specs; one reducer, buttons emit the same actions — see L3 |
+| piped (non-pty) bash mode, signals | **ported (M2)** | kind-tty `mode: piped` + `signal`; bash gets honest failures |
+| screenshot action | **pending (M4)** | browser kind, not tty |
+| README/TOUR | **rewrite as they become true** | README tracks the current milestone tip |
 
 ## Milestones
 
@@ -466,14 +524,17 @@ Functionality crosses from v2 only with a verdict recorded here.
   serialization, the apply-time fence, re-entrancy refusal, owner
   scoping, watermark semantics including removal, crash containment, and
   a live pty driven end-to-end through the bus.
-- **M1** — L2: auth port, generic verb gateway, one event stream,
+- **M1 (done)** — L2: auth port, generic verb gateway, one event stream,
   capability discovery; `myco.py` rewritten thin.
-- **M2** — chat kind (agent loop + providers ported), named-tool
+- **M2 (done)** — chat kind (agent loop + providers ported), named-tool
   dispatcher, standing subscriptions, notifier kind; user-created chats
-  and chat-parenting (subagents) fall out.
-- **M3** — GUI: tree sidebar, split-tree panes, renderer registry (tty +
-  chat renderers ported). The visual contract is **STYLE.md** (approved
-  "amethyst" direction: islands on violet-biased paper, presence/seat/ember
+  and chat-parenting (subagents) fall out. Piped bash + signals landed
+  in kind-tty.
+- **M3 (done)** — GUI: the single-reducer core (one action stream; see L3),
+  tree sidebar, split-tree panes, renderer registry (tty + chat
+  renderers ported), and the `Cmd+P` palette over the derived command
+  registry. The visual contract is **STYLE.md** (approved "amethyst"
+  direction: islands on violet-biased paper, presence/seat/ember
   vocabulary, theme-constant terminal material).
 - **M4** — protocol providers (toolds/hosts as bus-over-stdio); cron
   kind; browser kind (`a11y_tree` + `screenshot`, computer-use verb
