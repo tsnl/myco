@@ -320,12 +320,12 @@ as a method instead of a verb.)
   hardcodes per-kind read choices — the exact kind-knowledge leak L1
   exists to prevent. Two static strings, validated at registration, are
   the cheapest insurance in the codebase.
-- **What is knowingly *not* minimal** — schema fields whose consumers
-  are one milestone away (`cursored` → M2 subscriptions, `version` → M4
-  protocol providers, `read_only` → speculative-read clients). Cutting
-  fields that wire consumers re-add next milestone is churn wearing
-  minimalism's clothes; each names its consumer in its doc comment, and
-  the ledger holds the receipt.
+- **What is knowingly *not* minimal** — schema fields that named their
+  consumer before it existed (`cursored` → M2 subscriptions, now here;
+  `version` → M4 protocol providers; `read_only` → speculative-read
+  clients). Cutting fields that wire consumers re-add next milestone is
+  churn wearing minimalism's clothes; each names its consumer in its
+  doc comment, and the ledger holds the receipt.
 
 ## Worked requirement: push notifications
 
@@ -514,7 +514,8 @@ Functionality crosses from v2 only with a verdict recorded here.
 | observer notes machinery | **drop** | standing subscriptions |
 | notifications (v2 never had them) | **new: notifier kind (M2/M4)** | see the worked requirement |
 | command palette (v2 never had one) | **new: `Cmd+P` over the registry (M3)** | entries derived from kind specs; one reducer, buttons emit the same actions — see L3 |
-| piped (non-pty) bash mode, signals, screenshot action | **pending** | port into kind-tty when the agent arrives (M2) |
+| piped (non-pty) bash mode, signals | **ported (M2)** | kind-tty `mode: piped` + `signal`; bash gets honest failures |
+| screenshot action | **pending (M4)** | browser kind, not tty |
 | README/TOUR | **rewrite as they become true** | README tracks the current milestone tip |
 
 ## Milestones
@@ -525,9 +526,10 @@ Functionality crosses from v2 only with a verdict recorded here.
   a live pty driven end-to-end through the bus.
 - **M1 (done)** — L2: auth port, generic verb gateway, one event stream,
   capability discovery; `myco.py` rewritten thin.
-- **M2** — chat kind (agent loop + providers ported), named-tool
+- **M2 (done)** — chat kind (agent loop + providers ported), named-tool
   dispatcher, standing subscriptions, notifier kind; user-created chats
-  and chat-parenting (subagents) fall out.
+  and chat-parenting (subagents) fall out. Piped bash + signals landed
+  in kind-tty.
 - **M3** — GUI: the single-reducer core (one action stream; see L3),
   tree sidebar, split-tree panes, renderer registry (tty + chat
   renderers ported), and the `Cmd+P` palette over the derived command
