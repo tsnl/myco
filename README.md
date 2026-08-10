@@ -6,15 +6,17 @@ agents drive through the same **verbs**. See `DESIGN.md` — it is the
 contract this tree is held to, including the ledger of what crosses over
 from v2 (`main-v2` branch) and why.
 
-Current state: **M2** — the agent sits beside L2, not inside it. Chat is
-an instance (`post` / cursored `tail`); a subagent is a chat with a
-parent. Providers, a cancellable turn, the named-tool dispatcher (bash
-as verbs — including piped mode and signals), standing subscriptions,
-and the notifier kind (inbox; web-push delivery is M4). Still no GUI.
+Current state: **M3** — the client is a fold (one reducer, one action
+stream; see DESIGN.md L3). Rust→wasm, one-origin delivery: the `myco`
+binary serves the bundle at `/`, `/api/*` wins. Tree, split panes, tty +
+chat renderers, `Cmd+P` over the derived registry, operator panel.
+Visual contract: `STYLE.md`.
 
 ```
 cargo test --workspace
+rustup target add wasm32-unknown-unknown && cargo install trunk
+(cd clients/web && trunk build)
 printf '[[users]]\nid = "%s"\n' "$USER" > ~/.myco/server.toml
-# optional: [gateways.*] / [models.*] for the agent
 cargo run -p myco
+# → http://127.0.0.1:7773/
 ```
