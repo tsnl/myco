@@ -84,8 +84,9 @@ waking, and fault isolation are consumed, not reimplemented.
 **Contract offered (consuming only L1's):** authentication (ported from
 v2: one-time codes, passkeys, operator), principal resolution
 (token → `Principal`), then a generic gateway: `POST
-/instances/<id>/<verb>`, `GET /instances`, one multiplexed watch/event
-stream, `GET /kinds` for capability discovery. **L2 is the human's adapter
+/api/instances/{id}/verbs/{verb}`, `GET`/`POST /api/instances`, one
+multiplexed watch/event stream (`/api/instances/{id}/changed` +
+`/api/ws`), `GET /api/kinds` for capability discovery. **L2 is the human's adapter
 to the bus exactly as the agent loop is the model's adapter** — both
 translate an outside intelligence's native I/O into `Pool::call`. The
 razor: anything in L2 that is not authentication or translation is in the
