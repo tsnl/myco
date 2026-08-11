@@ -891,9 +891,11 @@ form {
     color: var(--ink);
     font: inherit;
     padding: 8px 12px;
-    resize: vertical;
+    resize: none;
+    overflow-y: auto;
     min-height: 2.4em;
-    max-height: 8em;
+    max-height: 40vh;
+    field-sizing: content;
 }
 
 .chat-dials {

@@ -712,6 +712,7 @@ fn render(state: &State) {
     }
 
     focus_summoned_field(&document);
+    grow_composers(&document);
 }
 
 /// Write a region's markup, but only when it actually changed — and put
@@ -870,6 +871,9 @@ fn restore_caret(document: &web_sys::Document, caret: Option<Caret>) {
             area.set_value(&caret.value);
         }
         let _ = area.set_selection_range(caret.start, caret.end);
+        if caret.id.starts_with("composer-") {
+            grow_composer(area);
+        }
     } else if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
         if input.value() != caret.value {
             input.set_value(&caret.value);
@@ -887,6 +891,32 @@ fn clear_field(id: &str) {
         .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
     {
         area.set_value("");
+        grow_composer(&area);
+    }
+}
+
+/// Fit a composer to its text: collapse, then grow to `scrollHeight`,
+/// capped by the CSS max-height. Called on input and after paint restores
+/// a draft — `rows="1"` alone stays one line.
+fn grow_composer(area: &web_sys::HtmlTextAreaElement) {
+    area.style().set_property("height", "auto").ok();
+    let height = area.scroll_height();
+    area.style()
+        .set_property("height", &format!("{height}px"))
+        .ok();
+}
+
+fn grow_composers(document: &web_sys::Document) {
+    let Ok(list) = document.query_selector_all("textarea.composer-input") else {
+        return;
+    };
+    for i in 0..list.length() {
+        let Some(node) = list.item(i) else {
+            continue;
+        };
+        if let Ok(area) = node.dyn_into::<web_sys::HtmlTextAreaElement>() {
+            grow_composer(&area);
+        }
     }
 }
 
@@ -1039,6 +1069,10 @@ fn attach_delegates(document: &web_sys::Document) {
                 }),
                 _ => {}
             }
+        } else if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>()
+            && el.id().starts_with("composer-")
+        {
+            grow_composer(area);
         }
     });
     let _ = document.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
