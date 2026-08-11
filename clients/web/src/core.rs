@@ -44,6 +44,10 @@ pub struct Workspace {
     /// the server never hears about it.
     pub panes: Vec<Pane>,
     pub feed: Feed,
+    /// Grouping key the next create inherits. Empty is the `workspace` bucket.
+    pub current_project: String,
+    /// When set, the sidebar is asking for a new project slug.
+    pub project_draft: Option<String>,
 }
 
 /// One open pane: an instance id plus the last projection read. The
@@ -256,6 +260,14 @@ pub enum Action {
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
     CreateAnswered { status: u16, body: String },
+    /// The person picked a project (tree header or the chip). Empty is workspace.
+    ProjectSelected { project: String },
+    /// Open the new-project slug field.
+    NewProjectRequested,
+    /// The slug field changed.
+    ProjectDrafted { draft: String },
+    /// Commit the slug field as the current project.
+    NewProjectCommitted { slug: String },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
 }
@@ -306,8 +318,13 @@ pub enum Effect {
     /// Open (or reopen) the event socket; delivers [`Action::FeedOpened`],
     /// [`Action::FeedEvent`]s, and one [`Action::FeedDropped`] at close.
     OpenFeed { token: String },
-    /// `POST /api/instances` with `{kind}` → [`Action::CreateAnswered`].
-    CreateInstance { token: String, kind: String },
+    /// `POST /api/instances` with `{kind, project, title}` → [`Action::CreateAnswered`].
+    CreateInstance {
+        token: String,
+        kind: String,
+        project: String,
+        title: String,
+    },
     /// Send `{"op":"watch","id"}` on the event socket.
     Watch { id: String },
     /// Send `{"op":"unwatch","id"}` on the event socket.
@@ -394,6 +411,17 @@ struct Refusal {
 }
 
 const LOG_CAP: usize = 256;
+
+/// Same charset L1 will enforce: `^[A-Za-z0-9][A-Za-z0-9-]*$`.
+pub fn valid_slug(title: &str) -> bool {
+    let mut bytes = title.bytes();
+    match bytes.next() {
+        Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9') => {
+            bytes.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        }
+        _ => false,
+    }
+}
 
 pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
     if state.log.len() == LOG_CAP {
@@ -675,10 +703,39 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::CreateRequested { kind } => match &state.token {
             Some(token) => vec![Effect::CreateInstance {
                 token: token.clone(),
+                project: state.workspace.current_project.clone(),
+                title: kind.clone(),
                 kind,
             }],
             None => vec![],
         },
+        Action::ProjectSelected { project } => {
+            state.workspace.current_project = project;
+            state.workspace.project_draft = None;
+            vec![]
+        }
+        Action::NewProjectRequested => {
+            state.workspace.project_draft = Some(String::new());
+            vec![]
+        }
+        Action::ProjectDrafted { draft } => {
+            if state.workspace.project_draft.is_some() {
+                state.workspace.project_draft = Some(draft);
+            }
+            vec![]
+        }
+        Action::NewProjectCommitted { slug } => {
+            let slug = slug.trim().to_string();
+            if slug.is_empty() {
+                state.workspace.current_project.clear();
+                state.workspace.project_draft = None;
+            } else if valid_slug(&slug) {
+                state.workspace.current_project = slug;
+                state.workspace.project_draft = None;
+            }
+            // A bad slug leaves the field open — type again.
+            vec![]
+        }
         Action::CreateAnswered { status, body } => {
             if status == 200
                 && let Ok(info) = serde_json::from_str::<InstanceInfo>(&body)
@@ -1134,7 +1191,9 @@ mod tests {
             effects,
             vec![Effect::CreateInstance {
                 token: "tok-1".into(),
-                kind: "tty".into()
+                kind: "tty".into(),
+                project: String::new(),
+                title: "tty".into(),
             }]
         );
         reduce(
@@ -1147,6 +1206,56 @@ mod tests {
             },
         );
         assert_eq!(state.workspace.selected.as_deref(), Some("new-1"));
+    }
+
+    #[test]
+    fn create_inherits_the_current_project() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::ProjectSelected {
+                project: "lab".into(),
+            },
+        );
+        assert_eq!(state.workspace.current_project, "lab");
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "tty".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "tty".into(),
+                project: "lab".into(),
+                title: "tty".into(),
+            }]
+        );
+
+        reduce(&mut state, Action::NewProjectRequested);
+        reduce(
+            &mut state,
+            Action::ProjectDrafted {
+                draft: "has space".into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::NewProjectCommitted {
+                slug: "has space".into(),
+            },
+        );
+        assert_eq!(
+            state.workspace.current_project, "lab",
+            "a bad slug does not stick"
+        );
+        assert_eq!(state.workspace.project_draft.as_deref(), Some("has space"));
+
+        reduce(
+            &mut state,
+            Action::NewProjectCommitted {
+                slug: "lab-2".into(),
+            },
+        );
+        assert_eq!(state.workspace.current_project, "lab-2");
+        assert!(state.workspace.project_draft.is_none());
     }
 
     /// A workspace with one tty instance listed and its kind known.
