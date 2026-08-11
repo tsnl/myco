@@ -197,7 +197,7 @@ async fn text_is_the_plain_transcript() {
 async fn a_subagent_is_a_chat_created_under_another_chat() {
     let (pool, parent_id) = pool_with_chat(Value::Null);
     let child = pool
-        .create_under(&ada(), "chat", "", "", Value::Null, Some(&parent_id))
+        .create_under(&ada(), "chat", "", "child", Value::Null, Some(&parent_id))
         .expect("create child");
     assert_eq!(child.parent.as_deref(), Some(parent_id.as_str()));
 

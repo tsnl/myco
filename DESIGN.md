@@ -170,6 +170,11 @@ owns, so a higher-priority verb — a user's interject, an explicit cancel
 stays sharp. Cancellation is a kind-level concern; the runtime never
 aborts a command.
 
+The catalog already names the next moment: `ModelSpec.auto_compact_at_tokens`
+is documented as "queue an auto-compaction when a turn ends" past that
+many tokens. Nothing queues — `kind-chat` never reads the field. The
+shape, when a store exists, is DP-3; do not implement it here.
+
 ## Concepts (the contract, post-review)
 
 **Instance.** Identity (`id`, `kind`, `project`, `title`), canonical
@@ -493,6 +498,42 @@ stream, N media flows — and the carrier maps them: WS multiplexes all of
 them today; WebTransport assigns streams and datagram flows later. The
 verb envelope never learns what carried it.
 
+### DP-3 — Compaction (successor chat, not in-place)
+
+**Deferred until** chats persist. The catalog already resolves
+`auto_compact_at` (default 0.85 of `context_window`) to
+`ModelSpec.auto_compact_at_tokens`; the turn-engine comment on that field
+is the queue that does not exist. No `select_tail`, no worker, no
+successor. The pool is RAM-only — restart drops every transcript — so
+an in-place rewrite would only shorten a chat that still dies on exit.
+
+v2 (`main-v2`) mints a successor session. A hidden `SessionKind::Compact`
+worker writes markdown; `select_tail` keeps the last **2** well-formed
+user turns and never ends mid-tool-loop (tool bodies capped 4_000
+chars); the successor is seeded with `# Compaction resume`, the
+predecessor id, and the summary path; `link_compact_pair` writes the
+successor first so a crash cannot leave the predecessor pointing at a
+missing file. Title, parent, and kind copy across; the predecessor stays
+readable on disk.
+
+grok-build 1.0.0 compresses *in place*. The full unsummarized transcript
+stays a file the model is told to `read_file`/`grep` ("Do NOT modify
+these files"); prior summaries are authoritative and must be merged
+forward (`<conversation_summary>` / "this session is being continued").
+Optional two-pass (`two_pass_compaction`, default false), `/compact
+[context]`, `/flush` to memory first, Pre/PostCompact hooks, degenerate-
+summary retry, `compaction_checkpoints/` for auto. That mutate is the
+wrong shape until a store exists.
+
+**When triggered:** a transcript that outlives the process. Then v2's
+successor *instance* (new chat, same parent / project / title; old chat
+stays readable) plus grok's "full transcript is a file" once that file
+exists. Threshold 0.85 can stay. No new crate; no worker on this
+branch.
+
+**Adopted now regardless (cheap):** the catalog field and its comment.
+The missing piece is the queue, not the threshold.
+
 ## The ledger
 
 Functionality crosses from v2 only with a verdict recorded here.
@@ -507,6 +548,7 @@ Functionality crosses from v2 only with a verdict recorded here.
 | SSE + shell WebSocket | **drop** | one multiplexed event/watch stream (M1) |
 | `MycoApi` trait + `HttpClient` + per-op routes | **drop** | generic verb gateway; four parallel op lists become one |
 | agent loop, models/providers, session store | **port + reshape (M2)** | the chat kind + the model-side adapter (dispatcher, standing subscriptions) |
+| session compaction (successor + compact worker) | **pending** | threshold on `ModelSpec`; queue does not. Successor instance, not in-place, and only after persistence. DP-3. |
 | `subagent` tool + child routes | **drop** | chat instances with a parent ref |
 | NDJSON host protocol | **re-derived (M4)** | `crates/wire` + `myco-hostd`; hosts/toolds are protocol providers |
 | GUI terminal renderer, transcript renderer | **port (M3)** | into the renderer registry |
