@@ -111,6 +111,20 @@ fn dispatch(action: Action) {
     for effect in effects {
         run(effect);
     }
+    // After the borrow is gone: a focused tty may need a resize. Measuring
+    // (and dispatching) from inside render re-entered STATE and panicked.
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let focused_tty = STATE.with(|s| {
+        let state = s.borrow();
+        state.workspace.selected.clone().filter(|_| {
+            state.workspace.panes.iter().any(|p| {
+                Some(p.id.as_str()) == state.workspace.selected.as_deref() && p.kind == "tty"
+            })
+        })
+    });
+    measure_focused_tty(&document, focused_tty);
 }
 
 fn run(effect: Effect) {
@@ -171,8 +185,14 @@ fn run(effect: Effect) {
             );
         }),
         Effect::OpenFeed { token } => open_feed(token),
-        Effect::CreateInstance { token, kind } => wasm_bindgen_futures::spawn_local(async move {
-            let body = serde_json::json!({ "kind": kind }).to_string();
+        Effect::CreateInstance {
+            token,
+            kind,
+            project,
+            title,
+        } => wasm_bindgen_futures::spawn_local(async move {
+            let body =
+                serde_json::json!({ "kind": kind, "project": project, "title": title }).to_string();
             dispatch(
                 match fetch("POST", "/api/instances", Some(&token), Some((JSON, body))).await {
                     Ok((status, body)) => Action::CreateAnswered { status, body },
@@ -564,7 +584,6 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
-    measure_focused_tty(document);
 
     if let Some(input) = document
         .get_element_by_id("palette-input")
@@ -785,6 +804,74 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
+    if let Ok(headers) = document.query_selector_all("[data-project]") {
+        for i in 0..headers.length() {
+            if let Some(el) = headers
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let project = el.get_attribute("data-project").unwrap_or_default();
+                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                    dispatch(Action::ProjectSelected {
+                        project: project.clone(),
+                    });
+                });
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+    if let Some(button) = document.get_element_by_id("new-project") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            dispatch(Action::NewProjectRequested);
+        });
+        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+    if let Some(input) = document
+        .get_element_by_id("project-slug")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        let _ = input.focus();
+        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Some(target) = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            {
+                dispatch(Action::ProjectDrafted {
+                    draft: target.value(),
+                });
+            }
+        });
+        let _ = input.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
+        on_input.forget();
+        let on_key =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                match e.key().as_str() {
+                    "Enter" => {
+                        e.prevent_default();
+                        if let Some(target) = e
+                            .target()
+                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                        {
+                            dispatch(Action::NewProjectCommitted {
+                                slug: target.value(),
+                            });
+                        }
+                    }
+                    "Escape" => {
+                        e.prevent_default();
+                        dispatch(Action::ProjectSelected {
+                            project: STATE.with(|s| s.borrow().workspace.current_project.clone()),
+                        });
+                    }
+                    _ => {}
+                }
+            });
+        let _ = input.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+        on_key.forget();
+    }
     if let Some(button) = document.get_element_by_id("sign-out") {
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             dispatch(Action::SignOutRequested);
@@ -827,10 +914,17 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
     let tree: String = groups
         .iter()
         .map(|(project, list)| {
+            let value = if *project == "workspace" { "" } else { project };
+            let current = if ws.current_project == value {
+                " current"
+            } else {
+                ""
+            };
             format!(
-                r#"<div class="tree-project">{}</div>{}"#,
-                escape(project),
-                tree_rows(list, ws, state.renaming.as_ref())
+                r#"<div class="tree-project{current}" data-project="{value}">{label}</div>{rows}"#,
+                value = escape(value),
+                label = escape(project),
+                rows = tree_rows(list, ws, state.renaming.as_ref()),
             )
         })
         .collect();
@@ -845,6 +939,7 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             )
         })
         .collect();
+    let chip = project_chip(ws);
 
     let overlay = palette_overlay(state);
     let notice = match &state.notice {
@@ -858,6 +953,7 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
         r#"{overlay}{notice}<div class="workspace">
              <div class="island sidebar">
                <div class="shell-brand"><span class="spore">●</span> myco</div>
+               {chip}
                <div class="tree">{tree}</div>
                <div class="row-buttons creates">{creates}</div>
                <div class="sidebar-foot">
@@ -947,7 +1043,7 @@ fn pane_view(
     };
     let focused = ws.selected.as_deref() == Some(pane.id.as_str());
     format!(
-        r#"<div class="island pane{gone}{focus}" data-focus="{id}">
+        r#"<div class="island pane {kind}{gone}{focus}" data-focus="{id}">
              <div class="pane-header">
                {title_node}
                <span class="pane-chrome">{chip}{release}
@@ -955,6 +1051,7 @@ fn pane_view(
              </div>
              {body}{view}
            </div>"#,
+        kind = escape(&pane.kind),
         gone = if pane.gone { " pane-gone" } else { "" },
         focus = if focused { " focused" } else { "" },
         title_node = title_node(&pane.id, &title, renaming, true),
@@ -1060,6 +1157,33 @@ fn tty_screen(raw: &str) -> String {
 /// anything else into CSS.
 fn ok_color(c: &str) -> bool {
     c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// The current-project chip: click a tree header to set it, or `+ project`
+/// to name a new one. Creating a project is just setting current — the
+/// next `+ kind` writes it.
+fn project_chip(ws: &crate::core::Workspace) -> String {
+    match &ws.project_draft {
+        Some(draft) => format!(
+            r#"<input id="project-slug" class="mono project-slug" placeholder="project-slug" value="{draft}" />"#,
+            draft = escape(draft),
+        ),
+        None => {
+            let label = if ws.current_project.is_empty() {
+                "workspace"
+            } else {
+                &ws.current_project
+            };
+            format!(
+                r#"<div class="project-bar">
+                     <button class="chip project" data-project="{value}" title="creates land here">{label}</button>
+                     <button id="new-project" class="quiet-button">+ project</button>
+                   </div>"#,
+                value = escape(&ws.current_project),
+                label = escape(label),
+            )
+        }
+    }
 }
 
 /// How deep the tree will indent before it gives up. Parentage is acyclic
@@ -1250,10 +1374,13 @@ fn palette_overlay(state: &State) -> String {
 /// dispatch cannot spin (the repeat measurement produces no effect and no
 /// state change worth re-rendering... except the action log; hence the
 /// edge-side dedupe here too).
-fn measure_focused_tty(document: &web_sys::Document) {
+fn measure_focused_tty(document: &web_sys::Document, id: Option<String>) {
     thread_local! {
         static LAST: RefCell<Option<(String, u16, u16)>> = const { RefCell::new(None) };
     }
+    let Some(id) = id else {
+        return;
+    };
     let Some(el) = document
         .query_selector(".pane.focused [data-tty-screen]")
         .ok()
@@ -1264,17 +1391,13 @@ fn measure_focused_tty(document: &web_sys::Document) {
     let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() else {
         return;
     };
-    // One character cell, measured off the live font: a hidden probe span.
-    let Some((cw, ch)) = char_cell(document) else {
+    // One character cell, measured off the live screen's font — not a
+    // detached body span that can disagree with `.tty-screen`.
+    let Some((cw, ch)) = char_cell(&el) else {
         return;
     };
-    let cols = ((el.client_width() as f64 - 8.0) / cw)
-        .floor()
-        .clamp(20.0, 500.0) as u16;
-    let rows = ((el.client_height() as f64) / ch).floor().clamp(5.0, 200.0) as u16;
-    let id = STATE
-        .with(|s| s.borrow().workspace.selected.clone())
-        .unwrap_or_default();
+    let cols = (el.client_width() as f64 / cw).floor().clamp(20.0, 500.0) as u16;
+    let rows = (el.client_height() as f64 / ch).floor().clamp(5.0, 200.0) as u16;
     let fresh = LAST.with(|last| {
         let mut last = last.borrow_mut();
         if *last == Some((id.clone(), cols, rows)) {
@@ -1284,16 +1407,17 @@ fn measure_focused_tty(document: &web_sys::Document) {
             true
         }
     });
-    if fresh && !id.is_empty() {
+    if fresh {
         dispatch(Action::PaneMeasured { id, cols, rows });
     }
 }
 
-fn char_cell(document: &web_sys::Document) -> Option<(f64, f64)> {
+fn char_cell(screen: &web_sys::HtmlElement) -> Option<(f64, f64)> {
+    let document = screen.owner_document()?;
     let probe = document.create_element("span").ok()?;
-    probe.set_class_name("mono tty-probe");
+    probe.set_class_name("tty-probe");
     probe.set_text_content(Some("MMMMMMMMMM"));
-    document.body()?.append_child(&probe).ok()?;
+    screen.append_child(&probe).ok()?;
     let rect = probe.get_bounding_client_rect();
     let (w, h) = (rect.width() / 10.0, rect.height());
     probe.remove();
