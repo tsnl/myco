@@ -874,7 +874,7 @@ fn adopted_row(id: &str, parent: Option<&str>) -> InstanceInfo {
 async fn adopted_rows_list_nest_and_forward_whole() {
     let pool = pool();
     let host = pool
-        .create(&ada(), "counter", "default", "the host", json!({}))
+        .create(&ada(), "counter", "default", "the-host", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),
@@ -901,7 +901,7 @@ async fn adopted_rows_list_nest_and_forward_whole() {
 async fn remote_marks_fold_monotonically_and_dropping_wakes_waiters() {
     let pool = pool();
     let host = pool
-        .create(&ada(), "counter", "default", "the host", json!({}))
+        .create(&ada(), "counter", "default", "the-host", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),
@@ -933,10 +933,10 @@ async fn remote_marks_fold_monotonically_and_dropping_wakes_waiters() {
 async fn drop_remotes_from_sweeps_an_origin() {
     let pool = pool();
     let host_a = pool
-        .create(&ada(), "counter", "default", "host a", json!({}))
+        .create(&ada(), "counter", "default", "host-a", json!({}))
         .unwrap();
     let host_b = pool
-        .create(&ada(), "counter", "default", "host b", json!({}))
+        .create(&ada(), "counter", "default", "host-b", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),
