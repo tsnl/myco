@@ -86,14 +86,22 @@ fn run(effect: Effect) {
             });
         }),
         Effect::FetchInstances { token } => wasm_bindgen_futures::spawn_local(async move {
-            dispatch(match fetch("GET", "/api/instances", Some(&token), None).await {
-                Ok((status, body)) => Action::InstancesAnswered { status, body },
-                Err(what) => Action::NetworkFailed { what },
-            });
+            dispatch(
+                match fetch("GET", "/api/instances", Some(&token), None).await {
+                    Ok((status, body)) => Action::InstancesAnswered { status, body },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
         }),
         Effect::OpenFeed { token } => open_feed(token),
-        Effect::CreateInstance { token, kind } => wasm_bindgen_futures::spawn_local(async move {
-            let body = serde_json::json!({ "kind": kind }).to_string();
+        Effect::CreateInstance {
+            token,
+            kind,
+            project,
+            title,
+        } => wasm_bindgen_futures::spawn_local(async move {
+            let body =
+                serde_json::json!({ "kind": kind, "project": project, "title": title }).to_string();
             dispatch(
                 match fetch("POST", "/api/instances", Some(&token), Some((JSON, body))).await {
                     Ok((status, body)) => Action::CreateAnswered { status, body },
@@ -149,10 +157,8 @@ fn open_feed(token: String) {
             }
         });
         if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                retry.unchecked_ref(),
-                2000,
-            );
+            let _ = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(retry.unchecked_ref(), 2000);
         }
     });
     socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -169,11 +175,17 @@ fn open_feed(token: String) {
 // ---------------------------------------------------------------------------
 
 async fn enroll_passkey(token: &str) -> Action {
-    let (status, challenge) =
-        match fetch("POST", "/api/auth/passkey/register/start", Some(token), None).await {
-            Ok(answer) => answer,
-            Err(what) => return Action::NetworkFailed { what },
-        };
+    let (status, challenge) = match fetch(
+        "POST",
+        "/api/auth/passkey/register/start",
+        Some(token),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(what) => return Action::NetworkFailed { what },
+    };
     if status != 200 {
         return Action::PasskeyEnrollAnswered {
             status,
@@ -318,7 +330,9 @@ fn storage() -> Option<web_sys::Storage> {
 }
 
 fn url_encode(text: &str) -> String {
-    js_sys::encode_uri_component(text).as_string().unwrap_or_default()
+    js_sys::encode_uri_component(text)
+        .as_string()
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +417,7 @@ fn wire(document: &web_sys::Document) {
                 code: value("code"),
             });
         });
-        let _ = form
-            .add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
+        let _ = form.add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
         on_submit.forget();
     }
     if let Some(button) = document.get_element_by_id("passkey-sign-in") {
@@ -431,13 +444,16 @@ fn wire(document: &web_sys::Document) {
     // argument; the listener only dispatches.
     if let Ok(rows) = document.query_selector_all("[data-open]") {
         for i in 0..rows.length() {
-            if let Some(row) = rows.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) {
+            if let Some(row) = rows
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
                 let id = row.get_attribute("data-open").unwrap_or_default();
                 let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
                     dispatch(Action::Selected { id: id.clone() });
                 });
-                let _ =
-                    row.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                let _ = row
+                    .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
                 on_click.forget();
             }
         }
@@ -457,6 +473,74 @@ fn wire(document: &web_sys::Document) {
                 on_click.forget();
             }
         }
+    }
+    if let Ok(headers) = document.query_selector_all("[data-project]") {
+        for i in 0..headers.length() {
+            if let Some(el) = headers
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let project = el.get_attribute("data-project").unwrap_or_default();
+                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                    dispatch(Action::ProjectSelected {
+                        project: project.clone(),
+                    });
+                });
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+    if let Some(button) = document.get_element_by_id("new-project") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            dispatch(Action::NewProjectRequested);
+        });
+        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+    if let Some(input) = document
+        .get_element_by_id("project-slug")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        let _ = input.focus();
+        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Some(target) = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            {
+                dispatch(Action::ProjectDrafted {
+                    draft: target.value(),
+                });
+            }
+        });
+        let _ = input.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
+        on_input.forget();
+        let on_key =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                match e.key().as_str() {
+                    "Enter" => {
+                        e.prevent_default();
+                        if let Some(target) = e
+                            .target()
+                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                        {
+                            dispatch(Action::NewProjectCommitted {
+                                slug: target.value(),
+                            });
+                        }
+                    }
+                    "Escape" => {
+                        e.prevent_default();
+                        dispatch(Action::ProjectSelected {
+                            project: STATE.with(|s| s.borrow().workspace.current_project.clone()),
+                        });
+                    }
+                    _ => {}
+                }
+            });
+        let _ = input.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+        on_key.forget();
     }
     if let Some(button) = document.get_element_by_id("sign-out") {
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
@@ -500,10 +584,17 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
     let tree: String = groups
         .iter()
         .map(|(project, list)| {
+            let value = if *project == "workspace" { "" } else { project };
+            let current = if ws.current_project == value {
+                " current"
+            } else {
+                ""
+            };
             format!(
-                r#"<div class="tree-project">{}</div>{}"#,
-                escape(project),
-                tree_rows(list, ws)
+                r#"<div class="tree-project{current}" data-project="{value}">{label}</div>{rows}"#,
+                value = escape(value),
+                label = escape(project),
+                rows = tree_rows(list, ws),
             )
         })
         .collect();
@@ -518,11 +609,13 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             )
         })
         .collect();
+    let chip = project_chip(ws);
 
     format!(
         r#"<div class="workspace">
              <div class="island sidebar">
                <div class="shell-brand"><span class="spore">●</span> myco</div>
+               {chip}
                <div class="tree">{tree}</div>
                <div class="row-buttons creates">{creates}</div>
                <div class="sidebar-foot">
@@ -549,6 +642,33 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             None => "open an instance from the tree".to_string(),
         },
     )
+}
+
+/// The current-project chip: click a tree header to set it, or `+ project`
+/// to name a new one. Creating a project is just setting current — the
+/// next `+ kind` writes it.
+fn project_chip(ws: &crate::core::Workspace) -> String {
+    match &ws.project_draft {
+        Some(draft) => format!(
+            r#"<input id="project-slug" class="mono project-slug" placeholder="project-slug" value="{draft}" />"#,
+            draft = escape(draft),
+        ),
+        None => {
+            let label = if ws.current_project.is_empty() {
+                "workspace"
+            } else {
+                &ws.current_project
+            };
+            format!(
+                r#"<div class="project-bar">
+                     <button class="chip project" data-project="{value}" title="creates land here">{label}</button>
+                     <button id="new-project" class="quiet-button">+ project</button>
+                   </div>"#,
+                value = escape(&ws.current_project),
+                label = escape(label),
+            )
+        }
+    }
 }
 
 /// How deep the tree will indent before it gives up. Parentage is acyclic
@@ -584,10 +704,7 @@ fn push_children(
     if depth > MAX_TREE_DEPTH {
         return;
     }
-    for child in list
-        .iter()
-        .filter(|i| i.parent.as_deref() == Some(parent))
-    {
+    for child in list.iter().filter(|i| i.parent.as_deref() == Some(parent)) {
         out.push_str(&tree_row(child, ws, depth));
         push_children(out, list, &child.id, ws, depth + 1);
     }

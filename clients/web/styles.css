@@ -272,6 +272,40 @@ form {
     letter-spacing: 0.08em;
     text-transform: uppercase;
     margin: 8px 0 4px;
+    cursor: pointer;
+}
+
+.tree-project.current {
+    color: var(--accent);
+}
+
+.project-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.chip.project {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: none;
+    border-radius: var(--radius-chip);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 3px 10px;
+    cursor: pointer;
+}
+
+.project-slug {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-row);
+    background: var(--sunken);
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    padding: 6px 10px;
 }
 
 .tree-row {
