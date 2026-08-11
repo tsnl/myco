@@ -25,6 +25,8 @@ pub struct State {
     /// The last palette-run verb's answer (or refusal) — a quiet line, not
     /// an ember; dismissed on the next palette open.
     pub notice: Option<String>,
+    /// Inline title edit on the selected instance, when open.
+    pub renaming: Option<RenameEdit>,
     /// A listing fetch is out and its answer has not landed. Bookkeeping,
     /// not content — it lives outside [`Workspace`] so a burst of feed
     /// events cannot make the tree look changed when nothing in it is.
@@ -145,6 +147,26 @@ pub struct Palette {
     pub stage: Stage,
 }
 
+/// An in-progress title edit. Commit calls `sys.rename`; a bad slug is
+/// refused here so the wire never sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameEdit {
+    pub id: String,
+    pub draft: String,
+    pub error: Option<String>,
+}
+
+/// Same charset L1 will enforce: `^[A-Za-z0-9][A-Za-z0-9-]*$`.
+pub fn valid_slug(title: &str) -> bool {
+    let mut bytes = title.bytes();
+    match bytes.next() {
+        Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9') => {
+            bytes.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
     List,
@@ -221,6 +243,18 @@ pub fn palette_rows(state: &State, query: &str) -> Vec<Row> {
                 },
             });
         }
+        // Framework verbs are not in KindSpec.verbs — inject them so a
+        // button and a palette row stay one registry.
+        rows.push(Row {
+            label: "rename".into(),
+            detail: "set {title}".into(),
+            group: "verbs",
+            gated: None,
+            commit: Commit::Verb {
+                id: instance.id.clone(),
+                verb: "sys.rename".into(),
+            },
+        });
         rows.push(Row {
             label: "close pane".into(),
             detail: String::new(),
@@ -292,6 +326,11 @@ fn palette_answered(
         why: String,
     }
     let wire = serde_json::from_str::<Wire>(&body).unwrap_or_default();
+    if status == 200 && verb == "sys.rename" {
+        // Rename is chrome: the listing moves, the answer is not a notice.
+        state.notice = None;
+        return relist(state);
+    }
     if status == 400 && wire.error == "bad_args" {
         // The error-driven second stage: the well opens with the server's
         // own words about what was missing.
@@ -498,6 +537,14 @@ pub enum Action {
     PaletteArgsCommitted { draft: String },
     /// Escape — close the palette (args stage falls back to the list).
     PaletteDismissed,
+    /// Clicked the pane or selected tree-row title: start an inline rename.
+    RenameStarted { id: String },
+    /// The inline rename field changed.
+    RenameDrafted { draft: String },
+    /// Commit the inline rename (`sys.rename`, chrome origin).
+    RenameCommitted { title: String },
+    /// Escape / blur away from the inline rename.
+    RenameDismissed,
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
@@ -590,7 +637,11 @@ pub fn reserved_chord(key: &str, ctrl: bool, meta: bool) -> bool {
 /// the focused pane is a live tty whose seat this person holds and the
 /// chord is not reserved.
 pub fn wants_key(state: &State, key: &str, ctrl: bool, meta: bool) -> bool {
-    if reserved_chord(key, ctrl, meta) || meta || state.palette.is_some() {
+    if reserved_chord(key, ctrl, meta)
+        || meta
+        || state.palette.is_some()
+        || state.renaming.is_some()
+    {
         return false;
     }
     let Session::SignedIn(user) = &state.session else {
@@ -893,6 +944,8 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.session = Session::SignedOut;
             state.sign_in = SignIn::default();
             state.passkey_note = None;
+            state.palette = None;
+            state.renaming = None;
             state.workspace = Workspace::default();
             state.listing_in_flight = false;
             state.listing_stale = false;
@@ -958,6 +1011,9 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             vec![]
         }
         Action::Selected { id } => {
+            if state.renaming.as_ref().is_some_and(|r| r.id != id) {
+                state.renaming = None;
+            }
             state.workspace.selected = Some(id.clone());
             if state.workspace.panes.iter().any(|p| p.id == id) {
                 return vec![];
@@ -1098,6 +1154,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         }
         Action::PaletteToggled => {
             state.notice = None;
+            state.renaming = None;
             state.palette = match state.palette {
                 Some(_) => None,
                 None => Some(Palette {
@@ -1137,6 +1194,63 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 }
             }
             vec![]
+        }
+        Action::RenameStarted { id } => {
+            if state.workspace.selected.as_deref() != Some(id.as_str()) {
+                return reduce_again(state, Action::Selected { id });
+            }
+            let draft = state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| {
+                    if i.title.is_empty() {
+                        i.kind.clone()
+                    } else {
+                        i.title.clone()
+                    }
+                })
+                .unwrap_or_default();
+            state.renaming = Some(RenameEdit {
+                id,
+                draft,
+                error: None,
+            });
+            vec![]
+        }
+        Action::RenameDrafted { draft } => {
+            if let Some(edit) = &mut state.renaming {
+                edit.draft = draft;
+                edit.error = None;
+            }
+            vec![]
+        }
+        Action::RenameDismissed => {
+            state.renaming = None;
+            vec![]
+        }
+        Action::RenameCommitted { title } => {
+            let Some(edit) = &mut state.renaming else {
+                return vec![];
+            };
+            if !valid_slug(&title) {
+                edit.draft = title;
+                edit.error = Some("title must match ^[A-Za-z0-9][A-Za-z0-9-]*$".into());
+                return vec![];
+            }
+            let id = edit.id.clone();
+            state.renaming = None;
+            match &state.token {
+                Some(token) => vec![Effect::call_with(
+                    Origin::Chrome,
+                    token,
+                    &id,
+                    "sys.rename",
+                    serde_json::json!({ "title": title }),
+                )],
+                None => vec![],
+            }
         }
         Action::PaletteCommitted => {
             let Some(palette) = &state.palette else {
@@ -1969,6 +2083,18 @@ mod tests {
         assert!(screen.gated.is_none(), "reads are never gated");
         assert!(rows.iter().any(|r| r.label == "open shell"));
         assert!(rows.iter().any(|r| r.label == "new tty"));
+        let rename = rows
+            .iter()
+            .find(|r| r.label == "rename")
+            .expect("sys.rename is injected");
+        assert_eq!(
+            rename.commit,
+            Commit::Verb {
+                id: "t1".into(),
+                verb: "sys.rename".into()
+            }
+        );
+        assert!(rename.gated.is_none());
 
         // The fuzzy filter is a subsequence match.
         let rows = palette_rows(&state, "sgn");
@@ -2089,6 +2215,67 @@ mod tests {
         // Escape closes; the terminal gets its keys back.
         reduce(&mut state, Action::PaletteDismissed);
         assert!(wants_key(&state, "a", false, false));
+    }
+
+    #[test]
+    fn inline_rename_refuses_a_bad_slug_and_calls_chrome() {
+        let mut state = with_palette_world();
+        reduce(&mut state, Action::RenameStarted { id: "t1".into() });
+        assert_eq!(
+            state.renaming.as_ref().map(|r| r.draft.as_str()),
+            Some("shell")
+        );
+        assert!(!wants_key(&state, "a", false, false));
+
+        let effects = reduce(
+            &mut state,
+            Action::RenameCommitted {
+                title: "has space".into(),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(
+            state
+                .renaming
+                .as_ref()
+                .and_then(|r| r.error.as_ref())
+                .is_some()
+        );
+
+        let effects = reduce(
+            &mut state,
+            Action::RenameCommitted {
+                title: "lab-1".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::call_with(
+                Origin::Chrome,
+                "tok-1",
+                "t1",
+                "sys.rename",
+                serde_json::json!({ "title": "lab-1" })
+            )]
+        );
+        assert!(state.renaming.is_none());
+    }
+
+    #[test]
+    fn a_palette_rename_is_chrome_not_a_notice() {
+        let mut state = with_palette_world();
+        reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Palette,
+                id: "t1".into(),
+                verb: "sys.rename".into(),
+                status: 200,
+                body: "null".into(),
+            },
+        );
+        assert!(state.notice.is_none(), "rename must not dump JSON");
+        assert!(state.listing_in_flight, "chrome-like: re-list");
     }
 
     /// The log is the repro: every action lands in order, capped.

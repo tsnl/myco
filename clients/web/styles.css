@@ -302,6 +302,33 @@ form {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: text;
+}
+
+.rename-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+}
+
+.rename-input {
+    min-width: 0;
+    flex: 1;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-row);
+    background: var(--sunken);
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    padding: 2px 8px;
+}
+
+.rename-error {
+    color: var(--attn);
+    font-size: 10.5px;
+    white-space: nowrap;
 }
 
 .kind-tag {

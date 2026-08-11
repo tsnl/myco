@@ -60,6 +60,14 @@ fn attach_keyboard() {
                 dispatch(Action::PaletteToggled);
                 return;
             }
+            let renaming = STATE.with(|s| s.borrow().renaming.is_some());
+            if renaming {
+                if key == "Escape" {
+                    event.prevent_default();
+                    dispatch(Action::RenameDismissed);
+                }
+                return;
+            }
             let palette_open = STATE.with(|s| s.borrow().palette.is_some());
             if palette_open {
                 // The palette owns the keyboard: navigation here, typing
@@ -669,6 +677,67 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
+    if let Ok(titles) = document.query_selector_all("[data-rename]") {
+        for i in 0..titles.length() {
+            if let Some(el) = titles
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let id = el.get_attribute("data-rename").unwrap_or_default();
+                let on_click =
+                    Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+                        event.stop_propagation();
+                        dispatch(Action::RenameStarted { id: id.clone() });
+                    });
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+    if let Some(input) = document
+        .get_element_by_id("rename-title")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        let _ = input.focus();
+        let len = input.value().len() as u32;
+        let _ = input.set_selection_range(len, len);
+        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Some(target) = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            {
+                dispatch(Action::RenameDrafted {
+                    draft: target.value(),
+                });
+            }
+        });
+        let _ = input.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
+        on_input.forget();
+        let on_key =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                match e.key().as_str() {
+                    "Enter" => {
+                        e.prevent_default();
+                        if let Some(target) = e
+                            .target()
+                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                        {
+                            dispatch(Action::RenameCommitted {
+                                title: target.value(),
+                            });
+                        }
+                    }
+                    "Escape" => {
+                        e.prevent_default();
+                        dispatch(Action::RenameDismissed);
+                    }
+                    _ => {}
+                }
+            });
+        let _ = input.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+        on_key.forget();
+    }
     if let Ok(buttons) = document.query_selector_all("[data-create]") {
         for i in 0..buttons.length() {
             if let Some(button) = buttons
@@ -761,7 +830,7 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
             format!(
                 r#"<div class="tree-project">{}</div>{}"#,
                 escape(project),
-                tree_rows(list, ws)
+                tree_rows(list, ws, state.renaming.as_ref())
             )
         })
         .collect();
@@ -812,7 +881,10 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
         stage = if ws.panes.is_empty() {
             r#"<div class="dim stage-empty">open an instance from the tree</div>"#.to_string()
         } else {
-            ws.panes.iter().map(|p| pane_view(p, ws)).collect()
+            ws.panes
+                .iter()
+                .map(|p| pane_view(p, ws, state.renaming.as_ref()))
+                .collect()
         },
     )
 }
@@ -820,7 +892,11 @@ fn workspace_view(state: &State, user: &crate::core::User) -> String {
 /// One pane: an island with chrome (title, the seat chip, close) over the
 /// generic projection. The chip is STYLE.md's vocabulary: who drives, in
 /// their hue; an open seat invites the take.
-fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
+fn pane_view(
+    pane: &crate::core::Pane,
+    ws: &crate::core::Workspace,
+    renaming: Option<&crate::core::RenameEdit>,
+) -> String {
     let instance = ws.instances.iter().find(|i| i.id == pane.id);
     let title = instance
         .map(|i| {
@@ -873,7 +949,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     format!(
         r#"<div class="island pane{gone}{focus}" data-focus="{id}">
              <div class="pane-header">
-               <span class="row-title">{title}</span>
+               {title_node}
                <span class="pane-chrome">{chip}{release}
                  <button class="quiet-button" data-close="{id}">close</button></span>
              </div>
@@ -881,7 +957,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
            </div>"#,
         gone = if pane.gone { " pane-gone" } else { "" },
         focus = if focused { " focused" } else { "" },
-        title = escape(&title),
+        title_node = title_node(&pane.id, &title, renaming, true),
         id = escape(&pane.id),
     )
 }
@@ -994,7 +1070,11 @@ const MAX_TREE_DEPTH: usize = 8;
 /// One project's rows: roots first, each followed by whatever hangs under
 /// it. A row whose parent is not in this group renders as a root, because
 /// an indent under nothing is a lie.
-fn tree_rows(list: &[&crate::core::InstanceInfo], ws: &crate::core::Workspace) -> String {
+fn tree_rows(
+    list: &[&crate::core::InstanceInfo],
+    ws: &crate::core::Workspace,
+    renaming: Option<&crate::core::RenameEdit>,
+) -> String {
     let mut out = String::new();
     for instance in list {
         let orphan = instance
@@ -1002,8 +1082,8 @@ fn tree_rows(list: &[&crate::core::InstanceInfo], ws: &crate::core::Workspace) -
             .as_deref()
             .is_none_or(|p| !list.iter().any(|i| i.id == p));
         if orphan {
-            out.push_str(&tree_row(instance, ws, 0));
-            push_children(&mut out, list, &instance.id, ws, 1);
+            out.push_str(&tree_row(instance, ws, 0, renaming));
+            push_children(&mut out, list, &instance.id, ws, 1, renaming);
         }
     }
     out
@@ -1015,13 +1095,14 @@ fn push_children(
     parent: &str,
     ws: &crate::core::Workspace,
     depth: usize,
+    renaming: Option<&crate::core::RenameEdit>,
 ) {
     if depth > MAX_TREE_DEPTH {
         return;
     }
     for child in list.iter().filter(|i| i.parent.as_deref() == Some(parent)) {
-        out.push_str(&tree_row(child, ws, depth));
-        push_children(out, list, &child.id, ws, depth + 1);
+        out.push_str(&tree_row(child, ws, depth, renaming));
+        push_children(out, list, &child.id, ws, depth + 1, renaming);
     }
 }
 
@@ -1032,6 +1113,7 @@ fn tree_row(
     instance: &crate::core::InstanceInfo,
     ws: &crate::core::Workspace,
     depth: usize,
+    renaming: Option<&crate::core::RenameEdit>,
 ) -> String {
     let selected = ws.selected.as_deref() == Some(instance.id.as_str());
     let title = if instance.title.is_empty() {
@@ -1043,15 +1125,49 @@ fn tree_row(
         r#"<div class="tree-row{sel}{crashed}" data-open="{id}" style="--depth:{depth}">
              <span class="seat {seat}"></span>
              <span class="kind-tag mono">{kind}</span>
-             <span class="row-title">{title}</span>
+             {title_node}
            </div>"#,
         sel = if selected { " selected" } else { "" },
         crashed = if instance.crashed { " crashed" } else { "" },
         id = escape(&instance.id),
         seat = crate::core::seat_of(instance.driver.as_ref()).tone(),
         kind = escape(&instance.kind),
-        title = escape(title),
+        title_node = title_node(
+            &instance.id,
+            title,
+            renaming,
+            !ws.panes.iter().any(|p| p.id == instance.id),
+        ),
     )
+}
+
+/// Click the selected title to rename; a bad slug stays in the field.
+fn title_node(
+    id: &str,
+    title: &str,
+    renaming: Option<&crate::core::RenameEdit>,
+    allow_input: bool,
+) -> String {
+    match renaming {
+        Some(edit) if edit.id == id && allow_input => {
+            let err = match &edit.error {
+                Some(why) => format!(r#"<span class="rename-error">{}</span>"#, escape(why)),
+                None => String::new(),
+            };
+            format!(
+                r#"<span class="rename-wrap"><input id="rename-title" class="mono rename-input" value="{draft}" />{err}</span>"#,
+                draft = escape(&edit.draft),
+            )
+        }
+        Some(edit) if edit.id == id => {
+            format!(r#"<span class="row-title">{}</span>"#, escape(&edit.draft),)
+        }
+        _ => format!(
+            r#"<span class="row-title" data-rename="{id}">{title}</span>"#,
+            id = escape(id),
+            title = escape(title),
+        ),
+    }
 }
 
 /// The summoned palette: one island over a scrim, the amethyst spec —
