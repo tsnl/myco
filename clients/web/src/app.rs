@@ -1262,7 +1262,7 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane, catalog: &crate::core::C
                 _ => "system",
             };
             match e.t.as_str() {
-                "message" => bubble(dot, &e.author.id, &escape(&e.text), ""),
+                "message" => bubble(dot, &e.author.id, &escape(&e.text), "", false),
                 "assistant" => {
                     let text = content_text(&e.content);
                     let streaming = e.turn_end.is_none();
@@ -1280,7 +1280,13 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane, catalog: &crate::core::C
                     } else {
                         ""
                     };
-                    bubble(dot, "agent", &format!("{}{cursor}", escape(&text)), &tools)
+                    bubble(
+                        dot,
+                        "agent",
+                        &format!("{}{cursor}", crate::core::render_markdown(&text)),
+                        &tools,
+                        true,
+                    )
                 }
                 "tool_results" => {
                     let text = e
@@ -1379,14 +1385,15 @@ fn chat_composer(
     )
 }
 
-fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {
+fn bubble(dot: &str, who: &str, text: &str, extra: &str, markdown: bool) -> String {
     format!(
         r#"<div class="entry">
              <div class="byline"><span class="seat {dot}"></span>
                <span class="dim">{who}</span></div>
-             <div class="entry-body">{text}{extra}</div>
+             <div class="entry-body{md}">{text}{extra}</div>
            </div>"#,
         who = escape(who),
+        md = if markdown { " md" } else { "" },
     )
 }
 

@@ -8,6 +8,9 @@
 //! whole. The action log rides the state — a client bug replays as a fold
 //! over recorded actions.
 
+mod markdown;
+pub use markdown::render_markdown;
+
 /// Everything the client knows. Rendering is a pure function of this.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
