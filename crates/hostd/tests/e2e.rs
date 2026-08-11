@@ -24,7 +24,7 @@ async fn a_host_dials_the_real_hostd_and_a_far_tty_answers() {
 
     let command = format!("{} --name farbox", env!("CARGO_BIN_EXE_myco-hostd"));
     let host = pool
-        .create(&ada(), "host", "", "far box", json!({ "command": command }))
+        .create(&ada(), "host", "", "far-box", json!({ "command": command }))
         .expect("the host instance creates");
 
     // The dial is a side-feed; status is state, so the wait is the

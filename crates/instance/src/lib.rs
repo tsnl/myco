@@ -192,7 +192,8 @@ pub enum VerbError {
 }
 
 /// A title is a slug: `^[A-Za-z0-9][A-Za-z0-9-]*$`. Empty at create
-/// becomes the kind name (which must itself be a slug).
+/// becomes the kind name, then `-2`, `-3`, … until the project is free.
+/// `sys.rename` still requires an explicit unused slug.
 fn valid_title(title: &str) -> bool {
     let mut bytes = title.bytes();
     match bytes.next() {
@@ -203,8 +204,9 @@ fn valid_title(title: &str) -> bool {
     }
 }
 
-fn resolve_title(title: &str, kind: &str) -> Result<String, VerbError> {
-    let resolved = if title.is_empty() {
+fn resolve_title(title: &str, kind: &str) -> Result<(String, bool), VerbError> {
+    let generated = title.is_empty();
+    let resolved = if generated {
         kind.to_string()
     } else {
         title.to_string()
@@ -214,7 +216,20 @@ fn resolve_title(title: &str, kind: &str) -> Result<String, VerbError> {
             why: format!("title {resolved:?} must match ^[A-Za-z0-9][A-Za-z0-9-]*$"),
         });
     }
-    Ok(resolved)
+    Ok((resolved, generated))
+}
+
+fn next_free_title(instances: &HashMap<String, Arc<Entry>>, project: &str, base: &str) -> String {
+    if title_taken(instances, project, base, None).is_none() {
+        return base.to_string();
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}-{n}");
+        if title_taken(instances, project, &candidate, None).is_none() {
+            return candidate;
+        }
+    }
+    base.to_string()
 }
 
 fn title_taken(
@@ -563,19 +578,20 @@ impl Pool {
                 .cloned()
                 .ok_or_else(|| VerbError::UnknownKind { kind: kind.into() })?
         };
-        let title = resolve_title(title, factory.spec().kind)?;
-        {
+        let (base, generated) = resolve_title(title, factory.spec().kind)?;
+        if !generated {
             let instances = self
                 .inner
                 .instances
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(other) = title_taken(&instances, project, &title, None) {
+            if let Some(other) = title_taken(&instances, project, &base, None) {
                 return Err(VerbError::BadArgs {
-                    why: format!("title {title:?} is already used by {other}"),
+                    why: format!("title {base:?} is already used by {other}"),
                 });
             }
         }
+        let title = base;
         // The context exists before the instance does, so `create` can hand
         // its kind a usable self-name and owner.
         let ctx = CreateCtx {
@@ -623,20 +639,23 @@ impl Pool {
             });
         }
 
-        let info = self.info_of(&entry);
         {
             let mut instances = self
                 .inner
                 .instances
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(other) = title_taken(&instances, project, &title, None) {
+            if generated {
+                let title = next_free_title(&instances, project, &title);
+                *entry.title.write().unwrap_or_else(|e| e.into_inner()) = title;
+            } else if let Some(other) = title_taken(&instances, project, &title, None) {
                 return Err(VerbError::BadArgs {
                     why: format!("title {title:?} is already used by {other}"),
                 });
             }
-            instances.insert(id.clone(), entry);
+            instances.insert(id.clone(), entry.clone());
         }
+        let info = self.info_of(&entry);
         let _ = self.inner.events.send((
             id,
             Event {
@@ -958,9 +977,13 @@ impl Pool {
             if let Some(e) = instances.get(id) {
                 return Some(e.parent.clone());
             }
-            remotes
-                .get(id)
-                .map(|r| r.info.read().unwrap_or_else(|e| e.into_inner()).parent.clone())
+            remotes.get(id).map(|r| {
+                r.info
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .parent
+                    .clone()
+            })
         };
         let mut chain = Vec::new();
         let mut next = parent_of(id).flatten();
@@ -993,7 +1016,10 @@ impl Pool {
             Err(miss) => match self.remote(id) {
                 Some(remote) => {
                     let mut rx = remote.mark.subscribe();
-                    let seen = rx.wait_for(|w| *w > since).await.map_err(|_| VerbError::Gone)?;
+                    let seen = rx
+                        .wait_for(|w| *w > since)
+                        .await
+                        .map_err(|_| VerbError::Gone)?;
                     Ok(*seen)
                 }
                 None => Err(miss),
@@ -1057,9 +1083,7 @@ impl Pool {
             Some(existing) => {
                 // The row's watermark is a snapshot; fold it in monotonically
                 // so a refresh can never rewind a watcher.
-                existing
-                    .mark
-                    .send_modify(|w| *w = (*w).max(info.watermark));
+                existing.mark.send_modify(|w| *w = (*w).max(info.watermark));
                 *existing.info.write().unwrap_or_else(|e| e.into_inner()) = info;
             }
             None => {

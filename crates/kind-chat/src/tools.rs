@@ -136,16 +136,13 @@ async fn bash(
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(1, MAX_TIMEOUT_SECS);
 
-    let title: String = format!("bash: {}", command.lines().next().unwrap_or(""))
-        .chars()
-        .take(48)
-        .collect();
+    // Empty title: L1 mints tty, tty-2, … — a command line is not a slug.
     let info = pool
         .create(
             agent,
             "tty",
             project,
-            &title,
+            "",
             json!({"command": command, "mode": "piped"}),
         )
         .map_err(|e| format!("cannot start a terminal: {e}"))?;
@@ -236,16 +233,12 @@ async fn subagent(
         ));
     }
 
-    let title: String = format!("subagent: {}", task.lines().next().unwrap_or(""))
-        .chars()
-        .take(48)
-        .collect();
     let child = pool
         .create_under(
             agent,
             "chat",
             project,
-            &title,
+            "",
             json!({"model": model}),
             Some(own_id),
         )

@@ -980,7 +980,13 @@ fn create_args_for(kind: &str, catalog: &Catalog) -> String {
         && let Some(model) = catalog
             .default
             .clone()
-            .or_else(|| catalog.models.iter().find(|m| m.default).map(|m| m.key.clone()))
+            .or_else(|| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|m| m.default)
+                    .map(|m| m.key.clone())
+            })
             .or_else(|| catalog.models.first().map(|m| m.key.clone()))
     {
         return serde_json::json!({ "model": model }).to_string();
@@ -1507,7 +1513,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             Some(token) => vec![Effect::CreateInstance {
                 token: token.clone(),
                 project: state.workspace.current_project.clone(),
-                title: kind.clone(),
+                title: String::new(),
                 args: create_args_for(&kind, &state.catalog),
                 kind,
             }],
@@ -1566,7 +1572,11 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     state.workspace.selected = Some(info.id);
                 }
             } else {
-                let why = if wire.why.is_empty() { wire.error } else { wire.why };
+                let why = if wire.why.is_empty() {
+                    wire.error
+                } else {
+                    wire.why
+                };
                 state.notice = Some(format!("new {kind}: {why}"));
             }
             relist(state)
@@ -1800,7 +1810,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                             Target::Create { kind } => Effect::CreateInstance {
                                 token: token.clone(),
                                 project: state.workspace.current_project.clone(),
-                                title: kind.clone(),
+                                title: String::new(),
                                 kind,
                                 args: draft,
                             },
@@ -2270,7 +2280,7 @@ mod tests {
                 token: "tok-1".into(),
                 kind: "tty".into(),
                 project: String::new(),
-                title: "tty".into(),
+                title: String::new(),
                 args: "{}".into(),
             }]
         );
@@ -2305,7 +2315,7 @@ mod tests {
                 token: "tok-1".into(),
                 kind: "host".into(),
                 project: String::new(),
-                title: "host".into(),
+                title: String::new(),
                 args: "{}".into(),
             }]
         );
@@ -2318,7 +2328,10 @@ mod tests {
                 body: r#"{"error":"bad_args","why":"a host needs {command}"}"#.into(),
             },
         );
-        assert!(effects.is_empty(), "the refusal opens the well, not a fetch");
+        assert!(
+            effects.is_empty(),
+            "the refusal opens the well, not a fetch"
+        );
         let palette = state.palette.as_ref().expect("the well opened");
         let Stage::Args { target, error, .. } = &palette.stage else {
             panic!("expected the args stage, got {:?}", palette.stage);
@@ -2343,7 +2356,7 @@ mod tests {
                 token: "tok-1".into(),
                 kind: "host".into(),
                 project: String::new(),
-                title: "host".into(),
+                title: String::new(),
                 args: r#"{"command":"ssh box myco-hostd"}"#.into(),
             }]
         );
@@ -2450,7 +2463,7 @@ mod tests {
                 token: "tok-1".into(),
                 kind: "tty".into(),
                 project: "lab".into(),
-                title: "tty".into(),
+                title: String::new(),
                 args: "{}".into(),
             }]
         );
@@ -3134,14 +3147,19 @@ mod tests {
                 .into(),
             },
         );
-        let effects = reduce(&mut state, Action::CreateRequested { kind: "chat".into() });
+        let effects = reduce(
+            &mut state,
+            Action::CreateRequested {
+                kind: "chat".into(),
+            },
+        );
         assert_eq!(
             effects,
             vec![Effect::CreateInstance {
                 token: "tok-1".into(),
                 kind: "chat".into(),
                 project: String::new(),
-                title: "chat".into(),
+                title: String::new(),
                 args: r#"{"model":"grok-4-6"}"#.into(),
             }]
         );
@@ -3153,7 +3171,7 @@ mod tests {
                 token: "tok-1".into(),
                 kind: "tty".into(),
                 project: String::new(),
-                title: "tty".into(),
+                title: String::new(),
                 args: "{}".into(),
             }]
         );
@@ -3208,7 +3226,10 @@ mod tests {
             },
         );
         assert_eq!(
-            state.workspace.panes[0].about.as_ref().map(|a| a.model.as_deref()),
+            state.workspace.panes[0]
+                .about
+                .as_ref()
+                .map(|a| a.model.as_deref()),
             Some(Some("claude-opus-5"))
         );
     }
