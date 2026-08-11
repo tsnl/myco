@@ -154,6 +154,20 @@ fn dispatch(action: Action) {
     for effect in effects {
         run(effect);
     }
+    // After the borrow is gone: a focused tty may need a resize. Measuring
+    // (and dispatching) from inside render re-entered STATE and panicked.
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let focused_tty = STATE.with(|s| {
+        let state = s.borrow();
+        state.workspace.selected.clone().filter(|_| {
+            state.workspace.panes.iter().any(|p| {
+                Some(p.id.as_str()) == state.workspace.selected.as_deref() && p.kind == "tty"
+            })
+        })
+    });
+    measure_focused_tty(&document, focused_tty);
 }
 
 fn run(effect: Effect) {
@@ -662,7 +676,6 @@ fn render(state: &State) {
     }
 
     focus_summoned_field(&document);
-    measure_focused_tty(&document);
 }
 
 /// Write a region's markup, but only when it actually changed — and put
@@ -1846,10 +1859,13 @@ fn palette_overlay(state: &State) -> String {
 /// dispatch cannot spin (the repeat measurement produces no effect and no
 /// state change worth re-rendering... except the action log; hence the
 /// edge-side dedupe here too).
-fn measure_focused_tty(document: &web_sys::Document) {
+fn measure_focused_tty(document: &web_sys::Document, id: Option<String>) {
     thread_local! {
         static LAST: RefCell<Option<(String, u16, u16)>> = const { RefCell::new(None) };
     }
+    let Some(id) = id else {
+        return;
+    };
     let Some(el) = document
         .query_selector(".pane.focused [data-tty-screen]")
         .ok()
@@ -1868,9 +1884,6 @@ fn measure_focused_tty(document: &web_sys::Document) {
         .floor()
         .clamp(20.0, 500.0) as u16;
     let rows = ((el.client_height() as f64) / ch).floor().clamp(5.0, 200.0) as u16;
-    let id = STATE
-        .with(|s| s.borrow().workspace.selected.clone())
-        .unwrap_or_default();
     let fresh = LAST.with(|last| {
         let mut last = last.borrow_mut();
         if *last == Some((id.clone(), cols, rows)) {
@@ -1880,7 +1893,7 @@ fn measure_focused_tty(document: &web_sys::Document) {
             true
         }
     });
-    if fresh && !id.is_empty() {
+    if fresh {
         dispatch(Action::PaneMeasured { id, cols, rows });
     }
 }

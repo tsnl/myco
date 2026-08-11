@@ -471,6 +471,18 @@ form {
     line-height: 1.25;
     overflow: hidden;
     white-space: pre;
+    min-height: 0;
+    flex: 1;
+}
+
+.entry-body.md math {
+    font-family: "Cambria Math", "Latin Modern Math", STIX Two Math, math;
+}
+
+.entry-body.md math[display="block"] {
+    display: block;
+    margin: 0.6em 0;
+    overflow-x: auto;
 }
 
 .tty-row {

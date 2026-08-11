@@ -1,7 +1,9 @@
 //! Markdown → escaped HTML. Agent replies are markdown; human posts stay
-//! plain. The parser is CommonMark + strikethrough + tables; raw HTML in
-//! the source is escaped, never passed through.
+//! plain. The parser is CommonMark + strikethrough + tables + `$`/`$$`
+//! math; raw HTML in the source is escaped, never passed through. Math
+//! becomes MathML via `latex2mathml` (unparseable latex stays as text).
 
+use latex2mathml::{DisplayStyle, latex_to_mathml};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Render markdown to an HTML fragment. Output is always escaped except
@@ -10,6 +12,7 @@ pub fn render_markdown(src: &str) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_MATH);
     let mut out = String::with_capacity(src.len() + src.len() / 4);
     for event in Parser::new_ext(src, opts) {
         match event {
@@ -28,7 +31,8 @@ pub fn render_markdown(src: &str) -> String {
             Event::TaskListMarker(done) => {
                 out.push_str(if done { "[x] " } else { "[ ] " });
             }
-            Event::InlineMath(t) | Event::DisplayMath(t) => push_esc(&mut out, &t),
+            Event::InlineMath(t) => push_math(&mut out, &t, DisplayStyle::Inline),
+            Event::DisplayMath(t) => push_math(&mut out, &t, DisplayStyle::Block),
             Event::FootnoteReference(t) => {
                 out.push_str("<sup>");
                 push_esc(&mut out, &t);
@@ -132,6 +136,24 @@ fn end(out: &mut String, tag: TagEnd) {
     }
 }
 
+fn push_math(out: &mut String, latex: &str, display: DisplayStyle) {
+    match latex_to_mathml(latex, display) {
+        Ok(mathml) => out.push_str(&mathml),
+        Err(_) => {
+            let wrap = if matches!(display, DisplayStyle::Block) {
+                "$$"
+            } else {
+                "$"
+            };
+            out.push_str("<code class=\"math\">");
+            push_esc(out, wrap);
+            push_esc(out, latex);
+            push_esc(out, wrap);
+            out.push_str("</code>");
+        }
+    }
+}
+
 fn push_esc(out: &mut String, text: &str) {
     for c in text.chars() {
         match c {
@@ -167,5 +189,21 @@ mod tests {
         let html = render_markdown("```rs\nfn main() {}\n```");
         assert!(html.contains("<pre><code"), "{html}");
         assert!(html.contains("fn main() {}"), "{html}");
+    }
+
+    #[test]
+    fn inline_and_display_math_become_mathml() {
+        let inline = render_markdown("the root is $\\sqrt{2}$.");
+        assert!(inline.contains("<math"), "{inline}");
+        assert!(inline.contains("display=\"inline\""), "{inline}");
+        let display = render_markdown("$$x = \\frac{1}{2}$$");
+        assert!(display.contains("display=\"block\""), "{display}");
+    }
+
+    #[test]
+    fn unparseable_math_stays_as_text() {
+        let html = render_markdown("$\\notacommand{");
+        assert!(!html.contains("<math"), "{html}");
+        assert!(html.contains("$"), "{html}");
     }
 }
