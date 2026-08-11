@@ -75,6 +75,20 @@ fn dispatch(action: Action) {
     for effect in effects {
         run(effect);
     }
+    // After the borrow is gone: a focused tty may need a resize. Measuring
+    // (and dispatching) from inside render re-entered STATE and panicked.
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let focused_tty = STATE.with(|s| {
+        let state = s.borrow();
+        state.workspace.selected.clone().filter(|_| {
+            state.workspace.panes.iter().any(|p| {
+                Some(p.id.as_str()) == state.workspace.selected.as_deref() && p.kind == "tty"
+            })
+        })
+    });
+    measure_focused_tty(&document, focused_tty);
 }
 
 fn run(effect: Effect) {
@@ -528,7 +542,6 @@ fn wire(document: &web_sys::Document) {
             }
         }
     }
-    measure_focused_tty(document);
 
     // Tree rows and create buttons: data attributes carry the action's
     // argument; the listener only dispatches.
@@ -742,7 +755,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     };
     let focused = ws.selected.as_deref() == Some(pane.id.as_str());
     format!(
-        r#"<div class="island pane{gone}{focus}" data-focus="{id}">
+        r#"<div class="island pane {kind}{gone}{focus}" data-focus="{id}">
              <div class="pane-header">
                <span class="row-title">{title}</span>
                <span class="pane-chrome">{chip}{release}
@@ -750,6 +763,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
              </div>
              {body}{view}
            </div>"#,
+        kind = escape(&pane.kind),
         gone = if pane.gone { " pane-gone" } else { "" },
         focus = if focused { " focused" } else { "" },
         title = escape(&title),
@@ -930,10 +944,13 @@ fn tree_row(
 /// dispatch cannot spin (the repeat measurement produces no effect and no
 /// state change worth re-rendering... except the action log; hence the
 /// edge-side dedupe here too).
-fn measure_focused_tty(document: &web_sys::Document) {
+fn measure_focused_tty(document: &web_sys::Document, id: Option<String>) {
     thread_local! {
         static LAST: RefCell<Option<(String, u16, u16)>> = const { RefCell::new(None) };
     }
+    let Some(id) = id else {
+        return;
+    };
     let Some(el) = document
         .query_selector(".pane.focused [data-tty-screen]")
         .ok()
@@ -944,17 +961,13 @@ fn measure_focused_tty(document: &web_sys::Document) {
     let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() else {
         return;
     };
-    // One character cell, measured off the live font: a hidden probe span.
-    let Some((cw, ch)) = char_cell(document) else {
+    // One character cell, measured off the live screen's font — not a
+    // detached body span that can disagree with `.tty-screen`.
+    let Some((cw, ch)) = char_cell(&el) else {
         return;
     };
-    let cols = ((el.client_width() as f64 - 8.0) / cw)
-        .floor()
-        .clamp(20.0, 500.0) as u16;
-    let rows = ((el.client_height() as f64) / ch).floor().clamp(5.0, 200.0) as u16;
-    let id = STATE
-        .with(|s| s.borrow().workspace.selected.clone())
-        .unwrap_or_default();
+    let cols = (el.client_width() as f64 / cw).floor().clamp(20.0, 500.0) as u16;
+    let rows = (el.client_height() as f64 / ch).floor().clamp(5.0, 200.0) as u16;
     let fresh = LAST.with(|last| {
         let mut last = last.borrow_mut();
         if *last == Some((id.clone(), cols, rows)) {
@@ -964,16 +977,17 @@ fn measure_focused_tty(document: &web_sys::Document) {
             true
         }
     });
-    if fresh && !id.is_empty() {
+    if fresh {
         dispatch(Action::PaneMeasured { id, cols, rows });
     }
 }
 
-fn char_cell(document: &web_sys::Document) -> Option<(f64, f64)> {
+fn char_cell(screen: &web_sys::HtmlElement) -> Option<(f64, f64)> {
+    let document = screen.owner_document()?;
     let probe = document.create_element("span").ok()?;
-    probe.set_class_name("mono tty-probe");
+    probe.set_class_name("tty-probe");
     probe.set_text_content(Some("MMMMMMMMMM"));
-    document.body()?.append_child(&probe).ok()?;
+    screen.append_child(&probe).ok()?;
     let rect = probe.get_bounding_client_rect();
     let (w, h) = (rect.width() / 10.0, rect.height());
     probe.remove();
