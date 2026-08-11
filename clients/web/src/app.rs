@@ -1114,7 +1114,10 @@ fn stage_view(state: &State) -> String {
     if ws.panes.is_empty() {
         r#"<div class="dim stage-empty">open an instance from the tree</div>"#.to_string()
     } else {
-        ws.panes.iter().map(|p| pane_view(p, ws)).collect()
+        ws.panes
+            .iter()
+            .map(|p| pane_view(p, ws, &state.catalog))
+            .collect()
     }
 }
 
@@ -1133,7 +1136,11 @@ fn notice_view(state: &State) -> String {
 /// One pane: an island with chrome (title, the seat chip, close) over the
 /// generic projection. The chip is STYLE.md's vocabulary: who drives, in
 /// their hue; an open seat invites the take.
-fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
+fn pane_view(
+    pane: &crate::core::Pane,
+    ws: &crate::core::Workspace,
+    catalog: &crate::core::Catalog,
+) -> String {
     let instance = ws.instances.iter().find(|i| i.id == pane.id);
     let title = instance
         .map(|i| {
@@ -1176,7 +1183,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
     };
     let view = match &pane.view {
         Some(view) if pane.kind == "tty" => tty_screen(view),
-        Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
+        Some(view) if pane.kind == "chat" => chat_transcript(view, pane, catalog),
         Some(view) if pane.kind == "host" => host_card(view),
         Some(view) if pane.kind == "browser" => browser_pane(view, pane),
         Some(view) => format!(
@@ -1207,7 +1214,7 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
 /// assistant entry with no turn_end is a breathing thought, not history),
 /// tool calls and their results folded quietly, watched splices set
 /// apart. Below it, the composer.
-fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
+fn chat_transcript(raw: &str, pane: &crate::core::Pane, catalog: &crate::core::Catalog) -> String {
     #[derive(serde::Deserialize)]
     struct Author {
         kind: String,
@@ -1302,18 +1309,22 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
         })
         .collect();
 
-    let composer = chat_composer(pane, running, &escape(&pane.draft));
+    let composer = chat_composer(pane, running, &escape(&pane.draft), catalog);
     format!(r#"<div class="pane-body chat"><div class="transcript">{body}</div>{composer}</div>"#)
 }
 
-fn chat_composer(pane: &crate::core::Pane, running: bool, draft: &str) -> String {
+fn chat_composer(
+    pane: &crate::core::Pane,
+    running: bool,
+    draft: &str,
+    catalog: &crate::core::Catalog,
+) -> String {
     let id = escape(&pane.id);
     let cancel = if running {
         format!(r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#)
     } else {
         String::new()
     };
-    let catalog = STATE.with(|s| s.borrow().catalog.clone());
     let current = pane.about.as_ref().and_then(|a| a.model.clone());
     let effort = pane
         .about
