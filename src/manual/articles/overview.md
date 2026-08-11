@@ -87,7 +87,10 @@ context_window = 500_000
   wildcard (`*`/`?`) and negated (`!`) patterns are ignored. The alias `local`
   is reserved (skipped).
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH
-  (`~/.local/bin` and `~/.cargo/bin` are common).
+  (`~/.local/bin` and `~/.cargo/bin` are common). Verify with
+  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` — that is the
+  PATH the host worker sees. An interactive login can report a newer binary later
+  on PATH while the worker still runs an older one earlier on it.
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
 ## Models & credentials (the catalog)
@@ -247,8 +250,8 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 ## Nested agents (the recipe)
 
 There is no subagent tool: a supervisor runs `myco` itself, on the **local host**, as an ordinary
-bash command. The system prompt carries the shape and the one hang that bites immediately; this is
-the working detail.
+bash command. The system prompt carries the shape, the hang that bites immediately, and the traps
+that cost a whole session; this is the working detail.
 
 **Live session** — for real back-and-forth:
 
@@ -264,9 +267,17 @@ the working detail.
    off automatically when piped.
 4. `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The child cancels its
    in-flight turn, returns to its prompt, and stays writable — use it when a child runs long or
-   goes down the wrong path, and keep driving the same session.
+   goes down the wrong path, and keep driving the same session. This is true for a nested
+   `myco`, which handles SIGINT. On an `ssh -tt` **login shell** there is no such handler: the
+   signal exits the session and kills whatever that shell owns (a cluster allocation, a
+   background job). `close` only what you started.
 5. `close` when done. Ask for terse summaries: the point of nesting is to spend the child's
    context instead of yours.
+
+**Worker contract.** The first line written to a child starts with `You are a SUBAGENT
+(worker). Do not spawn subagents.` plus a checkpoint ("return a PR URL or a blocker", "return
+only this digest"). Underspecified briefs are the usual way a worker wastes an hour. Cap output
+at the source; send bulk to a file and have the child return a path.
 
 **One-shot** — for a single self-contained task, skip the live session: `myco -p "<task>"
 --parent-session <id>` runs one turn and exits. Stdout is the answer text alone (no headers to
@@ -276,6 +287,10 @@ but each pays full process startup, so prefer a live session for real back-and-f
 **live** bash session, append `</dev/null`: with a prompt argument `-p` still drains piped stdin
 as context, and a live session's open stdin never EOFs. One-shot `bash` runs are safe — their
 stdin is null.
+
+A one-shot that exits 0 is not done. A malformed provider stream can exit 0 with a stub on
+stdout and no usable session. Check **answer size** (and that `session=<id>` appeared); treat a
+tiny digest as dead, not slow. Long or expensive work belongs in a live session.
 
 **Context forking.** `--fork` seeds the child with your session's saved conversation instead of a
 blank context. Fork when the task needs what you already know (decisions so far, investigation,
@@ -287,9 +302,18 @@ is checkpointed mid-turn after each user message and completed tool round, so a 
 current user request and finished tool rounds — never tool calls still in flight, its own launch
 included; put anything newer in the first prompt line you write to it.
 
+Cross-vendor `--fork` is broken: seeding a child on a different provider rejects inherited
+`tool_use` ids. Use a blank child and put the needed context in the first prompt line until that
+is fixed.
+
 The child's session is hidden (`kind: subagent`, parented to yours) in the shared
 `~/.myco/session/` store — read it later via `session_meta` get-by-id, or `list` with
 `include_hidden: true`.
+
+**Timeouts and process groups.** `bash` `exec` defaults to a 60 s wait (`timeout_ms`, max 30 min).
+The timeout kills the whole process group — a server, a `git worktree add`, anything that call
+started. Raise `timeout_ms` for long work, or `setsid … & disown` in a call that returns fast so
+a later timeout cannot take the background job with it.
 
 ## Agent workspace
 
@@ -329,7 +353,9 @@ gives each visible file's path (relative to `workspace/`), the UTC day it last
 changed, and its title (first markdown heading, else first non-empty line). Hidden
 names, symlinks, `prelude/` itself, and binary titles are skipped; the walk and the
 rendered block are bounded (4 levels, 200 files, 8 KiB) with a marker when files
-are left out. The prompt's appended blocks run least to most volatile — project
+are left out. The listing is a **sample**: absence from it is not absence from
+disk — walk `~/.myco/workspace/` when the marker appears or a note you expect is
+missing. The prompt's appended blocks run least to most volatile — project
 guidance, then the prelude, then this listing. Guidance leads because it changes
 only when the repo's own file does, while agents are asked to record into the
 prelude eagerly; ordering it that way keeps a recorded finding from invalidating

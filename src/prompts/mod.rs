@@ -62,6 +62,9 @@ Quick map (details in the manual):
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
   `myco --version`). Never scp prebuilt binaries across machines (glibc/arch mismatch).
+  Verify with `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` — that is the
+  PATH the host worker sees. An interactive `which` / `myco --version` can be a newer binary
+  later on PATH.
 
 ---
 
@@ -84,6 +87,17 @@ PATH plus SSH, never config or keys.
 a pipe fails in ways you cannot see from outside, and one bites immediately: each prompt is a
 single self-contained line, and only the trailing newline submits it, so a `write` without `"\n"`
 leaves the child waiting for the rest of the line while you wait on `read`, forever.
+
+Other traps that cost a session, not a turn (same manual section):
+- First write starts with `You are a SUBAGENT (worker). Do not spawn subagents.` plus a
+  checkpoint ("return X or a blocker"). Underspecified briefs are how a worker wastes an hour.
+- `signal` is Ctrl-C for a nested `myco`. On an `ssh -tt` **login shell** it exits the session
+  and kills whatever that shell owns.
+- One-shot `myco -p`: check **answer size**, not exit 0. A malformed provider stream exits 0
+  with a stub. Long work → live session.
+- A tool-call timeout kills the **process group** (anything started in that call). `setsid … &
+  disown` in a call that returns fast, or raise `timeout_ms`.
+- Cross-vendor `--fork` is broken (inherited `tool_use` ids). Blank child + inline context.
 
 ---
 "#,
@@ -381,8 +395,9 @@ const MAX_TITLE_CHARS: usize = 80;
 /// relative to `workspace/`, the UTC day it last changed, and its title.
 ///
 /// This is the read side of the workspace. A file the agent has forgotten is a
-/// file it will not open, so the listing makes existence free to check while
-/// leaving contents to a deliberate read.
+/// file it will not open, so the listing makes recent / early-path existence
+/// cheap to check. It is a sample (200 files / 8 KiB): absence from it is not
+/// absence from disk.
 ///
 /// Two choices keep the block cache-stable, since it lands in every agent's
 /// prompt prefix: days rather than timestamps (repeated writes to a file
@@ -421,8 +436,9 @@ fn workspace_listing(workspace: &Path) -> Option<String> {
 
     Some(format!(
         "\n---\n\n# Workspace Files\n\nUnder `~/.myco/workspace/` — path, UTC day \
-         last changed, title. A listing, not the contents: read the files that \
-         touch your task.\n\n{body}"
+         last changed, title. A sample, not the contents and not the full tree \
+         (200 files / 8 KiB): read the files that touch your task, and walk the \
+         disk when the listing says files were left out.\n\n{body}"
     ))
 }
 
@@ -555,12 +571,22 @@ mod tests {
             "force-merge",
             "manual",
             // The nested-agent recipe lives in the manual; the prompt keeps
-            // the pointer and the hang that would otherwise cost a turn to
-            // diagnose — prompts are single-line, submitted by a trailing
-            // newline alone.
+            // the pointer, the hang that would otherwise cost a turn to
+            // diagnose, and the traps that cost a whole session.
             "`overview.md` § Nested agents",
             "single self-contained line",
             "only the trailing newline submits it",
+            "You are a SUBAGENT (worker)",
+            "answer size",
+            "process group",
+            "Cross-vendor `--fork` is broken",
+            // Remote install: the PATH the host worker sees, not the login shell.
+            "PATH the host worker sees",
+            // Computer-use: look at images; do not trust a green signal.
+            "`view_image`",
+            "Do not accept a success *signal*",
+            // Workspace listing is a sample; absence from it is not absence.
+            "not the full tree",
             // Remote work goes through the `host` field, not local `ssh`.
             "do not run `ssh <alias> …` from",
             "persistent SSH connection",
@@ -657,6 +683,7 @@ mod tests {
             "action=list shows the live state",
             "`# Workspace Files` section",
             "read the listed files",
+            "absence from the listing is not absence from disk",
         ] {
             assert!(
                 DEFAULT_AGENT_PROMPT_EPILOGUE.contains(needle),
