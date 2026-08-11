@@ -595,6 +595,11 @@ fn render(state: &State) {
 /// the caret back when it did. Losing a caret mid-sentence is the whole
 /// reason wholesale re-rendering was intolerable, so the one case where a
 /// rewrite is unavoidable is the one case that restores it.
+///
+/// Chat transcripts are the other thing `set_inner_html` destroys: scroll
+/// snaps to 0. If the user was at (or near) the bottom, pin them there
+/// after the rewrite; if they had scrolled up, leave that offset. Skip
+/// both when the markup is unchanged — a no-op paint must not fight them.
 fn paint(document: &web_sys::Document, region: &str, html: &str) {
     let unchanged = PAINTED.with(|painted| {
         painted
@@ -609,13 +614,83 @@ fn paint(document: &web_sys::Document, region: &str, html: &str) {
         return;
     };
     let caret = caret_in(document, &host);
+    let pins = transcript_pins(&host);
     host.set_inner_html(html);
     restore_caret(document, caret);
+    restore_transcript_pins(&host, &pins);
     PAINTED.with(|painted| {
         painted
             .borrow_mut()
             .insert(region.to_string(), html.to_string())
     });
+}
+
+/// Near-enough to the bottom that a new line should still pin. Matches
+/// a typical chat "stick" slop — a hair more than one entry.
+const STICK_SLOP: i32 = 32;
+
+struct TranscriptPin {
+    id: String,
+    pin: bool,
+    top: i32,
+}
+
+fn transcript_of(el: &web_sys::Element) -> Option<(String, web_sys::HtmlElement)> {
+    let html = el.clone().dyn_into::<web_sys::HtmlElement>().ok()?;
+    let id = el
+        .closest("[data-focus]")
+        .ok()
+        .flatten()
+        .and_then(|p| p.get_attribute("data-focus"))?;
+    (!id.is_empty()).then_some((id, html))
+}
+
+fn transcript_pins(host: &web_sys::Element) -> Vec<TranscriptPin> {
+    let Ok(list) = host.query_selector_all(".transcript") else {
+        return Vec::new();
+    };
+    let mut pins = Vec::new();
+    for i in 0..list.length() {
+        let Some(node) = list.item(i) else {
+            continue;
+        };
+        let Ok(el) = node.dyn_into::<web_sys::Element>() else {
+            continue;
+        };
+        let Some((id, html)) = transcript_of(&el) else {
+            continue;
+        };
+        let remaining = html.scroll_height() - html.scroll_top() - html.client_height();
+        pins.push(TranscriptPin {
+            id,
+            pin: remaining <= STICK_SLOP,
+            top: html.scroll_top(),
+        });
+    }
+    pins
+}
+
+fn restore_transcript_pins(host: &web_sys::Element, pins: &[TranscriptPin]) {
+    let Ok(list) = host.query_selector_all(".transcript") else {
+        return;
+    };
+    for i in 0..list.length() {
+        let Some(node) = list.item(i) else {
+            continue;
+        };
+        let Ok(el) = node.dyn_into::<web_sys::Element>() else {
+            continue;
+        };
+        let Some((id, html)) = transcript_of(&el) else {
+            continue;
+        };
+        match pins.iter().find(|p| p.id == id) {
+            Some(p) if p.pin => html.set_scroll_top(html.scroll_height()),
+            Some(p) => html.set_scroll_top(p.top),
+            // First paint of this chat: land at the latest message.
+            None => html.set_scroll_top(html.scroll_height()),
+        }
+    }
 }
 
 /// A field mid-use, when it sits inside the region about to be rewritten:
