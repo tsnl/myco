@@ -183,6 +183,48 @@ pub enum VerbError {
     Gone,
 }
 
+/// A title is a slug: `^[A-Za-z0-9][A-Za-z0-9-]*$`. Empty at create
+/// becomes the kind name (which must itself be a slug).
+fn valid_title(title: &str) -> bool {
+    let mut bytes = title.bytes();
+    match bytes.next() {
+        Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9') => {
+            bytes.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        }
+        _ => false,
+    }
+}
+
+fn resolve_title(title: &str, kind: &str) -> Result<String, VerbError> {
+    let resolved = if title.is_empty() {
+        kind.to_string()
+    } else {
+        title.to_string()
+    };
+    if !valid_title(&resolved) {
+        return Err(VerbError::BadArgs {
+            why: format!("title {resolved:?} must match ^[A-Za-z0-9][A-Za-z0-9-]*$"),
+        });
+    }
+    Ok(resolved)
+}
+
+fn title_taken(
+    instances: &HashMap<String, Arc<Entry>>,
+    project: &str,
+    title: &str,
+    except: Option<&str>,
+) -> Option<String> {
+    instances.values().find_map(|e| {
+        if except == Some(e.id.as_str()) {
+            return None;
+        }
+        let same =
+            e.project == project && *e.title.read().unwrap_or_else(|e| e.into_inner()) == title;
+        same.then(|| e.id.clone())
+    })
+}
+
 impl std::fmt::Display for VerbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -457,6 +499,19 @@ impl Pool {
                 .cloned()
                 .ok_or_else(|| VerbError::UnknownKind { kind: kind.into() })?
         };
+        let title = resolve_title(title, factory.spec().kind)?;
+        {
+            let instances = self
+                .inner
+                .instances
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(other) = title_taken(&instances, project, &title, None) {
+                return Err(VerbError::BadArgs {
+                    why: format!("title {title:?} is already used by {other}"),
+                });
+            }
+        }
         // The id exists before the instance does, so `create` can hand its
         // kind a usable self-name.
         let id = uuid::Uuid::new_v4().to_string();
@@ -472,11 +527,7 @@ impl Pool {
             id: id.clone(),
             kind: factory.spec(),
             project: project.to_string(),
-            title: RwLock::new(if title.is_empty() {
-                factory.spec().kind.to_string()
-            } else {
-                title.to_string()
-            }),
+            title: RwLock::new(title.clone()),
             creator: creator.clone(),
             parent: parent.map(str::to_string),
             driver: Arc::new(RwLock::new(Some(creator.clone()))),
@@ -504,11 +555,19 @@ impl Pool {
         }
 
         let info = self.info_of(&entry);
-        self.inner
-            .instances
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), entry);
+        {
+            let mut instances = self
+                .inner
+                .instances
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(other) = title_taken(&instances, project, &title, None) {
+                return Err(VerbError::BadArgs {
+                    why: format!("title {title:?} is already used by {other}"),
+                });
+            }
+            instances.insert(id.clone(), entry);
+        }
         let _ = self.inner.events.send((
             id,
             Event {
@@ -650,7 +709,26 @@ impl Pool {
                         why: "rename needs {title}".into(),
                     }
                 })?;
-                *entry.title.write().unwrap_or_else(|e| e.into_inner()) = title.to_string();
+                if title.is_empty() || !valid_title(title) {
+                    return Err(VerbError::BadArgs {
+                        why: format!("title {title:?} must match ^[A-Za-z0-9][A-Za-z0-9-]*$"),
+                    });
+                }
+                {
+                    let instances = self
+                        .inner
+                        .instances
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(other) =
+                        title_taken(&instances, &entry.project, title, Some(&entry.id))
+                    {
+                        return Err(VerbError::BadArgs {
+                            why: format!("title {title:?} is already used by {other}"),
+                        });
+                    }
+                    *entry.title.write().unwrap_or_else(|e| e.into_inner()) = title.to_string();
+                }
                 self.meta_changed(entry, "renamed", json!({ "title": title }));
                 Ok(Value::Null)
             }
