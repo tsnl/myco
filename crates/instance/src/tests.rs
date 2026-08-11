@@ -382,7 +382,7 @@ async fn owned_verbs_belong_to_the_creator_regardless_of_the_seat() {
 async fn sys_verbs_expose_spec_meta_and_the_verb_log() {
     let pool = pool();
     let info = pool
-        .create(&ada(), "counter", "proj", "the count", Value::Null)
+        .create(&ada(), "counter", "proj", "the-count", Value::Null)
         .unwrap();
 
     let spec = pool
@@ -401,7 +401,7 @@ async fn sys_verbs_expose_spec_meta_and_the_verb_log() {
     );
 
     let m = meta(&pool, &info.id).await;
-    assert_eq!(m.title, "the count");
+    assert_eq!(m.title, "the-count");
     assert_eq!(m.project, "proj");
 
     // The log records refusals — that is what makes it a debugger — and its
@@ -540,11 +540,78 @@ async fn the_global_feed_carries_lifecycle_driver_and_kind_events() {
 }
 
 #[tokio::test]
+async fn titles_are_slugs_unique_per_project() {
+    let pool = pool();
+    let first = pool
+        .create(&ada(), "counter", "alpha", "lab-1", Value::Null)
+        .unwrap();
+    assert_eq!(first.title, "lab-1");
+    // Empty title becomes the kind name.
+    let unnamed = pool
+        .create(&ada(), "counter", "alpha", "", Value::Null)
+        .unwrap();
+    assert_eq!(unnamed.title, "counter");
+    let twice = pool.create(&ada(), "counter", "alpha", "", Value::Null);
+    assert!(
+        matches!(
+            twice,
+            Err(VerbError::BadArgs { ref why }) if why.contains(&unnamed.id)
+        ),
+        "a second empty title collides on the kind name: {twice:?}"
+    );
+
+    for bad in ["has space", "foo_bar", "-leading"] {
+        let err = pool
+            .create(&ada(), "counter", "alpha", bad, Value::Null)
+            .unwrap_err();
+        assert!(
+            matches!(err, VerbError::BadArgs { ref why } if why.contains("must match")),
+            "{bad:?} → {err:?}"
+        );
+    }
+
+    let clash = pool.create(&ada(), "counter", "alpha", "lab-1", Value::Null);
+    assert!(
+        matches!(
+            clash,
+            Err(VerbError::BadArgs { ref why }) if why.contains(&first.id)
+        ),
+        "{clash:?}"
+    );
+
+    // Same title, different project: allowed.
+    let other = pool
+        .create(&ada(), "counter", "beta", "lab-1", Value::Null)
+        .unwrap();
+    assert_eq!(other.title, "lab-1");
+
+    // Empty rename is refused; renaming to your own title is not a collision.
+    let empty = pool
+        .call(&ada(), &other.id, "sys.rename", json!({"title": ""}))
+        .await;
+    assert!(matches!(empty, Err(VerbError::BadArgs { .. })), "{empty:?}");
+    pool.call(&ada(), &other.id, "sys.rename", json!({"title": "lab-1"}))
+        .await
+        .unwrap();
+
+    let clash_rename = pool
+        .call(&ada(), &unnamed.id, "sys.rename", json!({"title": "lab-1"}))
+        .await;
+    assert!(
+        matches!(
+            clash_rename,
+            Err(VerbError::BadArgs { ref why }) if why.contains(&first.id)
+        ),
+        "{clash_rename:?}"
+    );
+}
+
+#[tokio::test]
 async fn listing_scopes_by_project() {
     let pool = pool();
-    pool.create(&ada(), "counter", "alpha", "", Value::Null)
+    pool.create(&ada(), "counter", "alpha", "a1", Value::Null)
         .unwrap();
-    pool.create(&ada(), "counter", "alpha", "", Value::Null)
+    pool.create(&ada(), "counter", "alpha", "a2", Value::Null)
         .unwrap();
     pool.create(&ada(), "counter", "beta", "", Value::Null)
         .unwrap();
@@ -603,15 +670,22 @@ async fn wait_until_checks_first_wakes_on_a_bump_and_gives_up_at_the_deadline() 
 async fn parentage_is_fixed_at_birth_and_carried_by_the_listing() {
     let pool = pool();
     let root = pool
-        .create(&ada(), "counter", "proj", "", Value::Null)
+        .create(&ada(), "counter", "proj", "root", Value::Null)
         .unwrap();
     assert_eq!(root.parent, None, "an unparented instance is a root");
 
     let child = pool
-        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&root.id))
+        .create_under(&ada(), "counter", "proj", "child", Value::Null, Some(&root.id))
         .unwrap();
     let grandchild = pool
-        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&child.id))
+        .create_under(
+            &ada(),
+            "counter",
+            "proj",
+            "grandchild",
+            Value::Null,
+            Some(&child.id),
+        )
         .unwrap();
     assert_eq!(child.parent.as_deref(), Some(root.id.as_str()));
     assert_eq!(
