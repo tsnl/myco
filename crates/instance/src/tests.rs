@@ -67,7 +67,12 @@ impl Kind for CounterSpec {
         &COUNTER_SPEC
     }
 
-    fn create(&self, args: Value, _signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(
+        &self,
+        _id: &str,
+        args: Value,
+        _signals: Signals,
+    ) -> Result<Box<dyn Instance>, VerbError> {
         let start = args.get("start").and_then(Value::as_i64).unwrap_or(0);
         Ok(Box::new(Counter(start)))
     }
@@ -247,7 +252,7 @@ async fn a_self_call_is_refused_not_deadlocked() {
         fn spec(&self) -> &'static KindSpec {
             &SELFIE_SPEC
         }
-        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(SelfieInstance {
                 pool: self.pool.clone(),
             }))
@@ -617,6 +622,46 @@ async fn listing_scopes_by_project() {
     assert_eq!(pool.list(Some("gamma")).len(), 0);
 }
 
+/// The watermark-wait, once: it checks before it waits (the condition may
+/// already hold), wakes on a bump rather than a timer, and gives up at the
+/// deadline instead of hanging forever on something that will never be true.
+#[tokio::test]
+async fn wait_until_checks_first_wakes_on_a_bump_and_gives_up_at_the_deadline() {
+    let pool = pool();
+    let info = pool
+        .create(&ada(), "counter", "proj", "", json!({"start": 3}))
+        .unwrap();
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", far, |v| v == &json!(3))
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(json!(3)), "already true: no wait at all");
+
+    let bumper = pool.clone();
+    let id = info.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        bumper
+            .call(&ada(), &id, "incr", json!({"by": 1}))
+            .await
+            .unwrap();
+    });
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", far, |v| v == &json!(4))
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(json!(4)), "true later: the bump wakes the read");
+
+    let soon = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    let seen = pool
+        .wait_until(&ada(), &info.id, "get", soon, |v| v == &json!(99))
+        .await
+        .unwrap();
+    assert_eq!(seen, None, "never true: the deadline ends it");
+}
+
 /// Parentage is identity, not kind state: fixed at birth, carried by the
 /// listing without entering any cell, refused when it names nothing, and
 /// left standing when the parent is removed — a child that is orphaned is
@@ -718,7 +763,7 @@ async fn a_kind_bug_crashes_one_instance_only() {
         fn spec(&self) -> &'static KindSpec {
             &BUGGY_SPEC
         }
-        fn create(&self, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(BuggyInstance))
         }
     }

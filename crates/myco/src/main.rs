@@ -82,6 +82,7 @@ async fn main() {
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
     pool.register(Arc::new(myco_kind_chat::ChatKind::new(
+        pool.clone(),
         catalog,
         default_model,
     )));

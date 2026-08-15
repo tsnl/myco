@@ -65,7 +65,7 @@ impl Kind for TtyKind {
         &TTY_SPEC
     }
 
-    fn create(&self, args: Value, signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
+    fn create(&self, _id: &str, args: Value, signals: Signals) -> Result<Box<dyn Instance>, VerbError> {
         let command = args
             .get("command")
             .and_then(Value::as_str)
