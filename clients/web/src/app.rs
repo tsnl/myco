@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::core::{Action, Effect, Session, State, reduce};
+use crate::core::{Action, Effect, Session, State, reduce, wants_key};
 
 const TOKEN_KEY: &str = "myco.token";
 
@@ -31,9 +31,36 @@ fn send_op(op: &str, id: &str) {
 
 #[wasm_bindgen(start)]
 pub fn start() {
+    attach_keyboard();
     dispatch(Action::Boot {
         token: storage().and_then(|s| s.get_item(TOKEN_KEY).ok().flatten()),
     });
+}
+
+/// One global keydown listener, attached once. preventDefault is
+/// synchronous, so the edge asks the pure [`wants_key`] policy before
+/// committing the keystroke to the reducer — the one place edge and core
+/// must agree in the same tick.
+fn attach_keyboard() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let on_key =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
+            let (key, ctrl, alt, meta) = (
+                event.key(),
+                event.ctrl_key(),
+                event.alt_key(),
+                event.meta_key(),
+            );
+            let wanted = STATE.with(|s| wants_key(&s.borrow(), &key, ctrl, meta));
+            if wanted {
+                event.prevent_default();
+                dispatch(Action::KeyPressed { key, ctrl, alt });
+            }
+        });
+    let _ = document.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref());
+    on_key.forget();
 }
 
 /// The one entry point for every action from every source. Reduce, render,
@@ -48,6 +75,20 @@ fn dispatch(action: Action) {
     for effect in effects {
         run(effect);
     }
+    // After the borrow is gone: a focused tty may need a resize. Measuring
+    // (and dispatching) from inside render re-entered STATE and panicked.
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let focused_tty = STATE.with(|s| {
+        let state = s.borrow();
+        state.workspace.selected.clone().filter(|_| {
+            state.workspace.panes.iter().any(|p| {
+                Some(p.id.as_str()) == state.workspace.selected.as_deref() && p.kind == "tty"
+            })
+        })
+    });
+    measure_focused_tty(&document, focused_tty);
 }
 
 fn run(effect: Effect) {
@@ -491,6 +532,23 @@ fn wire(document: &web_sys::Document) {
         let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
         on_click.forget();
     }
+    if let Ok(panes) = document.query_selector_all("[data-focus]") {
+        for i in 0..panes.length() {
+            if let Some(el) = panes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let id = el.get_attribute("data-focus").unwrap_or_default();
+                let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                    dispatch(Action::Selected { id: id.clone() });
+                });
+                let _ =
+                    el.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+                on_click.forget();
+            }
+        }
+    }
+
     // Tree rows and create buttons: data attributes carry the action's
     // argument; the listener only dispatches.
     if let Ok(rows) = document.query_selector_all("[data-open]") {
@@ -771,11 +829,16 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
         String::new()
     };
     let view = match &pane.view {
-        Some(view) => format!(r#"<pre class="mono pane-body">{}</pre>"#, escape(view)),
+        Some(view) if pane.kind == "tty" => tty_screen(view),
+        Some(view) => format!(
+            r#"<pre class="mono pane-body">{}</pre>"#,
+            escape(&pretty(view))
+        ),
         None => r#"<div class="dim">reading…</div>"#.to_string(),
     };
+    let focused = ws.selected.as_deref() == Some(pane.id.as_str());
     format!(
-        r#"<div class="island pane{gone}">
+        r#"<div class="island pane {kind}{gone}{focus}" data-focus="{id}">
              <div class="pane-header">
                <span class="row-title">{title}</span>
                <span class="pane-chrome">{chip}{release}
@@ -783,10 +846,112 @@ fn pane_view(pane: &crate::core::Pane, ws: &crate::core::Workspace) -> String {
              </div>
              {body}{view}
            </div>"#,
+        kind = escape(&pane.kind),
         gone = if pane.gone { " pane-gone" } else { "" },
+        focus = if focused { " focused" } else { "" },
         title = escape(&title),
         id = escape(&pane.id),
     )
+}
+
+fn pretty(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .and_then(|v| serde_json::to_string_pretty(&v))
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// The terminal renderer: the tty's `screen` payload (styled runs, cursor)
+/// as DOM, in the theme-constant graphite material. Rows are absolute; a
+/// run's cells become one span with inline colors (already concrete
+/// `#rrggbb` server-side).
+fn tty_screen(raw: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Run {
+        row: u16,
+        text: String,
+        #[serde(default)]
+        fg: Option<String>,
+        #[serde(default)]
+        bg: Option<String>,
+        #[serde(default)]
+        bold: bool,
+        #[serde(default)]
+        italic: bool,
+        #[serde(default)]
+        underline: bool,
+        #[serde(default)]
+        inverse: bool,
+        #[serde(default)]
+        cursor: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct Screen {
+        rows: u16,
+        #[serde(default)]
+        cursor_hidden: bool,
+        #[serde(default)]
+        runs: Vec<Run>,
+    }
+    let Ok(screen) = serde_json::from_str::<Screen>(raw) else {
+        return format!(
+            r#"<pre class="mono pane-body">{}</pre>"#,
+            escape(&pretty(raw))
+        );
+    };
+    let mut rows: Vec<String> = (0..screen.rows).map(|_| String::new()).collect();
+    for run in &screen.runs {
+        let Some(row) = rows.get_mut(run.row as usize) else {
+            continue;
+        };
+        let mut style = String::new();
+        let (fg, bg) = if run.inverse {
+            (run.bg.as_deref(), run.fg.as_deref())
+        } else {
+            (run.fg.as_deref(), run.bg.as_deref())
+        };
+        if let Some(fg) = fg
+            && ok_color(fg)
+        {
+            style.push_str(&format!("color:{fg};"));
+        }
+        if run.inverse && bg.is_none() {
+            style.push_str("background:#d8d5e0;color:#161420;");
+        } else if let Some(bg) = bg
+            && ok_color(bg)
+        {
+            style.push_str(&format!("background:{bg};"));
+        }
+        if run.bold {
+            style.push_str("font-weight:700;");
+        }
+        if run.italic {
+            style.push_str("font-style:italic;");
+        }
+        if run.underline {
+            style.push_str("text-decoration:underline;");
+        }
+        let cursor = if run.cursor && !screen.cursor_hidden {
+            " tty-cursor"
+        } else {
+            ""
+        };
+        row.push_str(&format!(
+            r#"<span class="{cursor}" style="{style}">{}</span>"#,
+            escape(&run.text),
+        ));
+    }
+    let body: String = rows
+        .into_iter()
+        .map(|row| format!(r#"<div class="tty-row">{row}</div>"#))
+        .collect();
+    format!(r#"<div class="pane-body tty-screen mono" data-tty-screen>{body}</div>"#)
+}
+
+/// Only concrete `#rrggbb` colors reach inline styles — the payload is
+/// server-shaped, but the render layer still refuses to interpolate
+/// anything else into CSS.
+fn ok_color(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 /// The current-project chip: click a tree header to set it, or `+ project`
@@ -882,6 +1047,61 @@ fn tree_row(
         kind = escape(&instance.kind),
         title = escape(title),
     )
+}
+
+/// Measure the focused tty pane's cell grid and offer it to the reducer,
+/// which resizes at most once per distinct size — so render → measure →
+/// dispatch cannot spin (the repeat measurement produces no effect and no
+/// state change worth re-rendering... except the action log; hence the
+/// edge-side dedupe here too).
+fn measure_focused_tty(document: &web_sys::Document, id: Option<String>) {
+    thread_local! {
+        static LAST: RefCell<Option<(String, u16, u16)>> = const { RefCell::new(None) };
+    }
+    let Some(id) = id else {
+        return;
+    };
+    let Some(el) = document
+        .query_selector(".pane.focused [data-tty-screen]")
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    // One character cell, measured off the live screen's font — not a
+    // detached body span that can disagree with `.tty-screen`.
+    let Some((cw, ch)) = char_cell(&el) else {
+        return;
+    };
+    let cols = (el.client_width() as f64 / cw).floor().clamp(20.0, 500.0) as u16;
+    let rows = (el.client_height() as f64 / ch).floor().clamp(5.0, 200.0) as u16;
+    let fresh = LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if *last == Some((id.clone(), cols, rows)) {
+            false
+        } else {
+            *last = Some((id.clone(), cols, rows));
+            true
+        }
+    });
+    if fresh {
+        dispatch(Action::PaneMeasured { id, cols, rows });
+    }
+}
+
+fn char_cell(screen: &web_sys::HtmlElement) -> Option<(f64, f64)> {
+    let document = screen.owner_document()?;
+    let probe = document.create_element("span").ok()?;
+    probe.set_class_name("tty-probe");
+    probe.set_text_content(Some("MMMMMMMMMM"));
+    screen.append_child(&probe).ok()?;
+    let rect = probe.get_bounding_client_rect();
+    let (w, h) = (rect.width() / 10.0, rect.height());
+    probe.remove();
+    (w > 0.0 && h > 0.0).then_some((w, h))
 }
 
 /// Text into markup, safely. Server-controlled strings still get escaped —
