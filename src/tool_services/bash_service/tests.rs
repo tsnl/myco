@@ -500,9 +500,8 @@ async fn exec_timeout_output_is_truncated() {
     );
 }
 
-/// Silent long-lived child: tool must return quickly with timed_out while
-/// the process stays alive in the background for later read/close — and the
-/// late `echo` must not appear in the returned stdout body.
+/// A plain start is backgrounding, not a long poll: a silent child returns on
+/// the default idle gap while staying alive for later read/close.
 #[tokio::test]
 async fn session_returns_while_process_still_running() {
     let harness = harness();
@@ -516,8 +515,6 @@ async fn session_returns_while_process_still_running() {
             "session_id": id,
             // No output for 30s — must not block the tool call that long.
             "command": "bash -c 'sleep 30; echo late'",
-            "timeout_ms": 1_000,
-            "idle_ms": 200,
         }),
     )
     .await;
@@ -525,13 +522,13 @@ async fn session_returns_while_process_still_running() {
     assert!(!start.is_error, "start: {}", result_text(&start));
     assert!(
         elapsed < Duration::from_secs(3),
-        "start should return in ~1s (session max), took {elapsed:?}: {}",
+        "start should return on the default idle gap, took {elapsed:?}: {}",
         result_text(&start)
     );
     let text = result_text(&start);
     assert!(
-        text.contains("timed_out") || text.contains("status: running"),
-        "expected timed_out/running for silent child: {text}"
+        text.contains("status: running"),
+        "expected running for silent child: {text}"
     );
     assert!(
         !text.contains("stdout:\nlate"),

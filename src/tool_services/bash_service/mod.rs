@@ -101,8 +101,10 @@ impl BashService {
                 by every agent on the host while `list` shows only yours — if `start` \
                 reports too many sessions and your list looks short, other agents own the \
                 rest; close your own idle sessions and retry.\n\n\
-                For start/write/read, the child runs in the background. Each call waits until \
-                an idle gap (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
+                For start/write/read, the child runs in the background. `start` without initial \
+                stdin returns after an idle gap even when the child is silent; `write` / `read` \
+                wait for output first. Calls otherwise return after the output goes idle \
+                (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
                 (`timeout_ms`, default {DEFAULT_TIMEOUT_MS} ms / {session_default_s}s; max \
                 {MAX_TIMEOUT_MS} ms / {session_max_min} min), a byte cap (`max_bytes`, \
                 default {DEFAULT_MAX_BYTES}), or process exit — then returns partial output \
@@ -560,7 +562,14 @@ impl BashService {
         }
 
         let snapshot = self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .collect_from_session(
+                session_id,
+                timeout_ms,
+                idle_ms,
+                max_bytes,
+                stdin.is_none_or(str::is_empty),
+                cancel,
+            )
             .await;
         match snapshot {
             Ok(s) => generative_model::ToolResult::text(s.format()),
@@ -586,7 +595,7 @@ impl BashService {
             return generative_model::ToolResult::err(e);
         }
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
             .await
         {
             Ok(s) => generative_model::ToolResult::text(s.format()),
@@ -607,7 +616,7 @@ impl BashService {
             return generative_model::ToolResult::err(e);
         }
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
             .await
         {
             Ok(s) => generative_model::ToolResult::text(s.format()),
@@ -664,7 +673,7 @@ impl BashService {
         }
 
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
             .await
         {
             Ok(s) => {
@@ -712,6 +721,7 @@ impl BashService {
             1_000,
             100,
             DEFAULT_MAX_BYTES,
+            false,
             &crate::core::CancelToken::new(),
         )
         .await;
@@ -867,6 +877,7 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
+        return_on_empty_idle: bool,
         cancel: crate::core::CancelToken,
     ) -> Result<SessionSnapshot, String> {
         let (shared, owner, cmdline) = {
@@ -887,7 +898,15 @@ impl BashService {
             return Err("cancelled".into());
         }
         Ok(collect_output(
-            &shared, session_id, owner, &cmdline, timeout_ms, idle_ms, max_bytes, &cancel,
+            &shared,
+            session_id,
+            owner,
+            &cmdline,
+            timeout_ms,
+            idle_ms,
+            max_bytes,
+            return_on_empty_idle,
+            &cancel,
         )
         .await)
     }
@@ -1275,6 +1294,7 @@ async fn collect_output(
     timeout_ms: u64,
     idle_ms: u64,
     max_bytes: usize,
+    return_on_empty_idle: bool,
     cancel: &crate::core::CancelToken,
 ) -> SessionSnapshot {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
@@ -1339,8 +1359,12 @@ async fn collect_output(
             status = SnapshotStatus::Running;
             break;
         }
-        // Idle with nothing: only meaningful once we've waited; fall through to timeout.
-        if last_activity.elapsed() >= idle && pending_len == 0 && already_pending {
+        // A plain start returns once the child has been quiet even if it has
+        // emitted nothing. Reads and writes long-poll for their first byte.
+        if last_activity.elapsed() >= idle
+            && pending_len == 0
+            && (already_pending || return_on_empty_idle)
+        {
             // Entered with pending that was drained by a concurrent collector, or exited
             // flag raced; treat as settled running/empty.
             status = SnapshotStatus::Running;
