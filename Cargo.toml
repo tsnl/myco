@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/runtime", "crates/instance", "crates/kind-tty"]
+members = [
+    "crates/runtime",
+    "crates/instance",
+    "crates/kind-tty",
+    "crates/server",
+    "crates/myco",
+]
 
 [workspace.package]
 edition = "2024"
@@ -8,11 +14,16 @@ license = "MIT"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+http-body-util = "0.1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["set-header"] }
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.15"

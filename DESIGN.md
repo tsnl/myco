@@ -79,7 +79,7 @@ by name, because in L0's contract it can only deadlock.
 principals, authority, uniform introspection, and one feed. Consistency,
 waking, and fault isolation are consumed, not reimplemented.
 
-### L2 — API server (M1, not yet built)
+### L2 — API server (M1)
 
 **Contract offered (consuming only L1's):** authentication (ported from
 v2: one-time codes, passkeys, operator), principal resolution
