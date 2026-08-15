@@ -17,4 +17,6 @@ myco-kind-notifier = { path = "../kind-notifier" }
 myco-models = { path = "../models" }
 myco-kind-tty = { path = "../kind-tty" }
 myco-server = { path = "../server" }
+mime_guess = { workspace = true }
+rust-embed = { workspace = true }
 tokio = { workspace = true }

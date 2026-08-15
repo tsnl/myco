@@ -1,0 +1,26 @@
+[package]
+name = "myco-client-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
+]
