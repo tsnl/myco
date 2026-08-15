@@ -625,15 +625,22 @@ async fn listing_scopes_by_project() {
 async fn parentage_is_fixed_at_birth_and_carried_by_the_listing() {
     let pool = pool();
     let root = pool
-        .create(&ada(), "counter", "proj", "", Value::Null)
+        .create(&ada(), "counter", "proj", "root", Value::Null)
         .unwrap();
     assert_eq!(root.parent, None, "an unparented instance is a root");
 
     let child = pool
-        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&root.id))
+        .create_under(&ada(), "counter", "proj", "child", Value::Null, Some(&root.id))
         .unwrap();
     let grandchild = pool
-        .create_under(&ada(), "counter", "proj", "", Value::Null, Some(&child.id))
+        .create_under(
+            &ada(),
+            "counter",
+            "proj",
+            "grandchild",
+            Value::Null,
+            Some(&child.id),
+        )
         .unwrap();
     assert_eq!(child.parent.as_deref(), Some(root.id.as_str()));
     assert_eq!(

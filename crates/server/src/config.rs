@@ -1,18 +1,25 @@
-//! The user roster: who is allowed to drive this server, read from
-//! `$MYCO_HOME/server.toml`. Ported from v2 (`main-v2:src/config/roster.rs`).
+//! `server.toml`: everything an operator configures, in one file.
 //!
-//! Instances are attributed — every verb call names its principal — so the
-//! server needs a real identity before it records anything. There is
+//! It started as the user roster and grew the rest as the server did —
+//! `[[users]]`, `[passkeys]`, and the model catalog's `model` /
+//! `[gateways]` / `[models]`. One file, because there is one thing to
+//! configure, and one parse, because a second file is a second chance for
+//! the two to disagree. (It is `server.toml` rather than `config.toml`
+//! because v1 owns that name in the shared `~/.myco`.)
+//!
+//! [`ServerConfig`] is the file as written; [`Roster`] is what the users
+//! half becomes once validated — who may appear as a principal, and which
+//! of them this process runs as. Instances are attributed, so the server
+//! needs a real identity before it records anything, and there is
 //! deliberately **no fallback**: a missing, empty, or unmatched roster is a
-//! startup error, not a guess. The roster is a closed list on purpose: it
-//! answers "which names may appear as a principal". It holds **no
-//! credentials** — those live in [`crate::auth::AuthStore`], which the
-//! server seeds from this list at startup.
+//! startup error, not a guess. The roster holds **no credentials** — those
+//! live in [`crate::auth::AuthStore`], which the server seeds from this
+//! list at startup. Ported from v2 (`main-v2:src/config/roster.rs`).
 
 use std::path::{Path, PathBuf};
 
-/// Where the roster lives: `$MYCO_SERVER_CONFIG` → `$MYCO_HOME/server.toml`.
-pub fn resolve_roster_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+/// Where the config lives: `$MYCO_SERVER_CONFIG` → `$MYCO_HOME/server.toml`.
+pub fn resolve_config_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     if let Some(p) = env("MYCO_SERVER_CONFIG") {
         return Ok(PathBuf::from(p));
     }
@@ -35,14 +42,22 @@ impl RosterUser {
     }
 }
 
-/// `server.toml` as written on disk.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct FileRoster {
+/// `server.toml` as written on disk — the whole file, before any of it is
+/// validated. Every section is optional to *parse*; what is required is
+/// decided where it is used (a roster with no users is refused, an absent
+/// `[passkeys]` takes the localhost defaults, an empty catalog is a
+/// modelless workspace).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ServerConfig {
     #[serde(default)]
     pub users: Vec<RosterUser>,
     /// Optional `[passkeys]` section; defaults serve the localhost story.
     #[serde(default)]
     pub passkeys: PasskeySettings,
+    /// The model catalog: `model` + `[gateways]` + `[models]`, resolved by
+    /// `myco_models::resolve_catalog` at boot.
+    #[serde(flatten)]
+    pub catalog: myco_models::CatalogFile,
 }
 
 /// `[passkeys]` in `server.toml`: the WebAuthn relying party.
@@ -79,8 +94,10 @@ impl Default for PasskeySettings {
     }
 }
 
-/// The validated roster, plus which entry this process is acting as — the
-/// operator.
+/// The validated file: the closed list of principals, which entry this
+/// process is acting as (the operator), and the sections the server hands
+/// on to whoever owns them. Named for the half it enforces — a roster is
+/// the only part of `server.toml` this module refuses on.
 #[derive(Debug, Clone)]
 pub struct Roster {
     pub path: PathBuf,
@@ -88,6 +105,8 @@ pub struct Roster {
     local: usize,
     /// The WebAuthn relying party (`[passkeys]` in the same file).
     pub passkeys: PasskeySettings,
+    /// The unresolved model catalog (`model` / `[gateways]` / `[models]`).
+    pub catalog: myco_models::CatalogFile,
 }
 
 /// What a usable `server.toml` looks like, quoted in every startup error so
@@ -115,10 +134,14 @@ impl Roster {
     /// (`$MYCO_USER` → `$USER` → `$USERNAME`, matched against `id`).
     pub fn resolve(
         path: PathBuf,
-        file: FileRoster,
+        file: ServerConfig,
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let FileRoster { users, passkeys } = file;
+        let ServerConfig {
+            users,
+            passkeys,
+            catalog,
+        } = file;
         if users.is_empty() {
             return Err(format!(
                 "no users defined in {} — add at least one [[users]] entry:\n\n{EXAMPLE_SERVER_TOML}",
@@ -174,6 +197,7 @@ impl Roster {
             users,
             local,
             passkeys,
+            catalog,
         })
     }
 }
@@ -188,7 +212,7 @@ fn id_list(users: &[RosterUser]) -> String {
 
 /// Read and parse `server.toml`. A missing file is an error carrying the
 /// file we wanted — this is the message a first-run user sees.
-pub fn load_file_roster(path: &Path) -> Result<FileRoster, String> {
+pub fn load_config(path: &Path) -> Result<ServerConfig, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -200,10 +224,10 @@ pub fn load_file_roster(path: &Path) -> Result<FileRoster, String> {
         }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    parse_file_roster_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_config_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn parse_file_roster_str(text: &str) -> Result<FileRoster, String> {
+pub fn parse_config_str(text: &str) -> Result<ServerConfig, String> {
     toml::from_str(text).map_err(|e| e.to_string())
 }
 
@@ -222,7 +246,7 @@ mod tests {
     fn roster(text: &str, env_pairs: &[(&str, &str)]) -> Result<Roster, String> {
         Roster::resolve(
             PathBuf::from("/cfg/server.toml"),
-            parse_file_roster_str(text).unwrap(),
+            parse_config_str(text).unwrap(),
             &env_of(env_pairs),
         )
     }
@@ -292,8 +316,26 @@ id = "grace"
     }
 
     #[test]
+    fn the_model_catalog_rides_the_same_file() {
+        // Top-level keys (`model`) must precede any table in TOML.
+        let with_models = format!(
+            "model = \"fast\"\n{TWO_USERS}\n[gateways.g]\nprotocol = \"openai-completions\"\n\
+             base_url = \"https://example.test/v1\"\n\n[models.fast]\ngateway = \"g\"\n\
+             context_window = 100000\n"
+        );
+        let r = roster(&with_models, &[("USER", "ada")]).unwrap();
+        assert_eq!(r.catalog.model.as_deref(), Some("fast"));
+        assert!(r.catalog.models.contains_key("fast"));
+        assert!(r.catalog.gateways.contains_key("g"));
+
+        // A roster without model tables is still a roster.
+        let bare = roster(TWO_USERS, &[("USER", "ada")]).unwrap();
+        assert!(bare.catalog.models.is_empty());
+    }
+
+    #[test]
     fn a_missing_file_names_itself_and_shows_the_fix() {
-        let err = load_file_roster(Path::new("/nonexistent/myco/server.toml")).unwrap_err();
+        let err = load_config(Path::new("/nonexistent/myco/server.toml")).unwrap_err();
         assert!(err.contains("/nonexistent/myco/server.toml"), "{err}");
         assert!(err.contains("[[users]]"), "{err}");
     }

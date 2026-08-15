@@ -234,7 +234,10 @@ pub fn read_auth_file(path: &Path) -> Result<String, String> {
     Ok(token.to_string())
 }
 
-/// Build the model catalog from a parsed [`CatalogFile`].
+/// Build the model catalog from a parsed [`CatalogFile`], and with it the
+/// default model for new chats — one call, because the default is only
+/// meaningful against the catalog it was checked against, and two calls
+/// invited a caller to check it against a different one.
 ///
 /// `env` is injected so tests never read the process environment; the
 /// binary passes `|k| std::env::var(k).ok()` and [`read_auth_file`].
@@ -242,7 +245,7 @@ pub fn resolve_catalog(
     file: &CatalogFile,
     env: &impl Fn(&str) -> Option<String>,
     read_auth: &impl Fn(&Path) -> Result<String, String>,
-) -> Result<ModelCatalog, String> {
+) -> Result<(ModelCatalog, Option<String>), String> {
     let mut entries = BTreeMap::new();
 
     for (key, entry) in &file.models {
@@ -380,7 +383,39 @@ pub fn resolve_catalog(
         );
     }
 
-    Ok(ModelCatalog::new(entries))
+    let catalog = ModelCatalog::new(entries);
+    let default = default_model(file, &catalog)?;
+    Ok((catalog, default))
+}
+
+/// The default model for new chats: the file's `model` key, or the sole
+/// catalog entry when the file names none. `Ok(None)` is the modelless
+/// workspace (an empty catalog); a named key that does not exist is a
+/// startup error — silently running modelless would hide the typo.
+fn default_model(file: &CatalogFile, catalog: &ModelCatalog) -> Result<Option<String>, String> {
+    match &file.model {
+        Some(key) => {
+            if !catalog.contains(key) {
+                return Err(format!(
+                    "default model {key:?} is not in the catalog (configured: [{}])",
+                    catalog.keys().join(", ")
+                ));
+            }
+            Ok(Some(key.clone()))
+        }
+        None => {
+            let keys = catalog.keys();
+            match keys.as_slice() {
+                [] => Ok(None),
+                [sole] => Ok(Some(sole.to_string())),
+                _ => Err(format!(
+                    "several models are configured ([{}]) — set `model = \"…\"` to pick the \
+                     default for new chats",
+                    keys.join(", ")
+                )),
+            }
+        }
+    }
 }
 
 /// Overlay a config `[retry]` table onto the built-in policy, field by
@@ -420,7 +455,12 @@ mod tests {
         toml::from_str(text).expect("catalog parses")
     }
 
+    /// Two models behind one gateway. It names its default, because
+    /// resolution now settles the default too: a file with a choice to make
+    /// and no choice made does not resolve.
     const GATEWAY_CATALOG: &str = r#"
+model = "fast"
+
 [gateways.g]
 protocol = "openai-completions"
 base_url = "https://example.test/v1"
@@ -438,7 +478,8 @@ context_window = 200000
 
     #[test]
     fn a_gateway_supplies_protocol_url_and_auth_to_its_models() {
-        let catalog = resolve_catalog(&parse(GATEWAY_CATALOG), &no_env, &no_file).expect("resolve");
+        let (catalog, _) =
+            resolve_catalog(&parse(GATEWAY_CATALOG), &no_env, &no_file).expect("resolve");
         let fast = catalog.get("fast").expect("usable");
         assert_eq!(fast.spec.api_id, "fast", "api_id defaults to the key");
         let smart = catalog.get("smart").expect("usable");
@@ -461,7 +502,8 @@ base_url = "https://api.anthropic.com"
 auth = { source = "env", var_name = "NOPE_KEY" }
 context_window = 100000
 "#;
-        let catalog = resolve_catalog(&parse(text), &no_env, &no_file).expect("resolve succeeds");
+        let (catalog, _) =
+            resolve_catalog(&parse(text), &no_env, &no_file).expect("resolve succeeds");
         let err = catalog.get("m").expect_err("use is refused");
         assert!(err.contains("NOPE_KEY"), "{err}");
         assert!(catalog.contains("m"), "the entry still exists");
@@ -488,6 +530,44 @@ context_window = 1000
         assert!(err.contains("thinking"), "{err}");
     }
 
+    /// The default arrives from the same call that built the catalog, so
+    /// it cannot have been checked against a different one.
+    #[test]
+    fn the_default_model_comes_back_with_the_catalog_that_validated_it() {
+        let sole = r#"
+[models.only]
+protocol = "openai-completions"
+base_url = "https://x.test"
+context_window = 1000
+"#;
+        let (_, default) = resolve_catalog(&parse(sole), &no_env, &no_file).expect("resolve");
+        assert_eq!(
+            default.as_deref(),
+            Some("only"),
+            "one model needs no naming"
+        );
+
+        let (_, default) = resolve_catalog(&parse(""), &no_env, &no_file).expect("resolve");
+        assert_eq!(
+            default, None,
+            "no models is a modelless workspace, not an error"
+        );
+
+        // Several with no pick, and a pick that names nothing, are both
+        // startup errors: guessing would land in stored history.
+        let unpicked = GATEWAY_CATALOG.replace("model = \"fast\"", "");
+        let err = resolve_catalog(&parse(&unpicked), &no_env, &no_file).unwrap_err();
+        assert!(err.contains("several models"), "{err}");
+
+        let typo = GATEWAY_CATALOG.replace("\"fast\"", "\"nope\"");
+        let err = resolve_catalog(&parse(&typo), &no_env, &no_file).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+
+        let (_, default) =
+            resolve_catalog(&parse(GATEWAY_CATALOG), &no_env, &no_file).expect("resolve");
+        assert_eq!(default.as_deref(), Some("fast"));
+    }
+
     #[test]
     fn retry_tables_overlay_field_by_field() {
         let text = r#"
@@ -502,7 +582,7 @@ max_attempts = 5
 gateway = "g"
 context_window = 1000
 "#;
-        let catalog = resolve_catalog(&parse(text), &no_env, &no_file).expect("resolve");
+        let (catalog, _) = resolve_catalog(&parse(text), &no_env, &no_file).expect("resolve");
         let m = catalog.get("m").expect("usable");
         let retry = match &m.backend {
             BackendConfig::OpenAICompletions(b) => b.retry,
@@ -510,6 +590,9 @@ context_window = 1000
         };
         assert_eq!(retry.max_attempts, 5);
         // Unset knobs keep the built-in defaults, not zeros.
-        assert_eq!(retry.backoff_multiplier, RetryPolicy::default().backoff_multiplier);
+        assert_eq!(
+            retry.backoff_multiplier,
+            RetryPolicy::default().backoff_multiplier
+        );
     }
 }

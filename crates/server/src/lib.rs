@@ -21,8 +21,8 @@
 
 mod admin;
 pub mod auth;
+pub mod config;
 mod passkey;
-pub mod roster;
 mod util;
 mod watch;
 
@@ -54,7 +54,7 @@ pub(crate) struct App {
 /// single-machine embedders use this; the binary goes through
 /// [`router_with`] so a configured relying party is honored.
 pub fn router(pool: Pool, auth: Arc<AuthStore>, operator: impl Into<String>) -> Router {
-    router_with(pool, auth, operator, &roster::PasskeySettings::default())
+    router_with(pool, auth, operator, &config::PasskeySettings::default())
         .expect("the default passkey settings always build")
 }
 
@@ -68,7 +68,7 @@ pub fn router_with(
     pool: Pool,
     auth: Arc<AuthStore>,
     operator: impl Into<String>,
-    passkeys: &roster::PasskeySettings,
+    passkeys: &config::PasskeySettings,
 ) -> Result<Router, String> {
     let webauthn = Arc::new(passkey::build_webauthn(passkeys)?);
     Ok(Router::new()

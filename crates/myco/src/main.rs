@@ -8,7 +8,7 @@ use std::sync::Arc;
 use clap::Parser;
 use myco_instance::Pool;
 use myco_server::auth::AuthStore;
-use myco_server::roster;
+use myco_server::config;
 
 #[derive(Parser, Debug)]
 #[command(name = "myco", version, about = "myco: a workspace of instances")]
@@ -35,9 +35,9 @@ async fn main() {
     // declares names; reconciling here means adding a [[users]] entry is
     // enough to mint that person a sign-in code, with no second step.
     let env = |k: &str| std::env::var(k).ok();
-    let roster = roster::resolve_roster_path(&env)
-        .and_then(|path| roster::load_file_roster(&path).map(|file| (path, file)))
-        .and_then(|(path, file)| roster::Roster::resolve(path, file, &env))
+    let roster = config::resolve_config_path(&env)
+        .and_then(|path| config::load_config(&path).map(|file| (path, file)))
+        .and_then(|(path, file)| config::Roster::resolve(path, file, &env))
         .unwrap_or_else(|e| fatal(e));
     let auth = AuthStore::default_path()
         .map_err(|e| e.to_string())
@@ -68,9 +68,23 @@ async fn main() {
         eprintln!("{banner}");
     }
 
+    // The model catalog rides server.toml; resolution is a startup gate
+    // (shape errors stop the boot) while credential lookups stay soft
+    // until a model is used. An empty catalog is a modelless workspace:
+    // chats are plain transcripts.
+    let (catalog, default_model) = myco_models::resolve_catalog(
+        &roster.catalog,
+        &|k| std::env::var(k).ok().filter(|v| !v.is_empty()),
+        &myco_models::read_auth_file,
+    )
+    .unwrap_or_else(|e| fatal(e));
+
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_tty::TtyKind));
-    pool.register(Arc::new(myco_kind_chat::ChatKind));
+    pool.register(Arc::new(myco_kind_chat::ChatKind::new(
+        catalog,
+        default_model,
+    )));
 
     let router = myco_server::router_with(pool, auth, operator, &roster.passkeys)
         .unwrap_or_else(|e| fatal(e));
