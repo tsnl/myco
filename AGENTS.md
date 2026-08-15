@@ -169,8 +169,8 @@ tiny one-liners or when the user asks to edit the current checkout.
 
 **Branch names in this repo:** `feat/…` for features, `fix/…` for fixes, short
 and descriptive after the prefix. The prompt fragment deliberately names no
-convention — branch naming is per-project, so it is stated here (and read from
-whatever `AGENTS.md` the launch directory has) rather than in every agent's
+convention — branch naming is per-project, so it is stated here (and found from
+the launch directory through the repository root) rather than in every agent's
 system prompt.
 
 ## Develop

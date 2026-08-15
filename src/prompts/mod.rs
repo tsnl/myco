@@ -80,10 +80,11 @@ the session store are shared by construction — and a nested agent reaches remo
 its own host pool exactly as you do. Remote hosts stay hands, not brains: they need only `myco` on
 PATH plus SSH, never config or keys.
 
-**Read `overview.md` § Nested agents before your first nest in a session** — driving a child over
-a pipe fails in ways you cannot see from outside, and one bites immediately: each prompt is a
-single self-contained line, and only the trailing newline submits it, so a `write` without `"\n"`
-leaves the child waiting for the rest of the line while you wait on `read`, forever.
+**Read `overview.md` § Nested agents before your first nest in a session** (`myco --help overview`
+prints the embedded copy if the exported file is unavailable) — driving a child over a pipe fails
+in ways you cannot see from outside, and one bites immediately:
+each prompt is a single self-contained line; only the trailing newline submits it, so a `write`
+without `"\n"` leaves the child waiting for the rest of the line while you wait on `read`, forever.
 
 ---
 "#,
@@ -234,11 +235,11 @@ fn human_bytes(n: usize) -> String {
 }
 
 /// The epilogue plus the current prelude (`~/.myco/workspace/prelude/`, respecting
-/// `MYCO_HOME`, capped at `max_prelude_bytes`), the launch directory's project
-/// guidance (`AGENTS.md` / `CLAUDE.md`), and a listing of the rest of the
-/// workspace, when present. Read at model build time — session start, model
-/// switch, each worker spawn — so a running agent's prompt never changes
-/// mid-conversation and the cached conversation prefix stays valid.
+/// `MYCO_HOME`, capped at `max_prelude_bytes`), project guidance (`AGENTS.md` /
+/// `CLAUDE.md`) from the launch directory through its git root, and a listing
+/// of the rest of the workspace, when present. Read at model build time —
+/// session start, model switch, each worker spawn — so a running agent's prompt
+/// never changes mid-conversation and the cached conversation prefix stays valid.
 pub fn agent_prompt_epilogue() -> String {
     epilogue_with(crate::core::myco_home().ok(), std::env::current_dir().ok())
 }
@@ -261,16 +262,22 @@ fn oversize_at(dir: &std::path::Path, max_bytes: usize) -> Option<PreludeOversiz
     })
 }
 
-/// Project guidance for the launch directory: `AGENTS.md` (preferred) or
-/// `CLAUDE.md`, when present and non-empty. Injected at session start so the
-/// agent knows how this project works without any indexing machinery.
+/// Nearest project guidance from the launch directory through its git root:
+/// `AGENTS.md` (preferred within one directory) or `CLAUDE.md`, when present
+/// and non-empty. Outside a git checkout, only the launch directory is read.
 fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
-            let text = text.trim().to_string();
-            if !text.is_empty() {
-                return Some((name.to_string(), text));
+    let repo_root = dir.ancestors().find(|path| path.join(".git").exists());
+    for dir in dir.ancestors() {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    return Some((name.to_string(), text));
+                }
             }
+        }
+        if repo_root.is_none_or(|root| dir == root) {
+            break;
         }
     }
     None
@@ -357,9 +364,10 @@ fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBu
 fn manual_section(dir: &Path) -> String {
     format!(
         "\n---\n\n# Manual\n\nRuntime docs for this myco build: `{}` (`index.md` plus one file \
-         per article). Search them like any other files — `rg -n 'ControlMaster' {}`. They are \
-         this binary's own docs, refreshed at startup, so trust them over memory when host, \
-         install, or config behavior is unclear.\n",
+         per article). Search them like any other files — `rg -n 'ControlMaster' {}`. If the \
+         files are unavailable, `myco --help <id>` prints the embedded copy. They are this \
+         binary's own docs, refreshed at startup, so trust them over memory when host, install, \
+         or config behavior is unclear.\n",
         dir.display(),
         dir.display(),
     )
@@ -592,8 +600,8 @@ mod tests {
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
     }
 
-    /// Project guidance from the launch directory is appended at model build
-    /// time — AGENTS.md preferred, CLAUDE.md fallback, absent = no section.
+    /// The nearest project guidance through the repository root is appended at
+    /// model build time — AGENTS.md preferred within one directory.
     #[test]
     fn project_guidance_is_appended_from_cwd() {
         let cwd = temp_dir("guidance");
@@ -621,6 +629,23 @@ mod tests {
         assert!(!prompt.contains("claude_guidance_token"), "{prompt}");
     }
 
+    #[test]
+    fn project_guidance_walks_to_the_nearest_ancestor() {
+        let root = temp_dir("ancestor-guidance");
+        let nested = root.path().join("src").join("feature");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root_guidance_token\n").unwrap();
+
+        let prompt = epilogue_with(None, Some(nested.clone()));
+        assert!(prompt.contains("root_guidance_token"), "{prompt}");
+
+        std::fs::write(nested.join("CLAUDE.md"), "nearest_guidance_token\n").unwrap();
+        let prompt = epilogue_with(None, Some(nested));
+        assert!(prompt.contains("nearest_guidance_token"), "{prompt}");
+        assert!(!prompt.contains("root_guidance_token"), "{prompt}");
+    }
+
     /// The manual is not a tool any more, so the prompt has to carry the
     /// resolved path — an agent told only `~/.myco` would guess wrong under
     /// `MYCO_HOME`, and a stale build's directory is a different one.
@@ -633,6 +658,7 @@ mod tests {
         assert!(prompt.contains("# Manual"), "{prompt}");
         assert!(prompt.contains(&dir.display().to_string()), "{prompt}");
         assert!(prompt.contains("index.md"), "{prompt}");
+        assert!(prompt.contains("myco --help <id>"), "{prompt}");
 
         // No home to resolve: no path claimed rather than a guessed one.
         let blind = epilogue_with(None, None);
