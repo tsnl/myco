@@ -38,12 +38,30 @@ pub struct State {
 pub struct Workspace {
     pub kinds: Vec<KindInfo>,
     pub instances: Vec<InstanceInfo>,
+    /// The focused pane's instance (tree highlight rides it too).
     pub selected: Option<String>,
+    /// Open panes, in split order. Layout is client state by doctrine —
+    /// the server never hears about it.
+    pub panes: Vec<Pane>,
     pub feed: Feed,
     /// Grouping key the next create inherits. Empty is the `workspace` bucket.
     pub current_project: String,
     /// When set, the sidebar is asking for a new project slug.
     pub project_draft: Option<String>,
+}
+
+/// One open pane: an instance id plus the last projection read. The
+/// content is whatever the kind's `primary_render` verb answered — a
+/// generic JSON view until kind renderers land (tty next PR).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pane {
+    pub id: String,
+    /// The `primary_render` payload, pretty-printed; `None` until the
+    /// first read answers.
+    pub view: Option<String>,
+    /// The instance was removed or crashed while open. The pane stays —
+    /// showing last state honestly beats vanishing work.
+    pub gone: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -60,6 +78,9 @@ pub struct KindInfo {
     pub kind: String,
     #[serde(default)]
     pub doc: String,
+    /// The default read a pane renders (the L1 spec hint).
+    #[serde(default)]
+    pub primary_render: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -213,8 +234,28 @@ pub enum Action {
     FeedOpened,
     /// The event socket closed or errored; the edge will retry.
     FeedDropped,
-    /// The person selected an instance in the tree.
+    /// The person selected an instance in the tree (opens its pane).
     Selected { id: String },
+    /// The person closed a pane.
+    PaneClosed { id: String },
+    /// The watch stream marked an instance: state changed, re-read.
+    Marked { id: String },
+    /// A watched instance is gone (removed or crashed).
+    InstanceGone { id: String },
+    /// The person asked to take the seat on an instance.
+    TakeRequested { id: String },
+    /// The person asked to release the seat.
+    ReleaseRequested { id: String },
+    /// A verb call answered. One action for every verb the client calls:
+    /// what differs between callers is what should happen next, and that
+    /// is exactly what `origin` says.
+    VerbReplied {
+        origin: Origin,
+        id: String,
+        verb: String,
+        status: u16,
+        body: String,
+    },
     /// The person asked to create an instance of `kind`.
     CreateRequested { kind: String },
     /// `POST /api/instances` answered.
@@ -229,6 +270,20 @@ pub enum Action {
     NewProjectCommitted { slug: String },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
+}
+
+/// Who asked for a verb call — the only thing that distinguished one
+/// answered-verb action from another. A pane's projection read, the pane
+/// chrome's seat verbs, and (above this PR) the palette's run all ask the
+/// gateway the same question; they differ in what they do with the answer,
+/// so the reducer matches on this rather than on a variant per caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A pane's projection read: the answer *is* the pane's view.
+    Pane,
+    /// A pane's chrome (`sys.take` / `sys.release`): the answer is only a
+    /// hint that the listing moved.
+    Chrome,
 }
 
 /// What the edge must do. Effects re-enter as actions; they never touch
@@ -270,6 +325,34 @@ pub enum Effect {
         project: String,
         title: String,
     },
+    /// Send `{"op":"watch","id"}` on the event socket.
+    Watch { id: String },
+    /// Send `{"op":"unwatch","id"}` on the event socket.
+    Unwatch { id: String },
+    /// Call a verb on an instance → [`Action::VerbReplied`], tagged with
+    /// the `origin` that asked. `args` is the JSON body, empty for none.
+    /// Every verb the client calls goes through here: one wire shape, one
+    /// place to get the headers and the error path right.
+    CallVerb {
+        origin: Origin,
+        token: String,
+        id: String,
+        verb: String,
+        args: String,
+    },
+}
+
+impl Effect {
+    /// A verb call with no arguments — the common case.
+    fn call(origin: Origin, token: &str, id: &str, verb: &str) -> Self {
+        Effect::CallVerb {
+            origin,
+            token: token.into(),
+            id: id.into(),
+            verb: verb.into(),
+            args: String::new(),
+        }
+    }
 }
 
 /// What entering a session kicks off, from either door (whoami or a fresh
@@ -302,6 +385,16 @@ fn relist(state: &mut State) -> Vec<Effect> {
     }
     state.listing_in_flight = true;
     vec![Effect::FetchInstances { token }]
+}
+
+impl Workspace {
+    /// The projection verb a pane on `id` reads: the kind's
+    /// `primary_render` hint, straight from the specs the server serves.
+    fn render_verb(&self, id: &str) -> Option<String> {
+        let instance = self.instances.iter().find(|i| i.id == id)?;
+        let kind = self.kinds.iter().find(|k| k.kind == instance.kind)?;
+        (!kind.primary_render.is_empty()).then(|| kind.primary_render.clone())
+    }
 }
 
 /// The token endpoint's 200 body (RFC 6749's shape).
@@ -510,8 +603,20 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::FeedEvent => relist(state),
         Action::FeedOpened => {
             state.workspace.feed = Feed::Live;
-            // Anything could have happened while the socket was down.
-            relist(state)
+            // Anything could have happened while the socket was down:
+            // re-list, and re-arm every open pane's watch + re-read.
+            let mut effects = relist(state);
+            if let Some(token) = &state.token {
+                for pane in &state.workspace.panes {
+                    effects.push(Effect::Watch {
+                        id: pane.id.clone(),
+                    });
+                    if let Some(verb) = state.workspace.render_verb(&pane.id) {
+                        effects.push(Effect::call(Origin::Pane, token, &pane.id, &verb));
+                    }
+                }
+            }
+            effects
         }
         Action::FeedDropped => {
             if matches!(state.session, Session::SignedIn(_)) {
@@ -520,9 +625,81 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             vec![]
         }
         Action::Selected { id } => {
-            state.workspace.selected = Some(id);
-            vec![]
+            state.workspace.selected = Some(id.clone());
+            if state.workspace.panes.iter().any(|p| p.id == id) {
+                return vec![];
+            }
+            state.workspace.panes.push(Pane {
+                id: id.clone(),
+                view: None,
+                gone: false,
+            });
+            let mut effects = vec![Effect::Watch { id: id.clone() }];
+            if let (Some(token), Some(verb)) = (&state.token, state.workspace.render_verb(&id)) {
+                effects.push(Effect::call(Origin::Pane, token, &id, &verb));
+            }
+            effects
         }
+        Action::PaneClosed { id } => {
+            state.workspace.panes.retain(|p| p.id != id);
+            if state.workspace.selected.as_deref() == Some(id.as_str()) {
+                state.workspace.selected = state.workspace.panes.last().map(|p| p.id.clone());
+            }
+            vec![Effect::Unwatch { id }]
+        }
+        Action::Marked { id } => {
+            let watched = state.workspace.panes.iter().any(|p| p.id == id && !p.gone);
+            match (watched, &state.token, state.workspace.render_verb(&id)) {
+                (true, Some(token), Some(verb)) => {
+                    vec![Effect::call(Origin::Pane, token, &id, &verb)]
+                }
+                _ => vec![],
+            }
+        }
+        Action::InstanceGone { id } => {
+            if let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id) {
+                pane.gone = true;
+            }
+            match &state.token {
+                Some(token) => vec![Effect::FetchInstances {
+                    token: token.clone(),
+                }],
+                None => vec![],
+            }
+        }
+        Action::TakeRequested { id } => match &state.token {
+            Some(token) => vec![Effect::call(Origin::Chrome, token, &id, "sys.take")],
+            None => vec![],
+        },
+        Action::ReleaseRequested { id } => match &state.token {
+            Some(token) => vec![Effect::call(Origin::Chrome, token, &id, "sys.release")],
+            None => vec![],
+        },
+        Action::VerbReplied {
+            origin,
+            id,
+            verb: _,
+            status,
+            body,
+        } => match origin {
+            Origin::Pane => {
+                if status == 200
+                    && let Some(pane) = state.workspace.panes.iter_mut().find(|p| p.id == id)
+                {
+                    // Pretty when it parses; verbatim when it doesn't — the
+                    // generic projection until kind renderers land.
+                    pane.view = Some(
+                        serde_json::from_str::<serde_json::Value>(&body)
+                            .and_then(|v| serde_json::to_string_pretty(&v))
+                            .unwrap_or(body),
+                    );
+                }
+                vec![]
+            }
+            // Seat changes surface through the listing; any answer means
+            // the listing may have moved.
+            Origin::Chrome => relist(state),
+        },
         Action::CreateRequested { kind } => match &state.token {
             Some(token) => vec![Effect::CreateInstance {
                 token: token.clone(),
@@ -1079,6 +1256,138 @@ mod tests {
         );
         assert_eq!(state.workspace.current_project, "lab-2");
         assert!(state.workspace.project_draft.is_none());
+    }
+
+    /// A workspace with one tty instance listed and its kind known.
+    fn with_tty(mut state: State) -> State {
+        reduce(
+            &mut state,
+            Action::KindsAnswered {
+                status: 200,
+                body: r#"[{"kind":"tty","doc":"","primary_render":"screen"}]"#.into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"t1","kind":"tty","project":"","title":"shell",
+                           "creator":{"kind":"human","id":"ada"},
+                           "driver":{"kind":"human","id":"ada"}}]"#
+                    .into(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn selecting_opens_a_pane_watches_and_reads_the_projection() {
+        let mut state = with_tty(signed_in());
+        let effects = reduce(&mut state, Action::Selected { id: "t1".into() });
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Watch { id: "t1".into() },
+                Effect::call(Origin::Pane, "tok-1", "t1", "screen")
+            ]
+        );
+        assert_eq!(state.workspace.panes.len(), 1);
+
+        // Selecting again focuses without duplicating.
+        let effects = reduce(&mut state, Action::Selected { id: "t1".into() });
+        assert!(effects.is_empty());
+        assert_eq!(state.workspace.panes.len(), 1);
+    }
+
+    #[test]
+    fn a_mark_rereads_and_the_payload_lands_in_the_pane() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        let effects = reduce(&mut state, Action::Marked { id: "t1".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::call(Origin::Pane, "tok-1", "t1", "screen")]
+        );
+        // A mark for an unopened instance reads nothing.
+        assert!(reduce(&mut state, Action::Marked { id: "other".into() }).is_empty());
+
+        reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Pane,
+                id: "t1".into(),
+                verb: "screen".into(),
+                status: 200,
+                body: r#"{"rows": 24}"#.into(),
+            },
+        );
+        assert!(
+            state.workspace.panes[0]
+                .view
+                .as_deref()
+                .unwrap()
+                .contains("24")
+        );
+    }
+
+    #[test]
+    fn gone_marks_the_pane_and_close_unwatches() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        reduce(&mut state, Action::InstanceGone { id: "t1".into() });
+        assert!(
+            state.workspace.panes[0].gone,
+            "the pane stays, honestly gone"
+        );
+
+        let effects = reduce(&mut state, Action::PaneClosed { id: "t1".into() });
+        assert_eq!(effects, vec![Effect::Unwatch { id: "t1".into() }]);
+        assert!(state.workspace.panes.is_empty());
+        assert_eq!(state.workspace.selected, None);
+    }
+
+    #[test]
+    fn a_reopened_feed_rearms_every_pane() {
+        let mut state = with_tty(signed_in());
+        reduce(&mut state, Action::Selected { id: "t1".into() });
+        reduce(&mut state, Action::FeedDropped);
+        let effects = reduce(&mut state, Action::FeedOpened);
+        assert!(effects.contains(&Effect::Watch { id: "t1".into() }));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::CallVerb {
+                origin: Origin::Pane,
+                id,
+                ..
+            } if id == "t1"
+        )));
+    }
+
+    #[test]
+    fn the_seat_verbs_round_trip_through_the_listing() {
+        let mut state = with_tty(signed_in());
+        let effects = reduce(&mut state, Action::TakeRequested { id: "t1".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::call(Origin::Chrome, "tok-1", "t1", "sys.take")]
+        );
+        let effects = reduce(
+            &mut state,
+            Action::VerbReplied {
+                origin: Origin::Chrome,
+                id: "t1".into(),
+                verb: "sys.take".into(),
+                status: 200,
+                body: String::new(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::FetchInstances {
+                token: "tok-1".into()
+            }],
+            "the chip refreshes from the listing, the one source of seat truth"
+        );
     }
 
     /// The log is the repro: every action lands in order, capped.
