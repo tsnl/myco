@@ -803,3 +803,18 @@ form {
     padding-top: 10px;
     font-size: 12px;
 }
+
+/* Host panes: the connection as a card. The status reuses the seat's
+   dot vocabulary — up breathes verdigris, dialing warms clay, down goes
+   slate — because presence is presence wherever it lives. */
+.host-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem 1.25rem;
+}
+.host-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
