@@ -69,7 +69,7 @@ impl Kind for CounterSpec {
 
     fn create(
         &self,
-        _id: &str,
+        _ctx: &CreateCtx,
         args: Value,
         _signals: Signals,
     ) -> Result<Box<dyn Instance>, VerbError> {
@@ -252,7 +252,12 @@ async fn a_self_call_is_refused_not_deadlocked() {
         fn spec(&self) -> &'static KindSpec {
             &SELFIE_SPEC
         }
-        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(
+            &self,
+            _: &CreateCtx,
+            _: Value,
+            _: Signals,
+        ) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(SelfieInstance {
                 pool: self.pool.clone(),
             }))
@@ -763,7 +768,12 @@ async fn a_kind_bug_crashes_one_instance_only() {
         fn spec(&self) -> &'static KindSpec {
             &BUGGY_SPEC
         }
-        fn create(&self, _: &str, _: Value, _: Signals) -> Result<Box<dyn Instance>, VerbError> {
+        fn create(
+            &self,
+            _: &CreateCtx,
+            _: Value,
+            _: Signals,
+        ) -> Result<Box<dyn Instance>, VerbError> {
             Ok(Box::new(BuggyInstance))
         }
     }
@@ -811,6 +821,7 @@ fn the_attention_envelope_round_trips() {
         for_: vec![ada()],
         title: "turn finished".into(),
         body: "the build is green".into(),
+        seq: None,
     };
     let data = a.data();
     assert_eq!(data["for"][0]["id"], "ada");

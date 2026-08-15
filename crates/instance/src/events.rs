@@ -29,6 +29,11 @@ pub struct Attention {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// The emitting instance's cursor position for the underlying moment
+    /// (a chat entry's seq), when there is one — consumers dedupe on
+    /// (source, seq) and reconcile by re-reading from a cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl Attention {

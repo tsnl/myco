@@ -199,7 +199,7 @@ impl Kind for ChatKind {
 
     fn create(
         &self,
-        id: &str,
+        ctx: &myco_instance::CreateCtx,
         args: Value,
         signals: Signals,
     ) -> Result<Box<dyn Instance>, VerbError> {
@@ -230,7 +230,7 @@ impl Kind for ChatKind {
             }
         };
         Ok(Box::new(Chat {
-            agent: Principal::Agent(id.to_string()),
+            agent: Principal::Agent(ctx.id.clone()),
             pool: self.pool.clone(),
             model,
             transcript: Shared::new(Transcript::default(), signals),
@@ -666,6 +666,22 @@ impl Instance for Chat {
                         },
                     )
                 });
+                // Mentions ride the pinned attention envelope. The entry
+                // is the re-readable moment behind the event (tail from
+                // seq), which is what makes the lossy feed honest.
+                for name in mentions(text) {
+                    let excerpt: String = text.chars().take(120).collect();
+                    signals.emit(
+                        myco_instance::events::ATTENTION,
+                        myco_instance::events::Attention {
+                            for_: vec![Principal::Human(name)],
+                            title: format!("mentioned by {caller}"),
+                            body: excerpt,
+                            seq: Some(entry.seq),
+                        }
+                        .data(),
+                    );
+                }
                 // Humans and *other* agents (a parent tasking this chat as
                 // a subagent) start or interrupt turns. The chat never
                 // answers itself — its own posts and entries are not
@@ -826,6 +842,31 @@ impl Instance for Chat {
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }
     }
+}
+
+/// `@name` tokens in a post: ascii word characters after an `@`, lowered
+/// to match user-id normalization. Distinct, in order of appearance.
+fn mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '@' {
+            continue;
+        }
+        let mut name = String::new();
+        while let Some(&n) = chars.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' || n == '-' {
+                name.push(n.to_ascii_lowercase());
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

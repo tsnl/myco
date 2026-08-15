@@ -207,12 +207,15 @@ async fn token(
         ));
     }
     match app.auth.redeem_code(&form.username, &form.code) {
-        Ok(issued) => Ok(Json(json!({
+        Ok(issued) => {
+            ensure_notifier(&app.pool, &issued.user.id);
+            Ok(Json(json!({
             "access_token": issued.access_token,
             "token_type": "bearer",
-            "expires_in": issued.expires_in_seconds,
-            "user": {"id": issued.user.id, "name": issued.user.name},
-        }))),
+                "expires_in": issued.expires_in_seconds,
+                "user": {"id": issued.user.id, "name": issued.user.name},
+            })))
+        }
         Err(e) => Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "unauthorized", "why": e.to_string()})),
@@ -230,6 +233,21 @@ async fn logout(State(app): State<App>, caller: Caller) -> Json<Value> {
 /// Who the presented token belongs to. Doubles as the client's login check.
 async fn whoami(caller: Caller) -> Json<Value> {
     Json(json!({"id": caller.user.id, "name": caller.user.name}))
+}
+
+/// Every signed-in person gets their attention inbox: find-or-create the
+/// per-user notifier, *as that user* — provisioning-as-the-user is
+/// principal resolution doing its job (DESIGN.md's worked requirement).
+/// Best-effort: a pool without the kind registered simply has no inboxes.
+pub fn ensure_notifier(pool: &Pool, user_id: &str) {
+    let principal = Principal::Human(user_id.to_string());
+    let exists = pool
+        .list(None)
+        .into_iter()
+        .any(|i| i.kind == "notifier" && i.creator == principal);
+    if !exists {
+        let _ = pool.create(&principal, "notifier", "", "notifications", Value::Null);
+    }
 }
 
 // ---------------------------------------------------------------------------
