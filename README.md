@@ -21,8 +21,8 @@ the local machine **and** on every concrete `Host` alias in your
   conversation history live under `~/.myco/` — pick up later with `/resume`.
 - **Nested agents for long work.** myco drives itself: start `myco` in a bash
   session to spin off focused agents so the main thread stays small and cheap.
-- **Project guidance is injected.** `AGENTS.md` / `CLAUDE.md` in your launch
-  directory is read at session start so the agent knows how _you_ work.
+- **Project guidance is injected.** The nearest `AGENTS.md` / `CLAUDE.md` from
+  your launch directory through the repository root is read at session start.
 - **Coming later:** multiplayer (multiple humans in the same agent workspace).
 
 ## Install
