@@ -13,6 +13,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 myco-instance = { path = "../instance" }
 myco-kind-chat = { path = "../kind-chat" }
+myco-kind-browser = { path = "../kind-browser" }
 myco-kind-cron = { path = "../kind-cron" }
 myco-kind-notifier = { path = "../kind-notifier" }
 myco-models = { path = "../models" }
