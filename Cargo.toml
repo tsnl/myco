@@ -14,14 +14,18 @@ license = "MIT"
 
 [workspace.dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 http-body-util = "0.1"
 libc = "0.2"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["set-header"] }

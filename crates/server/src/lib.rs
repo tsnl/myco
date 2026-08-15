@@ -16,6 +16,9 @@
 //! Authentication lands in a later PR of this stack; until then the router
 //! acts as one configured local principal and binds loopback only.
 
+pub mod auth;
+mod util;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::routing::{get, post};
