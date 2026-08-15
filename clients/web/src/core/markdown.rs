@@ -80,7 +80,9 @@ fn start(out: &mut String, tag: Tag<'_>) {
             push_esc(out, &dest_url);
             out.push_str("\" rel=\"noopener noreferrer\" target=\"_blank\">");
         }
-        Tag::Image { dest_url, title, .. } => {
+        Tag::Image {
+            dest_url, title, ..
+        } => {
             out.push_str("<img src=\"");
             push_esc(out, &dest_url);
             out.push_str("\" alt=\"");

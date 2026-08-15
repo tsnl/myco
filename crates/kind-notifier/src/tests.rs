@@ -279,7 +279,9 @@ async fn mock_push_service(status: Arc<std::sync::atomic::AtomicU16>, hits: Hits
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
                 let (head_end, need) = loop {
-                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
                     if n == 0 {
                         return;
                     }
@@ -295,7 +297,9 @@ async fn mock_push_service(status: Arc<std::sync::atomic::AtomicU16>, hits: Hits
                     }
                 };
                 while buf.len() < head_end + need {
-                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
                     if n == 0 {
                         break;
                     }
@@ -307,8 +311,10 @@ async fn mock_push_service(status: Arc<std::sync::atomic::AtomicU16>, hits: Hits
                 let code = status.load(std::sync::atomic::Ordering::SeqCst);
                 let _ = sock
                     .write_all(
-                        format!("HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                            .as_bytes(),
+                        format!(
+                            "HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
                     )
                     .await;
             });
@@ -330,9 +336,8 @@ async fn live_items_push_sealed_payloads_and_dead_endpoints_prune() {
     let endpoint = mock_push_service(status.clone(), hits.clone()).await;
 
     // The pusher speaks plain HTTP to localhost; no proxy may interfere.
-    let pusher = crate::push::Pusher::for_tests(
-        reqwest::Client::builder().no_proxy().build().unwrap(),
-    );
+    let pusher =
+        crate::push::Pusher::for_tests(reqwest::Client::builder().no_proxy().build().unwrap());
     let pool = Pool::new();
     pool.register(Arc::new(myco_kind_chat::ChatKind::transcript_only(
         pool.clone(),
@@ -370,9 +375,14 @@ async fn live_items_push_sealed_payloads_and_dead_endpoints_prune() {
     .await
     .expect("registers");
 
-    pool.call(&grace(), &chat.id, "post", json!({"text": "@ada the far box is up"}))
-        .await
-        .expect("posts");
+    pool.call(
+        &grace(),
+        &chat.id,
+        "post",
+        json!({"text": "@ada the far box is up"}),
+    )
+    .await
+    .expect("posts");
     wait_for_unacked(&pool, &notifier.id, &ada(), 1).await;
 
     // The push is async beside the inbox; give it its moment.
@@ -402,7 +412,10 @@ async fn live_items_push_sealed_payloads_and_dead_endpoints_prune() {
     wait_for_unacked(&pool, &notifier.id, &ada(), 2).await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while hits.lock().unwrap().len() < 2 {
-        assert!(tokio::time::Instant::now() < deadline, "the 410 knock arrived");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the 410 knock arrived"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 

@@ -34,7 +34,10 @@ static HOST_SPEC: KindSpec = KindSpec {
     verbs: &[
         VerbSpec::read("about", "connection status, the provider's name and offers"),
         VerbSpec::read("text", "the status, plainly"),
-        VerbSpec::write("new", "create an instance over there: {kind, title?, project?, args?}"),
+        VerbSpec::write(
+            "new",
+            "create an instance over there: {kind, title?, project?, args?}",
+        ),
         VerbSpec::write("reconnect", "drop the stream and dial again now"),
     ],
     primary_render: "about",
@@ -174,12 +177,12 @@ impl Instance for Host {
                     .ok_or_else(|| VerbError::Denied {
                         why: "the host is not connected".into(),
                     })?;
-                let kind = args
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| VerbError::BadArgs {
-                        why: "new needs {kind}".into(),
-                    })?;
+                let kind =
+                    args.get("kind")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "new needs {kind}".into(),
+                        })?;
                 let title = args.get("title").and_then(Value::as_str).unwrap_or("");
                 let project = args.get("project").and_then(Value::as_str).unwrap_or("");
                 let create_args = args.get("args").cloned().unwrap_or(json!({}));
@@ -298,6 +301,8 @@ async fn dial_once(
         s.status = "down";
         s.detail = ended.clone();
     });
-    shared.signals().emit("disconnected", json!({ "why": ended }));
+    shared
+        .signals()
+        .emit("disconnected", json!({ "why": ended }));
     true
 }

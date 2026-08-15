@@ -136,10 +136,10 @@ async fn main() {
         default_model,
     )
     .unwrap_or_else(|e| fatal(e))
-        // The delivery decision: the same origin serves the client. /api/*
-        // wins; everything else answers the shell (or the honest
-        // placeholder when the client was not built in).
-        .fallback(webdist::serve);
+    // The delivery decision: the same origin serves the client. /api/*
+    // wins; everything else answers the shell (or the honest
+    // placeholder when the client was not built in).
+    .fallback(webdist::serve);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,

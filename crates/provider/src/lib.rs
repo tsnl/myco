@@ -224,26 +224,29 @@ fn watch(
     }
     let pool = pool.clone();
     let out = out.clone();
-    watches.insert(id.clone(), tokio::spawn(async move {
-        let mut seen = 0;
-        loop {
-            match pool.changed(&id, seen).await {
-                Ok(watermark) => {
-                    seen = watermark;
-                    let frame = wire::ToPool::Mark {
-                        id: id.clone(),
-                        watermark,
-                    };
-                    if out.send(wire::encode(&frame)).await.is_err() {
-                        return;
+    watches.insert(
+        id.clone(),
+        tokio::spawn(async move {
+            let mut seen = 0;
+            loop {
+                match pool.changed(&id, seen).await {
+                    Ok(watermark) => {
+                        seen = watermark;
+                        let frame = wire::ToPool::Mark {
+                            id: id.clone(),
+                            watermark,
+                        };
+                        if out.send(wire::encode(&frame)).await.is_err() {
+                            return;
+                        }
                     }
+                    // Removed: the feed's gone frame is the announcement;
+                    // this loop just ends.
+                    Err(_) => return,
                 }
-                // Removed: the feed's gone frame is the announcement;
-                // this loop just ends.
-                Err(_) => return,
             }
-        }
-    }));
+        }),
+    );
 }
 
 fn offers(pool: &Pool) -> Vec<wire::KindOffer> {

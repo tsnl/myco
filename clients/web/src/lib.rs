@@ -6,6 +6,8 @@
 //! tests natively and is what a native client (DP‑1) would reuse.
 
 pub mod core;
+#[cfg(any(target_arch = "wasm32", test))]
+mod html;
 
 #[cfg(target_arch = "wasm32")]
 mod app;

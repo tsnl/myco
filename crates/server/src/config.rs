@@ -155,7 +155,7 @@ impl Roster {
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
         let ServerConfig {
-            users,
+            mut users,
             hosts,
             passkeys,
             catalog,
@@ -175,7 +175,7 @@ impl Roster {
                 path.display()
             ));
         }
-        for user in &users {
+        for user in &mut users {
             if user.id.trim().is_empty() {
                 return Err(format!(
                     "{}: a [[users]] entry has an empty id",
@@ -189,6 +189,7 @@ impl Roster {
                     user.id
                 ));
             }
+            user.id = crate::auth::normalize_id(&user.id);
         }
         for (i, user) in users.iter().enumerate() {
             if users[..i].iter().any(|u| u.id == user.id) {
@@ -210,6 +211,7 @@ impl Roster {
                 id_list(&users)
             ));
         };
+        let who = crate::auth::normalize_id(&who);
         let local = users.iter().position(|u| u.id == who).ok_or_else(|| {
             format!(
                 "{who:?} is not in the roster at {} (known ids: {}). Add a [[users]] entry \
@@ -281,7 +283,7 @@ mod tests {
 
     const TWO_USERS: &str = r#"
 [[users]]
-id = "ada"
+id = "Ada"
 name = "Ada Lovelace"
 
 [[users]]
@@ -290,7 +292,7 @@ id = "grace"
 
     #[test]
     fn the_local_user_is_the_roster_entry_matching_the_environment() {
-        let r = roster(TWO_USERS, &[("USER", "ada")]).unwrap();
+        let r = roster(TWO_USERS, &[("USER", "ADA")]).unwrap();
         assert_eq!(r.local().id, "ada");
         // A name is optional; the id stands in for it.
         let grace = r.users().iter().find(|u| u.id == "grace").unwrap();
@@ -319,7 +321,7 @@ id = "grace"
         assert!(err.contains("[[users]]"), "{err}");
 
         let dup = roster(
-            "[[users]]\nid = \"ada\"\n[[users]]\nid = \"ada\"\n",
+            "[[users]]\nid = \"ada\"\n[[users]]\nid = \"ADA\"\n",
             &[("USER", "ada")],
         )
         .unwrap_err();

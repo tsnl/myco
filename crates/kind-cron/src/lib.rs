@@ -324,8 +324,7 @@ async fn tick(pool: Pool, shared: Shared<Table>, id: u64, every_secs: u64) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let Some(entry) = shared.read(|t| t.entries.iter().find(|e| e.entry == id).cloned())
-        else {
+        let Some(entry) = shared.read(|t| t.entries.iter().find(|e| e.entry == id).cloned()) else {
             return;
         };
         if entry.paused {
