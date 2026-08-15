@@ -20,6 +20,9 @@ pub enum Request {
         agent_id: uuid::Uuid,
         tool_use: ToolUse,
     },
+    /// Cancel an in-flight tool call. Fire-and-forget: the original
+    /// [`Request::ToolCall`] receives the tool's cancelled result.
+    Cancel { id: String },
     /// Reap agent-owned host state (bash sessions, …). Fire-and-forget: the
     /// worker does not reply (host process exit is the hard guarantee).
     AgentFinished { agent_id: uuid::Uuid },
@@ -111,6 +114,16 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_cancel_roundtrip() {
+        let line = String::from_utf8(Request::Cancel { id: "7".into() }.encode().unwrap()).unwrap();
+        assert!(line.contains(r#""type":"cancel""#));
+        assert!(matches!(
+            Request::decode(&line).unwrap(),
+            Request::Cancel { id } if id == "7"
+        ));
     }
 
     #[test]

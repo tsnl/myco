@@ -24,6 +24,12 @@ use crate::host::HostWorker;
 use crate::host::protocol::{Request, Response};
 use crate::tool_services::HostDispatchContext;
 
+/// A remote tool gets its requested timeout plus this much time to return its
+/// result. This is a transport backstop, not a replacement for tool timeouts.
+const RESPONSE_GRACE_MS: u64 = 5_000;
+const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 60_000;
+const MAX_RESPONSE_TIMEOUT_MS: u64 = 1_800_000;
+
 /// Configuration for one remote host endpoint (spawn argv).
 ///
 /// Local is never described by this type — use [`HostController::in_process`].
@@ -184,9 +190,9 @@ impl HostController {
     /// wedged later calls under suite load. Tools that ignore cancel may run to
     /// completion (or their own timeout).
     ///
-    /// **Subprocess:** cancel abandons this waiter only (host may still finish
-    /// the tool). Connect happens on first use; concurrent callers only serialize
-    /// briefly in [`submit`].
+    /// **Subprocess:** cancel is forwarded to the worker before this waiter is
+    /// abandoned. Connect happens on first use; concurrent callers only
+    /// serialize briefly in [`submit`].
     pub async fn call(
         &self,
         agent_id: uuid::Uuid,
@@ -211,6 +217,7 @@ impl HostController {
         cancel: CancelToken,
     ) -> ToolResult {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        let response_timeout = response_timeout(&tool_use);
 
         let request = Request::ToolCall {
             id: id.clone(),
@@ -228,10 +235,19 @@ impl HostController {
         let reply = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                self.cancel_remote(&id).await;
                 self.abandon(&id).await;
                 return ToolResult::err("cancelled");
             }
             r = rx => r,
+            _ = tokio::time::sleep(response_timeout) => {
+                let message = format!(
+                    "tool call timed out after {}ms without a host response; connection reset",
+                    response_timeout.as_millis()
+                );
+                self.reset_connection(&message).await;
+                return ToolResult::err(format!("host {:?}: {message}", self.name));
+            }
         };
 
         // `run_reader` routes a reply to the waiter registered under exactly
@@ -388,6 +404,53 @@ impl HostController {
             pending.remove(id);
         }
     }
+
+    /// Best-effort remote cancellation. Keep the send bounded: cancellation
+    /// must still return when the worker's stdin pipe is what wedged.
+    async fn cancel_remote(&self, id: &str) {
+        let Backend::Subprocess { conn, .. } = &self.backend else {
+            return;
+        };
+        let write_tx = {
+            let slot = conn.lock().await;
+            slot.as_ref()
+                .filter(|c| !c.dead.load(Ordering::SeqCst))
+                .map(|c| c.write_tx.clone())
+        };
+        let Some(write_tx) = write_tx else {
+            return;
+        };
+        let Ok(bytes) = (Request::Cancel { id: id.to_string() }).encode() else {
+            return;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(250), write_tx.send(bytes)).await;
+    }
+
+    async fn reset_connection(&self, message: &str) {
+        let Backend::Subprocess {
+            conn, last_error, ..
+        } = &self.backend
+        else {
+            return;
+        };
+        *conn.lock().await = None;
+        if let Ok(mut error) = last_error.lock() {
+            *error = Some(message.to_string());
+        }
+    }
+}
+
+/// Bound a remote wait from the tool's requested timeout. Bash validates the
+/// value independently; clamping here keeps malformed input from disabling
+/// the transport watchdog before the worker can reject it.
+fn response_timeout(tool_use: &ToolUse) -> Duration {
+    let tool_ms = tool_use
+        .input
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS)
+        .min(MAX_RESPONSE_TIMEOUT_MS);
+    Duration::from_millis(tool_ms.saturating_add(RESPONSE_GRACE_MS))
 }
 
 impl Drop for HostController {
@@ -811,14 +874,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_host_response_hits_watchdog_and_resets_connection() {
+        let ctl = scripted_host(
+            "wedged",
+            format!(
+                "read -r _line; printf '%s\\n' '{}'; read -r _request; sleep 30",
+                hello_line(env!("CARGO_PKG_VERSION"))
+            ),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            ctl.call(
+                uuid::Uuid::nil(),
+                ToolUse {
+                    name: "bash".into(),
+                    input: json!({"command": "true", "timeout_ms": 1}),
+                },
+                CancelToken::new(),
+            ),
+        )
+        .await
+        .expect("controller watchdog did not fire");
+
+        assert!(result.is_error, "{result:?}");
+        let text = text_parts(&result).join("");
+        assert!(text.contains("without a host response"), "{text}");
+        assert!(!ctl.is_connected());
+    }
+
+    #[tokio::test]
     async fn subprocess_host_still_lazy_connects() {
-        // Still supported for remotes / tests that force a local subprocess.
-        let ctl = HostController::new(
-            HostConfig {
-                name: "sub".into(),
-                command: crate::harness::default_local_host_command(),
-            },
-            TEST_IMAGE_CAP,
+        let result_line = String::from_utf8(
+            Response::ToolResult {
+                id: "1".into(),
+                result: ToolResult::text("via-sub"),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let ctl = scripted_host(
+            "sub",
+            format!(
+                "read -r _hello; printf '%s\\n' '{}'; read -r _request; printf '%s' '{}'",
+                hello_line(env!("CARGO_PKG_VERSION")),
+                result_line.trim_end(),
+            ),
         );
 
         assert!(!ctl.is_connected());

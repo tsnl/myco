@@ -94,18 +94,6 @@ impl Default for HarnessConfig {
     }
 }
 
-/// Resolve `myco --mode host` argv (used by tests that still spawn a local subprocess).
-#[cfg(test)]
-pub fn default_local_host_command() -> Vec<String> {
-    vec![
-        myco_program(),
-        "--mode".into(),
-        "host".into(),
-        "--name".into(),
-        "local".into(),
-    ]
-}
-
 #[cfg(test)]
 pub(crate) fn myco_program() -> String {
     // cargo integration tests set this when the package builds the binary.
