@@ -30,6 +30,7 @@ pub struct Counter(i64);
 impl Instance for Counter {
     async fn verb(
         &mut self,
+        _caller: &myco_instance::Principal,
         verb: &str,
         args: Value,
         signals: &Signals,
