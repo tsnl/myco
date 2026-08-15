@@ -477,7 +477,7 @@ async fn run_turn(ctx: TurnCtx) {
                 if end == TurnEndReason::ToolUse && !tool_uses.is_empty() {
                     let mut results = Vec::with_capacity(tool_uses.len());
                     for tool in &tool_uses {
-                        results.push(tools::dispatch(&pool, &agent, &project, tool).await);
+                        results.push(tools::dispatch(&pool, &agent, &project, &model, tool).await);
                     }
                     transcript.with(|t| t.push(agent.clone(), Body::ToolResults { results }));
                     continue;
@@ -539,9 +539,16 @@ impl Instance for Chat {
                         },
                     )
                 });
-                // Only a person starts (or interrupts) a turn: the model
-                // answers humans, not itself and not the system.
-                if matches!(caller, Principal::Human(_)) && self.model.is_some() {
+                // Humans and *other* agents (a parent tasking this chat as
+                // a subagent) start or interrupt turns. The chat never
+                // answers itself — its own posts and entries are not
+                // prompts — and never answers the system.
+                let triggers = match caller {
+                    Principal::Human(_) => true,
+                    Principal::Agent(_) => *caller != self.agent,
+                    Principal::System(_) => false,
+                };
+                if triggers && self.model.is_some() {
                     if self.turn_running() {
                         self.abort_turn("interrupted", signals);
                     }
