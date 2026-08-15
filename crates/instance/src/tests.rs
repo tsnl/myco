@@ -551,19 +551,20 @@ async fn titles_are_slugs_unique_per_project() {
         .create(&ada(), "counter", "alpha", "lab-1", Value::Null)
         .unwrap();
     assert_eq!(first.title, "lab-1");
-    // Empty title becomes the kind name.
+    // Empty title becomes the kind name, then -2, -3 — tools create
+    // this way and must not collide on the second bash.
     let unnamed = pool
         .create(&ada(), "counter", "alpha", "", Value::Null)
         .unwrap();
     assert_eq!(unnamed.title, "counter");
-    let twice = pool.create(&ada(), "counter", "alpha", "", Value::Null);
-    assert!(
-        matches!(
-            twice,
-            Err(VerbError::BadArgs { ref why }) if why.contains(&unnamed.id)
-        ),
-        "a second empty title collides on the kind name: {twice:?}"
-    );
+    let twice = pool
+        .create(&ada(), "counter", "alpha", "", Value::Null)
+        .unwrap();
+    assert_eq!(twice.title, "counter-2");
+    let thrice = pool
+        .create(&ada(), "counter", "alpha", "", Value::Null)
+        .unwrap();
+    assert_eq!(thrice.title, "counter-3");
 
     for bad in ["has space", "foo_bar", "-leading"] {
         let err = pool
@@ -680,7 +681,14 @@ async fn parentage_is_fixed_at_birth_and_carried_by_the_listing() {
     assert_eq!(root.parent, None, "an unparented instance is a root");
 
     let child = pool
-        .create_under(&ada(), "counter", "proj", "child", Value::Null, Some(&root.id))
+        .create_under(
+            &ada(),
+            "counter",
+            "proj",
+            "child",
+            Value::Null,
+            Some(&root.id),
+        )
         .unwrap();
     let grandchild = pool
         .create_under(
@@ -874,7 +882,7 @@ fn adopted_row(id: &str, parent: Option<&str>) -> InstanceInfo {
 async fn adopted_rows_list_nest_and_forward_whole() {
     let pool = pool();
     let host = pool
-        .create(&ada(), "counter", "default", "the host", json!({}))
+        .create(&ada(), "counter", "default", "the-host", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),
@@ -883,11 +891,17 @@ async fn adopted_rows_list_nest_and_forward_whole() {
     pool.adopt(&host.id, adopted_row("r-1", None), far.clone());
 
     let rows = pool.list(None);
-    let row = rows.iter().find(|r| r.id == "r-1").expect("adopted row listed");
+    let row = rows
+        .iter()
+        .find(|r| r.id == "r-1")
+        .expect("adopted row listed");
     assert_eq!(row.parent.as_deref(), Some(host.id.as_str()));
     assert_eq!(pool.ancestors("r-1"), vec![host.id.clone()]);
 
-    let answer = pool.call(&ada(), "r-1", "sys.take", Value::Null).await.unwrap();
+    let answer = pool
+        .call(&ada(), "r-1", "sys.take", Value::Null)
+        .await
+        .unwrap();
     assert_eq!(answer, json!({ "answered": "sys.take" }));
     let calls = far.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -901,7 +915,7 @@ async fn adopted_rows_list_nest_and_forward_whole() {
 async fn remote_marks_fold_monotonically_and_dropping_wakes_waiters() {
     let pool = pool();
     let host = pool
-        .create(&ada(), "counter", "default", "the host", json!({}))
+        .create(&ada(), "counter", "default", "the-host", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),
@@ -933,10 +947,10 @@ async fn remote_marks_fold_monotonically_and_dropping_wakes_waiters() {
 async fn drop_remotes_from_sweeps_an_origin() {
     let pool = pool();
     let host_a = pool
-        .create(&ada(), "counter", "default", "host a", json!({}))
+        .create(&ada(), "counter", "default", "host-a", json!({}))
         .unwrap();
     let host_b = pool
-        .create(&ada(), "counter", "default", "host b", json!({}))
+        .create(&ada(), "counter", "default", "host-b", json!({}))
         .unwrap();
     let far = Arc::new(FakeRemote {
         calls: std::sync::Mutex::new(Vec::new()),

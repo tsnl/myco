@@ -5,12 +5,14 @@
 //! creates, drives, and removes instances under exactly the rules any
 //! principal lives by.
 //!
-//! Two tools. `bash` runs a command as a one-shot tty instance: create
-//! (the agent is creator and driver), wait on the watermark until the
-//! child exits or the budget runs out, drain the scrollback, remove. The
-//! terminal is a real pool instance while it lives — visible in the tree,
-//! watchable by anyone, and cleaned up even when the turn is cancelled
-//! mid-command (the removal rides a drop guard).
+//! Three tools. `look` is how the model sees the room: a listing, or one
+//! object's `recommended_context` (plain text). `bash` runs a command as
+//! a one-shot tty instance: create (the agent is creator and driver),
+//! wait on the watermark until the child exits or the budget runs out,
+//! drain the scrollback, remove. The terminal is a real pool instance
+//! while it lives — visible in the tree, watchable by anyone, and cleaned
+//! up even when the turn is cancelled mid-command (the removal rides a
+//! drop guard). `look` cannot drive; `bash` cannot attach.
 //!
 //! `subagent` is the ledger's "drop the child machinery" made concrete:
 //! it creates an ordinary chat *under* this one — parentage is L1
@@ -34,6 +36,28 @@ use serde_json::{Value, json};
 /// dispatcher below is the other half of the same contract.
 pub(crate) fn tool_specs() -> Vec<ToolSpec> {
     vec![
+        ToolSpec {
+            name: "look".into(),
+            description: "See the room. With no arguments, list every object in this \
+                          chat's workspace (kind, title, id, who holds control). With \
+                          {title} or {id}, read that object's current text — a terminal's \
+                          screen, another chat's transcript. This is how you find a \
+                          standing terminal the human opened; bash cannot attach to one."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "slug title of the object to read"
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "object id; wins if both id and title are set"
+                    }
+                }
+            }),
+        },
         ToolSpec {
             name: "subagent".into(),
             description: "Delegate a task to a subagent: a fresh chat, parented under this \
@@ -101,10 +125,11 @@ pub(crate) async fn dispatch(
     tool: &ToolUse,
 ) -> ToolResult {
     let outcome = match tool.name.as_str() {
+        "look" => look(pool, agent, project, &tool.input).await,
         "bash" => bash(pool, agent, project, &tool.input).await,
         "subagent" => subagent(pool, agent, project, model, &tool.input).await,
         other => Err(format!(
-            "unknown tool {other:?} — available tools: bash, subagent"
+            "unknown tool {other:?} — available tools: look, bash, subagent"
         )),
     };
     match outcome {
@@ -118,6 +143,119 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 /// Cap on what one command feeds back into context. The *end* of the
 /// output survives truncation — exit chatter beats preamble.
 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
+const LOOK_TEXT_CAP: usize = 8 * 1024;
+
+async fn look(
+    pool: &Pool,
+    agent: &Principal,
+    project: &str,
+    input: &Value,
+) -> Result<String, String> {
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let title = input
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if id.is_none() && title.is_none() {
+        return Ok(list_workspace(pool, project));
+    }
+    let info = resolve_object(pool, project, id, title)?;
+    let verb = recommended_context(pool, &info.kind);
+    let payload = pool
+        .call(agent, &info.id, verb, Value::Null)
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", label(&info)))?;
+    Ok(format_object(&info, &payload))
+}
+
+fn list_workspace(pool: &Pool, project: &str) -> String {
+    let rows = pool.list(Some(project));
+    if rows.is_empty() {
+        return "the workspace is empty.".into();
+    }
+    let mut out = String::from("workspace objects:\n");
+    for info in rows {
+        let control = match &info.driver {
+            Some(p) => format!("{p}"),
+            None => "open".into(),
+        };
+        let parent = info
+            .parent
+            .as_deref()
+            .map(|p| format!(" parent={p}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- {kind} {title} id={id} control={control}{parent}\n",
+            kind = info.kind,
+            title = info.title,
+            id = info.id,
+            control = control,
+            parent = parent,
+        ));
+    }
+    out
+}
+
+fn resolve_object(
+    pool: &Pool,
+    project: &str,
+    id: Option<&str>,
+    title: Option<&str>,
+) -> Result<myco_instance::InstanceInfo, String> {
+    let rows = pool.list(Some(project));
+    if let Some(id) = id {
+        return rows
+            .into_iter()
+            .find(|i| i.id == id)
+            .ok_or_else(|| format!("no object with id {id} in this workspace"));
+    }
+    let title = title.expect("caller checked");
+    let hits: Vec<_> = rows.into_iter().filter(|i| i.title == title).collect();
+    match hits.len() {
+        0 => Err(format!("no object titled {title:?} in this workspace")),
+        1 => Ok(hits.into_iter().next().expect("len 1")),
+        n => {
+            let ids: Vec<_> = hits.iter().map(|i| i.id.as_str()).collect();
+            Err(format!(
+                "{n} objects titled {title:?}: {}. Use {{id}}.",
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
+fn recommended_context(pool: &Pool, kind: &str) -> &'static str {
+    pool.kinds()
+        .into_iter()
+        .find(|k| k.kind == kind)
+        .map(|k| k.recommended_context)
+        .unwrap_or("text")
+}
+
+fn label(info: &myco_instance::InstanceInfo) -> String {
+    format!("{} {}", info.kind, info.title)
+}
+
+fn format_object(info: &myco_instance::InstanceInfo, payload: &Value) -> String {
+    let mut text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| payload.to_string());
+    if text.len() > LOOK_TEXT_CAP {
+        let skip = text.len() - LOOK_TEXT_CAP;
+        text = format!("[truncated; last {LOOK_TEXT_CAP} bytes]\n{}", &text[skip..]);
+    }
+    let running = payload.get("running").and_then(Value::as_bool);
+    let mut head = format!("{} {} id={}", info.kind, info.title, info.id);
+    if let Some(running) = running {
+        head.push_str(if running { " running" } else { " exited" });
+    }
+    format!("{head}\n{text}")
+}
 
 async fn bash(
     pool: &Pool,
@@ -136,16 +274,13 @@ async fn bash(
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(1, MAX_TIMEOUT_SECS);
 
-    let title: String = format!("bash: {}", command.lines().next().unwrap_or(""))
-        .chars()
-        .take(48)
-        .collect();
+    // Empty title: L1 mints tty, tty-2, … — a command line is not a slug.
     let info = pool
         .create(
             agent,
             "tty",
             project,
-            &title,
+            "",
             json!({"command": command, "mode": "piped"}),
         )
         .map_err(|e| format!("cannot start a terminal: {e}"))?;
@@ -236,16 +371,12 @@ async fn subagent(
         ));
     }
 
-    let title: String = format!("subagent: {}", task.lines().next().unwrap_or(""))
-        .chars()
-        .take(48)
-        .collect();
     let child = pool
         .create_under(
             agent,
             "chat",
             project,
-            &title,
+            "",
             json!({"model": model}),
             Some(own_id),
         )

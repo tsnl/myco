@@ -31,6 +31,8 @@ futures = "0.3"
 http-body-util = "0.1"
 libc = "0.2"
 rand = "0.9"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+latex2mathml = "0.2"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 hkdf = "0.12"
 aes-gcm = "0.10"

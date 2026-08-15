@@ -26,8 +26,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, Shared, VerbError, VerbSpec};
 use myco_models::{
-    Content, GenerateOutput, GenerativeModel, GenerativeModelConfig, MessagePart, ModelCatalog,
-    ToolResult, ToolUse, TurnEndReason,
+    Content, Effort, GenerateOutput, GenerativeModel, GenerativeModelConfig, MessagePart,
+    ModelCatalog, ToolResult, ToolUse, TurnEndReason,
 };
 use myco_runtime::Signals;
 use serde_json::{Value, json};
@@ -71,9 +71,14 @@ static CHAT_SPEC: KindSpec = KindSpec {
              starts from now",
         ),
         VerbSpec::write("unwatch", "drop the standing subscription on {instance}"),
+        VerbSpec::write(
+            "configure",
+            "set {model?} (a catalog key, or empty to drop the model) and/or {effort?} \
+             (low|medium|high|max). A running turn is left alone; the next post uses the new dials",
+        ),
         VerbSpec::read(
             "about",
-            "the chat's shape: {model, len, turn_running, watching}",
+            "the chat's shape: {model, effort, len, turn_running, watching}",
         ),
     ],
     primary_render: "tail",
@@ -82,11 +87,30 @@ static CHAT_SPEC: KindSpec = KindSpec {
 
 const DEFAULT_TAIL: u64 = 200;
 
-/// The interim system prompt. The full prompt assembly (tool guidance,
-/// workspace context) arrives with the tool dispatcher.
-const SYSTEM_PROMPT: &str = "You are the resident agent of a myco chat. Answer the humans in \
-                             the transcript plainly and concretely. Messages prefixed with a \
-                             bracketed name were said by that person.";
+/// What the model is told about the room. Tool schemas carry the
+/// mechanics; this is the map. Keep it short — it is cached as the
+/// Anthropic system breakpoint.
+const SYSTEM_PROMPT: &str = "\
+You are the resident agent of a myco chat.
+
+This chat is one object in a room. Other objects (chats, terminals, \
+pages, hosts, …) live in the same workspace. Each has a title (a slug \
+humans pick) and an id (a uuid). You send the same messages any person \
+would; there is no back door.
+
+Tools:
+- look — with no arguments, list the workspace (kind, title, id, who \
+holds control). With {title} or {id}, read that object's current text \
+(a terminal's screen, another chat's transcript). This is how you find \
+a standing terminal a human opened.
+- bash — run a command in a fresh one-shot terminal. It is created, \
+drained, and removed. State does not persist between calls; use files. \
+bash cannot attach to an existing terminal.
+- subagent — a child chat under this one. It stays in the room after \
+it answers.
+
+You cannot type into a standing terminal yet. If you need to, say so. \
+Answer plainly. A bracketed name in the transcript is another person.";
 
 /// One transcript entry. `seq` is dense from 0, so `tail`'s cursor is also
 /// an entry count; `body` is tagged (`"t"`) so readers skip variants they
@@ -203,40 +227,66 @@ impl Kind for ChatKind {
         args: Value,
         signals: Signals,
     ) -> Result<Box<dyn Instance>, VerbError> {
-        let requested = match args.get("model") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(key)) if !key.trim().is_empty() => Some(key.clone()),
-            Some(other) => {
-                return Err(VerbError::BadArgs {
-                    why: format!("model must be a catalog key string, got {other}"),
-                });
-            }
-        };
+        let requested = parse_model_arg(args.get("model"))?;
+        let effort = parse_effort_arg(args.get("effort"))?;
         let model = match requested.or_else(|| self.default_model.clone()) {
             None => None,
-            Some(key) => {
-                let entry = self
-                    .catalog
-                    .get(&key)
-                    .map_err(|why| VerbError::BadArgs { why })?;
-                let config = GenerativeModelConfig {
-                    model: entry.spec.clone(),
-                    tools: tools::tool_specs(),
-                    system_prompt: SYSTEM_PROMPT.to_string(),
-                    backend_config: entry.backend.clone(),
-                };
-                let generator = (self.factory)(config).map_err(|why| VerbError::Failed { why })?;
-                Some((key, generator))
-            }
+            Some(key) => Some(bind_model(&self.catalog, &self.factory, &key, effort)?),
         };
         Ok(Box::new(Chat {
             agent: Principal::Agent(ctx.id.clone()),
             pool: self.pool.clone(),
+            catalog: Arc::clone(&self.catalog),
+            factory: Arc::clone(&self.factory),
             model,
             transcript: Shared::new(Transcript::default(), signals),
             turn: None,
         }))
     }
+}
+
+fn parse_model_arg(value: Option<&Value>) -> Result<Option<String>, VerbError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(key)) if key.trim().is_empty() => Ok(None),
+        Some(Value::String(key)) => Ok(Some(key.clone())),
+        Some(other) => Err(VerbError::BadArgs {
+            why: format!("model must be a catalog key string, got {other}"),
+        }),
+    }
+}
+
+fn parse_effort_arg(value: Option<&Value>) -> Result<Option<Effort>, VerbError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => s
+            .parse::<Effort>()
+            .map(Some)
+            .map_err(|why| VerbError::BadArgs { why }),
+        Some(other) => Err(VerbError::BadArgs {
+            why: format!("effort must be low|medium|high|max, got {other}"),
+        }),
+    }
+}
+
+fn bind_model(
+    catalog: &ModelCatalog,
+    factory: &ModelFactory,
+    key: &str,
+    effort: Option<Effort>,
+) -> Result<(String, Effort, Arc<dyn GenerativeModel>), VerbError> {
+    let entry = catalog.get(key).map_err(|why| VerbError::BadArgs { why })?;
+    let chosen = effort
+        .or_else(|| entry.backend.effort())
+        .unwrap_or(Effort::DEFAULT);
+    let config = GenerativeModelConfig {
+        model: entry.spec.clone(),
+        tools: tools::tool_specs(),
+        system_prompt: SYSTEM_PROMPT.to_string(),
+        backend_config: entry.backend.clone().with_effort(chosen),
+    };
+    let generator = factory(config).map_err(|why| VerbError::Failed { why })?;
+    Ok((key.to_string(), chosen, generator))
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +455,11 @@ struct Chat {
     /// doctrine's naming, and the transcript's author for model entries.
     agent: Principal,
     pool: Pool,
-    model: Option<(String, Arc<dyn GenerativeModel>)>,
+    catalog: Arc<ModelCatalog>,
+    factory: ModelFactory,
+    /// Bound generator, when the chat has a model. The effort is what this
+    /// binding requested — `about` and the next `configure` read it back.
+    model: Option<(String, Effort, Arc<dyn GenerativeModel>)>,
     transcript: Shared<Transcript>,
     turn: Option<tokio::task::JoinHandle<()>>,
 }
@@ -431,7 +485,7 @@ impl Chat {
     }
 
     fn start_turn(&mut self) {
-        let Some((model, generator)) = &self.model else {
+        let Some((model, _, generator)) = &self.model else {
             return;
         };
         self.turn = Some(tokio::spawn(run_turn(TurnCtx {
@@ -441,6 +495,48 @@ impl Chat {
             agent: self.agent.clone(),
             model: model.clone(),
         })));
+    }
+
+    fn configure(&mut self, args: &Value) -> Result<Value, VerbError> {
+        let has_model = args.get("model").is_some();
+        let has_effort = args.get("effort").is_some();
+        if !has_model && !has_effort {
+            return Err(VerbError::BadArgs {
+                why: "configure needs {model?} and/or {effort?}".into(),
+            });
+        }
+        let requested = if has_model {
+            parse_model_arg(args.get("model"))?
+        } else {
+            self.model.as_ref().map(|(key, _, _)| key.clone())
+        };
+        let effort = parse_effort_arg(args.get("effort"))?;
+        if requested.is_none() && effort.is_some() {
+            return Err(VerbError::BadArgs {
+                why: "effort needs a model".into(),
+            });
+        }
+        self.model = match requested {
+            None => None,
+            Some(key) => Some(bind_model(&self.catalog, &self.factory, &key, effort)?),
+        };
+        Ok(self.about_json())
+    }
+
+    fn about_json(&self) -> Value {
+        let (len, watching) = self.transcript.read(|t| {
+            (
+                t.entries.len() as u64,
+                serde_json::to_value(&t.subs).expect("subs serialize"),
+            )
+        });
+        json!({
+            "model": self.model.as_ref().map(|(key, _, _)| key.clone()),
+            "effort": self.model.as_ref().map(|(_, effort, _)| effort.as_str()),
+            "len": len,
+            "turn_running": self.turn_running(),
+            "watching": watching,
+        })
     }
 }
 
@@ -825,20 +921,8 @@ impl Instance for Chat {
                 });
                 Ok(json!({"dropped": dropped}))
             }
-            "about" => {
-                let (len, watching) = self.transcript.read(|t| {
-                    (
-                        t.entries.len() as u64,
-                        serde_json::to_value(&t.subs).expect("subs serialize"),
-                    )
-                });
-                Ok(json!({
-                    "model": self.model.as_ref().map(|(key, _)| key.clone()),
-                    "len": len,
-                    "turn_running": self.turn_running(),
-                    "watching": watching,
-                }))
-            }
+            "configure" => self.configure(&args),
+            "about" => Ok(self.about_json()),
             other => Err(VerbError::UnknownVerb { verb: other.into() }),
         }
     }

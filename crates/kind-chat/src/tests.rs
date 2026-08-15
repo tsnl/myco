@@ -421,11 +421,73 @@ async fn an_unknown_model_is_refused_at_create_with_the_catalog_listed() {
     }
 }
 
+#[tokio::test]
+async fn create_and_configure_bind_model_and_effort() {
+    let pool = Pool::new();
+    pool.register(Arc::new(ChatKind::with_factory(
+        pool.clone(),
+        fake_catalog(),
+        None,
+        Arc::new(|_| Ok(Arc::new(HangingModel) as _)),
+    )));
+    let info = pool
+        .create(
+            &ada(),
+            "chat",
+            "",
+            "",
+            json!({"model": "fake", "effort": "low"}),
+        )
+        .expect("create");
+    let about = pool
+        .call(&ada(), &info.id, "about", Value::Null)
+        .await
+        .expect("about");
+    assert_eq!(about["model"], json!("fake"));
+    assert_eq!(about["effort"], json!("low"));
+
+    let about = pool
+        .call(&ada(), &info.id, "configure", json!({"effort": "max"}))
+        .await
+        .expect("configure");
+    assert_eq!(about["effort"], json!("max"));
+    assert_eq!(about["model"], json!("fake"));
+
+    let about = pool
+        .call(&ada(), &info.id, "configure", json!({"model": ""}))
+        .await
+        .expect("drop model");
+    assert_eq!(about["model"], Value::Null);
+    assert_eq!(about["effort"], Value::Null);
+
+    let err = pool
+        .call(&ada(), &info.id, "configure", json!({"effort": "high"}))
+        .await
+        .unwrap_err();
+    match err {
+        VerbError::BadArgs { why } => assert!(why.contains("model"), "{why}"),
+        other => panic!("expected BadArgs, got {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
 use myco_models::{GenerateOutput, ToolUse, TurnEndReason};
+
+fn look_turn(input: Value, id: &str) -> GenerateOutput {
+    GenerateOutput {
+        content: vec![],
+        tool_uses: vec![ToolUse {
+            id: id.into(),
+            name: "look".into(),
+            input,
+        }],
+        turn_end_reason: TurnEndReason::ToolUse,
+        usage: None,
+    }
+}
 
 fn tool_turn(command: &str, id: &str) -> GenerateOutput {
     GenerateOutput {
@@ -483,6 +545,48 @@ async fn a_tool_turn_runs_bash_on_the_bus_and_feeds_the_result_back() {
         }
         mark = pool.changed(&id, mark).await.expect("changed");
     }
+}
+
+#[tokio::test]
+async fn look_lists_the_workspace_and_reads_a_title() {
+    let scripted = ScriptedModel::new(vec![
+        look_turn(json!({}), "t1"),
+        look_turn(json!({"title": "lab"}), "t2"),
+        myco_models::test_support::text_output("seen"),
+    ]);
+    let (pool, id) = modeled_pool(Arc::new(move |_| Ok(scripted.clone() as _)));
+    let tty = pool
+        .create(
+            &ada(),
+            "tty",
+            "",
+            "lab",
+            json!({"command": "printf 'hello-from-lab\\n'"}),
+        )
+        .expect("standing tty");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    pool.wait_until(&ada(), &tty.id, "text", deadline, |text| {
+        text.get("running") != Some(&json!(true))
+    })
+    .await
+    .expect("tty settled");
+
+    pool.call(&ada(), &id, "post", json!({"text": "what is here"}))
+        .await
+        .expect("post");
+    let tail = wait_for_settled_turns(&pool, &id, 3).await;
+    let entries = tail["entries"].as_array().unwrap();
+    let list = entries[2]["results"][0]["content"][0]["Text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(list.contains("workspace objects:"), "{list}");
+    assert!(list.contains("tty lab"), "{list}");
+    assert!(list.contains("chat "), "{list}");
+    let screen = entries[4]["results"][0]["content"][0]["Text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(screen.contains("tty lab"), "{screen}");
+    assert!(screen.contains("hello-from-lab"), "{screen}");
 }
 
 #[tokio::test]

@@ -180,6 +180,20 @@ fn dispatch(action: Action) {
     for effect in effects {
         run(effect);
     }
+    // After the borrow is gone: a focused tty may need a resize. Measuring
+    // (and dispatching) from inside render re-entered STATE and panicked.
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let focused_tty = STATE.with(|s| {
+        let state = s.borrow();
+        state.workspace.selected.clone().filter(|_| {
+            state.workspace.panes.iter().any(|p| {
+                Some(p.id.as_str()) == state.workspace.selected.as_deref() && p.kind == "tty"
+            })
+        })
+    });
+    measure_focused_tty(&document, focused_tty);
 }
 
 fn run(effect: Effect) {
@@ -233,6 +247,12 @@ fn run(effect: Effect) {
         Effect::FetchKinds { token } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(match fetch("GET", "/api/kinds", Some(&token), None).await {
                 Ok((status, body)) => Action::KindsAnswered { status, body },
+                Err(what) => Action::NetworkFailed { what },
+            });
+        }),
+        Effect::FetchModels { token } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(match fetch("GET", "/api/models", Some(&token), None).await {
+                Ok((status, body)) => Action::ModelsAnswered { status, body },
                 Err(what) => Action::NetworkFailed { what },
             });
         }),
@@ -692,7 +712,7 @@ fn render(state: &State) {
     }
 
     focus_summoned_field(&document);
-    measure_focused_tty(&document);
+    grow_composers(&document);
 }
 
 /// Write a region's markup, but only when it actually changed — and put
@@ -851,6 +871,9 @@ fn restore_caret(document: &web_sys::Document, caret: Option<Caret>) {
             area.set_value(&caret.value);
         }
         let _ = area.set_selection_range(caret.start, caret.end);
+        if caret.id.starts_with("composer-") {
+            grow_composer(area);
+        }
     } else if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
         if input.value() != caret.value {
             input.set_value(&caret.value);
@@ -868,6 +891,32 @@ fn clear_field(id: &str) {
         .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
     {
         area.set_value("");
+        grow_composer(&area);
+    }
+}
+
+/// Fit a composer to its text: collapse, then grow to `scrollHeight`,
+/// capped by the CSS max-height. Called on input and after paint restores
+/// a draft — `rows="1"` alone stays one line.
+fn grow_composer(area: &web_sys::HtmlTextAreaElement) {
+    area.style().set_property("height", "auto").ok();
+    let height = area.scroll_height();
+    area.style()
+        .set_property("height", &format!("{height}px"))
+        .ok();
+}
+
+fn grow_composers(document: &web_sys::Document) {
+    let Ok(list) = document.query_selector_all("textarea.composer-input") else {
+        return;
+    };
+    for i in 0..list.length() {
+        let Some(node) = list.item(i) else {
+            continue;
+        };
+        if let Ok(area) = node.dyn_into::<web_sys::HtmlTextAreaElement>() {
+            grow_composer(&area);
+        }
     }
 }
 
@@ -1020,10 +1069,42 @@ fn attach_delegates(document: &web_sys::Document) {
                 }),
                 _ => {}
             }
+        } else if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>()
+            && el.id().starts_with("composer-")
+        {
+            grow_composer(area);
         }
     });
     let _ = document.add_event_listener_with_callback("input", on_input.as_ref().unchecked_ref());
     on_input.forget();
+
+    let on_change = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(el) = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let Some(id) = el.get_attribute("id") else {
+            return;
+        };
+        let value = field_value(&id);
+        if let Some(chat) = id.strip_prefix("model-") {
+            dispatch(Action::ChatConfigured {
+                id: chat.to_string(),
+                model: Some(value),
+                effort: None,
+            });
+        } else if let Some(chat) = id.strip_prefix("effort-") {
+            dispatch(Action::ChatConfigured {
+                id: chat.to_string(),
+                model: None,
+                effort: Some(value),
+            });
+        }
+    });
+    let _ = document.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+    on_change.forget();
 }
 
 /// What one element's action attributes mean. `true` means "this element
@@ -1110,6 +1191,8 @@ fn field_value(id: &str) -> String {
         input.value()
     } else if let Some(area) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
         area.value()
+    } else if let Some(select) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+        select.value()
     } else {
         String::new()
     }
@@ -1216,7 +1299,7 @@ fn stage_view(state: &State) -> String {
     } else {
         ws.panes
             .iter()
-            .map(|p| pane_view(p, ws, state.renaming.as_ref()))
+            .map(|p| pane_view(p, ws, &state.catalog, state.renaming.as_ref()))
             .collect()
     }
 }
@@ -1239,6 +1322,7 @@ fn notice_view(state: &State) -> String {
 fn pane_view(
     pane: &crate::core::Pane,
     ws: &crate::core::Workspace,
+    catalog: &crate::core::Catalog,
     renaming: Option<&crate::core::RenameEdit>,
 ) -> String {
     let instance = ws.instances.iter().find(|i| i.id == pane.id);
@@ -1283,7 +1367,7 @@ fn pane_view(
     };
     let view = match &pane.view {
         Some(view) if pane.kind == "tty" => tty_screen(view),
-        Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
+        Some(view) if pane.kind == "chat" => chat_transcript(view, pane, catalog),
         Some(view) if pane.kind == "host" => host_card(view),
         Some(view) if pane.kind == "browser" => browser_pane(view, pane),
         Some(view) => format!(
@@ -1314,7 +1398,7 @@ fn pane_view(
 /// assistant entry with no turn_end is a breathing thought, not history),
 /// tool calls and their results folded quietly, watched splices set
 /// apart. Below it, the composer.
-fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
+fn chat_transcript(raw: &str, pane: &crate::core::Pane, catalog: &crate::core::Catalog) -> String {
     #[derive(serde::Deserialize)]
     struct Author {
         kind: String,
@@ -1362,7 +1446,7 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
                 _ => "system",
             };
             match e.t.as_str() {
-                "message" => bubble(dot, &e.author.id, &escape(&e.text), ""),
+                "message" => bubble(dot, &e.author.id, &escape(&e.text), "", false),
                 "assistant" => {
                     let text = content_text(&e.content);
                     let streaming = e.turn_end.is_none();
@@ -1380,7 +1464,13 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
                     } else {
                         ""
                     };
-                    bubble(dot, "agent", &format!("{}{cursor}", escape(&text)), &tools)
+                    bubble(
+                        dot,
+                        "agent",
+                        &format!("{}{cursor}", crate::core::render_markdown(&text)),
+                        &tools,
+                        true,
+                    )
                 }
                 "tool_results" => {
                     let text = e
@@ -1409,54 +1499,85 @@ fn chat_transcript(raw: &str, pane: &crate::core::Pane) -> String {
         })
         .collect();
 
-    let modeled = pane_is_modeled(pane);
-    let composer = if modeled {
-        let cancel = if running {
-            format!(
-                r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#,
-                id = escape(&pane.id)
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            r#"<form class="composer" data-chat="{id}">
-                 <textarea id="composer-{id}" class="composer-input" rows="1"
-                   placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
-                 <div class="composer-foot">{cancel}
-                   <button class="primary-button">send</button></div>
-               </form>"#,
-            id = escape(&pane.id),
-            draft = escape(&pane.draft),
-        )
-    } else {
-        r#"<div class="dim composer-note">this chat has no model — it is a shared transcript.
-             post with the palette or the API.</div>"#
-            .to_string()
-    };
-
+    let composer = chat_composer(pane, running, &escape(&pane.draft), catalog);
     format!(r#"<div class="pane-body chat"><div class="transcript">{body}</div>{composer}</div>"#)
 }
 
-/// Whether the chat pane's instance carries a model driver — a modeled
-/// chat is driven by its own agent, which the listing shows as the seat.
-fn pane_is_modeled(pane: &crate::core::Pane) -> bool {
-    // The chat's `about` isn't in the pane; infer from the driver being an
-    // agent named for this instance (the doctrine's naming). Absent that,
-    // still offer the composer — worst case a post to a modelless chat
-    // simply appends without a reply.
-    let _ = pane;
-    true
+fn chat_composer(
+    pane: &crate::core::Pane,
+    running: bool,
+    draft: &str,
+    catalog: &crate::core::Catalog,
+) -> String {
+    let id = escape(&pane.id);
+    let cancel = if running {
+        format!(r#"<button class="quiet-button" data-cancel="{id}">cancel turn</button>"#)
+    } else {
+        String::new()
+    };
+    let current = pane.about.as_ref().and_then(|a| a.model.clone());
+    let effort = pane
+        .about
+        .as_ref()
+        .and_then(|a| a.effort.clone())
+        .unwrap_or_else(|| "high".into());
+    let dials = if catalog.models.is_empty() {
+        r#"<span class="dim">no models in server.toml — this post will not start a turn</span>"#
+            .to_string()
+    } else {
+        let none_sel = if current.is_none() { " selected" } else { "" };
+        let options: String = catalog
+            .models
+            .iter()
+            .map(|m| {
+                let selected = current.as_deref() == Some(m.key.as_str());
+                format!(
+                    r#"<option value="{key}"{sel}>{key}{ready}</option>"#,
+                    key = escape(&m.key),
+                    sel = if selected { " selected" } else { "" },
+                    ready = if m.ready { "" } else { " — unready" },
+                )
+            })
+            .collect();
+        let efforts = ["low", "medium", "high", "max"]
+            .into_iter()
+            .map(|e| {
+                format!(
+                    r#"<option value="{e}"{sel}>{e}</option>"#,
+                    sel = if effort == e { " selected" } else { "" },
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<div class="chat-dials">
+                 <label>model
+                   <select id="model-{id}"><option value=""{none_sel}>transcript only</option>{options}</select>
+                 </label>
+                 <label>effort
+                   <select id="effort-{id}">{efforts}</select>
+                 </label>
+               </div>"#
+        )
+    };
+    format!(
+        r#"<form class="composer" data-chat="{id}">
+             <textarea id="composer-{id}" class="composer-input" rows="1"
+               placeholder="message — enter to send, shift-enter for a newline">{draft}</textarea>
+             <div class="composer-foot">{dials}{cancel}
+               <button class="primary-button">send</button></div>
+           </form>"#
+    )
 }
 
-fn bubble(dot: &str, who: &str, text: &str, extra: &str) -> String {
+fn bubble(dot: &str, who: &str, text: &str, extra: &str, markdown: bool) -> String {
     format!(
         r#"<div class="entry">
              <div class="byline"><span class="seat {dot}"></span>
                <span class="dim">{who}</span></div>
-             <div class="entry-body">{text}{extra}</div>
+             <div class="entry-body{md}">{text}{extra}</div>
            </div>"#,
         who = escape(who),
+        md = if markdown { " md" } else { "" },
     )
 }
 
@@ -1976,10 +2097,13 @@ fn palette_overlay(state: &State) -> String {
 /// dispatch cannot spin (the repeat measurement produces no effect and no
 /// state change worth re-rendering... except the action log; hence the
 /// edge-side dedupe here too).
-fn measure_focused_tty(document: &web_sys::Document) {
+fn measure_focused_tty(document: &web_sys::Document, id: Option<String>) {
     thread_local! {
         static LAST: RefCell<Option<(String, u16, u16)>> = const { RefCell::new(None) };
     }
+    let Some(id) = id else {
+        return;
+    };
     let Some(el) = document
         .query_selector(".pane.focused [data-tty-screen]")
         .ok()
@@ -1998,9 +2122,6 @@ fn measure_focused_tty(document: &web_sys::Document) {
         .floor()
         .clamp(20.0, 500.0) as u16;
     let rows = ((el.client_height() as f64) / ch).floor().clamp(5.0, 200.0) as u16;
-    let id = STATE
-        .with(|s| s.borrow().workspace.selected.clone())
-        .unwrap_or_default();
     let fresh = LAST.with(|last| {
         let mut last = last.borrow_mut();
         if *last == Some((id.clone(), cols, rows)) {
@@ -2010,7 +2131,7 @@ fn measure_focused_tty(document: &web_sys::Document) {
             true
         }
     });
-    if fresh && !id.is_empty() {
+    if fresh {
         dispatch(Action::PaneMeasured { id, cols, rows });
     }
 }

@@ -356,6 +356,32 @@ impl ModelCatalog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// What a client may list: keys, whether credentials resolved, and
+    /// the catalog's default effort. Never the token.
+    pub fn listing(&self, default: Option<&str>) -> Vec<ModelListing> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| ModelListing {
+                key: key.clone(),
+                ready: entry.auth_error.is_none(),
+                effort: entry.backend.effort().unwrap_or(Effort::DEFAULT),
+                default: default == Some(key.as_str()),
+            })
+            .collect()
+    }
+}
+
+/// One catalog row for a client. Capability discovery, not credentials.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelListing {
+    pub key: String,
+    /// `false` when the auth source did not resolve — the key is known,
+    /// but a create/configure with it will fail until the credential is
+    /// there.
+    pub ready: bool,
+    pub effort: Effort,
+    pub default: bool,
 }
 
 /// Reasoning / extended-thinking effort level sent to providers.
@@ -436,6 +462,26 @@ impl BackendConfig {
             BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
             BackendConfig::OpenAICompletions(_) => Protocol::OpenAICompletions,
         }
+    }
+
+    /// The effort this backend will request, if any.
+    pub fn effort(&self) -> Option<Effort> {
+        match self {
+            BackendConfig::Anthropic(c) => c.effort,
+            BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => c.effort,
+        }
+    }
+
+    /// Copy with a different effort. Catalog defaults stay; a chat's dial
+    /// overrides per instance.
+    pub fn with_effort(mut self, effort: Effort) -> Self {
+        match &mut self {
+            BackendConfig::Anthropic(c) => c.effort = Some(effort),
+            BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
+                c.effort = Some(effort)
+            }
+        }
+        self
     }
 }
 
