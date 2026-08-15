@@ -45,12 +45,27 @@ impl RosterUser {
 /// `server.toml` as written on disk — the whole file, before any of it is
 /// validated. Every section is optional to *parse*; what is required is
 /// decided where it is used (a roster with no users is refused, an absent
+/// One `[[hosts]]` entry: a machine to dial at startup. Each becomes a
+/// `host` instance owned by the operator; the command runs under `sh -c`
+/// and its stdio becomes the provider stream.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostEntry {
+    /// The instance's title — what the tree shows. The provider announces
+    /// its own name too; this one is the operator's word for it.
+    pub name: String,
+    /// The line that reaches a provider's stdio, e.g. `ssh box myco-hostd`.
+    pub command: String,
+}
+
 /// `[passkeys]` takes the localhost defaults, an empty catalog is a
 /// modelless workspace).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
     pub users: Vec<RosterUser>,
+    /// Optional `[[hosts]]` entries — machines to dial at startup.
+    #[serde(default)]
+    pub hosts: Vec<HostEntry>,
     /// Optional `[passkeys]` section; defaults serve the localhost story.
     #[serde(default)]
     pub passkeys: PasskeySettings,
@@ -107,6 +122,8 @@ pub struct Roster {
     pub passkeys: PasskeySettings,
     /// The unresolved model catalog (`model` / `[gateways]` / `[models]`).
     pub catalog: myco_models::CatalogFile,
+    /// Machines to dial at startup (`[[hosts]]` in the same file).
+    pub hosts: Vec<HostEntry>,
 }
 
 /// What a usable `server.toml` looks like, quoted in every startup error so
@@ -139,9 +156,19 @@ impl Roster {
     ) -> Result<Self, String> {
         let ServerConfig {
             users,
+            hosts,
             passkeys,
             catalog,
         } = file;
+        for host in &hosts {
+            if host.name.trim().is_empty() || host.command.trim().is_empty() {
+                return Err(format!(
+                    "{}: a [[hosts]] entry needs both name and command \
+                     (e.g. name = \"buildbox\", command = \"ssh buildbox myco-hostd\")",
+                    path.display()
+                ));
+            }
+        }
         if users.is_empty() {
             return Err(format!(
                 "no users defined in {} — add at least one [[users]] entry:\n\n{EXAMPLE_SERVER_TOML}",
@@ -198,6 +225,7 @@ impl Roster {
             local,
             passkeys,
             catalog,
+            hosts,
         })
     }
 }

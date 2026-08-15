@@ -318,3 +318,96 @@ async fn a_wrong_protocol_ends_the_stream() {
     let outcome = task.await.expect("serve task finishes");
     assert!(outcome.is_err(), "unequal protocol is fatal, not negotiated");
 }
+
+/// The two halves against each other over a duplex: adopt, create, call,
+/// watch, remove — the full relay, no processes involved.
+#[tokio::test]
+async fn serve_and_attach_relay_a_pool_end_to_end() {
+    let far = pool_with_counter();
+    let near = Pool::new();
+    let (near_io, far_io) = tokio::io::duplex(1 << 16);
+    let (fr, fw) = tokio::io::split(far_io);
+    let _serve = tokio::spawn(serve(far.clone(), "farbox", fr, fw));
+
+    let (nr, nw) = tokio::io::split(near_io);
+    let attached = crate::attach(near.clone(), "h-1", nr, nw)
+        .await
+        .expect("handshake");
+    assert_eq!(attached.name, "farbox");
+    assert_eq!(attached.kinds.len(), 1);
+    let link = attached.link.clone();
+    let _run = tokio::spawn(attached.run());
+
+    let info = link
+        .create(&ada(), "counter", "default", "far counter", json!({}))
+        .await
+        .expect("creates over the wire");
+
+    // The row frame lands asynchronously; adoption makes it a listing
+    // fact with the host as parent.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let listed = near.list(None).into_iter().any(|r| r.id == info.id);
+        if listed {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "row adopted in time");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let row = near
+        .list(None)
+        .into_iter()
+        .find(|r| r.id == info.id)
+        .expect("listed");
+    assert_eq!(row.parent.as_deref(), Some("h-1"));
+
+    // Verbs flow through the near pool as if the instance were local.
+    assert_eq!(
+        near.call(&ada(), &info.id, "bump", Value::Null).await,
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        near.call(&ada(), &info.id, "about", Value::Null).await,
+        Ok(json!({"n": 1}))
+    );
+
+    // So does the watermark contract: the far bump reached the near watch.
+    let mark = near.changed(&info.id, 0).await.expect("changed resolves");
+    assert!(mark >= 1);
+
+    // And removal: forwarded, relayed back as gone, forgotten locally.
+    assert_eq!(
+        near.call(&ada(), &info.id, "sys.remove", Value::Null).await,
+        Ok(Value::Null)
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while near.list(None).iter().any(|r| r.id == info.id) {
+        assert!(tokio::time::Instant::now() < deadline, "row dropped in time");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// EOF is death: when the provider's stream ends, every adopted row
+/// leaves the pool and pending calls answer gone.
+#[tokio::test]
+async fn a_dead_stream_sweeps_its_rows() {
+    let far = pool_with_counter();
+    far.create(&ada(), "counter", "default", "doomed", json!({}))
+        .expect("creates");
+    let near = Pool::new();
+    let (near_io, far_io) = tokio::io::duplex(1 << 16);
+    let (fr, fw) = tokio::io::split(far_io);
+    let serve_task = tokio::spawn(serve(far.clone(), "farbox", fr, fw));
+
+    let (nr, nw) = tokio::io::split(near_io);
+    let attached = crate::attach(near.clone(), "h-1", nr, nw)
+        .await
+        .expect("handshake");
+    assert_eq!(near.list(None).len(), 1, "the hello row was adopted");
+    let run = tokio::spawn(attached.run());
+
+    // Kill the far end; the near side sees EOF and sweeps.
+    serve_task.abort();
+    let _ = run.await;
+    assert_eq!(near.list(None).len(), 0, "rows swept on stream death");
+}
