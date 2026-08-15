@@ -8,6 +8,8 @@ members = [
     "crates/kind-notifier",
     "crates/models",
     "crates/wire",
+    "crates/provider",
+    "crates/hostd",
     "crates/server",
     "crates/myco",
     "clients/web",
