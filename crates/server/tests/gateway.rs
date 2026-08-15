@@ -1,15 +1,17 @@
 //! The generic verb gateway, end to end over HTTP: create, list, call —
 //! including `sys.*` — with the serde error form as the wire body. One
 //! dynamic route carries every kind; these tests use a local counter kind
-//! so nothing here depends on a shell.
+//! so nothing here depends on a shell. (Auth contract details live in
+//! auth_http.rs; here every request simply bears ada's token.)
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
-use myco_instance::{Instance, Kind, KindSpec, Pool, Principal, VerbError, VerbSpec};
+use myco_instance::{Instance, Kind, KindSpec, Pool, VerbError, VerbSpec};
 use myco_runtime::Signals;
+use myco_server::auth::AuthStore;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -61,10 +63,14 @@ impl Kind for CounterKind {
     }
 }
 
-fn app() -> axum::Router {
+/// Router plus a live bearer token for ada.
+fn app() -> (axum::Router, String) {
+    let auth = Arc::new(AuthStore::in_memory());
+    auth.add_user("ada", "Ada Lovelace").unwrap();
+    let token = auth.issue_for("ada").unwrap().access_token;
     let pool = Pool::new();
     pool.register(Arc::new(CounterKind));
-    myco_server::router(pool, Principal::Human("ada".into()))
+    (myco_server::router(pool, auth), token)
 }
 
 async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -79,26 +85,37 @@ async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) 
     (status, body)
 }
 
-fn post(uri: &str, body: Value) -> Request<Body> {
-    Request::builder()
+fn post(token: &str, uri: &str, body: Value) -> Request<Body> {
+    let builder = Request::builder()
         .method("POST")
         .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .header("authorization", format!("Bearer {token}"));
+    if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
 }
 
-fn get(uri: &str) -> Request<Body> {
-    Request::builder().uri(uri).body(Body::empty()).unwrap()
+fn get(token: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tokio::test]
 async fn create_call_and_read_through_one_route() {
-    let app = app();
+    let (app, tok) = app();
 
     let (status, info) = send(
         &app,
         post(
+            &tok,
             "/api/instances",
             json!({"kind": "counter", "project": "alpha", "args": {"start": 40}}),
         ),
@@ -111,7 +128,11 @@ async fn create_call_and_read_through_one_route() {
 
     let (status, n) = send(
         &app,
-        post(&format!("/api/instances/{id}/verbs/incr"), json!({"by": 2})),
+        post(
+            &tok,
+            &format!("/api/instances/{id}/verbs/incr"),
+            json!({"by": 2}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -120,11 +141,7 @@ async fn create_call_and_read_through_one_route() {
     // A read with no body: absent args are null.
     let (status, n) = send(
         &app,
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/instances/{id}/verbs/get"))
-            .body(Body::empty())
-            .unwrap(),
+        post(&tok, &format!("/api/instances/{id}/verbs/get"), Value::Null),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -133,7 +150,11 @@ async fn create_call_and_read_through_one_route() {
     // sys.* rides the same route — the gateway adds nothing per verb.
     let (status, meta) = send(
         &app,
-        post(&format!("/api/instances/{id}/verbs/sys.meta"), Value::Null),
+        post(
+            &tok,
+            &format!("/api/instances/{id}/verbs/sys.meta"),
+            Value::Null,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -143,11 +164,12 @@ async fn create_call_and_read_through_one_route() {
 
 #[tokio::test]
 async fn listing_scopes_by_project() {
-    let app = app();
+    let (app, tok) = app();
     for project in ["alpha", "alpha", "beta"] {
         let (status, _) = send(
             &app,
             post(
+                &tok,
                 "/api/instances",
                 json!({"kind": "counter", "project": project}),
             ),
@@ -156,9 +178,9 @@ async fn listing_scopes_by_project() {
         assert_eq!(status, StatusCode::OK);
     }
 
-    let (_, all) = send(&app, get("/api/instances")).await;
+    let (_, all) = send(&app, get(&tok, "/api/instances")).await;
     assert_eq!(all.as_array().unwrap().len(), 3);
-    let (_, alpha) = send(&app, get("/api/instances?project=alpha")).await;
+    let (_, alpha) = send(&app, get(&tok, "/api/instances?project=alpha")).await;
     assert_eq!(alpha.as_array().unwrap().len(), 2);
 }
 
@@ -166,21 +188,33 @@ async fn listing_scopes_by_project() {
 /// wire body and the verb log can never disagree about what went wrong.
 #[tokio::test]
 async fn refusals_map_to_status_codes_with_the_serde_body() {
-    let app = app();
+    let (app, tok) = app();
 
-    let (status, err) = send(&app, post("/api/instances", json!({"kind": "nope"}))).await;
+    let (status, err) = send(&app, post(&tok, "/api/instances", json!({"kind": "nope"}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(err["error"], "unknown_kind");
 
-    let (status, err) = send(&app, post("/api/instances/nope/verbs/get", Value::Null)).await;
+    let (status, err) = send(
+        &app,
+        post(&tok, "/api/instances/nope/verbs/get", Value::Null),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(err["error"], "unknown_instance");
 
-    let (_, info) = send(&app, post("/api/instances", json!({"kind": "counter"}))).await;
+    let (_, info) = send(
+        &app,
+        post(&tok, "/api/instances", json!({"kind": "counter"})),
+    )
+    .await;
     let id = info["id"].as_str().unwrap();
     let (status, err) = send(
         &app,
-        post(&format!("/api/instances/{id}/verbs/explode"), Value::Null),
+        post(
+            &tok,
+            &format!("/api/instances/{id}/verbs/explode"),
+            Value::Null,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -190,6 +224,7 @@ async fn refusals_map_to_status_codes_with_the_serde_body() {
     let (status, _) = send(
         &app,
         post(
+            &tok,
             &format!("/api/instances/{id}/verbs/sys.remove"),
             Value::Null,
         ),
@@ -198,7 +233,7 @@ async fn refusals_map_to_status_codes_with_the_serde_body() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = send(
         &app,
-        post(&format!("/api/instances/{id}/verbs/get"), Value::Null),
+        post(&tok, &format!("/api/instances/{id}/verbs/get"), Value::Null),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
