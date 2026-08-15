@@ -251,7 +251,11 @@ async fn sys_verbs_forward_and_removal_travels_as_gone() {
     let meta: InstanceInfo =
         serde_json::from_value(side.reply(1).await.expect("meta answers")).expect("a row");
     assert_eq!(meta.title, "doomed");
-    assert_eq!(meta.driver, Some(ada()), "the seat lives over here, forwarded");
+    assert_eq!(
+        meta.driver,
+        Some(ada()),
+        "the seat lives over here, forwarded"
+    );
 
     side.send(&ToProvider::Call {
         seq: 2,
@@ -297,9 +301,7 @@ async fn a_slow_verb_does_not_convoy_other_replies() {
     })
     .await;
 
-    let first = side
-        .recv_until(|f| matches!(f, ToPool::Reply { .. }))
-        .await;
+    let first = side.recv_until(|f| matches!(f, ToPool::Reply { .. })).await;
     let ToPool::Reply { seq, .. } = first else {
         unreachable!()
     };
@@ -316,7 +318,10 @@ async fn a_wrong_protocol_ends_the_stream() {
     side.send(&ToProvider::Hello { protocol: 999 }).await;
 
     let outcome = task.await.expect("serve task finishes");
-    assert!(outcome.is_err(), "unequal protocol is fatal, not negotiated");
+    assert!(
+        outcome.is_err(),
+        "unequal protocol is fatal, not negotiated"
+    );
 }
 
 /// The two halves against each other over a duplex: adopt, create, call,
@@ -339,7 +344,7 @@ async fn serve_and_attach_relay_a_pool_end_to_end() {
     let _run = tokio::spawn(attached.run());
 
     let info = link
-        .create(&ada(), "counter", "default", "far counter", json!({}))
+        .create(&ada(), "counter", "default", "far-counter", json!({}))
         .await
         .expect("creates over the wire");
 
@@ -351,7 +356,10 @@ async fn serve_and_attach_relay_a_pool_end_to_end() {
         if listed {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "row adopted in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row adopted in time"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let row = near
@@ -382,7 +390,10 @@ async fn serve_and_attach_relay_a_pool_end_to_end() {
     );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while near.list(None).iter().any(|r| r.id == info.id) {
-        assert!(tokio::time::Instant::now() < deadline, "row dropped in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row dropped in time"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

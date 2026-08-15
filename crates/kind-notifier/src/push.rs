@@ -66,10 +66,7 @@ impl Pusher {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
-                    let _ = std::fs::set_permissions(
-                        path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
                 }
                 secret
             }
@@ -89,10 +86,7 @@ impl Pusher {
     /// The application server key a browser subscribes with: the raw
     /// uncompressed point, base64url.
     pub fn public_key_b64(&self) -> String {
-        let point = self
-            .vapid
-            .verifying_key()
-            .to_encoded_point(false);
+        let point = self.vapid.verifying_key().to_encoded_point(false);
         B64.encode(point.as_bytes())
     }
 
@@ -103,7 +97,11 @@ impl Pusher {
             .as_str()
             .ok_or("a subscription has an endpoint")?;
         let ua_public = B64
-            .decode(subscription["keys"]["p256dh"].as_str().ok_or("keys.p256dh")?)
+            .decode(
+                subscription["keys"]["p256dh"]
+                    .as_str()
+                    .ok_or("keys.p256dh")?,
+            )
             .map_err(|e| format!("p256dh: {e}"))?;
         let auth = B64
             .decode(subscription["keys"]["auth"].as_str().ok_or("keys.auth")?)
@@ -139,13 +137,14 @@ impl Pusher {
             .as_secs()
             + 12 * 60 * 60;
         let header = B64.encode(r#"{"typ":"JWT","alg":"ES256"}"#);
-        let claims = B64.encode(
-            json!({ "aud": aud, "exp": exp, "sub": self.contact }).to_string(),
-        );
+        let claims = B64.encode(json!({ "aud": aud, "exp": exp, "sub": self.contact }).to_string());
         let signing_input = format!("{header}.{claims}");
         // A JWS ES256 signature is raw r‖s (64 bytes), not DER.
         let signature: p256::ecdsa::Signature = self.vapid.sign(signing_input.as_bytes());
-        Ok(format!("{signing_input}.{}", B64.encode(signature.to_bytes())))
+        Ok(format!(
+            "{signing_input}.{}",
+            B64.encode(signature.to_bytes())
+        ))
     }
 
     #[cfg(test)]
@@ -168,8 +167,7 @@ pub fn encrypt(
     eph: Option<p256::SecretKey>,
     salt: Option<[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
-    let ua_key =
-        p256::PublicKey::from_sec1_bytes(ua_public).map_err(|e| format!("ua key: {e}"))?;
+    let ua_key = p256::PublicKey::from_sec1_bytes(ua_public).map_err(|e| format!("ua key: {e}"))?;
     let as_secret = eph.unwrap_or_else(random_secret);
     let as_public = as_secret.public_key().to_encoded_point(false);
     let shared = p256::ecdh::diffie_hellman(as_secret.to_nonzero_scalar(), ua_key.as_affine());
@@ -230,8 +228,7 @@ pub(crate) fn decrypt(ua_secret: &p256::SecretKey, auth: &[u8], body: &[u8]) -> 
     let as_public = p256::PublicKey::from_sec1_bytes(&body[21..21 + idlen]).unwrap();
     let ciphertext = &body[21 + idlen..];
 
-    let shared =
-        p256::ecdh::diffie_hellman(ua_secret.to_nonzero_scalar(), as_public.as_affine());
+    let shared = p256::ecdh::diffie_hellman(ua_secret.to_nonzero_scalar(), as_public.as_affine());
     let mut info = b"WebPush: info\x00".to_vec();
     info.extend_from_slice(ua_secret.public_key().to_encoded_point(false).as_bytes());
     info.extend_from_slice(as_public.to_encoded_point(false).as_bytes());
@@ -241,9 +238,11 @@ pub(crate) fn decrypt(ua_secret: &p256::SecretKey, auth: &[u8], body: &[u8]) -> 
         .unwrap();
     let kdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), &ikm);
     let mut cek = [0u8; 16];
-    kdf.expand(b"Content-Encoding: aes128gcm\x00", &mut cek).unwrap();
+    kdf.expand(b"Content-Encoding: aes128gcm\x00", &mut cek)
+        .unwrap();
     let mut nonce = [0u8; 12];
-    kdf.expand(b"Content-Encoding: nonce\x00", &mut nonce).unwrap();
+    kdf.expand(b"Content-Encoding: nonce\x00", &mut nonce)
+        .unwrap();
 
     let mut record = Aes128Gcm::new((&cek).into())
         .decrypt((&nonce).into(), ciphertext)
@@ -292,8 +291,7 @@ mod tests {
             parts.next().unwrap(),
         );
 
-        let claims_json: Value =
-            serde_json::from_slice(&B64.decode(claims).unwrap()).unwrap();
+        let claims_json: Value = serde_json::from_slice(&B64.decode(claims).unwrap()).unwrap();
         assert_eq!(claims_json["aud"], "https://push.example.net:8443");
         assert_eq!(claims_json["sub"], "mailto:test@myco.invalid");
         assert!(claims_json["exp"].as_u64().unwrap() > 0);

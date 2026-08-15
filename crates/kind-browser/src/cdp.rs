@@ -170,7 +170,10 @@ pub async fn launch(
                     continue;
                 };
                 if let Some(id) = frame["id"].as_u64() {
-                    let waiter = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    let waiter = pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
                     if let Some(tx) = waiter {
                         let result = match frame.get("error") {
                             Some(err) => Err(err["message"]

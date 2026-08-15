@@ -84,6 +84,7 @@ pub fn router_with(
     default_model: Option<String>,
 ) -> Result<Router, String> {
     let webauthn = Arc::new(passkey::build_webauthn(passkeys)?);
+    let operator = auth::normalize_id(&operator.into());
     Ok(Router::new()
         .route("/api/kinds", get(kinds))
         .route("/api/models", get(models))
@@ -123,7 +124,7 @@ pub fn router_with(
         .with_state(App {
             pool,
             auth,
-            operator: operator.into(),
+            operator,
             webauthn,
             catalog,
             default_model,

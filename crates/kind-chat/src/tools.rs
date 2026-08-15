@@ -245,9 +245,8 @@ fn format_object(info: &myco_instance::InstanceInfo, payload: &Value) -> String 
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| payload.to_string());
-    if text.len() > LOOK_TEXT_CAP {
-        let skip = text.len() - LOOK_TEXT_CAP;
-        text = format!("[truncated; last {LOOK_TEXT_CAP} bytes]\n{}", &text[skip..]);
+    if tail::keep_freshest(&mut text, LOOK_TEXT_CAP) {
+        text.insert_str(0, &format!("[truncated; last {LOOK_TEXT_CAP} bytes]\n"));
     }
     let running = payload.get("running").and_then(Value::as_bool);
     let mut head = format!("{} {} id={}", info.kind, info.title, info.id);
@@ -462,5 +461,34 @@ impl Drop for RemoveOnDrop {
                 Err(e) => eprintln!("myco: tool tty {id} not removed: {e}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn look_truncation_never_splits_a_codepoint() {
+        let tail = "x".repeat(LOOK_TEXT_CAP - 1);
+        let text = format!("é{tail}");
+        assert_eq!(text.len(), LOOK_TEXT_CAP + 1);
+        let info = myco_instance::InstanceInfo {
+            id: "one".into(),
+            kind: "tty".into(),
+            project: String::new(),
+            title: "shell".into(),
+            creator: Principal::Human("ada".into()),
+            parent: None,
+            driver: None,
+            watermark: 0,
+            crashed: false,
+            created_at: chrono::Utc::now(),
+        };
+
+        let rendered = format_object(&info, &json!({"text": text}));
+
+        assert!(rendered.contains(&format!("[truncated; last {LOOK_TEXT_CAP} bytes]")));
+        assert!(rendered.ends_with(&tail));
     }
 }

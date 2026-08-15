@@ -84,7 +84,11 @@ pub enum ToPool {
     Mark { id: String, watermark: Watermark },
     /// One instance event, id-tagged — the provider's global feed,
     /// relayed verbatim.
-    Event { id: String, name: String, data: Value },
+    Event {
+        id: String,
+        name: String,
+        data: Value,
+    },
     /// The instance is no longer over there: removed, or its kind
     /// crashed and the provider dropped it. The pool forgets the row.
     Gone { id: String },
@@ -261,7 +265,10 @@ mod tests {
             seq: 3,
             outcome: Ok(json!({"rows": 2})).into(),
         };
-        assert_eq!(encode(&ok), "{\"t\":\"reply\",\"seq\":3,\"ok\":{\"rows\":2}}\n");
+        assert_eq!(
+            encode(&ok),
+            "{\"t\":\"reply\",\"seq\":3,\"ok\":{\"rows\":2}}\n"
+        );
 
         let err = ToPool::Reply {
             seq: 4,

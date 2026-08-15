@@ -20,9 +20,7 @@ use myco_server::auth::AuthStore;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use webauthn_authenticator_rs::{WebauthnAuthenticator, softtoken::SoftToken};
-use webauthn_rs::prelude::{
-    CreationChallengeResponse, RequestChallengeResponse, Url,
-};
+use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
 
 fn router_over(auth: &Arc<AuthStore>) -> axum::Router {
     let pool = Pool::new();

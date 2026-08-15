@@ -89,9 +89,14 @@ async fn the_page_answers_computer_use_end_to_end() {
         .find(|n| n["name"] == "press me")
         .expect("the button is in the tree")["ref"]
         .clone();
-    pool.call(&ada(), &page.id, "click", serde_json::json!({ "ref": button }))
-        .await
-        .expect("clicks");
+    pool.call(
+        &ada(),
+        &page.id,
+        "click",
+        serde_json::json!({ "ref": button }),
+    )
+    .await
+    .expect("clicks");
     pool.wait_until(&ada(), &page.id, "about", in_secs(30), |about| {
         about["title"] == "pressed"
     })
@@ -111,9 +116,14 @@ async fn the_page_answers_computer_use_end_to_end() {
         .find(|n| n["name"] == "the field")
         .expect("the field is in the tree")["ref"]
         .clone();
-    pool.call(&ada(), &page.id, "click", serde_json::json!({ "ref": field }))
-        .await
-        .expect("focuses");
+    pool.call(
+        &ada(),
+        &page.id,
+        "click",
+        serde_json::json!({ "ref": field }),
+    )
+    .await
+    .expect("focuses");
     pool.call(
         &ada(),
         &page.id,

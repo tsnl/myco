@@ -22,7 +22,7 @@ async fn fixture() -> (axum::Router, String, String) {
     let grace = auth.issue_for("grace").unwrap().access_token;
     let pool = myco_instance::Pool::new();
     pool.register(Arc::new(common::CounterKind));
-    (myco_server::router(pool, auth, "ada"), ada, grace)
+    (myco_server::router(pool, auth, "Ada"), ada, grace)
 }
 
 async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {

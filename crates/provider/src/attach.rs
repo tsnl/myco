@@ -171,7 +171,11 @@ where
     let (out, mut out_rx) = tokio::sync::mpsc::channel::<wire::ToProvider>(256);
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if writer.write_all(wire::encode(&frame).as_bytes()).await.is_err() {
+            if writer
+                .write_all(wire::encode(&frame).as_bytes())
+                .await
+                .is_err()
+            {
                 break;
             }
             if writer.flush().await.is_err() {
@@ -269,11 +273,7 @@ impl<R> Drop for Attached<R> {
     fn drop(&mut self) {
         self.writer.abort();
         self.pool.drop_remotes_from(&self.origin);
-        let mut pending = self
-            .link
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.link.pending.lock().unwrap_or_else(|e| e.into_inner());
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(VerbError::Gone));
         }

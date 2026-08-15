@@ -257,8 +257,7 @@ fn deliver(
     if endpoints.is_empty() {
         return;
     }
-    let payload =
-        json!({ "title": attention.title, "body": attention.body }).to_string();
+    let payload = json!({ "title": attention.title, "body": attention.body }).to_string();
     tokio::spawn(async move {
         for subscription in endpoints {
             if let Ok(404 | 410) = pusher.send(&subscription, payload.as_bytes()).await {

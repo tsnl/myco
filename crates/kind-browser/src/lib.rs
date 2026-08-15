@@ -19,9 +19,7 @@ mod cdp;
 
 use std::sync::{Arc, Mutex};
 
-use myco_instance::{
-    CreateCtx, Instance, Kind, KindSpec, Principal, Shared, VerbError, VerbSpec,
-};
+use myco_instance::{CreateCtx, Instance, Kind, KindSpec, Principal, Shared, VerbError, VerbSpec};
 use myco_runtime::Signals;
 use serde_json::{Value, json};
 
@@ -33,7 +31,10 @@ static BROWSER_SPEC: KindSpec = KindSpec {
     verbs: &[
         VerbSpec::read("about", "status, url, title"),
         VerbSpec::read("screenshot", "the page as {png} (base64)"),
-        VerbSpec::read("a11y", "the accessibility tree: [{ref, role, name, value?}]"),
+        VerbSpec::read(
+            "a11y",
+            "the accessibility tree: [{ref, role, name, value?}]",
+        ),
         VerbSpec::read("text", "the accessibility tree, flattened to plain text"),
         VerbSpec::driven("goto", "navigate to {url}"),
         VerbSpec::driven("click", "click node {ref} (a ref from a11y)"),
@@ -78,10 +79,7 @@ impl Kind for BrowserKind {
                     .collect()
             })
             .unwrap_or_default();
-        let start_url = args
-            .get("url")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let start_url = args.get("url").and_then(Value::as_str).map(str::to_string);
 
         let shared = Shared::new(
             PageState {
@@ -99,7 +97,10 @@ impl Kind for BrowserKind {
                 match cdp::launch(&browser, &extra, signals).await {
                     Ok(launched) => {
                         if let Some(url) = start_url {
-                            let _ = launched.cdp.cmd("Page.navigate", json!({ "url": url })).await;
+                            let _ = launched
+                                .cdp
+                                .cmd("Page.navigate", json!({ "url": url }))
+                                .await;
                         }
                         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(launched);
                         shared.with(|s| s.status = "ready");
@@ -217,12 +218,12 @@ impl Instance for Browser {
                 Ok(Value::String(lines.join("\n")))
             }
             "goto" => {
-                let url = args
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| VerbError::BadArgs {
-                        why: "goto needs {url}".into(),
-                    })?;
+                let url =
+                    args.get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "goto needs {url}".into(),
+                        })?;
                 let (cdp, _) = self.cdp()?;
                 let nav = cdp
                     .cmd("Page.navigate", json!({ "url": url }))
@@ -234,12 +235,12 @@ impl Instance for Browser {
                 Ok(Value::Null)
             }
             "click" => {
-                let node = args
-                    .get("ref")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| VerbError::BadArgs {
-                        why: "click needs {ref} — a node ref from a11y".into(),
-                    })?;
+                let node =
+                    args.get("ref")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "click needs {ref} — a node ref from a11y".into(),
+                        })?;
                 let (cdp, _) = self.cdp()?;
                 let model = cdp
                     .cmd("DOM.getBoxModel", json!({ "backendNodeId": node }))
@@ -270,12 +271,12 @@ impl Instance for Browser {
                 Ok(Value::Null)
             }
             "type" => {
-                let text = args
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| VerbError::BadArgs {
-                        why: "type needs {text}".into(),
-                    })?;
+                let text =
+                    args.get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "type needs {text}".into(),
+                        })?;
                 let (cdp, _) = self.cdp()?;
                 cdp.cmd("Input.insertText", json!({ "text": text }))
                     .await
@@ -283,12 +284,12 @@ impl Instance for Browser {
                 Ok(Value::Null)
             }
             "key" => {
-                let key = args
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| VerbError::BadArgs {
-                        why: "key needs {key}".into(),
-                    })?;
+                let key =
+                    args.get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| VerbError::BadArgs {
+                            why: "key needs {key}".into(),
+                        })?;
                 let (code, text) = match key {
                     "Enter" => (13, Some("\r")),
                     "Tab" => (9, None),

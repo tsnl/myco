@@ -77,11 +77,11 @@ fn rig() -> (Pool, String, String) {
     pool.register(Arc::new(TargetKind));
     pool.register(Arc::new(CronKind::new(pool.clone())));
     let cron = pool
-        .create(&ada(), "cron", "", "the table", json!({}))
+        .create(&ada(), "cron", "", "the-table", json!({}))
         .expect("cron creates")
         .id;
     let target = pool
-        .create(&ada(), "target", "", "the target", json!({}))
+        .create(&ada(), "target", "", "the-target", json!({}))
         .expect("target creates")
         .id;
     (pool, cron, target)
@@ -157,7 +157,8 @@ async fn rm_forgets_the_entry_and_its_clock() {
     tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     assert_eq!(pokes(&pool, &target).await.0, 0);
     assert!(matches!(
-        pool.call(&ada(), &cron, "rm", json!({ "entry": entry })).await,
+        pool.call(&ada(), &cron, "rm", json!({ "entry": entry }))
+            .await,
         Err(VerbError::BadArgs { .. })
     ));
 }

@@ -11,6 +11,7 @@ use crate::core::{
     Action, AdminAct, Effect, Session, Stage, State, palette_rows, reduce, reserved_chord,
     wants_key,
 };
+use crate::html::escape;
 
 const TOKEN_KEY: &str = "myco.token";
 
@@ -236,11 +237,9 @@ fn run(effect: Effect) {
         Effect::EnrollPasskey { token } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(enroll_passkey(&token).await);
         }),
-        Effect::EnablePush { token, notifier } => {
-            wasm_bindgen_futures::spawn_local(async move {
-                dispatch(enable_push(&token, &notifier).await);
-            })
-        }
+        Effect::EnablePush { token, notifier } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(enable_push(&token, &notifier).await);
+        }),
         Effect::PasskeySignIn { username } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(passkey_sign_in(&username).await);
         }),
@@ -251,10 +250,12 @@ fn run(effect: Effect) {
             });
         }),
         Effect::FetchModels { token } => wasm_bindgen_futures::spawn_local(async move {
-            dispatch(match fetch("GET", "/api/models", Some(&token), None).await {
-                Ok((status, body)) => Action::ModelsAnswered { status, body },
-                Err(what) => Action::NetworkFailed { what },
-            });
+            dispatch(
+                match fetch("GET", "/api/models", Some(&token), None).await {
+                    Ok((status, body)) => Action::ModelsAnswered { status, body },
+                    Err(what) => Action::NetworkFailed { what },
+                },
+            );
         }),
         Effect::FetchInstances { token } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(
@@ -950,7 +951,12 @@ fn focus_summoned_field(document: &web_sys::Document) {
     {
         return;
     }
-    for id in ["rename-title", "project-slug", "palette-args", "palette-input"] {
+    for id in [
+        "rename-title",
+        "project-slug",
+        "palette-args",
+        "palette-input",
+    ] {
         let Some(el) = document.get_element_by_id(id) else {
             continue;
         };
@@ -1914,9 +1920,7 @@ fn host_card(view: &str) -> String {
 fn browser_pane(view: &str, pane: &crate::core::Pane) -> String {
     let shot: serde_json::Value = serde_json::from_str(view).unwrap_or_default();
     let image = match shot["png"].as_str().filter(|png| !png.is_empty()) {
-        Some(png) => format!(
-            r#"<img src="data:image/png;base64,{png}" alt="the page" />"#
-        ),
+        Some(png) => format!(r#"<img src="data:image/png;base64,{png}" alt="the page" />"#),
         None => r#"<div class="dim">no pixels yet — the browser may still be launching
                    (its about verb says)</div>"#
             .to_string(),
@@ -2145,12 +2149,4 @@ fn char_cell(document: &web_sys::Document) -> Option<(f64, f64)> {
     let (w, h) = (rect.width() / 10.0, rect.height());
     probe.remove();
     (w > 0.0 && h > 0.0).then_some((w, h))
-}
-
-/// Text into markup, safely. Server-controlled strings still get escaped —
-/// the render layer trusts nothing it did not write.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

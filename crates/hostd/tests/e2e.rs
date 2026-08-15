@@ -48,7 +48,7 @@ async fn a_host_dials_the_real_hostd_and_a_far_tty_answers() {
             "new",
             json!({
                 "kind": "tty",
-                "title": "far echo",
+                "title": "far-echo",
                 "args": { "mode": "piped", "command": "echo hello-from-far" },
             }),
         )
