@@ -73,8 +73,132 @@ fn run(effect: Effect) {
             // Best-effort revocation; the local state is already out.
             let _ = fetch("POST", "/api/auth/logout", Some(&token), None).await;
         }),
+        Effect::EnrollPasskey { token } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(enroll_passkey(&token).await);
+        }),
+        Effect::PasskeySignIn { username } => wasm_bindgen_futures::spawn_local(async move {
+            dispatch(passkey_sign_in(&username).await);
+        }),
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebAuthn ceremonies
+//
+// webauthn-rs speaks the exact JSON `PublicKeyCredential.parse*FromJSON`
+// and `credential.toJSON()` speak, so the ceremony is three passes through
+// a thin JS shim (the byte-mangling the older API required is exactly what
+// these Level-3 functions exist to delete).
+// ---------------------------------------------------------------------------
+
+async fn enroll_passkey(token: &str) -> Action {
+    let (status, challenge) =
+        match fetch("POST", "/api/auth/passkey/register/start", Some(token), None).await {
+            Ok(answer) => answer,
+            Err(what) => return Action::NetworkFailed { what },
+        };
+    if status != 200 {
+        return Action::PasskeyEnrollAnswered {
+            status,
+            body: challenge,
+        };
+    }
+    let credential = match ceremony("create", "parseCreationOptionsFromJSON", &challenge).await {
+        Ok(c) => c,
+        Err(why) => return Action::PasskeyFailed { why },
+    };
+    match fetch(
+        "POST",
+        "/api/auth/passkey/register/finish",
+        Some(token),
+        Some((JSON, credential)),
+    )
+    .await
+    {
+        Ok((status, body)) => Action::PasskeyEnrollAnswered { status, body },
+        Err(what) => Action::NetworkFailed { what },
+    }
+}
+
+async fn passkey_sign_in(username: &str) -> Action {
+    let start = serde_json::json!({ "username": username }).to_string();
+    let (status, body) = match fetch(
+        "POST",
+        "/api/auth/passkey/login/start",
+        None,
+        Some((JSON, start)),
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(what) => return Action::NetworkFailed { what },
+    };
+    if status != 200 {
+        // The uniform non-enumeration answer lands on the form verbatim.
+        return Action::TokenAnswered { status, body };
+    }
+    #[derive(serde::Deserialize)]
+    struct Challenge {
+        ticket: String,
+        options: serde_json::Value,
+    }
+    let Ok(challenge) = serde_json::from_str::<Challenge>(&body) else {
+        return Action::PasskeyFailed {
+            why: "the server's challenge made no sense".into(),
+        };
+    };
+    let assertion = match ceremony(
+        "get",
+        "parseRequestOptionsFromJSON",
+        &challenge.options.to_string(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(why) => return Action::PasskeyFailed { why },
+    };
+    let finish = format!(
+        r#"{{"ticket":{},"credential":{}}}"#,
+        serde_json::json!(challenge.ticket),
+        assertion
+    );
+    match fetch(
+        "POST",
+        "/api/auth/passkey/login/finish",
+        None,
+        Some((JSON, finish)),
+    )
+    .await
+    {
+        Ok((status, body)) => Action::TokenAnswered { status, body },
+        Err(what) => Action::NetworkFailed { what },
+    }
+}
+
+/// One browser ceremony: options JSON in, credential JSON out. `method` is
+/// `create` or `get`; `parser` the matching Level-3 parse function.
+async fn ceremony(method: &str, parser: &str, options_json: &str) -> Result<String, String> {
+    let body = format!(
+        "return navigator.credentials.{method}({{ publicKey: \
+         PublicKeyCredential.{parser}(JSON.parse(json).publicKey ?? JSON.parse(json)) }})\
+         .then(c => JSON.stringify(c.toJSON()));"
+    );
+    let shim = js_sys::Function::new_with_args("json", &body);
+    let promise = shim
+        .call1(&JsValue::NULL, &JsValue::from_str(options_json))
+        .map_err(|_| "this browser cannot run the passkey ceremony".to_string())?;
+    let promise: js_sys::Promise = promise
+        .dyn_into()
+        .map_err(|_| "this browser cannot run the passkey ceremony".to_string())?;
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(value) => value
+            .as_string()
+            .ok_or_else(|| "the ceremony returned nothing".into()),
+        Err(_) => Err("the passkey prompt was dismissed".into()),
+    }
+}
+
+const JSON: &str = "application/json";
 
 const FORM: &str = "application/x-www-form-urlencoded";
 
@@ -131,12 +255,24 @@ fn render(state: &State) {
         Session::Checking => shell_card("", "reaching the server…", ""),
         Session::Unreachable { why } => shell_card("attn", &escape(why), ""),
         Session::SignedOut => sign_in_card(state),
-        Session::SignedIn(user) => shell_card(
-            "ok",
-            &format!("signed in as {}", escape(user.display())),
-            r#"<div><button id="sign-out" class="quiet-button">sign out</button></div>
-               <div class="dim mono">the workspace arrives with the next PRs</div>"#,
-        ),
+        Session::SignedIn(user) => {
+            let note = match &state.passkey_note {
+                Some(note) => format!(r#"<div class="dim">{}</div>"#, escape(note)),
+                None => String::new(),
+            };
+            shell_card(
+                "ok",
+                &format!("signed in as {}", escape(user.display())),
+                &format!(
+                    r#"<div class="row-buttons">
+                         <button id="enroll-passkey" class="quiet-button">add a passkey</button>
+                         <button id="sign-out" class="quiet-button">sign out</button>
+                       </div>
+                       {note}
+                       <div class="dim mono">the workspace arrives with the next PRs</div>"#
+                ),
+            )
+        }
     };
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -180,6 +316,8 @@ fn sign_in_card(state: &State) -> String {
                           autocomplete="one-time-code" /></label>
                  {error}
                  <button class="primary-button" {busy}>sign in</button>
+                 <button type="button" id="passkey-sign-in" class="quiet-button" {busy}>
+                   sign in with a passkey</button>
                </form>
              </div>
            </div>"#
@@ -208,6 +346,26 @@ fn wire(document: &web_sys::Document) {
         let _ = form
             .add_event_listener_with_callback("submit", on_submit.as_ref().unchecked_ref());
         on_submit.forget();
+    }
+    if let Some(button) = document.get_element_by_id("passkey-sign-in") {
+        let doc = document.clone();
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let username = doc
+                .get_element_by_id("username")
+                .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+                .map(|i| i.value())
+                .unwrap_or_default();
+            dispatch(Action::PasskeySignInRequested { username });
+        });
+        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
+    }
+    if let Some(button) = document.get_element_by_id("enroll-passkey") {
+        let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            dispatch(Action::EnrollPasskeyRequested);
+        });
+        let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
+        on_click.forget();
     }
     if let Some(button) = document.get_element_by_id("sign-out") {
         let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
