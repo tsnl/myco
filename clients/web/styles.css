@@ -162,3 +162,75 @@ body {
 .status-dot.attn {
     background: var(--attn);
 }
+
+/* Forms: quiet fields on the island. */
+form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 4px;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+}
+
+.field input {
+    background: var(--sunken);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-row);
+    color: var(--ink);
+    font: inherit;
+    padding: 8px 12px;
+}
+
+.field input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+    border-color: transparent;
+}
+
+.field input.mono {
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+}
+
+.primary-button {
+    background: var(--accent);
+    border: none;
+    border-radius: var(--radius-row);
+    color: var(--surface);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    padding: 9px 14px;
+}
+
+.primary-button:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.quiet-button {
+    background: none;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-chip);
+    color: var(--dim);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 12px;
+}
+
+.quiet-button:hover {
+    color: var(--ink);
+    border-color: var(--faint);
+}
+
+.form-error {
+    color: var(--attn);
+    font-size: 12.5px;
+}
