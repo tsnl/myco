@@ -6,13 +6,15 @@ agents drive through the same **verbs**. See `DESIGN.md` — it is the
 contract this tree is held to, including the ledger of what crosses over
 from v2 (`main-v2` branch) and why.
 
-Current state: **M1 started** — L2 skeleton. `crates/server` serves
-`GET /api/kinds` (capability discovery off `Pool::kinds()`) with the
-COOP/COEP isolation headers. `crates/myco` is the binary: register tty,
-serve loopback (default `:7773`). No verb gateway, no auth, no GUI yet.
+Current state: **M1** — L2 is the human's adapter to the bus. Auth
+(one-time codes, passkeys, operator), the generic verb gateway, one
+multiplexed watch (`/api/instances/{id}/changed` + `/api/ws`), the
+operator admin surface, and `clients/myco.py`. Kinds: tty. No agent,
+no GUI yet.
 
 ```
 cargo test --workspace
+printf '[[users]]\nid = "%s"\n' "$USER" > ~/.myco/server.toml
 cargo run -p myco
-# → http://127.0.0.1:7773/api/kinds
+# banner prints a one-time code; then drive tty verbs over /api
 ```

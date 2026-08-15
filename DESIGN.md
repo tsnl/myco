@@ -503,7 +503,7 @@ Functionality crosses from v2 only with a verdict recorded here.
 | vt100 screen → styled runs renderer | **ported (M0)** | minus the embedded plain-text copy (now the `text` verb) |
 | shell scrollback + `tail(from)` | **re-derived (M0)** | cursored + budgeted (`max_bytes`) |
 | shell/subagent locks | **re-derived (M0)** | driver per-verb, apply-time fenced; + `owner_only` axis |
-| auth (codes, passkeys, tokens, admin routes, operator) | **port (M1)** | v2 got this right; lands in L2 nearly verbatim |
+| auth (codes, passkeys, tokens, admin routes, operator) | **ported (M1)** | v2 got this right; landed in L2 nearly verbatim |
 | SSE + shell WebSocket | **drop** | one multiplexed event/watch stream (M1) |
 | `MycoApi` trait + `HttpClient` + per-op routes | **drop** | generic verb gateway; four parallel op lists become one |
 | agent loop, models/providers, session store | **port + reshape (M2)** | the chat kind + the model-side adapter (dispatcher, standing subscriptions) |
@@ -515,7 +515,7 @@ Functionality crosses from v2 only with a verdict recorded here.
 | notifications (v2 never had them) | **new: notifier kind (M2/M4)** | see the worked requirement |
 | command palette (v2 never had one) | **new: `Cmd+P` over the registry (M3)** | entries derived from kind specs; one reducer, buttons emit the same actions — see L3 |
 | piped (non-pty) bash mode, signals, screenshot action | **pending** | port into kind-tty when the agent arrives (M2) |
-| README/TOUR | **rewrite as they become true** | |
+| README/TOUR | **rewrite as they become true** | README tracks the current milestone tip |
 
 ## Milestones
 
@@ -523,7 +523,7 @@ Functionality crosses from v2 only with a verdict recorded here.
   serialization, the apply-time fence, re-entrancy refusal, owner
   scoping, watermark semantics including removal, crash containment, and
   a live pty driven end-to-end through the bus.
-- **M1** — L2: auth port, generic verb gateway, one event stream,
+- **M1 (done)** — L2: auth port, generic verb gateway, one event stream,
   capability discovery; `myco.py` rewritten thin.
 - **M2** — chat kind (agent loop + providers ported), named-tool
   dispatcher, standing subscriptions, notifier kind; user-created chats

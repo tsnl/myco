@@ -37,10 +37,11 @@ impl FromRequestParts<App> for Operator {
 }
 
 /// The roster as the operator sees it: who exists, their state, their live
-/// sessions. (Passkey counts join this row when the passkey PRs land.)
+/// sessions, and how many passkeys they hold.
 pub(crate) async fn users(State(app): State<App>, _op: Operator) -> Json<Value> {
     let sessions: std::collections::HashMap<String, usize> =
         app.auth.session_counts().into_iter().collect();
+    let passkeys = app.auth.passkey_counts();
     let rows: Vec<Value> = app
         .auth
         .users()
@@ -51,6 +52,7 @@ pub(crate) async fn users(State(app): State<App>, _op: Operator) -> Json<Value> 
                 "name": u.name,
                 "disabled": u.disabled,
                 "sessions": sessions.get(&u.id).copied().unwrap_or(0),
+                "passkeys": passkeys.get(&u.id).copied().unwrap_or(0),
                 "operator": u.id == app.operator,
             })
         })
@@ -126,6 +128,17 @@ pub(crate) async fn revoke(
     Path(id): Path<String>,
 ) -> Json<Value> {
     Json(json!({"affected": app.auth.revoke_all_for(&id)}))
+}
+
+/// Forget every passkey for a user (lost or compromised authenticator).
+/// Live sessions survive — ending those is what revoke is for.
+pub(crate) async fn clear_passkeys(
+    State(app): State<App>,
+    _op: Operator,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let affected = app.auth.clear_passkeys(&id).map_err(auth_refusal)?;
+    Ok(Json(json!({"affected": affected})))
 }
 
 /// Forget a user's credentials entirely. If they are still in the roster,
