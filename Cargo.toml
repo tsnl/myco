@@ -6,6 +6,7 @@ members = [
     "crates/kind-tty",
     "crates/kind-chat",
     "crates/kind-notifier",
+    "crates/kind-cron",
     "crates/models",
     "crates/wire",
     "crates/provider",
