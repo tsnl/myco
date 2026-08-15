@@ -212,3 +212,111 @@ async fn removal_forgets_the_terminal() {
         Err(VerbError::UnknownInstance { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Piped mode + signals
+// ---------------------------------------------------------------------------
+
+/// The one-shot material: both streams captured, the exit code reported,
+/// and `running: false` only once the scrollback is complete.
+#[tokio::test]
+async fn piped_commands_report_exit_codes_with_complete_output() {
+    let pool = pool();
+    let info = pool
+        .create(
+            &ada(),
+            "tty",
+            "",
+            "",
+            json!({"command": "echo to-stdout; echo to-stderr >&2; exit 3", "mode": "piped"}),
+        )
+        .expect("create");
+
+    let text = wait_for(&pool, &ada(), &info.id, "text", Value::Null, |t| {
+        t["running"] == json!(false)
+    })
+    .await;
+    assert_eq!(text["exit_code"], json!(3));
+    assert_eq!(text["exit_signal"], Value::Null);
+    // Both streams are in the (complete) scrollback by the time running
+    // flips — the waiter drains the pumps first.
+    let tail = pool
+        .call(&ada(), &info.id, "tail", json!({"from": 0}))
+        .await
+        .expect("tail");
+    let data = tail["data"].as_str().unwrap();
+    assert!(data.contains("to-stdout"), "{data}");
+    assert!(data.contains("to-stderr"), "{data}");
+}
+
+/// Piped stdin: write, close with eof, and the reading child finishes.
+#[tokio::test]
+async fn piped_stdin_flows_and_eof_ends_it() {
+    let pool = pool();
+    let info = pool
+        .create(
+            &ada(),
+            "tty",
+            "",
+            "",
+            json!({"command": "wc -c", "mode": "piped"}),
+        )
+        .expect("create");
+
+    pool.call(&ada(), &info.id, "input", json!({"data": "12345"}))
+        .await
+        .expect("input");
+    pool.call(&ada(), &info.id, "input", json!({"eof": true}))
+        .await
+        .expect("eof");
+    let text = wait_for(&pool, &ada(), &info.id, "text", Value::Null, |t| {
+        t["running"] == json!(false)
+    })
+    .await;
+    assert_eq!(text["exit_code"], json!(0));
+    assert!(text["text"].as_str().unwrap().contains('5'), "{text}");
+}
+
+/// `signal` reaches the child's process group — the driver's Ctrl-C.
+#[tokio::test]
+async fn a_signal_ends_the_command_and_the_status_says_which() {
+    let pool = pool();
+    let info = pool
+        .create(
+            &ada(),
+            "tty",
+            "",
+            "",
+            json!({"command": "sleep 30", "mode": "piped"}),
+        )
+        .expect("create");
+
+    let delivered = pool
+        .call(&ada(), &info.id, "signal", json!({"signal": "TERM"}))
+        .await
+        .expect("signal");
+    assert_eq!(delivered["delivered"], json!(true));
+
+    let text = wait_for(&pool, &ada(), &info.id, "text", Value::Null, |t| {
+        t["running"] == json!(false)
+    })
+    .await;
+    assert_eq!(text["exit_signal"], json!(libc_sigterm()));
+    assert_eq!(text["exit_code"], Value::Null);
+
+    // Refusals stay named: an unknown signal, and resize on a piped tty.
+    let err = pool
+        .call(&ada(), &info.id, "signal", json!({"signal": "MAGIC"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VerbError::BadArgs { .. }), "{err}");
+    let err = pool
+        .call(&ada(), &info.id, "resize", json!({"cols": 100, "rows": 30}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VerbError::BadArgs { .. }), "{err}");
+}
+
+fn libc_sigterm() -> i64 {
+    15
+}
