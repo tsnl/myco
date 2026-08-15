@@ -31,5 +31,8 @@ tokio-tungstenite = "0.26"
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["set-header"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.15"
+webauthn-rs = "0.5.5"
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softtoken"] }
