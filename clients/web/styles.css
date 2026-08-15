@@ -818,3 +818,25 @@ form {
   align-items: center;
   gap: 0.5rem;
 }
+
+/* Browser panes: the URL row drives, the screenshot below is the page's
+   primary projection — pixels re-read on the watermark like any state. */
+.browser-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  min-height: 0;
+}
+.browser-nav input {
+  width: 100%;
+}
+.browser-shot {
+  overflow: auto;
+  min-height: 0;
+}
+.browser-shot img {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--faint);
+}

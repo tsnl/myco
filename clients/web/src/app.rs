@@ -1027,6 +1027,9 @@ fn submitted(form: &web_sys::Element) {
         let text = field_value(&field);
         clear_field(&field);
         dispatch(Action::ChatPosted { id, text });
+    } else if let Some(id) = form.get_attribute("data-goto") {
+        let url = field_value(&format!("nav-{id}"));
+        dispatch(Action::NavCommitted { id, url });
     }
 }
 
@@ -1212,6 +1215,7 @@ fn pane_view(
         Some(view) if pane.kind == "tty" => tty_screen(view),
         Some(view) if pane.kind == "chat" => chat_transcript(view, pane),
         Some(view) if pane.kind == "host" => host_card(view),
+        Some(view) if pane.kind == "browser" => browser_pane(view, pane),
         Some(view) => format!(
             r#"<pre class="mono pane-body">{}</pre>"#,
             escape(&pretty(view))
@@ -1710,6 +1714,31 @@ fn host_card(view: &str) -> String {
         status = escape(status),
         name = escape(name),
         command = escape(command),
+    )
+}
+
+/// A browser pane: the URL row (driving, like keys — enter commits a
+/// goto) over the screenshot projection, which the ordinary watch keeps
+/// fresh — every Page event bumps, the pane re-reads, new pixels.
+fn browser_pane(view: &str, pane: &crate::core::Pane) -> String {
+    let shot: serde_json::Value = serde_json::from_str(view).unwrap_or_default();
+    let image = match shot["png"].as_str().filter(|png| !png.is_empty()) {
+        Some(png) => format!(
+            r#"<img src="data:image/png;base64,{png}" alt="the page" />"#
+        ),
+        None => r#"<div class="dim">no pixels yet — the browser may still be launching
+                   (its about verb says)</div>"#
+            .to_string(),
+    };
+    format!(
+        r#"<div class="browser-pane">
+             <form class="browser-nav" data-goto="{id}">
+               <input id="nav-{id}" class="mono" placeholder="url — enter to go"
+                      autocomplete="off" spellcheck="false" />
+             </form>
+             <div class="browser-shot">{image}</div>
+           </div>"#,
+        id = escape(&pane.id),
     )
 }
 

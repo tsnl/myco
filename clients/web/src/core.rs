@@ -598,6 +598,8 @@ pub enum Action {
     PaneMeasured { id: String, cols: u16, rows: u16 },
     /// A chat composer submitted its text.
     ChatPosted { id: String, text: String },
+    /// A browser pane's URL row was committed.
+    NavCommitted { id: String, url: String },
     /// The person asked to cancel a chat's running turn.
     TurnCancelled { id: String },
     /// `Cmd/Ctrl+P` — summon (or dismiss, when already up) the palette.
@@ -1245,6 +1247,30 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             Origin::Drive => vec![],
             Origin::Palette => palette_answered(state, id, verb, status, body),
         },
+        Action::NavCommitted { id, url } => {
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return vec![];
+            }
+            // A bare host gets a scheme; anything explicit passes through.
+            let url = if url.contains("://") || url.starts_with("data:") {
+                url
+            } else {
+                format!("https://{url}")
+            };
+            match &state.token {
+                // Driving, like a keystroke: the page's own state is the
+                // answer, so the reply is dropped and the watch re-reads.
+                Some(token) => vec![Effect::CallVerb {
+                    origin: Origin::Drive,
+                    token: token.clone(),
+                    id,
+                    verb: "goto".into(),
+                    args: serde_json::json!({ "url": url }).to_string(),
+                }],
+                None => vec![],
+            }
+        }
         Action::KeyPressed { key, ctrl, alt } => {
             let Some(selected) = state.workspace.selected.clone() else {
                 return vec![];
@@ -2150,6 +2176,53 @@ mod tests {
             }]
         );
         assert!(state.palette.is_none(), "the well closes on commit");
+    }
+
+    /// The URL row drives: a committed nav becomes a goto with a scheme
+    /// filled in, and an empty row commits nothing.
+    #[test]
+    fn nav_commits_a_goto_with_a_scheme() {
+        let mut state = signed_in();
+        let effects = reduce(
+            &mut state,
+            Action::NavCommitted {
+                id: "b-1".into(),
+                url: "  example.com  ".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::CallVerb {
+                origin: Origin::Drive,
+                token: "tok-1".into(),
+                id: "b-1".into(),
+                verb: "goto".into(),
+                args: r#"{"url":"https://example.com"}"#.into(),
+            }]
+        );
+
+        let effects = reduce(
+            &mut state,
+            Action::NavCommitted {
+                id: "b-1".into(),
+                url: "data:text/html,hi".into(),
+            },
+        );
+        assert!(matches!(
+            &effects[..],
+            [Effect::CallVerb { args, .. }] if args.contains("data:text/html")
+        ));
+
+        assert!(
+            reduce(
+                &mut state,
+                Action::NavCommitted {
+                    id: "b-1".into(),
+                    url: "   ".into(),
+                }
+            )
+            .is_empty()
+        );
     }
 
     #[test]
