@@ -70,7 +70,7 @@ async fn main() {
         Err(e) => fatal(format!("cannot bind {addr}: {e}")),
     };
     eprintln!("myco: serving http://{addr}/api");
-    if let Err(e) = axum::serve(listener, myco_server::router(pool, auth)).await {
+    if let Err(e) = axum::serve(listener, myco_server::router(pool, auth, operator)).await {
         fatal(format!("server error: {e}"));
     }
 }
