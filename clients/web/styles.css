@@ -97,6 +97,11 @@ body {
     -webkit-font-smoothing: antialiased;
 }
 
+/* `hidden` means hidden, whatever display an element also carries. */
+[hidden] {
+    display: none !important;
+}
+
 /* Islands on quiet ground: the one card primitive everything floats in. */
 .island {
     background: var(--surface);
@@ -674,4 +679,127 @@ form {
     font-size: 20px;
     font-weight: 700;
     letter-spacing: 0.12em;
+}
+
+/* The chat renderer: a transcript that scrolls, a composer that grows. */
+.pane-body.chat {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+}
+
+.transcript {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-right: 4px;
+}
+
+.entry {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.byline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+}
+
+.entry-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-width: 62ch;
+}
+
+.tool-chip {
+    background: var(--sunken);
+    border-radius: var(--radius-chip);
+    color: var(--dim);
+    font-size: 11px;
+    margin-left: 6px;
+    padding: 1px 8px;
+}
+
+.tool-result {
+    margin-top: 4px;
+}
+
+.tool-result pre,
+.watched pre {
+    background: var(--sunken);
+    border-radius: var(--radius-row);
+    font-size: 11.5px;
+    margin-top: 4px;
+    max-height: 12em;
+    overflow: auto;
+    padding: 8px 10px;
+    white-space: pre-wrap;
+}
+
+.watched {
+    border-left: 2px solid var(--line);
+    padding-left: 10px;
+}
+
+/* A running turn breathes (STYLE.md: liveness, reduced-motion off). */
+.stream-cursor {
+    display: inline-block;
+    width: 7px;
+    height: 1.05em;
+    vertical-align: text-bottom;
+    margin-left: 2px;
+    background: var(--agent);
+    animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes breathe {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .stream-cursor { animation: none; opacity: 0.7; }
+}
+
+.composer {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 10px;
+}
+
+.composer-input {
+    background: var(--sunken);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-row);
+    color: var(--ink);
+    font: inherit;
+    padding: 8px 12px;
+    resize: vertical;
+    min-height: 2.4em;
+}
+
+.composer-input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.composer-foot {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.composer-note {
+    border-top: 1px solid var(--line-soft);
+    padding-top: 10px;
+    font-size: 12px;
 }

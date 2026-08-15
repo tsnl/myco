@@ -572,7 +572,7 @@ Functionality crosses from v2 only with a verdict recorded here.
   dispatcher, standing subscriptions, notifier kind; user-created chats
   and chat-parenting (subagents) fall out. Piped bash + signals landed
   in kind-tty.
-- **M3** — GUI: the single-reducer core (one action stream; see L3),
+- **M3 (done)** — GUI: the single-reducer core (one action stream; see L3),
   tree sidebar, split-tree panes, renderer registry (tty + chat
   renderers ported), and the `Cmd+P` palette over the derived command
   registry. The visual contract is **STYLE.md** (approved "amethyst"
