@@ -50,12 +50,8 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
       bracketed-paste handling. Terminal paste that injects bare newlines can still
       AcceptLine early (rustyline 15 default). Confirm on real paste; enable bracketed
       paste / filter if so.
-- [ ] **Remote host-side cancel** — the local half is fixed: cancel gives the dispatch a
-      grace window, so in-process tools run their process-group kill and return partial
-      output (`cancel_during_local_exec_leaves_no_process_group_survivors`). Remaining gap
-      is the protocol: no Cancel message (`Request`: Hello / ToolCall / AgentFinished), and
-      the worker invents a fresh `CancelToken` per ToolCall — a cancelled remote tool runs
-      to completion on the host. Need: Cancel over the pipe, wired to the worker-side token.
+- [x] **Remote host-side cancel** — request-id cancellation crosses the host protocol and
+      reaches the worker-side token; local and remote bash execs both kill their process groups.
 - [ ] **Host liveness / reconnect** — V1 is attach-time + next tool error. Soft reconnect,
       clearer mid-session DOWN UX (beyond `/hosts` at startup).
 - [x] (REJECT) **Cold resume honesty** — sessions restore messages only (no bash sessions, no editor
@@ -65,9 +61,8 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
 ### Tests that encode trust
 
 - [x] History: generate-error-after-tools; resume-after-tools mid-turn (agent unit tests).
-- [x] Composed local cancel (Agent → Harness → worker → bash) has an orphan-scan
-      integration test. Add **remote host-routed** cancel coverage once the protocol
-      Cancel message exists.
+- [x] Composed local and remote cancel (Agent/controller → worker → bash) have orphan-scan
+      integration coverage.
 - [ ] Tool integration tests (bash sessions, editor read-stamp races) — still thin beyond
       existing bash/editor unit tests.
 

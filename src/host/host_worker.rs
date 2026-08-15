@@ -114,8 +114,12 @@ impl HostWorker {
     }
 
     /// Handle one decoded request and write the reply through `writer`.
-    async fn handle_request<W>(self: Arc<Self>, writer: Arc<Mutex<W>>, msg: Request)
-    where
+    async fn handle_request<W>(
+        self: Arc<Self>,
+        writer: Arc<Mutex<W>>,
+        msg: Request,
+        cancel: Option<CancelToken>,
+    ) where
         W: AsyncWriteExt + Unpin,
     {
         match msg {
@@ -137,7 +141,7 @@ impl HostWorker {
                         tool_use,
                         HostDispatchContext {
                             agent_id,
-                            cancel: CancelToken::new(),
+                            cancel: cancel.expect("tool call has a registered cancel token"),
                         },
                     )
                     .await;
@@ -146,6 +150,7 @@ impl HostWorker {
                     eprintln!("host worker: write tool result failed: {e}");
                 }
             }
+            Request::Cancel { .. } => unreachable!("cancel is handled by the serve loop"),
             Request::AgentFinished { agent_id } => {
                 // Fire-and-forget: no reply message exists for this request.
                 self.notify_agent_finished(agent_id);
@@ -167,6 +172,8 @@ impl HostWorker {
         let mut lines = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
         let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let cancels: Arc<Mutex<HashMap<String, CancelToken>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         loop {
             let line = match read_line(&mut lines).await {
@@ -190,13 +197,56 @@ impl HostWorker {
                 }
             };
 
-            let worker = Arc::clone(self);
-            let writer = Arc::clone(&writer);
-            in_flight.spawn(async move {
-                worker.handle_request(writer, msg).await;
-            });
+            match msg {
+                Request::ToolCall {
+                    id,
+                    agent_id,
+                    tool_use,
+                } => {
+                    // Register before spawning so a following Cancel line can
+                    // never race ahead of the tool task's token.
+                    let cancel = CancelToken::new();
+                    cancels.lock().await.insert(id.clone(), cancel.clone());
+                    let request_id = id.clone();
+                    let worker = Arc::clone(self);
+                    let writer = Arc::clone(&writer);
+                    let cancels = Arc::clone(&cancels);
+                    in_flight.spawn(async move {
+                        worker
+                            .handle_request(
+                                writer,
+                                Request::ToolCall {
+                                    id,
+                                    agent_id,
+                                    tool_use,
+                                },
+                                Some(cancel),
+                            )
+                            .await;
+                        cancels.lock().await.remove(&request_id);
+                    });
+                }
+                Request::Cancel { id } => {
+                    if let Some(cancel) = cancels.lock().await.get(&id).cloned() {
+                        cancel.cancel();
+                    }
+                }
+                other => {
+                    let worker = Arc::clone(self);
+                    let writer = Arc::clone(&writer);
+                    in_flight.spawn(async move {
+                        worker.handle_request(writer, other, None).await;
+                    });
+                }
+            }
         }
 
+        // EOF means the controller is gone. Cancel host work before joining so
+        // a lost SSH connection cannot leave a command running until its own
+        // (possibly much longer) timeout.
+        for cancel in cancels.lock().await.values() {
+            cancel.cancel();
+        }
         while in_flight.join_next().await.is_some() {}
         Ok(())
     }
