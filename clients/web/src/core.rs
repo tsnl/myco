@@ -18,8 +18,128 @@ pub struct State {
     pub sign_in: SignIn,
     /// Feedback under the signed-in card's passkey button.
     pub passkey_note: Option<String>,
+    /// The workspace: what the pool holds, kept fresh by list + feed.
+    pub workspace: Workspace,
+    /// A listing fetch is out and its answer has not landed. Bookkeeping,
+    /// not content — it lives outside [`Workspace`] so a burst of feed
+    /// events cannot make the tree look changed when nothing in it is.
+    pub listing_in_flight: bool,
+    /// Something happened while that fetch was out, so its answer is
+    /// already behind: re-list once when it lands.
+    pub listing_stale: bool,
     /// Recent actions, newest last, capped — the repro log.
     pub log: Vec<String>,
+}
+
+/// The pool as the client knows it. `instances` is a cache of the listing,
+/// refreshed whenever the event feed hints at change — the feed is lossy
+/// by doctrine, so re-listing *is* the recovery path, not a fallback.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Workspace {
+    pub kinds: Vec<KindInfo>,
+    pub instances: Vec<InstanceInfo>,
+    pub selected: Option<String>,
+    pub feed: Feed,
+    /// Grouping key the next create inherits. Empty is the `workspace` bucket.
+    pub current_project: String,
+    /// When set, the sidebar is asking for a new project slug.
+    pub project_draft: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Feed {
+    #[default]
+    Connecting,
+    Live,
+    /// The socket dropped: showing last state, retrying.
+    Reconnecting,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct KindInfo {
+    pub kind: String,
+    #[serde(default)]
+    pub doc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct InstanceInfo {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub title: String,
+    pub creator: PrincipalRef,
+    /// What this instance was created under — a subagent chat names the
+    /// chat that spawned it. L1 identity, so the tree nests on it rather
+    /// than asking any kind where it came from.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub driver: Option<PrincipalRef>,
+    #[serde(default)]
+    pub crashed: bool,
+}
+
+/// A principal on the wire: {kind: human|agent|system, id}.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct PrincipalRef {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Who holds the driver seat, as the client presents it.
+///
+/// The tree's row dot, a pane's chip, and the palette's reason for greying
+/// a driven verb are three views of one fact. Spelled three times, they are
+/// three chances for the client to contradict itself about who is driving —
+/// so the classification happens once, here, and each view asks it for the
+/// part it renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seat {
+    /// Nobody: the open ring, and the take is an invitation.
+    Open,
+    Human(String),
+    Agent,
+    System,
+}
+
+/// The seat an instance's driver puts it in.
+pub fn seat_of(driver: Option<&PrincipalRef>) -> Seat {
+    match driver {
+        None => Seat::Open,
+        Some(p) if p.kind == "human" => Seat::Human(p.id.clone()),
+        Some(p) if p.kind == "agent" => Seat::Agent,
+        Some(_) => Seat::System,
+    }
+}
+
+impl Seat {
+    /// STYLE.md's presence vocabulary, as a class suffix.
+    pub fn tone(&self) -> &'static str {
+        match self {
+            Seat::Open => "open",
+            Seat::Human(_) => "human",
+            Seat::Agent => "agent",
+            Seat::System => "system",
+        }
+    }
+
+    /// The seat in words: a pane chip's label, a palette row's reason.
+    pub fn phrase(&self) -> String {
+        match self {
+            Seat::Open => "seat open".into(),
+            Seat::Human(id) => format!("{id} driving"),
+            Seat::Agent => "agent driving".into(),
+            Seat::System => "system driving".into(),
+        }
+    }
+
+    /// Is `me` the person in the seat? The whole of "may I drive this".
+    pub fn held_by(&self, me: Option<&str>) -> bool {
+        matches!(self, Seat::Human(id) if me == Some(id.as_str()))
+    }
 }
 
 /// The sign-in island's own state: in flight, and the last refusal.
@@ -52,7 +172,11 @@ pub struct User {
 
 impl User {
     pub fn display(&self) -> &str {
-        if self.name.is_empty() { &self.id } else { &self.name }
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
     }
 }
 
@@ -78,6 +202,31 @@ pub enum Action {
     PasskeySignInRequested { username: String },
     /// A browser ceremony failed or was dismissed before any wire call.
     PasskeyFailed { why: String },
+    /// `GET /api/kinds` answered.
+    KindsAnswered { status: u16, body: String },
+    /// `GET /api/instances` answered.
+    InstancesAnswered { status: u16, body: String },
+    /// The event socket delivered a pool event (any name) — a hint that
+    /// the listing may be stale.
+    FeedEvent,
+    /// The event socket opened.
+    FeedOpened,
+    /// The event socket closed or errored; the edge will retry.
+    FeedDropped,
+    /// The person selected an instance in the tree.
+    Selected { id: String },
+    /// The person asked to create an instance of `kind`.
+    CreateRequested { kind: String },
+    /// `POST /api/instances` answered.
+    CreateAnswered { status: u16, body: String },
+    /// The person picked a project (tree header or the chip). Empty is workspace.
+    ProjectSelected { project: String },
+    /// Open the new-project slug field.
+    NewProjectRequested,
+    /// The slug field changed.
+    ProjectDrafted { draft: String },
+    /// Commit the slug field as the current project.
+    NewProjectCommitted { slug: String },
     /// A wire call failed before an HTTP status existed.
     NetworkFailed { what: String },
 }
@@ -107,6 +256,52 @@ pub enum Effect {
     /// login/finish → [`Action::TokenAnswered`] — the finish answers in the
     /// code grant's exact shape, so sign-in converges downstream.
     PasskeySignIn { username: String },
+    /// `GET /api/kinds` → [`Action::KindsAnswered`].
+    FetchKinds { token: String },
+    /// `GET /api/instances` → [`Action::InstancesAnswered`].
+    FetchInstances { token: String },
+    /// Open (or reopen) the event socket; delivers [`Action::FeedOpened`],
+    /// [`Action::FeedEvent`]s, and one [`Action::FeedDropped`] at close.
+    OpenFeed { token: String },
+    /// `POST /api/instances` with `{kind, project, title}` → [`Action::CreateAnswered`].
+    CreateInstance {
+        token: String,
+        kind: String,
+        project: String,
+        title: String,
+    },
+}
+
+/// What entering a session kicks off, from either door (whoami or a fresh
+/// token): the workspace loads and the feed opens.
+fn enter_workspace(state: &mut State, token: &str) -> Vec<Effect> {
+    let mut effects = vec![Effect::FetchKinds {
+        token: token.into(),
+    }];
+    effects.extend(relist(state));
+    effects.push(Effect::OpenFeed {
+        token: token.into(),
+    });
+    effects
+}
+
+/// Ask for a fresh listing — at most one at a time.
+///
+/// The feed is a hint that fires per event, and events arrive in bursts (a
+/// chat's turn, a terminal's output). One fetch per hint is one fetch per
+/// byte of somebody else's work. So: if a fetch is already out, its answer
+/// is already behind — remember that, and send exactly one more when it
+/// lands. Any number of hints during a fetch cost one follow-up, never N.
+fn relist(state: &mut State) -> Vec<Effect> {
+    let Some(token) = state.token.clone() else {
+        return vec![];
+    };
+    if state.listing_in_flight {
+        state.listing_stale = true;
+        return vec![];
+    }
+    state.listing_in_flight = true;
+    vec![Effect::FetchInstances { token }]
 }
 
 /// The token endpoint's 200 body (RFC 6749's shape).
@@ -124,6 +319,17 @@ struct Refusal {
 
 const LOG_CAP: usize = 256;
 
+/// Same charset L1 will enforce: `^[A-Za-z0-9][A-Za-z0-9-]*$`.
+pub fn valid_slug(title: &str) -> bool {
+    let mut bytes = title.bytes();
+    match bytes.next() {
+        Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9') => {
+            bytes.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        }
+        _ => false,
+    }
+}
+
 pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
     if state.log.len() == LOG_CAP {
         state.log.remove(0);
@@ -139,7 +345,12 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::WhoamiAnswered { status, body } => {
             match status {
                 200 => match serde_json::from_str::<User>(&body) {
-                    Ok(user) => state.session = Session::SignedIn(user),
+                    Ok(user) => {
+                        state.session = Session::SignedIn(user);
+                        if let Some(token) = state.token.clone() {
+                            return enter_workspace(state, &token);
+                        }
+                    }
                     Err(_) => {
                         state.session = Session::Unreachable {
                             why: "the server's whoami made no sense".into(),
@@ -181,7 +392,9 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                         state.token = Some(issued.access_token.clone());
                         state.session = Session::SignedIn(issued.user);
                         state.sign_in = SignIn::default();
-                        vec![Effect::PersistToken(issued.access_token)]
+                        let mut effects = vec![Effect::PersistToken(issued.access_token.clone())];
+                        effects.extend(enter_workspace(state, &issued.access_token));
+                        effects
                     }
                     Err(_) => {
                         state.sign_in.error =
@@ -254,9 +467,111 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.session = Session::SignedOut;
             state.sign_in = SignIn::default();
             state.passkey_note = None;
+            state.workspace = Workspace::default();
+            state.listing_in_flight = false;
+            state.listing_stale = false;
             effects
         }
+        Action::KindsAnswered { status, body } => {
+            if status == 200
+                && let Ok(kinds) = serde_json::from_str::<Vec<KindInfo>>(&body)
+            {
+                state.workspace.kinds = kinds;
+            }
+            vec![]
+        }
+        Action::InstancesAnswered { status, body } => {
+            state.listing_in_flight = false;
+            if status == 200
+                && let Ok(mut instances) = serde_json::from_str::<Vec<InstanceInfo>>(&body)
+            {
+                // Stable order: project, then title, then id — the tree
+                // must not shuffle underfoot on every refresh.
+                instances.sort_by(|a, b| {
+                    (&a.project, &a.title, &a.id).cmp(&(&b.project, &b.title, &b.id))
+                });
+                state.workspace.instances = instances;
+                if let Some(selected) = &state.workspace.selected
+                    && !state.workspace.instances.iter().any(|i| &i.id == selected)
+                {
+                    state.workspace.selected = None;
+                }
+            }
+            // Whatever arrived while this fetch was out is owed exactly
+            // one more look.
+            if std::mem::take(&mut state.listing_stale) {
+                return relist(state);
+            }
+            vec![]
+        }
+        // Any event is only a hint; the listing is the truth. Lossy feed +
+        // re-list is the doctrine's recovery, used as the ordinary path —
+        // coalesced, because a hint is not worth a fetch of its own.
+        Action::FeedEvent => relist(state),
+        Action::FeedOpened => {
+            state.workspace.feed = Feed::Live;
+            // Anything could have happened while the socket was down.
+            relist(state)
+        }
+        Action::FeedDropped => {
+            if matches!(state.session, Session::SignedIn(_)) {
+                state.workspace.feed = Feed::Reconnecting;
+            }
+            vec![]
+        }
+        Action::Selected { id } => {
+            state.workspace.selected = Some(id);
+            vec![]
+        }
+        Action::CreateRequested { kind } => match &state.token {
+            Some(token) => vec![Effect::CreateInstance {
+                token: token.clone(),
+                project: state.workspace.current_project.clone(),
+                title: kind.clone(),
+                kind,
+            }],
+            None => vec![],
+        },
+        Action::ProjectSelected { project } => {
+            state.workspace.current_project = project;
+            state.workspace.project_draft = None;
+            vec![]
+        }
+        Action::NewProjectRequested => {
+            state.workspace.project_draft = Some(String::new());
+            vec![]
+        }
+        Action::ProjectDrafted { draft } => {
+            if state.workspace.project_draft.is_some() {
+                state.workspace.project_draft = Some(draft);
+            }
+            vec![]
+        }
+        Action::NewProjectCommitted { slug } => {
+            let slug = slug.trim().to_string();
+            if slug.is_empty() {
+                state.workspace.current_project.clear();
+                state.workspace.project_draft = None;
+            } else if valid_slug(&slug) {
+                state.workspace.current_project = slug;
+                state.workspace.project_draft = None;
+            }
+            // A bad slug leaves the field open — type again.
+            vec![]
+        }
+        Action::CreateAnswered { status, body } => {
+            if status == 200
+                && let Ok(info) = serde_json::from_str::<InstanceInfo>(&body)
+            {
+                state.workspace.selected = Some(info.id);
+            }
+            relist(state)
+        }
         Action::NetworkFailed { what } => {
+            // A call that never got a status cannot answer; releasing the
+            // listing latch here is what keeps one lost fetch from wedging
+            // the tree forever.
+            state.listing_in_flight = false;
             if state.sign_in.busy {
                 // A failed sign-in call lands on the form, not the shell.
                 state.sign_in.busy = false;
@@ -355,7 +670,13 @@ mod tests {
                     .into(),
             },
         );
-        assert_eq!(effects, vec![Effect::PersistToken("tok-1".into())]);
+        assert_eq!(effects[0], Effect::PersistToken("tok-1".into()));
+        assert!(
+            effects.contains(&Effect::OpenFeed {
+                token: "tok-1".into()
+            }),
+            "signing in enters the workspace: {effects:?}"
+        );
         assert_eq!(state.token.as_deref(), Some("tok-1"));
         assert!(matches!(&state.session, Session::SignedIn(u) if u.id == "ada"));
     }
@@ -490,7 +811,7 @@ mod tests {
                 body: r#"{"access_token":"tok-2","user":{"id":"ada"}}"#.into(),
             },
         );
-        assert_eq!(effects, vec![Effect::PersistToken("tok-2".into())]);
+        assert_eq!(effects[0], Effect::PersistToken("tok-2".into()));
         assert!(matches!(&state.session, Session::SignedIn(_)));
     }
 
@@ -511,7 +832,14 @@ mod tests {
             },
         );
         assert!(!state.sign_in.busy);
-        assert!(state.sign_in.error.as_deref().unwrap().contains("cancelled"));
+        assert!(
+            state
+                .sign_in
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cancelled")
+        );
 
         // Signed in: under the button.
         let mut state = signed_in();
@@ -523,6 +851,234 @@ mod tests {
             },
         );
         assert_eq!(state.passkey_note.as_deref(), Some("dismissed"));
+    }
+
+    #[test]
+    fn the_workspace_loads_and_the_feed_keeps_it_fresh() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"b","kind":"tty","project":"p","title":"z",
+                           "creator":{"kind":"human","id":"ada"},"driver":null},
+                          {"id":"a","kind":"chat","project":"p","title":"a",
+                           "creator":{"kind":"human","id":"ada"},
+                           "driver":{"kind":"agent","id":"a"}}]"#
+                    .into(),
+            },
+        );
+        assert_eq!(state.workspace.instances.len(), 2);
+        assert_eq!(state.workspace.instances[0].id, "a", "stable order");
+
+        // Any feed event is a hint: re-list.
+        let effects = reduce(&mut state, Action::FeedEvent);
+        assert_eq!(
+            effects,
+            vec![Effect::FetchInstances {
+                token: "tok-1".into()
+            }]
+        );
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+
+        // A dropped feed shows honestly and reopening re-lists.
+        reduce(&mut state, Action::FeedDropped);
+        assert_eq!(state.workspace.feed, Feed::Reconnecting);
+        let effects = reduce(&mut state, Action::FeedOpened);
+        assert_eq!(state.workspace.feed, Feed::Live);
+        assert!(!effects.is_empty(), "reopening re-lists");
+    }
+
+    /// The feed fires per event and events arrive in bursts. However many
+    /// land while a listing fetch is out, exactly one more fetch follows
+    /// it — two in total for the whole burst, not one per hint.
+    #[test]
+    fn a_burst_of_feed_events_costs_one_extra_listing_fetch() {
+        let mut state = signed_in();
+        assert!(state.listing_in_flight, "signing in lists once");
+
+        let fetches: usize = (0..20)
+            .map(|_| reduce(&mut state, Action::FeedEvent).len())
+            .sum();
+        assert_eq!(fetches, 0, "not one fetch per hint");
+        assert!(state.listing_stale, "but the hints are not forgotten");
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::FetchInstances {
+                token: "tok-1".into()
+            }],
+            "the burst is worth exactly one more look"
+        );
+        assert!(state.listing_in_flight && !state.listing_stale);
+
+        let effects = reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert!(effects.is_empty(), "and then it settles");
+        assert!(!state.listing_in_flight);
+    }
+
+    /// Parentage is L1 identity, carried in the listing: the client mirrors
+    /// it so the tree can nest subagents under the chat that spawned them
+    /// without asking any kind where it came from.
+    #[test]
+    fn the_listing_carries_parentage_for_the_tree_to_nest_on() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[{"id":"root","kind":"chat","project":"p","title":"a",
+                           "creator":{"kind":"human","id":"ada"}},
+                          {"id":"kid","kind":"chat","project":"p","title":"b",
+                           "parent":"root",
+                           "creator":{"kind":"agent","id":"root"}}]"#
+                    .into(),
+            },
+        );
+        let by = |id: &str| {
+            state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.id == id)
+                .cloned()
+                .expect("listed")
+        };
+        assert_eq!(by("root").parent, None);
+        assert_eq!(by("kid").parent.as_deref(), Some("root"));
+    }
+
+    /// One classification of the seat, asked three different questions.
+    #[test]
+    fn the_seat_reads_the_same_however_it_is_asked() {
+        let human = PrincipalRef {
+            kind: "human".into(),
+            id: "ada".into(),
+        };
+        let agent = PrincipalRef {
+            kind: "agent".into(),
+            id: "chat-1".into(),
+        };
+
+        let seat = seat_of(Some(&human));
+        assert_eq!(seat.tone(), "human");
+        assert_eq!(seat.phrase(), "ada driving");
+        assert!(seat.held_by(Some("ada")));
+        assert!(!seat.held_by(Some("grace")));
+
+        let seat = seat_of(Some(&agent));
+        assert_eq!(seat.tone(), "agent");
+        assert_eq!(seat.phrase(), "agent driving");
+        assert!(!seat.held_by(Some("chat-1")), "an agent is not a person");
+
+        let seat = seat_of(None);
+        assert_eq!(seat, Seat::Open);
+        assert_eq!(seat.tone(), "open");
+        assert!(!seat.held_by(Some("ada")));
+    }
+
+    #[test]
+    fn selection_follows_removals_and_creation_selects() {
+        let mut state = signed_in();
+        reduce(&mut state, Action::Selected { id: "gone".into() });
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: "[]".into(),
+            },
+        );
+        assert_eq!(state.workspace.selected, None, "a removed selection clears");
+
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "tty".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "tty".into(),
+                project: String::new(),
+                title: "tty".into(),
+            }]
+        );
+        reduce(
+            &mut state,
+            Action::CreateAnswered {
+                status: 200,
+                body: r#"{"id":"new-1","kind":"tty","project":"",
+                          "title":"tty","creator":{"kind":"human","id":"ada"}}"#
+                    .into(),
+            },
+        );
+        assert_eq!(state.workspace.selected.as_deref(), Some("new-1"));
+    }
+
+    #[test]
+    fn create_inherits_the_current_project() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::ProjectSelected {
+                project: "lab".into(),
+            },
+        );
+        assert_eq!(state.workspace.current_project, "lab");
+        let effects = reduce(&mut state, Action::CreateRequested { kind: "tty".into() });
+        assert_eq!(
+            effects,
+            vec![Effect::CreateInstance {
+                token: "tok-1".into(),
+                kind: "tty".into(),
+                project: "lab".into(),
+                title: "tty".into(),
+            }]
+        );
+
+        reduce(&mut state, Action::NewProjectRequested);
+        reduce(
+            &mut state,
+            Action::ProjectDrafted {
+                draft: "has space".into(),
+            },
+        );
+        reduce(
+            &mut state,
+            Action::NewProjectCommitted {
+                slug: "has space".into(),
+            },
+        );
+        assert_eq!(
+            state.workspace.current_project, "lab",
+            "a bad slug does not stick"
+        );
+        assert_eq!(state.workspace.project_draft.as_deref(), Some("has space"));
+
+        reduce(
+            &mut state,
+            Action::NewProjectCommitted {
+                slug: "lab-2".into(),
+            },
+        );
+        assert_eq!(state.workspace.current_project, "lab-2");
+        assert!(state.workspace.project_draft.is_none());
     }
 
     /// The log is the repro: every action lands in order, capped.

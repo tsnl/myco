@@ -239,3 +239,142 @@ form {
     display: flex;
     gap: 8px;
 }
+
+/* The workspace: sidebar island beside the stage, on quiet ground. */
+.workspace {
+    height: 100%;
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 14px;
+    padding: 14px;
+}
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    min-height: 0;
+}
+
+.tree {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.tree-project {
+    color: var(--faint);
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 8px 0 4px;
+    cursor: pointer;
+}
+
+.tree-project.current {
+    color: var(--accent);
+}
+
+.project-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.chip.project {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: none;
+    border-radius: var(--radius-chip);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 3px 10px;
+    cursor: pointer;
+}
+
+.project-slug {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-row);
+    background: var(--sunken);
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    padding: 6px 10px;
+}
+
+.tree-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: var(--radius-row);
+    cursor: pointer;
+    padding: 8px 12px;
+    /* Parentage as indent: a subagent sits under the chat that spawned it. */
+    padding-left: calc(12px + var(--depth, 0) * 14px);
+}
+
+.tree-row:hover {
+    background: var(--sunken);
+}
+
+.tree-row.selected {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.tree-row.crashed {
+    opacity: 0.55;
+}
+
+.row-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.kind-tag {
+    color: var(--faint);
+    font-size: 10.5px;
+}
+
+/* The seat, as dots: filled clay/verdigris/slate; an open seat is an
+ * open ring. */
+.seat {
+    width: 8px;
+    height: 8px;
+    border-radius: 99px;
+    flex: none;
+}
+
+.seat.human { background: var(--human); }
+.seat.agent { background: var(--agent); }
+.seat.system { background: var(--system); }
+.seat.open { border: 1.5px dashed var(--faint); }
+
+.creates {
+    flex-wrap: wrap;
+}
+
+.passkey-note {
+    font-size: 11px;
+    margin-top: 6px;
+}
+
+.sidebar-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 12px;
+}
+
+.stage {
+    display: grid;
+    place-items: center;
+}
