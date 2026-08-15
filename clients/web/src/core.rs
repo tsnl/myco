@@ -18,6 +18,8 @@ pub struct State {
     pub sign_in: SignIn,
     /// Feedback under the signed-in card's passkey button.
     pub passkey_note: Option<String>,
+    /// Feedback under the enable-notifications button.
+    pub push_note: Option<String>,
     /// The workspace: what the pool holds, kept fresh by list + feed.
     pub workspace: Workspace,
     /// The admin surface: `Some` exactly when the server said this person
@@ -551,6 +553,10 @@ pub enum Action {
     SignOutRequested,
     /// The person asked to enroll a passkey (signed in).
     EnrollPasskeyRequested,
+    /// The person asked for push notifications on this device.
+    EnablePushRequested,
+    /// The whole subscribe dance answered, in a human sentence.
+    PushEnrollAnswered { note: String },
     /// The whole enrollment ceremony answered (the finish call's status).
     PasskeyEnrollAnswered { status: u16, body: String },
     /// The person asked to sign in with a passkey.
@@ -697,6 +703,10 @@ pub enum Effect {
     /// `credentials.create` → register/finish → [`Action::PasskeyEnrollAnswered`]
     /// (or [`Action::PasskeyFailed`] if the browser bows out).
     EnrollPasskey { token: String },
+    /// The push dance: read the notifier's VAPID key, subscribe this
+    /// browser (service worker + PushManager), register the subscription
+    /// back on the notifier → [`Action::PushEnrollAnswered`].
+    EnablePush { token: String, notifier: String },
     /// The whole login ceremony: login/start → `credentials.get` →
     /// login/finish → [`Action::TokenAnswered`] — the finish answers in the
     /// code grant's exact shape, so sign-in converges downstream.
@@ -1035,6 +1045,35 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     vec![]
                 }
             }
+        }
+        Action::EnablePushRequested => {
+            state.push_note = None;
+            let Session::SignedIn(user) = &state.session else {
+                return vec![];
+            };
+            // The notifier is per-person, provisioned at sign-in; finding
+            // none is worth a sentence rather than a silent no-op.
+            let notifier = state
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.kind == "notifier" && i.creator.id == user.id)
+                .map(|i| i.id.clone());
+            match (notifier, &state.token) {
+                (Some(notifier), Some(token)) => vec![Effect::EnablePush {
+                    token: token.clone(),
+                    notifier,
+                }],
+                (None, _) => {
+                    state.push_note = Some("no notifier instance to register with".into());
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+        Action::PushEnrollAnswered { note } => {
+            state.push_note = Some(note);
+            vec![]
         }
         Action::EnrollPasskeyRequested => {
             state.passkey_note = None;
@@ -2176,6 +2215,42 @@ mod tests {
             }]
         );
         assert!(state.palette.is_none(), "the well closes on commit");
+    }
+
+    /// The push dance starts from the owner's notifier and lands its
+    /// answer as a sentence under the button.
+    #[test]
+    fn enabling_push_finds_the_owners_notifier() {
+        let mut state = signed_in();
+        reduce(
+            &mut state,
+            Action::InstancesAnswered {
+                status: 200,
+                body: r#"[
+                    {"id":"n-other","kind":"notifier","project":"","title":"",
+                     "creator":{"kind":"human","id":"grace"}},
+                    {"id":"n-1","kind":"notifier","project":"","title":"",
+                     "creator":{"kind":"human","id":"ada"}}
+                ]"#
+                .into(),
+            },
+        );
+        let effects = reduce(&mut state, Action::EnablePushRequested);
+        assert_eq!(
+            effects,
+            vec![Effect::EnablePush {
+                token: "tok-1".into(),
+                notifier: "n-1".into(),
+            }],
+            "the dance starts from MY notifier, not the first one listed"
+        );
+        reduce(
+            &mut state,
+            Action::PushEnrollAnswered {
+                note: "notifications on".into(),
+            },
+        );
+        assert_eq!(state.push_note.as_deref(), Some("notifications on"));
     }
 
     /// The URL row drives: a committed nav becomes a goto with a scheme

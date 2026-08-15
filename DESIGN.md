@@ -326,8 +326,8 @@ as a method instead of a verb.)
   exists to prevent. Two static strings, validated at registration, are
   the cheapest insurance in the codebase.
 - **What is knowingly *not* minimal** — schema fields that named their
-  consumer before it existed (`cursored` → M2 subscriptions, now here;
-  `version` → M4 protocol providers; `read_only` → speculative-read
+  consumer before it existed (`cursored` → M2 subscriptions; `version` →
+  M4 protocol providers, now here; `read_only` → speculative-read
   clients). Cutting fields that wire consumers re-add next milestone is
   churn wearing minimalism's clothes; each names its consumer in its
   doc comment, and the ledger holds the receipt.
@@ -550,15 +550,15 @@ Functionality crosses from v2 only with a verdict recorded here.
 | agent loop, models/providers, session store | **port + reshape (M2)** | the chat kind + the model-side adapter (dispatcher, standing subscriptions) |
 | session compaction (successor + compact worker) | **pending** | threshold on `ModelSpec`; queue does not. Successor instance, not in-place, and only after persistence. DP-3. |
 | `subagent` tool + child routes | **drop** | chat instances with a parent ref |
-| NDJSON host protocol | **re-derive (M4)** | the bus envelope over stdio; hosts/toolds are protocol providers |
+| NDJSON host protocol | **re-derived (M4)** | `crates/wire` + `myco-hostd`; hosts/toolds are protocol providers |
 | GUI terminal renderer, transcript renderer | **port (M3)** | into the renderer registry |
 | GUI browser/draft/conversation pages | **drop** | tree + panes replace page navigation |
 | observer notes machinery | **drop** | standing subscriptions |
 | notifications (v2 never had them) | **new: notifier kind (M2/M4)** | see the worked requirement |
 | command palette (v2 never had one) | **new: `Cmd+P` over the registry (M3)** | entries derived from kind specs; one reducer, buttons emit the same actions — see L3 |
 | piped (non-pty) bash mode, signals | **ported (M2)** | kind-tty `mode: piped` + `signal`; bash gets honest failures |
-| screenshot action | **pending (M4)** | browser kind, not tty |
-| README/TOUR | **rewrite as they become true** | README tracks the current milestone tip |
+| screenshot action | **ported (M4)** | `kind-browser` `screenshot` / `a11y` / driven gestures |
+| README/TOUR | **rewritten (M1–M4)** | README tracks the current milestone tip |
 
 ## Milestones
 
@@ -578,8 +578,8 @@ Functionality crosses from v2 only with a verdict recorded here.
   registry. The visual contract is **STYLE.md** (approved "amethyst"
   direction: islands on violet-biased paper, presence/seat/ember
   vocabulary, theme-constant terminal material).
-- **M4** — protocol providers (toolds/hosts as bus-over-stdio); cron
-  kind; browser kind (`a11y_tree` + `screenshot`, computer-use verb
+- **M4 (done)** — protocol providers (toolds/hosts as bus-over-stdio); cron
+  kind; browser kind (`a11y` + `screenshot`, computer-use verb
   vocabulary); web-push delivery for the notifier.
 - **M5** — self-describing debugging kinds; agent-to-agent messaging
   behind explicit grants with loop budgets.

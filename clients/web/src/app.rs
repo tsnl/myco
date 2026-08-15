@@ -222,6 +222,11 @@ fn run(effect: Effect) {
         Effect::EnrollPasskey { token } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(enroll_passkey(&token).await);
         }),
+        Effect::EnablePush { token, notifier } => {
+            wasm_bindgen_futures::spawn_local(async move {
+                dispatch(enable_push(&token, &notifier).await);
+            })
+        }
         Effect::PasskeySignIn { username } => wasm_bindgen_futures::spawn_local(async move {
             dispatch(passkey_sign_in(&username).await);
         }),
@@ -426,6 +431,65 @@ async fn enroll_passkey(token: &str) -> Action {
     {
         Ok((status, body)) => Action::PasskeyEnrollAnswered { status, body },
         Err(what) => Action::NetworkFailed { what },
+    }
+}
+
+/// The push dance: the notifier's key, the browser's subscription, the
+/// registration back — each failure a sentence, not a mystery.
+async fn enable_push(token: &str, notifier: &str) -> Action {
+    let key_url = format!("/api/instances/{notifier}/verbs/push_key");
+    let (status, body) = match fetch("POST", &key_url, Some(token), None).await {
+        Ok(answer) => answer,
+        Err(what) => return Action::NetworkFailed { what },
+    };
+    if status != 200 {
+        return Action::PushEnrollAnswered {
+            note: format!("the server offers no push key ({body})"),
+        };
+    }
+    let key = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["key"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    if key.is_empty() {
+        return Action::PushEnrollAnswered {
+            note: "the push key answer had no key".into(),
+        };
+    }
+    let subscription = match push_subscribe(&key).await {
+        Ok(subscription) => subscription,
+        Err(why) => return Action::PushEnrollAnswered { note: why },
+    };
+    let register_url = format!("/api/instances/{notifier}/verbs/register");
+    let body = format!("{{\"subscription\":{subscription}}}");
+    match fetch("POST", &register_url, Some(token), Some((JSON, body))).await {
+        Ok((200, _)) => Action::PushEnrollAnswered {
+            note: "notifications on — this device wakes for attention".into(),
+        },
+        Ok((_, body)) => Action::PushEnrollAnswered {
+            note: format!("the notifier refused the subscription: {body}"),
+        },
+        Err(what) => Action::NetworkFailed { what },
+    }
+}
+
+/// Service worker + PushManager, through the same `js_sys::Function`
+/// door as the WebAuthn ceremony: the platform steps stay one JS
+/// expression, the logic stays in Rust.
+async fn push_subscribe(key_b64url: &str) -> Result<String, String> {
+    let body = "let k = key.replace(/-/g, '+').replace(/_/g, '/');                 while (k.length % 4) k += '=';                 let bytes = Uint8Array.from(atob(k), c => c.charCodeAt(0));                 return navigator.serviceWorker.register('/sw.js')                   .then(() => navigator.serviceWorker.ready)                   .then(r => r.pushManager.subscribe({                      userVisibleOnly: true, applicationServerKey: bytes }))                   .then(s => JSON.stringify(s.toJSON()));";
+    let shim = js_sys::Function::new_with_args("key", body);
+    let promise = shim
+        .call1(&JsValue::NULL, &JsValue::from_str(key_b64url))
+        .map_err(|_| "this browser cannot subscribe to push".to_string())?;
+    let promise: js_sys::Promise = promise
+        .dyn_into()
+        .map_err(|_| "this browser cannot subscribe to push".to_string())?;
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(value) => value
+            .as_string()
+            .ok_or_else(|| "the subscription returned nothing".into()),
+        Err(_) => Err("the notification prompt was dismissed".into()),
     }
 }
 
@@ -1001,6 +1065,7 @@ fn clicked(el: &web_sys::Element) -> bool {
         match name.as_str() {
             "sign-out" => dispatch(Action::SignOutRequested),
             "enroll-passkey" => dispatch(Action::EnrollPasskeyRequested),
+            "enable-push" => dispatch(Action::EnablePushRequested),
             "passkey-sign-in" => dispatch(Action::PasskeySignInRequested {
                 username: field_value("username"),
             }),
@@ -1120,10 +1185,11 @@ fn sidebar_view(state: &State, user: &crate::core::User) -> String {
              <span class="dim">{user}</span>
              <div class="row-buttons">{admin_button}
                <button data-act="enroll-passkey" class="quiet-button">add a passkey</button>
+               <button data-act="enable-push" class="quiet-button">notify this device</button>
                <button data-act="sign-out" class="quiet-button">sign out</button>
              </div>
            </div>
-           {note}
+           {note}{push_note}
            <div class="status-line">{feed}</div>"#,
         user = escape(user.display()),
         admin_button = if state.admin.is_some() {
@@ -1132,6 +1198,10 @@ fn sidebar_view(state: &State, user: &crate::core::User) -> String {
             ""
         },
         note = match &state.passkey_note {
+            Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
+            None => String::new(),
+        },
+        push_note = match &state.push_note {
             Some(note) => format!(r#"<div class="dim passkey-note">{}</div>"#, escape(note)),
             None => String::new(),
         },
