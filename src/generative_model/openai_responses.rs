@@ -397,10 +397,10 @@ impl StreamAccumulator {
             ResponsesStreamEvent::ResponseCompleted { response } => {
                 let reason = match response.status.as_deref() {
                     Some("failed") => {
-                        return Err(GenerateError::ExecutionError(format!(
-                            "OpenAI Responses failed: {:?}",
-                            response.error
-                        )));
+                        return Err(provider_stream_error(
+                            format!("OpenAI Responses failed: {:?}", response.error),
+                            response.error.as_ref(),
+                        ));
                     }
                     Some("incomplete") => {
                         let incomplete = response
@@ -437,15 +437,16 @@ impl StreamAccumulator {
                 self.finished = true;
             }
             ResponsesStreamEvent::ResponseFailed { response } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "OpenAI Responses failed: {:?}",
-                    response.error
-                )));
+                return Err(provider_stream_error(
+                    format!("OpenAI Responses failed: {:?}", response.error),
+                    response.error.as_ref(),
+                ));
             }
             ResponsesStreamEvent::Error { error, message } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "OpenAI Responses stream error: {error:?} {message:?}"
-                )));
+                return Err(provider_stream_error(
+                    format!("OpenAI Responses stream error: {error:?} {message:?}"),
+                    error.as_ref(),
+                ));
             }
             ResponsesStreamEvent::Other => {}
         }

@@ -1,7 +1,7 @@
 use super::*;
 use myco::generative_model::{
     BackendConfig, GenerateError, GenerativeModelConfig, ModelSpec, OpenAIBackendConfig, Protocol,
-    RetryPolicy, ThinkingMode, ToolSpec,
+    Recovery, RetryPolicy, ThinkingMode, ToolSpec,
 };
 
 use crate::test_utils::StubHttpServer;
@@ -254,15 +254,16 @@ async fn wire_does_not_retry_a_client_error() {
     .await;
 
     let model = stub_model_with_retry(&server.base_url(), fast_retry(5));
-    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
         .await
         .expect_err("HTTP 400 is an error");
 
     assert_eq!(server.connections(), 1, "400 must not be retried");
+    assert_eq!(error.recovery(), Recovery::RewindLastUserTurn);
 }
 
 /// Retry is bounded: a provider that is down stays down, and the turn has to
-/// end with the error rather than looping.
+/// end with an explicitly transient error rather than looping or rewinding.
 #[tokio::test]
 async fn wire_gives_up_after_max_attempts() {
     let down = || StubHttpServer::status_response(503, r#"{"error":"down"}"#);
@@ -273,9 +274,10 @@ async fn wire_gives_up_after_max_attempts() {
         .await
         .expect_err("all attempts fail");
 
+    assert_eq!(error.recovery(), Recovery::Retry);
     match error {
-        GenerateError::ExecutionError(message) => assert!(message.contains("503"), "{message}"),
-        other => panic!("expected ExecutionError, got {other:?}"),
+        GenerateError::TransientError(message) => assert!(message.contains("503"), "{message}"),
+        other => panic!("expected TransientError, got {other:?}"),
     }
     // Exactly max_attempts — the fourth canned response is never collected.
     assert_eq!(server.connections(), 3);

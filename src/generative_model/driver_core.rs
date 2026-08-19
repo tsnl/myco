@@ -193,8 +193,8 @@ async fn send_with_retry(
 
 /// One send. A non-success status is mapped to an error carrying the response
 /// body (providers put the actionable detail in a JSON body, not the status
-/// line); a size rejection keeps its own variant so the caller rewinds rather
-/// than resending a request that can only fail again.
+/// line). Retryable statuses and transport failures are classified explicitly;
+/// every other failure keeps the rewind default.
 async fn attempt_send(
     client: &reqwest::Client,
     request: reqwest::Request,
@@ -204,7 +204,9 @@ async fn attempt_send(
         Ok(response) => response,
         // Transport-level: DNS, connect, TLS, idle timeout. Nothing about the
         // request is known to be at fault, so another attempt is worthwhile.
-        Err(e) => return Attempt::Transient(GenerateError::ExecutionError(format!("{e:?}")), None),
+        Err(e) => {
+            return Attempt::Transient(GenerateError::TransientError(format!("{e:?}")), None);
+        }
     };
     if response.status().is_success() {
         return Attempt::Ok(response);
@@ -215,14 +217,11 @@ async fn attempt_send(
         .text()
         .await
         .unwrap_or_else(|e| format!("<failed to read body: {e:?}>"));
-    let error = http_error(
-        status,
-        format!("{provider} API returned HTTP {status}: {body}"),
-    );
+    let message = format!("{provider} API returned HTTP {status}: {body}");
     if is_transient_status(status) {
-        Attempt::Transient(error, retry_after)
+        Attempt::Transient(GenerateError::TransientError(message), retry_after)
     } else {
-        Attempt::Fatal(error)
+        Attempt::Fatal(http_error(status, message))
     }
 }
 
@@ -261,7 +260,12 @@ async fn drive_sse_stream<A: SseAccumulator>(
 
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!("Error reading {provider} stream body: {e:?}"))
+            let message = format!("Error reading {provider} stream body: {e:?}");
+            if e.is_timeout() {
+                GenerateError::TransientError(message)
+            } else {
+                GenerateError::ExecutionError(message)
+            }
         })?;
 
         for data in sse.push(&chunk) {

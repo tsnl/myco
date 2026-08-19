@@ -196,11 +196,9 @@ impl Agent {
     /// Drop the last user turn — that message and everything the agent produced
     /// after it — and return the removed user content.
     ///
-    /// The recovery for [`Recovery::OmitLastMessage`]: a request the provider
-    /// rejects for its *size* is rejected again on every later turn, because
-    /// every later turn resends it. Truncating at the last `UserMessage` leaves
-    /// a well-formed prefix — the boundary is exactly where the previous turn
-    /// ended — so the session continues instead of failing forever.
+    /// The recovery for [`Recovery::RewindLastUserTurn`]. Truncating at the
+    /// last `UserMessage` leaves a well-formed prefix — the boundary is exactly
+    /// where the previous turn ended.
     ///
     /// `None` when there is no user message to remove; history is untouched.
     pub fn rewind_last_user_turn(&mut self) -> Option<Vec<Content>> {
@@ -506,8 +504,8 @@ pub enum AgentInteractionError {
 }
 
 impl AgentInteractionError {
-    /// Whether the failed turn can be resubmitted as-is, or the last user
-    /// message has to be rewound out of history first
+    /// Whether the failed turn can be retained, or the last user turn has to
+    /// be rewound first
     /// ([`Agent::rewind_last_user_turn`]).
     pub fn recovery(&self) -> Recovery {
         match self {
@@ -1249,11 +1247,11 @@ mod tests {
     }
 
     /// An oversized request is a property of the history, so the top-level
-    /// error must say the last message has to come out — not "try again".
+    /// error must say the last user turn has to be rewound — not "try again".
     /// (The rewind contract itself is proven by
     /// `rewind_drops_the_whole_turn_and_keeps_earlier_ones`.)
     #[tokio::test]
-    async fn oversized_request_reports_omit_last_message() {
+    async fn oversized_request_reports_rewind_last_user_turn() {
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![])
             .then_fail(GenerateError::RequestTooLargeError("42 MiB".into()));
@@ -1268,7 +1266,7 @@ mod tests {
             .await
             .expect_err("oversized request should fail");
 
-        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+        assert_eq!(err.recovery(), Recovery::RewindLastUserTurn);
     }
 
     /// History is well-formed after a cancel, so the same turn can be re-sent.

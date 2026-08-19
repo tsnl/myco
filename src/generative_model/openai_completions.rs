@@ -260,9 +260,10 @@ impl StreamAccumulator {
         chunk: ChatCompletionChunk,
     ) -> Result<Vec<MessagePart>, GenerateError> {
         if let Some(error) = chunk.error {
-            return Err(GenerateError::ExecutionError(format!(
-                "OpenAI Chat Completions stream error: {error}"
-            )));
+            return Err(provider_stream_error(
+                format!("OpenAI Chat Completions stream error: {error}"),
+                Some(&error),
+            ));
         }
 
         let mut out = Vec::new();
@@ -884,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_payload_is_an_execution_error() {
+    fn retryable_stream_error_payload_is_transient() {
         let mut acc = StreamAccumulator::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -892,10 +893,10 @@ mod tests {
             })))
             .unwrap_err();
         match err {
-            GenerateError::ExecutionError(msg) => {
+            GenerateError::TransientError(msg) => {
                 assert!(msg.contains("upstream is down"), "{msg}")
             }
-            other => panic!("expected ExecutionError, got {other:?}"),
+            other => panic!("expected TransientError, got {other:?}"),
         }
     }
 
