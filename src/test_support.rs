@@ -54,6 +54,7 @@ impl ScriptedModel {
 // be replayed on every drained call.
 fn clone_err(err: &GenerateError) -> GenerateError {
     match err {
+        GenerateError::TransientError(m) => GenerateError::TransientError(m.clone()),
         GenerateError::ExecutionError(m) => GenerateError::ExecutionError(m.clone()),
         GenerateError::RefusalError(m) => GenerateError::RefusalError(m.clone()),
         GenerateError::MalformedResponseError(m) => {

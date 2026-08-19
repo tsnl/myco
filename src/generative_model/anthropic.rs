@@ -468,9 +468,10 @@ impl StreamAccumulator {
             }
             AnthropicStreamEvent::Ping => {}
             AnthropicStreamEvent::Error { error } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "Anthropic stream error event: {error}"
-                )));
+                return Err(provider_stream_error(
+                    format!("Anthropic stream error event: {error}"),
+                    Some(&error),
+                ));
             }
             AnthropicStreamEvent::Other => {}
         }

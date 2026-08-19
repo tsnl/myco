@@ -1212,65 +1212,85 @@ mod tests {
             matches!(err, GenerateError::RequestTooLargeError(_)),
             "{err:?}"
         );
-        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+        assert_eq!(err.recovery(), Recovery::RewindLastUserTurn);
         assert!(err.to_string().contains("the limit is 30 MiB"), "{err}");
     }
 
-    /// A provider that rejects the size itself lands on the same variant, so
-    /// the caller rewinds whether the cap was caught locally or remotely.
+    /// Known provider size rejections keep their actionable error even though
+    /// rewind is now the recovery default.
     #[test]
-    fn provider_size_rejections_map_to_the_same_recovery() {
+    fn provider_size_rejections_get_an_actionable_error() {
         let too_large = http_error(
             reqwest::StatusCode::PAYLOAD_TOO_LARGE,
             "HTTP 413: too big".into(),
         );
-        assert_eq!(too_large.recovery(), Recovery::OmitLastMessage);
+        assert!(matches!(too_large, GenerateError::RequestTooLargeError(_)));
 
         // Anthropic reports it as a 400 whose body names the error type.
         let named = http_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"HTTP 400: {"error":{"type":"request_too_large"}}"#.into(),
         );
-        assert_eq!(named.recovery(), Recovery::OmitLastMessage);
+        assert!(matches!(named, GenerateError::RequestTooLargeError(_)));
 
-        // Others name no type and only describe the size in prose. Read as a
-        // generic failure this is resent unchanged on every later turn.
+        // Others name no type and only describe the size in prose.
         let described = http_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"HTTP 400: {"error":{"code":400,"message":"The message size (31271377 bytes) \
                exceeds 30.000MB limit.","status":"FAILED_PRECONDITION"}}"#
                 .into(),
         );
-        assert_eq!(described.recovery(), Recovery::OmitLastMessage);
+        assert!(matches!(described, GenerateError::RequestTooLargeError(_)));
+    }
 
-        let image_extent = http_error(
+    #[test]
+    fn generation_errors_rewind_unless_explicitly_transient() {
+        for err in [
+            GenerateError::ExecutionError("unknown".into()),
+            GenerateError::RefusalError("refused".into()),
+            GenerateError::MalformedResponseError("malformed".into()),
+            GenerateError::RequestTooLargeError("too large".into()),
+        ] {
+            assert_eq!(err.recovery(), Recovery::RewindLastUserTurn, "{err}");
+        }
+
+        let transient = GenerateError::TransientError("overloaded".into());
+        assert_eq!(transient.recovery(), Recovery::Retry);
+    }
+
+    #[test]
+    fn image_extent_rejection_uses_the_default_rewind() {
+        let err = http_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"HTTP 400: {"error":{"type":"invalid_request_error","message":"At least one \
                of the image dimensions exceed max allowed size for many-image requests: \
                2576 pixels"}}"#
                 .into(),
         );
-        assert_eq!(image_extent.recovery(), Recovery::OmitLastMessage);
 
-        let unrelated = http_error(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "HTTP 500: overloaded".into(),
-        );
-        assert_eq!(unrelated.recovery(), Recovery::Retry);
+        assert!(matches!(err, GenerateError::ExecutionError(_)), "{err:?}");
+        assert_eq!(err.recovery(), Recovery::RewindLastUserTurn);
     }
 
-    /// Reading the body is how a size rejection is recognized, so an ordinary
-    /// failure must not be mistaken for one: rewinding drops a user message,
-    /// which is destructive when the request was never too big.
     #[test]
-    fn ordinary_failures_are_not_read_as_size_rejections() {
-        for body in [
-            r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
-            r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
-            r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
+    fn structured_provider_errors_retain_turn_only_for_known_transients() {
+        for detail in [
+            serde_json::json!({"type": "overloaded_error"}),
+            serde_json::json!({"code": "rate_limit_exceeded"}),
+            serde_json::json!({"code": "request_timeout"}),
+            serde_json::json!({"status": 503}),
         ] {
-            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
-            assert_eq!(err.recovery(), Recovery::Retry, "{body}");
+            let err = provider_stream_error("provider failed".into(), Some(&detail));
+            assert_eq!(err.recovery(), Recovery::Retry, "{detail}");
+        }
+
+        for detail in [
+            serde_json::json!({"type": "invalid_request_error"}),
+            serde_json::json!({"code": "unknown"}),
+            serde_json::json!({"message": "overloaded"}),
+        ] {
+            let err = provider_stream_error("provider failed".into(), Some(&detail));
+            assert_eq!(err.recovery(), Recovery::RewindLastUserTurn, "{detail}");
         }
     }
 
@@ -1316,23 +1336,14 @@ mod tests {
     }
 }
 
-/// What a caller can do about a failed turn.
-///
-/// Failures that are a property of the *history* cannot be fixed by trying
-/// again — every later turn resends that history and fails the same way, which
-/// wedges the session. This is the top-level signal for those: it says whether
-/// the last user message has to come back out (see
-/// [`crate::session::Agent::rewind_last_user_turn`]) before the conversation
-/// can continue.
+/// What a caller does with the user turn after generation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// Nothing about the history is known to be at fault; resubmitting as-is
-    /// may work (provider blip, refusal, malformed stream).
+    /// An explicitly transient failure left the turn safe to retain.
     Retry,
-    /// The request is too big for the provider. Retrying unchanged fails
-    /// identically — drop the last user message (typically the one carrying an
-    /// oversized attachment) and the session can go on.
-    OmitLastMessage,
+    /// Rewind the last user turn, leaving the conversation at the previous turn
+    /// boundary.
+    RewindLastUserTurn,
 }
 
 /// Ceiling on one serialized API request body, checked before upload.
@@ -1341,11 +1352,16 @@ pub enum Recovery {
 /// attachments accumulate in history — so a session that was fine for several
 /// turns can cross the cap and then fail on *every* subsequent turn. Checking
 /// locally, with headroom under the provider's number, turns a confusing 413
-/// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
+/// after a multi-megabyte upload into an immediate rewind.
 pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
 #[derive(thiserror::Error, Debug)]
 pub enum GenerateError {
+    /// Explicitly retryable transport or provider failure. This is the only
+    /// generation error that preserves the last user turn.
+    #[error("Generation was interrupted by a transient failure: {0}")]
+    TransientError(String),
+
     #[error("Something went wrong while generating a response: {0}")]
     ExecutionError(String),
 
@@ -1364,10 +1380,10 @@ pub enum GenerateError {
 impl GenerateError {
     pub fn recovery(&self) -> Recovery {
         match self {
-            GenerateError::RequestTooLargeError(_) => Recovery::OmitLastMessage,
-            GenerateError::ExecutionError(_)
-            | GenerateError::RefusalError(_)
-            | GenerateError::MalformedResponseError(_) => Recovery::Retry,
+            GenerateError::TransientError(_) => Recovery::Retry,
+            // Rewind is deliberately the default. A new error must earn turn
+            // retention by being classified as transient at its source.
+            _ => Recovery::RewindLastUserTurn,
         }
     }
 }
@@ -1380,8 +1396,8 @@ pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), Gener
     if len > MAX_REQUEST_BYTES {
         return Err(GenerateError::RequestTooLargeError(format!(
             "the {provider} request is {:.1} MiB; the limit is {} MiB. \
-             Attached images stay in the conversation and add up — drop the last \
-             message (or start a new session) to get back under it",
+             Attached images stay in the conversation and add up — resubmit the \
+             rewound turn with fewer images (or start a new session) to get back under it",
             len as f64 / (1024.0 * 1024.0),
             MAX_REQUEST_BYTES / (1024 * 1024),
         )));
@@ -1389,16 +1405,13 @@ pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), Gener
     Ok(())
 }
 
-/// Map a provider HTTP status to the right error variant: a size rejection is
-/// not a generic failure.
+/// Map a non-transient provider HTTP failure to the right error variant: a size
+/// rejection gets a more actionable message than the default execution error.
 ///
 /// 413 is unambiguous. Everything else has to be read out of the body, because
 /// providers disagree on how they report an oversized request: some name a
 /// machine-readable type (`request_too_large`), others return a 400 whose body
-/// only describes the size in prose. Getting this wrong is expensive — the
-/// identical body is resent on every later turn, so a size failure classified
-/// as [`Recovery::Retry`] never triggers the rewind and the session fails
-/// forever.
+/// only describes the size in prose.
 pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || describes_a_size_rejection(&message) {
         GenerateError::RequestTooLargeError(message)
@@ -1407,15 +1420,49 @@ pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> Genera
     }
 }
 
+/// Classify a structured provider stream error. Only known transient codes
+/// retain the user turn; absent or unfamiliar fields follow the rewind default.
+pub(crate) fn provider_stream_error(
+    message: String,
+    detail: Option<&serde_json::Value>,
+) -> GenerateError {
+    let transient = detail.is_some_and(|detail| {
+        ["type", "code", "status"]
+            .into_iter()
+            .filter_map(|field| detail.get(field))
+            .any(|code| match code {
+                serde_json::Value::Number(code) => code
+                    .as_u64()
+                    .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code)),
+                serde_json::Value::String(code) => matches!(
+                    code.as_str(),
+                    "overloaded_error"
+                        | "rate_limit_error"
+                        | "rate_limit_exceeded"
+                        | "request_timeout"
+                        | "server_error"
+                        | "service_unavailable"
+                        | "timeout"
+                ),
+                _ => false,
+            })
+    });
+
+    if transient {
+        GenerateError::TransientError(message)
+    } else {
+        GenerateError::ExecutionError(message)
+    }
+}
+
 /// Does this provider error body say the request was too big?
 ///
 /// Matching prose is unavoidable, so it is kept to phrasings only a size
-/// rejection produces: "too large" however the provider spells it, a size
-/// that "exceeds" a stated limit, or Anthropic's image-extent wording.
+/// rejection produces: "too large" however the provider spells it, or a size
+/// that "exceeds" a stated limit.
 fn describes_a_size_rejection(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("too_large")
         || message.contains("too large")
         || (message.contains("size") && message.contains("exceeds"))
-        || message.contains("dimensions exceed max allowed size")
 }

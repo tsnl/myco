@@ -321,10 +321,10 @@ async fn run_print(args: Args) {
     sigint_task.abort();
     sink.finish();
 
-    // A too-large request would fail identically on every later turn of a
-    // resumed session; take the offending message back out before saving.
+    // Preserve only turns whose failure was explicitly classified as transient.
+    // Rewind every other failed user turn before saving the session.
     let rewound = match &result {
-        Err(e) if e.recovery() == Recovery::OmitLastMessage => agent.rewind_last_user_turn(),
+        Err(e) if e.recovery() == Recovery::RewindLastUserTurn => agent.rewind_last_user_turn(),
         _ => None,
     };
 
@@ -345,19 +345,15 @@ async fn run_print(args: Args) {
         Err(e) => {
             eprintln!("myco: {e}");
             if let Some(dropped) = rewound {
-                eprintln!(
-                    "myco: the last message was removed from the conversation so the session \
-                     can continue{}.",
-                    describe_dropped_images(&dropped)
-                );
+                eprintln!("myco: {}", rewind_notice(&dropped));
             }
             std::process::exit(1);
         }
     }
 }
 
-/// Parenthetical naming the images a rewound message carried, for the notice
-/// that explains why it is gone. Empty when it carried none.
+/// Parenthetical naming the images a rewound user turn carried. Empty when it
+/// carried none.
 fn describe_dropped_images(dropped: &[Content]) -> String {
     match dropped
         .iter()
@@ -368,6 +364,13 @@ fn describe_dropped_images(dropped: &[Content]) -> String {
         1 => " (it carried 1 image)".into(),
         n => format!(" (it carried {n} images)"),
     }
+}
+
+fn rewind_notice(dropped: &[Content]) -> String {
+    format!(
+        "The last user turn was rewound{} so the session can continue.",
+        describe_dropped_images(dropped)
+    )
 }
 
 /// Combine the `-p` argument and piped stdin into the user prompt. With both,
@@ -1123,18 +1126,13 @@ impl ReplSession {
                 // provider errors) are live-only — not stored in session history —
                 // so resume/Ctrl-L will not replay them.
                 let mut message = e.to_string();
-                // A too-large request fails identically on every later turn,
-                // because every later turn resends it. Rewind the offending
-                // message out of history here rather than leaving the session
-                // unable to continue.
-                if e.recovery() == Recovery::OmitLastMessage
+                // Unknown failures rewind by default. Only explicitly transient
+                // failures retain the user turn.
+                if e.recovery() == Recovery::RewindLastUserTurn
                     && let Some(dropped) = self.agent.rewind_last_user_turn()
                 {
-                    message.push_str(&format!(
-                        "\n\nThe last message was removed from the conversation so the session \
-                         can continue{}.",
-                        describe_dropped_images(&dropped)
-                    ));
+                    message.push_str("\n\n");
+                    message.push_str(&rewind_notice(&dropped));
                 }
                 self.ui.error_section(&message);
                 self.ui.blank_line();
@@ -1852,6 +1850,26 @@ mod tests {
                 }],
             },
         ]
+    }
+
+    #[test]
+    fn rewind_notice_names_the_turn_and_its_images() {
+        assert_eq!(
+            rewind_notice(&[]),
+            "The last user turn was rewound so the session can continue."
+        );
+        let dropped = vec![
+            Content::Text {
+                text: "retry".into(),
+            },
+            Content::Image {
+                source: "data:image/png;base64,AAAA".into(),
+            },
+        ];
+        assert_eq!(
+            rewind_notice(&dropped),
+            "The last user turn was rewound (it carried 1 image) so the session can continue."
+        );
     }
 
     #[test]
