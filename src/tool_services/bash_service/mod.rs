@@ -113,8 +113,8 @@ impl BashService {
                 programs.\n\n\
                 **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
                 process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
-                Tool uses whose `command` starts with `cd` are **rejected** — use `cwd` \
-                instead. (`write` stdin may still send interactive `cd` into a live shell.)",
+                A leading `cd` still runs, but the result nudges you toward `cwd`. (`write` stdin \
+                may still send interactive `cd` into a live shell.)",
                 exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
                 exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
                 session_default_s = DEFAULT_TIMEOUT_MS / 1000,
@@ -157,8 +157,15 @@ impl ToolService for BashService {
                 Ok(a) => a,
                 Err(e) => return generative_model::ToolResult::err(e),
             };
+            let nudge = action.command().and_then(command_nudge);
             // Owner is the agent that issued this tool call (root or subagent).
-            self.execute(action, ctx.agent_id, ctx.cancel).await
+            let mut result = self.execute(action, ctx.agent_id, ctx.cancel).await;
+            if let Some(text) = nudge {
+                result.content.push(generative_model::Content::Text {
+                    text: format!("\nNudge: {text}\n"),
+                });
+            }
+            result
         })
     }
 
@@ -1475,7 +1482,7 @@ pub struct Input {
     action: Option<ActionKind>,
     /// Command line. For `exec`: run via `bash -c`. For `start`: program line (default `bash -i`).
     ///
-    /// Must not start with `cd` — use [`Self::cwd`] instead.
+    /// Prefer [`Self::cwd`] over starting this with `cd`.
     #[serde(default)]
     command: Option<String>,
     /// Working directory for `exec` / `start` (process `current_dir`). Prefer this over
@@ -1599,27 +1606,39 @@ enum Action {
     List,
 }
 
-/// True when `command` begins with a shell `cd` (after optional whitespace).
-///
-/// Models should use the `cwd` param instead of prefixing with `cd … &&`.
-fn command_starts_with_cd(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    // Match `cd` as a shell word: `cd`, `cd …`, `cd\t…`, not `cdo` / `cdpath`.
-    matches!(trimmed.as_bytes(), [b'c', b'd'])
-        || trimmed.starts_with("cd ")
-        || trimmed.starts_with("cd\t")
-        || trimmed.starts_with("cd\n")
+impl Action {
+    fn command(&self) -> Option<&str> {
+        match self {
+            Action::Exec { command, .. } => Some(command),
+            Action::Start { command, .. } => command.as_deref(),
+            _ => None,
+        }
+    }
 }
 
-fn reject_if_command_starts_with_cd(command: &str) -> Result<(), String> {
-    if command_starts_with_cd(command) {
-        return Err(
-            "command must not start with `cd`; pass the directory via the `cwd` parameter instead \
-             (e.g. {\"command\": \"ls\", \"cwd\": \"/path\"} rather than \"cd /path && ls\")"
-                .into(),
-        );
+/// Guidance attached to a completed command that bypasses a first-class bash
+/// field. The command still runs; its result teaches the next call.
+fn command_nudge(command: &str) -> Option<&'static str> {
+    if command_starts_with_word(command, "cd") {
+        Some(
+            "pass the working directory as bash's `cwd` field instead of starting `command` \
+             with `cd`; this keeps the working directory visible to myco.",
+        )
+    } else if command_starts_with_word(command, "ssh") {
+        Some(
+            "for a configured myco host, pass its alias as bash's `host` field instead of \
+             invoking `ssh`; direct SSH is for setup, diagnosis, or unconfigured machines.",
+        )
+    } else {
+        None
     }
-    Ok(())
+}
+
+fn command_starts_with_word(command: &str, word: &str) -> bool {
+    let Some(rest) = command.trim_start().strip_prefix(word) else {
+        return false;
+    };
+    rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace()
 }
 
 /// Message for a `bash` tool use whose input object carries nothing at all.
@@ -1753,7 +1772,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .clone()
                 .ok_or_else(|| "exec requires `command`".to_string())?;
             require_non_blank("command", &command)?;
-            reject_if_command_starts_with_cd(&command)?;
             Ok(Action::Exec {
                 command,
                 cwd,
@@ -1769,7 +1787,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             require_non_blank("session_id", &session_id)?;
             if let Some(command) = input.command.as_deref() {
                 require_non_blank("command", command)?;
-                reject_if_command_starts_with_cd(command)?;
             }
             Ok(Action::Start {
                 session_id,
