@@ -229,6 +229,35 @@ fn accepts_command_starting_with_cd() {
 }
 
 #[test]
+fn command_nudges_match_only_leading_cd_or_ssh_words() {
+    assert!(command_nudge("cd /tmp && pwd").is_some());
+    assert!(command_nudge("  cd\t/tmp").is_some());
+    assert!(command_nudge("ssh devbox uname -a").is_some());
+    assert!(command_nudge("ssh").is_some());
+    for command in ["cdo thing", "ssh-add -l", "echo ssh devbox", "pwd"] {
+        assert!(command_nudge(command).is_none(), "command={command:?}");
+    }
+}
+
+#[tokio::test]
+async fn detected_commands_run_and_return_routing_nudges() {
+    for (command, output, field) in [
+        ("cd / && printf command-ran", "command-ran", "`cwd`"),
+        ("ssh -V", "OpenSSH", "`host`"),
+    ] {
+        let result = dispatch_json(harness(), json!({"command": command})).await;
+
+        assert!(!result.is_error, "command={command:?}: {result:?}");
+        let text = result_text(&result);
+        assert!(text.contains(output), "command={command:?}: {text}");
+        assert!(
+            text.contains("Nudge:") && text.contains(field),
+            "command={command:?}: {text}"
+        );
+    }
+}
+
+#[test]
 fn rejects_cwd_on_non_spawn_actions() {
     for action in ["write", "read", "signal", "close", "list"] {
         let input: Input = serde_json::from_value(json!({

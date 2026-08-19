@@ -157,8 +157,15 @@ impl ToolService for BashService {
                 Ok(a) => a,
                 Err(e) => return generative_model::ToolResult::err(e),
             };
+            let nudge = action.command().and_then(command_nudge);
             // Owner is the agent that issued this tool call (root or subagent).
-            self.execute(action, ctx.agent_id, ctx.cancel).await
+            let mut result = self.execute(action, ctx.agent_id, ctx.cancel).await;
+            if let Some(text) = nudge {
+                result.content.push(generative_model::Content::Text {
+                    text: format!("\nNudge: {text}\n"),
+                });
+            }
+            result
         })
     }
 
@@ -1597,6 +1604,41 @@ enum Action {
         session_id: String,
     },
     List,
+}
+
+impl Action {
+    fn command(&self) -> Option<&str> {
+        match self {
+            Action::Exec { command, .. } => Some(command),
+            Action::Start { command, .. } => command.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Guidance attached to a completed command that bypasses a first-class bash
+/// field. The command still runs; its result teaches the next call.
+fn command_nudge(command: &str) -> Option<&'static str> {
+    if command_starts_with_word(command, "cd") {
+        Some(
+            "pass the working directory as bash's `cwd` field instead of starting `command` \
+             with `cd`; this keeps the working directory visible to myco.",
+        )
+    } else if command_starts_with_word(command, "ssh") {
+        Some(
+            "for a configured myco host, pass its alias as bash's `host` field instead of \
+             invoking `ssh`; direct SSH is for setup, diagnosis, or unconfigured machines.",
+        )
+    } else {
+        None
+    }
+}
+
+fn command_starts_with_word(command: &str, word: &str) -> bool {
+    let Some(rest) = command.trim_start().strip_prefix(word) else {
+        return false;
+    };
+    rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace()
 }
 
 /// Message for a `bash` tool use whose input object carries nothing at all.

@@ -335,14 +335,7 @@ impl Harness {
                 ));
             };
 
-            let nudge = bash_command_nudge(&tool_use);
-            let mut result = client.call(agent_id, tool_use, cancel).await;
-            if let Some(text) = nudge {
-                result.content.push(generative_model::Content::Text {
-                    text: format!("\nNudge: {text}\n"),
-                });
-            }
-            result
+            client.call(agent_id, tool_use, cancel).await
         })
     }
 
@@ -405,42 +398,6 @@ fn strip_host_field(tool_use: &mut generative_model::ToolUse) {
     if let serde_json::Value::Object(map) = &mut tool_use.input {
         map.remove("host");
     }
-}
-
-/// Guidance attached to a completed bash call when its command bypasses a
-/// first-class routing field. The call still runs: shell parsing is too broad
-/// for a reliable policy gate, while a result-side reminder lets the model
-/// correct its next call without costing the current one.
-fn bash_command_nudge(tool_use: &generative_model::ToolUse) -> Option<&'static str> {
-    if tool_use.name != "bash" {
-        return None;
-    }
-    match tool_use.input.get("action") {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::String(action)) if matches!(action.as_str(), "exec" | "start") => {}
-        Some(_) => return None,
-    }
-    let command = tool_use.input.get("command")?.as_str()?;
-    if command_starts_with_word(command, "cd") {
-        Some(
-            "pass the working directory as bash's `cwd` field instead of starting `command` \
-             with `cd`; this keeps the working directory visible to myco.",
-        )
-    } else if command_starts_with_word(command, "ssh") {
-        Some(
-            "for a configured myco host, pass its alias as bash's `host` field instead of \
-             invoking `ssh`; direct SSH is for setup, diagnosis, or unconfigured machines.",
-        )
-    } else {
-        None
-    }
-}
-
-fn command_starts_with_word(command: &str, word: &str) -> bool {
-    let Some(rest) = command.trim_start().strip_prefix(word) else {
-        return false;
-    };
-    rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace()
 }
 
 /// Inject optional `host` into a host tool's JSON schema so models can target machines.
@@ -546,50 +503,6 @@ mod tests {
         };
         strip_host_field(&mut tu);
         assert_eq!(tu.input, json!({"command": "echo", "timeout_ms": 500}));
-    }
-
-    #[test]
-    fn bash_command_nudges_match_only_leading_cd_or_ssh_words() {
-        let nudge = |command| {
-            bash_command_nudge(&ToolUse {
-                name: "bash".into(),
-                input: json!({"command": command}),
-            })
-        };
-
-        assert!(nudge("cd /tmp && pwd").is_some());
-        assert!(nudge("  cd\t/tmp").is_some());
-        assert!(nudge("ssh devbox uname -a").is_some());
-        assert!(nudge("ssh").is_some());
-        for command in ["cdo thing", "ssh-add -l", "echo ssh devbox", "pwd"] {
-            assert!(nudge(command).is_none(), "command={command:?}");
-        }
-        assert!(
-            bash_command_nudge(&ToolUse {
-                name: "bash".into(),
-                input: json!({"action": "list", "command": "ssh devbox"}),
-            })
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn detected_bash_commands_run_and_return_routing_nudges() {
-        let harness = Harness::local_with_services(Vec::new());
-        for (command, output, field) in [
-            ("cd / && printf command-ran", "command-ran", "`cwd`"),
-            ("ssh -V", "OpenSSH", "`host`"),
-        ] {
-            let result = call(&harness, "bash", json!({"command": command})).await;
-
-            assert!(!result.is_error, "command={command:?}: {result:?}");
-            let text = result_text(&result);
-            assert!(text.contains(output), "command={command:?}: {text}");
-            assert!(
-                text.contains("Nudge:") && text.contains(field),
-                "command={command:?}: {text}"
-            );
-        }
     }
 
     #[test]
