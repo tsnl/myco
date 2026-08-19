@@ -1243,6 +1243,15 @@ mod tests {
         );
         assert_eq!(described.recovery(), Recovery::OmitLastMessage);
 
+        let image_extent = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"HTTP 400: {"error":{"type":"invalid_request_error","message":"At least one \
+               of the image dimensions exceed max allowed size for many-image requests: \
+               2576 pixels"}}"#
+                .into(),
+        );
+        assert_eq!(image_extent.recovery(), Recovery::OmitLastMessage);
+
         let unrelated = http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "HTTP 500: overloaded".into(),
@@ -1401,11 +1410,11 @@ pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> Genera
 /// Does this provider error body say the request was too big?
 ///
 /// Matching prose is unavoidable, so it is kept to phrasings only a size
-/// rejection produces: "too large" however the provider spells it, or a size
-/// that "exceeds" a stated limit.
+/// rejection produces: "too large" however the provider spells it, or language
+/// saying a size exceeds a stated limit.
 fn describes_a_size_rejection(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("too_large")
         || message.contains("too large")
-        || (message.contains("size") && message.contains("exceeds"))
+        || (message.contains("size") && message.contains("exceed"))
 }
