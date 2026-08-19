@@ -574,19 +574,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leading_cd_runs_and_returns_a_cwd_nudge() {
+    async fn detected_bash_commands_run_and_return_routing_nudges() {
         let harness = Harness::local_with_services(Vec::new());
-        let result = call(
-            &harness,
-            "bash",
-            json!({"command": "cd / && printf command-ran"}),
-        )
-        .await;
+        for (command, output, field) in [
+            ("cd / && printf command-ran", "command-ran", "`cwd`"),
+            ("ssh -V", "OpenSSH", "`host`"),
+        ] {
+            let result = call(&harness, "bash", json!({"command": command})).await;
 
-        assert!(!result.is_error, "{result:?}");
-        let text = result_text(&result);
-        assert!(text.contains("command-ran"), "{text}");
-        assert!(text.contains("Nudge:") && text.contains("`cwd`"), "{text}");
+            assert!(!result.is_error, "command={command:?}: {result:?}");
+            let text = result_text(&result);
+            assert!(text.contains(output), "command={command:?}: {text}");
+            assert!(
+                text.contains("Nudge:") && text.contains(field),
+                "command={command:?}: {text}"
+            );
+        }
     }
 
     #[test]
