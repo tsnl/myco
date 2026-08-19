@@ -1410,11 +1410,12 @@ pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> Genera
 /// Does this provider error body say the request was too big?
 ///
 /// Matching prose is unavoidable, so it is kept to phrasings only a size
-/// rejection produces: "too large" however the provider spells it, or language
-/// saying a size exceeds a stated limit.
+/// rejection produces: "too large" however the provider spells it, a size
+/// that "exceeds" a stated limit, or Anthropic's image-extent wording.
 fn describes_a_size_rejection(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("too_large")
         || message.contains("too large")
-        || (message.contains("size") && message.contains("exceed"))
+        || (message.contains("size") && message.contains("exceeds"))
+        || message.contains("dimensions exceed max allowed size")
 }
