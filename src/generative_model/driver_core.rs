@@ -80,9 +80,8 @@ pub(super) fn error_stream(e: GenerateError) -> AsyncStream<Result<MessagePart, 
 }
 
 /// Send `request` in a spawned task and bridge its SSE stream into the
-/// [`GenerativeModel::generate`] stream shape. Dropping the returned stream
-/// cancels generation: the task's channel sends fail, it returns, and the HTTP
-/// body drops so the provider stops generating/billing.
+/// [`GenerativeModel::generate`] stream shape. The receiver owns the request
+/// lifetime, including time spent awaiting headers, body bytes, or retries.
 pub(super) fn spawn_generate<A: SseAccumulator>(
     request: reqwest::RequestBuilder,
     acc: A,
@@ -93,7 +92,7 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
 
     tokio::spawn(async move {
-        let result = async {
+        let generate = async {
             // Build first so the composed body can be measured: providers cap
             // the whole request, and images accumulate in history, so a session
             // can cross the cap turns after the attachment was sent. Rejecting
@@ -108,20 +107,17 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
                 }
                 check_request_size(body.len(), provider)?;
             }
-            let response = send_with_retry(
-                &client,
-                request,
-                provider,
-                retry,
-                &tx,
-                debug_dump_api_requests,
-            )
-            .await?;
+            let response =
+                send_with_retry(&client, request, provider, retry, debug_dump_api_requests).await?;
             drive_sse_stream(response, &tx, acc, provider).await
-        }
-        .await;
-        if let Err(e) = result {
-            let _ = tx.send(Err(e)).await;
+        };
+        tokio::select! {
+            _ = tx.closed() => {}
+            result = generate => {
+                if let Err(e) = result {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
         }
     });
 
@@ -151,7 +147,6 @@ async fn send_with_retry(
     request: reqwest::Request,
     provider: &str,
     retry: RetryPolicy,
-    tx: &tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
     debug: bool,
 ) -> Result<reqwest::Response, GenerateError> {
     let mut attempt: u32 = 1;
@@ -181,12 +176,7 @@ async fn send_with_retry(
                 retry.max_attempts
             );
         }
-        // Ctrl-C during a long backoff drops the consumer; notice that instead
-        // of sleeping the wait out before the turn can end.
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = tx.closed() => return Err(error),
-        }
+        tokio::time::sleep(wait).await;
         attempt += 1;
     }
 }
