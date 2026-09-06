@@ -1,23 +1,19 @@
-//! The agent runtime: one user turn driven to completion against a model and a
+//! The agent runtime: model context driven to completion against a model and a
 //! harness, plus the live [`AgentEvent`] stream a front-end renders.
 //!
-//! The top layer: it depends on the model drivers, the harness and the session
-//! store, and none of them depend on it. [`TraceContext`] is display
-//! attribution, so it lives here; the harness takes a bare agent `Uuid`.
+//! It depends on the model drivers and harness; neither depends on it.
+//! [`TraceContext`] attributes events; the harness takes a bare agent `Uuid`.
 //!
 //! History well-formedness is the invariant everything else rests on: whatever
-//! a turn does — end cleanly, hit a provider error, get cancelled mid-tool, or
+//! a run does — end cleanly, hit a provider error, get cancelled mid-tool, or
 //! get truncated mid-tool-call by `max_tokens` — the transcript it leaves behind
 //! must be a prefix the provider will accept on the next request. See
-//! [`Agent::interact`].
+//! [`Agent::run`].
 
 use std::sync::Arc;
 
 mod generation;
 use generation::GenerateOrCancel;
-
-mod compact_worker;
-pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 
 use futures::future;
 
@@ -209,30 +205,17 @@ impl Agent {
         self.model = model;
     }
 
-    /// Drop the last user turn — that message and everything the agent produced
-    /// after it — and return the removed user content.
-    ///
-    /// The recovery for [`Recovery::OmitLastMessage`]: a request the provider
-    /// rejects for its *size* is rejected again on every later turn, because
-    /// every later turn resends it. Truncating at the last `UserMessage` leaves
-    /// a well-formed prefix — the boundary is exactly where the previous turn
-    /// ended — so the session continues instead of failing forever.
-    ///
-    /// `None` when there is no user message to remove; history is untouched.
-    pub fn rewind_last_user_turn(&mut self) -> Option<Vec<Content>> {
-        let at = self
-            .history
-            .iter()
-            .rposition(|m| matches!(m, Message::UserMessage { .. }))?;
-        let mut dropped = self.history.split_off(at);
-        // Usage described the request that just failed; it no longer describes
-        // this history. Callers re-establish it on the next successful turn.
+    /// Append input at a well-formed context boundary and checkpoint it.
+    pub fn append_input(&mut self, message: Message) {
+        self.history.push(message);
+        self.emit_checkpoint();
+    }
+
+    pub(crate) fn truncate_history(&mut self, index: usize) -> Vec<Message> {
+        let dropped = self.history.split_off(index);
         self.last_usage = None;
         self.emit_checkpoint();
-        match dropped.remove(0) {
-            Message::UserMessage { content } => Some(content),
-            other => unreachable!("rposition matched a user message, got {other:?}"),
-        }
+        dropped
     }
 
     /// Set the context window used for the USER `N/M` token header.
@@ -264,20 +247,12 @@ impl Agent {
         &self.context
     }
 
-    /// Run one user turn until the model ends the turn or [`cancel`] fires.
-    ///
-    /// Pass [`CancelToken::new`] when cancellation is not needed (tests, scripts).
-    /// The CLI cancels the token on Ctrl-C while a turn is in flight.
-    pub async fn interact(
+    /// Drive the existing model context to completion. The caller supplies input separately.
+    /// The instance owns host tool state across runs; dropping it tears that state down.
+    pub async fn run(
         &mut self,
-        user_input: Vec<Content>,
         cancel: CancelToken,
     ) -> Result<Vec<Content>, AgentInteractionError> {
-        self.history.push(Message::UserMessage {
-            content: user_input,
-        });
-        self.emit_checkpoint();
-
         // Output tokens accumulate across this turn's generate calls (one per
         // tool round-trip); each new report's input side already covers the
         // whole prompt, so it replaces rather than adds.
@@ -484,7 +459,7 @@ pub enum AgentInteractionError {
 impl AgentInteractionError {
     /// Whether the failed turn can be resubmitted as-is, or the last user
     /// message has to be rewound out of history first
-    /// ([`Agent::rewind_last_user_turn`]).
+    /// by the caller before starting another run.
     pub fn recovery(&self) -> Recovery {
         match self {
             AgentInteractionError::GenerateError(e) => e.recovery(),
@@ -607,15 +582,15 @@ mod tests {
 
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
         let wall_start = Instant::now();
-        let reply = agent
-            .interact(
-                vec![Content::Text {
-                    text: "run both".into(),
-                }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("interact");
+        let reply = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text {
+                text: "run both".into(),
+            }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("interact");
         let wall = wall_start.elapsed();
 
         // Reply is the final assistant text.
@@ -699,13 +674,13 @@ mod tests {
             record.lock().unwrap().push(history.to_vec());
         }));
 
-        agent
-            .interact(
-                vec![Content::Text { text: "run".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("interact");
+        crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "run".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("interact");
 
         let snapshots = snapshots.lock().unwrap();
         assert_eq!(snapshots.len(), 2, "{snapshots:?}");
@@ -755,13 +730,13 @@ mod tests {
         ]);
 
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent
-            .interact(
-                vec![Content::Text { text: "go".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("interact");
+        crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "go".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("interact");
 
         // Input side tracks the latest request (the live context); output sums the turn.
         let usage = agent.last_usage().expect("usage recorded");
@@ -825,10 +800,13 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        let err = agent
-            .interact(vec![Content::Text { text: "go".into() }], cancel)
-            .await
-            .expect_err("should cancel");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "go".into() }],
+            cancel,
+        )
+        .await
+        .expect_err("should cancel");
         let elapsed = t0.elapsed();
         assert!(
             matches!(err, AgentInteractionError::Cancelled),
@@ -886,10 +864,13 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        let err = agent
-            .interact(vec![Content::Text { text: "run".into() }], cancel)
-            .await
-            .expect_err("should cancel");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "run".into() }],
+            cancel,
+        )
+        .await
+        .expect_err("should cancel");
         let elapsed = t0.elapsed();
         assert!(matches!(err, AgentInteractionError::Cancelled));
         // A cancel-ignoring tool is abandoned after CANCEL_TOOL_GRACE — the
@@ -935,15 +916,15 @@ mod tests {
             "provider 500 after tools".into(),
         ));
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = agent
-            .interact(
-                vec![Content::Text {
-                    text: "run tool then fail".into(),
-                }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect_err("second generate should fail");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text {
+                text: "run tool then fail".into(),
+            }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect_err("second generate should fail");
         assert!(
             matches!(err, AgentInteractionError::GenerateError(_)),
             "got {err:?}"
@@ -981,13 +962,13 @@ mod tests {
             "boom on first generate".into(),
         ));
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect_err("generate should fail");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect_err("generate should fail");
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         assert_eq!(agent.history().len(), 1);
         assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
@@ -1005,13 +986,13 @@ mod tests {
             usage: None,
         }]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect_err("malformed turn should error");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect_err("malformed turn should error");
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
         // History stays well-formed: user + assistant, no ToolResults message.
         assert_eq!(agent.history().len(), 2);
@@ -1054,13 +1035,13 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let reply = agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("turn should resume through the truncation, not error");
+        let reply = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("turn should resume through the truncation, not error");
 
         // The truncation is resumed inside the same turn, so the caller gets the
         // continuation rather than the partial answer that preceded the tool call.
@@ -1106,13 +1087,13 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let reply = agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("turn should resume through the truncation");
+        let reply = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("turn should resume through the truncation");
 
         assert!(matches!(&reply[0], Content::Text { text } if text == "tence."));
 
@@ -1151,13 +1132,13 @@ mod tests {
         let model = ScriptedModel::new(scripts);
         let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
         agent.set_max_truncated_resumes(CAP);
-        agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("turn should hand back once the cap is hit, not error");
+        crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("turn should hand back once the cap is hit, not error");
 
         // The initial generate plus CAP resumes.
         assert_eq!(model.remaining() as u32, 1);
@@ -1188,13 +1169,13 @@ mod tests {
         ]);
         let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
         agent.set_max_truncated_resumes(0);
-        let reply = agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("turn should hand back the partial answer");
+        let reply = crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("turn should hand back the partial answer");
 
         assert!(matches!(&reply[0], Content::Text { text } if text == "half a sen"));
         // user + assistant only: no continuation turn, no second generate.
@@ -1213,13 +1194,13 @@ mod tests {
             usage: None,
         }]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent
-            .interact(
-                vec![Content::Text { text: "hi".into() }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("turn should succeed");
+        crate::chat::interact(
+            &mut agent,
+            vec![Content::Text { text: "hi".into() }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("turn should succeed");
         assert_eq!(agent.history().len(), 2);
     }
 
@@ -1233,15 +1214,15 @@ mod tests {
         let model = ScriptedModel::new(vec![])
             .then_fail(GenerateError::RequestTooLargeError("42 MiB".into()));
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = agent
-            .interact(
-                vec![Content::Image {
-                    source: "data:image/png;base64,AAAA".into(),
-                }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect_err("oversized request should fail");
+        let err = crate::chat::interact(
+            &mut agent,
+            vec![Content::Image {
+                source: "data:image/png;base64,AAAA".into(),
+            }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect_err("oversized request should fail");
 
         assert_eq!(err.recovery(), Recovery::OmitLastMessage);
     }
@@ -1269,7 +1250,7 @@ mod tests {
             tool_results(&["done"]),
         ]);
 
-        let dropped = agent.rewind_last_user_turn().expect("user turn to rewind");
+        let dropped = crate::chat::rewind_last_user_turn(&mut agent).expect("user turn to rewind");
         assert!(matches!(&dropped[0], Content::Text { text } if text == "second"));
 
         let history = agent.history();
@@ -1308,15 +1289,15 @@ mod tests {
         // history already has tool_results so a fresh user turn is the normal path.
         // Also verify set_history alone is well-formed for provider requests by
         // checking the model can complete a new turn on top.
-        let reply = resumed
-            .interact(
-                vec![Content::Text {
-                    text: "continue".into(),
-                }],
-                crate::core::CancelToken::new(),
-            )
-            .await
-            .expect("resume interact");
+        let reply = crate::chat::interact(
+            &mut resumed,
+            vec![Content::Text {
+                text: "continue".into(),
+            }],
+            crate::core::CancelToken::new(),
+        )
+        .await
+        .expect("resume interact");
         assert_eq!(reply.len(), 1);
         match &reply[0] {
             Content::Text { text } => assert_eq!(text, "recovered"),

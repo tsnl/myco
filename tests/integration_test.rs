@@ -39,8 +39,7 @@ async fn test_agent_tool_use() {
         let input = vec![Content::Text {
             text: prompt.to_string(),
         }];
-        let ret_content = agent
-            .interact(input, myco::CancelToken::new())
+        let ret_content = myco::chat::interact(&mut agent, input, myco::CancelToken::new())
             .await
             .unwrap();
         eprintln!("Tool result: {ret_content:#?}");

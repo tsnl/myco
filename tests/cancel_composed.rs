@@ -46,10 +46,13 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
     });
 
     let t0 = Instant::now();
-    let err = agent
-        .interact(vec![Content::Text { text: "run".into() }], cancel)
-        .await
-        .expect_err("turn should be cancelled");
+    let err = myco::chat::interact(
+        &mut agent,
+        vec![Content::Text { text: "run".into() }],
+        cancel,
+    )
+    .await
+    .expect_err("turn should be cancelled");
     let elapsed = t0.elapsed();
     assert!(matches!(err, AgentInteractionError::Cancelled), "{err:?}");
     assert!(

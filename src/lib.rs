@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod chat;
 pub mod config;
 pub mod core;
 pub mod external_command;
@@ -16,10 +17,8 @@ pub mod tui;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use agent::{
-    Agent, AgentEvent, AgentInteractionError, CompactWorkerError, EventSink, NullEventSink,
-    TraceContext, compact_subagent_prompt, run_compact_worker,
-};
+pub use agent::{Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext};
+pub use chat::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
 pub use core::{CancelToken, uuid_simple_hex};
 pub use harness::{
