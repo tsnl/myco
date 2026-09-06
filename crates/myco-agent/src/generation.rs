@@ -2,8 +2,8 @@
 
 use futures::StreamExt;
 
-use crate::core::CancelToken;
-use crate::generative_model::{
+use crate::CancelToken;
+use myco_model::{
     ContentDelta, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure,
     MessageAccumulator, MessagePart,
 };
@@ -113,12 +113,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::core::AsyncStream;
-    use crate::generative_model::{
-        ContentStart, GenerativeModel, Message, RetryPolicy, TurnEndReason,
-    };
-    use crate::harness::Harness;
+    use crate::test_support::TestTools;
     use crate::test_support::user;
+    use myco_model::AsyncStream;
+    use myco_model::{ContentStart, GenerativeModel, Message, RetryPolicy, TurnEndReason};
 
     use super::*;
 
@@ -149,7 +147,7 @@ mod tests {
         cancel_on_failure: Option<CancelToken>,
     }
 
-    impl crate::agent::EventSink for Events {
+    impl crate::EventSink for Events {
         fn emit(&self, event: AgentEvent) {
             if matches!(event, AgentEvent::Failure { .. })
                 && let Some(cancel) = &self.cancel_on_failure
@@ -165,7 +163,7 @@ mod tests {
             scripts: Mutex::new(scripts.into()),
             inputs: Mutex::default(),
         });
-        let mut agent = Agent::new(model.clone(), Harness::local_with_services(vec![]), events);
+        let mut agent = Agent::new(model.clone(), TestTools::new(vec![]), events);
         agent.set_retry_policy(RetryPolicy {
             initial_backoff: Duration::ZERO,
             ..Default::default()
@@ -204,7 +202,7 @@ mod tests {
             .await
             .expect("second attempt succeeds");
         assert!(
-            matches!(output.content.as_slice(), [crate::generative_model::Content::Text { text }] if text == "answer")
+            matches!(output.content.as_slice(), [myco_model::Content::Text { text }] if text == "answer")
         );
         let inputs = model.inputs.lock().unwrap();
         assert_eq!(inputs.len(), 2);

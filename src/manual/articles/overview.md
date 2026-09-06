@@ -11,8 +11,9 @@ itself as an ordinary command (see below).
 `myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
 
 ```
-myco (interactive) / Agent
-  └── SessionRuntime (shared live tool ownership)
+myco (interactive) / chat adapter
+  ├── Agent (model context and run loop)
+  └── SessionRuntime (session binding + tool ownership)
       └── Harness (routing, config, root-configured services)
           ├── HostController "local"   → in-process HostWorker (always on)
           └── HostController "…"       → ssh … myco --mode host (lazy remote)

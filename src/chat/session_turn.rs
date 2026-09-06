@@ -1,5 +1,8 @@
 //! Session turns stamp input, recover rejected context, and persist every completed run.
 
+use std::sync::Arc;
+
+use crate::SessionRuntime;
 use crate::agent::{Agent, AgentInteractionError};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
@@ -15,19 +18,19 @@ pub struct SessionTurnOutcome {
 /// The caller keeps ownership of the agent, session lock, and cancellation source.
 pub async fn run_session_turn(
     agent: &mut Agent,
-    session: &ActiveSession,
+    runtime: &Arc<SessionRuntime>,
     mut input: Vec<Content>,
     forked: bool,
     cancel: CancelToken,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
+    let session = runtime.session();
     let _writer = tokio::select! {
         biased;
         writer = session.writer() => writer,
         _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
     };
-    let snapshot = session.snapshot();
-    agent.bind_thread(&snapshot.id, snapshot.active_thread());
+    runtime.bind_agent(agent);
     let on_warning = std::sync::Arc::new(on_warning);
     let checkpoint_warning = on_warning.clone();
     wire_checkpoint(agent, session, move |warning| checkpoint_warning(warning));
@@ -82,11 +85,11 @@ pub fn wire_checkpoint(
 ) {
     let thread_id = session.with(|session| session.active_thread().id.clone());
     let session = session.clone();
-    agent.set_checkpoint(Box::new(move |messages, usage| {
+    agent.set_checkpoint(Some(Box::new(move |messages, usage| {
         if let Err(error) = session.persist_thread_messages(&thread_id, messages, usage, false) {
             on_warning(&format!("mid-turn session save failed: {error}"));
         }
-    }));
+    })));
 }
 
 /// Save current context, including an empty rewind of an existing session.
@@ -121,7 +124,7 @@ mod tests {
     fn agent(model: Arc<ScriptedModel>) -> Agent {
         Agent::new(
             model,
-            Harness::local_with_services(vec![]),
+            crate::test_support::tool_runtime(Harness::local_with_services(vec![])),
             Arc::new(NullEventSink),
         )
     }
@@ -137,7 +140,7 @@ mod tests {
             .unwrap()
             .block_on(run_session_turn(
                 agent,
-                session,
+                &SessionRuntime::new(Harness::local_with_services(vec![]), session.clone()),
                 vec![Content::Text {
                     text: "task".into(),
                 }],
@@ -242,9 +245,11 @@ mod tests {
                 usage: None,
             }]));
             {
+                let runtime =
+                    SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
                 let run = run_session_turn(
                     &mut agent,
-                    &session,
+                    &runtime,
                     vec![],
                     false,
                     CancelToken::new(),
@@ -281,11 +286,15 @@ mod tests {
             let mut agent = agent(ScriptedModel::new(vec![]));
             let cancel = CancelToken::new();
             cancel.cancel();
-            let outcome =
-                run_session_turn(&mut agent, &session, vec![], false, cancel, |warning| {
-                    panic!("{warning}")
-                })
-                .await;
+            let outcome = run_session_turn(
+                &mut agent,
+                &SessionRuntime::new(Harness::local_with_services(vec![]), session.clone()),
+                vec![],
+                false,
+                cancel,
+                |warning| panic!("{warning}"),
+            )
+            .await;
             assert!(matches!(
                 outcome.result,
                 Err(AgentInteractionError::Cancelled)

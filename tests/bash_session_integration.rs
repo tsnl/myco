@@ -72,7 +72,11 @@ async fn scripted_multi_turn_bash_session_transcript() {
         turn_end("multi-turn bash session ok"),
     ]);
 
-    let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+    let mut agent = Agent::new(
+        model.clone(),
+        crate::test_utils::tool_runtime(harness),
+        Arc::new(NullEventSink),
+    );
 
     let t0 = Instant::now();
     let reply = myco::chat::interact(

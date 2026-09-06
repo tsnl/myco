@@ -71,7 +71,7 @@ fn retry_agent(
     let events = std::sync::Arc::new(RecordedEvents::default());
     let mut agent = myco::Agent::new(
         stub_model(base_url, vec![]),
-        myco::Harness::local_with_services(vec![]),
+        crate::test_utils::tool_runtime(myco::Harness::local_with_services(vec![])),
         events.clone(),
     );
     agent.set_retry_policy(retry);

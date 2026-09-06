@@ -17,7 +17,7 @@ async fn headless_run_uses_supplied_context_without_adding_a_chat_turn() {
     }]);
     let mut agent = Agent::new(
         model,
-        Harness::local_with_services(vec![]),
+        crate::test_utils::tool_runtime(Harness::local_with_services(vec![])),
         Arc::new(NullEventSink),
     );
     agent.replace_context(

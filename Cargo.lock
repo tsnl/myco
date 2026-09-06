@@ -909,6 +909,7 @@ dependencies = [
  "futures",
  "infer",
  "libc",
+ "myco-agent",
  "myco-model",
  "rustyline",
  "schemars",
@@ -916,10 +917,22 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-util",
  "toml",
  "unicode-width",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "myco-agent"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "myco-model",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

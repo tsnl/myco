@@ -1,49 +1,76 @@
-//! Shared ownership of live host resources, independent of any one agent or thread.
+//! Session-bound tool ownership and agent binding, independent of the frontend.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::agent::{Agent, ToolExecutor};
+use crate::core::{Async, CancelToken};
+use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 use crate::harness::Harness;
+use crate::session::ActiveSession;
 
 pub struct SessionRuntime {
-    pub(super) harness: Arc<Harness>,
-    pub(super) owner_id: Uuid,
-    session_id: OnceLock<String>,
+    harness: Arc<Harness>,
+    owner_id: Uuid,
+    session_id: String,
+    session: ActiveSession,
 }
 
 impl SessionRuntime {
-    pub fn new(harness: Arc<Harness>) -> Arc<Self> {
-        Self::with_owner(harness, Uuid::new_v4())
+    pub fn new(harness: Arc<Harness>, session: ActiveSession) -> Arc<Self> {
+        Arc::new(Self {
+            harness,
+            owner_id: Uuid::new_v4(),
+            session_id: session.id(),
+            session,
+        })
     }
 
-    pub(super) fn for_session(self: &Arc<Self>, id: &str) -> Arc<Self> {
-        if self.session_id.get_or_init(|| id.to_string()) == id {
-            return self.clone();
-        }
-        let runtime = Self::new(self.harness.clone());
-        runtime.session_id.set(id.to_string()).expect("new runtime");
-        runtime
+    pub fn session(&self) -> &ActiveSession {
+        &self.session
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn bind_agent(self: &Arc<Self>, agent: &mut Agent) {
+        let session = self.session.snapshot();
+        assert_eq!(
+            self.session_id, session.id,
+            "a runtime belongs to one session"
+        );
+        let thread = session.active_thread();
+        let mut context = agent.context().clone();
+        context.session_id = Some(session.id.clone());
+        context.thread_id = Some(thread.id.clone());
+        agent.set_context(context);
+        agent.set_tools(self.clone());
+        agent.replace_context(thread.messages.clone(), thread.last_usage);
+        agent.set_checkpoint(None);
     }
 
     pub fn running_tool_summaries(&self) -> Vec<String> {
         self.harness.running_tool_summaries(self.owner_id)
     }
+}
 
-    pub(super) fn with_owner(harness: Arc<Harness>, owner_id: Uuid) -> Arc<Self> {
-        Arc::new(Self {
-            harness,
-            owner_id,
-            session_id: OnceLock::new(),
-        })
+impl ToolExecutor for SessionRuntime {
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.harness.tool_specs()
+    }
+
+    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+        self.harness
+            .clone()
+            .dispatch_tool_use(tool, self.owner_id, cancel)
     }
 }
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
-        if !self.owner_id.is_nil() {
-            self.harness.notify_agent_finished(self.owner_id);
-        }
+        self.harness.notify_agent_finished(self.owner_id);
     }
 }
 
@@ -79,10 +106,10 @@ mod tests {
         }
     }
 
-    async fn run(agent: &mut Agent, session: &ActiveSession) {
+    async fn run(agent: &mut Agent, runtime: &Arc<SessionRuntime>) {
         crate::chat::run_session_turn(
             agent,
-            session,
+            runtime,
             vec![Content::Text {
                 text: "task".into(),
             }],
@@ -101,16 +128,16 @@ mod tests {
         let executor = tokio::runtime::Runtime::new().unwrap();
         executor.block_on(async {
             let harness = Harness::local_with_services(vec![]);
-            let live = SessionRuntime::new(harness.clone());
-            let owner = live.owner_id;
             let session = ActiveSession::new(Session::new("test"));
+            let live = SessionRuntime::new(harness.clone(), session.clone());
+            let owner = live.owner_id;
             let model = ScriptedModel::new(vec![
                 bash(json!({"action":"start", "session_id":"shared", "command":"bash --noprofile --norc", "idle_ms":10, "timeout_ms":1000})),
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"marker=first; echo observed-$marker\n", "idle_ms":50, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut first = Agent::with_runtime(model, live.clone(), Arc::new(NullEventSink));
-            run(&mut first, &session).await;
+            let mut first = Agent::new(model, live.clone(), Arc::new(NullEventSink));
+            run(&mut first, &live).await;
             let original = serde_json::to_value(session.snapshot().active_thread()).unwrap();
             assert!(original.to_string().contains("observed-first"));
             let first_agent_id = first.context().agent_id;
@@ -123,8 +150,8 @@ mod tests {
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"echo inherited-$marker; marker=second; echo observed-$marker\n", "idle_ms":50, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut second = Agent::with_runtime(model, live.clone(), Arc::new(NullEventSink));
-            run(&mut second, &session).await;
+            let mut second = Agent::new(model, live.clone(), Arc::new(NullEventSink));
+            run(&mut second, &live).await;
             assert_ne!(second.context().agent_id, first_agent_id);
             assert_eq!(second.context().thread_id.as_deref(), Some(session.snapshot().active_thread().id.as_str()));
             let saved = session.snapshot();
@@ -138,9 +165,10 @@ mod tests {
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"echo stolen\n", "idle_ms":10, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut outsider = Agent::with_runtime(model, live.clone(), Arc::new(NullEventSink));
-            run(&mut outsider, &unrelated).await;
-            assert_ne!(outsider.runtime().owner_id, owner);
+            let mut outsider = Agent::new(model, live.clone(), Arc::new(NullEventSink));
+            let other_live = SessionRuntime::new(harness.clone(), unrelated);
+            run(&mut outsider, &other_live).await;
+            assert_ne!(other_live.owner_id, owner);
             let output = serde_json::to_string(outsider.history()).unwrap();
             assert!(output.contains("owned by another myco session"), "{output}");
             drop(outsider);

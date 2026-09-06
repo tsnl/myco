@@ -69,9 +69,10 @@ hosts, or lies about resume.
 ## Architecture (current)
 
 ```
-myco (interactive) / chat adapter / Agent
-  └── SessionRuntime (shared live tool ownership)
-      └── Harness (routing, config, root-only services)
+myco (interactive) / chat adapter
+  ├── Agent (myco-agent) → GenerativeModel (myco-model)
+  └── SessionRuntime (session binding + ToolExecutor)
+      └── Harness (host routing)
           ├── HostController "local"  → in-process HostWorker (always on)
           └── HostController "…"      → ssh … myco --mode host (lazy remote)
                 └── standard tools: bash, editor, view_image
@@ -89,9 +90,10 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
-| `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
+| `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/agent/` | `Agent::run` drives model context to completion and emits attributed events; shared `SessionRuntime` owns live tools across agent and thread changes |
+| `crates/myco-agent/` | Headless model/tool execution through `GenerativeModel`, `ToolExecutor`, and `EventSink`; no application dependency |
+| `src/session_runtime.rs` | Binds agents to a session, implements `ToolExecutor` over Harness, and owns live tools across thread changes |
 | `src/chat/` | Session-turn submission, checkpoints, recovery, and the `/compact` worker; operates on a separately owned agent |
 | `src/session/` | Persistent sessions: ordered `Thread` histories, shared metadata, search, writer locks, and compaction document logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
@@ -126,14 +128,13 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `myco-model` → `core` →
-  `manual` → `prelude` → `prompts` → `session` → `tool_services` → `host` →
-  `harness` → `agent` → `chat` → `tui`. A module reaching *up* that list is the smell;
-  the fix is
-  usually that the shared thing belongs lower down (`myco_home` in `core`, not
-  `session`) or that the caller wants data instead of rendering
-  (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
-  reach anywhere — test setup composes real layers on purpose.
+- **The crate graph is acyclic:** `myco-model` → `myco-agent` → `myco`.
+  Application modules compose the lower crates through their public interfaces;
+  lower crates must not depend on the application, including in tests.
+  Within `myco`, dependencies flow through `core` → `manual` → `prelude` →
+  `prompts` → `session` → `tool_services` → `host` → `harness` →
+  `session_runtime` → `chat` → `tui`. Shared data belongs below its callers;
+  rendering belongs above the data it presents.
 
 ## Code style
 
