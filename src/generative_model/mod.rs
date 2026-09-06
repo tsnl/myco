@@ -7,6 +7,9 @@ use crate::core::*;
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
 
+mod accumulator;
+pub use accumulator::MessageAccumulator;
+
 mod driver_core;
 
 mod openai_common;
@@ -718,220 +721,13 @@ impl GenerateOutput {
     pub async fn from_stream(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
     ) -> Result<Self, GenerateError> {
-        Self::from_stream_with_hook(stream, |_| {}).await
-    }
-
-    /// Accumulate a generation stream, invoking `on_part` for each successfully parsed part
-    /// (including the initial `MessageStart`).
-    pub async fn from_stream_with_hook(
-        stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
-        mut on_part: impl FnMut(&MessagePart),
-    ) -> Result<Self, GenerateError> {
-        struct IncompleteToolUse {
-            name: String,
-            input_json: String,
-        }
-
-        impl TryInto<ToolUse> for IncompleteToolUse {
-            type Error = GenerateError;
-
-            fn try_into(self) -> Result<ToolUse, Self::Error> {
-                let input = if self.input_json.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&self.input_json).map_err(|e| {
-                        GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use input JSON is invalid: {e}"
-                        ))
-                    })?
-                };
-                Ok(ToolUse {
-                    name: self.name,
-                    input,
-                })
-            }
-        }
-
-        let mut content: Vec<Option<Content>> = Vec::new();
-        let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
-        let mut turn_end_reason = None;
-        let mut usage: Option<TokenUsage> = None;
-
+        let mut accumulator = MessageAccumulator::default();
         let mut stream = pin!(stream);
-
-        let Some(try_item) = stream.next().await else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: empty stream. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        let first = try_item?;
-        let MessagePart::MessageStart = &first else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: first item is not MessageStart. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        on_part(&first);
-
-        while let Some(item) = stream.next().await {
-            let item = item?;
-            on_part(&item);
-            match item {
-                MessagePart::MessageStart => {
-                    return Err(GenerateError::MalformedResponseError(
-                        "Malformed stream: unexpected MessageStart".into(),
-                    ));
-                }
-                MessagePart::ContentStart(start) => {
-                    let (index, block) = start_block(start);
-                    ensure_slot(&mut content, index, block);
-                }
-                MessagePart::ContentDelta(delta) => apply_content_delta(&mut content, delta)?,
-                MessagePart::ToolUseStart(ToolUseStart { index, name }) => {
-                    ensure_slot(
-                        &mut tool_uses,
-                        index,
-                        IncompleteToolUse {
-                            name,
-                            input_json: String::new(),
-                        },
-                    );
-                }
-                MessagePart::ToolUseDelta(ToolUseDelta {
-                    index,
-                    input_json_delta,
-                }) => {
-                    let Some(Some(tool_use)) = tool_uses.get_mut(index) else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use delta index {index} is out of bounds"
-                        )));
-                    };
-                    tool_use.input_json.push_str(&input_json_delta);
-                }
-                MessagePart::TurnEndReason(reason) => {
-                    turn_end_reason = Some(reason);
-                }
-                MessagePart::Usage(u) => {
-                    usage = Some(match usage {
-                        Some(prev) => prev.merge(u),
-                        None => u,
-                    });
-                }
-            }
+        while let Some(part) = stream.next().await {
+            accumulator.push(&part?)?;
         }
-
-        let content = content
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing content block at index {i}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let tool_uses = tool_uses
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                let incomplete = slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing tool use at index {i}"
-                    ))
-                })?;
-                incomplete.try_into()
-            })
-            .collect::<Result<Vec<ToolUse>, GenerateError>>()?;
-
-        let turn_end_reason = turn_end_reason.ok_or_else(|| {
-            GenerateError::MalformedResponseError(
-                "Malformed stream: no turn end reason provided".into(),
-            )
-        })?;
-
-        Ok(GenerateOutput {
-            content,
-            tool_uses,
-            turn_end_reason,
-            usage,
-        })
+        accumulator.finish()
     }
-}
-
-fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize, value: T) {
-    while slots.len() <= index {
-        slots.push(None);
-    }
-    slots[index] = Some(value);
-}
-
-/// The empty [`Content`] block a [`ContentStart`] opens, with its index.
-fn start_block(start: ContentStart) -> (usize, Content) {
-    match start {
-        ContentStart::Text { index } => (
-            index,
-            Content::Text {
-                text: String::new(),
-            },
-        ),
-        ContentStart::Image { index } => (
-            index,
-            Content::Image {
-                source: String::new(),
-            },
-        ),
-        ContentStart::Thinking {
-            index,
-            signature,
-            redacted,
-        } => (
-            index,
-            Content::Thinking {
-                text: String::new(),
-                signature,
-                redacted,
-            },
-        ),
-    }
-}
-
-/// Append a [`ContentDelta`] to its opened block; the slot must exist and be
-/// the matching kind (redacted thinking swallows its deltas).
-fn apply_content_delta(
-    content: &mut [Option<Content>],
-    delta: ContentDelta,
-) -> Result<(), GenerateError> {
-    let index = match &delta {
-        ContentDelta::Text { index, .. }
-        | ContentDelta::Image { index, .. }
-        | ContentDelta::Thinking { index, .. } => *index,
-    };
-    match (content.get_mut(index).and_then(Option::as_mut), delta) {
-        (Some(Content::Text { text }), ContentDelta::Text { delta, .. }) => text.push_str(&delta),
-        (Some(Content::Image { source }), ContentDelta::Image { delta, .. }) => {
-            source.push_str(&delta);
-        }
-        (Some(Content::Thinking { text, redacted, .. }), ContentDelta::Thinking { delta, .. }) => {
-            if !*redacted {
-                text.push_str(&delta);
-            }
-        }
-        _ => {
-            return Err(GenerateError::MalformedResponseError(format!(
-                "Malformed stream: content delta at index {index}: out of bounds or wrong kind"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
