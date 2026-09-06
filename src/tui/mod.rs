@@ -35,7 +35,7 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::{Message, RetryStatus, TokenUsage};
+use crate::generative_model::{GenerateError, Message, TokenUsage};
 use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
@@ -691,15 +691,20 @@ impl TuiProducer {
         self.broadcast(events);
     }
 
-    fn retry(&self, status: &RetryStatus) {
+    fn retry(
+        &self,
+        cause: &GenerateError,
+        attempt: u32,
+        max_attempts: u32,
+        delay: std::time::Duration,
+    ) {
         self.turn_finished();
         let body = format!(
-            "{}: attempt {}/{} in {:.1}s\n{}",
-            status.provider,
-            status.next_attempt,
-            status.max_attempts,
-            status.delay.as_secs_f64(),
-            status.reason.escape_debug(),
+            "Attempt {}/{} in {:.1}s\n{}",
+            attempt + 1,
+            max_attempts,
+            delay.as_secs_f64(),
+            cause.to_string().escape_debug(),
         );
         self.headed_section(Style::WARNING, "RETRY", &body);
     }
@@ -724,10 +729,13 @@ impl EventSink for TuiProducer {
     fn emit(&self, event: AgentEvent) {
         // Root agent only — hide nested worker noise (depth > 0, e.g. compact).
         match event {
-            AgentEvent::Retry {
-                status,
+            AgentEvent::Failure {
+                failure,
+                attempt,
+                max_attempts,
+                retry_in: Some(delay),
                 context: TraceContext { depth: 0, .. },
-            } => self.retry(&status),
+            } => self.retry(&failure.cause, attempt, max_attempts, delay),
             AgentEvent::ThinkingDelta {
                 text,
                 context: TraceContext { depth: 0, .. },
@@ -826,21 +834,18 @@ mod tests {
     fn retry_notice_flushes_text_and_is_mirrored_before_the_next_answer() {
         let (p, terminal, mirror) = producer(None);
         text(&p, "before");
-        let status = RetryStatus {
-            provider: "test".into(),
-            next_attempt: 2,
-            max_attempts: 3,
-            delay: std::time::Duration::from_secs(1),
-            reason: "busy\x1b[31m".into(),
-        };
-        p.emit(AgentEvent::Retry {
-            status: status.clone(),
-            context: ctx(1),
-        });
-        p.emit(AgentEvent::Retry {
-            status,
-            context: ctx(0),
-        });
+        for depth in [1, 0] {
+            p.emit(AgentEvent::Failure {
+                failure: crate::generative_model::GenerationFailure::transient(
+                    GenerateError::ExecutionError("busy\x1b[31m".into()),
+                    None,
+                ),
+                attempt: 1,
+                max_attempts: 3,
+                retry_in: Some(std::time::Duration::from_secs(1)),
+                context: ctx(depth),
+            });
+        }
         text(&p, "after");
         finish(&p);
         let output = encode_plain(&terminal.events());
@@ -849,7 +854,7 @@ mod tests {
         assert_eq!(output.matches("RETRY").count(), 1);
         assert_eq!(output.matches("ASSISTANT").count(), 2);
         let before = output.find("before").unwrap();
-        let retry = output.find("test: attempt 2/3 in 1.0s").unwrap();
+        let retry = output.find("Attempt 2/3 in 1.0s").unwrap();
         let after = output.find("after").unwrap();
         assert!(before < retry && retry < after, "{output}");
         assert!(output.contains("busy"));

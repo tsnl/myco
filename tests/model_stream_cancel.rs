@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use myco::generative_model::{
-    BackendConfig, GenerativeModelConfig, Message, MessagePart, ModelSpec, OpenAIBackendConfig,
-    Protocol, ThinkingMode,
+    BackendConfig, GenerationEvent, GenerativeModelConfig, Message, MessagePart, ModelSpec,
+    OpenAIBackendConfig, Protocol, ThinkingMode,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,35 +28,6 @@ async fn dropping_generation_closes_stalled_event_stream() {
     .await;
 }
 
-#[tokio::test]
-async fn dropping_generation_during_announced_backoff_prevents_the_retry() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let mut generation = model(&base_url).generate(&[Message::UserMessage { content: vec![] }]);
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        read_request(&mut socket).await;
-        socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n").await.unwrap();
-        drop(socket);
-        listener
-    });
-    let part = tokio::time::timeout(Duration::from_secs(5), generation.next())
-        .await
-        .expect("retry status arrives before the wait")
-        .unwrap()
-        .unwrap();
-    assert!(matches!(part, MessagePart::Retry(status)
-        if status.next_attempt == 2 && status.delay == Duration::from_secs(1)));
-    drop(generation);
-    let listener = server.await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1500), listener.accept())
-            .await
-            .is_err(),
-        "cancelled backoff sent another request"
-    );
-}
-
 async fn assert_cancel_closes_connection(headers: &'static str) {
     tokio::time::timeout(Duration::from_secs(5), run_cancellation_case(headers))
         .await
@@ -73,7 +44,7 @@ async fn run_cancellation_case(headers: &'static str) {
     if headers.starts_with("HTTP/1.1 200") {
         assert!(matches!(
             generation.next().await,
-            Some(Ok(MessagePart::MessageStart))
+            Some(GenerationEvent::Part(MessagePart::MessageStart))
         ));
     }
     drop(generation);

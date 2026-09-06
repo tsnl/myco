@@ -13,6 +13,9 @@
 
 use std::sync::Arc;
 
+mod generation;
+use generation::GenerateOrCancel;
+
 mod compact_worker;
 pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 
@@ -20,9 +23,8 @@ use futures::future;
 
 use crate::core::CancelToken;
 use crate::generative_model::{
-    self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, Recovery, RetryStatus, TokenUsage, ToolResult, ToolUse, TurnEndReason,
-    answer_content,
+    self, Content, GenerateError, GenerationFailure, GenerativeModel, Message, Recovery,
+    RetryPolicy, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
 use crate::harness::Harness;
 use uuid::Uuid;
@@ -68,8 +70,11 @@ impl TraceContext {
 /// All ongoing work is attributed via [`TraceContext::agent_id`].
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    Retry {
-        status: RetryStatus,
+    Failure {
+        failure: GenerationFailure,
+        attempt: u32,
+        max_attempts: u32,
+        retry_in: Option<std::time::Duration>,
         context: TraceContext,
     },
     /// Incremental assistant text (for streaming UX).
@@ -129,6 +134,7 @@ const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not r
      and do not acknowledge this message.";
 
 pub struct Agent {
+    retry_policy: RetryPolicy,
     model: Arc<dyn GenerativeModel>,
     harness: Arc<Harness>,
     sink: Arc<dyn EventSink>,
@@ -161,6 +167,7 @@ impl Agent {
         context: TraceContext,
     ) -> Self {
         Self {
+            retry_policy: RetryPolicy::default(),
             model,
             harness,
             sink,
@@ -191,6 +198,10 @@ impl Agent {
     /// Replace the conversation history (e.g. when resuming a saved session).
     pub fn set_history(&mut self, history: Vec<Message>) {
         self.history = history;
+    }
+
+    pub fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
+        self.retry_policy = retry_policy;
     }
 
     /// Swap the generative model (e.g. mid-session `/effort` rebuild). History is kept.
@@ -279,10 +290,7 @@ impl Agent {
                 return self.finish_cancelled();
             }
 
-            let stream = self.model.generate(&self.history);
-            let sink = self.sink.clone();
-            let context = self.context.clone();
-            let output = match accumulate_generate(stream, sink, context, cancel.clone()).await {
+            let output = match generation::generate(self, cancel.clone()).await {
                 Ok(output) => output,
                 Err(GenerateOrCancel::Cancelled) => return self.finish_cancelled(),
                 // finish_generate_error emits TurnFinished so live ASSISTANT closes
@@ -452,47 +460,6 @@ impl Agent {
     }
 }
 
-enum GenerateOrCancel {
-    Cancelled,
-    Generate(GenerateError),
-}
-
-/// Drain a model stream, forwarding text/thinking deltas, until completion or cancel.
-async fn accumulate_generate(
-    stream: impl futures::Stream<Item = Result<MessagePart, GenerateError>> + Unpin,
-    sink: Arc<dyn EventSink>,
-    context: TraceContext,
-    cancel: CancelToken,
-) -> Result<GenerateOutput, GenerateOrCancel> {
-    // Race the full accumulator against cancel. Dropping the stream aborts the
-    // underlying HTTP body when the provider future is cancelled.
-    let accumulate = GenerateOutput::from_stream_with_hook(stream, |part| match part {
-        MessagePart::Retry(status) => sink.emit(AgentEvent::Retry {
-            status: status.clone(),
-            context: context.clone(),
-        }),
-        MessagePart::ContentDelta(ContentDelta::Text { delta, .. }) => {
-            sink.emit(AgentEvent::TextDelta {
-                text: delta.clone(),
-                context: context.clone(),
-            });
-        }
-        MessagePart::ContentDelta(ContentDelta::Thinking { delta, .. }) if !delta.is_empty() => {
-            sink.emit(AgentEvent::ThinkingDelta {
-                text: delta.clone(),
-                context: context.clone(),
-            });
-        }
-        _ => {}
-    });
-
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(GenerateOrCancel::Cancelled),
-        result = accumulate => result.map_err(GenerateOrCancel::Generate),
-    }
-}
-
 impl Drop for Agent {
     fn drop(&mut self) {
         // Tear down agent-owned harness state (bash sessions, …). Skip the nil id used
@@ -531,7 +498,9 @@ impl AgentInteractionError {
 mod tests {
     use super::*;
     use crate::core::Async;
-    use crate::generative_model::{GenerateError, MessagePart, ToolSpec};
+    use crate::generative_model::{
+        ContentDelta, GenerateError, GenerateOutput, GenerationEvent, MessagePart, ToolSpec,
+    };
     use crate::test_support::{
         ScriptedModel, assistant, assistant_tool, result_text, tool_results, user,
     };
@@ -540,53 +509,6 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-
-    #[derive(Default)]
-    struct RecordedEvents(Mutex<Vec<AgentEvent>>);
-
-    impl EventSink for RecordedEvents {
-        fn emit(&self, event: AgentEvent) {
-            self.0.lock().unwrap().push(event);
-        }
-    }
-
-    #[tokio::test]
-    async fn retry_status_reaches_sink_before_text_without_entering_output() {
-        let status = RetryStatus {
-            provider: "test".into(),
-            next_attempt: 2,
-            max_attempts: 3,
-            delay: Duration::from_secs(1),
-            reason: "busy".into(),
-        };
-        let parts = vec![
-            MessagePart::Retry(status.clone()),
-            MessagePart::MessageStart,
-            MessagePart::ContentStart(generative_model::ContentStart::Text { index: 0 }),
-            MessagePart::ContentDelta(ContentDelta::Text {
-                index: 0,
-                delta: "answer".into(),
-            }),
-            MessagePart::TurnEndReason(TurnEndReason::EndTurn),
-        ];
-        let sink = Arc::new(RecordedEvents::default());
-        let context = TraceContext::root();
-        let output = accumulate_generate(
-            stream::iter(parts.into_iter().map(Ok)),
-            sink.clone(),
-            context.clone(),
-            CancelToken::new(),
-        )
-        .await
-        .ok()
-        .expect("generation succeeds");
-        assert!(matches!(output.content.as_slice(), [Content::Text { text }] if text == "answer"));
-        let events = sink.0.lock().unwrap();
-        assert!(
-            matches!(events.as_slice(), [AgentEvent::Retry { status: seen, context: trace }, AgentEvent::TextDelta { .. }]
-            if seen == &status && trace.agent_id == context.agent_id)
-        );
-    }
 
     /// Sleeps, records start/end instants, returns the configured label.
     struct SlowService {
@@ -856,10 +778,7 @@ mod tests {
     }
 
     impl GenerativeModel for SlowStreamModel {
-        fn generate(
-            &self,
-            _input: &[Message],
-        ) -> crate::core::AsyncStream<Result<MessagePart, GenerateError>> {
+        fn generate(&self, _input: &[Message]) -> crate::core::AsyncStream<GenerationEvent> {
             let delay = self.delay;
             let chunks = self.chunks;
             // State machine: 0 = MessageStart, 1 = ContentStart, 2..chunks+1 = delayed
@@ -884,7 +803,7 @@ mod tests {
                     } else {
                         MessagePart::TurnEndReason(TurnEndReason::EndTurn)
                     };
-                    Some((Ok(part), step + 1))
+                    Some((GenerationEvent::Part(part), step + 1))
                 }
             }))
         }

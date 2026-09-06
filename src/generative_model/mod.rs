@@ -19,8 +19,8 @@ mod sse_parser;
 use sse_parser::SseParser;
 
 pub trait GenerativeModel: Send + Sync {
-    /// Retry status may precede `MessageStart`. Dropping the stream cancels generation.
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
+    /// One attempt. Failure ends the stream; dropping it cancels the request.
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent>;
 }
 
 /// Wire protocol a model is served over.
@@ -122,14 +122,8 @@ impl ThinkingMode {
     }
 }
 
-/// How a driver retries a request that failed *before* any of the response
-/// reached the consumer.
-///
-/// Resolved from `[gateways.NAME.retry]` (see [`crate::config::RetryEntry`]).
-/// Retrying is only sound ahead of the stream: once parts have been emitted the
-/// consumer has seen them, and a second attempt would replay them as duplicates.
-/// Deterministic failures (a 400, a 413) are never retried — see
-/// [`crate::generative_model::driver_core`]'s send loop.
+/// Agent policy for retrying transient failures before any response parts arrive.
+/// Resolved from `[gateways.NAME.retry]` or `[models.KEY.retry]`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
     /// Total attempts including the first. `1` disables retry.
@@ -362,6 +356,13 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::Anthropic(config) => config.retry,
+            Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
+        }
+    }
+
     pub fn protocol(&self) -> Protocol {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
@@ -573,19 +574,50 @@ fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     id
 }
 
-/// A scheduled retry, emitted before the delay and before `MessageStart`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetryStatus {
-    pub provider: String,
-    pub next_attempt: u32,
-    pub max_attempts: u32,
-    pub delay: std::time::Duration,
-    pub reason: String,
+/// One generation attempt emits parts, or ends with a failure.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    Part(MessagePart),
+    Failure(GenerationFailure),
+}
+
+impl GenerationEvent {
+    pub fn into_result(self) -> Result<MessagePart, GenerateError> {
+        match self {
+            Self::Part(part) => Ok(part),
+            Self::Failure(failure) => Err(failure.cause),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationFailure {
+    pub cause: GenerateError,
+    /// A transient cause; the caller must also ensure no response parts were emitted.
+    pub retryable: bool,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl GenerationFailure {
+    pub fn terminal(cause: GenerateError) -> Self {
+        Self {
+            cause,
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    pub fn transient(cause: GenerateError, retry_after: Option<std::time::Duration>) -> Self {
+        Self {
+            cause,
+            retryable: true,
+            retry_after,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum MessagePart {
-    Retry(RetryStatus),
     MessageStart,
     ContentStart(ContentStart),
     ContentDelta(ContentDelta),
@@ -677,6 +709,12 @@ pub struct GenerateOutput {
 }
 
 impl GenerateOutput {
+    pub async fn from_generation(
+        stream: impl Stream<Item = GenerationEvent>,
+    ) -> Result<Self, GenerateError> {
+        Self::from_stream(stream.map(GenerationEvent::into_result)).await
+    }
+
     pub async fn from_stream(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
     ) -> Result<Self, GenerateError> {
@@ -684,7 +722,7 @@ impl GenerateOutput {
     }
 
     /// Accumulate a generation stream, invoking `on_part` for each successfully parsed part
-    /// (including retries before `MessageStart`). Retry status is never accumulated.
+    /// (including the initial `MessageStart`).
     pub async fn from_stream_with_hook(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
         mut on_part: impl FnMut(&MessagePart),
@@ -721,15 +759,16 @@ impl GenerateOutput {
 
         let mut stream = pin!(stream);
 
-        let first = loop {
-            let part = stream.next().await.ok_or_else(|| {
-                GenerateError::MalformedResponseError("Malformed stream: empty stream".into())
-            })??;
-            if !matches!(part, MessagePart::Retry(_)) {
-                break part;
-            }
-            on_part(&part);
+        let Some(try_item) = stream.next().await else {
+            return Err(GenerateError::MalformedResponseError(
+                concat!(
+                    "Malformed stream: empty stream. ",
+                    "Did you accidentally drain the stream already?"
+                )
+                .into(),
+            ));
         };
+        let first = try_item?;
         let MessagePart::MessageStart = &first else {
             return Err(GenerateError::MalformedResponseError(
                 concat!(
@@ -745,9 +784,9 @@ impl GenerateOutput {
             let item = item?;
             on_part(&item);
             match item {
-                MessagePart::MessageStart | MessagePart::Retry(_) => {
+                MessagePart::MessageStart => {
                     return Err(GenerateError::MalformedResponseError(
-                        "Malformed stream: unexpected restart after MessageStart".into(),
+                        "Malformed stream: unexpected MessageStart".into(),
                     ));
                 }
                 MessagePart::ContentStart(start) => {
@@ -1346,7 +1385,7 @@ pub enum Recovery {
 /// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
 pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {
     #[error("Something went wrong while generating a response: {0}")]
     ExecutionError(String),

@@ -12,8 +12,9 @@ use serde_json::json;
 
 use crate::core::AsyncStream;
 use crate::generative_model::{
-    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, ToolResult, ToolUse, ToolUseDelta, ToolUseStart, TurnEndReason,
+    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerationEvent,
+    GenerationFailure, GenerativeModel, Message, MessagePart, ToolResult, ToolUse, ToolUseDelta,
+    ToolUseStart, TurnEndReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,25 +51,14 @@ impl ScriptedModel {
     }
 }
 
-// [`GenerateError`] is not `Clone`; rebuild it so the configured failure can
-// be replayed on every drained call.
-fn clone_err(err: &GenerateError) -> GenerateError {
-    match err {
-        GenerateError::ExecutionError(m) => GenerateError::ExecutionError(m.clone()),
-        GenerateError::RefusalError(m) => GenerateError::RefusalError(m.clone()),
-        GenerateError::MalformedResponseError(m) => {
-            GenerateError::MalformedResponseError(m.clone())
-        }
-        GenerateError::RequestTooLargeError(m) => GenerateError::RequestTooLargeError(m.clone()),
-    }
-}
-
 impl GenerativeModel for ScriptedModel {
-    fn generate(&self, _input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, _input: &[Message]) -> AsyncStream<GenerationEvent> {
         let Some(output) = self.scripts.lock().expect("scripts lock").pop_front() else {
-            let err = self.fail.lock().expect("fail lock").as_ref().map(clone_err);
+            let err = self.fail.lock().expect("fail lock").clone();
             let err = err.expect("scripted model ran out of outputs");
-            return Box::pin(stream::once(async move { Err(err) }));
+            return Box::pin(stream::once(async move {
+                GenerationEvent::Failure(GenerationFailure::terminal(err))
+            }));
         };
 
         let mut parts = vec![MessagePart::MessageStart];
@@ -122,7 +112,7 @@ impl GenerativeModel for ScriptedModel {
         }
         parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
 
-        Box::pin(stream::iter(parts.into_iter().map(Ok)))
+        Box::pin(stream::iter(parts.into_iter().map(GenerationEvent::Part)))
     }
 }
 

@@ -137,7 +137,7 @@ impl AnthropicGenerativeModel {
 }
 
 impl GenerativeModel for AnthropicGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let messages = match convert_messages(input) {
             Ok(messages) => messages,
             Err(e) => return driver_core::error_stream(e),
@@ -147,7 +147,6 @@ impl GenerativeModel for AnthropicGenerativeModel {
             StreamAccumulator::default(),
             "Anthropic",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }
