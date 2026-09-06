@@ -35,7 +35,7 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::{Message, TokenUsage};
+use crate::generative_model::{Message, RetryStatus, TokenUsage};
 use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
@@ -691,6 +691,19 @@ impl TuiProducer {
         self.broadcast(events);
     }
 
+    fn retry(&self, status: &RetryStatus) {
+        self.turn_finished();
+        let body = format!(
+            "{}: attempt {}/{} in {:.1}s\n{}",
+            status.provider,
+            status.next_attempt,
+            status.max_attempts,
+            status.delay.as_secs_f64(),
+            status.reason.escape_debug(),
+        );
+        self.headed_section(Style::WARNING, "RETRY", &body);
+    }
+
     fn turn_finished(&self) {
         let events = self.with_state(|st| {
             let mut events = Vec::new();
@@ -711,6 +724,10 @@ impl EventSink for TuiProducer {
     fn emit(&self, event: AgentEvent) {
         // Root agent only — hide nested worker noise (depth > 0, e.g. compact).
         match event {
+            AgentEvent::Retry {
+                status,
+                context: TraceContext { depth: 0, .. },
+            } => self.retry(&status),
             AgentEvent::ThinkingDelta {
                 text,
                 context: TraceContext { depth: 0, .. },
@@ -803,6 +820,39 @@ mod tests {
         let mirror = Arc::new(Capture::default());
         let producer = TuiProducer::new(terminal.clone(), mirror.clone(), true, wrap);
         (producer, terminal, mirror)
+    }
+
+    #[test]
+    fn retry_notice_flushes_text_and_is_mirrored_before_the_next_answer() {
+        let (p, terminal, mirror) = producer(None);
+        text(&p, "before");
+        let status = RetryStatus {
+            provider: "test".into(),
+            next_attempt: 2,
+            max_attempts: 3,
+            delay: std::time::Duration::from_secs(1),
+            reason: "busy\x1b[31m".into(),
+        };
+        p.emit(AgentEvent::Retry {
+            status: status.clone(),
+            context: ctx(1),
+        });
+        p.emit(AgentEvent::Retry {
+            status,
+            context: ctx(0),
+        });
+        text(&p, "after");
+        finish(&p);
+        let output = encode_plain(&terminal.events());
+        assert_eq!(output, encode_plain(&mirror.events()));
+        assert!(!output.contains('\x1b'));
+        assert_eq!(output.matches("RETRY").count(), 1);
+        assert_eq!(output.matches("ASSISTANT").count(), 2);
+        let before = output.find("before").unwrap();
+        let retry = output.find("test: attempt 2/3 in 1.0s").unwrap();
+        let after = output.find("after").unwrap();
+        assert!(before < retry && retry < after, "{output}");
+        assert!(output.contains("busy"));
     }
 
     fn ctx(depth: usize) -> TraceContext {

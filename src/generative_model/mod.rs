@@ -19,6 +19,7 @@ mod sse_parser;
 use sse_parser::SseParser;
 
 pub trait GenerativeModel: Send + Sync {
+    /// Retry status may precede `MessageStart`. Dropping the stream cancels generation.
     fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
 }
 
@@ -572,8 +573,19 @@ fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     id
 }
 
+/// A scheduled retry, emitted before the delay and before `MessageStart`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryStatus {
+    pub provider: String,
+    pub next_attempt: u32,
+    pub max_attempts: u32,
+    pub delay: std::time::Duration,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
+    Retry(RetryStatus),
     MessageStart,
     ContentStart(ContentStart),
     ContentDelta(ContentDelta),
@@ -672,7 +684,7 @@ impl GenerateOutput {
     }
 
     /// Accumulate a generation stream, invoking `on_part` for each successfully parsed part
-    /// (including the initial `MessageStart`).
+    /// (including retries before `MessageStart`). Retry status is never accumulated.
     pub async fn from_stream_with_hook(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
         mut on_part: impl FnMut(&MessagePart),
@@ -709,16 +721,15 @@ impl GenerateOutput {
 
         let mut stream = pin!(stream);
 
-        let Some(try_item) = stream.next().await else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: empty stream. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
+        let first = loop {
+            let part = stream.next().await.ok_or_else(|| {
+                GenerateError::MalformedResponseError("Malformed stream: empty stream".into())
+            })??;
+            if !matches!(part, MessagePart::Retry(_)) {
+                break part;
+            }
+            on_part(&part);
         };
-        let first = try_item?;
         let MessagePart::MessageStart = &first else {
             return Err(GenerateError::MalformedResponseError(
                 concat!(
@@ -734,9 +745,9 @@ impl GenerateOutput {
             let item = item?;
             on_part(&item);
             match item {
-                MessagePart::MessageStart => {
+                MessagePart::MessageStart | MessagePart::Retry(_) => {
                     return Err(GenerateError::MalformedResponseError(
-                        "Malformed stream: unexpected MessageStart".into(),
+                        "Malformed stream: unexpected restart after MessageStart".into(),
                     ));
                 }
                 MessagePart::ContentStart(start) => {

@@ -107,8 +107,7 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
                 }
                 check_request_size(body.len(), provider)?;
             }
-            let response =
-                send_with_retry(&client, request, provider, retry, debug_dump_api_requests).await?;
+            let response = send_with_retry(&client, request, provider, retry, &tx).await?;
             drive_sse_stream(response, &tx, acc, provider).await
         };
         tokio::select! {
@@ -139,15 +138,15 @@ enum Attempt {
 /// Send, retrying transient failures per `retry`.
 ///
 /// Retry lives here, ahead of [`drive_sse_stream`], because this is the last
-/// point at which nothing has reached the consumer yet. A failure *during* the
-/// stream cannot be retried: parts already emitted would be replayed as
-/// duplicates, so those still surface to the agent as a turn-ending error.
+/// point at which no response content has reached the consumer yet. A failure
+/// during the stream cannot be retried: emitted parts would be duplicated,
+/// so those failures surface to the agent as a turn-ending error.
 async fn send_with_retry(
     client: &reqwest::Client,
     request: reqwest::Request,
     provider: &str,
     retry: RetryPolicy,
-    debug: bool,
+    tx: &tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
 ) -> Result<reqwest::Response, GenerateError> {
     let mut attempt: u32 = 1;
     loop {
@@ -170,12 +169,14 @@ async fn send_with_retry(
             return Err(error);
         }
         let wait = retry.backoff(attempt + 1, retry_after);
-        if debug {
-            eprintln!(
-                "{provider}: attempt {attempt}/{} failed ({error}); retrying in {wait:?}",
-                retry.max_attempts
-            );
-        }
+        let status = RetryStatus {
+            provider: provider.into(),
+            next_attempt: attempt + 1,
+            max_attempts: retry.max_attempts,
+            delay: wait,
+            reason: error.to_string(),
+        };
+        let _ = tx.send(Ok(MessagePart::Retry(status))).await;
         tokio::time::sleep(wait).await;
         attempt += 1;
     }

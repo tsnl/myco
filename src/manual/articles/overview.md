@@ -198,7 +198,10 @@ streamed are retried (connection errors, 408, 429, and 5xx including Anthropic's
 surfaces immediately. A failure mid-stream is never retried either, because the
 already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
 is honoured when it asks for longer than the computed backoff, still bounded by
-`max_backoff_ms`.
+`max_backoff_ms`. The interactive CLI shows a RETRY notice with the provider, failure reason,
+next attempt number, and delay before each retry. Ctrl-C cancels the request,
+including retry waits. Notices appear in the console log, but are not added to
+conversation history.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

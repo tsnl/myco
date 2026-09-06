@@ -21,7 +21,8 @@ use futures::future;
 use crate::core::CancelToken;
 use crate::generative_model::{
     self, Content, ContentDelta, GenerateError, GenerateOutput, GenerativeModel, Message,
-    MessagePart, Recovery, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
+    MessagePart, Recovery, RetryStatus, TokenUsage, ToolResult, ToolUse, TurnEndReason,
+    answer_content,
 };
 use crate::harness::Harness;
 use uuid::Uuid;
@@ -67,6 +68,10 @@ impl TraceContext {
 /// All ongoing work is attributed via [`TraceContext::agent_id`].
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    Retry {
+        status: RetryStatus,
+        context: TraceContext,
+    },
     /// Incremental assistant text (for streaming UX).
     TextDelta {
         text: String,
@@ -462,6 +467,10 @@ async fn accumulate_generate(
     // Race the full accumulator against cancel. Dropping the stream aborts the
     // underlying HTTP body when the provider future is cancelled.
     let accumulate = GenerateOutput::from_stream_with_hook(stream, |part| match part {
+        MessagePart::Retry(status) => sink.emit(AgentEvent::Retry {
+            status: status.clone(),
+            context: context.clone(),
+        }),
         MessagePart::ContentDelta(ContentDelta::Text { delta, .. }) => {
             sink.emit(AgentEvent::TextDelta {
                 text: delta.clone(),
@@ -531,6 +540,53 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct RecordedEvents(Mutex<Vec<AgentEvent>>);
+
+    impl EventSink for RecordedEvents {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_status_reaches_sink_before_text_without_entering_output() {
+        let status = RetryStatus {
+            provider: "test".into(),
+            next_attempt: 2,
+            max_attempts: 3,
+            delay: Duration::from_secs(1),
+            reason: "busy".into(),
+        };
+        let parts = vec![
+            MessagePart::Retry(status.clone()),
+            MessagePart::MessageStart,
+            MessagePart::ContentStart(generative_model::ContentStart::Text { index: 0 }),
+            MessagePart::ContentDelta(ContentDelta::Text {
+                index: 0,
+                delta: "answer".into(),
+            }),
+            MessagePart::TurnEndReason(TurnEndReason::EndTurn),
+        ];
+        let sink = Arc::new(RecordedEvents::default());
+        let context = TraceContext::root();
+        let output = accumulate_generate(
+            stream::iter(parts.into_iter().map(Ok)),
+            sink.clone(),
+            context.clone(),
+            CancelToken::new(),
+        )
+        .await
+        .ok()
+        .expect("generation succeeds");
+        assert!(matches!(output.content.as_slice(), [Content::Text { text }] if text == "answer"));
+        let events = sink.0.lock().unwrap();
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Retry { status: seen, context: trace }, AgentEvent::TextDelta { .. }]
+            if seen == &status && trace.agent_id == context.agent_id)
+        );
+    }
 
     /// Sleeps, records start/end instants, returns the configured label.
     struct SlowService {

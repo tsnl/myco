@@ -232,9 +232,24 @@ async fn wire_retries_transient_statuses_then_succeeds() {
     .await;
 
     let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
-    let output = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let mut retries = Vec::new();
+    let output =
+        GenerateOutput::from_stream_with_hook(model.generate(&user_turn("Say OK.")), |part| {
+            if let myco::generative_model::MessagePart::Retry(status) = part {
+                retries.push(status.clone());
+            }
+        })
         .await
         .expect("third attempt succeeds");
+    assert_eq!(retries.len(), 2);
+    for (index, retry) in retries.iter().enumerate() {
+        assert_eq!(retry.next_attempt, index as u32 + 2);
+        assert_eq!(retry.max_attempts, 3);
+        assert_eq!(retry.delay, fast_retry(3).backoff(retry.next_attempt, None));
+        assert_eq!(retry.provider, "OpenAI Chat Completions");
+    }
+    assert!(retries[0].reason.contains("503"));
+    assert!(retries[1].reason.contains("529"));
 
     match output.content.as_slice() {
         [Content::Text { text }] => assert_eq!(text, "OK"),
@@ -254,9 +269,14 @@ async fn wire_does_not_retry_a_client_error() {
     .await;
 
     let model = stub_model_with_retry(&server.base_url(), fast_retry(5));
-    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
-        .await
-        .expect_err("HTTP 400 is an error");
+    GenerateOutput::from_stream_with_hook(model.generate(&user_turn("Say OK.")), |part| {
+        assert!(!matches!(
+            part,
+            myco::generative_model::MessagePart::Retry(_)
+        ));
+    })
+    .await
+    .expect_err("HTTP 400 is an error");
 
     assert_eq!(server.connections(), 1, "400 must not be retried");
 }
@@ -269,9 +289,16 @@ async fn wire_gives_up_after_max_attempts() {
     let server = StubHttpServer::sequence(vec![down(), down(), down(), down()]).await;
 
     let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
-    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let mut attempts = Vec::new();
+    let error =
+        GenerateOutput::from_stream_with_hook(model.generate(&user_turn("Say OK.")), |part| {
+            if let myco::generative_model::MessagePart::Retry(status) = part {
+                attempts.push(status.next_attempt);
+            }
+        })
         .await
         .expect_err("all attempts fail");
+    assert_eq!(attempts, [2, 3]);
 
     match error {
         GenerateError::ExecutionError(message) => assert!(message.contains("503"), "{message}"),
@@ -291,9 +318,14 @@ async fn wire_retry_can_be_disabled() {
     .await;
 
     let model = stub_model_with_retry(&server.base_url(), fast_retry(1));
-    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
-        .await
-        .expect_err("no retry, so the 503 surfaces");
+    GenerateOutput::from_stream_with_hook(model.generate(&user_turn("Say OK.")), |part| {
+        assert!(!matches!(
+            part,
+            myco::generative_model::MessagePart::Retry(_)
+        ));
+    })
+    .await
+    .expect_err("no retry, so the 503 surfaces");
 
     assert_eq!(server.connections(), 1);
 }
