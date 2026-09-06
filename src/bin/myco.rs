@@ -9,9 +9,11 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::chat::{CompactWorkerError, run_compact_worker};
+use myco::chat::{
+    CompactWorkerError, persist_session, run_compact_worker, run_session_turn, wire_checkpoint,
+};
 use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -276,9 +278,9 @@ async fn run_print(args: Args) {
     // `@path.png` mentions attach images, same contract as the REPL. After
     // boot, not before: the per-image cap is the resolved model's, so this
     // cannot run until the catalog says which model the turn will use.
-    let mut content = match print_turn_content(
+    let content = match print_turn_content(
         arg.as_deref(),
-        prompt.clone(),
+        prompt,
         catalog_model.spec.max_image_base64_bytes,
     ) {
         Ok(c) => c,
@@ -289,20 +291,6 @@ async fn run_print(args: Args) {
     };
     if let Some(note) = attachment_note(&content) {
         eprintln!("{note}");
-    }
-
-    if needs_session_stamp(agent.history(), args.fork) {
-        let (id, started_at) = active_session.with(|s| (s.id.clone(), s.created_at));
-        content.insert(
-            0,
-            Content::Text {
-                text: prompts::session_stamp(&id, started_at),
-            },
-        );
-    }
-
-    if let Err(e) = active_session.maybe_auto_title_from_user_text(&prompt) {
-        eprintln!("warning: could not auto-title session: {e}");
     }
 
     // Ctrl-C cancels the in-flight turn; history stays well-formed.
@@ -317,28 +305,23 @@ async fn run_print(args: Args) {
         }
     });
 
-    let result = myco::chat::interact(&mut agent, content, cancel).await;
+    let outcome = run_session_turn(
+        &mut agent,
+        &active_session,
+        content,
+        args.fork,
+        cancel,
+        session_warning,
+    )
+    .await;
     sigint_task.abort();
     sink.finish();
 
-    // A too-large request would fail identically on every later turn of a
-    // resumed session; take the offending message back out before saving.
-    let rewound = match &result {
-        Err(e) if e.recovery() == Recovery::OmitLastMessage => {
-            myco::chat::rewind_last_user_turn(&mut agent)
-        }
-        _ => None,
-    };
-
-    // Persist whatever history the agent has, including failed/cancelled turns.
-    if let Err(e) = persist_session(&agent, &active_session, /*force*/ true) {
-        eprintln!("warning: could not save session: {e}");
-    }
     if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
         eprintln!("session={}", active_session.id());
     }
 
-    match result {
+    match outcome.result {
         Ok(_) => {}
         Err(myco::AgentInteractionError::Cancelled) => {
             eprintln!("(cancelled)");
@@ -346,7 +329,7 @@ async fn run_print(args: Args) {
         }
         Err(e) => {
             eprintln!("myco: {e}");
-            if let Some(dropped) = rewound {
+            if let Some(dropped) = outcome.rewound {
                 eprintln!(
                     "myco: the last message was removed from the conversation so the session \
                      can continue{}.",
@@ -403,15 +386,6 @@ fn print_turn_content(
             .collect();
     content.push(Content::Text { text: prompt });
     Ok(content)
-}
-
-/// Whether this run's first user message has to carry the session stamp
-/// ([`prompts::session_stamp`]). A fresh session has no history to carry it; a
-/// context fork inherits the *parent's* stamped first message, so the child
-/// stamps its own id onto the first message it adds. A resumed session already
-/// carries the stamp it was created with — same session, same id.
-fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    history.is_empty() || forked
 }
 
 /// Read piped stdin fully; `None` when stdin is a TTY or effectively empty.
@@ -551,16 +525,8 @@ fn lock_session_or_report(session_id: &str) -> Result<Option<SessionWriteLock>, 
     }
 }
 
-/// Persist agent history at replayable mid-turn boundaries (after the user
-/// message, after each completed tool round) so context forks and crash
-/// recovery see the freshest well-formed snapshot.
-fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
-    let checkpoint_session = active_session.clone();
-    agent.set_checkpoint(Box::new(move |messages, last_usage| {
-        if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
-            eprintln!("warning: mid-turn session save failed: {e}");
-        }
-    }));
+fn session_warning(message: &str) {
+    eprintln!("warning: {message}");
 }
 
 /// Everything both agent modes build identically before their first turn: the
@@ -643,7 +609,7 @@ async fn boot<S: EventSink + 'static>(
     agent.replace_context(restored.messages.clone(), restored.last_usage);
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
-    wire_checkpoint(&mut agent, &session);
+    wire_checkpoint(&mut agent, &session, session_warning);
 
     (
         Boot {
@@ -886,7 +852,7 @@ struct ReplSession {
     turn_cancel: TurnCancel,
     /// This run started as a context fork, whose inherited first message
     /// carries the *parent's* session stamp — cleared once this session has
-    /// stamped its own id ([`needs_session_stamp`]).
+    /// stamped its own id on its first submitted turn.
     forked: bool,
     /// Single-writer guard on the live session, swapped whenever the REPL
     /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
@@ -1080,7 +1046,7 @@ impl ReplSession {
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
         // the user can fix the path and resubmit — nothing is silently dropped.
-        let mut content = match expand_image_attachments(
+        let content = match expand_image_attachments(
             &input,
             self.catalog_model.spec.max_image_base64_bytes,
         ) {
@@ -1096,27 +1062,18 @@ impl ReplSession {
         if let Some(note) = attachment_note(&content) {
             self.ui.note(&note);
         }
-        if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
-            eprintln!("warning: could not auto-title session: {e}");
-        }
-        // The session id rides the conversation, not the system prompt (see
-        // `prompts::session_stamp`). `/new` empties the history, so a session
-        // started mid-run stamps its own id on its first turn.
-        if needs_session_stamp(self.agent.history(), self.forked) {
-            let (id, started_at) = self.session.with(|s| (s.id.clone(), s.created_at));
-            content.insert(
-                0,
-                Content::Text {
-                    text: prompts::session_stamp(&id, started_at),
-                },
-            );
-        }
-        self.forked = false;
-
         let cancel = self.turn_cancel.arm();
 
-        // First assistant section opens with its own blank line + thin rule + header.
-        match myco::chat::interact(&mut self.agent, content, cancel).await {
+        let outcome = run_session_turn(
+            &mut self.agent,
+            &self.session,
+            content,
+            std::mem::take(&mut self.forked),
+            cancel,
+            session_warning,
+        )
+        .await;
+        match outcome.result {
             Ok(_) => self.ui.blank_line(),
             Err(myco::AgentInteractionError::Cancelled) => self.ui.cancelled(),
             Err(e) => {
@@ -1125,13 +1082,7 @@ impl ReplSession {
                 // provider errors) are live-only — not stored in session history —
                 // so resume/Ctrl-L will not replay them.
                 let mut message = e.to_string();
-                // A too-large request fails identically on every later turn,
-                // because every later turn resends it. Rewind the offending
-                // message out of history here rather than leaving the session
-                // unable to continue.
-                if e.recovery() == Recovery::OmitLastMessage
-                    && let Some(dropped) = myco::chat::rewind_last_user_turn(&mut self.agent)
-                {
+                if let Some(dropped) = outcome.rewound {
                     message.push_str(&format!(
                         "\n\nThe last message was removed from the conversation so the session \
                          can continue{}.",
@@ -1145,10 +1096,6 @@ impl ReplSession {
 
         self.turn_cancel.disarm();
 
-        // Persist whatever history the agent has, including failed/cancelled turns.
-        if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ true) {
-            eprintln!("warning: could not save session: {e}");
-        }
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
@@ -1581,19 +1528,6 @@ fn format_host_status(harness: &Harness) -> String {
 // ---------------------------------------------------------------------------
 // Session persistence (agent history ↔ Session file / readline history)
 // ---------------------------------------------------------------------------
-
-/// Copy agent history into `session` and write it when needed.
-///
-/// Empty sessions (no messages) are never written — this avoids littering
-/// `~/.myco/session` with stubs from `/new` or quit-without-chat.
-fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
-    let history = agent.history();
-    // Never create a file for a session that has never had a turn.
-    if history.is_empty() && !session.snapshot().json_path().exists() {
-        return Ok(());
-    }
-    session.persist_messages(history, agent.last_usage(), force)
-}
 
 fn save_readline_history(
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -2036,21 +1970,6 @@ mod tests {
         assert!(matches!(session.kind, SessionKind::Subagent));
         assert_eq!(session.parent_session_id.as_deref(), Some("abc123"));
         assert!(session.messages.is_empty());
-    }
-
-    /// A session stamps its id on the first message of its own conversation:
-    /// once on a fresh session, again on the first message a context fork adds
-    /// (the inherited one names the parent), never on a resumed turn.
-    #[test]
-    fn session_stamp_covers_fresh_and_forked_runs_only() {
-        let seeded = [Message::UserMessage {
-            content: vec![Content::Text {
-                text: "inherited".into(),
-            }],
-        }];
-        assert!(needs_session_stamp(&[], /*forked*/ false));
-        assert!(needs_session_stamp(&seeded, /*forked*/ true));
-        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
     }
 
     #[test]
