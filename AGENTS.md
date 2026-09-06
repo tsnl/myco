@@ -97,7 +97,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `crates/myco-model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + prelude / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/prelude.rs` | The agent prelude (always-in-prompt knowledge, not a Rust re-export module): maildir-style write-once entries under `~/.myco/workspace/prelude/`, rendered into every prompt and edited via the root-only `prelude` tool |
@@ -126,7 +126,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
+- **The module graph is acyclic.** Bottom-up: `myco-model` → `core` →
   `manual` → `prelude` → `prompts` → `session` → `tool_services` → `host` →
   `harness` → `agent` → `chat` → `tui`. A module reaching *up* that list is the smell;
   the fix is
@@ -183,7 +183,7 @@ system prompt.
 
 ```bash
 cargo build --locked
-cargo test --locked --lib
+cargo test --locked --workspace --lib
 cargo test --locked --test integration_test   # and other tests/ binaries as needed
 cargo run --locked --bin myco
 ```

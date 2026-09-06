@@ -2,8 +2,6 @@
 //! client construction, the spawned generate task (channel + request + stream
 //! bridge), the SSE drive loop, and stream-index remapping.
 
-use crate::core::*;
-
 use super::*;
 
 /// Build a driver's HTTP client: JSON content type, provider `extra_headers`,

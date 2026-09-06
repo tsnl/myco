@@ -909,7 +909,7 @@ dependencies = [
  "futures",
  "infer",
  "libc",
- "reqwest",
+ "myco-model",
  "rustyline",
  "schemars",
  "serde",
@@ -921,6 +921,19 @@ dependencies = [
  "unicode-width",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "myco-model"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

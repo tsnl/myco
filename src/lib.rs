@@ -3,7 +3,7 @@ pub mod chat;
 pub mod config;
 pub mod core;
 pub mod external_command;
-pub mod generative_model;
+pub use myco_model as generative_model;
 pub mod harness;
 pub mod host;
 pub mod manual;

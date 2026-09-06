@@ -1,8 +1,13 @@
+//! Backend-independent messages and one-attempt streaming model drivers.
+
 use std::{pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
-use crate::core::*;
+pub type AsyncStream<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
+
+#[cfg(test)]
+mod test_support;
 
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
@@ -177,7 +182,7 @@ impl RetryPolicy {
 }
 
 /// A resolved model: everything the protocol drivers need, minus credentials
-/// (those live in [`BackendConfig`]). Built by `crate::config` from the
+/// (those live in [`BackendConfig`]). Built by the application configuration from the
 /// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
 /// models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +206,7 @@ pub struct ModelSpec {
     /// How many consecutive `max_tokens` truncations one turn resumes through
     /// before handing control back (`0` never resumes). Resolved from the
     /// model's `max_truncated_resumes` or its default; the agent takes this
-    /// value via [`crate::agent::Agent::set_max_truncated_resumes`].
+    /// value via the agent's continuation policy.
     pub max_truncated_resumes: u32,
     /// Prompt size at which the REPL compacts without being asked. `None` =
     /// no auto-compaction (the default; `/compact` still works).
@@ -946,7 +951,7 @@ mod tests {
             protocol,
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
-            max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            max_image_base64_bytes: 5 * 1024 * 1024,
             max_truncated_resumes: 3,
             auto_compact_at_tokens: None,
         }
@@ -1159,7 +1164,7 @@ mod tests {
 /// again — every later turn resends that history and fails the same way, which
 /// wedges the session. This is the top-level signal for those: it says whether
 /// the last user message has to come back out (see
-/// [`crate::chat::rewind_last_user_turn`]) before the conversation
+/// the chat adapter's rewind operation) before the conversation
 /// can continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {

@@ -74,3 +74,9 @@ cargo test --locked --lib
 cargo run --locked --bin myco
 bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre-commit
 ```
+
+## Workspace
+
+`myco-model` provides backend drivers and message types. The `myco` package
+assembles the application and CLI. Workspace packages share a version and lockfile.
+Run `cargo test --locked --workspace` to test all packages.
