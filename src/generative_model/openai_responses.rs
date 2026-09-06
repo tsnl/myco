@@ -85,7 +85,7 @@ impl OpenAIResponsesGenerativeModel {
 }
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let input_items = match convert_messages(input) {
             Ok(items) => items,
             Err(e) => return driver_core::error_stream(e),
@@ -95,7 +95,6 @@ impl GenerativeModel for OpenAIResponsesGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Responses",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }

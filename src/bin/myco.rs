@@ -634,6 +634,7 @@ async fn boot<S: EventSink + 'static>(
         args.effort,
     );
     let mut agent = Agent::new(model, harness.clone(), sink.clone());
+    agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let restored = session.snapshot();

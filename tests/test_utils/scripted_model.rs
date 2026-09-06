@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream;
 use myco::generative_model::{
-    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerativeModel, Message,
+    Content, ContentDelta, ContentStart, GenerateOutput, GenerationEvent, GenerativeModel, Message,
     MessagePart, ToolUseDelta, ToolUseStart,
 };
 
@@ -33,10 +33,7 @@ impl ScriptedModel {
 }
 
 impl GenerativeModel for ScriptedModel {
-    fn generate(
-        &self,
-        _input: &[Message],
-    ) -> myco::core::AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, _input: &[Message]) -> myco::core::AsyncStream<GenerationEvent> {
         let output = self
             .scripts
             .lock()
@@ -92,6 +89,6 @@ impl GenerativeModel for ScriptedModel {
         }
         parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
 
-        Box::pin(stream::iter(parts.into_iter().map(Ok)))
+        Box::pin(stream::iter(parts.into_iter().map(GenerationEvent::Part)))
     }
 }

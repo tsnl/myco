@@ -92,7 +92,7 @@ impl OpenAICompletionsGenerativeModel {
 }
 
 impl GenerativeModel for OpenAICompletionsGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let messages = match convert_messages(&self.system_prompt, input) {
             Ok(messages) => messages,
             Err(e) => return driver_core::error_stream(e),
@@ -102,7 +102,6 @@ impl GenerativeModel for OpenAICompletionsGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Chat Completions",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }

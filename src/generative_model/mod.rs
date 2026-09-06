@@ -19,7 +19,8 @@ mod sse_parser;
 use sse_parser::SseParser;
 
 pub trait GenerativeModel: Send + Sync {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
+    /// One attempt. Failure ends the stream; dropping it cancels the request.
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent>;
 }
 
 /// Wire protocol a model is served over.
@@ -121,14 +122,8 @@ impl ThinkingMode {
     }
 }
 
-/// How a driver retries a request that failed *before* any of the response
-/// reached the consumer.
-///
-/// Resolved from `[gateways.NAME.retry]` (see [`crate::config::RetryEntry`]).
-/// Retrying is only sound ahead of the stream: once parts have been emitted the
-/// consumer has seen them, and a second attempt would replay them as duplicates.
-/// Deterministic failures (a 400, a 413) are never retried — see
-/// [`crate::generative_model::driver_core`]'s send loop.
+/// Agent policy for retrying transient failures before any response parts arrive.
+/// Resolved from `[gateways.NAME.retry]` or `[models.KEY.retry]`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
     /// Total attempts including the first. `1` disables retry.
@@ -361,6 +356,13 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::Anthropic(config) => config.retry,
+            Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
+        }
+    }
+
     pub fn protocol(&self) -> Protocol {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
@@ -572,6 +574,48 @@ fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     id
 }
 
+/// One generation attempt emits parts, or ends with a failure.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    Part(MessagePart),
+    Failure(GenerationFailure),
+}
+
+impl GenerationEvent {
+    pub fn into_result(self) -> Result<MessagePart, GenerateError> {
+        match self {
+            Self::Part(part) => Ok(part),
+            Self::Failure(failure) => Err(failure.cause),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationFailure {
+    pub cause: GenerateError,
+    /// A transient cause; the caller must also ensure no response parts were emitted.
+    pub retryable: bool,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl GenerationFailure {
+    pub fn terminal(cause: GenerateError) -> Self {
+        Self {
+            cause,
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    pub fn transient(cause: GenerateError, retry_after: Option<std::time::Duration>) -> Self {
+        Self {
+            cause,
+            retryable: true,
+            retry_after,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
     MessageStart,
@@ -665,6 +709,12 @@ pub struct GenerateOutput {
 }
 
 impl GenerateOutput {
+    pub async fn from_generation(
+        stream: impl Stream<Item = GenerationEvent>,
+    ) -> Result<Self, GenerateError> {
+        Self::from_stream(stream.map(GenerationEvent::into_result)).await
+    }
+
     pub async fn from_stream(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
     ) -> Result<Self, GenerateError> {
@@ -1335,7 +1385,7 @@ pub enum Recovery {
 /// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
 pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {
     #[error("Something went wrong while generating a response: {0}")]
     ExecutionError(String),

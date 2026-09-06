@@ -124,6 +124,7 @@ pub async fn run_compact_worker(
             depth: 1,
         },
     );
+    worker.set_retry_policy(catalog_model.backend.retry_policy());
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
 
