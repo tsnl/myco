@@ -1363,7 +1363,7 @@ mod tests {
 /// again — every later turn resends that history and fails the same way, which
 /// wedges the session. This is the top-level signal for those: it says whether
 /// the last user message has to come back out (see
-/// [`crate::session::Agent::rewind_last_user_turn`]) before the conversation
+/// [`crate::chat::rewind_last_user_turn`]) before the conversation
 /// can continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {

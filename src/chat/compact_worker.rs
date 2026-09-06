@@ -15,7 +15,7 @@ use crate::harness::Harness;
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
 
-use super::{Agent, AgentInteractionError, NullEventSink, TraceContext};
+use crate::agent::{Agent, AgentInteractionError, NullEventSink, TraceContext};
 
 /// Read the summary this run wrote, where `before` is the file's content from
 /// before the worker started. Unchanged content is an error.
@@ -129,9 +129,8 @@ pub async fn run_compact_worker(
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
 
     let prompt = compact_subagent_prompt(&predecessor.id);
-    let result = worker
-        .interact(vec![Content::Text { text: prompt }], cancel)
-        .await;
+    let result =
+        crate::chat::interact(&mut worker, vec![Content::Text { text: prompt }], cancel).await;
 
     worker_session.messages = worker.history().to_vec();
     worker_session.touch();

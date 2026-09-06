@@ -229,8 +229,7 @@ async fn agent_retries_transient_statuses_then_succeeds() {
     ])
     .await;
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
-    let output = agent
-        .interact(prompt(), myco::CancelToken::new())
+    let output = myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .unwrap();
     assert!(matches!(output.as_slice(), [Content::Text { text }] if text == "OK"));
@@ -265,8 +264,7 @@ async fn agent_retries_transient_statuses_then_succeeds() {
 async fn agent_does_not_retry_a_client_error() {
     let server = StubHttpServer::status(400, "bad request").await;
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(5));
-    agent
-        .interact(prompt(), myco::CancelToken::new())
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .expect_err("HTTP 400");
     assert_eq!(server.connections(), 1);
@@ -279,8 +277,7 @@ async fn agent_gives_up_after_max_attempts() {
     let down = || StubHttpServer::status_response(503, "down");
     let server = StubHttpServer::sequence(vec![down(), down(), down(), down()]).await;
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
-    let error = agent
-        .interact(prompt(), myco::CancelToken::new())
+    let error = myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .expect_err("all attempts fail");
     assert!(error.to_string().contains("503"));
@@ -306,8 +303,7 @@ async fn agent_retry_can_be_disabled() {
     ])
     .await;
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(1));
-    agent
-        .interact(prompt(), myco::CancelToken::new())
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .expect_err("no retry");
     assert_eq!(server.connections(), 1);
@@ -322,8 +318,7 @@ async fn agent_never_retries_after_partial_response() {
     })]);
     let server = StubHttpServer::sequence(vec![partial, ok_sse_response()]).await;
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
-    agent
-        .interact(prompt(), myco::CancelToken::new())
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .expect_err("missing stop reason");
     assert_eq!(server.connections(), 1);

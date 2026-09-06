@@ -69,7 +69,7 @@ hosts, or lies about resume.
 ## Architecture (current)
 
 ```
-myco (interactive) / Agent
+myco (interactive) / chat adapter / Agent
   └── Harness (routing, config, root-only services)
         ├── HostController "local"  → in-process HostWorker (always on)
         └── HostController "…"      → ssh … myco --mode host (lazy remote)
@@ -90,7 +90,8 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
 | `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/agent/` | The agent runtime: one turn driven to completion (`Agent::interact`), the `AgentEvent` / `EventSink` stream, and the `/compact` worker |
+| `src/agent/` | The agent runtime: model context driven to completion (`Agent::run`), generation attempts, tool dispatch, and the `AgentEvent` / `EventSink` stream |
+| `src/chat/` | User-turn submission, rewind, and the `/compact` worker; operates on a separately owned agent |
 | `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
@@ -122,7 +123,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   NDJSON protocol sound.
 - **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
   `manual` → `prelude` → `prompts` → `session` → `tool_services` → `host` →
-  `harness` → `agent` → `tui`. A module reaching *up* that list is the smell;
+  `harness` → `agent` → `chat` → `tui`. A module reaching *up* that list is the smell;
   the fix is
   usually that the shared thing belongs lower down (`myco_home` in `core`, not
   `session`) or that the caller wants data instead of rendering

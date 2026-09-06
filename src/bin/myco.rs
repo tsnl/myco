@@ -9,7 +9,7 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::agent::{CompactWorkerError, run_compact_worker};
+use myco::chat::{CompactWorkerError, run_compact_worker};
 use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
 };
@@ -317,14 +317,16 @@ async fn run_print(args: Args) {
         }
     });
 
-    let result = agent.interact(content, cancel).await;
+    let result = myco::chat::interact(&mut agent, content, cancel).await;
     sigint_task.abort();
     sink.finish();
 
     // A too-large request would fail identically on every later turn of a
     // resumed session; take the offending message back out before saving.
     let rewound = match &result {
-        Err(e) if e.recovery() == Recovery::OmitLastMessage => agent.rewind_last_user_turn(),
+        Err(e) if e.recovery() == Recovery::OmitLastMessage => {
+            myco::chat::rewind_last_user_turn(&mut agent)
+        }
         _ => None,
     };
 
@@ -1115,7 +1117,7 @@ impl ReplSession {
         let cancel = self.turn_cancel.arm();
 
         // First assistant section opens with its own blank line + thin rule + header.
-        match self.agent.interact(content, cancel).await {
+        match myco::chat::interact(&mut self.agent, content, cancel).await {
             Ok(_) => self.ui.blank_line(),
             Err(myco::AgentInteractionError::Cancelled) => self.ui.cancelled(),
             Err(e) => {
@@ -1129,7 +1131,7 @@ impl ReplSession {
                 // message out of history here rather than leaving the session
                 // unable to continue.
                 if e.recovery() == Recovery::OmitLastMessage
-                    && let Some(dropped) = self.agent.rewind_last_user_turn()
+                    && let Some(dropped) = myco::chat::rewind_last_user_turn(&mut self.agent)
                 {
                     message.push_str(&format!(
                         "\n\nThe last message was removed from the conversation so the session \
@@ -1164,7 +1166,7 @@ impl ReplSession {
 
 impl ReplSession {
     /// `/compact`: run the worker lifecycle (see
-    /// [`myco::session::run_compact_worker`]) and switch the live REPL to the
+    /// [`myco::chat::run_compact_worker`]) and switch the live REPL to the
     /// successor it built.
     /// Returns whether the successor was installed, so an automatic caller can
     /// stop retrying a compaction that is failing every time.

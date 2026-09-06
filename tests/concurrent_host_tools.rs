@@ -61,7 +61,8 @@ async fn agent_concurrent_host_bash_tools_complete() {
     let t0 = Instant::now();
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
-        agent.interact(
+        myco::chat::interact(
+            &mut agent,
             vec![Content::Text {
                 text: "run three".into(),
             }],
@@ -123,7 +124,8 @@ async fn agent_concurrent_bash_and_editor_complete() {
     let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
     let reply = tokio::time::timeout(
         Duration::from_secs(20),
-        agent.interact(
+        myco::chat::interact(
+            &mut agent,
             vec![Content::Text {
                 text: "run both".into(),
             }],
