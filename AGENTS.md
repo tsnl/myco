@@ -91,7 +91,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `src/agent/` | The agent runtime: model context driven to completion (`Agent::run`), generation attempts, tool dispatch, and the `AgentEvent` / `EventSink` stream |
-| `src/chat/` | User-turn submission, rewind, and the `/compact` worker; operates on a separately owned agent |
+| `src/chat/` | Session-turn submission, checkpoints, recovery, and the `/compact` worker; operates on a separately owned agent |
 | `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |

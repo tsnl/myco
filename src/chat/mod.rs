@@ -1,8 +1,11 @@
-//! Chat operations over a separately owned agent: user turns, rewind, and compaction.
+//! Chat operations over a separately owned agent: session turns, rewind, and compaction.
 
 use crate::agent::{Agent, AgentInteractionError};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message};
+
+mod session_turn;
+pub use session_turn::{SessionTurnOutcome, persist_session, run_session_turn, wire_checkpoint};
 
 mod compact_worker;
 pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
