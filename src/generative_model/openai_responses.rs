@@ -7,8 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::core::*;
-
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
     OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
