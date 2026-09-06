@@ -4,7 +4,8 @@ use futures::StreamExt;
 
 use crate::core::CancelToken;
 use crate::generative_model::{
-    ContentDelta, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure, MessagePart,
+    ContentDelta, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure,
+    MessageAccumulator, MessagePart,
 };
 
 use super::{Agent, AgentEvent, AgentInteractionError};
@@ -59,21 +60,32 @@ fn retry_delay(agent: &Agent, failed: &FailedAttempt, attempt: u32) -> Option<st
 }
 
 async fn generate_attempt(agent: &Agent) -> Result<GenerateOutput, FailedAttempt> {
-    let mut failure = None;
+    let mut stream = agent.model.generate(&agent.history);
+    let mut accumulator = MessageAccumulator::default();
     let mut started = false;
-    let parts = agent.model.generate(&agent.history).map(|event| {
-        match &event {
-            GenerationEvent::Failure(cause) => failure = Some(cause.clone()),
-            GenerationEvent::Part(_) => started = true,
-        }
-        event.into_result()
-    });
-    GenerateOutput::from_stream_with_hook(parts, |part| emit_part(agent, part))
-        .await
-        .map_err(|cause| FailedAttempt {
-            failure: failure.unwrap_or_else(|| GenerationFailure::terminal(cause)),
+    while let Some(event) = stream.next().await {
+        let part = match event {
+            GenerationEvent::Part(part) => part,
+            GenerationEvent::Failure(failure) => return Err(FailedAttempt { failure, started }),
+        };
+        started = true;
+        accumulator
+            .push(&part)
+            .map_err(|cause| FailedAttempt::terminal(cause, started))?;
+        emit_part(agent, &part);
+    }
+    accumulator
+        .finish()
+        .map_err(|cause| FailedAttempt::terminal(cause, started))
+}
+
+impl FailedAttempt {
+    fn terminal(cause: GenerateError, started: bool) -> Self {
+        Self {
+            failure: GenerationFailure::terminal(cause),
             started,
-        })
+        }
+    }
 }
 
 fn emit_part(agent: &Agent, part: &MessagePart) {
