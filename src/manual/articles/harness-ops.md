@@ -146,7 +146,10 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   **same-platform** binary when available.
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
-  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`.
+  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`. That is the PATH
+  the host worker sees. An interactive shell can report a newer `myco` later on PATH
+  (`~/.cargo/bin`) while the worker still runs an older one earlier on it
+  (`~/.local/bin`).
 - After replacing binaries, the **interactive CLI must be restarted** to load a new agent binary;
   remote **host** workers respawn on next tool use (or after `/hosts` shows DOWN and reconnect).
 - Ask before destructive remote installs; prefer installing into user prefixes (`~/.local`,
@@ -160,10 +163,12 @@ When tools fail or the user asks why something is broken, investigate with tools
    - **Local** never needs a host subprocess; if local tools fail, debug the agent process itself.
    - Read `~/.ssh/config` for `Host` aliases (remote names == destinations);
      `~/.myco/config.toml` (or `$MYCO_CONFIG`) only for knobs.
-   - On remote: `ssh -o BatchMode=yes <alias> 'which myco; myco --help'` via the
-     **local** host's bash. If missing/outdated: install a **binary built for that
-     platform** (release asset — weights already embedded), or **build on that host**
-     from source. Do not copy binaries across mismatched OS/arch/glibc.
+   - On remote: `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` via the
+     **local** host's bash — that is the PATH the host worker sees. An interactive
+     `which` / `myco --version` can be a newer binary later on PATH. If missing/outdated:
+     install a **binary built for that platform** (release asset — weights already
+     embedded), or **build on that host** from source. Do not copy binaries across
+     mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
    - Startup checks expected executables on the **agent** machine (`bash`,
      `ssh`/`ssh-add`/`ssh-keygen` when remotes are configured) and

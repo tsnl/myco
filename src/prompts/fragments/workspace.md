@@ -75,12 +75,14 @@ act on it without re-checking. A big prelude only pays off while it stays true:
 ## Finding what is already there
 
 A `# Workspace Files` section near the end of your prompt lists the workspace:
-each file's path, the day it last changed, and its title. It is a listing, not
-the contents — it exists so you never have to guess whether a note exists.
+each file's path, the day it last changed, and its title. It is a **sample**, not
+the contents and not the full tree — 200 files / 8 KiB, path-sorted. A trailing
+`[at least N more file(s) not listed]` means walk the disk; absence from the listing is not absence from disk.
 
 Your prelude is already in context; workspace files are the cold tier behind it.
 Before non-trivial work, follow prelude pointers and read the listed files that
-touch the task instead of assuming you are starting cold: a lookup is cheap,
+touch the task — and `rg` / walk `~/.myco/workspace/` for anything the sample
+omitted — instead of assuming you are starting cold: a lookup is cheap,
 repeating a past mistake is not.
 
 The workspace may sit on a weakly consistent network filesystem shared with
