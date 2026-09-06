@@ -163,7 +163,7 @@ mod tests {
             initial_backoff: Duration::ZERO,
             ..Default::default()
         });
-        agent.set_history(vec![user("task")]);
+        agent.replace_context(vec![user("task")], None);
         (agent, model)
     }
 

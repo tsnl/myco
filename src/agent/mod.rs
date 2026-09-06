@@ -191,9 +191,10 @@ impl Agent {
         &self.history
     }
 
-    /// Replace the conversation history (e.g. when resuming a saved session).
-    pub fn set_history(&mut self, history: Vec<Message>) {
+    /// Replace model context and its usage estimate without changing live tool state.
+    pub fn replace_context(&mut self, history: Vec<Message>, usage: Option<TokenUsage>) {
         self.history = history;
+        self.last_usage = usage;
     }
 
     pub fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
@@ -236,11 +237,6 @@ impl Agent {
     /// Last observed prompt/context token usage (from the provider), if any.
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.last_usage
-    }
-
-    /// Seed last-usage when resuming a saved session (`None` if never tracked).
-    pub fn set_last_usage(&mut self, usage: Option<TokenUsage>) {
-        self.last_usage = usage;
     }
 
     pub fn context(&self) -> &TraceContext {
@@ -1242,13 +1238,16 @@ mod tests {
         let harness = Harness::local_with_services(vec![]);
         let model = ScriptedModel::new(vec![]);
         let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        agent.set_history(vec![
-            user("first"),
-            assistant("ok"),
-            user("second"),
-            assistant_tool(None, "noop", json!({})),
-            tool_results(&["done"]),
-        ]);
+        agent.replace_context(
+            vec![
+                user("first"),
+                assistant("ok"),
+                user("second"),
+                assistant_tool(None, "noop", json!({})),
+                tool_results(&["done"]),
+            ],
+            None,
+        );
 
         let dropped = crate::chat::rewind_last_user_turn(&mut agent).expect("user turn to rewind");
         assert!(matches!(&dropped[0], Content::Text { text } if text == "second"));
@@ -1283,11 +1282,11 @@ mod tests {
             usage: None,
         }]);
         let mut resumed = Agent::new(resume_model, harness, Arc::new(NullEventSink));
-        resumed.set_history(snapshot);
+        resumed.replace_context(snapshot, None);
 
         // Continue by interacting with a follow-up user message (CLI would re-prompt);
         // history already has tool_results so a fresh user turn is the normal path.
-        // Also verify set_history alone is well-formed for provider requests by
+        // Also verify the restored context is well-formed for provider requests by
         // checking the model can complete a new turn on top.
         let reply = crate::chat::interact(
             &mut resumed,

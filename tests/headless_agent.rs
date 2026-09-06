@@ -20,11 +20,14 @@ async fn headless_run_uses_supplied_context_without_adding_a_chat_turn() {
         Harness::local_with_services(vec![]),
         Arc::new(NullEventSink),
     );
-    agent.set_history(vec![Message::UserMessage {
-        content: vec![Content::Text {
-            text: "eval task".into(),
+    agent.replace_context(
+        vec![Message::UserMessage {
+            content: vec![Content::Text {
+                text: "eval task".into(),
+            }],
         }],
-    }]);
+        None,
+    );
     let id = agent.context().agent_id;
     let agent = tokio::spawn(async move {
         agent.run(CancelToken::new()).await.unwrap();
