@@ -606,7 +606,7 @@ async fn boot<S: EventSink + 'static>(
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let restored = session.snapshot();
-    agent.replace_context(restored.messages.clone(), restored.last_usage);
+    agent.bind_thread(&restored.id, restored.active_thread());
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
     wire_checkpoint(&mut agent, &session, session_warning);
@@ -891,9 +891,7 @@ impl ReplSession {
                 None if self.agent.history().is_empty() => Some(0),
                 None => None,
             };
-            let running = self
-                .harness
-                .running_tool_summaries(self.agent.context().agent_id);
+            let running = self.agent.runtime().running_tool_summaries();
             self.ui.user_header(used, max, usage, &running);
             // No "> " prefix; body is typed on the line after the USER header.
             // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
@@ -1111,12 +1109,10 @@ impl ReplSession {
 // ---------------------------------------------------------------------------
 
 impl ReplSession {
-    /// `/compact`: run the worker lifecycle (see
-    /// [`myco::chat::run_compact_worker`]) and switch the live REPL to the
-    /// successor it built.
-    /// Returns whether the successor was installed, so an automatic caller can
-    /// stop retrying a compaction that is failing every time.
+    /// Commit a successor thread without changing the session or its tools.
+    /// Failure disables automatic compaction until the next session.
     async fn run_compact(&mut self) -> bool {
+        let writer = self.session.writer().await;
         if let Err(e) =
             self.session
                 .persist_messages(self.agent.history(), self.agent.last_usage(), true)
@@ -1126,7 +1122,7 @@ impl ReplSession {
             return false;
         }
         let predecessor = self.session.snapshot();
-        if predecessor.messages.is_empty() {
+        if predecessor.active_thread().messages.is_empty() {
             self.ui.error_section("compact: session is empty");
             return false;
         }
@@ -1134,8 +1130,11 @@ impl ReplSession {
         // Progress note under the USER header, not chrome: the COMPACTED
         // banner replaces it on success, and it survives on screen (and in
         // the mirror) when the worker fails.
-        self.ui
-            .note(&format!("compacting session={} …", predecessor.id));
+        self.ui.note(&format!(
+            "compacting session={} thread={} …",
+            predecessor.id,
+            predecessor.active_thread().id
+        ));
 
         // Ctrl-C during compaction cancels the worker turn like any user turn.
         let cancel = self.turn_cancel.arm();
@@ -1160,24 +1159,14 @@ impl ReplSession {
             }
         };
 
-        // Switch live REPL to successor.
-        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
-        }
-        if let Err(msg) = self.relock_session(&successor.id) {
-            self.ui.error_section(&format!("compact: {msg}"));
+        if let Err(error) = writer.commit_thread(successor) {
+            self.ui.error_section(&format!("compact: {error}"));
             return false;
         }
-        self.session.replace(successor.clone());
-        self.agent
-            .replace_context(successor.messages.clone(), successor.last_usage);
-        load_readline_history(&mut self.editor, &self.session);
+        let updated = self.session.snapshot();
+        self.agent.bind_thread(&updated.id, updated.active_thread());
+        wire_checkpoint(&mut self.agent, &self.session, session_warning);
 
-        // Compaction starts over: wipe the screen the predecessor filled and
-        // hand the successor a COMPACTED banner instead of a replayed
-        // transcript. The conversation is not lost — it is on disk in both
-        // sessions and in the console mirror, and Ctrl-L reprints the
-        // successor's summary + tail.
         clear_screen();
         self.ui.compacted_banner(&outcome);
         true
@@ -1320,9 +1309,7 @@ impl ReplSession {
                     self.ui.error_section(&format!("new session failed: {msg}"));
                     return;
                 }
-                self.session.replace(fresh);
-                self.agent.replace_context(Vec::new(), None);
-                load_readline_history(&mut self.editor, &self.session);
+                self.install_session(&fresh);
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
                 // (the Session: line carries the fresh id).
@@ -1448,8 +1435,8 @@ impl ReplSession {
     /// agent history/usage, and reload readline history.
     fn install_session(&mut self, loaded: &Session) {
         self.session.replace(loaded.clone());
-        self.agent
-            .replace_context(loaded.messages.clone(), loaded.last_usage);
+        self.agent.bind_thread(&loaded.id, loaded.active_thread());
+        wire_checkpoint(&mut self.agent, &self.session, session_warning);
         load_readline_history(&mut self.editor, &self.session);
     }
 }
@@ -1798,22 +1785,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess.json");
 
-        let mut session = Session {
-            version: myco::SESSION_FILE_VERSION,
-            id: "aabbccddeeff00112233445566778899".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            model: "claude-opus-4-8".into(),
-            messages: sample_messages(),
-            title: Some("roundtrip".into()),
-            links: vec![],
-            scratchpad: String::new(),
-            parent_session_id: None,
-            kind: myco::SessionKind::User,
-            predecessor_id: None,
-            successor_id: None,
-            last_usage: None,
-        };
+        let mut session =
+            Session::new_with_id("claude-opus-4-8", "aabbccddeeff00112233445566778899");
+        session.replace_context(sample_messages(), None);
+        session.title = Some("roundtrip".into());
         session.updated_at = session.created_at + Duration::from_secs(1);
 
         let json = serde_json::to_vec_pretty(&session).unwrap();
@@ -1823,10 +1798,13 @@ mod tests {
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.model, session.model);
         assert_eq!(loaded.title.as_deref(), Some("roundtrip"));
-        assert_eq!(loaded.messages.len(), session.messages.len());
         assert_eq!(
-            serde_json::to_value(&loaded.messages).unwrap(),
-            serde_json::to_value(&session.messages).unwrap()
+            loaded.active_thread().messages.len(),
+            session.active_thread().messages.len()
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded.active_thread().messages).unwrap(),
+            serde_json::to_value(&session.active_thread().messages).unwrap()
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1969,13 +1947,13 @@ mod tests {
         let session = initial_session_or_exit(&args, "some-model");
         assert!(matches!(session.kind, SessionKind::Subagent));
         assert_eq!(session.parent_session_id.as_deref(), Some("abc123"));
-        assert!(session.messages.is_empty());
+        assert!(session.active_thread().messages.is_empty());
     }
 
     #[test]
     fn new_session_starts_empty() {
         let session = Session::new("grok-4.5-build");
-        assert!(session.messages.is_empty());
+        assert!(session.active_thread().messages.is_empty());
     }
 
     #[test]

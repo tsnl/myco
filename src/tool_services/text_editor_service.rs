@@ -18,8 +18,8 @@ const MAX_VIEW_BYTES: u64 = 256 * 1024;
 /// Cf https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool
 #[derive(Default)]
 pub struct TextEditorService {
-    /// Paths the agent has successfully viewed/mutated → content fingerprint at that moment.
-    read_files: Mutex<HashMap<PathBuf, u64>>,
+    /// Read fingerprints partitioned by session runtime owner.
+    read_files: Mutex<HashMap<uuid::Uuid, HashMap<PathBuf, u64>>>,
 }
 
 impl TextEditorService {
@@ -42,10 +42,17 @@ impl ToolService for TextEditorService {
         Self::specs()
     }
 
+    fn on_agent_finished(&self, owner: uuid::Uuid) {
+        self.read_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&owner);
+    }
+
     fn dispatch_tool_use(
         self: Arc<Self>,
         tool_use: generative_model::ToolUse,
-        _ctx: HostDispatchContext,
+        ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input) {
@@ -56,7 +63,7 @@ impl ToolService for TextEditorService {
                     ));
                 }
             };
-            match self.execute(input) {
+            match self.execute(input, ctx.agent_id) {
                 Ok(text) => generative_model::ToolResult::text(text),
                 Err(e) => generative_model::ToolResult::err(e),
             }
@@ -69,7 +76,7 @@ impl TextEditorService {
         Self::default()
     }
 
-    fn execute(&self, input: Input) -> Result<String, String> {
+    fn execute(&self, input: Input, owner: uuid::Uuid) -> Result<String, String> {
         let Input {
             command,
             path,
@@ -86,14 +93,15 @@ impl TextEditorService {
         // never go stale between its check and the write it authorized, and
         // the recorded fingerprint always describes the bytes this command
         // left behind.
-        let mut read_files = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        let mut owners = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        let read_files = owners.entry(owner).or_default();
 
         let output = match command {
             Command::View => view_path(&path, view_range)?,
             Command::StrReplace => {
                 let old_str = require(old_str, "str_replace", "old_str")?;
                 let new_str = require(new_str, "str_replace", "new_str")?;
-                ensure_mutated_file_already_read(&read_files, Path::new(&path))?;
+                ensure_mutated_file_already_read(read_files, Path::new(&path))?;
                 str_replace_in_file(&path, &old_str, &new_str)?;
                 "Successfully replaced text at exactly one location.".to_string()
             }
@@ -105,7 +113,7 @@ impl TextEditorService {
             Command::Insert => {
                 let insert_line = require(insert_line, "insert", "insert_line")?;
                 let insert_text = require(insert_text, "insert", "insert_text")?;
-                ensure_mutated_file_already_read(&read_files, Path::new(&path))?;
+                ensure_mutated_file_already_read(read_files, Path::new(&path))?;
                 insert_in_file(&path, insert_line, &insert_text)?;
                 format!("Successfully inserted text after line {insert_line}.")
             }
@@ -536,6 +544,34 @@ mod tests {
                 cancel: crate::core::CancelToken::new(),
             },
         ))
+    }
+
+    #[test]
+    fn read_stamps_are_isolated_and_released_with_the_session_owner() {
+        let dir = temp_dir("editor-session");
+        let path = write_file(dir.path(), "file", "before");
+        let service = Arc::new(TextEditorService::new());
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let call = |owner, input| {
+            futures::executor::block_on(service.clone().dispatch_tool_use(
+                generative_model::ToolUse {
+                    name: "str_replace_based_edit_tool".into(),
+                    input,
+                },
+                HostDispatchContext::new(owner, crate::core::CancelToken::new()),
+            ))
+        };
+        let view = json!({"command":"view", "path":path});
+        let edit =
+            json!({"command":"str_replace", "path":path, "old_str":"before", "new_str":"after"});
+        assert!(!call(first, view.clone()).is_error);
+        assert!(result_text(&call(second, edit.clone())).contains("not read"));
+        assert!(!call(second, view).is_error);
+        service.on_agent_finished(first);
+        assert!(result_text(&call(first, edit.clone())).contains("not read"));
+        assert!(!call(second, edit).is_error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after");
     }
 
     /// A malformed call must name its missing field, not fail some later

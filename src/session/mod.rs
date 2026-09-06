@@ -1,12 +1,12 @@
 //! Conversation session persistence and metadata.
 //!
 //! Sessions live under `~/.myco/session/{shard}/{id}.json` (plus a sibling
-//! `.history` for readline). Schema is intentionally breaking vs earlier WIP
-//! files: only [`SESSION_FILE_VERSION`] is accepted.
+//! `.history` for readline). Each document owns ordered threads and shared
+//! metadata. Version 2 loads as one thread; saves use [`SESSION_FILE_VERSION`].
 //!
 //! Persistence only: how a conversation is stored, not how one is produced.
 //! Compaction is split along that line — the document work
-//! ([`compact_session`], [`select_tail`], [`link_compact_pair`]) is here, and the
+//! ([`compact_thread`], [`select_tail`]) is here, and the
 //! agent run that writes the summary is [`crate::chat::run_compact_worker`].
 
 mod attach;
@@ -14,9 +14,12 @@ mod compact;
 mod console_log;
 mod lock;
 mod search;
+mod thread;
+
+pub use thread::Thread;
 
 pub use attach::{MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
-pub use compact::{CompactOutcome, compact_session, link_compact_pair, select_tail};
+pub use compact::{CompactOutcome, compact_thread, select_tail};
 pub use console_log::ConsoleLog;
 pub use lock::{SessionLockError, SessionWriteLock};
 pub use search::{SessionSearchReport, search_sessions};
@@ -31,8 +34,8 @@ use uuid::Uuid;
 use crate::core::{atomically_write, myco_home, uuid_simple_hex};
 use crate::generative_model::{Message, TokenUsage};
 
-/// On-disk session schema version. Older files are rejected (WIP break).
-pub const SESSION_FILE_VERSION: u32 = 2;
+/// Written schema version; version 2 is also accepted on read.
+pub const SESSION_FILE_VERSION: u32 = 3;
 pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
@@ -42,7 +45,7 @@ pub const MAX_SCRATCHPAD_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
-    /// Interactive / user-visible conversation (REPL, successor after compact).
+    /// Interactive / user-visible conversation.
     #[default]
     User,
     /// Nested agent run (`myco --parent-session <id>`; also written by the
@@ -80,7 +83,8 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model: String,
-    pub messages: Vec<Message>,
+    #[serde(deserialize_with = "thread::deserialize_threads")]
+    threads: Vec<Thread>,
     /// Short human label; agent/CLI maintained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -97,16 +101,12 @@ pub struct Session {
     /// [`SessionKind::is_user`] (only [`SessionKind::User`] is listed by default).
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
-    /// Session this one was compacted from, if any.
+    /// Predecessor session from a legacy v2 compaction, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_id: Option<String>,
-    /// Session created by compacting this one, if any.
+    /// Successor session from a legacy v2 compaction, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_id: Option<String>,
-    /// Last provider usage, persisted so a resumed session shows real context
-    /// (absent in sessions written before usage tracking).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_usage: Option<TokenUsage>,
 }
 
 /// Structured association stored on a session.
@@ -177,12 +177,21 @@ impl LinkCounts {
 #[derive(Clone)]
 pub struct ActiveSession {
     inner: Arc<Mutex<Session>>,
+    writer: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ActiveSession {
     pub fn new(session: Session) -> Self {
         Self {
             inner: Arc::new(Mutex::new(session)),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    pub async fn writer(&self) -> SessionWriter {
+        SessionWriter {
+            session: self.clone(),
+            _guard: self.writer.clone().lock_owned().await,
         }
     }
 
@@ -215,12 +224,29 @@ impl ActiveSession {
         last_usage: Option<TokenUsage>,
         force: bool,
     ) -> Result<(), String> {
+        let thread_id = self.with(|session| session.active_thread().id.clone());
+        self.persist_thread_messages(&thread_id, messages, last_usage, force)
+    }
+
+    pub fn persist_thread_messages(
+        &self,
+        thread_id: &str,
+        messages: &[Message],
+        last_usage: Option<TokenUsage>,
+        force: bool,
+    ) -> Result<(), String> {
         let mut session = self.lock();
-        let usage_changed = last_usage.is_some() && last_usage != session.last_usage;
-        if force || messages.len() != session.messages.len() || usage_changed {
-            session.messages = messages.to_vec();
+        if session.active_thread().id != thread_id {
+            return Err(format!(
+                "thread {thread_id} is no longer active; refusing a stale checkpoint"
+            ));
+        }
+        let usage_changed =
+            last_usage.is_some() && last_usage != session.active_thread().last_usage;
+        if force || messages.len() != session.active_thread().messages.len() || usage_changed {
+            session.active_thread_mut().messages = messages.to_vec();
             if last_usage.is_some() {
-                session.last_usage = last_usage;
+                session.active_thread_mut().last_usage = last_usage;
             }
             session.touch();
             session.save()?;
@@ -248,6 +274,27 @@ impl ActiveSession {
     }
 }
 
+pub struct SessionWriter {
+    session: ActiveSession,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SessionWriter {
+    pub fn commit_thread(&self, thread: Thread) -> Result<(), String> {
+        let mut session = self.session.lock();
+        if thread.predecessor_id.as_deref() != Some(&session.active_thread().id) {
+            return Err("compaction predecessor is no longer the active thread".into());
+        }
+        let mut successor = session.clone();
+        successor.threads.push(thread);
+        thread::validate_threads(&successor.threads)?;
+        successor.touch();
+        successor.save()?;
+        *session = successor;
+        Ok(())
+    }
+}
+
 impl Session {
     /// `model` is the catalog key from config.toml (recorded as metadata; a
     /// resumed session runs on whatever model the CLI selects).
@@ -255,7 +302,7 @@ impl Session {
         Self::new_with_id(model, uuid_simple_hex(Uuid::new_v4()))
     }
 
-    /// Create a session with an explicit id (same hex as agent id).
+    /// Create a session with an explicit id.
     pub fn new_with_id(model: impl Into<String>, id: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -264,7 +311,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             model: model.into(),
-            messages: Vec::new(),
+            threads: vec![Thread::new()],
             title: None,
             links: Vec::new(),
             scratchpad: String::new(),
@@ -272,7 +319,6 @@ impl Session {
             kind: SessionKind::User,
             predecessor_id: None,
             successor_id: None,
-            last_usage: None,
         }
     }
 
@@ -282,9 +328,42 @@ impl Session {
         !self.kind.is_user()
     }
 
-    /// Sibling summary file written by compact workers: `{id}.summary.md`.
+    /// The only thread accepting new messages; earlier threads are read-only.
+    pub fn active_thread(&self) -> &Thread {
+        self.threads
+            .last()
+            .expect("sessions contain at least one thread")
+    }
+
+    pub(crate) fn active_thread_mut(&mut self) -> &mut Thread {
+        self.threads
+            .last_mut()
+            .expect("sessions contain at least one thread")
+    }
+
+    pub fn threads(&self) -> &[Thread] {
+        &self.threads
+    }
+
+    pub fn find_thread(&self, id: &str) -> Result<&Thread, String> {
+        self.threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .ok_or_else(|| format!("session {} has no thread {id}", self.id))
+    }
+
+    pub fn replace_context(&mut self, messages: Vec<Message>, usage: Option<TokenUsage>) {
+        let thread = self.active_thread_mut();
+        thread.messages = messages;
+        thread.last_usage = usage;
+    }
+
     pub fn summary_path(&self) -> PathBuf {
-        session_file_path(&self.id, "summary.md")
+        self.thread_summary_path(&self.active_thread().id)
+    }
+
+    pub fn thread_summary_path(&self, thread_id: &str) -> PathBuf {
+        session_file_path(&self.id, &format!("{thread_id}.summary.md"))
     }
 
     /// Worker session (subagent / compact). Kind must be non-user so it is hidden.
@@ -312,8 +391,8 @@ impl Session {
         let mut child = Self::new(model);
         child.kind = SessionKind::Subagent;
         child.parent_session_id = Some(self.id.clone());
-        child.messages = self.messages.clone();
-        child.last_usage = self.last_usage;
+        child.active_thread_mut().messages = self.active_thread().messages.clone();
+        child.active_thread_mut().last_usage = self.active_thread().last_usage;
         child
     }
 
@@ -348,18 +427,24 @@ impl Session {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let session: Session =
-            serde_json::from_slice(&data).map_err(|e| format!("parse {}: {e}", path.display()))?;
-        if session.version != SESSION_FILE_VERSION {
-            return Err(format!(
-                "unsupported session version {} in {} (expected {SESSION_FILE_VERSION}; \
-                 old WIP sessions are not migrated)",
-                session.version,
-                path.display()
-            ));
+        Self::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    pub fn from_json(data: &[u8]) -> Result<Self, String> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(data).map_err(|e| e.to_string())?;
+        match value["version"].as_u64() {
+            Some(2) => thread::upgrade_v2(&mut value)?,
+            Some(3) => {}
+            version => {
+                return Err(format!(
+                    "unsupported session version {version:?}; expected 2 or {SESSION_FILE_VERSION}"
+                ));
+            }
         }
+        let session: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
         if session.id.is_empty() {
-            return Err(format!("session file {} has empty id", path.display()));
+            return Err("session has empty id".into());
         }
         Ok(session)
     }
@@ -580,14 +665,19 @@ pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, Str
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
     // Prefer full parse so version is enforced; fall back is not used for wrong version.
     let session = Session::load(path)?;
-    let snippet = first_user_text_from_messages(&session.messages).unwrap_or_default();
+    let snippet = first_user_text_from_messages(&session.threads()[0].messages).unwrap_or_default();
+    let message_count = session
+        .threads()
+        .iter()
+        .map(|thread| thread.messages.len())
+        .sum();
     Ok(SessionListEntry {
         id: session.id,
         path: path.to_path_buf(),
         created_at: session.created_at,
         updated_at: session.updated_at,
         model: session.model,
-        message_count: session.messages.len(),
+        message_count,
         title: session.title,
         snippet,
         link_counts: LinkCounts::from_links(&session.links),
@@ -810,7 +900,7 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
 pub fn format_session_detail(session: &Session) -> String {
     let console = session.console_path();
     // (label incl. padding, value); `None` rows are omitted.
-    let rows: [(&str, Option<String>); 13] = [
+    let rows: [(&str, Option<String>); 15] = [
         ("id:        ", Some(session.id.clone())),
         (
             "path:      ",
@@ -823,7 +913,19 @@ pub fn format_session_detail(session: &Session) -> String {
         ("created:   ", Some(session.created_at.to_rfc3339())),
         ("updated:   ", Some(session.updated_at.to_rfc3339())),
         ("model:     ", Some(session.model.clone())),
-        ("messages:  ", Some(session.messages.len().to_string())),
+        ("thread:    ", Some(session.active_thread().id.clone())),
+        ("threads:   ", Some(session.threads().len().to_string())),
+        (
+            "messages:  ",
+            Some(
+                session
+                    .threads()
+                    .iter()
+                    .map(|thread| thread.messages.len())
+                    .sum::<usize>()
+                    .to_string(),
+            ),
+        ),
         ("kind:      ", Some(session.kind.to_string())),
         ("hidden:    ", Some(session.is_hidden().to_string())),
         ("parent:    ", session.parent_session_id.clone()),
@@ -1057,7 +1159,10 @@ mod tests {
         let _home = temp_home("session-save");
 
         let mut session = Session::new("claude-haiku-4-5");
-        session.messages.push(user("hello\nworld"));
+        session
+            .active_thread_mut()
+            .messages
+            .push(user("hello\nworld"));
         session.save().unwrap();
 
         // Minified: no newlines outside JSON string escapes, no indentation.
@@ -1066,7 +1171,7 @@ mod tests {
 
         let loaded = Session::load(&session.json_path()).unwrap();
         assert_eq!(loaded.id, session.id);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.active_thread().messages.len(), 1);
     }
 
     fn set_mtime(path: &Path, t: std::time::SystemTime) {
@@ -1158,7 +1263,7 @@ mod tests {
         let path = dir.path().join("sess.json");
 
         let mut session = Session::new("claude-opus-4-8");
-        session.messages = vec![user("hello")];
+        session.active_thread_mut().messages = vec![user("hello")];
         session.title = Some("hello session".into());
         session.links = vec![SessionLink::Worktree {
             host: "local".into(),
@@ -1176,7 +1281,7 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("hello session"));
         assert_eq!(loaded.scratchpad, "notes");
         assert_eq!(loaded.links.len(), 1);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.active_thread().messages.len(), 1);
     }
 
     /// Session labels, snippets, and search read the first user message; the
@@ -1207,8 +1312,8 @@ mod tests {
         let mut parent = Session::new_with_id("modelkey", "aa00bb11cc22dd33ee44ff5566778899");
         parent.title = Some("parent title".into());
         parent.scratchpad = "parent notes".into();
-        parent.messages = vec![user("hi")];
-        parent.last_usage = Some(TokenUsage {
+        parent.active_thread_mut().messages = vec![user("hi")];
+        parent.active_thread_mut().last_usage = Some(TokenUsage {
             input_tokens: 100,
             output_tokens: 10,
             cached_input_tokens: 50,
@@ -1217,8 +1322,11 @@ mod tests {
         let child = parent.fork_child("othermodel");
         // Conversation + usage are inherited so the fork resumes the parent's
         // context (and its USER n/m headroom header) exactly.
-        assert_eq!(child.messages.len(), 1);
-        assert_eq!(child.last_usage, parent.last_usage);
+        assert_eq!(child.active_thread().messages.len(), 1);
+        assert_eq!(
+            child.active_thread().last_usage,
+            parent.active_thread().last_usage
+        );
         // Identity is fresh: new id, hidden subagent kind, parented; the
         // parent's metadata does not leak.
         assert_ne!(child.id, parent.id);
@@ -1237,7 +1345,7 @@ mod tests {
         let path = dir.path().join("with_usage.json");
         let mut session =
             Session::new_with_id("claude-opus-4-8", "aa00bb11cc22dd33ee44ff5566778899");
-        session.last_usage = Some(TokenUsage {
+        session.active_thread_mut().last_usage = Some(TokenUsage {
             input_tokens: 12_345,
             output_tokens: 678,
             cached_input_tokens: 1_000,
@@ -1245,10 +1353,16 @@ mod tests {
         let json = serde_json::to_vec_pretty(&session).unwrap();
         fs::write(&path, &json).unwrap();
         let loaded = Session::load(&path).unwrap();
-        assert_eq!(loaded.last_usage, session.last_usage);
-        assert_eq!(loaded.last_usage.unwrap().context_tokens(), 12_345);
+        assert_eq!(
+            loaded.active_thread().last_usage,
+            session.active_thread().last_usage
+        );
+        assert_eq!(
+            loaded.active_thread().last_usage.unwrap().context_tokens(),
+            12_345
+        );
 
-        assert!(load_legacy_v2().last_usage.is_none());
+        assert!(load_legacy_v2().active_thread().last_usage.is_none());
     }
 
     #[test]
@@ -1267,7 +1381,10 @@ mod tests {
             .persist_messages(&[user("hi")], Some(usage), true)
             .unwrap();
         assert_eq!(
-            Session::load_by_id_or_prefix(&id).unwrap().last_usage,
+            Session::load_by_id_or_prefix(&id)
+                .unwrap()
+                .active_thread()
+                .last_usage,
             Some(usage)
         );
 
@@ -1275,28 +1392,22 @@ mod tests {
             .persist_messages(&[user("hi"), user("more")], None, true)
             .unwrap();
         assert_eq!(
-            Session::load_by_id_or_prefix(&id).unwrap().last_usage,
+            Session::load_by_id_or_prefix(&id)
+                .unwrap()
+                .active_thread()
+                .last_usage,
             Some(usage)
         );
     }
 
     /// The on-disk schema is a contract, and it is spelled with Rust
     /// identifiers: `Message`, `Content`, `ToolUse`, `ToolResult` and
-    /// `TurnEndReason` serialize externally tagged with no `serde(rename)`
-    /// pinning them. Renaming a variant or a field therefore compiles, keeps
-    /// `version: 2`, and makes every stored session unreadable — after which
-    /// `list_sessions_filtered` drops the files from listings.
-    ///
-    /// This fixture is that contract written down: a v2 document covering every
-    /// variant of every persisted type. It must keep loading, and it must
-    /// re-serialize byte-for-byte. If this test fails, the disk format changed:
-    /// either revert the rename or bump [`SESSION_FILE_VERSION`] deliberately
-    /// and replace this fixture.
+    /// Every v2 message variant and metadata field survives conversion to threads.
     #[test]
-    fn v2_golden_fixture_loads_and_reserializes_byte_identically() {
+    fn v2_golden_fixture_preserves_messages_and_metadata_in_a_thread() {
         const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2_all_variants.json");
 
-        let session: Session = serde_json::from_str(FIXTURE).expect("fixture must parse as v2");
+        let session = Session::from_json(FIXTURE.as_bytes()).expect("fixture must load as v2");
 
         assert_eq!(session.version, SESSION_FILE_VERSION);
         assert_eq!(session.id, "aabbccddeeff00112233445566778899");
@@ -1309,7 +1420,7 @@ mod tests {
         assert!(session.predecessor_id.is_some());
         assert!(session.successor_id.is_some());
 
-        let usage = session.last_usage.expect("last_usage");
+        let usage = session.active_thread().last_usage.expect("last_usage");
         assert_eq!(usage.input_tokens, 12_345);
         assert_eq!(usage.output_tokens, 678);
         assert_eq!(usage.cached_input_tokens, 9_000);
@@ -1333,8 +1444,8 @@ mod tests {
 
         // Every Message variant, and every Content variant inside them.
         use crate::generative_model::TurnEndReason;
-        assert_eq!(session.messages.len(), 6);
-        match &session.messages[0] {
+        assert_eq!(session.active_thread().messages.len(), 6);
+        match &session.active_thread().messages[0] {
             Message::UserMessage { content } => {
                 assert!(
                     matches!(&content[0], Content::Text { text } if text == "look at this shot")
@@ -1345,7 +1456,7 @@ mod tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
-        match &session.messages[1] {
+        match &session.active_thread().messages[1] {
             Message::AssistantMessage {
                 content,
                 tool_uses,
@@ -1374,7 +1485,7 @@ mod tests {
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
-        match &session.messages[2] {
+        match &session.active_thread().messages[2] {
             Message::ToolResults { tool_use_results } => {
                 assert_eq!(tool_use_results.len(), 2);
                 assert!(!tool_use_results[0].is_error);
@@ -1383,7 +1494,7 @@ mod tests {
             other => panic!("expected tool results, got {other:?}"),
         }
         // The remaining turn-end reasons, including the stringly-typed arm.
-        let reasons: Vec<_> = session.messages[3..]
+        let reasons: Vec<_> = session.active_thread().messages[3..]
             .iter()
             .map(|m| match m {
                 Message::AssistantMessage {
@@ -1401,25 +1512,30 @@ mod tests {
             ]
         );
 
-        // Round-trip: the bytes we write must be the bytes we accept.
-        let reserialized = format!("{}\n", serde_json::to_string_pretty(&session).unwrap());
-        assert_eq!(
-            reserialized, FIXTURE,
-            "session serialization drifted from the v2 fixture"
-        );
+        let original: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let mut restored = serde_json::to_value(&session).unwrap();
+        let thread = restored.as_object_mut().unwrap().remove("threads").unwrap();
+        restored["messages"] = thread[0]["messages"].clone();
+        restored["last_usage"] = thread[0]["last_usage"].clone();
+        restored["version"] = 2.into();
+        assert_eq!(restored, original);
+        let encoded = serde_json::to_vec(&session).unwrap();
+        let decoded = Session::from_json(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
     }
 
     /// Sessions written before tool ids were cut carry `"id"` fields on
     /// tool_uses / tool_use_results. They must still load (ids ignored), and
-    /// the next save silently drops them — same file version, narrower shape.
+    /// the next save drops them while upgrading the document to v3.
     #[test]
     fn v2_files_with_tool_ids_still_load_and_shed_them_on_save() {
         const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2_all_variants.json");
         let mut v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
         v["messages"][1]["AssistantMessage"]["tool_uses"][0]["id"] = "toolu_01".into();
         v["messages"][2]["ToolResults"]["tool_use_results"][0]["id"] = "toolu_01".into();
-        let session: Session = serde_json::from_value(v).expect("old-shape v2 file must load");
-        match &session.messages[1] {
+        let session = Session::from_json(&serde_json::to_vec(&v).unwrap())
+            .expect("old-shape v2 file must load");
+        match &session.active_thread().messages[1] {
             Message::AssistantMessage { tool_uses, .. } => {
                 assert_eq!(tool_uses[0].name, "bash");
             }
@@ -1440,11 +1556,13 @@ mod tests {
         fs::create_dir_all(&shard).unwrap();
 
         let mut good = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
-        good.messages.push(Message::UserMessage {
-            content: vec![Content::Text {
-                text: "readable".into(),
-            }],
-        });
+        good.active_thread_mut()
+            .messages
+            .push(Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "readable".into(),
+                }],
+            });
         fs::write(
             shard.join(format!("{}.json", good.id)),
             serde_json::to_vec(&good).unwrap(),
@@ -1507,7 +1625,7 @@ mod tests {
         let _home = temp_home("session-hidden");
 
         let mut visible = Session::new("claude-haiku-4-5");
-        visible.messages.push(user("visible"));
+        visible.active_thread_mut().messages.push(user("visible"));
         visible.save().unwrap();
 
         let mut hidden = Session::new_hidden(
@@ -1516,7 +1634,10 @@ mod tests {
             SessionKind::Subagent,
             Some(visible.id.clone()),
         );
-        hidden.messages.push(user("hidden subagent"));
+        hidden
+            .active_thread_mut()
+            .messages
+            .push(user("hidden subagent"));
         hidden.save().unwrap();
 
         let listed = list_sessions(0).unwrap();

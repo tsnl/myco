@@ -114,7 +114,7 @@ fn scrub_schema(v: &mut serde_json::Value) {
 /// Ambient context for host tool-service invocations.
 #[derive(Clone)]
 pub struct HostDispatchContext {
-    /// Agent that owns this call; used for session ownership.
+    /// Session runtime owner of this call; shared across its agents and threads.
     pub agent_id: uuid::Uuid,
     /// Cancel signal for the in-flight call / agent turn.
     pub cancel: CancelToken,
@@ -162,8 +162,8 @@ pub trait ToolService: Send + Sync + 'static {
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult>;
 
-    /// Called when an agent session ends so services can drop agent-scoped state
-    /// (e.g. bash sessions owned by that agent). Default: no-op.
+    /// Called when a session runtime ends so services can release its state.
+    /// Default: no-op.
     fn on_agent_finished(&self, _agent_id: uuid::Uuid) {}
 
     /// One-line summaries of work this service still has running for

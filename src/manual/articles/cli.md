@@ -10,7 +10,7 @@ You cannot press these yourself — tell the user which command to run.
 | `/resume [id]` | Load conversation memory (no id: session browser, see below) |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
-| `/compact` | Compact into successor session (summary + recent tail) |
+| `/compact` | Create a successor thread in this session (summary + recent tail) |
 | `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
 | `/help` | Full help |
 | Alt-Enter / Ctrl-J | Multiline input |
@@ -150,11 +150,12 @@ summary inside a unified ASSISTANT section; it is stored in session history for 
 but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
 ERROR section (live only; not stored in session history).
 
-`/compact` starts over rather than appending: it clears the screen (scrollback included) and
-prints a **COMPACTED** banner — the same `█` rule + bold title as the startup banner — listing
-the successor session, the predecessor it came from, how many tail messages were kept, and the
-summary path. Nothing is lost: both sessions are on disk, the console mirror keeps the whole
-run, and Ctrl-L reprints the successor's summary + kept tail.
+`/compact` creates a successor thread in the current session. It clears the screen
+(scrollback included) and prints a **COMPACTED** banner listing the session, the new thread,
+its predecessor, the retained message count, and the summary path. Older threads stay in
+the session file and can be read through `session_history` with `thread_id`. Live shells
+and editor read stamps continue across compaction. The console mirror keeps the whole
+run, and Ctrl-L reprints the active thread's summary + retained context.
 
 Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,
 compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`
