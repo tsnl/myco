@@ -2,7 +2,8 @@
 //! harness, plus the live [`AgentEvent`] stream a front-end renders.
 //!
 //! It depends on the model drivers and harness; neither depends on it.
-//! [`TraceContext`] attributes events; the harness takes a bare agent `Uuid`.
+//! [`TraceContext`] attributes events to an agent and its current thread.
+//! [`SessionRuntime`] owns host resources across agent and thread changes.
 //!
 //! History well-formedness is the invariant everything else rests on: whatever
 //! a run does — end cleanly, hit a provider error, get cancelled mid-tool, or
@@ -13,6 +14,8 @@
 use std::sync::Arc;
 
 mod generation;
+mod session_runtime;
+pub use session_runtime::SessionRuntime;
 
 use futures::future;
 
@@ -28,18 +31,16 @@ use uuid::Uuid;
 // Event sink — live observability for agent / tool activity
 //
 
-/// Attribution carried on every [`AgentEvent`]: which agent produced it, and
-/// how deeply nested that agent is.
-///
-/// A display concern — sinks filter on [`Self::depth`] to show root-agent output
-/// and hide nested workers. One type for every agent role; nesting is a number,
-/// not a separate event per role.
+/// Event attribution for frontends and evaluators. Session and thread are
+/// present when bound; depth lets displays distinguish nested workers.
 #[derive(Debug, Clone)]
 pub struct TraceContext {
-    /// Stable id for this agent session (root or subagent).
+    /// Stable id for this agent instance (root or subagent).
     pub agent_id: Uuid,
     /// Nesting depth: root agent is 0; each nested agent is parent depth + 1.
     pub depth: usize,
+    pub session_id: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 impl Default for TraceContext {
@@ -47,6 +48,8 @@ impl Default for TraceContext {
         Self {
             agent_id: Uuid::nil(),
             depth: 0,
+            session_id: None,
+            thread_id: None,
         }
     }
 }
@@ -56,6 +59,8 @@ impl TraceContext {
         Self {
             agent_id: Uuid::new_v4(),
             depth: 0,
+            session_id: None,
+            thread_id: None,
         }
     }
 }
@@ -131,7 +136,7 @@ const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not r
 pub struct Agent {
     retry_policy: RetryPolicy,
     model: Arc<dyn GenerativeModel>,
-    harness: Arc<Harness>,
+    runtime: Arc<SessionRuntime>,
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
@@ -161,10 +166,28 @@ impl Agent {
         sink: Arc<dyn EventSink>,
         context: TraceContext,
     ) -> Self {
+        let runtime = SessionRuntime::with_owner(harness, context.agent_id);
+        Self::build(model, runtime, sink, context)
+    }
+
+    pub fn with_runtime(
+        model: Arc<dyn GenerativeModel>,
+        runtime: Arc<SessionRuntime>,
+        sink: Arc<dyn EventSink>,
+    ) -> Self {
+        Self::build(model, runtime, sink, TraceContext::root())
+    }
+
+    fn build(
+        model: Arc<dyn GenerativeModel>,
+        runtime: Arc<SessionRuntime>,
+        sink: Arc<dyn EventSink>,
+        context: TraceContext,
+    ) -> Self {
         Self {
             retry_policy: RetryPolicy::default(),
             model,
-            harness,
+            runtime,
             sink,
             context,
             history: Vec::new(),
@@ -173,6 +196,19 @@ impl Agent {
             max_truncated_resumes: crate::config::DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
         }
+    }
+
+    pub fn runtime(&self) -> &Arc<SessionRuntime> {
+        &self.runtime
+    }
+
+    /// Bind one thread while idle. A different session gets a new tool owner.
+    pub fn bind_thread(&mut self, session_id: &str, thread: &crate::session::Thread) {
+        self.runtime = self.runtime.for_session(session_id);
+        self.context.session_id = Some(session_id.to_string());
+        self.context.thread_id = Some(thread.id.clone());
+        self.replace_context(thread.messages.clone(), thread.last_usage);
+        self.checkpoint = None;
     }
 
     /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
@@ -243,7 +279,7 @@ impl Agent {
     }
 
     /// Drive the existing model context to completion. The caller supplies input separately.
-    /// The instance owns host tool state across runs; dropping it tears that state down.
+    /// The session runtime owns live tools across runs and agent replacements.
     pub async fn run(
         &mut self,
         cancel: CancelToken,
@@ -361,10 +397,11 @@ impl Agent {
             context: self.context.clone(),
         });
 
-        let work =
-            self.harness
-                .clone()
-                .dispatch_tool_use(tool_use, self.context.agent_id, cancel.clone());
+        let work = self.runtime.harness.clone().dispatch_tool_use(
+            tool_use,
+            self.runtime.owner_id,
+            cancel.clone(),
+        );
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it
@@ -387,17 +424,6 @@ impl Agent {
             }
             result = &mut work => result,
         }
-    }
-}
-
-impl Drop for Agent {
-    fn drop(&mut self) {
-        // Tear down agent-owned harness state (bash sessions, …). Skip the nil id used
-        // by some unit tests that never go through TraceContext::root().
-        if self.context.agent_id.is_nil() {
-            return;
-        }
-        self.harness.notify_agent_finished(self.context.agent_id);
     }
 }
 

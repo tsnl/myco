@@ -17,7 +17,10 @@ pub mod tui;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use agent::{Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, TraceContext};
+pub use agent::{
+    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, SessionRuntime,
+    TraceContext,
+};
 pub use chat::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
 pub use core::{CancelToken, uuid_simple_hex};
@@ -30,7 +33,7 @@ pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
-    SessionLink, SessionListEntry, compact_session, link_compact_pair, select_tail,
+    SessionLink, SessionListEntry, Thread, compact_thread, select_tail,
 };
 pub use tool_services::{
     HostDispatchContext, ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool,

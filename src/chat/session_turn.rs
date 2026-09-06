@@ -19,8 +19,18 @@ pub async fn run_session_turn(
     mut input: Vec<Content>,
     forked: bool,
     cancel: CancelToken,
-    on_warning: impl Fn(&str),
+    on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
+    let _writer = tokio::select! {
+        biased;
+        writer = session.writer() => writer,
+        _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
+    };
+    let snapshot = session.snapshot();
+    agent.bind_thread(&snapshot.id, snapshot.active_thread());
+    let on_warning = std::sync::Arc::new(on_warning);
+    let checkpoint_warning = on_warning.clone();
+    wire_checkpoint(agent, session, move |warning| checkpoint_warning(warning));
     if let Err(error) = auto_title(session, &input) {
         on_warning(&format!("could not auto-title session: {error}"));
     }
@@ -46,7 +56,9 @@ fn auto_title(session: &ActiveSession, input: &[Content]) -> Result<(), String> 
 }
 
 fn stamp_input(session: &ActiveSession, input: &mut Vec<Content>) {
-    let text = session.with(|session| prompts::session_stamp(&session.id, session.created_at));
+    let text = session.with(|session| {
+        prompts::thread_stamp(&session.id, &session.active_thread().id, session.created_at)
+    });
     input.insert(0, Content::Text { text });
 }
 
@@ -68,9 +80,10 @@ pub fn wire_checkpoint(
     session: &ActiveSession,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) {
+    let thread_id = session.with(|session| session.active_thread().id.clone());
     let session = session.clone();
     agent.set_checkpoint(Box::new(move |messages, usage| {
-        if let Err(error) = session.persist_messages(messages, usage, false) {
+        if let Err(error) = session.persist_thread_messages(&thread_id, messages, usage, false) {
             on_warning(&format!("mid-turn session save failed: {error}"));
         }
     }));
@@ -83,7 +96,10 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
     if history.is_empty() && !session.snapshot().json_path().exists() {
         return Ok(());
     }
-    session.persist_messages(history, agent.last_usage(), force)
+    match agent.context().thread_id.as_deref() {
+        Some(id) => session.persist_thread_messages(id, history, agent.last_usage(), force),
+        None => session.persist_messages(history, agent.last_usage(), force),
+    }
 }
 
 // Forks inherit a parent's stamp and need their own; resumes keep the existing one.
@@ -133,20 +149,20 @@ mod tests {
 
     fn saved_messages(session: &ActiveSession) -> serde_json::Value {
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
-        serde_json::to_value(saved.messages).unwrap()
+        serde_json::to_value(&saved.active_thread().messages).unwrap()
     }
 
     #[test]
     fn rejected_input_is_rewound_before_the_session_is_saved() {
         let _home = temp_home("chat-rejection");
         let mut document = Session::new("test");
-        document.messages = vec![user("earlier"), assistant("answer")];
-        let expected = serde_json::to_value(&document.messages).unwrap();
+        document.active_thread_mut().messages = vec![user("earlier"), assistant("answer")];
+        let expected = serde_json::to_value(&document.active_thread().messages).unwrap();
         let mut agent = agent(
             ScriptedModel::new(vec![])
                 .then_fail(GenerateError::RequestTooLargeError("oversized".into())),
         );
-        agent.replace_context(document.messages.clone(), None);
+        agent.replace_context(document.active_thread().messages.clone(), None);
         let session = ActiveSession::new(document);
         wire_checkpoint(&mut agent, &session, |warning| panic!("{warning}"));
         let outcome = submit(&mut agent, &session, CancelToken::new());
@@ -174,7 +190,7 @@ mod tests {
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         assert_eq!(saved.title.as_deref(), Some("task"));
         assert!(
-            matches!(&saved.messages[0], Message::UserMessage { content }
+            matches!(&saved.active_thread().messages[0], Message::UserMessage { content }
             if matches!(&content[0], Content::Text { text } if text.contains(&saved.id)))
         );
         assert_eq!(
@@ -208,6 +224,75 @@ mod tests {
             );
         }
         assert_eq!(agent.history().len(), 3);
+    }
+
+    #[test]
+    fn queued_turn_uses_the_successor_thread_after_compaction_finishes() {
+        let _home = temp_home("thread-queued-turn");
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        executor.block_on(async {
+            let mut document = Session::new("m");
+            document.replace_context(vec![user("earlier"), assistant("answer")], None);
+            let session = ActiveSession::new(document);
+            let writer = session.writer().await;
+            let mut agent = agent(ScriptedModel::new(vec![GenerateOutput {
+                content: vec![],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            }]));
+            {
+                let run = run_session_turn(
+                    &mut agent,
+                    &session,
+                    vec![],
+                    false,
+                    CancelToken::new(),
+                    |warning| panic!("{warning}"),
+                );
+                let mut run = std::pin::pin!(run);
+                assert!(futures::poll!(&mut run).is_pending());
+                let (next, _) =
+                    crate::session::compact_thread(&session.snapshot(), "compacted goal").unwrap();
+                writer.commit_thread(next).unwrap();
+                drop(writer);
+                run.await.result.unwrap();
+            }
+            let saved = session.snapshot();
+            assert_eq!(saved.threads().len(), 2);
+            assert_eq!(
+                agent.context().thread_id.as_deref(),
+                Some(saved.active_thread().id.as_str())
+            );
+            assert!(
+                matches!(&agent.history()[0], Message::UserMessage { content }
+                if matches!(&content[1], Content::Text { text } if text.contains("compacted goal")))
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_while_waiting_for_the_writer_does_not_submit_input() {
+        let _home = temp_home("thread-queued-cancel");
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        executor.block_on(async {
+            let session = ActiveSession::new(Session::new("m"));
+            let _writer = session.writer().await;
+            let mut agent = agent(ScriptedModel::new(vec![]));
+            let cancel = CancelToken::new();
+            cancel.cancel();
+            let outcome =
+                run_session_turn(&mut agent, &session, vec![], false, cancel, |warning| {
+                    panic!("{warning}")
+                })
+                .await;
+            assert!(matches!(
+                outcome.result,
+                Err(AgentInteractionError::Cancelled)
+            ));
+            assert!(session.snapshot().active_thread().messages.is_empty());
+            assert!(!session.snapshot().json_path().exists());
+        });
     }
 
     /// A session stamps its id on the first message of its own conversation:

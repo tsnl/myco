@@ -70,10 +70,11 @@ hosts, or lies about resume.
 
 ```
 myco (interactive) / chat adapter / Agent
-  └── Harness (routing, config, root-only services)
-        ├── HostController "local"  → in-process HostWorker (always on)
-        └── HostController "…"      → ssh … myco --mode host (lazy remote)
-              └── standard tools: bash, editor, view_image
+  └── SessionRuntime (shared live tool ownership)
+      └── Harness (routing, config, root-only services)
+          ├── HostController "local"  → in-process HostWorker (always on)
+          └── HostController "…"      → ssh … myco --mode host (lazy remote)
+                └── standard tools: bash, editor, view_image
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
@@ -90,9 +91,9 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
 | `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/agent/` | The agent runtime: model context driven to completion (`Agent::run`), generation attempts, tool dispatch, and the `AgentEvent` / `EventSink` stream |
+| `src/agent/` | `Agent::run` drives model context to completion and emits attributed events; shared `SessionRuntime` owns live tools across agent and thread changes |
 | `src/chat/` | Session-turn submission, checkpoints, recovery, and the `/compact` worker; operates on a separately owned agent |
-| `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
+| `src/session/` | Persistent sessions: ordered `Thread` histories, shared metadata, search, writer locks, and compaction document logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
@@ -111,7 +112,11 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Standard tool catalog is the same on every host**; root-only tools
   (`session_meta`, `prelude`) are installed only on the in-process local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
-  (and per agent id).
+  (and per session runtime owner).
+- **Compaction creates a thread, not a session.** Only the latest thread accepts
+  messages; older threads retain their original observations. Session turns and
+  compaction share a writer gate; stale checkpoints are rejected. Live tools
+  belong to `SessionRuntime`, whose lifetime is independent of any one agent.
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
 - **Builds are offline** beyond the crates.io fetch — `build.rs` shells out to
