@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Required checks for branch protection / publish wait_for_checks:
+# Required checks for branch protection and the release CI gate:
 #   Check Formatting, Lint, Test  (job names; see publish.yml)
 jobs:
   fmt:
@@ -47,6 +47,8 @@ jobs:
         run: |
           cargo check --locked -p myco-model --lib
           cargo check --locked -p myco-agent --lib
+      - name: Release version and CI gate tests
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
       - name: cargo test (offline)
         # Full suite, no live provider calls. Live Anthropic/xAI tests are
         # #[ignore] — run locally with: cargo test -- --ignored
