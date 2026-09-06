@@ -640,8 +640,7 @@ async fn boot<S: EventSink + 'static>(
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let restored = session.snapshot();
-    agent.set_history(restored.messages.clone());
-    agent.set_last_usage(restored.last_usage);
+    agent.replace_context(restored.messages.clone(), restored.last_usage);
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
     wire_checkpoint(&mut agent, &session);
@@ -1223,8 +1222,8 @@ impl ReplSession {
             return false;
         }
         self.session.replace(successor.clone());
-        self.agent.set_history(successor.messages.clone());
-        self.agent.set_last_usage(successor.last_usage);
+        self.agent
+            .replace_context(successor.messages.clone(), successor.last_usage);
         load_readline_history(&mut self.editor, &self.session);
 
         // Compaction starts over: wipe the screen the predecessor filled and
@@ -1375,8 +1374,7 @@ impl ReplSession {
                     return;
                 }
                 self.session.replace(fresh);
-                self.agent.set_history(Vec::new());
-                self.agent.set_last_usage(None);
+                self.agent.replace_context(Vec::new(), None);
                 load_readline_history(&mut self.editor, &self.session);
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
@@ -1503,8 +1501,8 @@ impl ReplSession {
     /// agent history/usage, and reload readline history.
     fn install_session(&mut self, loaded: &Session) {
         self.session.replace(loaded.clone());
-        self.agent.set_history(loaded.messages.clone());
-        self.agent.set_last_usage(loaded.last_usage);
+        self.agent
+            .replace_context(loaded.messages.clone(), loaded.last_usage);
         load_readline_history(&mut self.editor, &self.session);
     }
 }
