@@ -1,4 +1,3 @@
-use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -8,7 +7,7 @@ pub mod image;
 pub use fs::{atomically_write, myco_home};
 
 pub type Async<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-pub type AsyncStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
+pub use myco_model::AsyncStream;
 
 /// Cooperative cancellation signal for in-flight agent turns.
 ///
