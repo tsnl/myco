@@ -212,24 +212,26 @@ fn tool_description_states_actual_defaults() {
 }
 
 #[test]
-fn rejects_command_starting_with_cd() {
-    for command in [
-        "cd /tmp && ls",
-        "  cd /tmp",
-        "cd\t/tmp",
-        "cd",
-        "cd /tmp; ls",
-    ] {
+fn rejects_lone_cd_command() {
+    // Nothing but a `cd` — a no-op in exec; the caller wants `cwd`.
+    for command in ["cd", "  cd /tmp", "cd\t/tmp", "cd /tmp  "] {
         let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
         let err = resolve_action(&input).unwrap_err();
         assert!(
-            err.contains("must not start with `cd`") && err.contains("`cwd`"),
+            err.contains("only a `cd`") && err.contains("`cwd`"),
             "command={command:?} err={err}"
         );
     }
 
-    // Not a leading shell `cd` word — allowed.
-    for command in ["cdo something", "echo cd /tmp", "true && cd /tmp"] {
+    // A `cd` that chains into a real command, or no leading `cd` word — allowed.
+    for command in [
+        "cd /tmp && ls",
+        "cd /tmp; ls",
+        "cd /tmp\nls",
+        "cdo something",
+        "echo cd /tmp",
+        "true && cd /tmp",
+    ] {
         let input: Input = serde_json::from_value(json!({"command": command})).unwrap();
         assert!(
             resolve_action(&input).is_ok(),
