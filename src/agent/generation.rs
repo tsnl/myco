@@ -7,21 +7,16 @@ use crate::generative_model::{
     ContentDelta, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure, MessagePart,
 };
 
-use super::{Agent, AgentEvent};
-
-pub(super) enum GenerateOrCancel {
-    Cancelled,
-    Generate(GenerateError),
-}
+use super::{Agent, AgentEvent, AgentInteractionError};
 
 pub(super) async fn generate(
     agent: &Agent,
     cancel: CancelToken,
-) -> Result<GenerateOutput, GenerateOrCancel> {
+) -> Result<GenerateOutput, AgentInteractionError> {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => Err(GenerateOrCancel::Cancelled),
-        result = generate_attempts(agent) => result.map_err(GenerateOrCancel::Generate),
+        _ = cancel.cancelled() => Err(AgentInteractionError::Cancelled),
+        result = generate_attempts(agent) => result.map_err(AgentInteractionError::GenerateError),
     }
 }
 
@@ -195,7 +190,6 @@ mod tests {
         let (agent, model) = setup(vec![vec![failure(None)], answer()], events.clone());
         let output = generate(&agent, CancelToken::new())
             .await
-            .ok()
             .expect("second attempt succeeds");
         assert!(
             matches!(output.content.as_slice(), [crate::generative_model::Content::Text { text }] if text == "answer")
@@ -222,7 +216,7 @@ mod tests {
         );
         assert!(matches!(
             generate(&agent, CancelToken::new()).await,
-            Err(GenerateOrCancel::Generate(_))
+            Err(AgentInteractionError::GenerateError(_))
         ));
         assert_eq!(model.inputs.lock().unwrap().len(), 1);
         assert!(matches!(
@@ -249,7 +243,7 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_millis(100), generate(&agent, cancel))
             .await
             .expect("cancel must interrupt backoff");
-        assert!(matches!(outcome, Err(GenerateOrCancel::Cancelled)));
+        assert!(matches!(outcome, Err(AgentInteractionError::Cancelled)));
         assert_eq!(model.inputs.lock().unwrap().len(), 1);
         assert!(
             matches!(events.events.lock().unwrap().as_slice(), [AgentEvent::Failure { retry_in: Some(delay), .. }]
@@ -264,7 +258,7 @@ mod tests {
         cancel.cancel();
         assert!(matches!(
             generate(&agent, cancel).await,
-            Err(GenerateOrCancel::Cancelled)
+            Err(AgentInteractionError::Cancelled)
         ));
         assert!(model.inputs.lock().unwrap().is_empty());
     }

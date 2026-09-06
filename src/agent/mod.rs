@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 mod generation;
-use generation::GenerateOrCancel;
 
 use futures::future;
 
@@ -249,151 +248,111 @@ impl Agent {
         &mut self,
         cancel: CancelToken,
     ) -> Result<Vec<Content>, AgentInteractionError> {
-        // Output tokens accumulate across this turn's generate calls (one per
-        // tool round-trip); each new report's input side already covers the
-        // whole prompt, so it replaces rather than adds.
-        let mut turn_output: u64 = 0;
-        // Consecutive `max_tokens` stops, capped by MAX_TRUNCATED_RESUMES.
-        let mut truncations: u32 = 0;
+        let result = self.run_loop(cancel).await;
+        self.sink.emit(AgentEvent::TurnFinished {
+            context: self.context.clone(),
+        });
+        result
+    }
 
+    async fn run_loop(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<Vec<Content>, AgentInteractionError> {
+        let mut output_tokens = 0;
+        let mut truncations = 0;
         loop {
-            if cancel.is_cancelled() {
-                return self.finish_cancelled();
+            let output = generation::generate(self, cancel.clone()).await?;
+            self.record_usage(output.usage, &mut output_tokens);
+            let answer = answer_content(&output.content);
+            let reason = output.turn_end_reason;
+            let has_tools = !output.tool_uses.is_empty();
+            self.record_assistant(output.content, &output.tool_uses, reason.clone())?;
+            self.answer_tools(output.tool_uses, cancel.clone()).await?;
+            let resume = self.resume_truncated(&reason, &mut truncations);
+            if resume && !has_tools {
+                self.append_continuation();
             }
-
-            let output = match generation::generate(self, cancel.clone()).await {
-                Ok(output) => output,
-                Err(GenerateOrCancel::Cancelled) => return self.finish_cancelled(),
-                // finish_generate_error emits TurnFinished so live ASSISTANT closes
-                // before the CLI opens an ERROR section.
-                Err(GenerateOrCancel::Generate(e)) => return self.finish_generate_error(e),
-            };
-
-            if let Some(usage) = output.usage {
-                turn_output += usage.output_tokens;
-                self.last_usage = Some(TokenUsage {
-                    output_tokens: turn_output,
-                    ..usage
-                });
-            }
-
-            let reason = output.turn_end_reason.clone();
-
-            // A tool_use stop with zero accumulated tool calls is malformed
-            // (e.g. a content block the accumulator ignored). Retrying with
-            // unchanged history would loop generate forever, and pushing an
-            // empty ToolResults message is rejected by the API — fail loud.
-            if matches!(reason, TurnEndReason::ToolUse) && output.tool_uses.is_empty() {
-                self.history.push(Message::AssistantMessage {
-                    content: output.content,
-                    tool_uses: vec![],
-                    turn_end_reason: Some(TurnEndReason::ToolUse),
-                });
-                return self.finish_generate_error(GenerateError::MalformedResponseError(
-                    "turn ended in tool_use but streamed zero tool uses".into(),
-                ));
-            }
-
-            // Return answer content only; history keeps thinking for resume/UI.
-            // Backends strip thinking when composing the next request.
-            let content = answer_content(&output.content);
-            let tool_uses = output.tool_uses;
-            // Persist full content (including thinking summaries) for session
-            // resume/UI. Backends strip thinking when composing the next request.
-            self.history.push(Message::AssistantMessage {
-                content: output.content,
-                tool_uses: tool_uses.clone(),
-                turn_end_reason: Some(reason.clone()),
-            });
-
-            // Tool calls are answered whenever the turn carries them — the stop
-            // reason does not decide this. `max_tokens` truncates a turn
-            // mid-call, so the block arrives under a non-`tool_use` stop; a
-            // tool_use nothing responds to makes the whole history unsendable
-            // (every later request resends it), which strands the session on the
-            // provider's "tool_use without tool_result" error.
-            let answered_tool_calls = !tool_uses.is_empty();
-            if answered_tool_calls {
-                // Dispatch every tool use in this turn concurrently. join_all preserves
-                // input order so tool_results[i] matches tool_uses[i]; events may
-                // interleave freely while tools run. Each tool races against cancel so
-                // unfinished work returns a synthetic cancelled ToolResult.
-                let tool_use_results = future::join_all(
-                    tool_uses
-                        .into_iter()
-                        .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
-                )
-                .await;
-
-                self.history.push(Message::ToolResults { tool_use_results });
-                self.emit_checkpoint();
-
-                // If cancel fired during tools, do not start another generate — the
-                // transcript already has matching tool results for every tool_use.
-                if cancel.is_cancelled() {
-                    return self.finish_cancelled();
-                }
-            }
-
-            // Consecutive-truncation guard; any clean stop clears it.
-            if matches!(reason, TurnEndReason::MaxTokens) {
-                truncations += 1;
-            } else {
-                truncations = 0;
-            }
-
-            // A `max_tokens` stop resumes rather than ending the turn: without
-            // this an overnight run stops mid-task, holding tool results nobody
-            // read or a sentence that breaks off mid-word.
-            let resume_truncated = matches!(reason, TurnEndReason::MaxTokens)
-                && truncations <= self.max_truncated_resumes;
-
-            // How it resumes depends on what the truncated turn left behind. A
-            // turn that carried tool calls already ends on their results, so the
-            // next request is an ordinary continuation. Truncated *text* ends on
-            // the assistant's own cut-off message, and re-sending that is the
-            // prefill shape current Anthropic models reject outright — so ask
-            // for the rest in a user turn, the one continuation every provider
-            // accepts. It is a real message: the provider is sent it, and the
-            // transcript shows it.
-            if resume_truncated && !answered_tool_calls {
-                self.history.push(Message::UserMessage {
-                    content: vec![Content::Text {
-                        text: CONTINUE_PROMPT.to_string(),
-                    }],
-                });
-                self.emit_checkpoint();
-            }
-
-            // `tool_use` is the other stop that continues the turn; everything
-            // else hands control back with whatever the model managed to say.
-            if !matches!(reason, TurnEndReason::ToolUse) && !resume_truncated {
-                self.sink.emit(AgentEvent::TurnFinished {
-                    context: self.context.clone(),
-                });
-                return Ok(content);
+            if !matches!(reason, TurnEndReason::ToolUse) && !resume {
+                return Ok(answer);
             }
         }
     }
 
-    fn finish_cancelled(&self) -> Result<Vec<Content>, AgentInteractionError> {
-        self.sink.emit(AgentEvent::TurnFinished {
-            context: self.context.clone(),
-        });
-        Err(AgentInteractionError::Cancelled)
+    fn record_usage(&mut self, usage: Option<TokenUsage>, output_tokens: &mut u64) {
+        if let Some(usage) = usage {
+            // Input describes the latest prompt; output spans every request in the run.
+            *output_tokens += usage.output_tokens;
+            self.last_usage = Some(TokenUsage {
+                output_tokens: *output_tokens,
+                ..usage
+            });
+        }
     }
 
-    /// Errors end the turn too: sinks key section/state resets off
-    /// `TurnFinished`, so skipping it on error leaves the next turn's output
-    /// rendering glued to this one's (and an open `Thinking:` line dangling).
-    fn finish_generate_error(
-        &self,
-        error: GenerateError,
-    ) -> Result<Vec<Content>, AgentInteractionError> {
-        self.sink.emit(AgentEvent::TurnFinished {
-            context: self.context.clone(),
+    fn record_assistant(
+        &mut self,
+        content: Vec<Content>,
+        tool_uses: &[ToolUse],
+        reason: TurnEndReason,
+    ) -> Result<(), AgentInteractionError> {
+        let missing_tools = matches!(reason, TurnEndReason::ToolUse) && tool_uses.is_empty();
+        self.history.push(Message::AssistantMessage {
+            content,
+            tool_uses: tool_uses.to_vec(),
+            turn_end_reason: Some(reason),
         });
-        Err(AgentInteractionError::GenerateError(error))
+        if missing_tools {
+            return Err(AgentInteractionError::GenerateError(
+                GenerateError::MalformedResponseError(
+                    "turn ended in tool_use but streamed zero tool uses".into(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn answer_tools(
+        &mut self,
+        tool_uses: Vec<ToolUse>,
+        cancel: CancelToken,
+    ) -> Result<(), AgentInteractionError> {
+        if tool_uses.is_empty() {
+            return Ok(());
+        }
+        // Even truncated calls need results. join_all preserves call order;
+        // checkpoint and cancellation must wait until every call has a result.
+        let tool_use_results = future::join_all(
+            tool_uses
+                .into_iter()
+                .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
+        )
+        .await;
+        self.history.push(Message::ToolResults { tool_use_results });
+        self.emit_checkpoint();
+        if cancel.is_cancelled() {
+            return Err(AgentInteractionError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn resume_truncated(&self, reason: &TurnEndReason, truncations: &mut u32) -> bool {
+        if matches!(reason, TurnEndReason::MaxTokens) {
+            *truncations += 1;
+            *truncations <= self.max_truncated_resumes
+        } else {
+            *truncations = 0;
+            false
+        }
+    }
+
+    fn append_continuation(&mut self) {
+        // A user continuation avoids the assistant-prefill shape Anthropic rejects.
+        self.append_input(Message::UserMessage {
+            content: vec![Content::Text {
+                text: CONTINUE_PROMPT.to_string(),
+            }],
+        });
     }
 
     async fn dispatch_tool_use(&self, tool_use: ToolUse, cancel: CancelToken) -> ToolResult {
@@ -480,6 +439,51 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    impl EventSink for EventLog {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn each_run_closes_its_event_stream_once_on_success_failure_or_cancel() {
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }])
+        .then_fail(GenerateError::ExecutionError("unavailable".into()));
+        let events = Arc::new(EventLog::default());
+        let mut agent = Agent::new(model, Harness::local_with_services(vec![]), events.clone());
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        for (cancel, succeeds) in [
+            (CancelToken::new(), true),
+            (CancelToken::new(), false),
+            (cancelled, false),
+        ] {
+            let result = crate::chat::interact(&mut agent, vec![], cancel).await;
+            assert_eq!(result.is_ok(), succeeds);
+            let mut emitted = events.0.lock().unwrap();
+            assert!(matches!(
+                emitted.last(),
+                Some(AgentEvent::TurnFinished { .. })
+            ));
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnFinished { .. }))
+                    .count(),
+                1
+            );
+            emitted.clear();
+        }
+    }
 
     /// Sleeps, records start/end instants, returns the configured label.
     struct SlowService {
