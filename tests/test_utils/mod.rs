@@ -111,3 +111,12 @@ pub fn live_openrouter_kimi(protocol: Protocol) -> (ModelSpec, BackendConfig) {
     };
     (spec, backend)
 }
+
+pub fn tool_runtime(
+    harness: std::sync::Arc<myco::Harness>,
+) -> std::sync::Arc<myco::SessionRuntime> {
+    myco::SessionRuntime::new(
+        harness,
+        myco::ActiveSession::new(myco::Session::new("test")),
+    )
+}

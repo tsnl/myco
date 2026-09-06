@@ -44,7 +44,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check standalone library features
-        run: cargo check --locked -p myco-model --lib
+        run: |
+          cargo check --locked -p myco-model --lib
+          cargo check --locked -p myco-agent --lib
       - name: cargo test (offline)
         # Full suite, no live provider calls. Live Anthropic/xAI tests are
         # #[ignore] — run locally with: cargo test -- --ignored

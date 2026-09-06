@@ -1,4 +1,4 @@
-pub mod agent;
+pub use myco_agent as agent;
 pub mod chat;
 pub mod config;
 pub mod core;
@@ -11,6 +11,7 @@ pub mod prelude;
 pub mod prompts;
 pub mod session;
 pub mod session_browser;
+pub mod session_runtime;
 pub mod tool_services;
 pub mod tui;
 
@@ -18,8 +19,7 @@ pub mod tui;
 pub(crate) mod test_support;
 
 pub use agent::{
-    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, SessionRuntime,
-    TraceContext,
+    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, ToolExecutor, TraceContext,
 };
 pub use chat::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
@@ -35,6 +35,7 @@ pub use session::{
     ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
     SessionLink, SessionListEntry, Thread, compact_thread, select_tail,
 };
+pub use session_runtime::SessionRuntime;
 pub use tool_services::{
     HostDispatchContext, ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool,
     ToolService,

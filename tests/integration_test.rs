@@ -28,7 +28,11 @@ async fn test_agent_tool_use() {
     })
     .expect("create anthropic model");
 
-    let mut agent = Agent::new(model, harness, Arc::new(myco::NullEventSink));
+    let mut agent = Agent::new(
+        model,
+        crate::test_utils::tool_runtime(harness),
+        Arc::new(myco::NullEventSink),
+    );
 
     let user_prompts_and_answers = [
         ("How many Rs are there in 'strawberry'?", "3"),

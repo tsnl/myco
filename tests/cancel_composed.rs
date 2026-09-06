@@ -35,7 +35,11 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
         turn_end_reason: TurnEndReason::ToolUse,
         usage: None,
     }]);
-    let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+    let mut agent = Agent::new(
+        model,
+        crate::test_utils::tool_runtime(harness),
+        Arc::new(NullEventSink),
+    );
 
     let cancel = CancelToken::new();
     let cancel_bg = cancel.clone();

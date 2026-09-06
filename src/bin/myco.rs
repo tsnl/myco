@@ -271,6 +271,7 @@ async fn run_print(args: Args) {
         // Bound, not dropped: the guard must outlive the turn.
         session_lock: _session_lock,
         mut agent,
+        runtime,
         catalog_model,
         ..
     } = boot;
@@ -307,7 +308,7 @@ async fn run_print(args: Args) {
 
     let outcome = run_session_turn(
         &mut agent,
-        &active_session,
+        &runtime,
         content,
         args.fork,
         cancel,
@@ -543,6 +544,7 @@ struct Boot {
     session_lock: Option<SessionWriteLock>,
     harness: Arc<Harness>,
     agent: Agent,
+    runtime: Arc<myco::SessionRuntime>,
 }
 
 /// Shared startup for `-p/--print` and the interactive REPL. The one genuinely
@@ -601,12 +603,12 @@ async fn boot<S: EventSink + 'static>(
         args.debug_dump_api_requests,
         args.effort,
     );
-    let mut agent = Agent::new(model, harness.clone(), sink.clone());
+    let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
+    let mut agent = Agent::new(model, runtime.clone(), sink.clone());
     agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
-    let restored = session.snapshot();
-    agent.bind_thread(&restored.id, restored.active_thread());
+    runtime.bind_agent(&mut agent);
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
     wire_checkpoint(&mut agent, &session, session_warning);
@@ -620,6 +622,7 @@ async fn boot<S: EventSink + 'static>(
             session_lock,
             harness,
             agent,
+            runtime,
         },
         sink,
     )
@@ -655,6 +658,7 @@ async fn run_interactive(args: Args) {
         session_lock,
         harness,
         agent,
+        runtime,
     } = boot;
     let wrap = effective_wrap_width(app_config.wrap_max);
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -682,6 +686,7 @@ async fn run_interactive(args: Args) {
     // (not stored).
     let mut repl = ReplSession {
         agent,
+        runtime,
         session: active_session,
         editor,
         harness,
@@ -837,6 +842,7 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 /// model and UI handles, and the REPL-scoped knobs.
 struct ReplSession {
     agent: Agent,
+    runtime: Arc<myco::SessionRuntime>,
     session: ActiveSession,
     editor: Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
@@ -891,7 +897,7 @@ impl ReplSession {
                 None if self.agent.history().is_empty() => Some(0),
                 None => None,
             };
-            let running = self.agent.runtime().running_tool_summaries();
+            let running = self.runtime.running_tool_summaries();
             self.ui.user_header(used, max, usage, &running);
             // No "> " prefix; body is typed on the line after the USER header.
             // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
@@ -1064,7 +1070,7 @@ impl ReplSession {
 
         let outcome = run_session_turn(
             &mut self.agent,
-            &self.session,
+            &self.runtime,
             content,
             std::mem::take(&mut self.forked),
             cancel,
@@ -1163,8 +1169,7 @@ impl ReplSession {
             self.ui.error_section(&format!("compact: {error}"));
             return false;
         }
-        let updated = self.session.snapshot();
-        self.agent.bind_thread(&updated.id, updated.active_thread());
+        self.runtime.bind_agent(&mut self.agent);
         wire_checkpoint(&mut self.agent, &self.session, session_warning);
 
         clear_screen();
@@ -1435,7 +1440,10 @@ impl ReplSession {
     /// agent history/usage, and reload readline history.
     fn install_session(&mut self, loaded: &Session) {
         self.session.replace(loaded.clone());
-        self.agent.bind_thread(&loaded.id, loaded.active_thread());
+        if self.runtime.session_id() != loaded.id {
+            self.runtime = myco::SessionRuntime::new(self.harness.clone(), self.session.clone());
+        }
+        self.runtime.bind_agent(&mut self.agent);
         wire_checkpoint(&mut self.agent, &self.session, session_warning);
         load_readline_history(&mut self.editor, &self.session);
     }

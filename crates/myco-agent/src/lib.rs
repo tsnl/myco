@@ -1,31 +1,26 @@
-//! The agent runtime: model context driven to completion against a model and a
-//! harness, plus the live [`AgentEvent`] stream a front-end renders.
-//!
-//! It depends on the model drivers and harness; neither depends on it.
-//! [`TraceContext`] attributes events to an agent and its current thread.
-//! [`SessionRuntime`] owns host resources across agent and thread changes.
-//!
-//! History well-formedness is the invariant everything else rests on: whatever
-//! a run does — end cleanly, hit a provider error, get cancelled mid-tool, or
-//! get truncated mid-tool-call by `max_tokens` — the transcript it leaves behind
-//! must be a prefix the provider will accept on the next request. See
-//! [`Agent::run`].
+//! Drive model context through generation and tool calls at replayable boundaries.
+//! Callers supply tool execution, event sinks, context, and persistence callbacks.
 
 use std::sync::Arc;
 
-mod generation;
-mod session_runtime;
-pub use session_runtime::SessionRuntime;
-
 use futures::future;
-
-use crate::core::CancelToken;
-use crate::generative_model::{
-    self, Content, GenerateError, GenerationFailure, GenerativeModel, Message, Recovery,
-    RetryPolicy, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
+use myco_model::{
+    self as generative_model, Content, GenerateError, GenerationFailure, GenerativeModel, Message,
+    Recovery, RetryPolicy, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
 };
-use crate::harness::Harness;
 use uuid::Uuid;
+
+mod generation;
+
+pub use tokio_util::sync::CancellationToken as CancelToken;
+pub type Async<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+pub const DEFAULT_MAX_TRUNCATED_RESUMES: u32 = 3;
+
+/// Capabilities available to this execution. Ownership and routing belong to the caller.
+pub trait ToolExecutor: Send + Sync {
+    fn tool_specs(&self) -> Vec<generative_model::ToolSpec>;
+    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult>;
+}
 
 //
 // Event sink — live observability for agent / tool activity
@@ -136,7 +131,7 @@ const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not r
 pub struct Agent {
     retry_policy: RetryPolicy,
     model: Arc<dyn GenerativeModel>,
-    runtime: Arc<SessionRuntime>,
+    tools: Arc<dyn ToolExecutor>,
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     history: Vec<Message>,
@@ -154,66 +149,43 @@ pub struct Agent {
 impl Agent {
     pub fn new(
         model: Arc<dyn GenerativeModel>,
-        harness: Arc<Harness>,
+        tools: Arc<dyn ToolExecutor>,
         sink: Arc<dyn EventSink>,
     ) -> Self {
-        Self::with_context(model, harness, sink, TraceContext::root())
+        Self::with_context(model, tools, sink, TraceContext::root())
     }
 
     pub fn with_context(
         model: Arc<dyn GenerativeModel>,
-        harness: Arc<Harness>,
-        sink: Arc<dyn EventSink>,
-        context: TraceContext,
-    ) -> Self {
-        let runtime = SessionRuntime::with_owner(harness, context.agent_id);
-        Self::build(model, runtime, sink, context)
-    }
-
-    pub fn with_runtime(
-        model: Arc<dyn GenerativeModel>,
-        runtime: Arc<SessionRuntime>,
-        sink: Arc<dyn EventSink>,
-    ) -> Self {
-        Self::build(model, runtime, sink, TraceContext::root())
-    }
-
-    fn build(
-        model: Arc<dyn GenerativeModel>,
-        runtime: Arc<SessionRuntime>,
+        tools: Arc<dyn ToolExecutor>,
         sink: Arc<dyn EventSink>,
         context: TraceContext,
     ) -> Self {
         Self {
             retry_policy: RetryPolicy::default(),
             model,
-            runtime,
+            tools,
             sink,
             context,
             history: Vec::new(),
             last_usage: None,
             context_window_tokens: 200_000,
-            max_truncated_resumes: crate::config::DEFAULT_MAX_TRUNCATED_RESUMES,
+            max_truncated_resumes: DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
         }
     }
 
-    pub fn runtime(&self) -> &Arc<SessionRuntime> {
-        &self.runtime
+    pub fn set_tools(&mut self, tools: Arc<dyn ToolExecutor>) {
+        self.tools = tools;
     }
 
-    /// Bind one thread while idle. A different session gets a new tool owner.
-    pub fn bind_thread(&mut self, session_id: &str, thread: &crate::session::Thread) {
-        self.runtime = self.runtime.for_session(session_id);
-        self.context.session_id = Some(session_id.to_string());
-        self.context.thread_id = Some(thread.id.clone());
-        self.replace_context(thread.messages.clone(), thread.last_usage);
-        self.checkpoint = None;
+    pub fn set_context(&mut self, context: TraceContext) {
+        self.context = context;
     }
 
     /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
-    pub fn set_checkpoint(&mut self, checkpoint: HistoryCheckpoint) {
-        self.checkpoint = Some(checkpoint);
+    pub fn set_checkpoint(&mut self, checkpoint: Option<HistoryCheckpoint>) {
+        self.checkpoint = checkpoint;
     }
 
     fn emit_checkpoint(&self) {
@@ -247,14 +219,14 @@ impl Agent {
         self.emit_checkpoint();
     }
 
-    pub(crate) fn truncate_history(&mut self, index: usize) -> Vec<Message> {
+    pub fn truncate_history(&mut self, index: usize) -> Vec<Message> {
         let dropped = self.history.split_off(index);
         self.last_usage = None;
         self.emit_checkpoint();
         dropped
     }
 
-    /// Set the context window used for the USER `N/M` token header.
+    /// Set the model context budget available to callers.
     pub fn set_context_window_tokens(&mut self, tokens: u64) {
         self.context_window_tokens = tokens.max(1);
     }
@@ -279,7 +251,7 @@ impl Agent {
     }
 
     /// Drive the existing model context to completion. The caller supplies input separately.
-    /// The session runtime owns live tools across runs and agent replacements.
+    /// The supplied tool executor determines the lifetime of live resources.
     pub async fn run(
         &mut self,
         cancel: CancelToken,
@@ -397,11 +369,7 @@ impl Agent {
             context: self.context.clone(),
         });
 
-        let work = self.runtime.harness.clone().dispatch_tool_use(
-            tool_use,
-            self.runtime.owner_id,
-            cancel.clone(),
-        );
+        let work = self.tools.clone().dispatch(tool_use, cancel.clone());
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it
@@ -451,17 +419,19 @@ impl AgentInteractionError {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Async;
-    use crate::generative_model::{
-        ContentDelta, GenerateError, GenerateOutput, GenerationEvent, MessagePart, ToolSpec,
-    };
     use crate::test_support::{
         ScriptedModel, assistant, assistant_tool, result_text, tool_results, user,
     };
-    use crate::tool_services::{HostDispatchContext, ToolService};
+    use crate::test_support::{TestTools, interact};
     use futures::stream;
+    use myco_model::{
+        ContentDelta, GenerateError, GenerateOutput, GenerationEvent, MessagePart, ToolSpec,
+    };
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -485,7 +455,7 @@ mod tests {
         }])
         .then_fail(GenerateError::ExecutionError("unavailable".into()));
         let events = Arc::new(EventLog::default());
-        let mut agent = Agent::new(model, Harness::local_with_services(vec![]), events.clone());
+        let mut agent = Agent::new(model, TestTools::new(vec![]), events.clone());
         let cancelled = CancelToken::new();
         cancelled.cancel();
         for (cancel, succeeds) in [
@@ -493,7 +463,7 @@ mod tests {
             (CancelToken::new(), false),
             (cancelled, false),
         ] {
-            let result = crate::chat::interact(&mut agent, vec![], cancel).await;
+            let result = interact(&mut agent, vec![], cancel).await;
             assert_eq!(result.is_ok(), succeeds);
             let mut emitted = events.0.lock().unwrap();
             assert!(matches!(
@@ -519,7 +489,7 @@ mod tests {
         ends: Arc<Mutex<Vec<(String, Instant)>>>,
     }
 
-    impl ToolService for SlowService {
+    impl ToolExecutor for SlowService {
         fn tool_specs(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: self.name.clone(),
@@ -532,11 +502,7 @@ mod tests {
             }]
         }
 
-        fn dispatch_tool_use(
-            self: Arc<Self>,
-            tool_use: ToolUse,
-            _ctx: HostDispatchContext,
-        ) -> Async<ToolResult> {
+        fn dispatch(self: Arc<Self>, tool_use: ToolUse, _cancel: CancelToken) -> Async<ToolResult> {
             Box::pin(async move {
                 let started = Instant::now();
                 self.starts
@@ -561,7 +527,7 @@ mod tests {
         // Long enough that serial execution is unambiguous even under CI load.
         let delay = Duration::from_millis(300);
 
-        // Two distinct tool names so the harness router can host both (same service type).
+        // Two distinct tool names so the test executor can route both (same service type).
         let slow_a = Arc::new(SlowService {
             name: "slow_a".into(),
             delay,
@@ -575,9 +541,9 @@ mod tests {
             ends: ends.clone(),
         });
 
-        let harness = Harness::local_with_services(vec![
-            slow_a as Arc<dyn ToolService>,
-            slow_b as Arc<dyn ToolService>,
+        let tools = TestTools::new(vec![
+            slow_a as Arc<dyn ToolExecutor>,
+            slow_b as Arc<dyn ToolExecutor>,
         ]);
 
         let model = ScriptedModel::new(vec![
@@ -606,14 +572,14 @@ mod tests {
             },
         ]);
 
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
         let wall_start = Instant::now();
-        let reply = crate::chat::interact(
+        let reply = interact(
             &mut agent,
             vec![Content::Text {
                 text: "run both".into(),
             }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("interact");
@@ -673,7 +639,7 @@ mod tests {
             starts: Arc::new(Mutex::new(Vec::new())),
             ends: Arc::new(Mutex::new(Vec::new())),
         });
-        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let tools = TestTools::new(vec![slow as Arc<dyn ToolExecutor>]);
         let model = ScriptedModel::new(vec![
             GenerateOutput {
                 content: vec![],
@@ -693,17 +659,17 @@ mod tests {
                 usage: None,
             },
         ]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
         let snapshots: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
         let record = snapshots.clone();
-        agent.set_checkpoint(Box::new(move |history, _usage| {
+        agent.set_checkpoint(Some(Box::new(move |history, _usage| {
             record.lock().unwrap().push(history.to_vec());
-        }));
+        })));
 
-        crate::chat::interact(
+        interact(
             &mut agent,
             vec![Content::Text { text: "run".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("interact");
@@ -725,7 +691,7 @@ mod tests {
             starts: Arc::new(Mutex::new(Vec::new())),
             ends: Arc::new(Mutex::new(Vec::new())),
         });
-        let harness = Harness::local_with_services(vec![tool as Arc<dyn ToolService>]);
+        let tools = TestTools::new(vec![tool as Arc<dyn ToolExecutor>]);
 
         let model = ScriptedModel::new(vec![
             GenerateOutput {
@@ -755,11 +721,11 @@ mod tests {
             },
         ]);
 
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        interact(
             &mut agent,
             vec![Content::Text { text: "go".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("interact");
@@ -779,7 +745,7 @@ mod tests {
     }
 
     impl GenerativeModel for SlowStreamModel {
-        fn generate(&self, _input: &[Message]) -> crate::core::AsyncStream<GenerationEvent> {
+        fn generate(&self, _input: &[Message]) -> myco_model::AsyncStream<GenerationEvent> {
             let delay = self.delay;
             let chunks = self.chunks;
             // State machine: 0 = MessageStart, 1 = ContentStart, 2..chunks+1 = delayed
@@ -812,13 +778,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_during_generate_returns_cancelled() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = Arc::new(SlowStreamModel {
             delay: Duration::from_millis(200),
             chunks: 20,
         });
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let cancel = crate::core::CancelToken::new();
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let cancel = crate::CancelToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -826,7 +792,7 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        let err = crate::chat::interact(
+        let err = interact(
             &mut agent,
             vec![Content::Text { text: "go".into() }],
             cancel,
@@ -859,7 +825,7 @@ mod tests {
             starts: starts.clone(),
             ends: ends.clone(),
         });
-        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let tools = TestTools::new(vec![slow as Arc<dyn ToolExecutor>]);
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![],
             tool_uses: vec![ToolUse {
@@ -870,8 +836,8 @@ mod tests {
             usage: None,
         }]);
         // No EndTurn scripted — cancel during tools must stop without another generate.
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let cancel = crate::core::CancelToken::new();
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let cancel = crate::CancelToken::new();
         let cancel2 = cancel.clone();
         let starts_bg = starts.clone();
         tokio::spawn(async move {
@@ -890,7 +856,7 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        let err = crate::chat::interact(
+        let err = interact(
             &mut agent,
             vec![Content::Text { text: "run".into() }],
             cancel,
@@ -928,7 +894,7 @@ mod tests {
             starts: Arc::new(Mutex::new(Vec::new())),
             ends: Arc::new(Mutex::new(Vec::new())),
         });
-        let harness = Harness::local_with_services(vec![slow as Arc<dyn ToolService>]);
+        let tools = TestTools::new(vec![slow as Arc<dyn ToolExecutor>]);
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![],
             tool_uses: vec![ToolUse {
@@ -941,13 +907,13 @@ mod tests {
         .then_fail(GenerateError::ExecutionError(
             "provider 500 after tools".into(),
         ));
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let err = interact(
             &mut agent,
             vec![Content::Text {
                 text: "run tool then fail".into(),
             }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect_err("second generate should fail");
@@ -983,15 +949,15 @@ mod tests {
 
     #[tokio::test]
     async fn generate_error_before_assistant_keeps_only_user() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError(
             "boom on first generate".into(),
         ));
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let err = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect_err("generate should fail");
@@ -1004,18 +970,18 @@ mod tests {
     /// generate forever on unchanged history or push empty ToolResults.
     #[tokio::test]
     async fn tool_use_stop_with_zero_tool_uses_errors_not_loops() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text { text: "hmm".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::ToolUse,
             usage: None,
         }]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let err = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect_err("malformed turn should error");
@@ -1028,26 +994,18 @@ mod tests {
         ));
     }
 
-    /// `max_tokens` can cut a turn off mid-tool-call: the stop reason is not
-    /// `tool_use`, but the tool_use block is still in the assistant message
-    /// (typically with `input: {}` — the arguments never streamed). Tool calls
-    /// are answered on their presence, not on the stop reason, because providers
-    /// reject any later request carrying a tool_use with no matching tool_result:
-    /// leaving it unanswered fails the very next user message, and every one
-    /// after it. Here the truncated call reaches the real bash tool, which
-    /// rejects the empty input — an error result, but a well-formed turn, which
-    /// the agent then resumes from without waiting for a new user message.
+    /// A truncated call still needs a result before generation can continue,
+    /// including when the executor rejects it.
     #[tokio::test]
     async fn max_tokens_mid_tool_call_answers_the_dangling_tool_use_and_resumes() {
-        // The standard local services include the real bash tool.
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![
             GenerateOutput {
                 content: vec![Content::Text {
                     text: "let me check".into(),
                 }],
                 tool_uses: vec![ToolUse {
-                    name: "bash".into(),
+                    name: "unavailable".into(),
                     input: serde_json::json!({}),
                 }],
                 turn_end_reason: TurnEndReason::MaxTokens,
@@ -1060,11 +1018,11 @@ mod tests {
                 usage: None,
             },
         ]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let reply = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let reply = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("turn should resume through the truncation, not error");
@@ -1081,7 +1039,7 @@ mod tests {
                 assert_eq!(tool_use_results.len(), 1);
                 assert!(tool_use_results[0].is_error);
                 let text = result_text(&tool_use_results[0]);
-                assert!(text.contains("empty bash input"), "text={text}");
+                assert!(text.contains("unknown tool 'unavailable'"), "text={text}");
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
@@ -1093,7 +1051,7 @@ mod tests {
     /// accepts — so a truncated sentence finishes instead of dead-ending.
     #[tokio::test]
     async fn max_tokens_without_tool_calls_resumes_with_a_continue_turn() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![
             GenerateOutput {
                 content: vec![Content::Text {
@@ -1112,11 +1070,11 @@ mod tests {
                 usage: None,
             },
         ]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let reply = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let reply = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("turn should resume through the truncation");
@@ -1140,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn consecutive_max_tokens_resumes_are_bounded() {
         const CAP: u32 = 2;
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let truncated_with_tool_call = || GenerateOutput {
             content: vec![Content::Text {
                 text: "still going".into(),
@@ -1156,12 +1114,12 @@ mod tests {
         // loop stopped on the cap rather than on an exhausted script list.
         let scripts = (0..CAP + 2).map(|_| truncated_with_tool_call()).collect();
         let model = ScriptedModel::new(scripts);
-        let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+        let mut agent = Agent::new(model.clone(), tools, Arc::new(NullEventSink));
         agent.set_max_truncated_resumes(CAP);
-        crate::chat::interact(
+        interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("turn should hand back once the cap is hit, not error");
@@ -1174,7 +1132,7 @@ mod tests {
     /// partial answer, exactly as it did before resuming existed.
     #[tokio::test]
     async fn zero_max_truncated_resumes_hands_back_the_partial_answer() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![
             GenerateOutput {
                 content: vec![Content::Text {
@@ -1193,12 +1151,12 @@ mod tests {
                 usage: None,
             },
         ]);
-        let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+        let mut agent = Agent::new(model.clone(), tools, Arc::new(NullEventSink));
         agent.set_max_truncated_resumes(0);
-        let reply = crate::chat::interact(
+        let reply = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("turn should hand back the partial answer");
@@ -1212,18 +1170,18 @@ mod tests {
     /// A turn that ends cleanly with no tool calls gains no ToolResults message.
     #[tokio::test]
     async fn plain_end_turn_pushes_no_tool_results() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text { text: "hi".into() }],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
             usage: None,
         }]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("turn should succeed");
@@ -1236,16 +1194,16 @@ mod tests {
     /// `rewind_drops_the_whole_turn_and_keeps_earlier_ones`.)
     #[tokio::test]
     async fn oversized_request_reports_omit_last_message() {
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![])
             .then_fail(GenerateError::RequestTooLargeError("42 MiB".into()));
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
-        let err = crate::chat::interact(
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        let err = interact(
             &mut agent,
             vec![Content::Image {
                 source: "data:image/png;base64,AAAA".into(),
             }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect_err("oversized request should fail");
@@ -1264,10 +1222,10 @@ mod tests {
     /// user message too — the remaining prefix must end where the *previous*
     /// turn ended, or the next request is malformed.
     #[tokio::test]
-    async fn rewind_drops_the_whole_turn_and_keeps_earlier_ones() {
-        let harness = Harness::local_with_services(vec![]);
+    async fn truncating_context_drops_the_whole_turn_and_keeps_earlier_ones() {
+        let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![]);
-        let mut agent = Agent::new(model, harness, Arc::new(NullEventSink));
+        let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
         agent.replace_context(
             vec![
                 user("first"),
@@ -1279,8 +1237,10 @@ mod tests {
             None,
         );
 
-        let dropped = crate::chat::rewind_last_user_turn(&mut agent).expect("user turn to rewind");
-        assert!(matches!(&dropped[0], Content::Text { text } if text == "second"));
+        let dropped = agent.truncate_history(2);
+        assert!(
+            matches!(&dropped[0], Message::UserMessage { content } if matches!(&content[0], Content::Text { text } if text == "second"))
+        );
 
         let history = agent.history();
         assert_eq!(history.len(), 2);
@@ -1302,7 +1262,7 @@ mod tests {
         ];
 
         // "Resume": new agent, same well-formed history, model only needs EndTurn.
-        let harness = Harness::local_with_services(vec![]);
+        let tools = TestTools::new(vec![]);
         let resume_model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![Content::Text {
                 text: "recovered".into(),
@@ -1311,19 +1271,19 @@ mod tests {
             turn_end_reason: TurnEndReason::EndTurn,
             usage: None,
         }]);
-        let mut resumed = Agent::new(resume_model, harness, Arc::new(NullEventSink));
+        let mut resumed = Agent::new(resume_model, tools, Arc::new(NullEventSink));
         resumed.replace_context(snapshot, None);
 
         // Continue by interacting with a follow-up user message (CLI would re-prompt);
         // history already has tool_results so a fresh user turn is the normal path.
         // Also verify the restored context is well-formed for provider requests by
         // checking the model can complete a new turn on top.
-        let reply = crate::chat::interact(
+        let reply = interact(
             &mut resumed,
             vec![Content::Text {
                 text: "continue".into(),
             }],
-            crate::core::CancelToken::new(),
+            crate::CancelToken::new(),
         )
         .await
         .expect("resume interact");

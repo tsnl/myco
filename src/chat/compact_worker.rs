@@ -102,7 +102,10 @@ pub async fn run_compact_worker(
     let sink = Arc::new(NullEventSink);
     let mut worker = Agent::with_context(
         model,
-        harness.clone(),
+        crate::SessionRuntime::new(
+            harness.clone(),
+            crate::session::ActiveSession::new(worker_session.clone()),
+        ),
         sink,
         TraceContext {
             agent_id: worker_id,

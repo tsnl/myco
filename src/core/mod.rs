@@ -1,12 +1,9 @@
-use std::future::Future;
-use std::pin::Pin;
-
 mod fs;
 pub mod image;
 
 pub use fs::{atomically_write, myco_home};
 
-pub type Async<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+pub use myco_agent::Async;
 pub use myco_model::AsyncStream;
 
 /// Cooperative cancellation signal for in-flight agent turns.
@@ -17,7 +14,7 @@ pub use myco_model::AsyncStream;
 /// because Ctrl-C raced ahead of the waiter. Nested work (tools, subagents)
 /// shares one token so a single cancel aborts the whole turn;
 /// [`CancelToken::child_token`] scopes cancellation to one branch of that work.
-pub use tokio_util::sync::CancellationToken as CancelToken;
+pub use myco_agent::CancelToken;
 
 pub use futures::StreamExt;
 

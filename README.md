@@ -77,6 +77,7 @@ bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre
 
 ## Workspace
 
-`myco-model` provides backend drivers and message types. The `myco` package
-assembles the application and CLI. Workspace packages share a version and lockfile.
+`myco-model` provides backend drivers and message types. `myco-agent` drives
+headless execution using supplied tools and event sinks. The `myco` package
+assembles sessions, host tools, and the CLI. Workspace packages share a version and lockfile.
 Run `cargo test --locked --workspace` to test all packages.
