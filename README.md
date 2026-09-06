@@ -69,6 +69,8 @@ non-interactive SSH. Runtime details: `myco --help overview`.
 
 ## Develop
 
+New to the codebase? Start with the [guided tour](TOUR.md).
+
 ```bash
 cargo test --locked --lib
 cargo run --locked --bin myco
