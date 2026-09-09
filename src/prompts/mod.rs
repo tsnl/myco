@@ -34,9 +34,10 @@ exported them to. Read and search them with the tools you already have (`rg`, th
 
 Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
-  local is always on. `~/.myco/config.toml` (or `$MYCO_CONFIG`) holds knobs only
+  local is always on. The profile's `config.toml` (or `$MYCO_CONFIG`) holds knobs
   (`attach_timeout_secs`, `max_prelude_bytes`).
-- Sessions: `~/.myco/session/{shard}/{id}.json` — use `session_meta`, not raw file edits.
+- Sessions: `session/{shard}/{id}.json` under the profile root in the newest `# Session`
+  block — use `session_meta`, not raw file edits.
 - Host tools take optional `host`; omitted → **`local`** (in-process). Remotes are lazy on first use.
 - **To act on a remote machine, set `host` on the tool call — do not run `ssh <alias> …` from
   local `bash`.** A host worker keeps one persistent SSH connection, so each call skips connection
@@ -133,11 +134,19 @@ const SESSION_STAMP_HEADING: &str = "# Session";
 /// being a start rather than a clock: a session open for days would otherwise
 /// carry a confidently wrong "now" in its prompt, and `date` is always right.
 pub fn session_stamp(session_id: &str, started_at: DateTime<Utc>) -> String {
-    stamp_with(
+    let mut stamp = stamp_with(
         session_id,
         started_at,
         std::env::current_dir().ok().as_deref(),
-    )
+    );
+    if let Ok(root) = crate::core::myco_home() {
+        stamp.push_str(&format!(
+            "- Profile root: `{}`. Local nested agents inherit `MYCO_PROFILE` and \
+             `MYCO_HOME`; preserve them so children share this session store.\n",
+            root.display()
+        ));
+    }
+    stamp
 }
 
 /// [`session_stamp`] against an explicit launch directory, so tests need no
@@ -354,7 +363,7 @@ fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBu
         .and_then(|ws| rendered_prelude(&ws.join("prelude")));
     if let Some(prelude) = prelude {
         prompt.push_str(&format!(
-            "\n---\n\n# Prelude\n\n(entries under `~/.myco/workspace/prelude/`, a snapshot from when \
+            "\n---\n\n# Prelude\n\n(entries under the profile's `workspace/prelude/`, a snapshot from when \
              this agent's model was built — edit with the `prelude` tool; action=list shows the \
              live state)\n\n{prelude}\n"
         ));
@@ -435,9 +444,10 @@ fn workspace_listing(workspace: &Path) -> Option<String> {
     }
 
     Some(format!(
-        "\n---\n\n# Workspace Files\n\nUnder `~/.myco/workspace/` — path, UTC day \
+        "\n---\n\n# Workspace Files\n\nUnder `{}` — path, UTC day \
          last changed, title. A listing, not the contents: read the files that \
-         touch your task.\n\n{body}"
+         touch your task.\n\n{body}",
+        workspace.display()
     ))
 }
 
@@ -592,7 +602,7 @@ mod tests {
             // Free-form workspace policy: maildir-style prelude entries, the
             // record/curate habit, and the consistency caution.
             "Workspace & prelude",
-            "~/.myco/workspace/prelude/",
+            "workspace/prelude/",
             "write-once",
             "weakly consistent",
         ] {

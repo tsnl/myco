@@ -48,7 +48,7 @@ git diff | myco -p "review this"  # piped stdin becomes context for the prompt
 saved like any other (`session=<id>` on stderr) — continue it with
 `--resume <id>`. Bare `-p` takes the prompt from piped stdin.
 
-Configure your models first: myco ships none built in. `~/.myco/config.toml`
+Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
 Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
 pass to `--model`). The `auth` value is the token itself or a source such as
@@ -56,7 +56,7 @@ pass to `--model`). The `auth` value is the token itself or a source such as
 at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
 `myco --help overview` once installed. Set a default model with
-`model = "<id>"` in `~/.myco/config.toml` (`--model` wins). Transcript
+`model = "<id>"` in `~/.myco/profiles/default/config.toml` (`--model` wins). Transcript
 sections are colored when stdout is a TTY (`--color auto|always|never`;
 `NO_COLOR` / `CLICOLOR_FORCE` honored), and prose is word-wrapped with light
 markdown styling (`--wrap auto|off|COLS` caps the width at min(cap, terminal

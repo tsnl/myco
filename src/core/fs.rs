@@ -8,22 +8,34 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// myco's data root: `$MYCO_HOME` when set to a non-empty value, else
-/// `~/.myco`. Sessions, the prelude, the exported manual and the config all hang
-/// off this.
-///
-/// `$MYCO_HOME` is what tests point at a scratch directory, so nothing that
-/// resolves a myco path may hardcode `~/.myco` instead of calling this.
+/// The selected profile's data root: `$MYCO_HOME/profiles/$MYCO_PROFILE`.
+/// Defaults are `~/.myco` and `default`; all durable application data lives here.
 pub fn myco_home() -> Result<PathBuf, String> {
-    if let Ok(root) = std::env::var("MYCO_HOME") {
-        let p = PathBuf::from(root);
-        if !p.as_os_str().is_empty() {
-            return Ok(p);
-        }
+    myco_home_with(|key| std::env::var(key).ok())
+}
+
+pub fn validate_profile(name: &str) -> Result<String, String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(
+            "profile must contain only letters, digits, '-' or '_' and must not be empty".into(),
+        );
     }
-    dirs::home_dir()
-        .map(|h| h.join(".myco"))
-        .ok_or_else(|| "could not resolve home directory".into())
+    Ok(name.to_string())
+}
+
+pub(crate) fn myco_home_with(env: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    let profile = validate_profile(&env("MYCO_PROFILE").unwrap_or_else(|| "default".into()))?;
+    let root = match env("MYCO_HOME").filter(|s| !s.is_empty()) {
+        Some(root) => PathBuf::from(root),
+        None => dirs::home_dir()
+            .map(|h| h.join(".myco"))
+            .ok_or_else(|| "could not resolve home directory".to_string())?,
+    };
+    Ok(root.join("profiles").join(profile))
 }
 
 /// Publish `content` at `path` in one step: write a temporary sibling, fsync it,
@@ -48,6 +60,33 @@ pub fn atomically_write(path: &Path, content: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_roots_are_isolated_and_default_is_named() {
+        for profile in [None, Some("default"), Some("testing")] {
+            let path = myco_home_with(|key| match key {
+                "MYCO_HOME" => Some("/tmp/myco-profiles".into()),
+                "MYCO_PROFILE" => profile.map(str::to_string),
+                _ => None,
+            })
+            .unwrap();
+            assert_eq!(
+                path,
+                Path::new("/tmp/myco-profiles/profiles").join(profile.unwrap_or("default"))
+            );
+        }
+        for name in [
+            "",
+            "..",
+            "../other",
+            "/tmp/escape",
+            "a/b",
+            "a\\b",
+            "two words",
+        ] {
+            assert!(validate_profile(name).is_err(), "{name}");
+        }
+    }
 
     /// Replacing an existing file leaves no window where a reader sees neither
     /// version, and no leftover temporary sibling in the directory.

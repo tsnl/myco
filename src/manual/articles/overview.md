@@ -71,16 +71,33 @@ remain metadata; separate saved sessions are not automatically combined.
 
 ## Config & paths
 
+Select a profile with `myco --profile NAME`, or set `MYCO_PROFILE`; the default
+name is `default`. Each profile has its own config, sessions, workspace/prelude,
+and exported manual under `~/.myco/profiles/NAME/`. `MYCO_HOME` changes the parent
+installation directory, so test runs can use `MYCO_HOME=/tmp/myco-test`.
+Profile names contain letters, digits, hyphens, or underscores.
+
+Local nested agents inherit the selected profile through `MYCO_PROFILE` and
+`MYCO_HOME`, including children launched from a different working directory.
+Preserve those variables when using `--parent-session` or `--fork`. The tmux
+session browser receives the same selectors. Remote hosts remain tool workers;
+the profile's config and credentials stay local.
+
+For an existing installation, stop myco and move its `config.toml`, `session/`,
+and `workspace/` into `~/.myco/profiles/default/` before restarting. Files are
+never moved automatically; missing profile config is reported at its new path.
+The manual is regenerated on startup. The paths below show the default profile.
+
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
-| `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
-| `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/prelude/` holds write-once prelude entries (edited via the root-only `prelude` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
+| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/profiles/default/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
+| `~/.myco/profiles/default/session/{shard}/{id}.history` | Readline history for that session. |
+| `~/.myco/profiles/default/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
+| `~/.myco/profiles/default/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/prelude/` holds write-once prelude entries (edited via the root-only `prelude` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
-Minimal config shape (`~/.myco/config.toml` — hosts are **not** listed here;
+Minimal config shape (`~/.myco/profiles/default/config.toml` — hosts are **not** listed here;
 top-level keys must come before the tables, per TOML):
 
 ```toml
@@ -109,7 +126,7 @@ context_window = 500_000
   reference, and a `thinking` mode the protocol does not support. Every config
   error names the file it came from.
 - A config path **you** name (`--config`, `$MYCO_CONFIG`) must exist — a typo
-  there is an error, not an empty catalog. The defaulted `~/.myco/config.toml`
+  there is an error, not an empty catalog. The defaulted `~/.myco/profiles/default/config.toml`
   may be absent (that is a first run).
 - Remote hosts come from `~/.ssh/config`: each concrete `Host` alias attaches as
   `ssh -o BatchMode=yes <alias> myco --mode host`. `Include` directives are
@@ -254,7 +271,7 @@ do not.
 
 All resolution happens in one startup step (`myco::config::Config`), which
 also loads the config file (`--config` → `$MYCO_CONFIG` →
-`~/.myco/config.toml`) and decides color output: sections are colored when
+`~/.myco/profiles/default/config.toml`) and decides color output: sections are colored when
 stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 `CLICOLOR_FORCE` / `TERM=dumb`.
 
@@ -322,12 +339,12 @@ current user request and finished tool rounds — never tool calls still in flig
 included; put anything newer in the first prompt line you write to it.
 
 The child's session is hidden (`kind: subagent`, parented to yours) in the shared
-`~/.myco/session/` store — read it later via `session_meta` get-by-id, or `list` with
+`~/.myco/profiles/default/session/` store — read it later via `session_meta` get-by-id, or `list` with
 `include_hidden: true`.
 
 ## Agent workspace
 
-`~/.myco/workspace/` is the agents' own directory — free-form files maintained with
+`~/.myco/profiles/default/workspace/` is the agents' own directory — free-form files maintained with
 the ordinary tools (no required format), persistent across sessions and shared by
 every agent on the machine. `workspace/prelude/` is the one special place: it holds
 the agent's prelude as maildir-style entries — one write-once `*.md` file each, never
