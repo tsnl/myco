@@ -61,7 +61,7 @@ pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 /// turn; without a ceiling an unattended run would resume forever, spending
 /// tokens to re-truncate. Three is enough to carry a turn that overruns once or
 /// twice without letting a misconfigured cap run all night.
-pub const DEFAULT_MAX_TRUNCATED_RESUMES: u32 = 3;
+pub use myco_agent::DEFAULT_MAX_TRUNCATED_RESUMES;
 
 /// Default per-image cap when a model entry sets no `max_image_base64_bytes`
 /// (matches the Anthropic API's 5 MB per-image cap; a clear local error beats

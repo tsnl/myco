@@ -1,10 +1,5 @@
-//! The `/compact` worker lifecycle: run a hidden agent that summarises a
-//! session, then hand back the successor it seeds.
-//!
-//! An agent run: it builds a model, drives one turn against the harness to get
-//! the summary written, then calls the session-side document logic
-//! ([`crate::session::compact_session`], [`crate::session::link_compact_pair`])
-//! to seed and link the successor.
+//! Run a hidden agent to summarize the active thread and build its successor.
+//! The caller holds the session writer and commits the completed thread.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,19 +8,12 @@ use crate::core::{CancelToken, uuid_simple_hex};
 use crate::generative_model::{self, CatalogModel, Content, GenerativeModelConfig};
 use crate::harness::Harness;
 use crate::prompts;
-use crate::session::{CompactOutcome, Session, SessionKind, compact_session, link_compact_pair};
+use crate::session::{CompactOutcome, Session, SessionKind, Thread, compact_thread};
 
-use super::{Agent, AgentInteractionError, NullEventSink, TraceContext};
+use crate::agent::{Agent, AgentInteractionError, NullEventSink, TraceContext};
 
-/// Read the summary this run wrote, where `before` is the file's content from
-/// before the worker started. Unchanged content is an error.
-///
-/// `{id}.summary.md` survives an earlier compaction of the same predecessor, so
-/// its presence alone is not proof this run wrote one: a worker that ends its
-/// turn without calling `write_summary` would otherwise get the previous
-/// compaction's text — describing a shorter conversation — folded into the
-/// successor with no error anywhere. The stale file stays on disk, because the
-/// successor built by that earlier compaction names it by path.
+/// A failed attempt can leave a summary behind. Require fresh contents so a
+/// worker that omits `write_summary` cannot silently reuse that stale context.
 fn read_fresh_summary(path: &Path, before: Option<&str>) -> Result<String, String> {
     let summary = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -61,17 +49,14 @@ pub enum CompactWorkerError {
     Failed(String),
 }
 
-/// The whole compact worker lifecycle against a saved `predecessor`: create
-/// the hidden worker session, run the worker agent (which writes the summary
-/// via `session_history`), read the summary back, then build and link the
-/// successor. Pure orchestration — the caller owns all UI (progress, error
-/// display) and installing the successor into the live REPL.
+/// Summarize the saved active thread. The caller owns cancellation, UI, and
+/// committing the successor while holding the session writer.
 pub async fn run_compact_worker(
     predecessor: &Session,
     catalog_model: &CatalogModel,
     harness: Arc<Harness>,
     cancel: CancelToken,
-) -> Result<(Session, CompactOutcome), CompactWorkerError> {
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
     let mut worker_session = Session::new_hidden(
@@ -117,22 +102,27 @@ pub async fn run_compact_worker(
     let sink = Arc::new(NullEventSink);
     let mut worker = Agent::with_context(
         model,
-        harness.clone(),
+        crate::SessionRuntime::new(
+            harness.clone(),
+            crate::session::ActiveSession::new(worker_session.clone()),
+        ),
         sink,
         TraceContext {
             agent_id: worker_id,
             depth: 1,
+            session_id: Some(worker_session.id.clone()),
+            thread_id: Some(worker_session.active_thread().id.clone()),
         },
     );
+    worker.set_retry_policy(catalog_model.backend.retry_policy());
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
 
-    let prompt = compact_subagent_prompt(&predecessor.id);
-    let result = worker
-        .interact(vec![Content::Text { text: prompt }], cancel)
-        .await;
+    let prompt = compact_subagent_prompt(&predecessor.id, &predecessor.active_thread().id);
+    let result =
+        crate::chat::interact(&mut worker, vec![Content::Text { text: prompt }], cancel).await;
 
-    worker_session.messages = worker.history().to_vec();
+    worker_session.active_thread_mut().messages = worker.history().to_vec();
     worker_session.touch();
     if let Err(e) = worker_session.save() {
         eprintln!("warning: could not save compact worker session: {e}");
@@ -147,22 +137,16 @@ pub async fn run_compact_worker(
     let summary = read_fresh_summary(&summary_path, summary_before.as_deref())
         .map_err(CompactWorkerError::Failed)?;
 
-    let (successor, outcome) = compact_session(predecessor, &summary, &catalog_model.spec.key)
-        .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor: {e}")))?;
-
-    let mut pred = predecessor.clone();
-    link_compact_pair(&mut pred, &successor)
-        .map_err(|e| CompactWorkerError::Failed(format!("failed to link sessions: {e}")))?;
-
-    Ok((successor, outcome))
+    compact_thread(predecessor, &summary)
+        .map_err(|e| CompactWorkerError::Failed(format!("failed to build successor thread: {e}")))
 }
 
 /// Prompt for a compact subagent.
-pub fn compact_subagent_prompt(predecessor_id: &str) -> String {
+pub fn compact_subagent_prompt(session_id: &str, thread_id: &str) -> String {
     format!(
-        r#"You are a compaction worker. Explore session `{predecessor_id}` with the `session_history` tool (stats, search, range, expand). Do NOT use bash to read session JSON.
+        r#"You are a compaction worker. Explore thread `{thread_id}` in session `{session_id}` with the `session_history` tool (stats, search, range, expand). Do NOT use bash to read session JSON.
 
-Write a concise markdown summary via `session_history` action `write_summary` for that same session_id. The summary MUST use these headings:
+Write a concise markdown summary via `session_history` action `write_summary` for that same session_id and thread_id. Include both IDs in every session_history call. The summary MUST use these headings:
 
 # Goal / active task
 # Decisions
@@ -199,11 +183,8 @@ mod tests {
         assert!(err.contains("without writing a new summary"), "{err}");
         assert!(err.contains("session unchanged"), "{err}");
 
-        // The old summary is left on disk — a successor from the earlier
-        // compaction still references it.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
 
-        // A worker that actually rewrote it is accepted.
         std::fs::write(&path, "# Fresh summary\n").unwrap();
         assert_eq!(
             read_fresh_summary(&path, Some(previous)).unwrap(),

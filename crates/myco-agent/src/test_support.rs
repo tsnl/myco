@@ -1,21 +1,18 @@
-#![allow(dead_code)]
-//! Shared fixtures and doubles for unit tests: a scripted [`GenerativeModel`],
-//! message/conversation builders, tool-result text extraction, RAII temp-dir
-//! and `MYCO_HOME` guards.
+//! Scripted generation streams and in-memory tool execution for agent tests.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use futures::stream;
-use serde_json::json;
 
-use crate::core::AsyncStream;
-use crate::generative_model::{
+use myco_model::AsyncStream;
+use myco_model::{
     Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerationEvent,
     GenerationFailure, GenerativeModel, Message, MessagePart, ToolResult, ToolUse, ToolUseDelta,
     ToolUseStart, TurnEndReason,
 };
+
+use crate::{Agent, AgentInteractionError, Async, CancelToken, ToolExecutor};
 
 // ---------------------------------------------------------------------------
 // ScriptedModel
@@ -153,34 +150,6 @@ pub(crate) fn tool_results(results: &[&str]) -> Message {
     }
 }
 
-/// A thinking block as session history stores it (plaintext, unsigned).
-pub(crate) fn thinking(text: &str) -> Content {
-    Content::Thinking {
-        text: text.into(),
-        signature: None,
-        redacted: false,
-    }
-}
-
-pub(crate) fn thinking_msg(parts: &[&str]) -> Message {
-    Message::AssistantMessage {
-        content: parts.iter().map(|t| thinking(t)).collect(),
-        tool_uses: vec![],
-        turn_end_reason: Some(TurnEndReason::EndTurn),
-    }
-}
-
-/// Canonical complete tool loop: user → assistant tool call → tool result →
-/// final assistant answer.
-pub(crate) fn tool_loop() -> Vec<Message> {
-    vec![
-        user("hello"),
-        assistant_tool(Some("hi there"), "bash", json!({"command": "echo hi"})),
-        tool_results(&["hi\n"]),
-        assistant("done"),
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // ToolResult text extraction
 // ---------------------------------------------------------------------------
@@ -200,71 +169,38 @@ pub(crate) fn result_text(result: &ToolResult) -> String {
     text_parts(result).join("\n")
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem / environment guards
-// ---------------------------------------------------------------------------
+pub(crate) async fn interact(
+    agent: &mut Agent,
+    input: Vec<Content>,
+    cancel: CancelToken,
+) -> Result<Vec<Content>, AgentInteractionError> {
+    agent.append_input(Message::UserMessage { content: input });
+    agent.run(cancel).await
+}
 
-/// Fresh directory under the system temp root, removed on drop.
-pub(crate) struct TempDir(PathBuf);
+pub(crate) struct TestTools(Vec<Arc<dyn ToolExecutor>>);
 
-impl TempDir {
-    pub(crate) fn path(&self) -> &Path {
-        &self.0
+impl TestTools {
+    pub(crate) fn new(tools: Vec<Arc<dyn ToolExecutor>>) -> Arc<Self> {
+        Arc::new(Self(tools))
     }
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+impl ToolExecutor for TestTools {
+    fn tool_specs(&self) -> Vec<myco_model::ToolSpec> {
+        self.0.iter().flat_map(|tool| tool.tool_specs()).collect()
     }
-}
 
-pub(crate) fn temp_dir(tag: &str) -> TempDir {
-    let dir = std::env::temp_dir().join(format!("myco-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    TempDir(dir)
-}
-
-/// Points `MYCO_HOME` at a fresh temp dir for the guard's lifetime, holding
-/// [`crate::session::lock_myco_home_for_test`] so mutating tests serialize.
-/// Cleanup is RAII so a panicking test cannot leak the override to the next.
-pub(crate) struct TempHome {
-    dir: PathBuf,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl TempHome {
-    pub(crate) fn path(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for TempHome {
-    fn drop(&mut self) {
-        // Runs before the lock guard field drops, so the env var is cleared
-        // while `MYCO_HOME` is still exclusively ours.
-        // SAFETY: test-only env override; held under the myco-home lock.
-        unsafe {
-            std::env::remove_var("MYCO_HOME");
+    fn dispatch(self: Arc<Self>, call: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+        match self
+            .0
+            .iter()
+            .find(|tool| tool.tool_specs().iter().any(|spec| spec.name == call.name))
+        {
+            Some(tool) => tool.clone().dispatch(call, cancel),
+            None => {
+                Box::pin(async move { ToolResult::err(format!("unknown tool '{}'", call.name)) })
+            }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-pub(crate) fn temp_home(tag: &str) -> TempHome {
-    let lock = crate::session::lock_myco_home_for_test();
-    let dir = std::env::temp_dir().join(format!("myco-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    // SAFETY: test-only env override; held under the myco-home lock.
-    unsafe {
-        std::env::set_var("MYCO_HOME", &dir);
-    }
-    TempHome { dir, _lock: lock }
-}
-
-pub(crate) fn tool_runtime(harness: Arc<crate::harness::Harness>) -> Arc<crate::SessionRuntime> {
-    crate::SessionRuntime::new(
-        harness,
-        crate::session::ActiveSession::new(crate::session::Session::new("test")),
-    )
 }

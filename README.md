@@ -69,8 +69,32 @@ non-interactive SSH. Runtime details: `myco --help overview`.
 
 ## Develop
 
+New to the codebase? Start with the [guided tour](TOUR.md).
+
 ```bash
 cargo test --locked --lib
 cargo run --locked --bin myco
 bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre-commit
 ```
+
+## Workspace
+
+`myco-model` provides backend drivers and message types. `myco-agent` drives
+headless execution using supplied tools and event sinks. The `myco` package
+assembles sessions, host tools, and the CLI. Workspace packages share a version and lockfile.
+Run `cargo test --locked --workspace` to test all packages.
+
+## Release
+
+The Publish workflow bumps the shared workspace version and exact internal
+dependency pins, verifies all three package archives, then publishes them in
+dependency order. Run it with `dry_run: true` to check a release without writing
+commits, tags, or registry versions. A real release requires successful CI on
+the selected `main` commit and pushes the version commit and tag without
+overriding branch protection.
+
+Registry publication is not atomic. If it stops after uploading some packages,
+keep the release commit and tag: inspect crates.io and publish only the missing
+packages from that tag with `cargo publish -p <package> --locked`, in order
+`myco-model`, `myco-agent`, `myco`. Finish the GitHub Release after all three
+exist. Never roll back a version that has reached the registry.

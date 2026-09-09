@@ -28,7 +28,11 @@ async fn test_agent_tool_use() {
     })
     .expect("create anthropic model");
 
-    let mut agent = Agent::new(model, harness, Arc::new(myco::NullEventSink));
+    let mut agent = Agent::new(
+        model,
+        crate::test_utils::tool_runtime(harness),
+        Arc::new(myco::NullEventSink),
+    );
 
     let user_prompts_and_answers = [
         ("How many Rs are there in 'strawberry'?", "3"),
@@ -39,8 +43,7 @@ async fn test_agent_tool_use() {
         let input = vec![Content::Text {
             text: prompt.to_string(),
         }];
-        let ret_content = agent
-            .interact(input, myco::CancelToken::new())
+        let ret_content = myco::chat::interact(&mut agent, input, myco::CancelToken::new())
             .await
             .unwrap();
         eprintln!("Tool result: {ret_content:#?}");

@@ -22,8 +22,6 @@
 
 use std::sync::Arc;
 
-use crate::core::*;
-
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
     OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
@@ -94,7 +92,7 @@ impl OpenAICompletionsGenerativeModel {
 }
 
 impl GenerativeModel for OpenAICompletionsGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let messages = match convert_messages(&self.system_prompt, input) {
             Ok(messages) => messages,
             Err(e) => return driver_core::error_stream(e),
@@ -104,7 +102,6 @@ impl GenerativeModel for OpenAICompletionsGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Chat Completions",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }
@@ -260,10 +257,9 @@ impl StreamAccumulator {
         chunk: ChatCompletionChunk,
     ) -> Result<Vec<MessagePart>, GenerateError> {
         if let Some(error) = chunk.error {
-            return Err(provider_stream_error(
-                format!("OpenAI Chat Completions stream error: {error}"),
-                Some(&error),
-            ));
+            return Err(GenerateError::ExecutionError(format!(
+                "OpenAI Chat Completions stream error: {error}"
+            )));
         }
 
         let mut out = Vec::new();
@@ -885,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_stream_error_payload_is_transient() {
+    fn stream_error_payload_is_an_execution_error() {
         let mut acc = StreamAccumulator::default();
         let err = acc
             .handle_chunk(chunk(serde_json::json!({
@@ -893,10 +889,10 @@ mod tests {
             })))
             .unwrap_err();
         match err {
-            GenerateError::TransientError(msg) => {
+            GenerateError::ExecutionError(msg) => {
                 assert!(msg.contains("upstream is down"), "{msg}")
             }
-            other => panic!("expected TransientError, got {other:?}"),
+            other => panic!("expected ExecutionError, got {other:?}"),
         }
     }
 

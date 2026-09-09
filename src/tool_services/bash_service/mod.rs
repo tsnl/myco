@@ -694,7 +694,7 @@ impl BashService {
             match sessions.get(session_id) {
                 Some(s) if s.owner != owner => {
                     return generative_model::ToolResult::err(format!(
-                        "session {session_id:?} is owned by another agent"
+                        "session {session_id:?} is owned by another myco session"
                     ));
                 }
                 Some(_) => {}
@@ -777,7 +777,9 @@ impl BashService {
             .get(session_id)
             .ok_or_else(|| format!("unknown session {session_id:?}"))?;
         if session.owner != owner {
-            return Err(format!("session {session_id:?} is owned by another agent"));
+            return Err(format!(
+                "session {session_id:?} is owned by another myco session"
+            ));
         }
         Ok(())
     }

@@ -8,8 +8,6 @@
 
 use std::sync::Arc;
 
-use crate::core::*;
-
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::*;
 
@@ -139,7 +137,7 @@ impl AnthropicGenerativeModel {
 }
 
 impl GenerativeModel for AnthropicGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let messages = match convert_messages(input) {
             Ok(messages) => messages,
             Err(e) => return driver_core::error_stream(e),
@@ -149,7 +147,6 @@ impl GenerativeModel for AnthropicGenerativeModel {
             StreamAccumulator::default(),
             "Anthropic",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }
@@ -468,10 +465,9 @@ impl StreamAccumulator {
             }
             AnthropicStreamEvent::Ping => {}
             AnthropicStreamEvent::Error { error } => {
-                return Err(provider_stream_error(
-                    format!("Anthropic stream error event: {error}"),
-                    Some(&error),
-                ));
+                return Err(GenerateError::ExecutionError(format!(
+                    "Anthropic stream error event: {error}"
+                )));
             }
             AnthropicStreamEvent::Other => {}
         }
@@ -585,11 +581,11 @@ struct AnthropicUsage {
 }
 
 impl AnthropicUsage {
-    fn into_token_usage(self) -> crate::generative_model::TokenUsage {
+    fn into_token_usage(self) -> crate::TokenUsage {
         // Full prompt = input + cache read + cache write; cached_input = reads.
         let cache_read = self.cache_read_input_tokens.unwrap_or(0);
         let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
-        crate::generative_model::TokenUsage {
+        crate::TokenUsage {
             input_tokens: self
                 .input_tokens
                 .saturating_add(cache_read)

@@ -9,9 +9,11 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::agent::{CompactWorkerError, run_compact_worker};
+use myco::chat::{
+    CompactWorkerError, persist_session, run_compact_worker, run_session_turn, wire_checkpoint,
+};
 use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message, Recovery,
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -269,6 +271,7 @@ async fn run_print(args: Args) {
         // Bound, not dropped: the guard must outlive the turn.
         session_lock: _session_lock,
         mut agent,
+        runtime,
         catalog_model,
         ..
     } = boot;
@@ -276,9 +279,9 @@ async fn run_print(args: Args) {
     // `@path.png` mentions attach images, same contract as the REPL. After
     // boot, not before: the per-image cap is the resolved model's, so this
     // cannot run until the catalog says which model the turn will use.
-    let mut content = match print_turn_content(
+    let content = match print_turn_content(
         arg.as_deref(),
-        prompt.clone(),
+        prompt,
         catalog_model.spec.max_image_base64_bytes,
     ) {
         Ok(c) => c,
@@ -289,20 +292,6 @@ async fn run_print(args: Args) {
     };
     if let Some(note) = attachment_note(&content) {
         eprintln!("{note}");
-    }
-
-    if needs_session_stamp(agent.history(), args.fork) {
-        let (id, started_at) = active_session.with(|s| (s.id.clone(), s.created_at));
-        content.insert(
-            0,
-            Content::Text {
-                text: prompts::session_stamp(&id, started_at),
-            },
-        );
-    }
-
-    if let Err(e) = active_session.maybe_auto_title_from_user_text(&prompt) {
-        eprintln!("warning: could not auto-title session: {e}");
     }
 
     // Ctrl-C cancels the in-flight turn; history stays well-formed.
@@ -317,26 +306,23 @@ async fn run_print(args: Args) {
         }
     });
 
-    let result = agent.interact(content, cancel).await;
+    let outcome = run_session_turn(
+        &mut agent,
+        &runtime,
+        content,
+        args.fork,
+        cancel,
+        session_warning,
+    )
+    .await;
     sigint_task.abort();
     sink.finish();
 
-    // Preserve only turns whose failure was explicitly classified as transient.
-    // Rewind every other failed user turn before saving the session.
-    let rewound = match &result {
-        Err(e) if e.recovery() == Recovery::RewindLastUserTurn => agent.rewind_last_user_turn(),
-        _ => None,
-    };
-
-    // Persist whatever history the agent has, including failed/cancelled turns.
-    if let Err(e) = persist_session(&agent, &active_session, /*force*/ true) {
-        eprintln!("warning: could not save session: {e}");
-    }
     if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
         eprintln!("session={}", active_session.id());
     }
 
-    match result {
+    match outcome.result {
         Ok(_) => {}
         Err(myco::AgentInteractionError::Cancelled) => {
             eprintln!("(cancelled)");
@@ -344,16 +330,20 @@ async fn run_print(args: Args) {
         }
         Err(e) => {
             eprintln!("myco: {e}");
-            if let Some(dropped) = rewound {
-                eprintln!("myco: {}", rewind_notice(&dropped));
+            if let Some(dropped) = outcome.rewound {
+                eprintln!(
+                    "myco: the last user turn was removed from active context so the session \
+                     can continue{}. Its recorded actions remain in the predecessor thread.",
+                    describe_dropped_images(&dropped)
+                );
             }
             std::process::exit(1);
         }
     }
 }
 
-/// Parenthetical naming the images a rewound user turn carried. Empty when it
-/// carried none.
+/// Parenthetical naming the images a rewound message carried, for the notice
+/// that explains why it is gone. Empty when it carried none.
 fn describe_dropped_images(dropped: &[Content]) -> String {
     match dropped
         .iter()
@@ -364,13 +354,6 @@ fn describe_dropped_images(dropped: &[Content]) -> String {
         1 => " (it carried 1 image)".into(),
         n => format!(" (it carried {n} images)"),
     }
-}
-
-fn rewind_notice(dropped: &[Content]) -> String {
-    format!(
-        "The last user turn was rewound{} so the session can continue.",
-        describe_dropped_images(dropped)
-    )
 }
 
 /// Combine the `-p` argument and piped stdin into the user prompt. With both,
@@ -404,15 +387,6 @@ fn print_turn_content(
             .collect();
     content.push(Content::Text { text: prompt });
     Ok(content)
-}
-
-/// Whether this run's first user message has to carry the session stamp
-/// ([`prompts::session_stamp`]). A fresh session has no history to carry it; a
-/// context fork inherits the *parent's* stamped first message, so the child
-/// stamps its own id onto the first message it adds. A resumed session already
-/// carries the stamp it was created with — same session, same id.
-fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    history.is_empty() || forked
 }
 
 /// Read piped stdin fully; `None` when stdin is a TTY or effectively empty.
@@ -552,16 +526,8 @@ fn lock_session_or_report(session_id: &str) -> Result<Option<SessionWriteLock>, 
     }
 }
 
-/// Persist agent history at replayable mid-turn boundaries (after the user
-/// message, after each completed tool round) so context forks and crash
-/// recovery see the freshest well-formed snapshot.
-fn wire_checkpoint(agent: &mut Agent, active_session: &ActiveSession) {
-    let checkpoint_session = active_session.clone();
-    agent.set_checkpoint(Box::new(move |messages, last_usage| {
-        if let Err(e) = checkpoint_session.persist_messages(messages, last_usage, false) {
-            eprintln!("warning: mid-turn session save failed: {e}");
-        }
-    }));
+fn session_warning(message: &str) {
+    eprintln!("warning: {message}");
 }
 
 /// Everything both agent modes build identically before their first turn: the
@@ -578,6 +544,7 @@ struct Boot {
     session_lock: Option<SessionWriteLock>,
     harness: Arc<Harness>,
     agent: Agent,
+    runtime: Arc<myco::SessionRuntime>,
 }
 
 /// Shared startup for `-p/--print` and the interactive REPL. The one genuinely
@@ -636,15 +603,15 @@ async fn boot<S: EventSink + 'static>(
         args.debug_dump_api_requests,
         args.effort,
     );
-    let mut agent = Agent::new(model, harness.clone(), sink.clone());
+    let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
+    let mut agent = Agent::new(model, runtime.clone(), sink.clone());
+    agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
-    let restored = session.snapshot();
-    agent.set_history(restored.messages.clone());
-    agent.set_last_usage(restored.last_usage);
+    runtime.bind_agent(&mut agent);
     // Mid-turn checkpoints: context forks and crash recovery see finished
     // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
-    wire_checkpoint(&mut agent, &session);
+    wire_checkpoint(&mut agent, &session, session_warning);
 
     (
         Boot {
@@ -655,6 +622,7 @@ async fn boot<S: EventSink + 'static>(
             session_lock,
             harness,
             agent,
+            runtime,
         },
         sink,
     )
@@ -690,6 +658,7 @@ async fn run_interactive(args: Args) {
         session_lock,
         harness,
         agent,
+        runtime,
     } = boot;
     let wrap = effective_wrap_width(app_config.wrap_max);
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -717,6 +686,7 @@ async fn run_interactive(args: Args) {
     // (not stored).
     let mut repl = ReplSession {
         agent,
+        runtime,
         session: active_session,
         editor,
         harness,
@@ -872,6 +842,7 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 /// model and UI handles, and the REPL-scoped knobs.
 struct ReplSession {
     agent: Agent,
+    runtime: Arc<myco::SessionRuntime>,
     session: ActiveSession,
     editor: Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
@@ -887,7 +858,7 @@ struct ReplSession {
     turn_cancel: TurnCancel,
     /// This run started as a context fork, whose inherited first message
     /// carries the *parent's* session stamp — cleared once this session has
-    /// stamped its own id ([`needs_session_stamp`]).
+    /// stamped its own id on its first submitted turn.
     forked: bool,
     /// Single-writer guard on the live session, swapped whenever the REPL
     /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
@@ -926,9 +897,7 @@ impl ReplSession {
                 None if self.agent.history().is_empty() => Some(0),
                 None => None,
             };
-            let running = self
-                .harness
-                .running_tool_summaries(self.agent.context().agent_id);
+            let running = self.runtime.running_tool_summaries();
             self.ui.user_header(used, max, usage, &running);
             // No "> " prefix; body is typed on the line after the USER header.
             // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
@@ -1081,7 +1050,7 @@ impl ReplSession {
         // `@path.png` mentions attach images. A bad path aborts the turn before
         // the model is called (headed ERROR section, like generate failures) so
         // the user can fix the path and resubmit — nothing is silently dropped.
-        let mut content = match expand_image_attachments(
+        let content = match expand_image_attachments(
             &input,
             self.catalog_model.spec.max_image_base64_bytes,
         ) {
@@ -1097,27 +1066,18 @@ impl ReplSession {
         if let Some(note) = attachment_note(&content) {
             self.ui.note(&note);
         }
-        if let Err(e) = self.session.maybe_auto_title_from_user_text(&input) {
-            eprintln!("warning: could not auto-title session: {e}");
-        }
-        // The session id rides the conversation, not the system prompt (see
-        // `prompts::session_stamp`). `/new` empties the history, so a session
-        // started mid-run stamps its own id on its first turn.
-        if needs_session_stamp(self.agent.history(), self.forked) {
-            let (id, started_at) = self.session.with(|s| (s.id.clone(), s.created_at));
-            content.insert(
-                0,
-                Content::Text {
-                    text: prompts::session_stamp(&id, started_at),
-                },
-            );
-        }
-        self.forked = false;
-
         let cancel = self.turn_cancel.arm();
 
-        // First assistant section opens with its own blank line + thin rule + header.
-        match self.agent.interact(content, cancel).await {
+        let outcome = run_session_turn(
+            &mut self.agent,
+            &self.runtime,
+            content,
+            std::mem::take(&mut self.forked),
+            cancel,
+            session_warning,
+        )
+        .await;
+        match outcome.result {
             Ok(_) => self.ui.blank_line(),
             Err(myco::AgentInteractionError::Cancelled) => self.ui.cancelled(),
             Err(e) => {
@@ -1126,13 +1086,12 @@ impl ReplSession {
                 // provider errors) are live-only — not stored in session history —
                 // so resume/Ctrl-L will not replay them.
                 let mut message = e.to_string();
-                // Unknown failures rewind by default. Only explicitly transient
-                // failures retain the user turn.
-                if e.recovery() == Recovery::RewindLastUserTurn
-                    && let Some(dropped) = self.agent.rewind_last_user_turn()
-                {
-                    message.push_str("\n\n");
-                    message.push_str(&rewind_notice(&dropped));
+                if let Some(dropped) = outcome.rewound {
+                    message.push_str(&format!(
+                        "\n\nThe last user turn was removed from active context so the session \
+                         can continue{}. Its recorded actions remain in the predecessor thread.",
+                        describe_dropped_images(&dropped)
+                    ));
                 }
                 self.ui.error_section(&message);
                 self.ui.blank_line();
@@ -1141,10 +1100,6 @@ impl ReplSession {
 
         self.turn_cancel.disarm();
 
-        // Persist whatever history the agent has, including failed/cancelled turns.
-        if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ true) {
-            eprintln!("warning: could not save session: {e}");
-        }
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
@@ -1160,12 +1115,10 @@ impl ReplSession {
 // ---------------------------------------------------------------------------
 
 impl ReplSession {
-    /// `/compact`: run the worker lifecycle (see
-    /// [`myco::session::run_compact_worker`]) and switch the live REPL to the
-    /// successor it built.
-    /// Returns whether the successor was installed, so an automatic caller can
-    /// stop retrying a compaction that is failing every time.
+    /// Commit a successor thread without changing the session or its tools.
+    /// Failure disables automatic compaction until the next session.
     async fn run_compact(&mut self) -> bool {
+        let writer = self.session.writer().await;
         if let Err(e) =
             self.session
                 .persist_messages(self.agent.history(), self.agent.last_usage(), true)
@@ -1175,7 +1128,7 @@ impl ReplSession {
             return false;
         }
         let predecessor = self.session.snapshot();
-        if predecessor.messages.is_empty() {
+        if predecessor.active_thread().messages.is_empty() {
             self.ui.error_section("compact: session is empty");
             return false;
         }
@@ -1183,8 +1136,11 @@ impl ReplSession {
         // Progress note under the USER header, not chrome: the COMPACTED
         // banner replaces it on success, and it survives on screen (and in
         // the mirror) when the worker fails.
-        self.ui
-            .note(&format!("compacting session={} …", predecessor.id));
+        self.ui.note(&format!(
+            "compacting session={} thread={} …",
+            predecessor.id,
+            predecessor.active_thread().id
+        ));
 
         // Ctrl-C during compaction cancels the worker turn like any user turn.
         let cancel = self.turn_cancel.arm();
@@ -1209,24 +1165,13 @@ impl ReplSession {
             }
         };
 
-        // Switch live REPL to successor.
-        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
-        }
-        if let Err(msg) = self.relock_session(&successor.id) {
-            self.ui.error_section(&format!("compact: {msg}"));
+        if let Err(error) = writer.commit_thread(successor) {
+            self.ui.error_section(&format!("compact: {error}"));
             return false;
         }
-        self.session.replace(successor.clone());
-        self.agent.set_history(successor.messages.clone());
-        self.agent.set_last_usage(successor.last_usage);
-        load_readline_history(&mut self.editor, &self.session);
+        self.runtime.bind_agent(&mut self.agent);
+        wire_checkpoint(&mut self.agent, &self.session, session_warning);
 
-        // Compaction starts over: wipe the screen the predecessor filled and
-        // hand the successor a COMPACTED banner instead of a replayed
-        // transcript. The conversation is not lost — it is on disk in both
-        // sessions and in the console mirror, and Ctrl-L reprints the
-        // successor's summary + tail.
         clear_screen();
         self.ui.compacted_banner(&outcome);
         true
@@ -1369,10 +1314,7 @@ impl ReplSession {
                     self.ui.error_section(&format!("new session failed: {msg}"));
                     return;
                 }
-                self.session.replace(fresh);
-                self.agent.set_history(Vec::new());
-                self.agent.set_last_usage(None);
-                load_readline_history(&mut self.editor, &self.session);
+                self.install_session(&fresh);
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
                 // (the Session: line carries the fresh id).
@@ -1498,8 +1440,11 @@ impl ReplSession {
     /// agent history/usage, and reload readline history.
     fn install_session(&mut self, loaded: &Session) {
         self.session.replace(loaded.clone());
-        self.agent.set_history(loaded.messages.clone());
-        self.agent.set_last_usage(loaded.last_usage);
+        if self.runtime.session_id() != loaded.id {
+            self.runtime = myco::SessionRuntime::new(self.harness.clone(), self.session.clone());
+        }
+        self.runtime.bind_agent(&mut self.agent);
+        wire_checkpoint(&mut self.agent, &self.session, session_warning);
         load_readline_history(&mut self.editor, &self.session);
     }
 }
@@ -1578,19 +1523,6 @@ fn format_host_status(harness: &Harness) -> String {
 // ---------------------------------------------------------------------------
 // Session persistence (agent history ↔ Session file / readline history)
 // ---------------------------------------------------------------------------
-
-/// Copy agent history into `session` and write it when needed.
-///
-/// Empty sessions (no messages) are never written — this avoids littering
-/// `~/.myco/session` with stubs from `/new` or quit-without-chat.
-fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
-    let history = agent.history();
-    // Never create a file for a session that has never had a turn.
-    if history.is_empty() && !session.snapshot().json_path().exists() {
-        return Ok(());
-    }
-    session.persist_messages(history, agent.last_usage(), force)
-}
 
 fn save_readline_history(
     editor: &mut Editor<ReplHelper, DefaultHistory>,
@@ -1853,26 +1785,6 @@ mod tests {
     }
 
     #[test]
-    fn rewind_notice_names_the_turn_and_its_images() {
-        assert_eq!(
-            rewind_notice(&[]),
-            "The last user turn was rewound so the session can continue."
-        );
-        let dropped = vec![
-            Content::Text {
-                text: "retry".into(),
-            },
-            Content::Image {
-                source: "data:image/png;base64,AAAA".into(),
-            },
-        ];
-        assert_eq!(
-            rewind_notice(&dropped),
-            "The last user turn was rewound (it carried 1 image) so the session can continue."
-        );
-    }
-
-    #[test]
     fn session_file_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "myco-session-test-{}",
@@ -1881,22 +1793,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess.json");
 
-        let mut session = Session {
-            version: myco::SESSION_FILE_VERSION,
-            id: "aabbccddeeff00112233445566778899".into(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            model: "claude-opus-4-8".into(),
-            messages: sample_messages(),
-            title: Some("roundtrip".into()),
-            links: vec![],
-            scratchpad: String::new(),
-            parent_session_id: None,
-            kind: myco::SessionKind::User,
-            predecessor_id: None,
-            successor_id: None,
-            last_usage: None,
-        };
+        let mut session =
+            Session::new_with_id("claude-opus-4-8", "aabbccddeeff00112233445566778899");
+        session.replace_context(sample_messages(), None);
+        session.title = Some("roundtrip".into());
         session.updated_at = session.created_at + Duration::from_secs(1);
 
         let json = serde_json::to_vec_pretty(&session).unwrap();
@@ -1906,10 +1806,13 @@ mod tests {
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.model, session.model);
         assert_eq!(loaded.title.as_deref(), Some("roundtrip"));
-        assert_eq!(loaded.messages.len(), session.messages.len());
         assert_eq!(
-            serde_json::to_value(&loaded.messages).unwrap(),
-            serde_json::to_value(&session.messages).unwrap()
+            loaded.active_thread().messages.len(),
+            session.active_thread().messages.len()
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded.active_thread().messages).unwrap(),
+            serde_json::to_value(&session.active_thread().messages).unwrap()
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -2052,28 +1955,13 @@ mod tests {
         let session = initial_session_or_exit(&args, "some-model");
         assert!(matches!(session.kind, SessionKind::Subagent));
         assert_eq!(session.parent_session_id.as_deref(), Some("abc123"));
-        assert!(session.messages.is_empty());
-    }
-
-    /// A session stamps its id on the first message of its own conversation:
-    /// once on a fresh session, again on the first message a context fork adds
-    /// (the inherited one names the parent), never on a resumed turn.
-    #[test]
-    fn session_stamp_covers_fresh_and_forked_runs_only() {
-        let seeded = [Message::UserMessage {
-            content: vec![Content::Text {
-                text: "inherited".into(),
-            }],
-        }];
-        assert!(needs_session_stamp(&[], /*forked*/ false));
-        assert!(needs_session_stamp(&seeded, /*forked*/ true));
-        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
+        assert!(session.active_thread().messages.is_empty());
     }
 
     #[test]
     fn new_session_starts_empty() {
         let session = Session::new("grok-4.5-build");
-        assert!(session.messages.is_empty());
+        assert!(session.active_thread().messages.is_empty());
     }
 
     #[test]

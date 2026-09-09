@@ -162,7 +162,8 @@ pub fn compacted_banner_events(
 ) -> Vec<TuiEvent> {
     let mut events = banner_open_events("COMPACTED", wrap);
     events.push(TuiEvent::Text(format!(
-        "Session: {}\nFrom: {}\nKept: {} {}\nSummary: {}\n",
+        "Session: {}\nThread: {}\nFrom thread: {}\nKept: {} {}\nSummary: {}\n",
+        outcome.session_id,
         outcome.successor_id,
         outcome.predecessor_id,
         outcome.tail_messages,
@@ -443,6 +444,7 @@ mod tests {
 
     fn sample_outcome(tail_messages: usize) -> crate::session::CompactOutcome {
         crate::session::CompactOutcome {
+            session_id: "session-id".into(),
             predecessor_id: "993d14889c414aab81963843cccf8090".into(),
             successor_id: "1c0ffee0dead0beef0000000000000aa".into(),
             summary_path: std::path::PathBuf::from("/home/u/.myco/sessions/993d1488.summary.md"),
@@ -466,8 +468,9 @@ mod tests {
         let rendered = render_compacted_banner(&sample_outcome(7), Palette::plain());
         let expected = format!(
             "{rule}\nCOMPACTED\n\n\
-             Session: 1c0ffee0dead0beef0000000000000aa\n\
-             From: 993d14889c414aab81963843cccf8090\n\
+             Session: session-id\n\
+             Thread: 1c0ffee0dead0beef0000000000000aa\n\
+             From thread: 993d14889c414aab81963843cccf8090\n\
              Kept: 7 messages\n\
              Summary: /home/u/.myco/sessions/993d1488.summary.md\n",
             rule = banner_rule(None)

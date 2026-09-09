@@ -187,7 +187,7 @@ async fn fork_seeds_child_with_parent_conversation() {
     let session = session_json(&env.dir, &child_id);
     assert_eq!(session["kind"], "subagent", "{session}");
     assert_eq!(session["parent_session_id"], parent_id, "{session}");
-    let messages = serde_json::to_string(&session["messages"]).unwrap();
+    let messages = serde_json::to_string(&session["threads"][0]["messages"]).unwrap();
     assert!(messages.contains("parent-marker-alpha"), "{messages}");
     assert!(messages.contains("child-marker-beta"), "{messages}");
 }
@@ -220,13 +220,13 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     let stdout = run_myco(&env, &[], b"parent-marker-alpha\nsecond-turn\n/quit\n").await;
     let parent_id = announced_session_id(&stdout);
     let parent = session_json(&env.dir, &parent_id);
-    let first = user_texts(&parent["messages"][0]);
+    let first = user_texts(&parent["threads"][0]["messages"][0]);
     assert!(first[0].starts_with("# Session"), "{first:?}");
     assert!(first[0].contains(&parent_id), "{first:?}");
     assert!(first[1].contains("parent-marker-alpha"), "{first:?}");
     // The first message only: later turns carry the user's words alone, so
     // one conversation states its session once.
-    let later = parent["messages"]
+    let later = parent["threads"][0]["messages"]
         .as_array()
         .expect("messages")
         .iter()
@@ -247,7 +247,9 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     let child_id = announced_session_id(&child_stdout);
     assert_ne!(child_id, parent_id, "fork must mint a new session id");
     let child = session_json(&env.dir, &child_id);
-    let messages = child["messages"].as_array().expect("messages");
+    let messages = child["threads"][0]["messages"]
+        .as_array()
+        .expect("messages");
     let inherited = user_texts(&messages[0]);
     assert!(inherited[0].contains(&parent_id), "{inherited:?}");
     let own = messages

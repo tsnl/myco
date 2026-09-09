@@ -72,18 +72,22 @@ async fn scripted_multi_turn_bash_session_transcript() {
         turn_end("multi-turn bash session ok"),
     ]);
 
-    let mut agent = Agent::new(model.clone(), harness, Arc::new(NullEventSink));
+    let mut agent = Agent::new(
+        model.clone(),
+        crate::test_utils::tool_runtime(harness),
+        Arc::new(NullEventSink),
+    );
 
     let t0 = Instant::now();
-    let reply = agent
-        .interact(
-            vec![Content::Text {
-                text: "Drive an interactive shell across multiple turns.".into(),
-            }],
-            myco::CancelToken::new(),
-        )
-        .await
-        .expect("interact should succeed");
+    let reply = myco::chat::interact(
+        &mut agent,
+        vec![Content::Text {
+            text: "Drive an interactive shell across multiple turns.".into(),
+        }],
+        myco::CancelToken::new(),
+    )
+    .await
+    .expect("interact should succeed");
     let elapsed = t0.elapsed();
 
     // Three short session steps should finish well under any long hang. CI

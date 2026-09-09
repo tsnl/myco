@@ -24,7 +24,7 @@ pub async fn test_generative_model_messaging(model: Arc<dyn GenerativeModel>) {
         });
 
         let stream = model.generate(&history);
-        let output = GenerateOutput::from_stream(stream).await.unwrap();
+        let output = GenerateOutput::from_generation(stream).await.unwrap();
 
         assert!(output.tool_uses.is_empty());
         // Models may return Thinking + Text (or multiple text parts); assert on text only.
@@ -66,7 +66,10 @@ pub async fn drain_turn_end_reason(
     let mut stream = model.generate(history);
     let mut reason = None;
     while let Some(part) = stream.next().await {
-        if let Ok(myco::generative_model::MessagePart::TurnEndReason(r)) = part {
+        if let myco::generative_model::GenerationEvent::Part(
+            myco::generative_model::MessagePart::TurnEndReason(r),
+        ) = part
+        {
             reason = Some(r);
         }
     }

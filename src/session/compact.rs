@@ -1,102 +1,67 @@
-//! Session compaction: archive predecessor, seed successor with summary + tail.
+//! Compaction creates a successor thread with a summary and bounded recent context.
 
 use crate::generative_model::{Content, Message};
 use crate::prompts;
 use crate::session::Session;
 
-/// How many trailing user-turns the successor keeps verbatim (well-formed).
+/// How many trailing user turns seed the successor context.
 const TAIL_USER_TURNS: usize = 2;
 /// Max chars for any single tool body retained in the tail.
 const TAIL_TOOL_BODY_MAX_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone)]
 pub struct CompactOutcome {
+    pub session_id: String,
     pub predecessor_id: String,
     pub successor_id: String,
     pub summary_path: std::path::PathBuf,
     pub tail_messages: usize,
 }
 
-/// Build a successor session from a summary file + well-formed recent tail.
-///
-/// Caller is responsible for: running the compact worker (which writes the summary),
-/// installing the successor into the live agent, and linking UI.
-pub fn compact_session(
-    predecessor: &Session,
+/// Build a successor from the summary at `session.summary_path()`. The caller
+/// commits the returned thread to the live session atomically.
+pub fn compact_thread(
+    session: &Session,
     summary_markdown: &str,
-    model: &str,
-) -> Result<(Session, CompactOutcome), String> {
+) -> Result<(super::Thread, CompactOutcome), String> {
+    let predecessor = session.active_thread();
     if predecessor.messages.is_empty() {
-        return Err("cannot compact an empty session".into());
+        return Err("cannot compact an empty thread".into());
     }
     if summary_markdown.trim().is_empty() {
         return Err("summary markdown is empty".into());
     }
-
     let tail = select_tail(
         &predecessor.messages,
         TAIL_USER_TURNS,
         TAIL_TOOL_BODY_MAX_CHARS,
     );
-
-    let mut successor = Session::new(model);
-    successor.title = predecessor.title.clone();
-    successor.links = predecessor.links.clone();
-    successor.scratchpad = predecessor.scratchpad.clone();
+    let mut successor = super::Thread::new();
     successor.predecessor_id = Some(predecessor.id.clone());
-    // Nested (hidden) sessions stay nested across compaction; user sessions stay user.
-    successor.kind = predecessor.kind;
-    successor.parent_session_id = predecessor.parent_session_id.clone();
-
-    let mut resume = String::from("# Compaction resume\n\n");
-    resume.push_str(summary_markdown.trim());
-    resume.push_str(&format!(
-        "\n\n---\nPredecessor session: `{}`\nSummary file: `{}`\n",
+    let resume = format!(
+        "# Compaction resume\n\n{}\n\n---\nSession: `{}`\nPredecessor thread: `{}`\nSummary file: `{}`\n",
+        summary_markdown.trim(),
+        session.id,
         predecessor.id,
-        predecessor.summary_path().display()
-    ));
-
-    // Compaction mints a new session id, so the successor's first message
-    // stamps its own — the resume block below names the predecessor.
-    let mut messages = vec![Message::UserMessage {
+        session.summary_path().display()
+    );
+    successor.messages = vec![Message::UserMessage {
         content: vec![
             Content::Text {
-                text: prompts::session_stamp(&successor.id, successor.created_at),
+                text: prompts::thread_stamp(&session.id, &successor.id, session.created_at),
             },
             Content::Text { text: resume },
         ],
     }];
-    messages.extend(tail.iter().cloned());
-    let tail_messages = messages.len().saturating_sub(1);
-    successor.messages = messages;
-
-    // Persist summary next to predecessor if not already present / overwrite with canonical.
-    let summary_path = predecessor.summary_path();
-    if let Some(parent) = summary_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    crate::core::atomically_write(summary_path.as_path(), summary_markdown.as_bytes())?;
-
+    successor.messages.extend(tail);
     let outcome = CompactOutcome {
+        session_id: session.id.clone(),
         predecessor_id: predecessor.id.clone(),
         successor_id: successor.id.clone(),
-        summary_path,
-        tail_messages,
+        summary_path: session.summary_path(),
+        tail_messages: successor.messages.len() - 1,
     };
     Ok((successor, outcome))
-}
-
-/// Link predecessor → successor on disk (updates both documents).
-///
-/// The successor is written first: a crash between the two saves must not leave
-/// the predecessor pointing at a `successor_id` that has no file behind it. The
-/// other order — an unreferenced successor on disk — is recoverable, since the
-/// predecessor still reads as un-compacted.
-pub fn link_compact_pair(predecessor: &mut Session, successor: &Session) -> Result<(), String> {
-    successor.save()?;
-    predecessor.successor_id = Some(successor.id.clone());
-    predecessor.touch();
-    predecessor.save()
 }
 
 /// Select the last `user_turns` well-formed user turns (user → … → assistant end).
@@ -127,9 +92,17 @@ pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize
         end = end.saturating_sub(1);
     }
     let mut out: Vec<Message> = slice[..end].to_vec();
-    for m in &mut out {
-        truncate_message_bodies(m, tool_body_max);
+    for message in &mut out {
+        if let Message::UserMessage { content } = message {
+            content.retain(
+                |part| !matches!(part, Content::Text { text } if prompts::is_session_stamp(text)),
+            );
+        }
+        truncate_message_bodies(message, tool_body_max);
     }
+    out.retain(
+        |message| !matches!(message, Message::UserMessage { content } if content.is_empty()),
+    );
     out
 }
 
@@ -168,36 +141,131 @@ mod tests {
     use crate::test_support::{assistant, assistant_tool, temp_home, tool_results, user};
     use serde_json::json;
 
-    /// The successor document must exist before the predecessor points at it,
-    /// so a crash mid-link can never leave a dangling `successor_id`.
     #[test]
-    fn linking_writes_the_successor_before_the_pointer_to_it() {
-        // RAII: points MYCO_HOME at a temp dir under the myco-home lock, and
-        // clears both on drop even if an assertion panics.
-        let _home = temp_home("compact-link");
-
-        let mut pred = Session::new_with_id("m", "aa00bb11cc22dd33ee44ff5566778899");
-        pred.messages = vec![user("hello"), assistant("hi")];
-        pred.save().unwrap();
-
-        let successor = pred.fork_child("m");
-        link_compact_pair(&mut pred, &successor).unwrap();
-
-        // Both documents on disk, cross-linked.
-        let saved_pred = Session::load_by_id_or_prefix(&pred.id).unwrap();
-        let saved_succ = Session::load_by_id_or_prefix(&successor.id).unwrap();
-        assert_eq!(
-            saved_pred.successor_id.as_deref(),
-            Some(successor.id.as_str())
+    fn carried_context_cannot_override_the_successor_thread_stamp() {
+        let mut session = Session::new("test");
+        let original = session.active_thread().id.clone();
+        let stamp = prompts::thread_stamp(&session.id, &original, session.created_at);
+        session.replace_context(
+            vec![
+                Message::UserMessage {
+                    content: vec![
+                        Content::Text { text: stamp },
+                        Content::Text {
+                            text: "task".into(),
+                        },
+                    ],
+                },
+                assistant("done"),
+            ],
+            None,
         );
-        assert_eq!(saved_succ.id, successor.id);
-
-        // The pointer is only durable because the target already was: loading
-        // the id the predecessor names must succeed.
+        let (successor, _) = compact_thread(&session, "summary").unwrap();
+        let stamps: Vec<_> = successor
+            .messages
+            .iter()
+            .filter_map(|message| {
+                if let Message::UserMessage { content } = message {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                Content::Text { text } if prompts::is_session_stamp(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamps.len(), 1);
+        assert!(stamps[0].contains(&successor.id));
+        assert!(!stamps[0].contains(&original));
         assert!(
-            Session::load_by_id_or_prefix(saved_pred.successor_id.as_deref().unwrap()).is_ok(),
-            "predecessor names a successor that is not on disk"
+            serde_json::to_string(&successor.messages)
+                .unwrap()
+                .contains("task")
         );
+    }
+
+    #[test]
+    fn compaction_preserves_session_identity_and_archives_the_original_thread() {
+        let _home = temp_home("thread-compact");
+        let mut session = Session::new("m");
+        session.replace_context(vec![user("hello"), assistant("answer")], None);
+        session.title = Some("ongoing".into());
+        let id = session.id.clone();
+        let original = serde_json::to_value(session.active_thread()).unwrap();
+        let active = super::super::ActiveSession::new(session);
+        let (next, outcome) = compact_thread(&active.snapshot(), "# Goal\nContinue work").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(active.writer())
+            .commit_thread(next)
+            .unwrap();
+        let saved = Session::load_by_id_or_prefix(&id).unwrap();
+        assert_eq!(saved.id, id);
+        assert_eq!(saved.title.as_deref(), Some("ongoing"));
+        assert_eq!(saved.threads().len(), 2);
+        assert_eq!(serde_json::to_value(&saved.threads()[0]).unwrap(), original);
+        assert_eq!(
+            saved.active_thread().predecessor_id.as_deref(),
+            Some(outcome.predecessor_id.as_str())
+        );
+        assert_eq!(saved.active_thread().id, outcome.successor_id);
+        assert!(saved.active_thread().last_usage.is_none());
+        assert!(
+            matches!(&saved.active_thread().messages[0], Message::UserMessage { content }
+            if matches!(&content[1], Content::Text { text } if text.contains("Continue work")))
+        );
+    }
+
+    #[test]
+    fn stale_checkpoints_cannot_overwrite_a_successor_thread() {
+        let _home = temp_home("thread-stale");
+        let mut session = Session::new("m");
+        session.replace_context(vec![user("original")], None);
+        let original = serde_json::to_value(session.active_thread()).unwrap();
+        let predecessor = session.active_thread().id.clone();
+        let (next, _) = compact_thread(&session, "summary").unwrap();
+        let active = super::super::ActiveSession::new(session);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let writer = runtime.block_on(active.writer());
+        active.with_mut(|session| session.title = Some("updated during compaction".into()));
+        writer.commit_thread(next.clone()).unwrap();
+        assert!(
+            active
+                .persist_thread_messages(&predecessor, &[user("stale")], None, true)
+                .is_err()
+        );
+        assert_eq!(
+            active.snapshot().title.as_deref(),
+            Some("updated during compaction")
+        );
+        assert_eq!(
+            serde_json::to_value(&active.snapshot().threads()[0]).unwrap(),
+            original
+        );
+        assert!(writer.commit_thread(next).is_err());
+    }
+
+    #[test]
+    fn failed_compaction_save_keeps_the_original_thread_active() {
+        let home = temp_home("thread-save-failure");
+        let mut session = Session::new("m");
+        session.replace_context(vec![user("original")], None);
+        let original_id = session.active_thread().id.clone();
+        let (next, _) = compact_thread(&session, "summary").unwrap();
+        let active = super::super::ActiveSession::new(session);
+        std::fs::write(home.path().join("session"), "blocks the store directory").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            runtime
+                .block_on(active.writer())
+                .commit_thread(next)
+                .is_err()
+        );
+        assert_eq!(active.snapshot().active_thread().id, original_id);
+        assert_eq!(active.snapshot().threads().len(), 1);
     }
 
     fn assistant_tools() -> Message {
@@ -232,41 +300,5 @@ mod tests {
         let tail = select_tail(&messages, 1, 1000);
         assert_eq!(tail.len(), 1);
         assert!(matches!(tail[0], Message::UserMessage { .. }));
-    }
-
-    #[test]
-    fn compact_session_seeds_resume_and_links() {
-        let _home = temp_home("compact");
-
-        let mut pred = Session::new("claude-haiku-4-5");
-        pred.messages = vec![user("hello"), assistant("world")];
-        pred.title = Some("t".into());
-        pred.save().unwrap();
-
-        let (succ, out) =
-            compact_session(&pred, "## Goal\nDo the thing\n", "claude-haiku-4-5").unwrap();
-        assert_eq!(out.predecessor_id, pred.id);
-        assert_eq!(succ.predecessor_id.as_deref(), Some(pred.id.as_str()));
-        assert!(matches!(succ.messages[0], Message::UserMessage { .. }));
-        // Compaction mints a new id, so the successor's first message stamps
-        // its own — an agent that compacts must not keep quoting the
-        // predecessor's id as its session.
-        let Message::UserMessage { content } = &succ.messages[0] else {
-            unreachable!()
-        };
-        assert!(
-            matches!(&content[0], Content::Text { text }
-                if prompts::is_session_stamp(text) && text.contains(&succ.id)),
-            "{content:?}"
-        );
-        assert!(
-            matches!(&content[1], Content::Text { text } if text.contains(&pred.id)),
-            "{content:?}"
-        );
-        assert!(
-            std::fs::read_to_string(pred.summary_path())
-                .unwrap()
-                .contains("Do the thing")
-        );
     }
 }

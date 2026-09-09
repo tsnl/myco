@@ -1,7 +1,7 @@
 use super::*;
 use myco::generative_model::{
     BackendConfig, GenerateError, GenerativeModelConfig, ModelSpec, OpenAIBackendConfig, Protocol,
-    Recovery, RetryPolicy, ThinkingMode, ToolSpec,
+    RetryPolicy, ThinkingMode, ToolSpec,
 };
 
 use crate::test_utils::StubHttpServer;
@@ -55,33 +55,33 @@ fn stub_model(base_url: &str, tools: Vec<ToolSpec>) -> std::sync::Arc<dyn Genera
     .expect("create stub-backed model")
 }
 
-/// [`stub_model`] with an explicit retry policy. The sub-millisecond backoff
-/// keeps retry tests instant while still exercising the real wait path.
-fn stub_model_with_retry(
+#[derive(Default)]
+struct RecordedEvents(std::sync::Mutex<Vec<myco::AgentEvent>>);
+
+impl myco::EventSink for RecordedEvents {
+    fn emit(&self, event: myco::AgentEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+fn retry_agent(
     base_url: &str,
     retry: RetryPolicy,
-) -> std::sync::Arc<dyn GenerativeModel> {
-    myco::generative_model::new(GenerativeModelConfig {
-        model: ModelSpec {
-            key: "local".into(),
-            api_id: "test-model".into(),
-            protocol: Protocol::OpenAICompletions,
-            thinking: ThinkingMode::None,
-            context_window_tokens: 4096,
-            max_image_base64_bytes: myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
-            max_truncated_resumes: 3,
-            auto_compact_at_tokens: None,
-        },
-        tools: Vec::new(),
-        system_prompt: "Answer in one word.".into(),
-        backend_config: BackendConfig::OpenAICompletions(OpenAIBackendConfig {
-            base_url: format!("{base_url}/v1"),
-            max_output_tokens: Some(32),
-            retry,
-            ..Default::default()
-        }),
-    })
-    .expect("create stub-backed model")
+) -> (myco::Agent, std::sync::Arc<RecordedEvents>) {
+    let events = std::sync::Arc::new(RecordedEvents::default());
+    let mut agent = myco::Agent::new(
+        stub_model(base_url, vec![]),
+        crate::test_utils::tool_runtime(myco::Harness::local_with_services(vec![])),
+        events.clone(),
+    );
+    agent.set_retry_policy(retry);
+    (agent, events)
+}
+
+fn prompt() -> Vec<Content> {
+    vec![Content::Text {
+        text: "Say OK.".into(),
+    }]
 }
 
 fn fast_retry(max_attempts: u32) -> RetryPolicy {
@@ -118,7 +118,7 @@ async fn wire_request_shape_and_text_stream() {
     .await;
 
     let model = stub_model(&server.base_url(), Vec::new());
-    let output = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let output = GenerateOutput::from_generation(model.generate(&user_turn("Say OK.")))
         .await
         .expect("stream decodes");
 
@@ -174,7 +174,7 @@ async fn wire_tool_call_streamed_across_chunks() {
         input_schema: serde_json::json!({"type": "object"}),
     }];
     let model = stub_model(&server.base_url(), tools);
-    let output = GenerateOutput::from_stream(model.generate(&user_turn("List files.")))
+    let output = GenerateOutput::from_generation(model.generate(&user_turn("List files.")))
         .await
         .expect("stream decodes");
 
@@ -201,7 +201,7 @@ async fn wire_http_error_body_reaches_the_caller() {
     .await;
 
     let model = stub_model(&server.base_url(), Vec::new());
-    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let error = GenerateOutput::from_generation(model.generate(&user_turn("Say OK.")))
         .await
         .expect_err("HTTP 400 is an error");
 
@@ -220,82 +220,139 @@ async fn wire_http_error_body_reaches_the_caller() {
 // statuses — is worth pinning against a real socket.
 //
 
-/// A 503 then a 529 (Anthropic's overloaded) then success: the caller sees only
-/// the successful turn, and three requests reached the server.
 #[tokio::test]
-async fn wire_retries_transient_statuses_then_succeeds() {
+async fn agent_retries_transient_statuses_then_succeeds() {
     let server = StubHttpServer::sequence(vec![
-        StubHttpServer::status_response(503, r#"{"error":"service unavailable"}"#),
-        StubHttpServer::status_response(529, r#"{"error":{"type":"overloaded_error"}}"#),
+        StubHttpServer::status_response(503, "service unavailable"),
+        StubHttpServer::status_response(529, "overloaded"),
         ok_sse_response(),
     ])
     .await;
-
-    let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
-    let output = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
+    let output = myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
-        .expect("third attempt succeeds");
-
-    match output.content.as_slice() {
-        [Content::Text { text }] => assert_eq!(text, "OK"),
-        other => panic!("expected one text block, got {other:?}"),
+        .unwrap();
+    assert!(matches!(output.as_slice(), [Content::Text { text }] if text == "OK"));
+    assert_eq!(server.connections(), 3);
+    assert_eq!(agent.history().len(), 2);
+    let events = events.0.lock().unwrap();
+    let failures: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            myco::AgentEvent::Failure {
+                failure,
+                attempt,
+                max_attempts,
+                retry_in,
+                ..
+            } => Some((failure, *attempt, *max_attempts, *retry_in)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 2);
+    for (index, (failure, attempt, max_attempts, retry_in)) in failures.iter().enumerate() {
+        assert_eq!(*attempt, index as u32 + 1);
+        assert_eq!(*max_attempts, 3);
+        assert_eq!(*retry_in, Some(fast_retry(3).backoff(attempt + 1, None)));
+        assert!(failure.retryable);
     }
-    assert_eq!(server.connections(), 3, "two retries then the success");
+    assert!(failures[0].0.cause.to_string().contains("503"));
+    assert!(failures[1].0.cause.to_string().contains("529"));
 }
 
-/// A deterministic status is never retried: resending a malformed request only
-/// delays the error the user needs to see.
 #[tokio::test]
-async fn wire_does_not_retry_a_client_error() {
-    let server = StubHttpServer::sequence(vec![StubHttpServer::status_response(
-        400,
-        r#"{"error":"bad request"}"#,
-    )])
-    .await;
-
-    let model = stub_model_with_retry(&server.base_url(), fast_retry(5));
-    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+async fn agent_does_not_retry_a_client_error() {
+    let server = StubHttpServer::status(400, "bad request").await;
+    let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(5));
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
-        .expect_err("HTTP 400 is an error");
-
-    assert_eq!(server.connections(), 1, "400 must not be retried");
-    assert_eq!(error.recovery(), Recovery::RewindLastUserTurn);
+        .expect_err("HTTP 400");
+    assert_eq!(server.connections(), 1);
+    assert!(events.0.lock().unwrap().iter().any(|event| matches!(event,
+        myco::AgentEvent::Failure { failure, retry_in: None, .. } if !failure.retryable)));
 }
 
-/// Retry is bounded: a provider that is down stays down, and the turn has to
-/// end with an explicitly transient error rather than looping or rewinding.
 #[tokio::test]
-async fn wire_gives_up_after_max_attempts() {
-    let down = || StubHttpServer::status_response(503, r#"{"error":"down"}"#);
+async fn agent_gives_up_after_max_attempts() {
+    let down = || StubHttpServer::status_response(503, "down");
     let server = StubHttpServer::sequence(vec![down(), down(), down(), down()]).await;
-
-    let model = stub_model_with_retry(&server.base_url(), fast_retry(3));
-    let error = GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
+    let error = myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
         .expect_err("all attempts fail");
-
-    assert_eq!(error.recovery(), Recovery::Retry);
-    match error {
-        GenerateError::TransientError(message) => assert!(message.contains("503"), "{message}"),
-        other => panic!("expected TransientError, got {other:?}"),
-    }
-    // Exactly max_attempts — the fourth canned response is never collected.
+    assert!(error.to_string().contains("503"));
     assert_eq!(server.connections(), 3);
+    let events = events.0.lock().unwrap();
+    let failures: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            myco::AgentEvent::Failure {
+                attempt, retry_in, ..
+            } => Some((*attempt, retry_in.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures, [(1, true), (2, true), (3, false)]);
 }
 
-/// `max_attempts = 1` is the opt-out.
 #[tokio::test]
-async fn wire_retry_can_be_disabled() {
+async fn agent_retry_can_be_disabled() {
     let server = StubHttpServer::sequence(vec![
-        StubHttpServer::status_response(503, r#"{"error":"down"}"#),
+        StubHttpServer::status_response(503, "down"),
         ok_sse_response(),
     ])
     .await;
-
-    let model = stub_model_with_retry(&server.base_url(), fast_retry(1));
-    GenerateOutput::from_stream(model.generate(&user_turn("Say OK.")))
+    let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(1));
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
-        .expect_err("no retry, so the 503 surfaces");
+        .expect_err("no retry");
+    assert_eq!(server.connections(), 1);
+    assert!(events.0.lock().unwrap().iter().any(|event| matches!(event,
+        myco::AgentEvent::Failure { failure, retry_in: None, .. } if failure.retryable)));
+}
 
+#[tokio::test]
+async fn agent_never_retries_after_partial_response() {
+    let partial = StubHttpServer::sse_response(vec![serde_json::json!({
+        "choices": [{"index": 0, "delta": {"content": "partial"}}]
+    })]);
+    let server = StubHttpServer::sequence(vec![partial, ok_sse_response()]).await;
+    let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
+    myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
+        .await
+        .expect_err("missing stop reason");
+    assert_eq!(server.connections(), 1);
+    assert_eq!(agent.history().len(), 1);
+    let events = events.0.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+        myco::AgentEvent::TextDelta { text, .. } if text == "partial"))
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, myco::AgentEvent::Failure { retry_in: None, .. }))
+    );
+}
+
+#[tokio::test]
+async fn driver_emits_one_failure_without_retrying() {
+    use futures::StreamExt;
+    use myco::generative_model::GenerationEvent;
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, "busy"),
+        ok_sse_response(),
+    ])
+    .await;
+    let mut events = stub_model(&server.base_url(), vec![]).generate(&user_turn("Say OK."));
+    assert!(
+        matches!(events.next().await, Some(GenerationEvent::Failure(failure))
+        if failure.retryable && failure.cause.to_string().contains("503"))
+    );
+    assert!(events.next().await.is_none());
     assert_eq!(server.connections(), 1);
 }

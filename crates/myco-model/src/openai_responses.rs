@@ -7,8 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::core::*;
-
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
     OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
@@ -87,7 +85,7 @@ impl OpenAIResponsesGenerativeModel {
 }
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>> {
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         let input_items = match convert_messages(input) {
             Ok(items) => items,
             Err(e) => return driver_core::error_stream(e),
@@ -97,7 +95,6 @@ impl GenerativeModel for OpenAIResponsesGenerativeModel {
             StreamAccumulator::default(),
             "OpenAI Responses",
             self.backend.debug_dump_api_requests,
-            self.backend.retry,
         )
     }
 }
@@ -397,10 +394,10 @@ impl StreamAccumulator {
             ResponsesStreamEvent::ResponseCompleted { response } => {
                 let reason = match response.status.as_deref() {
                     Some("failed") => {
-                        return Err(provider_stream_error(
-                            format!("OpenAI Responses failed: {:?}", response.error),
-                            response.error.as_ref(),
-                        ));
+                        return Err(GenerateError::ExecutionError(format!(
+                            "OpenAI Responses failed: {:?}",
+                            response.error
+                        )));
                     }
                     Some("incomplete") => {
                         let incomplete = response
@@ -437,16 +434,15 @@ impl StreamAccumulator {
                 self.finished = true;
             }
             ResponsesStreamEvent::ResponseFailed { response } => {
-                return Err(provider_stream_error(
-                    format!("OpenAI Responses failed: {:?}", response.error),
-                    response.error.as_ref(),
-                ));
+                return Err(GenerateError::ExecutionError(format!(
+                    "OpenAI Responses failed: {:?}",
+                    response.error
+                )));
             }
             ResponsesStreamEvent::Error { error, message } => {
-                return Err(provider_stream_error(
-                    format!("OpenAI Responses stream error: {error:?} {message:?}"),
-                    error.as_ref(),
-                ));
+                return Err(GenerateError::ExecutionError(format!(
+                    "OpenAI Responses stream error: {error:?} {message:?}"
+                )));
             }
             ResponsesStreamEvent::Other => {}
         }

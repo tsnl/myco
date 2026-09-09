@@ -1,11 +1,19 @@
+//! Backend-independent messages and one-attempt streaming model drivers.
+
 use std::{pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
-use crate::core::*;
+pub type AsyncStream<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
+
+#[cfg(test)]
+mod test_support;
 
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
+
+mod accumulator;
+pub use accumulator::MessageAccumulator;
 
 mod driver_core;
 
@@ -19,7 +27,8 @@ mod sse_parser;
 use sse_parser::SseParser;
 
 pub trait GenerativeModel: Send + Sync {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
+    /// One attempt. Failure ends the stream; dropping it cancels the request.
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent>;
 }
 
 /// Wire protocol a model is served over.
@@ -121,14 +130,8 @@ impl ThinkingMode {
     }
 }
 
-/// How a driver retries a request that failed *before* any of the response
-/// reached the consumer.
-///
-/// Resolved from `[gateways.NAME.retry]` (see [`crate::config::RetryEntry`]).
-/// Retrying is only sound ahead of the stream: once parts have been emitted the
-/// consumer has seen them, and a second attempt would replay them as duplicates.
-/// Deterministic failures (a 400, a 413) are never retried — see
-/// [`crate::generative_model::driver_core`]'s send loop.
+/// Agent policy for retrying transient failures before any response parts arrive.
+/// Resolved from `[gateways.NAME.retry]` or `[models.KEY.retry]`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
     /// Total attempts including the first. `1` disables retry.
@@ -179,7 +182,7 @@ impl RetryPolicy {
 }
 
 /// A resolved model: everything the protocol drivers need, minus credentials
-/// (those live in [`BackendConfig`]). Built by `crate::config` from the
+/// (those live in [`BackendConfig`]). Built by the application configuration from the
 /// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
 /// models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +206,7 @@ pub struct ModelSpec {
     /// How many consecutive `max_tokens` truncations one turn resumes through
     /// before handing control back (`0` never resumes). Resolved from the
     /// model's `max_truncated_resumes` or its default; the agent takes this
-    /// value via [`crate::agent::Agent::set_max_truncated_resumes`].
+    /// value via the agent's continuation policy.
     pub max_truncated_resumes: u32,
     /// Prompt size at which the REPL compacts without being asked. `None` =
     /// no auto-compaction (the default; `/compact` still works).
@@ -361,6 +364,13 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::Anthropic(config) => config.retry,
+            Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
+        }
+    }
+
     pub fn protocol(&self) -> Protocol {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
@@ -572,6 +582,48 @@ fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     id
 }
 
+/// One generation attempt emits parts, or ends with a failure.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    Part(MessagePart),
+    Failure(GenerationFailure),
+}
+
+impl GenerationEvent {
+    pub fn into_result(self) -> Result<MessagePart, GenerateError> {
+        match self {
+            Self::Part(part) => Ok(part),
+            Self::Failure(failure) => Err(failure.cause),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationFailure {
+    pub cause: GenerateError,
+    /// A transient cause; the caller must also ensure no response parts were emitted.
+    pub retryable: bool,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl GenerationFailure {
+    pub fn terminal(cause: GenerateError) -> Self {
+        Self {
+            cause,
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    pub fn transient(cause: GenerateError, retry_after: Option<std::time::Duration>) -> Self {
+        Self {
+            cause,
+            retryable: true,
+            retry_after,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
     MessageStart,
@@ -665,223 +717,22 @@ pub struct GenerateOutput {
 }
 
 impl GenerateOutput {
+    pub async fn from_generation(
+        stream: impl Stream<Item = GenerationEvent>,
+    ) -> Result<Self, GenerateError> {
+        Self::from_stream(stream.map(GenerationEvent::into_result)).await
+    }
+
     pub async fn from_stream(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
     ) -> Result<Self, GenerateError> {
-        Self::from_stream_with_hook(stream, |_| {}).await
-    }
-
-    /// Accumulate a generation stream, invoking `on_part` for each successfully parsed part
-    /// (including the initial `MessageStart`).
-    pub async fn from_stream_with_hook(
-        stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
-        mut on_part: impl FnMut(&MessagePart),
-    ) -> Result<Self, GenerateError> {
-        struct IncompleteToolUse {
-            name: String,
-            input_json: String,
-        }
-
-        impl TryInto<ToolUse> for IncompleteToolUse {
-            type Error = GenerateError;
-
-            fn try_into(self) -> Result<ToolUse, Self::Error> {
-                let input = if self.input_json.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&self.input_json).map_err(|e| {
-                        GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use input JSON is invalid: {e}"
-                        ))
-                    })?
-                };
-                Ok(ToolUse {
-                    name: self.name,
-                    input,
-                })
-            }
-        }
-
-        let mut content: Vec<Option<Content>> = Vec::new();
-        let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
-        let mut turn_end_reason = None;
-        let mut usage: Option<TokenUsage> = None;
-
+        let mut accumulator = MessageAccumulator::default();
         let mut stream = pin!(stream);
-
-        let Some(try_item) = stream.next().await else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: empty stream. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        let first = try_item?;
-        let MessagePart::MessageStart = &first else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: first item is not MessageStart. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        on_part(&first);
-
-        while let Some(item) = stream.next().await {
-            let item = item?;
-            on_part(&item);
-            match item {
-                MessagePart::MessageStart => {
-                    return Err(GenerateError::MalformedResponseError(
-                        "Malformed stream: unexpected MessageStart".into(),
-                    ));
-                }
-                MessagePart::ContentStart(start) => {
-                    let (index, block) = start_block(start);
-                    ensure_slot(&mut content, index, block);
-                }
-                MessagePart::ContentDelta(delta) => apply_content_delta(&mut content, delta)?,
-                MessagePart::ToolUseStart(ToolUseStart { index, name }) => {
-                    ensure_slot(
-                        &mut tool_uses,
-                        index,
-                        IncompleteToolUse {
-                            name,
-                            input_json: String::new(),
-                        },
-                    );
-                }
-                MessagePart::ToolUseDelta(ToolUseDelta {
-                    index,
-                    input_json_delta,
-                }) => {
-                    let Some(Some(tool_use)) = tool_uses.get_mut(index) else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use delta index {index} is out of bounds"
-                        )));
-                    };
-                    tool_use.input_json.push_str(&input_json_delta);
-                }
-                MessagePart::TurnEndReason(reason) => {
-                    turn_end_reason = Some(reason);
-                }
-                MessagePart::Usage(u) => {
-                    usage = Some(match usage {
-                        Some(prev) => prev.merge(u),
-                        None => u,
-                    });
-                }
-            }
+        while let Some(part) = stream.next().await {
+            accumulator.push(&part?)?;
         }
-
-        let content = content
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing content block at index {i}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let tool_uses = tool_uses
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                let incomplete = slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing tool use at index {i}"
-                    ))
-                })?;
-                incomplete.try_into()
-            })
-            .collect::<Result<Vec<ToolUse>, GenerateError>>()?;
-
-        let turn_end_reason = turn_end_reason.ok_or_else(|| {
-            GenerateError::MalformedResponseError(
-                "Malformed stream: no turn end reason provided".into(),
-            )
-        })?;
-
-        Ok(GenerateOutput {
-            content,
-            tool_uses,
-            turn_end_reason,
-            usage,
-        })
+        accumulator.finish()
     }
-}
-
-fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize, value: T) {
-    while slots.len() <= index {
-        slots.push(None);
-    }
-    slots[index] = Some(value);
-}
-
-/// The empty [`Content`] block a [`ContentStart`] opens, with its index.
-fn start_block(start: ContentStart) -> (usize, Content) {
-    match start {
-        ContentStart::Text { index } => (
-            index,
-            Content::Text {
-                text: String::new(),
-            },
-        ),
-        ContentStart::Image { index } => (
-            index,
-            Content::Image {
-                source: String::new(),
-            },
-        ),
-        ContentStart::Thinking {
-            index,
-            signature,
-            redacted,
-        } => (
-            index,
-            Content::Thinking {
-                text: String::new(),
-                signature,
-                redacted,
-            },
-        ),
-    }
-}
-
-/// Append a [`ContentDelta`] to its opened block; the slot must exist and be
-/// the matching kind (redacted thinking swallows its deltas).
-fn apply_content_delta(
-    content: &mut [Option<Content>],
-    delta: ContentDelta,
-) -> Result<(), GenerateError> {
-    let index = match &delta {
-        ContentDelta::Text { index, .. }
-        | ContentDelta::Image { index, .. }
-        | ContentDelta::Thinking { index, .. } => *index,
-    };
-    match (content.get_mut(index).and_then(Option::as_mut), delta) {
-        (Some(Content::Text { text }), ContentDelta::Text { delta, .. }) => text.push_str(&delta),
-        (Some(Content::Image { source }), ContentDelta::Image { delta, .. }) => {
-            source.push_str(&delta);
-        }
-        (Some(Content::Thinking { text, redacted, .. }), ContentDelta::Thinking { delta, .. }) => {
-            if !*redacted {
-                text.push_str(&delta);
-            }
-        }
-        _ => {
-            return Err(GenerateError::MalformedResponseError(format!(
-                "Malformed stream: content delta at index {index}: out of bounds or wrong kind"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1100,7 +951,7 @@ mod tests {
             protocol,
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
-            max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            max_image_base64_bytes: 5 * 1024 * 1024,
             max_truncated_resumes: 3,
             auto_compact_at_tokens: None,
         }
@@ -1212,85 +1063,62 @@ mod tests {
             matches!(err, GenerateError::RequestTooLargeError(_)),
             "{err:?}"
         );
-        assert_eq!(err.recovery(), Recovery::RewindLastUserTurn);
+        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
         assert!(err.to_string().contains("the limit is 30 MiB"), "{err}");
     }
 
-    /// Known provider size rejections keep their actionable error even though
-    /// rewind is now the recovery default.
+    /// A provider that rejects the size itself lands on the same variant, so
+    /// the caller rewinds whether the cap was caught locally or remotely.
     #[test]
-    fn provider_size_rejections_get_an_actionable_error() {
+    fn provider_size_rejections_map_to_the_same_recovery() {
         let too_large = http_error(
             reqwest::StatusCode::PAYLOAD_TOO_LARGE,
             "HTTP 413: too big".into(),
         );
-        assert!(matches!(too_large, GenerateError::RequestTooLargeError(_)));
+        assert_eq!(too_large.recovery(), Recovery::OmitLastMessage);
 
         // Anthropic reports it as a 400 whose body names the error type.
         let named = http_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"HTTP 400: {"error":{"type":"request_too_large"}}"#.into(),
         );
-        assert!(matches!(named, GenerateError::RequestTooLargeError(_)));
+        assert_eq!(named.recovery(), Recovery::OmitLastMessage);
 
-        // Others name no type and only describe the size in prose.
+        // Others name no type and only describe the size in prose. Read as a
+        // generic failure this is resent unchanged on every later turn.
         let described = http_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"HTTP 400: {"error":{"code":400,"message":"The message size (31271377 bytes) \
                exceeds 30.000MB limit.","status":"FAILED_PRECONDITION"}}"#
                 .into(),
         );
-        assert!(matches!(described, GenerateError::RequestTooLargeError(_)));
-    }
+        assert_eq!(described.recovery(), Recovery::OmitLastMessage);
 
-    #[test]
-    fn generation_errors_rewind_unless_explicitly_transient() {
-        for err in [
-            GenerateError::ExecutionError("unknown".into()),
-            GenerateError::RefusalError("refused".into()),
-            GenerateError::MalformedResponseError("malformed".into()),
-            GenerateError::RequestTooLargeError("too large".into()),
-        ] {
-            assert_eq!(err.recovery(), Recovery::RewindLastUserTurn, "{err}");
-        }
-
-        let transient = GenerateError::TransientError("overloaded".into());
-        assert_eq!(transient.recovery(), Recovery::Retry);
-    }
-
-    #[test]
-    fn image_extent_rejection_uses_the_default_rewind() {
-        let err = http_error(
+        let extent = http_error(
             reqwest::StatusCode::BAD_REQUEST,
-            r#"HTTP 400: {"error":{"type":"invalid_request_error","message":"At least one \
-               of the image dimensions exceed max allowed size for many-image requests: \
-               2576 pixels"}}"#
-                .into(),
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.13.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2576 pixels"}}"#.into(),
         );
+        assert_eq!(extent.recovery(), Recovery::OmitLastMessage);
 
-        assert!(matches!(err, GenerateError::ExecutionError(_)), "{err:?}");
-        assert_eq!(err.recovery(), Recovery::RewindLastUserTurn);
+        let unrelated = http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "HTTP 500: overloaded".into(),
+        );
+        assert_eq!(unrelated.recovery(), Recovery::Retry);
     }
 
+    /// Reading the body is how a size rejection is recognized, so an ordinary
+    /// failure must not be mistaken for one: rewinding drops a user message,
+    /// which is destructive when the request was never too big.
     #[test]
-    fn structured_provider_errors_retain_turn_only_for_known_transients() {
-        for detail in [
-            serde_json::json!({"type": "overloaded_error"}),
-            serde_json::json!({"code": "rate_limit_exceeded"}),
-            serde_json::json!({"code": "request_timeout"}),
-            serde_json::json!({"status": 503}),
+    fn ordinary_failures_are_not_read_as_size_rejections() {
+        for body in [
+            r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
+            r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
+            r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
         ] {
-            let err = provider_stream_error("provider failed".into(), Some(&detail));
-            assert_eq!(err.recovery(), Recovery::Retry, "{detail}");
-        }
-
-        for detail in [
-            serde_json::json!({"type": "invalid_request_error"}),
-            serde_json::json!({"code": "unknown"}),
-            serde_json::json!({"message": "overloaded"}),
-        ] {
-            let err = provider_stream_error("provider failed".into(), Some(&detail));
-            assert_eq!(err.recovery(), Recovery::RewindLastUserTurn, "{detail}");
+            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
+            assert_eq!(err.recovery(), Recovery::Retry, "{body}");
         }
     }
 
@@ -1336,14 +1164,23 @@ mod tests {
     }
 }
 
-/// What a caller does with the user turn after generation fails.
+/// What a caller can do about a failed turn.
+///
+/// Failures that are a property of the *history* cannot be fixed by trying
+/// again — every later turn resends that history and fails the same way, which
+/// wedges the session. This is the top-level signal for those: it says whether
+/// the last user message has to come back out (see
+/// the chat adapter's rewind operation) before the conversation
+/// can continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// An explicitly transient failure left the turn safe to retain.
+    /// Nothing about the history is known to be at fault; resubmitting as-is
+    /// may work (provider blip, refusal, malformed stream).
     Retry,
-    /// Rewind the last user turn, leaving the conversation at the previous turn
-    /// boundary.
-    RewindLastUserTurn,
+    /// The request is too big for the provider. Retrying unchanged fails
+    /// identically — drop the last user message (typically the one carrying an
+    /// oversized attachment) and the session can go on.
+    OmitLastMessage,
 }
 
 /// Ceiling on one serialized API request body, checked before upload.
@@ -1352,16 +1189,11 @@ pub enum Recovery {
 /// attachments accumulate in history — so a session that was fine for several
 /// turns can cross the cap and then fail on *every* subsequent turn. Checking
 /// locally, with headroom under the provider's number, turns a confusing 413
-/// after a multi-megabyte upload into an immediate rewind.
+/// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
 pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {
-    /// Explicitly retryable transport or provider failure. This is the only
-    /// generation error that preserves the last user turn.
-    #[error("Generation was interrupted by a transient failure: {0}")]
-    TransientError(String),
-
     #[error("Something went wrong while generating a response: {0}")]
     ExecutionError(String),
 
@@ -1380,10 +1212,10 @@ pub enum GenerateError {
 impl GenerateError {
     pub fn recovery(&self) -> Recovery {
         match self {
-            GenerateError::TransientError(_) => Recovery::Retry,
-            // Rewind is deliberately the default. A new error must earn turn
-            // retention by being classified as transient at its source.
-            _ => Recovery::RewindLastUserTurn,
+            GenerateError::RequestTooLargeError(_) => Recovery::OmitLastMessage,
+            GenerateError::ExecutionError(_)
+            | GenerateError::RefusalError(_)
+            | GenerateError::MalformedResponseError(_) => Recovery::Retry,
         }
     }
 }
@@ -1396,8 +1228,8 @@ pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), Gener
     if len > MAX_REQUEST_BYTES {
         return Err(GenerateError::RequestTooLargeError(format!(
             "the {provider} request is {:.1} MiB; the limit is {} MiB. \
-             Attached images stay in the conversation and add up — resubmit the \
-             rewound turn with fewer images (or start a new session) to get back under it",
+             Attached images stay in the conversation and add up — drop the last \
+             message (or start a new session) to get back under it",
             len as f64 / (1024.0 * 1024.0),
             MAX_REQUEST_BYTES / (1024 * 1024),
         )));
@@ -1405,51 +1237,19 @@ pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), Gener
     Ok(())
 }
 
-/// Map a non-transient provider HTTP failure to the right error variant: a size
-/// rejection gets a more actionable message than the default execution error.
+/// Map a provider HTTP status to the right error variant: a size rejection is
+/// not a generic failure.
 ///
 /// 413 is unambiguous. Everything else has to be read out of the body, because
 /// providers disagree on how they report an oversized request: some name a
 /// machine-readable type (`request_too_large`), others return a 400 whose body
-/// only describes the size in prose.
+/// only describes the size in prose. Getting this wrong is expensive — the
+/// identical body is resent on every later turn, so a size failure classified
+/// as [`Recovery::Retry`] never triggers the rewind and the session fails
+/// forever.
 pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || describes_a_size_rejection(&message) {
         GenerateError::RequestTooLargeError(message)
-    } else {
-        GenerateError::ExecutionError(message)
-    }
-}
-
-/// Classify a structured provider stream error. Only known transient codes
-/// retain the user turn; absent or unfamiliar fields follow the rewind default.
-pub(crate) fn provider_stream_error(
-    message: String,
-    detail: Option<&serde_json::Value>,
-) -> GenerateError {
-    let transient = detail.is_some_and(|detail| {
-        ["type", "code", "status"]
-            .into_iter()
-            .filter_map(|field| detail.get(field))
-            .any(|code| match code {
-                serde_json::Value::Number(code) => code
-                    .as_u64()
-                    .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code)),
-                serde_json::Value::String(code) => matches!(
-                    code.as_str(),
-                    "overloaded_error"
-                        | "rate_limit_error"
-                        | "rate_limit_exceeded"
-                        | "request_timeout"
-                        | "server_error"
-                        | "service_unavailable"
-                        | "timeout"
-                ),
-                _ => false,
-            })
-    });
-
-    if transient {
-        GenerateError::TransientError(message)
     } else {
         GenerateError::ExecutionError(message)
     }
@@ -1465,4 +1265,7 @@ fn describes_a_size_rejection(message: &str) -> bool {
     message.contains("too_large")
         || message.contains("too large")
         || (message.contains("size") && message.contains("exceeds"))
+        || (message.contains("image dimensions")
+            && message.contains("exceed")
+            && message.contains("max allowed size"))
 }
