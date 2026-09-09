@@ -1262,7 +1262,7 @@ async fn session_foreign_owner_rejected() {
     .await;
     assert!(write.is_error, "foreign write should fail");
     assert!(
-        result_text(&write).contains("owned by another agent"),
+        result_text(&write).contains("owned by another myco session"),
         "{}",
         result_text(&write)
     );
@@ -1521,7 +1521,7 @@ async fn signal_rejects_foreign_owner() {
     .await;
     assert!(signal.is_error, "expected error: {}", result_text(&signal));
     assert!(
-        result_text(&signal).contains("owned by another agent"),
+        result_text(&signal).contains("owned by another myco session"),
         "{}",
         result_text(&signal)
     );

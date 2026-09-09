@@ -163,6 +163,13 @@ fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -
     block
 }
 
+pub fn thread_stamp(session_id: &str, thread_id: &str, started_at: DateTime<Utc>) -> String {
+    format!(
+        "{}- Thread id: `{thread_id}`. Use `session_history` with `session_id` and `thread_id` to read this thread or older threads.\n",
+        session_stamp(session_id, started_at)
+    )
+}
+
 /// Whether a user-message text block is a [`session_stamp`] rather than the
 /// user's own words. Session labels and search snippets read the first user
 /// message, and the stamp is myco's payload, not something anyone typed.

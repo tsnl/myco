@@ -2,8 +2,6 @@
 //! client construction, the spawned generate task (channel + request + stream
 //! bridge), the SSE drive loop, and stream-index remapping.
 
-use crate::core::*;
-
 use super::*;
 
 /// Build a driver's HTTP client: JSON content type, provider `extra_headers`,
@@ -75,53 +73,39 @@ pub(super) fn validate_finish<'a>(
     Ok(())
 }
 
-pub(super) fn error_stream(e: GenerateError) -> AsyncStream<Result<MessagePart, GenerateError>> {
-    Box::pin(futures::stream::once(async move { Err(e) }))
+pub(super) fn error_stream(e: GenerateError) -> AsyncStream<GenerationEvent> {
+    Box::pin(futures::stream::once(async move {
+        GenerationEvent::Failure(GenerationFailure::terminal(e))
+    }))
 }
 
 /// Send `request` in a spawned task and bridge its SSE stream into the
-/// [`GenerativeModel::generate`] stream shape. Dropping the returned stream
-/// cancels generation: the task's channel sends fail, it returns, and the HTTP
-/// body drops so the provider stops generating/billing.
+/// [`GenerativeModel::generate`] stream shape. The receiver owns the request
+/// lifetime, including time spent awaiting headers or body bytes. It never retries.
 pub(super) fn spawn_generate<A: SseAccumulator>(
     request: reqwest::RequestBuilder,
     acc: A,
     provider: &'static str,
     debug_dump_api_requests: bool,
-    retry: RetryPolicy,
-) -> AsyncStream<Result<MessagePart, GenerateError>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<MessagePart, GenerateError>>(32);
+) -> AsyncStream<GenerationEvent> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<GenerationEvent>(32);
 
     tokio::spawn(async move {
-        let result = async {
-            // Build first so the composed body can be measured: providers cap
-            // the whole request, and images accumulate in history, so a session
-            // can cross the cap turns after the attachment was sent. Rejecting
-            // here beats a 413 after a multi-megabyte upload.
-            let (client, request) = request.build_split();
-            let request = request.map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
-            if let Some(body) = request.body().and_then(|b| b.as_bytes()) {
-                if debug_dump_api_requests {
-                    // The exact serialized body, dumped before the size check
-                    // so an over-limit request can still be inspected.
-                    eprintln!("{}", String::from_utf8_lossy(body));
+        let generate = async {
+            let (client, request) = prepare_request(request, provider, debug_dump_api_requests)
+                .map_err(GenerationFailure::terminal)?;
+            let response = attempt_send(&client, request, provider).await?;
+            drive_sse_stream(response, &tx, acc, provider)
+                .await
+                .map_err(GenerationFailure::terminal)
+        };
+        tokio::select! {
+            _ = tx.closed() => {}
+            result = generate => {
+                if let Err(e) = result {
+                    let _ = tx.send(GenerationEvent::Failure(e)).await;
                 }
-                check_request_size(body.len(), provider)?;
             }
-            let response = send_with_retry(
-                &client,
-                request,
-                provider,
-                retry,
-                &tx,
-                debug_dump_api_requests,
-            )
-            .await?;
-            drive_sse_stream(response, &tx, acc, provider).await
-        }
-        .await;
-        if let Err(e) = result {
-            let _ = tx.send(Err(e)).await;
         }
     });
 
@@ -130,65 +114,20 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     }))
 }
 
-/// How one send attempt ended.
-enum Attempt {
-    Ok(reqwest::Response),
-    /// Might succeed if sent again; carries the provider's `Retry-After` when
-    /// it named one.
-    Transient(GenerateError, Option<std::time::Duration>),
-    /// Deterministic — the identical request fails the identical way.
-    Fatal(GenerateError),
-}
-
-/// Send, retrying transient failures per `retry`.
-///
-/// Retry lives here, ahead of [`drive_sse_stream`], because this is the last
-/// point at which nothing has reached the consumer yet. A failure *during* the
-/// stream cannot be retried: parts already emitted would be replayed as
-/// duplicates, so those still surface to the agent as a turn-ending error.
-async fn send_with_retry(
-    client: &reqwest::Client,
-    request: reqwest::Request,
+fn prepare_request(
+    builder: reqwest::RequestBuilder,
     provider: &str,
-    retry: RetryPolicy,
-    tx: &tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
     debug: bool,
-) -> Result<reqwest::Response, GenerateError> {
-    let mut attempt: u32 = 1;
-    loop {
-        // A body reqwest cannot clone cannot be replayed either; send the
-        // original and report whatever it gives.
-        let Some(this_attempt) = request.try_clone() else {
-            return match attempt_send(client, request, provider).await {
-                Attempt::Ok(response) => Ok(response),
-                Attempt::Transient(e, _) | Attempt::Fatal(e) => Err(e),
-            };
-        };
-
-        let (error, retry_after) = match attempt_send(client, this_attempt, provider).await {
-            Attempt::Ok(response) => return Ok(response),
-            Attempt::Fatal(e) => return Err(e),
-            Attempt::Transient(e, retry_after) => (e, retry_after),
-        };
-
-        if attempt >= retry.max_attempts {
-            return Err(error);
-        }
-        let wait = retry.backoff(attempt + 1, retry_after);
+) -> Result<(reqwest::Client, reqwest::Request), GenerateError> {
+    let (client, request) = builder.build_split();
+    let request = request.map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
+    if let Some(body) = request.body().and_then(|body| body.as_bytes()) {
         if debug {
-            eprintln!(
-                "{provider}: attempt {attempt}/{} failed ({error}); retrying in {wait:?}",
-                retry.max_attempts
-            );
+            eprintln!("{}", String::from_utf8_lossy(body));
         }
-        // Ctrl-C during a long backoff drops the consumer; notice that instead
-        // of sleeping the wait out before the turn can end.
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = tx.closed() => return Err(error),
-        }
-        attempt += 1;
+        check_request_size(body.len(), provider)?;
     }
+    Ok((client, request))
 }
 
 /// One send. A non-success status is mapped to an error carrying the response
@@ -199,15 +138,20 @@ async fn attempt_send(
     client: &reqwest::Client,
     request: reqwest::Request,
     provider: &str,
-) -> Attempt {
+) -> Result<reqwest::Response, GenerationFailure> {
     let response = match client.execute(request).await {
         Ok(response) => response,
         // Transport-level: DNS, connect, TLS, idle timeout. Nothing about the
         // request is known to be at fault, so another attempt is worthwhile.
-        Err(e) => return Attempt::Transient(GenerateError::ExecutionError(format!("{e:?}")), None),
+        Err(e) => {
+            return Err(GenerationFailure::transient(
+                GenerateError::ExecutionError(format!("{provider} request failed: {e:?}")),
+                None,
+            ));
+        }
     };
     if response.status().is_success() {
-        return Attempt::Ok(response);
+        return Ok(response);
     }
     let status = response.status();
     let retry_after = parse_retry_after(response.headers());
@@ -220,9 +164,9 @@ async fn attempt_send(
         format!("{provider} API returned HTTP {status}: {body}"),
     );
     if is_transient_status(status) {
-        Attempt::Transient(error, retry_after)
+        Err(GenerationFailure::transient(error, retry_after))
     } else {
-        Attempt::Fatal(error)
+        Err(GenerationFailure::terminal(error))
     }
 }
 
@@ -246,11 +190,15 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 
 async fn drive_sse_stream<A: SseAccumulator>(
     response: reqwest::Response,
-    tx: &tokio::sync::mpsc::Sender<Result<MessagePart, GenerateError>>,
+    tx: &tokio::sync::mpsc::Sender<GenerationEvent>,
     mut acc: A,
     provider: &str,
 ) -> Result<(), GenerateError> {
-    if tx.send(Ok(MessagePart::MessageStart)).await.is_err() {
+    if tx
+        .send(GenerationEvent::Part(MessagePart::MessageStart))
+        .await
+        .is_err()
+    {
         // Consumer dropped (turn cancelled): stop reading so the response
         // body drops and the provider stops generating/billing.
         return Ok(());
@@ -266,7 +214,7 @@ async fn drive_sse_stream<A: SseAccumulator>(
 
         for data in sse.push(&chunk) {
             for item in acc.handle_data(&data)? {
-                if tx.send(Ok(item)).await.is_err() {
+                if tx.send(GenerationEvent::Part(item)).await.is_err() {
                     return Ok(());
                 }
             }

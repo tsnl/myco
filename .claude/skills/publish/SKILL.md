@@ -13,9 +13,10 @@ metadata:
 
 # Publish myco
 
-Ship a version of **myco** using GitHub Actions workflow **Publish**
-(`.github/workflows/publish.yml`), which runs
-`tsnl/semver-bump-and-cargo-publish@v1` then creates a GitHub Release.
+Ship a coordinated version of **myco-model**, **myco-agent**, and **myco**
+using GitHub Actions workflow **Publish** (`.github/workflows/publish.yml`).
+It verifies the workspace packages before committing, tagging, publishing,
+and creating a GitHub Release.
 
 Do **not** hand-edit `Cargo.toml` version or run `cargo publish` locally unless
 the user explicitly overrides this skill.
@@ -35,12 +36,12 @@ the user explicitly overrides this skill.
    - `CARGO_REGISTRY_TOKEN` — crates.io API token
    - `PAT_TOKEN` — fine-grained PAT with **contents: write** (push version
      commit + tag) on this repo
-4. **crates.io metadata**: root `Cargo.toml` must set `license` (currently
+4. **crates.io metadata**: workspace packages must inherit `license` (currently
    `MIT`) and ship a matching `LICENSE` file. If either is missing, stop and
    fix before a real publish (or dry-run only).
 5. **Branch protection**: `main` requires CI + one review for human merges;
-   the publish bot uses `PAT_TOKEN` and may need admin/bypass if push fails —
-   confirm with the user.
+   the publish bot uses `PAT_TOKEN`. A rejected push stops the release;
+   do not bypass branch protection.
 
 ## How to run the workflow
 
@@ -73,7 +74,7 @@ Inputs (must match the workflow):
 
 | Input | Values | Notes |
 |-------|--------|--------|
-| `branch` | e.g. `main` | Branch to checkout and bump |
+| `branch` | `main` for real releases | Other branches support dry runs |
 | `bump_type` | `patch` / `minor` / `major` | Semver |
 | `dry_run` | `true` / `false` | Default in UI is dry-run |
 | `release_notes` | markdown string | Optional; prepended to the GitHub Release body above the install boilerplate |
@@ -108,8 +109,7 @@ from that file:
 - Remove the request file (and notes file, if desired) from the branch
   once the release is verified.
 
-The semver action (v1.0.4+, pinned by SHA in publish.yml) waits for
-check runs on the publish branch's checked-out HEAD — for `main`, the
+The workflow waits for check runs on the publish branch's checked-out HEAD — for `main`, the
 checks its CI push run already produced — so no CI configuration is
 needed on the request branch itself.
 
@@ -130,7 +130,7 @@ Ask the user if unclear. Default suggestion for routine ship: **patch**.
 4. On dry-run success, run again with `dry_run=false` and the agreed `bump_type`.
 5. Verify:
    - New git tag and version commit on the branch
-   - [crates.io/crates/myco](https://crates.io/crates/myco) shows the version
+   - crates.io shows the version for `myco-model`, `myco-agent`, and `myco`
    - GitHub Release exists for the tag
 6. Tell the user install lines:
 
@@ -144,10 +144,13 @@ cargo install --git https://github.com/tsnl/myco --tag <tag> --locked
 
 1. Checkout `branch` with `PAT_TOKEN`
 2. Wait for check-runs named `Check Formatting`, `Lint`, `Test` (see
-   `wait_for_checks` in the workflow; not the `CI / …` protection strings)
-3. Bump version in `Cargo.toml` / lockfile, commit, tag
-4. `cargo publish` when not dry-run and on main
-5. Create GitHub Release notes (when published)
+   `scripts/release.py`; not the `CI / …` protection strings)
+3. Bump `[workspace.package].version`, exact internal dependency pins,
+   and the workspace lockfile
+4. Verify all archives with `cargo publish --workspace --dry-run --locked --allow-dirty`
+5. When not dry-run, commit and tag, push both atomically, and run
+   `cargo publish --workspace --locked` in dependency order
+6. Create the GitHub Release after every package is published
 
 Source of truth: `.github/workflows/publish.yml`.
 
@@ -159,7 +162,13 @@ Source of truth: `.github/workflows/publish.yml`.
 | crates.io reject / license | Add `license` + LICENSE file; dry-run still validates much of the path |
 | Push rejected | `PAT_TOKEN` scopes; branch protection |
 | Secrets missing | Workflow fails early — add `CARGO_REGISTRY_TOKEN` and `PAT_TOKEN` |
-| Dry-run OK, real publish fails | Read publish job log; action may roll back version commit on crates.io failure |
+| Dry-run OK, real publish fails | Inspect which packages reached crates.io; preserve the release commit and tag |
+
+Registry publication is not atomic. After a partial upload, publish only missing
+packages from the retained release tag with `cargo publish -p <package> --locked`,
+in order `myco-model`, `myco-agent`, `myco`. This recovery is the exception to the
+local-publishing rule above and requires the user's release authorization.
+Finish the GitHub Release after all packages exist. Never roll back published versions.
 
 ## Out of scope
 

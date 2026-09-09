@@ -181,7 +181,7 @@ mod tests {
     fn saved_session(model: &str, title: &str, user_text: &str) -> Session {
         let mut s = Session::new(model);
         s.title = Some(title.to_string());
-        s.messages.push(Message::UserMessage {
+        s.active_thread_mut().messages.push(Message::UserMessage {
             content: vec![Content::Text {
                 text: user_text.to_string(),
             }],

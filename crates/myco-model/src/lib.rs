@@ -1,11 +1,19 @@
+//! Backend-independent messages and one-attempt streaming model drivers.
+
 use std::{pin::pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
-use crate::core::*;
+pub type AsyncStream<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
+
+#[cfg(test)]
+mod test_support;
 
 mod anthropic;
 pub use anthropic::AnthropicBackendConfig;
+
+mod accumulator;
+pub use accumulator::MessageAccumulator;
 
 mod driver_core;
 
@@ -19,7 +27,8 @@ mod sse_parser;
 use sse_parser::SseParser;
 
 pub trait GenerativeModel: Send + Sync {
-    fn generate(&self, input: &[Message]) -> AsyncStream<Result<MessagePart, GenerateError>>;
+    /// One attempt. Failure ends the stream; dropping it cancels the request.
+    fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent>;
 }
 
 /// Wire protocol a model is served over.
@@ -121,14 +130,8 @@ impl ThinkingMode {
     }
 }
 
-/// How a driver retries a request that failed *before* any of the response
-/// reached the consumer.
-///
-/// Resolved from `[gateways.NAME.retry]` (see [`crate::config::RetryEntry`]).
-/// Retrying is only sound ahead of the stream: once parts have been emitted the
-/// consumer has seen them, and a second attempt would replay them as duplicates.
-/// Deterministic failures (a 400, a 413) are never retried — see
-/// [`crate::generative_model::driver_core`]'s send loop.
+/// Agent policy for retrying transient failures before any response parts arrive.
+/// Resolved from `[gateways.NAME.retry]` or `[models.KEY.retry]`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
     /// Total attempts including the first. `1` disables retry.
@@ -179,7 +182,7 @@ impl RetryPolicy {
 }
 
 /// A resolved model: everything the protocol drivers need, minus credentials
-/// (those live in [`BackendConfig`]). Built by `crate::config` from the
+/// (those live in [`BackendConfig`]). Built by the application configuration from the
 /// `[models]` / `[gateways]` catalog in config.toml — myco ships no built-in
 /// models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +206,7 @@ pub struct ModelSpec {
     /// How many consecutive `max_tokens` truncations one turn resumes through
     /// before handing control back (`0` never resumes). Resolved from the
     /// model's `max_truncated_resumes` or its default; the agent takes this
-    /// value via [`crate::agent::Agent::set_max_truncated_resumes`].
+    /// value via the agent's continuation policy.
     pub max_truncated_resumes: u32,
     /// Prompt size at which the REPL compacts without being asked. `None` =
     /// no auto-compaction (the default; `/compact` still works).
@@ -361,6 +364,13 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::Anthropic(config) => config.retry,
+            Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
+        }
+    }
+
     pub fn protocol(&self) -> Protocol {
         match self {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
@@ -572,6 +582,48 @@ fn mint_tool_id(message_index: usize, ordinal: usize) -> String {
     id
 }
 
+/// One generation attempt emits parts, or ends with a failure.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    Part(MessagePart),
+    Failure(GenerationFailure),
+}
+
+impl GenerationEvent {
+    pub fn into_result(self) -> Result<MessagePart, GenerateError> {
+        match self {
+            Self::Part(part) => Ok(part),
+            Self::Failure(failure) => Err(failure.cause),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationFailure {
+    pub cause: GenerateError,
+    /// A transient cause; the caller must also ensure no response parts were emitted.
+    pub retryable: bool,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl GenerationFailure {
+    pub fn terminal(cause: GenerateError) -> Self {
+        Self {
+            cause,
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    pub fn transient(cause: GenerateError, retry_after: Option<std::time::Duration>) -> Self {
+        Self {
+            cause,
+            retryable: true,
+            retry_after,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
     MessageStart,
@@ -665,223 +717,22 @@ pub struct GenerateOutput {
 }
 
 impl GenerateOutput {
+    pub async fn from_generation(
+        stream: impl Stream<Item = GenerationEvent>,
+    ) -> Result<Self, GenerateError> {
+        Self::from_stream(stream.map(GenerationEvent::into_result)).await
+    }
+
     pub async fn from_stream(
         stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
     ) -> Result<Self, GenerateError> {
-        Self::from_stream_with_hook(stream, |_| {}).await
-    }
-
-    /// Accumulate a generation stream, invoking `on_part` for each successfully parsed part
-    /// (including the initial `MessageStart`).
-    pub async fn from_stream_with_hook(
-        stream: impl Stream<Item = Result<MessagePart, GenerateError>>,
-        mut on_part: impl FnMut(&MessagePart),
-    ) -> Result<Self, GenerateError> {
-        struct IncompleteToolUse {
-            name: String,
-            input_json: String,
-        }
-
-        impl TryInto<ToolUse> for IncompleteToolUse {
-            type Error = GenerateError;
-
-            fn try_into(self) -> Result<ToolUse, Self::Error> {
-                let input = if self.input_json.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&self.input_json).map_err(|e| {
-                        GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use input JSON is invalid: {e}"
-                        ))
-                    })?
-                };
-                Ok(ToolUse {
-                    name: self.name,
-                    input,
-                })
-            }
-        }
-
-        let mut content: Vec<Option<Content>> = Vec::new();
-        let mut tool_uses: Vec<Option<IncompleteToolUse>> = Vec::new();
-        let mut turn_end_reason = None;
-        let mut usage: Option<TokenUsage> = None;
-
+        let mut accumulator = MessageAccumulator::default();
         let mut stream = pin!(stream);
-
-        let Some(try_item) = stream.next().await else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: empty stream. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        let first = try_item?;
-        let MessagePart::MessageStart = &first else {
-            return Err(GenerateError::MalformedResponseError(
-                concat!(
-                    "Malformed stream: first item is not MessageStart. ",
-                    "Did you accidentally drain the stream already?"
-                )
-                .into(),
-            ));
-        };
-        on_part(&first);
-
-        while let Some(item) = stream.next().await {
-            let item = item?;
-            on_part(&item);
-            match item {
-                MessagePart::MessageStart => {
-                    return Err(GenerateError::MalformedResponseError(
-                        "Malformed stream: unexpected MessageStart".into(),
-                    ));
-                }
-                MessagePart::ContentStart(start) => {
-                    let (index, block) = start_block(start);
-                    ensure_slot(&mut content, index, block);
-                }
-                MessagePart::ContentDelta(delta) => apply_content_delta(&mut content, delta)?,
-                MessagePart::ToolUseStart(ToolUseStart { index, name }) => {
-                    ensure_slot(
-                        &mut tool_uses,
-                        index,
-                        IncompleteToolUse {
-                            name,
-                            input_json: String::new(),
-                        },
-                    );
-                }
-                MessagePart::ToolUseDelta(ToolUseDelta {
-                    index,
-                    input_json_delta,
-                }) => {
-                    let Some(Some(tool_use)) = tool_uses.get_mut(index) else {
-                        return Err(GenerateError::MalformedResponseError(format!(
-                            "Malformed stream: tool use delta index {index} is out of bounds"
-                        )));
-                    };
-                    tool_use.input_json.push_str(&input_json_delta);
-                }
-                MessagePart::TurnEndReason(reason) => {
-                    turn_end_reason = Some(reason);
-                }
-                MessagePart::Usage(u) => {
-                    usage = Some(match usage {
-                        Some(prev) => prev.merge(u),
-                        None => u,
-                    });
-                }
-            }
+        while let Some(part) = stream.next().await {
+            accumulator.push(&part?)?;
         }
-
-        let content = content
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing content block at index {i}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let tool_uses = tool_uses
-            .into_iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                let incomplete = slot.ok_or_else(|| {
-                    GenerateError::MalformedResponseError(format!(
-                        "Malformed stream: missing tool use at index {i}"
-                    ))
-                })?;
-                incomplete.try_into()
-            })
-            .collect::<Result<Vec<ToolUse>, GenerateError>>()?;
-
-        let turn_end_reason = turn_end_reason.ok_or_else(|| {
-            GenerateError::MalformedResponseError(
-                "Malformed stream: no turn end reason provided".into(),
-            )
-        })?;
-
-        Ok(GenerateOutput {
-            content,
-            tool_uses,
-            turn_end_reason,
-            usage,
-        })
+        accumulator.finish()
     }
-}
-
-fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize, value: T) {
-    while slots.len() <= index {
-        slots.push(None);
-    }
-    slots[index] = Some(value);
-}
-
-/// The empty [`Content`] block a [`ContentStart`] opens, with its index.
-fn start_block(start: ContentStart) -> (usize, Content) {
-    match start {
-        ContentStart::Text { index } => (
-            index,
-            Content::Text {
-                text: String::new(),
-            },
-        ),
-        ContentStart::Image { index } => (
-            index,
-            Content::Image {
-                source: String::new(),
-            },
-        ),
-        ContentStart::Thinking {
-            index,
-            signature,
-            redacted,
-        } => (
-            index,
-            Content::Thinking {
-                text: String::new(),
-                signature,
-                redacted,
-            },
-        ),
-    }
-}
-
-/// Append a [`ContentDelta`] to its opened block; the slot must exist and be
-/// the matching kind (redacted thinking swallows its deltas).
-fn apply_content_delta(
-    content: &mut [Option<Content>],
-    delta: ContentDelta,
-) -> Result<(), GenerateError> {
-    let index = match &delta {
-        ContentDelta::Text { index, .. }
-        | ContentDelta::Image { index, .. }
-        | ContentDelta::Thinking { index, .. } => *index,
-    };
-    match (content.get_mut(index).and_then(Option::as_mut), delta) {
-        (Some(Content::Text { text }), ContentDelta::Text { delta, .. }) => text.push_str(&delta),
-        (Some(Content::Image { source }), ContentDelta::Image { delta, .. }) => {
-            source.push_str(&delta);
-        }
-        (Some(Content::Thinking { text, redacted, .. }), ContentDelta::Thinking { delta, .. }) => {
-            if !*redacted {
-                text.push_str(&delta);
-            }
-        }
-        _ => {
-            return Err(GenerateError::MalformedResponseError(format!(
-                "Malformed stream: content delta at index {index}: out of bounds or wrong kind"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1100,7 +951,7 @@ mod tests {
             protocol,
             thinking: ThinkingMode::default_for(protocol),
             context_window_tokens: 1_000_000,
-            max_image_base64_bytes: crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+            max_image_base64_bytes: 5 * 1024 * 1024,
             max_truncated_resumes: 3,
             auto_compact_at_tokens: None,
         }
@@ -1313,7 +1164,7 @@ mod tests {
 /// again — every later turn resends that history and fails the same way, which
 /// wedges the session. This is the top-level signal for those: it says whether
 /// the last user message has to come back out (see
-/// [`crate::session::Agent::rewind_last_user_turn`]) before the conversation
+/// the chat adapter's rewind operation) before the conversation
 /// can continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
@@ -1335,7 +1186,7 @@ pub enum Recovery {
 /// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
 pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {
     #[error("Something went wrong while generating a response: {0}")]
     ExecutionError(String),

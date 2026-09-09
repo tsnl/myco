@@ -175,8 +175,34 @@ impl HostWorker {
         let cancels: Arc<Mutex<HashMap<String, CancelToken>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        self.serve_requests(&mut lines, &writer, &cancels, &mut in_flight)
+            .await?;
+
+        // EOF means the controller is gone. Cancel host work before joining so
+        // a lost SSH connection cannot leave a command running until its own
+        // (possibly much longer) timeout.
+        for cancel in cancels.lock().await.values() {
+            cancel.cancel();
+        }
+        while in_flight.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    async fn serve_requests<R, W>(
+        self: &Arc<Self>,
+        lines: &mut BufReader<R>,
+        writer: &Arc<Mutex<W>>,
+        cancels: &Arc<Mutex<HashMap<String, CancelToken>>>,
+        in_flight: &mut tokio::task::JoinSet<()>,
+    ) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: AsyncWriteExt + Unpin + Send + 'static,
+    {
         loop {
-            let line = match read_line(&mut lines).await {
+            // Reap between reads: cancelling a partial read_line can lose protocol bytes.
+            while in_flight.try_join_next().is_some() {}
+            let line = match read_line(lines).await {
                 Ok(l) => l,
                 Err(e) if e == "peer closed" => break,
                 Err(e) => return Err(e),
@@ -185,7 +211,7 @@ impl HostWorker {
             let msg = match Request::decode(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    let writer = Arc::clone(&writer);
+                    let writer = Arc::clone(writer);
                     in_flight.spawn(async move {
                         let err = Response::Error {
                             id: None,
@@ -209,8 +235,8 @@ impl HostWorker {
                     cancels.lock().await.insert(id.clone(), cancel.clone());
                     let request_id = id.clone();
                     let worker = Arc::clone(self);
-                    let writer = Arc::clone(&writer);
-                    let cancels = Arc::clone(&cancels);
+                    let writer = Arc::clone(writer);
+                    let cancels = Arc::clone(cancels);
                     in_flight.spawn(async move {
                         worker
                             .handle_request(
@@ -233,7 +259,7 @@ impl HostWorker {
                 }
                 other => {
                     let worker = Arc::clone(self);
-                    let writer = Arc::clone(&writer);
+                    let writer = Arc::clone(writer);
                     in_flight.spawn(async move {
                         worker.handle_request(writer, other, None).await;
                     });
@@ -241,13 +267,6 @@ impl HostWorker {
             }
         }
 
-        // EOF means the controller is gone. Cancel host work before joining so
-        // a lost SSH connection cannot leave a command running until its own
-        // (possibly much longer) timeout.
-        for cancel in cancels.lock().await.values() {
-            cancel.cancel();
-        }
-        while in_flight.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -305,6 +324,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_requests_are_reaped_before_peer_disconnects() {
+        let worker = Arc::new(HostWorker::new("test", Vec::new()));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let writer = Arc::new(Mutex::new(writer));
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let mut in_flight = tokio::task::JoinSet::new();
+
+        let exchange = async {
+            let mut replies = BufReader::new(&mut client);
+            for index in 0..8 {
+                let request = Request::ToolCall {
+                    id: index.to_string(),
+                    agent_id: uuid::Uuid::nil(),
+                    tool_use: ToolUse {
+                        name: "unknown".into(),
+                        input: serde_json::json!({}),
+                    },
+                };
+                replies
+                    .get_mut()
+                    .write_all(&request.encode().unwrap())
+                    .await
+                    .unwrap();
+                let mut reply = String::new();
+                replies.read_line(&mut reply).await.unwrap();
+                assert!(matches!(
+                    Response::decode(&reply).unwrap(),
+                    Response::ToolResult { id, .. } if id == index.to_string()
+                ));
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = worker.serve_requests(&mut reader, &writer, &cancels, &mut in_flight) => {
+                    panic!("worker stopped before the client disconnected: {result:?}");
+                }
+                _ = exchange => {}
+            }
+        })
+        .await
+        .expect("worker stopped responding");
+
+        assert!(
+            in_flight.len() <= 1,
+            "completed requests retained: {}",
+            in_flight.len()
+        );
+    }
 
     /// The static catalog and a live standard worker must advertise the same
     /// tools: [`HostWorker::standard_tool_specs`] is what routing trusts

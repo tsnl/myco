@@ -11,11 +11,13 @@ itself as an ordinary command (see below).
 `myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
 
 ```
-myco (interactive) / Agent
-  └── Harness (routing, config, root-configured services)
-        ├── HostController "local"   → in-process HostWorker (always on)
-        └── HostController "…"       → ssh … myco --mode host (lazy remote)
-              └── bash, str_replace_based_edit_tool, view_image (per host)
+myco (interactive) / chat adapter
+  ├── Agent (model context and run loop)
+  └── SessionRuntime (session binding + tool ownership)
+      └── Harness (routing, config, root-configured services)
+          ├── HostController "local"   → in-process HostWorker (always on)
+          └── HostController "…"       → ssh … myco --mode host (lazy remote)
+                └── bash, str_replace_based_edit_tool, view_image (per host)
 ```
 
 - **Agent process:** model, conversation history, cancel, event sink, and the in-process
@@ -39,13 +41,41 @@ myco (interactive) / Agent
   own id on the first message it adds, so the newest `# Session` block is the running session's.
   Remotes stay config/key-free hands.
 
+## Sessions and threads
+
+A **session** has a stable id, metadata, and an ordered set of **threads**. Each thread
+is a linear message history. Only the latest thread accepts new messages; an agent
+works on one thread at a time, and session turns and compaction share a writer gate.
+
+`/compact` creates a successor thread in the same session. Its first message contains
+the summary, followed by bounded recent context. The predecessor retains its original
+messages and tool output. Title, links, scratchpad, readline history, and console mirror
+remain attached to the same session.
+
+Live bash shells and editor read stamps belong to the **session runtime**, shared across
+threads and any replacement agent using that runtime. Compaction does not reset them.
+A recorded tool result remains an observation from its original thread: a shell or file
+may have changed since then. `/new` or switching to another session uses fresh tool
+ownership. Resuming saved history after process exit does not restore tools.
+
+Use `session_history` to read saved threads without loading all of them into context:
+
+- `{"session_id":"…","action":"threads"}` lists threads, newest first.
+- `{"session_id":"…","thread_id":"…","action":"stats"}` reports a thread and its predecessor.
+- `{"session_id":"…","thread_id":"…","action":"expand","index":12}` reads an original message.
+
+Omitting `thread_id` selects the active thread. Older threads are read-only.
+Session files use schema version 3; version 2 files load as one initial thread and are
+written as version 3 on the next save. Existing predecessor/successor session links
+remain metadata; separate saved sessions are not automatically combined.
+
 ## Config & paths
 
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
 | `~/.myco/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
-| `~/.myco/session/{shard}/{id}.json` | Conversation + metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
+| `~/.myco/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/session/{shard}/{id}.history` | Readline history for that session. |
 | `~/.myco/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
 | `~/.myco/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/prelude/` holds write-once prelude entries (edited via the root-only `prelude` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
@@ -198,7 +228,11 @@ streamed are retried (connection errors, 408, 429, and 5xx including Anthropic's
 surfaces immediately. A failure mid-stream is never retried either, because the
 already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
 is honoured when it asks for longer than the computed backoff, still bounded by
-`max_backoff_ms`.
+`max_backoff_ms`. The agent starts a fresh generation attempt for each retry;
+provider drivers perform one attempt and report failures. The interactive CLI
+shows a RETRY notice with the failure reason, next attempt number, and delay. Ctrl-C cancels the request,
+including retry waits. Notices appear in the console log, but are not added to
+conversation history.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:
@@ -228,7 +262,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 - Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
-- Bash `session_id`s are **per host** (and per agent id). Do not assume a session on `local`
+- Bash `session_id`s are **per host** and owned by a session runtime. Do not assume a session on `local`
   exists on `devbox`.
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
 - Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
@@ -344,4 +378,4 @@ workspace writes leave the shared prompt prefix intact for same-model forks.
 - You cannot invoke slash-commands; tell the user which to run.
 - Conversation resume ≠ restored bash sessions or editor state.
 - Bash sessions die when the host process exits (CLI exit, host crash, SSH drop). Local in-process
-  sessions die with the agent process.
+  sessions also end when their owning session runtime is released (for example, `/new`).

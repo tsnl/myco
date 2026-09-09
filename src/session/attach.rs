@@ -34,7 +34,7 @@ use crate::generative_model::Content;
 pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Expand `@<path>` image mentions in `input` into content blocks for
-/// `Agent::interact`: attached images first (providers prefer
+/// `chat::interact`: attached images first (providers prefer
 /// image-before-text), then the input text exactly as typed. Repeated
 /// mentions of one path attach it once. Any unreadable, oversized, or
 /// non-image file fails the whole message so the user can fix it and resubmit —

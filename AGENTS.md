@@ -69,11 +69,13 @@ hosts, or lies about resume.
 ## Architecture (current)
 
 ```
-myco (interactive) / Agent
-  └── Harness (routing, config, root-only services)
-        ├── HostController "local"  → in-process HostWorker (always on)
-        └── HostController "…"      → ssh … myco --mode host (lazy remote)
-              └── standard tools: bash, editor, view_image
+myco (interactive) / chat adapter
+  ├── Agent (myco-agent) → GenerativeModel (myco-model)
+  └── SessionRuntime (session binding + ToolExecutor)
+      └── Harness (host routing)
+          ├── HostController "local"  → in-process HostWorker (always on)
+          └── HostController "…"      → ssh … myco --mode host (lazy remote)
+                └── standard tools: bash, editor, view_image
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
@@ -88,14 +90,16 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
-| `src/core/` | Bottom layer, depends on nothing: `Async`/`AsyncStream` aliases, `CancelToken`, image decoding, and the filesystem primitives every layer needs — `myco_home()` and `atomically_write()` |
+| `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
-| `src/agent/` | The agent runtime: one turn driven to completion (`Agent::interact`), the `AgentEvent` / `EventSink` stream, and the `/compact` worker |
-| `src/session/` | Session persistence only: documents under `~/.myco/session/`, metadata, search, the single-writer lock, and the compaction *document* logic |
+| `crates/myco-agent/` | Headless model/tool execution through `GenerativeModel`, `ToolExecutor`, and `EventSink`; no application dependency |
+| `src/session_runtime.rs` | Binds agents to a session, implements `ToolExecutor` over Harness, and owns live tools across thread changes |
+| `src/chat/` | Session-turn submission, checkpoints, recovery, and the `/compact` worker; operates on a separately owned agent |
+| `src/session/` | Persistent sessions: ordered `Thread` histories, shared metadata, search, writer locks, and compaction document logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `src/generative_model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `crates/myco-model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + prelude / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/prelude.rs` | The agent prelude (always-in-prompt knowledge, not a Rust re-export module): maildir-style write-once entries under `~/.myco/workspace/prelude/`, rendered into every prompt and edited via the root-only `prelude` tool |
@@ -110,7 +114,11 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Standard tool catalog is the same on every host**; root-only tools
   (`session_meta`, `prelude`) are installed only on the in-process local worker.
 - **Tool field `host`** defaults to `local`; bash sessions are **per host**
-  (and per agent id).
+  (and per session runtime owner).
+- **Compaction creates a thread, not a session.** Only the latest thread accepts
+  messages; older threads retain their original observations. Session turns and
+  compaction share a writer gate; stale checkpoints are rejected. Live tools
+  belong to `SessionRuntime`, whose lifetime is independent of any one agent.
 - **Conversation resume ≠ restored bash/editor state** — document honesty;
   don’t fake rehydration.
 - **Builds are offline** beyond the crates.io fetch — `build.rs` shells out to
@@ -120,14 +128,13 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 - **Local and remote myco run the same version** — connect fails loud on
   package-version skew, which is what keeps the assumed tool catalog and the
   NDJSON protocol sound.
-- **The module graph is acyclic.** Bottom-up: `core` → `generative_model` →
-  `manual` → `prelude` → `prompts` → `session` → `tool_services` → `host` →
-  `harness` → `agent` → `tui`. A module reaching *up* that list is the smell;
-  the fix is
-  usually that the shared thing belongs lower down (`myco_home` in `core`, not
-  `session`) or that the caller wants data instead of rendering
-  (`StartupPreflight::warning_body`, not a WARNING block). `#[cfg(test)]` may
-  reach anywhere — test setup composes real layers on purpose.
+- **The crate graph is acyclic:** `myco-model` → `myco-agent` → `myco`.
+  Application modules compose the lower crates through their public interfaces;
+  lower crates must not depend on the application, including in tests.
+  Within `myco`, dependencies flow through `core` → `manual` → `prelude` →
+  `prompts` → `session` → `tool_services` → `host` → `harness` →
+  `session_runtime` → `chat` → `tui`. Shared data belongs below its callers;
+  rendering belongs above the data it presents.
 
 ## Code style
 
@@ -177,7 +184,7 @@ system prompt.
 
 ```bash
 cargo build --locked
-cargo test --locked --lib
+cargo test --locked --workspace --lib
 cargo test --locked --test integration_test   # and other tests/ binaries as needed
 cargo run --locked --bin myco
 ```
