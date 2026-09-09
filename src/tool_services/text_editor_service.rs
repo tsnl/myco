@@ -4,9 +4,7 @@ use std::sync::Mutex;
 
 use super::*;
 
-/// Byte cap for an unranged `view` — every sibling tool bounds its output;
-/// whole-file view of a huge log would otherwise become a giant history entry
-/// resent to the model every turn.
+/// Bound observations before they become history entries resent every turn.
 const MAX_VIEW_BYTES: u64 = 256 * 1024;
 
 /// Gives agents tools to view, create, and edit files, and handle its view, str_replace, create,
@@ -27,8 +25,11 @@ impl TextEditorService {
     pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "str_replace_based_edit_tool".to_string(),
-            description: "A tool for viewing, creating, and editing files. Matches Anthropic tool."
-                .to_string(),
+            description:
+                "A tool for viewing, creating, and editing files. Matches Anthropic tool. \
+                Views are limited to 262144 bytes, including ranged reads and directory listings. \
+                Use a smaller view_range or bash with bounded output for larger observations."
+                    .to_string(),
             // Schema comes from [`Input`]: one flat object, so schemars emits the
             // root `type: "object"` Anthropic requires (a tagged per-command enum
             // would emit root `oneOf`, which Anthropic rejects).
@@ -191,20 +192,22 @@ fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String>
 }
 
 fn view_directory(path: &Path, path_display: &str) -> Result<String, String> {
-    let mut entries = std::fs::read_dir(path)
-        .map_err(|e| format!("Error listing directory '{path_display}': {e}"))?
-        .map(|entry| {
-            entry.map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    format!("{name}/")
-                } else {
-                    name
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
+    let directory = std::fs::read_dir(path)
         .map_err(|e| format!("Error listing directory '{path_display}': {e}"))?;
+    let mut entries = Vec::new();
+    let mut bytes = 0;
+    for entry in directory {
+        let entry = entry.map_err(|e| format!("Error listing directory '{path_display}': {e}"))?;
+        let mut name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            name.push('/');
+        }
+        bytes += name.len() + usize::from(!entries.is_empty());
+        if bytes > MAX_VIEW_BYTES as usize {
+            return Err(view_limit_error(path_display));
+        }
+        entries.push(name);
+    }
 
     entries.sort();
     Ok(entries.join("\n"))
@@ -222,22 +225,27 @@ fn view_file(
     let mut reader = BufReader::new(file);
 
     let Some([start, end]) = view_range else {
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        if len > MAX_VIEW_BYTES {
-            return Err(format!(
-                "File '{path_display}' is {len} bytes — over the {MAX_VIEW_BYTES}-byte cap for \
-                 an unranged view. Pass view_range to read a slice (e.g. [1, 400]), or search \
-                 it with bash + rg."
-            ));
-        }
-        let mut data = String::new();
+        let mut data = Vec::new();
         reader
-            .read_to_string(&mut data)
+            .take(MAX_VIEW_BYTES + 1)
+            .read_to_end(&mut data)
             .map_err(|e| format!("Error reading file '{path_display}': {e}"))?;
-        return Ok(data);
+        if data.len() > MAX_VIEW_BYTES as usize {
+            return Err(view_limit_error(path_display));
+        }
+        return String::from_utf8(data)
+            .map_err(|e| format!("Error reading file '{path_display}': {e}"));
     };
 
     read_lines_in_range(&mut reader, start, end, path_display)
+}
+
+fn view_limit_error(path: &str) -> String {
+    format!(
+        "View of '{path}' exceeds the {MAX_VIEW_BYTES}-byte output cap. \
+         Use a smaller view_range for files, or bash with bounded output \
+         for long lines and directory listings."
+    )
 }
 
 /// Stream a 1-indexed inclusive line range from `reader`.
@@ -250,6 +258,8 @@ fn read_lines_in_range<R: std::io::BufRead>(
     end: i64,
     path_display: &str,
 ) -> Result<String, String> {
+    use std::io::{BufRead, Read};
+
     if start < 1 {
         return Err(format!(
             "view_range start must be >= 1 (1-indexed), got {start}"
@@ -262,36 +272,50 @@ fn read_lines_in_range<R: std::io::BufRead>(
     }
 
     let mut line_no = 0i64;
-    let mut selected: Vec<String> = Vec::new();
-    let mut buf = String::new();
+    let mut selected = String::new();
+    let mut buf = Vec::new();
 
     loop {
+        if line_no + 1 < start {
+            if reader
+                .skip_until(b'\n')
+                .map_err(|e| format!("Error reading file '{path_display}': {e}"))?
+                == 0
+            {
+                break;
+            }
+            line_no += 1;
+            continue;
+        }
         buf.clear();
+        let separator = usize::from(line_no >= start);
+        let remaining = (MAX_VIEW_BYTES as usize).saturating_sub(selected.len() + separator);
+        // Include CRLF and one overflow byte without allocating an unbounded line.
         let n = reader
-            .read_line(&mut buf)
+            .by_ref()
+            .take(remaining as u64 + 3)
+            .read_until(b'\n', &mut buf)
             .map_err(|e| format!("Error reading file '{path_display}': {e}"))?;
         if n == 0 {
             break;
         }
         line_no += 1;
 
-        // `read_line` keeps the trailing delimiter; drop it so joining with `\n` is correct.
-        if buf.ends_with('\n') {
+        if buf.ends_with(b"\n") {
             buf.pop();
-            if buf.ends_with('\r') {
+            if buf.ends_with(b"\r") {
                 buf.pop();
             }
         }
-
-        if line_no < start {
-            continue;
+        if selected.len() + separator + buf.len() > MAX_VIEW_BYTES as usize {
+            return Err(view_limit_error(path_display));
         }
-        // end past EOF is clamped by simply stopping at EOF below.
-        if end != -1 && line_no > end {
-            break;
+        let line = std::str::from_utf8(&buf)
+            .map_err(|e| format!("Error reading file '{path_display}': {e}"))?;
+        if separator > 0 {
+            selected.push('\n');
         }
-
-        selected.push(std::mem::take(&mut buf));
+        selected.push_str(line);
 
         if end != -1 && line_no == end {
             break;
@@ -307,7 +331,7 @@ fn read_lines_in_range<R: std::io::BufRead>(
         ));
     }
 
-    Ok(selected.join("\n"))
+    Ok(selected)
 }
 
 fn str_replace_in_file(path: &str, old_str: &str, new_str: &str) -> Result<(), String> {
@@ -636,6 +660,49 @@ mod tests {
     }
 
     #[test]
+    fn ranged_view_rejects_oversized_lines_and_accumulated_output() {
+        let huge_line = "x".repeat((MAX_VIEW_BYTES + 1) as usize);
+        for end in [1, -1] {
+            assert!(matches!(range_from(&huge_line, 1, end), Err(e) if e.contains("cap")));
+        }
+        let many_lines = "abcd\n".repeat(MAX_VIEW_BYTES as usize / 5 + 2);
+        assert!(matches!(range_from(&many_lines, 1, -1), Err(e) if e.contains("cap")));
+        assert_eq!(
+            range_from(&format!("{huge_line}\nsmall\n"), 2, 2).unwrap(),
+            "small"
+        );
+    }
+
+    #[test]
+    fn oversized_line_read_stops_at_the_output_budget() {
+        let data = "x".repeat(MAX_VIEW_BYTES as usize * 4);
+        let mut reader = std::io::Cursor::new(data);
+        assert!(read_lines_in_range(&mut reader, 1, 1, "<test>").is_err());
+        assert!(reader.position() <= MAX_VIEW_BYTES + 3);
+    }
+
+    #[test]
+    fn oversized_directory_listing_is_rejected() {
+        let tmp = temp_dir("editor-directory-cap");
+        for index in 0..1100 {
+            let name = format!("{index:04}{}", "x".repeat(240));
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        assert!(matches!(view_directory(tmp.path(), "<test>"), Err(e) if e.contains("cap")));
+    }
+
+    #[test]
+    fn ranged_view_cap_counts_utf8_bytes_and_preserves_exact_limit() {
+        let exact = "é".repeat(MAX_VIEW_BYTES as usize / 2);
+        assert_eq!(range_from(&format!("{exact}\r\n"), 1, 1).unwrap(), exact);
+        assert!(
+            range_from(&format!("{exact}é"), 1, 1)
+                .unwrap_err()
+                .contains("cap")
+        );
+    }
+
+    #[test]
     fn view_range_middle_lines() {
         assert_eq!(range_from("a\nb\nc\nd\ne\n", 2, 4).unwrap(), "b\nc\nd");
     }
@@ -884,11 +951,15 @@ mod tests {
             result_text(&view)
         );
 
-        // A ranged view of the same file still works.
         let ranged = dispatch(
             &harness,
             json!({"command": "view", "path": path.to_string_lossy(), "view_range": [1, 1]}),
         );
-        assert!(!ranged.is_error, "{}", result_text(&ranged));
+        assert!(ranged.is_error, "oversized lines must not bypass the cap");
+        let edit = dispatch(
+            &harness,
+            json!({"command": "str_replace", "path": path.to_string_lossy(), "old_str": "x", "new_str": "y"}),
+        );
+        assert!(result_text(&edit).contains("was not read"));
     }
 }
