@@ -7,6 +7,9 @@ You cannot press these yourself — tell the user which command to run.
 | `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
 | `/session` | Current session metadata (title, links, scratchpad, path) |
 | `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
+| `/sessions archived` | List archived user sessions |
+| `/archive [id]` | Archive this session or a saved session by id/prefix |
+| `/restore [id]` | Restore this session or a saved session by id/prefix |
 | `/resume [id]` | Load conversation memory (no id: session browser, see below) |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
@@ -23,6 +26,19 @@ Shift-Enter does **not** insert a newline in most terminals: they transmit it as
 plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
+
+Accepted user turns carry a persisted UTC acceptance time, shown as `Accepted:`
+below the input in live output and replay. Older turns and synthetic compaction
+input have unknown timestamps; their creation time is not substituted.
+
+Archiving hides a session from ordinary listings and bare resume. It preserves
+all threads, metadata, search, and links; it does not cancel a run or close tools.
+Children and legacy predecessor/successor sessions keep their own archive status.
+Use `/sessions archived`, `myco --mode session-browser --archived`, or
+`session_meta list archive_filter=archived` to find archived sessions, then
+`/restore id` to show one again. Explicit `/resume id` can open an archived
+session without changing its status. Another running process owns its session's
+writer lock; archive or restore that session in its own CLI or `session_meta`.
 
 Mentioning `@<path>` in a message attaches that file as image input (extensions
 png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the

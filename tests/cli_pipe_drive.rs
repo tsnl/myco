@@ -117,6 +117,37 @@ fn only_session(dir: &Path) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
+    let env = pipe_env("visibility");
+    let stdout = run_myco(
+        &env,
+        &[],
+        b"task\n/archive\n/session\n/sessions archived\n/restore\n/session\n/quit\n",
+    )
+    .await;
+    assert!(stdout.contains("archived:  true"), "{stdout}");
+    assert!(stdout.contains("archived:  false"), "{stdout}");
+    assert!(stdout.contains("[archived]"), "{stdout}");
+    let session = only_session(&env.dir);
+    assert_eq!(session["version"], 4);
+    let time = chrono::DateTime::parse_from_rfc3339(
+        session["threads"][0]["user_turn_timestamps"]["0"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let line = myco::tui::transcript::acceptance_line(Some(time.with_timezone(&chrono::Utc)));
+    assert!(stdout.contains(&line), "{stdout}");
+    let replay = run_myco(
+        &env,
+        &["--resume", session["id"].as_str().unwrap()],
+        b"/quit\n",
+    )
+    .await;
+    assert!(replay.contains(&line), "{replay}");
+}
+
+#[tokio::test]
 async fn piped_repl_serves_turns_slash_commands_and_clean_exit() {
     let env = pipe_env("pipe-drive");
 

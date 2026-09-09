@@ -18,7 +18,7 @@ use std::process::Stdio;
 
 use crate::core::uuid_simple_hex;
 use crate::external_command;
-use crate::session::{SessionListEntry, list_sessions, search_sessions, session_label};
+use crate::session::{SessionListEntry, search_sessions, session_label};
 
 /// Result cap for content search (`--search`).
 pub const SESSION_SEARCH_LIMIT: usize = 50;
@@ -31,8 +31,8 @@ pub const SESSION_SEARCH_LIMIT: usize = 50;
 /// reports the choice: written to `out` when given (the popup handshake),
 /// printed to stdout otherwise. Cancelling reports nothing and exits 0.
 /// With `search`, the list is ranked by content match instead of recency.
-pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
-    match (pick(search)?, out) {
+pub fn run(out: Option<&Path>, search: Option<&str>, archived: bool) -> Result<(), String> {
+    match (pick_archived(search, archived)?, out) {
         (Some(id), Some(path)) => std::fs::write(path, id).map_err(|e| e.to_string()),
         (Some(id), None) => {
             println!("{id}");
@@ -45,7 +45,19 @@ pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
 /// List (or, with `search`, rank) visible sessions and pick one via fzf.
 /// `Ok(None)` = cancelled.
 pub fn pick(search: Option<&str>) -> Result<Option<String>, String> {
-    let all = list_sessions(0)?;
+    pick_archived(search, false)
+}
+
+fn pick_archived(search: Option<&str>, archived: bool) -> Result<Option<String>, String> {
+    let all = crate::session::list_sessions_with_filter(
+        0,
+        false,
+        if archived {
+            crate::session::ArchiveFilter::Archived
+        } else {
+            crate::session::ArchiveFilter::Active
+        },
+    )?;
     if all.is_empty() {
         return Err("no sessions found under ~/.myco/session".into());
     }
@@ -224,6 +236,7 @@ mod tests {
     #[test]
     fn fzf_line_is_three_tab_fields_with_sanitized_display() {
         let entry = SessionListEntry {
+            archived: false,
             id: "deadbeef00112233".into(),
             path: PathBuf::from("/tmp/deadbeef00112233.json"),
             created_at: chrono::Utc::now(),

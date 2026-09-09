@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::SessionRuntime;
 use crate::agent::{Agent, AgentInteractionError};
 use crate::core::CancelToken;
@@ -22,6 +24,7 @@ pub async fn run_session_turn(
     mut input: Vec<Content>,
     forked: bool,
     cancel: CancelToken,
+    accepted_at: DateTime<Utc>,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
     let session = runtime.session();
@@ -33,7 +36,10 @@ pub async fn run_session_turn(
     runtime.bind_agent(agent);
     let on_warning = std::sync::Arc::new(on_warning);
     let checkpoint_warning = on_warning.clone();
-    wire_checkpoint(agent, session, move |warning| checkpoint_warning(warning));
+    let accepted = Some((agent.history().len(), accepted_at));
+    wire_checkpoint_at(agent, session, accepted, move |warning| {
+        checkpoint_warning(warning)
+    });
     if let Err(error) = auto_title(session, &input) {
         on_warning(&format!("could not auto-title session: {error}"));
     }
@@ -83,10 +89,21 @@ pub fn wire_checkpoint(
     session: &ActiveSession,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) {
+    wire_checkpoint_at(agent, session, None, on_warning);
+}
+
+fn wire_checkpoint_at(
+    agent: &mut Agent,
+    session: &ActiveSession,
+    accepted: Option<(usize, DateTime<Utc>)>,
+    on_warning: impl Fn(&str) + Send + Sync + 'static,
+) {
     let thread_id = session.with(|session| session.active_thread().id.clone());
     let session = session.clone();
     agent.set_checkpoint(Some(Box::new(move |messages, usage| {
-        if let Err(error) = session.persist_thread_messages(&thread_id, messages, usage, false) {
+        if let Err(error) =
+            session.persist_thread_messages_at(&thread_id, messages, usage, false, accepted)
+        {
             on_warning(&format!("mid-turn session save failed: {error}"));
         }
     })));
@@ -146,6 +163,7 @@ mod tests {
                 }],
                 false,
                 cancel,
+                chrono::Utc::now(),
                 |warning| panic!("{warning}"),
             ))
     }
@@ -153,6 +171,33 @@ mod tests {
     fn saved_messages(session: &ActiveSession) -> serde_json::Value {
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         serde_json::to_value(&saved.active_thread().messages).unwrap()
+    }
+
+    #[test]
+    fn user_turn_acceptance_times_survive_restart_and_context_forks() {
+        let _home = temp_home("turn-timestamps");
+        let session = ActiveSession::new(Session::new("test"));
+        let mut agent = agent(
+            ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError("offline".into())),
+        );
+        let before = Utc::now();
+        submit(&mut agent, &session, CancelToken::new());
+        let after = Utc::now();
+        let saved = Session::load(&session.snapshot().json_path()).unwrap();
+        let time = saved.active_thread().user_turn_timestamps[&0];
+        assert!(time >= before && time <= after);
+        assert_eq!(
+            saved
+                .fork_child("test")
+                .active_thread()
+                .user_turn_timestamps[&0],
+            time
+        );
+        let legacy = Session::from_json(include_bytes!(
+            "../../tests/fixtures/session_v2_all_variants.json"
+        ))
+        .unwrap();
+        assert!(legacy.active_thread().user_turn_timestamps.is_empty());
     }
 
     #[test]
@@ -253,6 +298,7 @@ mod tests {
                     vec![],
                     false,
                     CancelToken::new(),
+                    chrono::Utc::now(),
                     |warning| panic!("{warning}"),
                 );
                 let mut run = std::pin::pin!(run);
@@ -292,6 +338,7 @@ mod tests {
                 vec![],
                 false,
                 cancel,
+                chrono::Utc::now(),
                 |warning| panic!("{warning}"),
             )
             .await;

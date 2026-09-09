@@ -133,6 +133,7 @@ mod tests {
 
     fn entry(id: &str, snippet: &str, dir: &Path) -> SessionListEntry {
         SessionListEntry {
+            archived: false,
             id: id.to_string(),
             path: dir.join(format!("{id}.json")),
             created_at: chrono::Utc::now(),

@@ -65,9 +65,16 @@ Use `session_history` to read saved threads without loading all of them into con
 - `{"session_id":"…","thread_id":"…","action":"expand","index":12}` reads an original message.
 
 Omitting `thread_id` selects the active thread. Older threads are read-only.
-Session files use schema version 3; version 2 files load as one initial thread and are
-written as version 3 on the next save. Existing predecessor/successor session links
+Session files use schema version 4, including archive status and per-user-turn acceptance
+times. Version 2 files load as one initial thread; versions 2 and 3 are written as
+version 4 on the next save. Older turns keep unknown timestamps. Older binaries
+reject version 4. Existing predecessor/successor session links
 remain metadata; separate saved sessions are not automatically combined.
+
+`/archive` and `/restore` change a session's browsing visibility while retaining
+every thread and live tool. Archive status belongs to the named session only;
+children and legacy compaction-linked sessions are independent. See `cli` for
+archive filters and restoration.
 
 ## Config & paths
 

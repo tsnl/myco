@@ -144,6 +144,7 @@ mod tests {
     fn entry(id: &str, updated_minutes_ago: i64, message_count: usize) -> SessionListEntry {
         let updated_at = Utc::now() - Duration::minutes(updated_minutes_ago);
         SessionListEntry {
+            archived: false,
             id: id.to_string(),
             path: std::path::PathBuf::from(format!("/dev/null/{id}")),
             created_at: updated_at,

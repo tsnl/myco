@@ -34,8 +34,8 @@ use uuid::Uuid;
 use crate::core::{atomically_write, myco_home, uuid_simple_hex};
 use crate::generative_model::{Message, TokenUsage};
 
-/// Written schema version; version 2 is also accepted on read.
-pub const SESSION_FILE_VERSION: u32 = 3;
+/// Written schema version; versions 2 and 3 are also accepted on read.
+pub const SESSION_FILE_VERSION: u32 = 4;
 pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
@@ -66,10 +66,8 @@ impl std::fmt::Display for SessionKind {
 }
 
 impl SessionKind {
-    /// The one visibility predicate: only [`SessionKind::User`] sessions show
-    /// in default `/sessions` / bare `--resume` / `session_meta list` —
-    /// visibility is derived from kind, not a separate stored flag. Doubles as
-    /// the serde skip helper (omit `kind` on disk when it is the default).
+    /// Classify user sessions separately from hidden workers. Archive status
+    /// filters visibility independently. Also omits the default kind on disk.
     pub fn is_user(&self) -> bool {
         matches!(self, SessionKind::User)
     }
@@ -83,6 +81,8 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
     #[serde(deserialize_with = "thread::deserialize_threads")]
     threads: Vec<Thread>,
     /// Short human label; agent/CLI maintained.
@@ -97,8 +97,8 @@ pub struct Session {
     /// Session / agent that spawned this one (subagent, compact worker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// Classification for filtering and UI. Visibility is derived via
-    /// [`SessionKind::is_user`] (only [`SessionKind::User`] is listed by default).
+    /// Classification for filtering and UI; ordinary listings show unarchived
+    /// [`SessionKind::User`] sessions.
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
     /// Predecessor session from a legacy v2 compaction, if any.
@@ -142,12 +142,42 @@ pub struct SessionListEntry {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model: String,
+    pub archived: bool,
     pub message_count: usize,
     pub title: Option<String>,
     pub snippet: String,
     pub link_counts: LinkCounts,
     pub kind: SessionKind,
     pub parent_session_id: Option<String>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveFilter {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
+impl ArchiveFilter {
+    fn includes(self, archived: bool) -> bool {
+        match self {
+            Self::Active => !archived,
+            Self::Archived => archived,
+            Self::All => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -216,6 +246,32 @@ impl ActiveSession {
         f(&mut self.lock())
     }
 
+    /// Archive only this session, preserving threads, lineage and live tools.
+    pub fn set_archived(&self, archived: bool) -> Result<(), String> {
+        let mut current = self.lock();
+        let mut updated = current.clone();
+        updated.archived = archived;
+        updated.touch();
+        updated.save()?;
+        *current = updated;
+        Ok(())
+    }
+
+    pub fn set_session_archived(&self, id: Option<&str>, archived: bool) -> Result<String, String> {
+        let id = match id {
+            Some(id) => resolve_session_id(id)?,
+            None => self.id(),
+        };
+        if id == self.id() {
+            self.set_archived(archived)?;
+        } else {
+            let _lock = SessionWriteLock::acquire(&id).map_err(|e| e.to_string())?;
+            let session = Self::new(Session::load_by_id_or_prefix(&id)?);
+            session.set_archived(archived)?;
+        }
+        Ok(id)
+    }
+
     /// Persist messages + last usage when either changed (or `force`). A `None`
     /// usage keeps the stored value rather than clearing it.
     pub fn persist_messages(
@@ -235,6 +291,17 @@ impl ActiveSession {
         last_usage: Option<TokenUsage>,
         force: bool,
     ) -> Result<(), String> {
+        self.persist_thread_messages_at(thread_id, messages, last_usage, force, None)
+    }
+
+    pub(crate) fn persist_thread_messages_at(
+        &self,
+        thread_id: &str,
+        messages: &[Message],
+        last_usage: Option<TokenUsage>,
+        force: bool,
+        accepted: Option<(usize, DateTime<Utc>)>,
+    ) -> Result<(), String> {
         let mut session = self.lock();
         if session.active_thread().id != thread_id {
             return Err(format!(
@@ -245,6 +312,15 @@ impl ActiveSession {
             last_usage.is_some() && last_usage != session.active_thread().last_usage;
         if force || messages.len() != session.active_thread().messages.len() || usage_changed {
             session.active_thread_mut().messages = messages.to_vec();
+            let times = &mut session.active_thread_mut().user_turn_timestamps;
+            times.retain(|&index, _| {
+                matches!(messages.get(index), Some(Message::UserMessage { .. }))
+            });
+            if let Some((index, time)) = accepted
+                && matches!(messages.get(index), Some(Message::UserMessage { .. }))
+            {
+                times.entry(index).or_insert(time);
+            }
             if last_usage.is_some() {
                 session.active_thread_mut().last_usage = last_usage;
             }
@@ -311,6 +387,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             model: model.into(),
+            archived: false,
             threads: vec![Thread::new()],
             title: None,
             links: Vec::new(),
@@ -356,6 +433,7 @@ impl Session {
         let thread = self.active_thread_mut();
         thread.messages = messages;
         thread.last_usage = usage;
+        thread.user_turn_timestamps.clear();
     }
 
     pub fn summary_path(&self) -> PathBuf {
@@ -393,6 +471,8 @@ impl Session {
         child.parent_session_id = Some(self.id.clone());
         child.active_thread_mut().messages = self.active_thread().messages.clone();
         child.active_thread_mut().last_usage = self.active_thread().last_usage;
+        child.active_thread_mut().user_turn_timestamps =
+            self.active_thread().user_turn_timestamps.clone();
         child
     }
 
@@ -435,10 +515,11 @@ impl Session {
             serde_json::from_slice(data).map_err(|e| e.to_string())?;
         match value["version"].as_u64() {
             Some(2) => thread::upgrade_v2(&mut value)?,
-            Some(3) => {}
+            Some(3) => value["version"] = serde_json::json!(SESSION_FILE_VERSION),
+            Some(4) => {}
             version => {
                 return Err(format!(
-                    "unsupported session version {version:?}; expected 2 or {SESSION_FILE_VERSION}"
+                    "unsupported session version {version:?}; expected 2, 3 or {SESSION_FILE_VERSION}"
                 ));
             }
         }
@@ -588,12 +669,20 @@ pub fn list_sessions_filtered(
     limit: usize,
     include_hidden: bool,
 ) -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_with_filter(limit, include_hidden, ArchiveFilter::Active)
+}
+
+pub fn list_sessions_with_filter(
+    limit: usize,
+    include_hidden: bool,
+    archive: ArchiveFilter,
+) -> Result<Vec<SessionListEntry>, String> {
     let root = session_root()?;
     if !root.exists() {
         return Ok(Vec::new());
     }
 
-    let (mut metas, skipped) = collect_session_entries(&root, include_hidden)?;
+    let (mut metas, skipped) = collect_session_entries(&root, include_hidden, archive)?;
     warn_about_skipped_sessions(&skipped);
 
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
@@ -609,13 +698,17 @@ type SessionScan = (Vec<SessionListEntry>, Vec<(PathBuf, String)>);
 
 /// Read every session document under `root`, partitioned into listable entries
 /// and the ones that could not be read.
-fn collect_session_entries(root: &Path, include_hidden: bool) -> Result<SessionScan, String> {
+fn collect_session_entries(
+    root: &Path,
+    include_hidden: bool,
+    archive: ArchiveFilter,
+) -> Result<SessionScan, String> {
     let mut metas = Vec::new();
     let mut skipped = Vec::new();
     for path in iter_session_json_files(root)? {
         match session_list_entry_from_path(&path) {
             Ok(entry) => {
-                if include_hidden || entry.kind.is_user() {
+                if (include_hidden || entry.kind.is_user()) && archive.includes(entry.archived) {
                     metas.push(entry);
                 }
             }
@@ -659,7 +752,7 @@ pub fn list_all_sessions() -> Result<Vec<SessionListEntry>, String> {
 
 /// List every readable session including hidden (no limit).
 pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, String> {
-    list_sessions_filtered(0, true)
+    list_sessions_with_filter(0, true, ArchiveFilter::All)
 }
 
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
@@ -677,6 +770,7 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         created_at: session.created_at,
         updated_at: session.updated_at,
         model: session.model,
+        archived: session.archived,
         message_count,
         title: session.title,
         snippet,
@@ -716,6 +810,7 @@ fn load_most_recent_session() -> Result<Session, String> {
         // only has to add the visibility half.
         if let Ok(session) = Session::load(path)
             && !session.is_hidden()
+            && !session.archived
         {
             return Ok(session);
         }
@@ -870,7 +965,10 @@ pub fn session_label(entry: &SessionListEntry) -> String {
 }
 
 pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> String {
-    let label = session_label(entry);
+    let mut label = session_label(entry);
+    if entry.archived {
+        label.push_str(" [archived]");
+    }
     let links = if entry.link_counts.is_empty() {
         String::new()
     } else {
@@ -900,7 +998,7 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
 pub fn format_session_detail(session: &Session) -> String {
     let console = session.console_path();
     // (label incl. padding, value); `None` rows are omitted.
-    let rows: [(&str, Option<String>); 15] = [
+    let rows: [(&str, Option<String>); 16] = [
         ("id:        ", Some(session.id.clone())),
         (
             "path:      ",
@@ -913,6 +1011,7 @@ pub fn format_session_detail(session: &Session) -> String {
         ("created:   ", Some(session.created_at.to_rfc3339())),
         ("updated:   ", Some(session.updated_at.to_rfc3339())),
         ("model:     ", Some(session.model.clone())),
+        ("archived:  ", Some(session.archived.to_string())),
         ("thread:    ", Some(session.active_thread().id.clone())),
         ("threads:   ", Some(session.threads().len().to_string())),
         (
@@ -1576,7 +1675,8 @@ mod tests {
         )
         .unwrap();
 
-        let (entries, skipped) = collect_session_entries(dir, false).unwrap();
+        let (entries, skipped) =
+            collect_session_entries(dir, false, ArchiveFilter::Active).unwrap();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].id, good.id);
         assert_eq!(skipped.len(), 2, "{skipped:?}");
@@ -1618,6 +1718,54 @@ mod tests {
         assert!(s.set_scratchpad(big).is_err());
         s.set_scratchpad("ok".into()).unwrap();
         assert_eq!(s.scratchpad, "ok");
+    }
+
+    #[test]
+    fn archived_sessions_remain_searchable_and_restorable_with_lineage_intact() {
+        let _home = temp_home("session-archive");
+        let mut session = Session::new("test");
+        session.replace_context(vec![user("archive needle")], None);
+        session.set_scratchpad("keep this context".into()).unwrap();
+        session.save().unwrap();
+        let child = session.fork_child("test");
+        child.save().unwrap();
+        let id = session.id.clone();
+        let active = ActiveSession::new(session);
+        let _lock = SessionWriteLock::acquire(&id).unwrap();
+        active.set_session_archived(None, true).unwrap();
+        assert!(list_sessions(0).unwrap().is_empty());
+        assert!(resolve_and_load_session(None).is_err());
+        let archived = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            search_sessions(&archived, "needle", 20).unwrap().entries[0].id,
+            id
+        );
+        let saved = Session::load_by_id_or_prefix(&id).unwrap();
+        assert!(saved.archived);
+        assert_eq!(saved.scratchpad, "keep this context");
+        let child = Session::load_by_id_or_prefix(&child.id).unwrap();
+        assert!(!child.archived);
+        assert_eq!(child.parent_session_id.as_deref(), Some(id.as_str()));
+        active.set_session_archived(None, false).unwrap();
+        assert_eq!(list_sessions(0).unwrap()[0].id, id);
+        assert!(
+            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn archiving_another_live_session_respects_its_writer_lock() {
+        let _home = temp_home("archive-writer");
+        let mut other = Session::new("test");
+        other.replace_context(vec![user("busy")], None);
+        other.save().unwrap();
+        let _lock = SessionWriteLock::acquire(&other.id).unwrap();
+        let active = ActiveSession::new(Session::new("test"));
+        assert!(active.set_session_archived(Some(&other.id), true).is_err());
+        assert!(!Session::load_by_id_or_prefix(&other.id).unwrap().archived);
     }
 
     #[test]

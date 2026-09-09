@@ -1,6 +1,6 @@
 //! Ordered conversation histories. Only the final thread accepts new context.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
@@ -15,6 +15,9 @@ pub struct Thread {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_id: Option<String>,
     pub messages: Vec<Message>,
+    /// Acceptance times keyed by message index. Absence means unknown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_turn_timestamps: BTreeMap<usize, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<TokenUsage>,
 }
@@ -26,6 +29,7 @@ impl Thread {
             created_at: Utc::now(),
             predecessor_id: None,
             messages: Vec::new(),
+            user_turn_timestamps: BTreeMap::new(),
             last_usage: None,
         }
     }
@@ -45,6 +49,14 @@ pub(super) fn validate_threads(threads: &[Thread]) -> Result<(), String> {
     }
     let mut seen = HashSet::new();
     for thread in threads {
+        if thread.user_turn_timestamps.keys().any(|&index| {
+            !matches!(
+                thread.messages.get(index),
+                Some(Message::UserMessage { .. })
+            )
+        }) {
+            return Err("user turn timestamps must refer to user messages".into());
+        }
         if matches!(thread.id.as_str(), "" | "." | "..")
             || thread.id.contains(['/', '\\'])
             || seen.contains(&thread.id)
@@ -107,6 +119,21 @@ mod tests {
         assert_eq!(first.active_thread().id, first.id);
         assert_eq!(first.active_thread().id, second.active_thread().id);
         assert_eq!(first.threads().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn loading_v3_leaves_unknown_turn_times_and_the_source_file_unchanged() {
+        let dir = temp_dir("thread-v3");
+        let path = dir.path().join("session.json");
+        let mut document = serde_json::to_value(Session::new("test")).unwrap();
+        document["version"] = serde_json::json!(3);
+        let original = serde_json::to_vec(&document).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.version, super::super::SESSION_FILE_VERSION);
+        assert!(loaded.active_thread().user_turn_timestamps.is_empty());
+        assert!(!loaded.archived);
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
