@@ -1094,6 +1094,12 @@ mod tests {
         );
         assert_eq!(described.recovery(), Recovery::OmitLastMessage);
 
+        let extent = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.13.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2576 pixels"}}"#.into(),
+        );
+        assert_eq!(extent.recovery(), Recovery::OmitLastMessage);
+
         let unrelated = http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "HTTP 500: overloaded".into(),
@@ -1259,4 +1265,7 @@ fn describes_a_size_rejection(message: &str) -> bool {
     message.contains("too_large")
         || message.contains("too large")
         || (message.contains("size") && message.contains("exceeds"))
+        || (message.contains("image dimensions")
+            && message.contains("exceed")
+            && message.contains("max allowed size"))
 }

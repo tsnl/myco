@@ -346,8 +346,8 @@ async fn run_print(args: Args) {
             eprintln!("myco: {e}");
             if let Some(dropped) = outcome.rewound {
                 eprintln!(
-                    "myco: the last message was removed from the conversation so the session \
-                     can continue{}.",
+                    "myco: the last user turn was removed from active context so the session \
+                     can continue{}. Its recorded actions remain in the predecessor thread.",
                     describe_dropped_images(&dropped)
                 );
             }
@@ -1106,8 +1106,8 @@ impl ReplSession {
                 let mut message = e.to_string();
                 if let Some(dropped) = outcome.rewound {
                     message.push_str(&format!(
-                        "\n\nThe last message was removed from the conversation so the session \
-                         can continue{}.",
+                        "\n\nThe last user turn was removed from active context so the session \
+                         can continue{}. Its recorded actions remain in the predecessor thread.",
                         describe_dropped_images(&dropped)
                     ));
                 }
