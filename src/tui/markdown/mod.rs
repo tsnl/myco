@@ -154,6 +154,8 @@ pub struct MarkdownRenderer {
     word_width: usize,
     spaces: usize,
     hang: usize,
+    /// Content columns of open list items, retained across paragraph breaks.
+    list_indents: Vec<usize>,
     /// Word already reached the wrap width; stream it raw until a break.
     overflow: bool,
     /// Widest word emitted so far, hanging indent included — the narrowest
@@ -220,6 +222,7 @@ impl MarkdownRenderer {
             spaces: 0,
             max_word_width: 0,
             hang: 0,
+            list_indents: Vec::new(),
             overflow: false,
             word_is_url: false,
             word_start_prev: None,
@@ -324,7 +327,11 @@ impl MarkdownRenderer {
             self.end_prefix(Some('\n'));
             return;
         }
-        if prefix_still_open(&self.prefix, c) {
+        if prefix_still_open(
+            &self.prefix,
+            c,
+            self.list_indents.last().copied().unwrap_or(0),
+        ) {
             self.prefix.push(c);
             return;
         }
@@ -335,6 +342,8 @@ impl MarkdownRenderer {
     fn classify_prefix(&mut self, c: char) {
         let prefix = std::mem::take(&mut self.prefix);
         let (indent, stripped) = split_indent(&prefix);
+        self.list_indents.retain(|&column| column <= indent);
+        let list_indent = self.list_indents.last().copied().unwrap_or(0);
 
         // GFM pipe table (styled only): a line whose first non-space char is
         // `|` opens or extends a capture. Suppressed during replay so a
@@ -350,8 +359,8 @@ impl MarkdownRenderer {
         // A non-pipe line ends any pending capture before it is classified.
         self.flush_pending_table();
 
-        // 4-space (or tab) indent: verbatim line, no styles, no wrap.
-        if stripped.is_empty() && (c == '\t' || (indent >= 3 && c == ' ')) {
+        // Code is indented four spaces beyond the containing list item.
+        if stripped.is_empty() && (c == '\t' || (indent >= list_indent + 3 && c == ' ')) {
             self.line = Line::Raw;
             self.out_str(&prefix);
             self.out_ch(c);
@@ -384,6 +393,7 @@ impl MarkdownRenderer {
         if c == ' ' && (is_bullet_marker(stripped) || stripped == ">") {
             if stripped != ">" {
                 self.hang = display_width(&prefix) + 1;
+                self.list_indents.push(self.hang);
             }
             self.line = Line::Body;
             self.replay_literal(&prefix);
@@ -392,6 +402,9 @@ impl MarkdownRenderer {
         }
         // Ordinary text: replay through the inline machine so a line-leading
         // `**bold` or `` `code` `` still styles.
+        if list_indent > 0 {
+            self.hang = indent;
+        }
         self.line = Line::Body;
         for pc in prefix.chars() {
             self.inline_char(pc);
@@ -404,8 +417,9 @@ impl MarkdownRenderer {
         // A blank / marker-only line terminates a pending table capture.
         self.flush_pending_table();
         let prefix = std::mem::take(&mut self.prefix);
-        let (_, stripped) = split_indent(&prefix);
+        let (indent, stripped) = split_indent(&prefix);
         if let Some((fc, n)) = fence_run(stripped) {
+            self.list_indents.retain(|&column| column <= indent);
             self.out_str(&prefix);
             self.fence = Some((fc, n));
             self.fence_line = None;
@@ -935,7 +949,7 @@ pub fn render_block_with_base(text: &str, palette: Palette, base: &'static str) 
 
 // -- prefix classification helpers ------------------------------------------
 
-/// Leading-space indent (max 3 counted) and the marker chars after it.
+/// Leading-space indent and the marker chars after it.
 fn split_indent(prefix: &str) -> (usize, &str) {
     let indent = prefix.len() - prefix.trim_start_matches(' ').len();
     (indent, &prefix[indent..])
@@ -960,11 +974,11 @@ fn is_bullet_marker(s: &str) -> bool {
 
 /// Could `prefix + c` still become a structural marker? While true, chars are
 /// buffered; the first char that decides goes to [`MarkdownRenderer::classify_prefix`].
-fn prefix_still_open(prefix: &str, c: char) -> bool {
+fn prefix_still_open(prefix: &str, c: char, list_indent: usize) -> bool {
     let (indent, stripped) = split_indent(prefix);
     if stripped.is_empty() {
         return match c {
-            ' ' => indent < 3,
+            ' ' => indent < list_indent + 3,
             '#' | '`' | '~' | '-' | '+' | '*' | '>' => true,
             _ => c.is_ascii_digit(),
         };
@@ -1243,6 +1257,70 @@ mod tests {
         assert_eq!(
             render("12. aaa bbb ccc", wrapped(12)),
             "12. aaa bbb\n    ccc"
+        );
+    }
+
+    #[test]
+    fn list_paragraphs_keep_their_indent_across_stream_chunks() {
+        for (input, expected) in [
+            (
+                "- aaaa bbbb cccc\n\n  dddd eeee ffff",
+                "- aaaa bbbb\n  cccc\n\n  dddd eeee\n  ffff",
+            ),
+            (
+                "12. aaa bbb ccc\n\n    ddd eee fff",
+                "12. aaa bbb\n    ccc\n\n    ddd eee\n    fff",
+            ),
+            (
+                "- outer\n  - inner\n\n    aaa bbb ccc\n\n  dddd eeee ffff\n\nplain dddd eeee",
+                "- outer\n  - inner\n\n    aaa bbb\n    ccc\n\n  dddd eeee\n  ffff\n\nplain dddd\neeee",
+            ),
+        ] {
+            assert_eq!(render(input, wrapped(12)), expected);
+            assert_eq!(render_char_chunks(input, wrapped(12)), expected);
+            assert_eq!(
+                strip_escapes(&render_char_chunks(input, styled().with_wrap(Some(12)))),
+                expected
+            );
+            assert_eq!(render_char_chunks(input, plain()), input);
+        }
+    }
+
+    #[test]
+    fn top_level_fences_end_lists_before_indented_code() {
+        for fence in ["```", "~~~"] {
+            for indent in ["", " "] {
+                let input = format!(
+                    "- item\n\n{indent}{fence}\nfenced\n{indent}{fence}\n\n    let x = **unchanged**; long code stays verbatim"
+                );
+                assert_eq!(render(&input, wrapped(12)), input);
+                assert_eq!(render_char_chunks(&input, wrapped(12)), input);
+                assert_eq!(
+                    strip_escapes(&render_char_chunks(&input, styled().with_wrap(Some(12)))),
+                    input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fences_inside_lists_preserve_paragraph_indentation() {
+        for fence in ["```", "~~~"] {
+            let input =
+                format!("12. item\n\n    {fence}\n    fenced\n    {fence}\n\n    aaa bbb ccc");
+            let expected =
+                format!("12. item\n\n    {fence}\n    fenced\n    {fence}\n\n    aaa bbb\n    ccc");
+            assert_eq!(render(&input, wrapped(12)), expected);
+            assert_eq!(render_char_chunks(&input, wrapped(12)), expected);
+        }
+    }
+
+    #[test]
+    fn list_indented_code_remains_verbatim() {
+        let input = "- item\n\n      let x = a * b; long code stays verbatim\n\n  aaaa bbbb cccc";
+        assert_eq!(
+            render_char_chunks(input, wrapped(12)),
+            "- item\n\n      let x = a * b; long code stays verbatim\n\n  aaaa bbbb\n  cccc"
         );
     }
 
