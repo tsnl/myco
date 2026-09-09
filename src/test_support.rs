@@ -230,12 +230,13 @@ pub(crate) fn temp_dir(tag: &str) -> TempDir {
 /// Cleanup is RAII so a panicking test cannot leak the override to the next.
 pub(crate) struct TempHome {
     dir: PathBuf,
+    profile_dir: PathBuf,
     _lock: MutexGuard<'static, ()>,
 }
 
 impl TempHome {
     pub(crate) fn path(&self) -> &Path {
-        &self.dir
+        &self.profile_dir
     }
 }
 
@@ -259,7 +260,13 @@ pub(crate) fn temp_home(tag: &str) -> TempHome {
     unsafe {
         std::env::set_var("MYCO_HOME", &dir);
     }
-    TempHome { dir, _lock: lock }
+    let profile_dir = crate::core::myco_home().unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    TempHome {
+        dir,
+        profile_dir,
+        _lock: lock,
+    }
 }
 
 pub(crate) fn tool_runtime(harness: Arc<crate::harness::Harness>) -> Arc<crate::SessionRuntime> {

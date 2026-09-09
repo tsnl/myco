@@ -181,11 +181,19 @@ pub fn pick_via_tmux_popup() -> Result<Option<String>, String> {
         sh_quote(&exe.to_string_lossy()),
         sh_quote(&result_path.to_string_lossy()),
     );
+    let mut cmd = external_command::TMUX.command();
+    cmd.args(["display-popup", "-E", "-w", "90%", "-h", "80%"]);
+    // The tmux server can predate the current profile selection.
+    for key in ["MYCO_HOME", "MYCO_PROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            let mut assignment = std::ffi::OsString::from(format!("{key}="));
+            assignment.push(value);
+            cmd.arg("-e").arg(assignment);
+        }
+    }
     // -E closes the popup when the command exits; the tmux client blocks
     // until then, so waiting on it is the synchronization.
-    let status = external_command::TMUX
-        .command()
-        .args(["display-popup", "-E", "-w", "90%", "-h", "80%"])
+    let status = cmd
         .arg(&popup_cmd)
         .status()
         .map_err(|e| format!("failed to run tmux: {e}"))?;

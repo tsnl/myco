@@ -1,5 +1,10 @@
 # User-facing CLI
 
+`myco --profile NAME` selects a profile; otherwise `MYCO_PROFILE` applies, then
+`default`. Config, sessions, workspace, and manual live under
+`$MYCO_HOME/profiles/NAME/` (`MYCO_HOME` defaults to `~/.myco`). Local nested
+agents inherit the selection. Use the same profile to resume a session.
+
 You cannot press these yourself — tell the user which command to run.
 
 | Command | Meaning |
@@ -107,7 +112,7 @@ attachments. No console mirror is written in print mode.
 ### Models & config (quick)
 
 - Models come from the `[gateways]` / `[models]` catalog in
-  `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
+  `~/.myco/profiles/default/config.toml` — **none are built in**. `--model <key>` picks a
   catalog key; default is config.toml `model`, or the sole configured entry.
 - A gateway holds `protocol` (`anthropic-messages` | `openai-responses` |
   `openai-completions`),
@@ -173,7 +178,7 @@ startup banner, preflight WARNING, USER headers + submitted input, the streamed
 ASSISTANT section, the `/compact` progress line + COMPACTED banner, live
 ERROR / `(cancelled)` notices, and meta-command output (`/hosts`, `/session`,
 …) — to a plain-text, ANSI-free file beside the session JSON:
-`~/.myco/session/<shard>/<id>.console` (shown as `console:` in `/session`
+`~/.myco/profiles/default/session/<shard>/<id>.console` (shown as `console:` in `/session`
 and `session_meta` get). It is append-only and accumulates across runs of the
 same session.
 

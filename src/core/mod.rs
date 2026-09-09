@@ -1,7 +1,8 @@
 mod fs;
 pub mod image;
 
-pub use fs::{atomically_write, myco_home};
+pub(crate) use fs::myco_home_with;
+pub use fs::{atomically_write, myco_home, validate_profile};
 
 pub use myco_agent::Async;
 pub use myco_model::AsyncStream;
