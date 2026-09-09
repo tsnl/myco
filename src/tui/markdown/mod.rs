@@ -417,8 +417,9 @@ impl MarkdownRenderer {
         // A blank / marker-only line terminates a pending table capture.
         self.flush_pending_table();
         let prefix = std::mem::take(&mut self.prefix);
-        let (_, stripped) = split_indent(&prefix);
+        let (indent, stripped) = split_indent(&prefix);
         if let Some((fc, n)) = fence_run(stripped) {
+            self.list_indents.retain(|&column| column <= indent);
             self.out_str(&prefix);
             self.fence = Some((fc, n));
             self.fence_line = None;
@@ -1282,6 +1283,35 @@ mod tests {
                 expected
             );
             assert_eq!(render_char_chunks(input, plain()), input);
+        }
+    }
+
+    #[test]
+    fn top_level_fences_end_lists_before_indented_code() {
+        for fence in ["```", "~~~"] {
+            for indent in ["", " "] {
+                let input = format!(
+                    "- item\n\n{indent}{fence}\nfenced\n{indent}{fence}\n\n    let x = **unchanged**; long code stays verbatim"
+                );
+                assert_eq!(render(&input, wrapped(12)), input);
+                assert_eq!(render_char_chunks(&input, wrapped(12)), input);
+                assert_eq!(
+                    strip_escapes(&render_char_chunks(&input, styled().with_wrap(Some(12)))),
+                    input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fences_inside_lists_preserve_paragraph_indentation() {
+        for fence in ["```", "~~~"] {
+            let input =
+                format!("12. item\n\n    {fence}\n    fenced\n    {fence}\n\n    aaa bbb ccc");
+            let expected =
+                format!("12. item\n\n    {fence}\n    fenced\n    {fence}\n\n    aaa bbb\n    ccc");
+            assert_eq!(render(&input, wrapped(12)), expected);
+            assert_eq!(render_char_chunks(&input, wrapped(12)), expected);
         }
     }
 
