@@ -9,8 +9,7 @@ use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
     ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, list_sessions_filtered, normalize_pr_url, parse_pr_fields,
-    search_sessions,
+    format_session_list_line, normalize_pr_url, parse_pr_fields, search_sessions,
 };
 
 use super::{HostDispatchContext, ToolService};
@@ -30,6 +29,12 @@ Actions (`action` is required):
   Optional `query` ranks sessions by content instead of recency — keyword search over
   title, first user message, scratchpad, and the console-transcript tail. Use it to
   find past sessions by what was discussed, not just what the title says.
+  `archive_filter` is active (default), archived, or all; `include_hidden` applies
+  independently. Archived sessions remain searchable and readable by id.
+- archive / restore: change visibility of the current session, or `session_id`.
+  Preserve every thread, link, and live tool. Only the named session changes;
+  children and legacy predecessor/successor sessions retain their own status.
+  Another process's live session must be changed by its owner.
 - set_title: set the **current** session title. `title` is required: a non-empty string
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
@@ -103,7 +108,18 @@ impl SessionMetaTool {
                 input.limit,
                 input.include_hidden.unwrap_or(false),
                 input.query.as_deref(),
+                input.archive_filter.unwrap_or_default(),
             ),
+            ActionKind::Archive | ActionKind::Restore => {
+                let archived = input.action == ActionKind::Archive;
+                let id = self
+                    .active
+                    .set_session_archived(input.session_id.as_deref(), archived)?;
+                Ok(format!(
+                    "session {id} {}\n",
+                    if archived { "archived" } else { "restored" }
+                ))
+            }
             ActionKind::SetTitle => self.action_set_title(input.title),
             ActionKind::SetScratchpad => match input.scratchpad {
                 Some(text) => self.action_set_scratchpad(text),
@@ -132,9 +148,11 @@ impl SessionMetaTool {
         limit: Option<usize>,
         include_hidden: bool,
         query: Option<&str>,
+        archive_filter: crate::session::ArchiveFilter,
     ) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
-        let mut list = list_sessions_filtered(0, include_hidden)?;
+        let mut list =
+            crate::session::list_sessions_with_filter(0, include_hidden, archive_filter)?;
         let mut header = String::new();
         match query {
             None => {
@@ -296,7 +314,7 @@ impl SessionMetaTool {
 struct Input {
     /// Action to perform (required).
     action: ActionKind,
-    /// Target session id or unique prefix for `get`. Omit for the current session.
+    /// Target session id or unique prefix for get/archive/restore. Omit for current.
     #[serde(default)]
     session_id: Option<String>,
     /// Max sessions for `list` (default 20; 0 = all).
@@ -305,6 +323,9 @@ struct Input {
     /// When true, `list` includes hidden sessions (subagents, compact workers).
     #[serde(default)]
     include_hidden: Option<bool>,
+    /// For list: active (default), archived, or all sessions.
+    #[serde(default)]
+    archive_filter: Option<crate::session::ArchiveFilter>,
     /// For `list`: rank sessions matching this text (keyword) instead of
     /// listing by recency.
     #[serde(default)]
@@ -351,6 +372,8 @@ struct Input {
 enum ActionKind {
     Get,
     List,
+    Archive,
+    Restore,
     SetTitle,
     SetScratchpad,
     AddLink,
@@ -435,6 +458,8 @@ mod tests {
             serde_json::json!([
                 "get",
                 "list",
+                "archive",
+                "restore",
                 "set_title",
                 "set_scratchpad",
                 "add_link",

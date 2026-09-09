@@ -75,20 +75,22 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 ### Context lifecycle
 
 - [x] **Compaction (manual)** — `/compact` runs a hidden compact-worker agent over the
-      session (`session_history` tool), writes `{id}.summary.md`, and seeds a linked
-      successor session with the summary + a well-formed recent tail. Ctrl-C cancels it.
+      session (`session_history` tool), writes `{id}.summary.md`, and creates a
+      successor thread in the same session with the summary + a well-formed recent
+      tail. Ctrl-C cancels it.
 - [x] **Auto-compact** when approaching the context limit — per-model
       `auto_compact_at` fraction of `context_window`, checked after each turn against
       the provider's reported prompt size. Runs the same worker as `/compact` and
-      switches the REPL to the successor. Unset = off; a failed automatic run disables
-      itself for the session rather than repeating every turn.
+      switches the REPL to the successor thread. Unset = off; a failed automatic run
+      disables itself for the session rather than repeating every turn.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`
       (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `backoff_multiplier`),
-      applied in the drivers ahead of the stream, honouring `Retry-After`. Only
-      pre-stream failures (connection, 408, 429, 5xx) retry; deterministic statuses and
-      mid-stream failures still surface immediately.
+      applied by the agent before any response part arrives, honouring `Retry-After`.
+      Retry progress is visible and cancellable. Only pre-stream failures
+      (connection, 408, 429, 5xx) retry; deterministic statuses and mid-stream
+      failures still surface immediately.
 - [ ] **Token + cost tracking**
   - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
     and session totals.
@@ -158,7 +160,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Invocation surface
 
-- [ ] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
+- [x] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
 - [x] **User multimodal (images)** — `@path` mentions in the REPL attach
       png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
       Responses sends `input_image` parts. Non-image files: see **Rich attach**.
