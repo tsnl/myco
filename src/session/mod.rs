@@ -1,6 +1,6 @@
 //! Conversation session persistence and metadata.
 //!
-//! Sessions live under `~/.myco/session/{shard}/{id}.json` (plus a sibling
+//! Sessions live under the selected profile's `session/{shard}/{id}.json` (plus a sibling
 //! `.history` for readline). Each document owns ordered threads and shared
 //! metadata. Version 2 loads as one thread; saves use [`SESSION_FILE_VERSION`].
 //!
@@ -642,7 +642,7 @@ fn warn_about_skipped_sessions(skipped: &[(PathBuf, String)]) {
         skipped.len(),
         session_root()
             .map(|r| r.display().to_string())
-            .unwrap_or_else(|_| "~/.myco/session".into())
+            .unwrap_or_else(|_| "the selected profile's session directory".into())
     );
     for (path, reason) in skipped.iter().take(3) {
         eprintln!("  {}: {reason}", path.display());
@@ -720,7 +720,7 @@ fn load_most_recent_session() -> Result<Session, String> {
             return Ok(session);
         }
     }
-    Err("no sessions found under ~/.myco/session".to_string())
+    Err(format!("no sessions found under {}", root.display()))
 }
 
 pub fn resolve_session_id(id_or_prefix: &str) -> Result<String, String> {

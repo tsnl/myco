@@ -47,7 +47,10 @@ pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
 pub fn pick(search: Option<&str>) -> Result<Option<String>, String> {
     let all = list_sessions(0)?;
     if all.is_empty() {
-        return Err("no sessions found under ~/.myco/session".into());
+        return Err(format!(
+            "no sessions found under {}",
+            crate::session::session_root()?.display()
+        ));
     }
     let entries = match search {
         Some(query) => {
