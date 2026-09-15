@@ -162,9 +162,21 @@ compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arri
 (no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
 `⚙`-prefixed line shows its usage — `⚙ last turn: input 63.8k (58k cached) · output 1.4k` —
 where input is the prompt of the turn's final request (≈ the live context) and output is
-summed across all of the turn's requests (one per tool round-trip). Below it, one
-`●`-prefixed line per still-running tool (live bash session on the in-process local host)
-shows its command, uptime, and idle time; remote hosts are not queried for this.
+summed across all of the turn's requests (one per tool round-trip). Below it,
+`●`-prefixed lines show this session's local bash sessions, with command, uptime, and
+time since the last interaction. A session stays visible until its launched process
+exits and both captured output streams close. If descendants keep a stream open after
+the process exits, the line says `process exited, output still open`; use bash `read`
+for later output or `close` to stop the process group.
+The tool result's `exit_code` and `exit_signal` describe the launched process;
+`status: exited` means its output streams have also closed. While descendants keep
+output open, `read` waits for their next output, idle gap, or timeout as usual.
+
+These lines refresh at each prompt. They are not an inventory of OS processes: remote
+hosts are not queried, one-shot `exec` commands are not retained, and descendants that
+close or redirect both output streams cannot be tracked after the launched process exits.
+Use bash `list` with a `host` to inspect that host's sessions. For managed background
+work, use bash `start` and keep the program in the foreground of that session.
 
 ### Console mirror (`{id}.console`)
 
