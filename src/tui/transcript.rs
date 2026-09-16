@@ -242,9 +242,25 @@ pub fn attachment_note(content: &[Content]) -> Option<String> {
 /// tool_uses as separate lists (interleaving is lost), so replay renders
 /// content paragraphs first, then tool paragraphs, per message.
 pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
+    history_events_at(messages, palette, &std::collections::BTreeMap::new())
+}
+
+pub fn acceptance_line(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    format!(
+        "Accepted: {}",
+        time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "unknown".into())
+    )
+}
+
+pub fn history_events_at(
+    messages: &[Message],
+    palette: Palette,
+    times: &std::collections::BTreeMap<usize, chrono::DateTime<chrono::Utc>>,
+) -> Vec<TuiEvent> {
     let mut st = SectionState::new();
     let mut events = Vec::new();
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         match msg {
             Message::UserMessage { content } => {
                 let text = content
@@ -275,6 +291,10 @@ pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
                 if let Some(note) = note {
                     events.push(TuiEvent::Text(format!("{note}\n")));
                 }
+                events.push(TuiEvent::Text(format!(
+                    "{}\n",
+                    acceptance_line(times.get(&index).copied())
+                )));
                 // Next assistant turn opens a fresh ASSISTANT section.
                 st = SectionState::new();
             }

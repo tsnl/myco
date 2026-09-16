@@ -2,7 +2,7 @@
 //!
 //! Runs once at application startup: [`Config::resolve`] takes optional
 //! [`ConfigUserSettings`] overrides (CLI flags, embedder choices), loads the
-//! config file (`--config` → `$MYCO_CONFIG` → `~/.myco/config.toml`), and
+//! config file (`--config` → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`), and
 //! produces fully resolved settings — the **model catalog**, the host pool
 //! (remote hosts from `~/.ssh/config` `Host` aliases), the default model key
 //! (`--model` → config file `model` → sole catalog entry), the prelude size cap
@@ -229,7 +229,7 @@ pub struct ConfigUserSettings {
     /// Override TTY detection (tests / embedders). `None` → detect from stdout.
     pub stdout_is_tty: Option<bool>,
     /// Config file override (CLI `--config`).
-    /// `None` → `$MYCO_CONFIG` → `~/.myco/config.toml`.
+    /// `None` → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`.
     pub config_path: Option<PathBuf>,
     /// Model key override (CLI `--model`).
     /// `None` → config file `model` → sole catalog entry.
@@ -254,7 +254,7 @@ pub struct Config {
     /// dumb terminals — it only inserts newlines.
     pub repaint_enabled: bool,
     /// Path the config file was loaded from
-    /// (override → `$MYCO_CONFIG` → `~/.myco/config.toml`).
+    /// (override → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`).
     pub config_path: PathBuf,
     /// Host pool: knobs from the config file (missing file → defaults) plus
     /// remote hosts from `~/.ssh/config` `Host` aliases.
@@ -366,7 +366,7 @@ impl Config {
     }
 }
 
-/// `--config` override → `$MYCO_CONFIG` → `~/.myco/config.toml`.
+/// `--config` override → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`.
 ///
 /// The flag reports whether the user named the path (the first two), which is
 /// what makes a missing file an error instead of an empty catalog.
@@ -380,8 +380,7 @@ fn resolve_config_path(
     if let Some(p) = env("MYCO_CONFIG") {
         return Ok((PathBuf::from(p), true));
     }
-    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok((home.join(".myco").join("config.toml"), false))
+    Ok((crate::core::myco_home_with(env)?.join("config.toml"), false))
 }
 
 /// What to tell someone whose catalog is empty — the state every fresh install
@@ -1117,7 +1116,7 @@ context_window = 32_768
         let empty = |_: &str| None;
         let (path, named) = resolve_config_path(None, &empty).unwrap();
         assert!(!named);
-        assert!(path.ends_with(".myco/config.toml"));
+        assert!(path.ends_with(".myco/profiles/default/config.toml"));
     }
 
     /// `base_url = ""` satisfies "set" but not "usable": without this it
@@ -1366,7 +1365,7 @@ context_window = 200_000
             path_for(None, &[("MYCO_CONFIG", "/env/y.toml")]),
             PathBuf::from("/env/y.toml")
         );
-        assert!(path_for(None, &[]).ends_with(".myco/config.toml"));
+        assert!(path_for(None, &[]).ends_with(".myco/profiles/default/config.toml"));
     }
 
     #[test]

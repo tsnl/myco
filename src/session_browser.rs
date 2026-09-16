@@ -18,7 +18,7 @@ use std::process::Stdio;
 
 use crate::core::uuid_simple_hex;
 use crate::external_command;
-use crate::session::{SessionListEntry, list_sessions, search_sessions, session_label};
+use crate::session::{SessionListEntry, search_sessions, session_label};
 
 /// Result cap for content search (`--search`).
 pub const SESSION_SEARCH_LIMIT: usize = 50;
@@ -31,8 +31,8 @@ pub const SESSION_SEARCH_LIMIT: usize = 50;
 /// reports the choice: written to `out` when given (the popup handshake),
 /// printed to stdout otherwise. Cancelling reports nothing and exits 0.
 /// With `search`, the list is ranked by content match instead of recency.
-pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
-    match (pick(search)?, out) {
+pub fn run(out: Option<&Path>, search: Option<&str>, archived: bool) -> Result<(), String> {
+    match (pick_archived(search, archived)?, out) {
         (Some(id), Some(path)) => std::fs::write(path, id).map_err(|e| e.to_string()),
         (Some(id), None) => {
             println!("{id}");
@@ -45,9 +45,24 @@ pub fn run(out: Option<&Path>, search: Option<&str>) -> Result<(), String> {
 /// List (or, with `search`, rank) visible sessions and pick one via fzf.
 /// `Ok(None)` = cancelled.
 pub fn pick(search: Option<&str>) -> Result<Option<String>, String> {
-    let all = list_sessions(0)?;
+    pick_archived(search, false)
+}
+
+fn pick_archived(search: Option<&str>, archived: bool) -> Result<Option<String>, String> {
+    let all = crate::session::list_sessions_with_filter(
+        0,
+        false,
+        if archived {
+            crate::session::ArchiveFilter::Archived
+        } else {
+            crate::session::ArchiveFilter::Active
+        },
+    )?;
     if all.is_empty() {
-        return Err("no sessions found under ~/.myco/session".into());
+        return Err(format!(
+            "no sessions found under {}",
+            crate::session::session_root()?.display()
+        ));
     }
     let entries = match search {
         Some(query) => {
@@ -181,11 +196,19 @@ pub fn pick_via_tmux_popup() -> Result<Option<String>, String> {
         sh_quote(&exe.to_string_lossy()),
         sh_quote(&result_path.to_string_lossy()),
     );
+    let mut cmd = external_command::TMUX.command();
+    cmd.args(["display-popup", "-E", "-w", "90%", "-h", "80%"]);
+    // The tmux server can predate the current profile selection.
+    for key in ["MYCO_HOME", "MYCO_PROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            let mut assignment = std::ffi::OsString::from(format!("{key}="));
+            assignment.push(value);
+            cmd.arg("-e").arg(assignment);
+        }
+    }
     // -E closes the popup when the command exits; the tmux client blocks
     // until then, so waiting on it is the synchronization.
-    let status = external_command::TMUX
-        .command()
-        .args(["display-popup", "-E", "-w", "90%", "-h", "80%"])
+    let status = cmd
         .arg(&popup_cmd)
         .status()
         .map_err(|e| format!("failed to run tmux: {e}"))?;
@@ -224,6 +247,7 @@ mod tests {
     #[test]
     fn fzf_line_is_three_tab_fields_with_sanitized_display() {
         let entry = SessionListEntry {
+            archived: false,
             id: "deadbeef00112233".into(),
             path: PathBuf::from("/tmp/deadbeef00112233.json"),
             created_at: chrono::Utc::now(),

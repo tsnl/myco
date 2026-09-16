@@ -1,5 +1,10 @@
 # User-facing CLI
 
+`myco --profile NAME` selects a profile; otherwise `MYCO_PROFILE` applies, then
+`default`. Config, sessions, workspace, and manual live under
+`$MYCO_HOME/profiles/NAME/` (`MYCO_HOME` defaults to `~/.myco`). Local nested
+agents inherit the selection. Use the same profile to resume a session.
+
 You cannot press these yourself — tell the user which command to run.
 
 | Command | Meaning |
@@ -7,6 +12,9 @@ You cannot press these yourself — tell the user which command to run.
 | `/hosts` | Hosts (local in-process + remotes), tools, cmd, live/idle/error |
 | `/session` | Current session metadata (title, links, scratchpad, path) |
 | `/sessions` | Recent **visible** sessions (titles + link counts; hides subagent/compact) |
+| `/sessions archived` | List archived user sessions |
+| `/archive [id]` | Archive this session or a saved session by id/prefix |
+| `/restore [id]` | Restore this session or a saved session by id/prefix |
 | `/resume [id]` | Load conversation memory (no id: session browser, see below) |
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
@@ -23,6 +31,19 @@ Shift-Enter does **not** insert a newline in most terminals: they transmit it as
 plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
+
+Accepted user turns carry a persisted UTC acceptance time, shown as `Accepted:`
+below the input in live output and replay. Older turns and synthetic compaction
+input have unknown timestamps; their creation time is not substituted.
+
+Archiving hides a session from ordinary listings and bare resume. It preserves
+all threads, metadata, search, and links; it does not cancel a run or close tools.
+Children and legacy predecessor/successor sessions keep their own archive status.
+Use `/sessions archived`, `myco --mode session-browser --archived`, or
+`session_meta list archive_filter=archived` to find archived sessions, then
+`/restore id` to show one again. Explicit `/resume id` can open an archived
+session without changing its status. Another running process owns its session's
+writer lock; archive or restore that session in its own CLI or `session_meta`.
 
 Mentioning `@<path>` in a message attaches that file as image input (extensions
 png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the
@@ -50,8 +71,11 @@ was sent. myco checks each composed request against a 30 MiB ceiling before
 uploading it, and maps a provider's own size rejection — a 413, or a 400 whose
 body names or describes the size — to the same failure. That failure
 is not retryable — every later turn resends the same history — so myco **rewinds
-the last user message out of the conversation** and says so in the ERROR
-section. The session continues; re-send the message with a smaller image, or
+the last user turn out of the active context** and says so in the ERROR
+section. This includes Anthropic's many-image dimension limit. Recovery creates
+a successor thread; the predecessor keeps the rejected input and all recorded
+tool actions, readable with `session_history`. If saving fails, the original
+context stays active. The session continues; re-send the message with a smaller image, or
 `/compact` (or `/new`) to shed history.
 
 ### Session browser
@@ -107,7 +131,7 @@ attachments. No console mirror is written in print mode.
 ### Models & config (quick)
 
 - Models come from the `[gateways]` / `[models]` catalog in
-  `~/.myco/config.toml` — **none are built in**. `--model <key>` picks a
+  `~/.myco/profiles/default/config.toml` — **none are built in**. `--model <key>` picks a
   catalog key; default is config.toml `model`, or the sole configured entry.
 - A gateway holds `protocol` (`anthropic-messages` | `openai-responses` |
   `openai-completions`),
@@ -173,7 +197,7 @@ startup banner, preflight WARNING, USER headers + submitted input, the streamed
 ASSISTANT section, the `/compact` progress line + COMPACTED banner, live
 ERROR / `(cancelled)` notices, and meta-command output (`/hosts`, `/session`,
 …) — to a plain-text, ANSI-free file beside the session JSON:
-`~/.myco/session/<shard>/<id>.console` (shown as `console:` in `/session`
+`~/.myco/profiles/default/session/<shard>/<id>.console` (shown as `console:` in `/session`
 and `session_meta` get). It is append-only and accumulates across runs of the
 same session.
 

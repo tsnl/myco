@@ -115,6 +115,7 @@ mod tests {
             }],
             false,
             CancelToken::new(),
+            chrono::Utc::now(),
             |warning| panic!("{warning}"),
         )
         .await
@@ -123,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn shells_survive_compaction_and_agent_replacement_but_end_with_the_session_runtime() {
+    fn shells_survive_archive_compaction_and_agent_replacement_but_end_with_the_session_runtime() {
         let _home = temp_home("thread-shell");
         let executor = tokio::runtime::Runtime::new().unwrap();
         executor.block_on(async {
@@ -142,6 +143,7 @@ mod tests {
             assert!(original.to_string().contains("observed-first"));
             let first_agent_id = first.context().agent_id;
             drop(first);
+            session.set_archived(true).unwrap();
             assert_eq!(live.running_tool_summaries().len(), 1);
 
             let (thread, _) = compact_thread(&session.snapshot(), "A shell holds marker=first").unwrap();
@@ -155,6 +157,7 @@ mod tests {
             assert_ne!(second.context().agent_id, first_agent_id);
             assert_eq!(second.context().thread_id.as_deref(), Some(session.snapshot().active_thread().id.as_str()));
             let saved = session.snapshot();
+            assert!(saved.archived);
             let current = serde_json::to_string(saved.active_thread()).unwrap();
             assert!(current.contains("inherited-first"), "{current}");
             assert!(current.contains("observed-second"), "{current}");

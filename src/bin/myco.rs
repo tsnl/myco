@@ -62,6 +62,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "/effort",
     "/title",
     "/compact",
+    "/archive",
+    "/restore",
 ];
 
 // ---------------------------------------------------------------------------
@@ -79,7 +81,7 @@ const SLASH_COMMANDS: &[&str] = &[
 struct Args {
     /// Show CLI help, or print a manual article when ARTICLE is given
     /// (e.g. `myco --help overview`). Same articles startup exports to
-    /// `~/.myco/manual/<version>/<commit>/` for agents to read.
+    /// `~/.myco/profiles/default/manual/<version>/<commit>/` for agents to read.
     #[arg(
         long = "help",
         short = 'h',
@@ -95,6 +97,11 @@ struct Args {
     /// ssh); `session-browser` runs the standalone session picker.
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
+
+    /// Data profile: --profile overrides MYCO_PROFILE (default: default).
+    /// Config, sessions and workspace live under MYCO_HOME/profiles/NAME.
+    #[arg(long, value_name = "NAME", value_parser = myco::core::validate_profile)]
+    profile: Option<String>,
 
     /// Print mode (non-interactive): run one agent turn, stream the answer to
     /// stdout, and exit. Bare `-p` takes the prompt from piped stdin; with
@@ -114,6 +121,10 @@ struct Args {
     /// listing by recency.
     #[arg(long, value_name = "QUERY")]
     search: Option<String>,
+
+    /// With --mode session-browser: browse archived sessions.
+    #[arg(long)]
+    archived: bool,
 
     /// Host name advertised in hello_ok / logs. Only used with `--mode host`.
     #[arg(long, default_value = "local")]
@@ -157,7 +168,7 @@ struct Args {
     effort: Effort,
 
     /// Path to myco config (knobs; hosts come from ~/.ssh/config).
-    /// Default: $MYCO_CONFIG or ~/.myco/config.toml.
+    /// Default: $MYCO_CONFIG or ~/.myco/profiles/default/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -200,30 +211,60 @@ enum Mode {
 // main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let _ = dotenvy::dotenv();
     let args = Args::parse();
     if let Some(topic) = args.help_topic.as_deref() {
         print_cli_help(topic);
         return;
     }
+    if let Err(error) = configure_profile(args.profile.as_deref()) {
+        eprintln!("myco: {error}");
+        std::process::exit(2);
+    }
     if args.print.is_some() && args.mode != Mode::Interactive {
         eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
         std::process::exit(2);
     }
-    match args.mode {
-        Mode::Interactive if args.print.is_some() => run_print(args).await,
-        Mode::Interactive => run_interactive(args).await,
-        Mode::Host => run_host(args).await,
-        Mode::SessionBrowser => run_session_browser(args),
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create async runtime")
+        .block_on(async {
+            match args.mode {
+                Mode::Interactive if args.print.is_some() => run_print(args).await,
+                Mode::Interactive => run_interactive(args).await,
+                Mode::Host => run_host(args).await,
+                Mode::SessionBrowser => run_session_browser(args),
+            }
+        });
+}
+
+fn configure_profile(profile: Option<&str>) -> Result<(), String> {
+    let inherited = std::env::var("MYCO_PROFILE").ok();
+    let profile =
+        myco::core::validate_profile(profile.or(inherited.as_deref()).unwrap_or("default"))?;
+    let root = std::env::var_os("MYCO_HOME")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".myco")))
+        .ok_or("could not resolve home directory")?;
+    let root = std::path::absolute(root).map_err(|e| format!("resolve MYCO_HOME: {e}"))?;
+    // Startup is single-threaded, before Tokio or tools can read the environment.
+    // Local bash children inherit both selectors, including across cwd changes.
+    unsafe {
+        std::env::set_var("MYCO_PROFILE", profile);
+        std::env::set_var("MYCO_HOME", root);
     }
+    Ok(())
 }
 
 /// `--mode session-browser`: standalone picker, spawned by the bare-/resume
 /// tmux popup or run directly.
 fn run_session_browser(args: Args) {
-    if let Err(e) = myco::session_browser::run(args.out.as_deref(), args.search.as_deref()) {
+    if let Err(e) =
+        myco::session_browser::run(args.out.as_deref(), args.search.as_deref(), args.archived)
+    {
         eprintln!("session browser error: {e}");
         std::process::exit(1);
     }
@@ -306,12 +347,18 @@ async fn run_print(args: Args) {
         }
     });
 
+    let accepted_at = chrono::Utc::now();
+    eprintln!(
+        "{}",
+        myco::tui::transcript::acceptance_line(Some(accepted_at))
+    );
     let outcome = run_session_turn(
         &mut agent,
         &runtime,
         content,
         args.fork,
         cancel,
+        accepted_at,
         session_warning,
     )
     .await;
@@ -332,8 +379,8 @@ async fn run_print(args: Args) {
             eprintln!("myco: {e}");
             if let Some(dropped) = outcome.rewound {
                 eprintln!(
-                    "myco: the last message was removed from the conversation so the session \
-                     can continue{}.",
+                    "myco: the last user turn was removed from active context so the session \
+                     can continue{}. Its recorded actions remain in the predecessor thread.",
                     describe_dropped_images(&dropped)
                 );
             }
@@ -403,7 +450,7 @@ fn read_piped_stdin() -> Option<String> {
 
 /// One explicit resolution step: model catalog (gateways/models + auth),
 /// harness hosts and default model key (--config → $MYCO_CONFIG →
-/// ~/.myco/config.toml), and the color decision. Everything downstream
+/// ~/.myco/profiles/default/config.toml), and the color decision. Everything downstream
 /// reads this, not the env or config files.
 fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
     let app_config = Config::resolve(ConfigUserSettings {
@@ -679,7 +726,7 @@ async fn run_interactive(args: Args) {
     // (or the resumed-history replay).
     ui.blank_line();
     if resuming {
-        ui.replay_history(agent.history());
+        active_session.with(|session| ui.replay_thread(session.active_thread()));
     }
 
     // Thinking/reasoning is always requested; UI shows summary lines only
@@ -886,7 +933,7 @@ impl ReplSession {
                 last_wrap = wrap;
                 self.ui.set_wrap(wrap);
                 if self.repaint && !self.agent.history().is_empty() {
-                    clear_and_reprint(&self.agent, &self.ui);
+                    clear_and_reprint(&self.session, &self.ui);
                 }
             }
             let max = self.agent.context_window_tokens();
@@ -918,7 +965,7 @@ impl ReplSession {
             // Ctrl-L on an empty buffer submits an empty line + sets this flag:
             // clear scrollback and reprint the conversation.
             if self.ctrl_l.swap(false, Ordering::SeqCst) {
-                clear_and_reprint(&self.agent, &self.ui);
+                clear_and_reprint(&self.session, &self.ui);
                 continue;
             }
 
@@ -1067,6 +1114,9 @@ impl ReplSession {
             self.ui.note(&note);
         }
         let cancel = self.turn_cancel.arm();
+        let accepted_at = chrono::Utc::now();
+        self.ui
+            .note(&myco::tui::transcript::acceptance_line(Some(accepted_at)));
 
         let outcome = run_session_turn(
             &mut self.agent,
@@ -1074,6 +1124,7 @@ impl ReplSession {
             content,
             std::mem::take(&mut self.forked),
             cancel,
+            accepted_at,
             session_warning,
         )
         .await;
@@ -1088,8 +1139,8 @@ impl ReplSession {
                 let mut message = e.to_string();
                 if let Some(dropped) = outcome.rewound {
                     message.push_str(&format!(
-                        "\n\nThe last message was removed from the conversation so the session \
-                         can continue{}.",
+                        "\n\nThe last user turn was removed from active context so the session \
+                         can continue{}. Its recorded actions remain in the predecessor thread.",
                         describe_dropped_images(&dropped)
                     ));
                 }
@@ -1224,7 +1275,9 @@ enum MetaCommand<'a> {
     Help,
     New,
     Session,
-    Sessions,
+    Sessions(bool),
+    Archive(Option<&'a str>),
+    Restore(Option<&'a str>),
     Hosts,
     Resume(Option<&'a str>),
     /// `None` → print current effort; `Some` → set effort.
@@ -1259,7 +1312,10 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
         (None, _) if head == "help" => Some(MetaCommand::Help),
         (Some("new"), _) => Some(MetaCommand::New),
         (Some("session"), _) => Some(MetaCommand::Session),
-        (Some("sessions"), _) => Some(MetaCommand::Sessions),
+        (Some("sessions"), None) => Some(MetaCommand::Sessions(false)),
+        (Some("sessions"), Some("archived")) => Some(MetaCommand::Sessions(true)),
+        (Some("archive"), arg) => Some(MetaCommand::Archive(arg)),
+        (Some("restore"), arg) => Some(MetaCommand::Restore(arg)),
         (Some("hosts"), _) => Some(MetaCommand::Hosts),
         (Some("resume"), arg) => Some(MetaCommand::Resume(arg.filter(|s| !s.is_empty()))),
         (Some("effort"), arg) => Some(MetaCommand::Effort(arg.filter(|s| !s.is_empty()))),
@@ -1286,7 +1342,15 @@ impl ReplSession {
                 self.ui
                     .myco_section(&format_session_detail(&self.session.snapshot()));
             }
-            MetaCommand::Sessions => match list_sessions(0) {
+            MetaCommand::Sessions(archived) => match myco::session::list_sessions_with_filter(
+                0,
+                false,
+                if archived {
+                    myco::session::ArchiveFilter::Archived
+                } else {
+                    myco::session::ArchiveFilter::Active
+                },
+            ) {
                 Ok(list) => {
                     let shown = RECENT_SESSION_LIMIT.min(list.len());
                     let mut body = format_session_list(&list[..shown]);
@@ -1302,6 +1366,16 @@ impl ReplSession {
                     .ui
                     .error_section(&format!("Failed to list sessions: {e}")),
             },
+            MetaCommand::Archive(id) | MetaCommand::Restore(id) => {
+                let archived = matches!(cmd, MetaCommand::Archive(_));
+                match self.session.set_session_archived(id, archived) {
+                    Ok(id) => self.ui.myco_section(&format!(
+                        "session {id} {}",
+                        if archived { "archived" } else { "restored" }
+                    )),
+                    Err(error) => self.ui.error_section(&error),
+                }
+            }
             MetaCommand::Hosts => self.ui.myco_section(&format_host_status(&self.harness)),
             MetaCommand::New => {
                 self.save_before_switch();
@@ -1336,7 +1410,8 @@ impl ReplSession {
                             self.session.id(),
                             self.agent.history().len()
                         ));
-                        self.ui.replay_history(self.agent.history());
+                        self.session
+                            .with(|session| self.ui.replay_thread(session.active_thread()));
                     }
                     Err(e) if e == RESUME_CANCELLED => self.ui.note("resume cancelled"),
                     Err(e) => self.ui.error_section(&format!("resume failed: {e}")),
@@ -1612,9 +1687,9 @@ fn clear_screen() {
 /// Triggered by Ctrl-L and by resize reflow; the prompt loop reprints the USER
 /// header on its next iteration. The replay is terminal-only: this is a redraw
 /// of content the console mirror already holds.
-fn clear_and_reprint(agent: &Agent, ui: &TuiProducer) {
+fn clear_and_reprint(session: &ActiveSession, ui: &TuiProducer) {
     clear_screen();
-    ui.replay_history(agent.history());
+    session.with(|session| ui.replay_thread(session.active_thread()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,7 +1908,7 @@ mod tests {
         assert!(matches!(parse_meta("help"), Some(MetaCommand::Help)));
         assert!(matches!(
             parse_meta(":sessions"),
-            Some(MetaCommand::Sessions)
+            Some(MetaCommand::Sessions(false))
         ));
         // A typo'd command surfaces as Unknown (→ ERROR section in
         // handle_meta) and is never sent to the model.
