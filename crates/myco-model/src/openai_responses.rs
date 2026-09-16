@@ -5,6 +5,7 @@
 //! xAI: https://docs.x.ai/docs/guides/function-calling
 //! OpenRouter: https://openrouter.ai/docs/api/api-reference/responses/create-responses
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
@@ -206,6 +207,7 @@ fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
 #[derive(Default)]
 struct StreamAccumulator {
     slots: SlotMap,
+    reasoning: BTreeMap<usize, Reasoning>,
     /// Streamed function-call arguments per `output_index`, so a
     /// `function_call_arguments.done` with final arguments can be preferred
     /// when no deltas were streamed.
@@ -213,6 +215,12 @@ struct StreamAccumulator {
     saw_tool_call: bool,
     stop_reason: Option<TurnEndReason>,
     finished: bool,
+}
+
+#[derive(Default)]
+struct Reasoning {
+    raw: String,
+    has_summary: bool,
 }
 
 impl SseAccumulator for StreamAccumulator {
@@ -249,6 +257,34 @@ impl StreamAccumulator {
         self.tool_input_json[output_index] = Some(json);
     }
 
+    fn thinking_index(&mut self, output_index: usize, out: &mut Vec<MessagePart>) -> Option<usize> {
+        if matches!(self.slots.get(output_index), None | Some(Slot::Ignored)) {
+            let index = self.slots.open_thinking(output_index);
+            out.push(MessagePart::ContentStart(ContentStart::Thinking {
+                index,
+                signature: None,
+                redacted: false,
+            }));
+        }
+        match self.slots.get(output_index) {
+            Some(Slot::Thinking { index }) => Some(index),
+            _ => None,
+        }
+    }
+
+    fn finish_reasoning(&mut self, output_index: usize, out: &mut Vec<MessagePart>) {
+        if let Some(reasoning) = self.reasoning.remove(&output_index)
+            && !reasoning.has_summary
+            && !reasoning.raw.is_empty()
+            && let Some(Slot::Thinking { index }) = self.slots.get(output_index)
+        {
+            out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
+                index,
+                delta: reasoning.raw,
+            }));
+        }
+    }
+
     fn handle_event(
         &mut self,
         event: ResponsesStreamEvent,
@@ -265,12 +301,7 @@ impl StreamAccumulator {
                     }));
                 }
                 ResponsesOutputItem::Reasoning => {
-                    let content_index = self.slots.open_thinking(output_index);
-                    out.push(MessagePart::ContentStart(ContentStart::Thinking {
-                        index: content_index,
-                        signature: None,
-                        redacted: false,
-                    }));
+                    self.thinking_index(output_index, &mut out);
                 }
                 ResponsesOutputItem::FunctionCall { name, arguments } => {
                     // A nameless call cannot be dispatched or resent. Fail
@@ -313,34 +344,37 @@ impl StreamAccumulator {
                     }));
                 }
             }
-            // Summary-only thinking API: surface reasoning *summaries*, ignore raw
-            // chain-of-thought streams (e.g. Grok `reasoning_text` can be very long).
             ResponsesStreamEvent::ResponseReasoningSummaryTextDelta {
                 output_index,
                 delta,
             } => {
-                // Lazy-open a thinking slot if the gateway streams deltas without item.added.
-                if matches!(self.slots.get(output_index), None | Some(Slot::Ignored)) {
-                    let content_index = self.slots.open_thinking(output_index);
-                    out.push(MessagePart::ContentStart(ContentStart::Thinking {
-                        index: content_index,
-                        signature: None,
-                        redacted: false,
+                if !delta.is_empty()
+                    && let Some(index) = self.thinking_index(output_index, &mut out)
+                {
+                    let reasoning = self.reasoning.entry(output_index).or_default();
+                    reasoning.has_summary = true;
+                    reasoning.raw.clear();
+                    out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
+                        index,
+                        delta,
                     }));
                 }
-                match self.slots.get(output_index) {
-                    Some(Slot::Thinking { index }) if !delta.is_empty() => {
-                        out.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                            index,
-                            delta,
-                        }));
+            }
+            ResponsesStreamEvent::ResponseReasoningTextDelta {
+                output_index,
+                delta,
+            } => {
+                if !delta.is_empty() && self.thinking_index(output_index, &mut out).is_some() {
+                    let reasoning = self.reasoning.entry(output_index).or_default();
+                    if !reasoning.has_summary {
+                        // A summary may arrive later, so raw text waits until the item is complete.
+                        reasoning.raw.push_str(&delta);
                     }
-                    // If this index was already opened as normal text, don't corrupt it.
-                    _ => {}
                 }
             }
-            // Raw reasoning traces are intentionally dropped (summary-only public API).
-            ResponsesStreamEvent::ResponseReasoningTextDelta => {}
+            ResponsesStreamEvent::ResponseOutputItemDone { output_index } => {
+                self.finish_reasoning(output_index, &mut out);
+            }
             ResponsesStreamEvent::ResponseFunctionCallArgumentsDelta {
                 output_index,
                 delta,
@@ -426,6 +460,9 @@ impl StreamAccumulator {
                         }
                     }
                 };
+                for output_index in self.reasoning.keys().copied().collect::<Vec<_>>() {
+                    self.finish_reasoning(output_index, &mut out);
+                }
                 self.stop_reason = Some(reason.clone());
                 if let Some(u) = response.usage {
                     out.push(MessagePart::Usage(u.into_token_usage()));
@@ -549,6 +586,11 @@ enum ResponsesStreamEvent {
         output_index: usize,
         item: ResponsesOutputItem,
     },
+    #[serde(rename = "response.output_item.done")]
+    ResponseOutputItemDone {
+        #[serde(default)]
+        output_index: usize,
+    },
     #[serde(rename = "response.output_text.delta")]
     ResponseOutputTextDelta {
         #[serde(default)]
@@ -562,10 +604,12 @@ enum ResponsesStreamEvent {
         output_index: usize,
         delta: String,
     },
-    /// Some gateways stream raw reasoning text under this event name.
-    /// Intentionally ignored (summary-only public thinking API).
     #[serde(rename = "response.reasoning_text.delta")]
-    ResponseReasoningTextDelta,
+    ResponseReasoningTextDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
     ResponseFunctionCallArgumentsDelta {
         #[serde(default)]
@@ -828,35 +872,117 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stream_accumulator_ignores_raw_reasoning_text() {
-        let mut acc = StreamAccumulator::default();
+    fn assembled_response(events: Vec<serde_json::Value>) -> GenerateOutput {
+        let mut stream = StreamAccumulator::default();
+        let mut message = MessageAccumulator::default();
+        message.push(&MessagePart::MessageStart).unwrap();
+        for event in events.into_iter().chain([serde_json::json!({
+            "type": "response.completed", "response": {"status": "completed"}
+        })]) {
+            for part in stream.handle_data(&event.to_string()).unwrap() {
+                message.push(&part).unwrap();
+            }
+        }
+        stream.finish().unwrap();
+        message.finish().unwrap()
+    }
 
-        let items = acc
-            .handle_event(ResponsesStreamEvent::ResponseOutputItemAdded {
-                output_index: 0,
-                item: ResponsesOutputItem::Reasoning,
+    fn thinking_text(output: GenerateOutput) -> Vec<String> {
+        output
+            .content
+            .into_iter()
+            .filter_map(|content| match content {
+                Content::Thinking { text, .. } => Some(text),
+                _ => None,
             })
+            .collect()
+    }
+
+    #[test]
+    fn raw_reasoning_without_a_summary_reaches_the_opened_thinking_slot_once() {
+        let output = assembled_response(vec![
+            serde_json::json!({"type":"response.output_item.added", "output_index":3,
+                "item":{"type":"reasoning", "summary":[]}}),
+            serde_json::json!({"type":"response.reasoning_text.delta", "output_index":3,
+                "delta":"Let me "}),
+            serde_json::json!({"type":"response.reasoning_text.delta", "output_index":3,
+                "delta":"check."}),
+            serde_json::json!({"type":"response.output_item.done", "output_index":3}),
+            serde_json::json!({"type":"response.output_item.done", "output_index":3}),
+        ]);
+        assert_eq!(thinking_text(output), vec!["Let me check."]);
+    }
+
+    #[test]
+    fn raw_reasoning_is_released_when_its_item_finishes() {
+        let mut stream = StreamAccumulator::default();
+        let parts = stream
+            .handle_data(
+                r#"{
+            "type":"response.reasoning_text.delta", "output_index":4, "delta":"thinking"
+        }"#,
+            )
             .unwrap();
         assert!(matches!(
-            &items[0],
-            MessagePart::ContentStart(ContentStart::Thinking { index: 0, .. })
+            parts.as_slice(),
+            [MessagePart::ContentStart(ContentStart::Thinking {
+                index: 0,
+                ..
+            })]
         ));
 
-        // Raw reasoning_text must not produce Thinking deltas (summary-only API).
-        let items = acc
-            .handle_event(ResponsesStreamEvent::ResponseReasoningTextDelta)
+        let parts = stream
+            .handle_data(
+                r#"{
+            "type":"response.output_item.done", "output_index":4
+        }"#,
+            )
             .unwrap();
-        assert!(items.is_empty());
+        assert_eq!(parts.len(), 1);
+        expect_thinking_delta(&parts[0], 0, "thinking");
+    }
 
-        // Summaries still flow.
-        let items = acc
-            .handle_event(ResponsesStreamEvent::ResponseReasoningSummaryTextDelta {
-                output_index: 0,
-                delta: "brief summary".into(),
-            })
-            .unwrap();
-        expect_thinking_delta(&items[0], 0, "brief summary");
+    #[test]
+    fn summaries_win_over_raw_reasoning_in_either_arrival_order() {
+        let raw = serde_json::json!({"type":"response.reasoning_text.delta", "output_index":0,
+            "delta":"verbose reasoning"});
+        let summary = serde_json::json!({"type":"response.reasoning_summary_text.delta", "output_index":0,
+            "delta":"brief summary"});
+        for events in [vec![raw.clone(), summary.clone()], vec![summary, raw]] {
+            assert_eq!(
+                thinking_text(assembled_response(events)),
+                vec!["brief summary"]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_summaries_do_not_suppress_raw_reasoning_at_response_completion() {
+        let output = assembled_response(vec![
+            serde_json::json!({"type":"response.reasoning_summary_part.added", "output_index":0,
+                "part":{"type":"summary_text", "text":""}}),
+            serde_json::json!({"type":"response.reasoning_summary_text.delta", "output_index":0,
+                "delta":""}),
+            serde_json::json!({"type":"response.reasoning_text.delta", "output_index":0,
+                "delta":"raw fallback"}),
+        ]);
+        assert_eq!(thinking_text(output), vec!["raw fallback"]);
+    }
+
+    #[test]
+    fn summary_preference_is_independent_for_each_reasoning_item() {
+        let output = assembled_response(vec![
+            serde_json::json!({"type":"response.reasoning_summary_text.delta", "output_index":2,
+                "delta":"first summary"}),
+            serde_json::json!({"type":"response.reasoning_text.delta", "output_index":7,
+                "delta":"second raw fallback"}),
+            serde_json::json!({"type":"response.reasoning_text.delta", "output_index":2,
+                "delta":"ignored first raw"}),
+        ]);
+        assert_eq!(
+            thinking_text(output),
+            vec!["first summary", "second raw fallback"]
+        );
     }
 
     #[test]

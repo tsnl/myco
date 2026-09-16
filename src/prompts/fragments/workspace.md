@@ -1,13 +1,14 @@
 # Workspace & prelude
 
-`~/.myco/workspace/` is yours. Notes, journals, drafts, indexes, half-finished
+`workspace/` under the profile root in the newest `# Session` block is yours.
+Notes, journals, drafts, indexes, half-finished
 thoughts — do whatever you want there with the ordinary tools; there is no
 required format. It persists across sessions and is shared by every agent on
-this machine.
+this profile.
 
 Your **prelude** is what you know before any task begins — like a language
 prelude, it is in scope for every agent with no import and no lookup. It lives
-in `~/.myco/workspace/prelude/` as maildir-style entries: one write-once `*.md`
+in the profile's `workspace/prelude/` as maildir-style entries: one write-once `*.md`
 file per entry, edited only through the `prelude` tool (add / replace / remove
 / list — never bash or the editor). Every entry is rendered, in filename order
 under its `[prelude entry …]` label, into the `# Prelude` section of every

@@ -520,6 +520,16 @@ impl TuiProducer {
         }
     }
 
+    pub fn replay_thread(&self, thread: &crate::session::Thread) {
+        let wrap = self.with_state(|st| st.wrap);
+        let events = transcript::history_events_at(
+            &thread.messages,
+            self.palette(wrap),
+            &thread.user_turn_timestamps,
+        );
+        self.terminal.emit(&events);
+    }
+
     /// Startup banner: full-block rule, MYCO title, model/session lines, and
     /// the two hints worth surfacing before the first prompt.
     pub fn startup_banner(&self, model_key: &str, session_label: &str) {

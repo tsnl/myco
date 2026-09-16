@@ -31,7 +31,7 @@ pub fn compact_thread(
     if summary_markdown.trim().is_empty() {
         return Err("summary markdown is empty".into());
     }
-    let tail = select_tail(
+    let tail = select_tail_indexed(
         &predecessor.messages,
         TAIL_USER_TURNS,
         TAIL_TOOL_BODY_MAX_CHARS,
@@ -53,7 +53,13 @@ pub fn compact_thread(
             Content::Text { text: resume },
         ],
     }];
-    successor.messages.extend(tail);
+    for (old_index, message) in tail {
+        let index = successor.messages.len();
+        successor.messages.push(message);
+        if let Some(time) = predecessor.user_turn_timestamps.get(&old_index) {
+            successor.user_turn_timestamps.insert(index, *time);
+        }
+    }
     let outcome = CompactOutcome {
         session_id: session.id.clone(),
         predecessor_id: predecessor.id.clone(),
@@ -66,6 +72,17 @@ pub fn compact_thread(
 
 /// Select the last `user_turns` well-formed user turns (user → … → assistant end).
 pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize) -> Vec<Message> {
+    select_tail_indexed(messages, user_turns, tool_body_max)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+fn select_tail_indexed(
+    messages: &[Message],
+    user_turns: usize,
+    tool_body_max: usize,
+) -> Vec<(usize, Message)> {
     if user_turns == 0 || messages.is_empty() {
         return Vec::new();
     }
@@ -91,8 +108,13 @@ pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize
     {
         end = end.saturating_sub(1);
     }
-    let mut out: Vec<Message> = slice[..end].to_vec();
-    for message in &mut out {
+    let mut out: Vec<_> = slice[..end]
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, message)| (start + index, message))
+        .collect();
+    for (_, message) in &mut out {
         if let Message::UserMessage { content } = message {
             content.retain(
                 |part| !matches!(part, Content::Text { text } if prompts::is_session_stamp(text)),
@@ -101,7 +123,7 @@ pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize
         truncate_message_bodies(message, tool_body_max);
     }
     out.retain(
-        |message| !matches!(message, Message::UserMessage { content } if content.is_empty()),
+        |(_, message)| !matches!(message, Message::UserMessage { content } if content.is_empty()),
     );
     out
 }
@@ -270,6 +292,40 @@ mod tests {
 
     fn assistant_tools() -> Message {
         assistant_tool(None, "bash", json!({"command": "echo hi"}))
+    }
+
+    #[test]
+    fn compaction_preserves_original_acceptance_times_and_archive_status() {
+        let _home = temp_home("compact-timestamps");
+        let mut session = Session::new("test");
+        session.replace_context(
+            vec![
+                user("older"),
+                assistant("answer"),
+                user("latest"),
+                assistant("answer"),
+            ],
+            None,
+        );
+        let time = chrono::Utc::now();
+        session
+            .active_thread_mut()
+            .user_turn_timestamps
+            .insert(2, time);
+        session.archived = true;
+        let (next, _) = compact_thread(&session, "summary").unwrap();
+        assert_eq!(next.user_turn_timestamps.len(), 1);
+        assert_eq!(next.user_turn_timestamps[&3], time);
+        let active = super::super::ActiveSession::new(session);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(active.writer())
+            .commit_thread(next)
+            .unwrap();
+        let saved = Session::load(&active.snapshot().json_path()).unwrap();
+        assert!(saved.archived);
+        assert_eq!(saved.threads()[0].user_turn_timestamps[&2], time);
+        assert_eq!(saved.active_thread().user_turn_timestamps[&3], time);
     }
 
     #[test]
