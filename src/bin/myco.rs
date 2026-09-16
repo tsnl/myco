@@ -79,7 +79,7 @@ const SLASH_COMMANDS: &[&str] = &[
 struct Args {
     /// Show CLI help, or print a manual article when ARTICLE is given
     /// (e.g. `myco --help overview`). Same articles startup exports to
-    /// `~/.myco/manual/<version>/<commit>/` for agents to read.
+    /// `~/.myco/profiles/default/manual/<version>/<commit>/` for agents to read.
     #[arg(
         long = "help",
         short = 'h',
@@ -95,6 +95,11 @@ struct Args {
     /// ssh); `session-browser` runs the standalone session picker.
     #[arg(long, value_enum, default_value_t = Mode::Interactive)]
     mode: Mode,
+
+    /// Data profile: --profile overrides MYCO_PROFILE (default: default).
+    /// Config, sessions and workspace live under MYCO_HOME/profiles/NAME.
+    #[arg(long, value_name = "NAME", value_parser = myco::core::validate_profile)]
+    profile: Option<String>,
 
     /// Print mode (non-interactive): run one agent turn, stream the answer to
     /// stdout, and exit. Bare `-p` takes the prompt from piped stdin; with
@@ -157,7 +162,7 @@ struct Args {
     effort: Effort,
 
     /// Path to myco config (knobs; hosts come from ~/.ssh/config).
-    /// Default: $MYCO_CONFIG or ~/.myco/config.toml.
+    /// Default: $MYCO_CONFIG or ~/.myco/profiles/default/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -200,24 +205,52 @@ enum Mode {
 // main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let _ = dotenvy::dotenv();
     let args = Args::parse();
     if let Some(topic) = args.help_topic.as_deref() {
         print_cli_help(topic);
         return;
     }
+    if let Err(error) = configure_profile(args.profile.as_deref()) {
+        eprintln!("myco: {error}");
+        std::process::exit(2);
+    }
     if args.print.is_some() && args.mode != Mode::Interactive {
         eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
         std::process::exit(2);
     }
-    match args.mode {
-        Mode::Interactive if args.print.is_some() => run_print(args).await,
-        Mode::Interactive => run_interactive(args).await,
-        Mode::Host => run_host(args).await,
-        Mode::SessionBrowser => run_session_browser(args),
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create async runtime")
+        .block_on(async {
+            match args.mode {
+                Mode::Interactive if args.print.is_some() => run_print(args).await,
+                Mode::Interactive => run_interactive(args).await,
+                Mode::Host => run_host(args).await,
+                Mode::SessionBrowser => run_session_browser(args),
+            }
+        });
+}
+
+fn configure_profile(profile: Option<&str>) -> Result<(), String> {
+    let inherited = std::env::var("MYCO_PROFILE").ok();
+    let profile =
+        myco::core::validate_profile(profile.or(inherited.as_deref()).unwrap_or("default"))?;
+    let root = std::env::var_os("MYCO_HOME")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".myco")))
+        .ok_or("could not resolve home directory")?;
+    let root = std::path::absolute(root).map_err(|e| format!("resolve MYCO_HOME: {e}"))?;
+    // Startup is single-threaded, before Tokio or tools can read the environment.
+    // Local bash children inherit both selectors, including across cwd changes.
+    unsafe {
+        std::env::set_var("MYCO_PROFILE", profile);
+        std::env::set_var("MYCO_HOME", root);
     }
+    Ok(())
 }
 
 /// `--mode session-browser`: standalone picker, spawned by the bare-/resume
@@ -403,7 +436,7 @@ fn read_piped_stdin() -> Option<String> {
 
 /// One explicit resolution step: model catalog (gateways/models + auth),
 /// harness hosts and default model key (--config → $MYCO_CONFIG →
-/// ~/.myco/config.toml), and the color decision. Everything downstream
+/// ~/.myco/profiles/default/config.toml), and the color decision. Everything downstream
 /// reads this, not the env or config files.
 fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
     let app_config = Config::resolve(ConfigUserSettings {

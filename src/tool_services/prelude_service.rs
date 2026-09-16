@@ -1,4 +1,4 @@
-//! Root-only tool: edit the agent prelude (`~/.myco/workspace/prelude/` entries).
+//! Root-only tool: edit the selected profile's agent prelude.
 //!
 //! Installed on the in-process local worker only — the prelude lives on the
 //! user's machine (brains stay local), so there is nothing to run remotely.
@@ -16,8 +16,9 @@ use crate::prelude;
 use super::{HostDispatchContext, ToolService};
 
 const TOOL_DESCRIPTION: &str = r#"
-Edit your prelude: the maildir-style entries under `~/.myco/workspace/prelude/` rendered, every
-entry in filename order, into the `# Prelude` section of every agent system prompt.
+Edit your prelude: the maildir-style entries under `workspace/prelude/` in the selected
+profile. Every entry is rendered in filename order into the `# Prelude` section of
+every agent system prompt.
 
 The prelude is the default home for durable information — record findings eagerly (user
 preferences, project and machine facts, gotchas, settled decisions, what finally worked),

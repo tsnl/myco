@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
+mod test_utils;
+
 /// Fresh `MYCO_HOME` + config for one test, removed on drop so a panicking
 /// test cannot leak it.
 struct PipeEnv {
@@ -53,6 +55,7 @@ async fn run_myco(env: &PipeEnv, args: &[&str], input: &[u8]) -> String {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
         .args(args)
         .env("MYCO_HOME", &env.dir)
+        .env("MYCO_PROFILE", "default")
         .env("MYCO_CONFIG", &env.config)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -89,7 +92,7 @@ fn announced_session_id(stdout: &str) -> String {
 
 /// Every stored session file under the sharded session store.
 fn session_files(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir.join("session"))
+    std::fs::read_dir(dir.join("profiles/default/session"))
         .expect("session store exists")
         .flatten()
         .filter(|shard| shard.path().is_dir())
@@ -133,6 +136,98 @@ async fn piped_repl_serves_turns_slash_commands_and_clean_exit() {
 
     // No subagent tool in the catalog: nested agents ARE this piped interface.
     assert!(!stdout.contains("subagent"), "{stdout}");
+}
+
+#[tokio::test]
+async fn profile_selection_reaches_nested_agents_after_a_cwd_change() {
+    use serde_json::json;
+    use test_utils::StubHttpServer;
+
+    let env = pipe_env("profiles");
+    let root = env.dir.join("installation");
+    let profile = root.join("profiles/research");
+    let parent = myco::Session::new_with_id("pipetest", "cafef00dcafef00dcafef00dcafef00d");
+    let store = profile.join("session/ca");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{}.json", parent.id)),
+        serde_json::to_vec(&parent).unwrap(),
+    )
+    .unwrap();
+    let executable = env!("CARGO_BIN_EXE_myco").replace('\'', "'\\''");
+    let arguments = json!({
+        "command": format!("'{executable}' -p child --parent-session {}", parent.id),
+        "cwd": "/",
+    });
+    let done = || {
+        StubHttpServer::sse_response(vec![
+            json!({"type":"response.output_text.delta", "delta":"done"}),
+            json!({"type":"response.completed", "response":{"status":"completed"}}),
+        ])
+    };
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::sse_response(vec![
+            json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"type":"function_call", "name":"bash", "call_id":"nested", "arguments":""}}),
+            json!({"type":"response.function_call_arguments.done", "output_index":0, "arguments":arguments.to_string()}),
+            json!({"type":"response.completed", "response":{"status":"completed"}}),
+        ]),
+        done(),
+        done(),
+    ]).await;
+    let config = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("http://127.0.0.1:1/v1", &server.base_url());
+    std::fs::write(profile.join("config.toml"), config).unwrap();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+            .args([
+                "--profile",
+                "research",
+                "--resume",
+                &parent.id,
+                "-p",
+                "parent",
+            ])
+            .current_dir(&env.dir)
+            .env("MYCO_HOME", "installation")
+            .env("MYCO_PROFILE", "wrong")
+            .env_remove("MYCO_CONFIG")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("nested profile run stalled")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        server.connections(),
+        3,
+        "parent, child, parent continuation: {}",
+        std::fs::read_to_string(store.join(format!("{}.json", parent.id))).unwrap()
+    );
+    let sessions: Vec<myco::Session> = std::fs::read_dir(profile.join("session"))
+        .unwrap()
+        .flatten()
+        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| myco::Session::load(&entry.path()).unwrap())
+        .collect();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session.parent_session_id.as_deref() == Some(&parent.id))
+    );
+    assert!(!root.join("profiles/wrong").exists());
+    assert!(!root.join("profiles/default").exists());
 }
 
 /// `--parent-session` is the nested-agent lineage contract: the child's fresh

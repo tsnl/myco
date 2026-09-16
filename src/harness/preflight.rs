@@ -161,7 +161,7 @@ pub fn fatal_startup_check(max_prelude_bytes: usize) -> Option<String> {
     let over = prelude_oversize(max_prelude_bytes)?;
     let dir = crate::prelude::dir()
         .map(|d| d.display().to_string())
-        .unwrap_or_else(|_| "~/.myco/workspace/prelude".into());
+        .unwrap_or_else(|_| "the selected profile's workspace/prelude directory".into());
     Some(format!(
         "{}\n\
          refusing to start: agents would run on a prelude too big to carry, and trimming it \
