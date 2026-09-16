@@ -76,13 +76,15 @@ act on it without re-checking. A big prelude only pays off while it stays true:
 ## Finding what is already there
 
 A `# Workspace Files` section near the end of your prompt lists the workspace:
-each file's path, the day it last changed, and its title. It is a listing, not
-the contents — it exists so you never have to guess whether a note exists.
+each file's path, the day it last changed, and its title. It is a limited listing,
+not the contents or the full tree: at most 200 files and 8 KiB of entries, with
+bounded scan depth. The omission marker reports known omissions; even without
+one, a missing path may still exist on disk.
 
 Your prelude is already in context; workspace files are the cold tier behind it.
 Before non-trivial work, follow prelude pointers and read the listed files that
-touch the task instead of assuming you are starting cold: a lookup is cheap,
-repeating a past mistake is not.
+touch the task. Search the profile's `workspace/` when an expected note is missing
+or entries were omitted. A lookup is cheap; repeating a past mistake is not.
 
 The workspace may sit on a weakly consistent network filesystem shared with
 concurrently running agents. Write whole files in one shot (or create new

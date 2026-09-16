@@ -88,6 +88,8 @@ Quick map (details in the manual):
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
   `myco --version`). Never scp prebuilt binaries across machines (glibc/arch mismatch).
+  Verify with `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`;
+  an interactive login can resolve a different binary than the host worker.
 
 ---
 
@@ -111,6 +113,11 @@ prints the embedded copy if the exported file is unavailable) — driving a chil
 in ways you cannot see from outside, and one bites immediately:
 each prompt is a single self-contained line; only the trailing newline submits it, so a `write`
 without `"\n"` leaves the child waiting for the rest of the line while you wait on `read`, forever.
+
+Give each child a bounded task, constraints, expected result, and whether it may delegate further.
+Ask for completion evidence or a specific blocker; keep bulk output in files and return paths.
+For one-shot runs, check the exit status and stderr, then verify the answer and artifacts against
+the task. A completed turn alone does not prove the task is complete.
 
 ---
 "#,
@@ -275,8 +282,8 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// The epilogue plus the current prelude (`~/.myco/workspace/prelude/`, respecting
-/// `MYCO_HOME`, capped at `max_prelude_bytes`), project guidance (`AGENTS.md` /
+/// The epilogue plus the selected profile's prelude (capped at
+/// `max_prelude_bytes`), project guidance (`AGENTS.md` /
 /// `CLAUDE.md`) from the launch directory through its git root, and a listing
 /// of the rest of the workspace, when present. Read at model build time —
 /// session start, model switch, each worker spawn — so a running agent's prompt
@@ -429,9 +436,7 @@ const MAX_TITLE_CHARS: usize = 80;
 /// A `# Workspace Files` section: one line per workspace file, giving its path
 /// relative to `workspace/`, the UTC day it last changed, and its title.
 ///
-/// This is the read side of the workspace. A file the agent has forgotten is a
-/// file it will not open, so the listing makes existence free to check while
-/// leaving contents to a deliberate read.
+/// The listing is bounded; omitted paths may still exist on disk.
 ///
 /// Two choices keep the block cache-stable, since it lands in every agent's
 /// prompt prefix: days rather than timestamps (repeated writes to a file
@@ -470,8 +475,8 @@ fn workspace_listing(workspace: &Path) -> Option<String> {
 
     Some(format!(
         "\n---\n\n# Workspace Files\n\nUnder `{}` — path, UTC day \
-         last changed, title. A listing, not the contents: read the files that \
-         touch your task.\n\n{body}",
+         last changed, title. A limited listing, not the contents or the full \
+         tree: read relevant files and search this directory for omitted paths.\n\n{body}",
         workspace.display()
     ))
 }

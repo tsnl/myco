@@ -146,7 +146,8 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   **same-platform** binary when available.
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH (`BatchMode`);
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
-  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`.
+  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`. An interactive
+  login can resolve a different binary; check the non-interactive command used by the worker.
 - After replacing binaries, the **interactive CLI must be restarted** to load a new agent binary;
   remote **host** workers respawn on next tool use (or after `/hosts` shows DOWN and reconnect).
 - Ask before destructive remote installs; prefer installing into user prefixes (`~/.local`,
@@ -159,10 +160,11 @@ When tools fail or the user asks why something is broken, investigate with tools
 1. **Host down / unavailable**
    - **Local** never needs a host subprocess; if local tools fail, debug the agent process itself.
    - Read `~/.ssh/config` for `Host` aliases (remote names == destinations);
-     `~/.myco/profiles/default/config.toml` (or `$MYCO_CONFIG`) only for knobs.
-   - On remote: `ssh -o BatchMode=yes <alias> 'which myco; myco --help'` via the
-     **local** host's bash. If missing/outdated: install a **binary built for that
-     platform** (release asset — weights already embedded), or **build on that host**
+     the selected profile's `config.toml` (or `$MYCO_CONFIG`) only for knobs.
+   - On remote: `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` via the
+     **local** host's bash. Compare that path and version with the expected install;
+     an interactive login may use a different PATH. If missing/outdated: install a
+     **binary built for that platform** (matching release asset), or **build on that host**
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.
    - Startup checks expected executables on the **agent** machine (`bash`,
