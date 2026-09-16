@@ -50,8 +50,11 @@ was sent. myco checks each composed request against a 30 MiB ceiling before
 uploading it, and maps a provider's own size rejection — a 413, or a 400 whose
 body names or describes the size — to the same failure. That failure
 is not retryable — every later turn resends the same history — so myco **rewinds
-the last user message out of the conversation** and says so in the ERROR
-section. The session continues; re-send the message with a smaller image, or
+the last user turn out of the active context** and says so in the ERROR
+section. This includes Anthropic's many-image dimension limit. Recovery creates
+a successor thread; the predecessor keeps the rejected input and all recorded
+tool actions, readable with `session_history`. If saving fails, the original
+context stays active. The session continues; re-send the message with a smaller image, or
 `/compact` (or `/new`) to shed history.
 
 ### Session browser
