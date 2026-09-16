@@ -575,7 +575,7 @@ async fn session_returns_while_process_still_running() {
 }
 
 /// Prompt-time summaries list only the caller's live sessions, one line
-/// each; exited-but-unclosed and foreign-owned sessions are excluded.
+/// each; completed and foreign-owned sessions are excluded.
 #[tokio::test]
 async fn running_tool_summaries_list_live_sessions_for_owner_only() {
     let service = Arc::new(BashService::new());
@@ -643,6 +643,98 @@ async fn running_tool_summaries_list_live_sessions_for_owner_only() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
+    let service = Arc::new(BashService::new());
+    let owner = uuid::Uuid::new_v4();
+    let id = unique_id("background-summary");
+    let directory = temp_dir("background-output");
+    let release = directory.path().join("release");
+    let command = format!(
+        "(while [ ! -e '{}' ]; do sleep 0.01; done; printf 'descendant output\\n' >&2; sleep 30) \
+         >/dev/null & printf 'shell done\\n'",
+        release.display()
+    );
+    let result = dispatch_json_as(
+        &service,
+        owner,
+        json!({
+            "action": "start",
+            "session_id": id,
+            "command": command,
+            "timeout_ms": 1000,
+            "idle_ms": 10,
+        }),
+    )
+    .await;
+    assert!(!result.is_error, "{}", result_text(&result));
+    let shared = Arc::clone(&service.sessions().get(&id).unwrap().shared);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while {
+            let buffer = lock_unpoisoned(&shared.buffer);
+            !buffer.exited || buffer.eof_streams < 1
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shell did not exit and close stdout");
+
+    let running = service.running_tool_summaries(owner);
+    let listed = result_text(&service.session_list(owner));
+    let snapshot = {
+        let read = dispatch_json_as(
+            &service,
+            owner,
+            json!({"action": "read", "session_id": id, "timeout_ms": 5000, "idle_ms": 10}),
+        );
+        tokio::pin!(read);
+        let waiting = futures::poll!(&mut read).is_pending();
+        if !waiting {
+            service.reap_owner(owner);
+        }
+        assert!(
+            waiting,
+            "read returned before the descendant produced output"
+        );
+        std::fs::write(&release, "go").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+    };
+    kill_session_process(service.sessions().get(&id).unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while lock_unpoisoned(&shared.buffer).eof_streams < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background output remained open after killing the process group");
+    let finished = service.running_tool_summaries(owner);
+    let final_snapshot =
+        dispatch_json_as(&service, owner, json!({"action": "read", "session_id": id})).await;
+    service.reap_owner(owner);
+
+    assert_eq!(running.len(), 1, "{running:?}");
+    assert!(running[0].contains("output still open"), "{running:?}");
+    assert!(listed.contains("output still open"), "{listed}");
+    let snapshot = result_text(&snapshot);
+    assert!(snapshot.contains("status: running"), "{snapshot}");
+    assert!(snapshot.contains("descendant output"), "{snapshot}");
+    assert!(snapshot.contains("exit_code: Some(0)"), "{snapshot}");
+    assert!(snapshot.contains("output still open"), "{snapshot}");
+    assert!(finished.is_empty(), "{finished:?}");
+    let final_snapshot = result_text(&final_snapshot);
+    assert!(
+        final_snapshot.contains("status: exited"),
+        "{final_snapshot}"
+    );
+    assert!(
+        !final_snapshot.contains("output still open"),
+        "{final_snapshot}"
+    );
 }
 
 /// Summary lines stay compact: cmdlines are first-line-only and capped,

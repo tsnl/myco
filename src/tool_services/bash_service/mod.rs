@@ -107,10 +107,14 @@ impl BashService {
                 (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
                 (`timeout_ms`, default {DEFAULT_TIMEOUT_MS} ms / {session_default_s}s; max \
                 {MAX_TIMEOUT_MS} ms / {session_max_min} min), a byte cap (`max_bytes`, \
-                default {DEFAULT_MAX_BYTES}), or process exit — then returns partial output \
+                default {DEFAULT_MAX_BYTES}), or completion of the process and its output \
+                streams — then returns partial output \
                 with status timed_out / truncated / running while the session stays live. \
                 Raise `timeout_ms` when you need to wait longer for quiet interactive \
-                programs.\n\n\
+                programs. `exit_code` / `exit_signal` describe the launched process; \
+                `status: exited` means that process exited and both output streams closed. \
+                Descendants may keep output open; use `read` for later output or `close` \
+                to stop the process group.\n\n\
                 **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
                 process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
                 A leading `cd` still runs, but the result nudges you toward `cwd`. (`write` stdin \
@@ -177,18 +181,26 @@ impl ToolService for BashService {
         let sessions = self.sessions();
         let mut lines: Vec<String> = sessions
             .iter()
-            .filter(|(_, s)| {
-                // Exited-but-unclosed sessions are not running; skip them.
-                s.owner == agent_id && !s.shared.buffer.lock().map(|b| b.exited).unwrap_or(true)
-            })
-            .map(|(id, s)| {
+            .filter_map(|(id, s)| {
+                if s.owner != agent_id {
+                    return None;
+                }
+                let buffer = lock_unpoisoned(&s.shared.buffer);
+                if buffer.is_finished() {
+                    return None;
+                }
+                let state = if buffer.exited {
+                    "; process exited, output still open"
+                } else {
+                    ""
+                };
                 let idle = s.last_used.lock().map(|t| t.elapsed()).unwrap_or_default();
-                format!(
-                    "bash session {id}: {} (up {}, idle {})",
+                Some(format!(
+                    "bash session {id}: {} (up {}, idle {}{state})",
                     summary_cmdline(&s.cmdline),
                     brief_age(s.created_at.elapsed()),
                     brief_age(idle),
-                )
+                ))
             })
             .collect();
         lines.sort();
@@ -756,7 +768,12 @@ impl BashService {
                 .ok()
                 .and_then(|b| {
                     if b.exited {
-                        Some(format!("exited({:?})", b.exit_code))
+                        let output = if b.is_finished() {
+                            ""
+                        } else {
+                            "; output still open"
+                        };
+                        Some(format!("exited({:?}){output}", b.exit_code))
                     } else {
                         None
                     }
@@ -954,9 +971,14 @@ struct OutputBuffer {
     exited: bool,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
-    /// Readers (stdout, stderr) that hit EOF. 2 + `exited` ⇒ the whole
-    /// process group is almost certainly gone (see `kill_session_process`).
+    /// Captured output streams whose readers have finished (stdout and stderr).
     eof_streams: u8,
+}
+
+impl OutputBuffer {
+    fn is_finished(&self) -> bool {
+        self.exited && self.eof_streams >= 2
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -972,6 +994,7 @@ struct SessionSnapshot {
     status: SnapshotStatus,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
+    background_output: bool,
     stdout: String,
     stderr: String,
     bytes_returned: usize,
@@ -1027,6 +1050,9 @@ impl SessionSnapshot {
         out.push_str(&self.stderr);
         if !self.stderr.ends_with('\n') && !self.stderr.is_empty() {
             out.push('\n');
+        }
+        if self.background_output {
+            out.push_str("(process exited; output still open, descendants may still be running — call read/close)\n");
         }
         match self.status {
             SnapshotStatus::TimedOut => {
@@ -1268,7 +1294,7 @@ fn kill_session_process(session: &Session) {
         .shared
         .buffer
         .lock()
-        .map(|b| b.exited && b.eof_streams >= 2)
+        .map(|b| b.is_finished())
         .unwrap_or(false);
     if !group_done {
         kill_process_group(session.pid);
@@ -1315,7 +1341,7 @@ async fn collect_output(
     let already_pending = shared
         .buffer
         .lock()
-        .map(|b| !b.stdout.is_empty() || !b.stderr.is_empty() || b.exited)
+        .map(|b| !b.stdout.is_empty() || !b.stderr.is_empty() || b.is_finished())
         .unwrap_or(false);
     if already_pending {
         last_activity = Instant::now();
@@ -1332,12 +1358,12 @@ async fn collect_output(
             break;
         }
 
-        let (total, exited, pending_len) = {
+        let (total, finished, pending_len) = {
             let b = shared.buffer.lock().ok();
             match b {
                 Some(b) => (
                     b.total_bytes,
-                    b.exited,
+                    b.is_finished(),
                     b.stdout.len().saturating_add(b.stderr.len()),
                 ),
                 None => (last_total, false, 0),
@@ -1359,7 +1385,7 @@ async fn collect_output(
             status = SnapshotStatus::Truncated;
             break;
         }
-        if exited {
+        if finished {
             status = SnapshotStatus::Exited;
             break;
         }
@@ -1397,7 +1423,7 @@ async fn collect_output(
     }
 
     // Drain up to max_bytes from the buffer (stdout first, then stderr).
-    let (stdout, stderr, exit_code, exit_signal, exited, bytes_dropped) = {
+    let (stdout, stderr, exit_code, exit_signal, background_output, bytes_dropped) = {
         let mut b = match shared.buffer.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -1408,6 +1434,7 @@ async fn collect_output(
                     status: SnapshotStatus::TimedOut,
                     exit_code: None,
                     exit_signal: None,
+                    background_output: false,
                     stdout: String::new(),
                     stderr: String::new(),
                     bytes_returned: 0,
@@ -1431,7 +1458,7 @@ async fn collect_output(
 
         if !b.stdout.is_empty() || !b.stderr.is_empty() {
             status = SnapshotStatus::Truncated;
-        } else if b.exited {
+        } else if b.is_finished() {
             status = SnapshotStatus::Exited;
         }
 
@@ -1440,14 +1467,10 @@ async fn collect_output(
             String::from_utf8_lossy(&out_stderr).into_owned(),
             b.exit_code,
             b.exit_signal,
-            b.exited,
+            b.exited && !b.is_finished(),
             std::mem::take(&mut b.dropped_bytes),
         )
     };
-
-    if exited && !matches!(status, SnapshotStatus::Truncated) {
-        status = SnapshotStatus::Exited;
-    }
 
     let bytes_returned = stdout.len().saturating_add(stderr.len());
     SessionSnapshot {
@@ -1457,6 +1480,7 @@ async fn collect_output(
         status,
         exit_code,
         exit_signal,
+        background_output,
         stdout,
         stderr,
         bytes_returned,
