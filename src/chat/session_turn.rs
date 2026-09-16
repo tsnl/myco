@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::SessionRuntime;
 use crate::agent::{Agent, AgentInteractionError};
 use crate::core::CancelToken;
@@ -22,6 +24,7 @@ pub async fn run_session_turn(
     mut input: Vec<Content>,
     forked: bool,
     cancel: CancelToken,
+    accepted_at: DateTime<Utc>,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
     let session = runtime.session();
@@ -33,7 +36,10 @@ pub async fn run_session_turn(
     runtime.bind_agent(agent);
     let on_warning = std::sync::Arc::new(on_warning);
     let checkpoint_warning = on_warning.clone();
-    wire_checkpoint(agent, session, move |warning| checkpoint_warning(warning));
+    let accepted = Some((agent.history().len(), accepted_at));
+    wire_checkpoint_at(agent, session, accepted, move |warning| {
+        checkpoint_warning(warning)
+    });
     if let Err(error) = auto_title(session, &input) {
         on_warning(&format!("could not auto-title session: {error}"));
     }
@@ -106,6 +112,7 @@ fn rewind_rejected_input(
     successor.created_at = chrono::Utc::now();
     successor.predecessor_id = Some(original.active_thread().id.clone());
     successor.messages = agent.history()[..index].to_vec();
+    successor.user_turn_timestamps.retain(|&key, _| key < index);
     successor.last_usage = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
@@ -129,10 +136,21 @@ pub fn wire_checkpoint(
     session: &ActiveSession,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) {
+    wire_checkpoint_at(agent, session, None, on_warning);
+}
+
+fn wire_checkpoint_at(
+    agent: &mut Agent,
+    session: &ActiveSession,
+    accepted: Option<(usize, DateTime<Utc>)>,
+    on_warning: impl Fn(&str) + Send + Sync + 'static,
+) {
     let thread_id = session.with(|session| session.active_thread().id.clone());
     let session = session.clone();
     agent.set_checkpoint(Some(Box::new(move |messages, usage| {
-        if let Err(error) = session.persist_thread_messages(&thread_id, messages, usage, false) {
+        if let Err(error) =
+            session.persist_thread_messages_at(&thread_id, messages, usage, false, accepted)
+        {
             on_warning(&format!("mid-turn session save failed: {error}"));
         }
     })));
@@ -192,6 +210,7 @@ mod tests {
                 }],
                 false,
                 cancel,
+                chrono::Utc::now(),
                 |warning| panic!("{warning}"),
             ))
     }
@@ -202,10 +221,42 @@ mod tests {
     }
 
     #[test]
+    fn user_turn_acceptance_times_survive_restart_and_context_forks() {
+        let _home = temp_home("turn-timestamps");
+        let session = ActiveSession::new(Session::new("test"));
+        let mut agent = agent(
+            ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError("offline".into())),
+        );
+        let before = Utc::now();
+        submit(&mut agent, &session, CancelToken::new());
+        let after = Utc::now();
+        let saved = Session::load(&session.snapshot().json_path()).unwrap();
+        let time = saved.active_thread().user_turn_timestamps[&0];
+        assert!(time >= before && time <= after);
+        assert_eq!(
+            saved
+                .fork_child("test")
+                .active_thread()
+                .user_turn_timestamps[&0],
+            time
+        );
+        let legacy = Session::from_json(include_bytes!(
+            "../../tests/fixtures/session_v2_all_variants.json"
+        ))
+        .unwrap();
+        assert!(legacy.active_thread().user_turn_timestamps.is_empty());
+    }
+
+    #[test]
     fn rejected_input_is_preserved_in_a_predecessor_before_context_is_rewound() {
         let _home = temp_home("chat-rejection");
         let mut document = Session::new("test");
         document.active_thread_mut().messages = vec![user("earlier"), assistant("answer")];
+        let earlier_time = Utc::now() - chrono::Duration::minutes(5);
+        document
+            .active_thread_mut()
+            .user_turn_timestamps
+            .insert(0, earlier_time);
         let expected = serde_json::to_value(&document.active_thread().messages).unwrap();
         let mut agent = agent(
             ScriptedModel::new(vec![])
@@ -224,6 +275,10 @@ mod tests {
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         assert_eq!(saved.threads().len(), 2);
         assert_eq!(saved.threads()[0].messages.len(), 3);
+        assert_eq!(saved.threads()[0].user_turn_timestamps[&0], earlier_time);
+        assert!(saved.threads()[0].user_turn_timestamps[&2] > earlier_time);
+        assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+        assert_eq!(saved.active_thread().user_turn_timestamps[&0], earlier_time);
         assert!(
             matches!(&saved.threads()[0].messages[2], Message::UserMessage { content }
             if matches!(&content[0], Content::Text { text } if text == "task"))
@@ -260,6 +315,8 @@ mod tests {
             Some(Message::ToolResults { .. })
         ));
         assert!(saved.active_thread().messages.is_empty());
+        assert!(saved.active_thread().user_turn_timestamps.is_empty());
+        assert_eq!(saved.threads()[0].user_turn_timestamps.len(), 1);
         let original = serde_json::to_value(&saved.threads()[0]).unwrap();
         assert!(
             submit(&mut agent, &session, CancelToken::new())
@@ -370,6 +427,7 @@ mod tests {
                     vec![],
                     false,
                     CancelToken::new(),
+                    chrono::Utc::now(),
                     |warning| panic!("{warning}"),
                 );
                 let mut run = std::pin::pin!(run);
@@ -409,6 +467,7 @@ mod tests {
                 vec![],
                 false,
                 cancel,
+                chrono::Utc::now(),
                 |warning| panic!("{warning}"),
             )
             .await;
