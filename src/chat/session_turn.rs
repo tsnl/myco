@@ -7,7 +7,7 @@ use crate::agent::{Agent, AgentInteractionError};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
 use crate::prompts;
-use crate::session::ActiveSession;
+use crate::session::{ActiveSession, SessionWriter};
 
 pub struct SessionTurnOutcome {
     pub result: Result<Vec<Content>, AgentInteractionError>,
@@ -25,7 +25,7 @@ pub async fn run_session_turn(
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
     let session = runtime.session();
-    let _writer = tokio::select! {
+    let writer = tokio::select! {
         biased;
         writer = session.writer() => writer,
         _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
@@ -41,9 +41,24 @@ pub async fn run_session_turn(
         stamp_input(session, &mut input);
     }
     let result = super::interact(agent, input, cancel).await;
-    let rewound = rewind_rejected_input(agent, &result);
     if let Err(error) = persist_session(agent, session, true) {
         on_warning(&format!("could not save session: {error}"));
+        return SessionTurnOutcome {
+            result,
+            rewound: None,
+        };
+    }
+    let rewound = match rewind_rejected_input(agent, runtime, &writer, &result) {
+        Ok(rewound) => rewound,
+        Err(error) => {
+            on_warning(&format!(
+                "could not recover rejected input; original history retained: {error}"
+            ));
+            None
+        }
+    };
+    if rewound.is_some() {
+        wire_checkpoint(agent, session, move |warning| on_warning(warning));
     }
     SessionTurnOutcome { result, rewound }
 }
@@ -67,14 +82,45 @@ fn stamp_input(session: &ActiveSession, input: &mut Vec<Content>) {
 
 fn rewind_rejected_input(
     agent: &mut Agent,
+    runtime: &Arc<SessionRuntime>,
+    writer: &SessionWriter,
     result: &Result<Vec<Content>, AgentInteractionError>,
-) -> Option<Vec<Content>> {
-    match result {
-        Err(error) if error.recovery() == Recovery::OmitLastMessage => {
-            super::rewind_last_user_turn(agent)
-        }
-        _ => None,
+) -> Result<Option<Vec<Content>>, String> {
+    if !matches!(result, Err(error) if error.recovery() == Recovery::OmitLastMessage) {
+        return Ok(None);
     }
+    let Some(index) = agent
+        .history()
+        .iter()
+        .rposition(|message| matches!(message, Message::UserMessage { .. }))
+    else {
+        return Ok(None);
+    };
+    let Message::UserMessage { content } = &agent.history()[index] else {
+        unreachable!()
+    };
+    let dropped = content.clone();
+    let original = runtime.session().snapshot();
+    let mut successor = original.active_thread().clone();
+    successor.id = uuid::Uuid::new_v4().as_simple().to_string();
+    successor.created_at = chrono::Utc::now();
+    successor.predecessor_id = Some(original.active_thread().id.clone());
+    successor.messages = agent.history()[..index].to_vec();
+    successor.last_usage = None;
+    if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
+        for part in content {
+            if let Content::Text { text } = part
+                && prompts::is_session_stamp(text)
+            {
+                *text = prompts::thread_stamp(&original.id, &successor.id, original.created_at);
+            }
+        }
+    }
+    // Commit the repaired context before installing it; the predecessor retains
+    // every observation, including actions taken during the rejected turn.
+    writer.commit_thread(successor)?;
+    runtime.bind_agent(agent);
+    Ok(Some(dropped))
 }
 
 /// Save well-formed history boundaries; warnings do not interrupt a run.
@@ -156,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_input_is_rewound_before_the_session_is_saved() {
+    fn rejected_input_is_preserved_in_a_predecessor_before_context_is_rewound() {
         let _home = temp_home("chat-rejection");
         let mut document = Session::new("test");
         document.active_thread_mut().messages = vec![user("earlier"), assistant("answer")];
@@ -175,6 +221,77 @@ mod tests {
         );
         assert_eq!(saved_messages(&session), expected);
         assert_eq!(serde_json::to_value(agent.history()).unwrap(), expected);
+        let saved = Session::load(&session.snapshot().json_path()).unwrap();
+        assert_eq!(saved.threads().len(), 2);
+        assert_eq!(saved.threads()[0].messages.len(), 3);
+        assert!(
+            matches!(&saved.threads()[0].messages[2], Message::UserMessage { content }
+            if matches!(&content[0], Content::Text { text } if text == "task"))
+        );
+        assert_eq!(
+            saved.active_thread().predecessor_id.as_deref(),
+            Some(saved.threads()[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_completed_tool_actions_without_reexecuting_them() {
+        let home = temp_home("recovery-actions");
+        let effect = home.path().join("effect");
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![crate::generative_model::ToolUse {
+                name: "bash".into(),
+                input: serde_json::json!({"command": format!("printf x >> '{}'", effect.display())}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        }]).then_fail(GenerateError::RequestTooLargeError("image dimensions".into()));
+        let session = ActiveSession::new(Session::new("test"));
+        let mut agent = agent(model);
+        assert!(
+            submit(&mut agent, &session, CancelToken::new())
+                .rewound
+                .is_some()
+        );
+        let saved = Session::load(&session.snapshot().json_path()).unwrap();
+        assert!(matches!(
+            saved.threads()[0].messages.last(),
+            Some(Message::ToolResults { .. })
+        ));
+        assert!(saved.active_thread().messages.is_empty());
+        let original = serde_json::to_value(&saved.threads()[0]).unwrap();
+        assert!(
+            submit(&mut agent, &session, CancelToken::new())
+                .rewound
+                .is_some()
+        );
+        assert_eq!(std::fs::read_to_string(effect).unwrap(), "x");
+        assert_eq!(
+            serde_json::to_value(&session.snapshot().threads()[0]).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn failed_recovery_commit_keeps_the_original_context_active() {
+        let home = temp_home("recovery-save-failure");
+        let mut document = Session::new("test");
+        document.replace_context(vec![user("rejected")], None);
+        let original_id = document.active_thread().id.clone();
+        let session = ActiveSession::new(document);
+        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
+        let mut agent = agent(ScriptedModel::new(vec![]));
+        runtime.bind_agent(&mut agent);
+        std::fs::write(home.path().join("session"), "blocks writes").unwrap();
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let writer = executor.block_on(session.writer());
+        let result = Err(AgentInteractionError::GenerateError(
+            GenerateError::RequestTooLargeError("too big".into()),
+        ));
+        assert!(rewind_rejected_input(&mut agent, &runtime, &writer, &result).is_err());
+        assert_eq!(session.snapshot().active_thread().id, original_id);
+        assert_eq!(agent.history().len(), 1);
     }
 
     #[test]
