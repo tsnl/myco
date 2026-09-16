@@ -31,7 +31,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
 - Remotes are the concrete `Host` aliases in **`~/.ssh/config`** (`Include`s are
   followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
   is reserved). Host name == alias == SSH destination.
-- **`~/.myco/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
+- **`~/.myco/profiles/default/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
   `attach_timeout_secs`, `max_prelude_bytes`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
@@ -159,7 +159,7 @@ When tools fail or the user asks why something is broken, investigate with tools
 1. **Host down / unavailable**
    - **Local** never needs a host subprocess; if local tools fail, debug the agent process itself.
    - Read `~/.ssh/config` for `Host` aliases (remote names == destinations);
-     `~/.myco/config.toml` (or `$MYCO_CONFIG`) only for knobs.
+     `~/.myco/profiles/default/config.toml` (or `$MYCO_CONFIG`) only for knobs.
    - On remote: `ssh -o BatchMode=yes <alias> 'which myco; myco --help'` via the
      **local** host's bash. If missing/outdated: install a **binary built for that
      platform** (release asset — weights already embedded), or **build on that host**
@@ -192,4 +192,4 @@ When tools fail or the user asks why something is broken, investigate with tools
    - You cannot invoke slash-commands; tell the user which to run.
 
 When helping the user change config, prefer **surgical edits** to `~/.ssh/config` (hosts) or
-`~/.myco/config.toml` (knobs) and show a minimal diff. Ask before destructive remote installs.
+`~/.myco/profiles/default/config.toml` (knobs) and show a minimal diff. Ask before destructive remote installs.

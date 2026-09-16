@@ -18,7 +18,8 @@ const TOOL_DESCRIPTION: &str = r#"
 Read and update Myco conversation session metadata, and inspect the running agent binary.
 
 Sessions store a title, structured links (GitHub PRs across repos, worktree paths on any
-host), and a markdown scratchpad. Files live at `~/.myco/session/{shard}/{id}.json`.
+host), and a markdown scratchpad. Files live at `session/{shard}/{id}.json` under the
+selected profile root.
 
 Actions (`action` is required):
 - get: metadata for the current session (default) or another session via `session_id`
