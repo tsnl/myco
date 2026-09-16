@@ -277,6 +277,10 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 - **Text search**: `bash` + `rg`/`grep` on the target host. myco ships no
   search tools of its own; project guidance (`AGENTS.md`/`CLAUDE.md`, skill
   packs) is read with the editor or `rg` like any other file.
+- **Editor views**: whole-file reads, `view_range` slices, and directory listings
+  reject output over 256 KiB. A single long line also counts toward the cap.
+  Read a smaller range, or use bash with bounded output for long lines and large
+  directories. A rejected view does not authorize subsequent edits.
 
 ## Nested agents (the recipe)
 
