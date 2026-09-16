@@ -489,7 +489,7 @@ pub enum Content {
     Image {
         source: String,
     },
-    /// Model thinking *summary* (session history + live UI).
+    /// Model thinking text (session history + live UI).
     ///
     /// Stored in agent/session history for resume, but **stripped when backends
     /// compose the next API request** (not echoed as CoT). Prefer provider
