@@ -386,3 +386,225 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     assert!(own[0].starts_with("# Session"), "{own:?}");
     assert!(own[0].contains(&child_id), "{own:?}");
 }
+
+fn model_answer(text: &str, input_tokens: u64) -> Vec<u8> {
+    test_utils::StubHttpServer::sse_response(vec![
+        serde_json::json!({"type":"response.output_text.delta", "delta":text}),
+        serde_json::json!({"type":"response.completed", "response":{
+            "status":"completed", "usage":{"input_tokens":input_tokens,"output_tokens":1}
+        }}),
+    ])
+}
+
+fn compact_test_session(env: &PipeEnv) -> myco::Session {
+    let session = myco::Session::new("pipetest");
+    let store = env
+        .dir
+        .join("profiles/default/session")
+        .join(&session.id[..2]);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{}.json", session.id)),
+        serde_json::to_vec(&session).unwrap(),
+    )
+    .unwrap();
+    session
+}
+
+fn write_summary_response(session: &myco::Session) -> Vec<u8> {
+    use serde_json::json;
+    let arguments = json!({
+        "action":"write_summary", "session_id":session.id,
+        "thread_id":session.active_thread().id,
+        "markdown":"# Goal / active task\nFinish the pending task."
+    });
+    model_tool("session_history", arguments, 100)
+}
+
+fn model_tool(name: &str, arguments: serde_json::Value, input_tokens: u64) -> Vec<u8> {
+    use serde_json::json;
+    test_utils::StubHttpServer::sse_response(vec![
+        json!({"type":"response.output_item.added", "output_index":0,
+            "item":{"type":"function_call", "name":name, "call_id":"tool", "arguments":""}}),
+        json!({"type":"response.function_call_arguments.done", "output_index":0, "arguments":arguments.to_string()}),
+        json!({"type":"response.completed", "response":{
+            "status":"completed", "usage":{"input_tokens":input_tokens,"output_tokens":1}
+        }}),
+    ])
+}
+
+fn configure_compact(env: &PipeEnv, server: &test_utils::StubHttpServer, enabled: bool) {
+    let mut config = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("http://127.0.0.1:1/v1", &server.base_url());
+    if enabled {
+        config.push_str("auto_compact_at = 0.8\n");
+    }
+    std::fs::write(&env.config, config).unwrap();
+}
+
+#[tokio::test]
+async fn automatic_compaction_resumes_once_without_inventing_user_input() {
+    let env = pipe_env("auto-resume");
+    let session = compact_test_session(&env);
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_answer("working", 80_000),
+        write_summary_response(&session),
+        model_answer("summary ready", 100),
+        // A large retained tail must not cause a compact/resume loop.
+        model_answer("continued task", 80_000),
+    ])
+    .await;
+    configure_compact(&env, &server, true);
+
+    let stdout = run_myco(&env, &["--resume", &session.id], b"finish task\n/quit\n").await;
+    assert!(stdout.contains("continued task"), "{stdout}");
+    assert_eq!(server.connections(), 4, "{stdout}");
+    let request = server.captured().await.body.to_string();
+    assert!(request.contains("80%"), "{request}");
+    assert!(request.contains("/compact"), "{request}");
+
+    let saved = session_json(&env.dir, &session.id);
+    let threads = saved["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 2);
+    let active = threads.last().unwrap();
+    let messages = active["messages"].as_array().unwrap();
+    let resume = messages[messages.len() - 2].to_string();
+    assert!(resume.contains("# Resumption"), "{resume}");
+    assert_eq!(active["user_turn_timestamps"].as_object().unwrap().len(), 1);
+    assert_eq!(threads[0]["messages"].as_array().unwrap().len(), 2);
+    let history = env
+        .dir
+        .join("profiles/default/session")
+        .join(&session.id[..2])
+        .join(format!("{}.history", session.id));
+    let history = std::fs::read_to_string(history).unwrap();
+    assert!(!history.contains("# Resumption"), "{history}");
+}
+
+#[tokio::test]
+async fn manual_compaction_does_not_resume_automatically() {
+    let env = pipe_env("manual-compact");
+    let session = compact_test_session(&env);
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_answer("done", 100),
+        write_summary_response(&session),
+        model_answer("summary ready", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, true);
+    let stdout = run_myco(&env, &["--resume", &session.id], b"task\n/compact\n/quit\n").await;
+    assert_eq!(server.connections(), 3, "{stdout}");
+    let saved = session_json(&env.dir, &session.id);
+    assert_eq!(saved["threads"].as_array().unwrap().len(), 2);
+    assert!(!saved.to_string().contains("# Resumption"));
+}
+
+#[tokio::test]
+async fn failed_auto_compaction_keeps_the_thread_and_does_not_resume() {
+    let env = pipe_env("failed-compact");
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_answer("done", 80_000),
+        model_answer("no summary written", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, true);
+    let stdout = run_myco(&env, &[], b"task\n/quit\n").await;
+    assert!(stdout.contains("auto-compact disabled"), "{stdout}");
+    assert_eq!(server.connections(), 2);
+    let saved = session_json(&env.dir, &announced_session_id(&stdout));
+    assert_eq!(saved["threads"].as_array().unwrap().len(), 1);
+    assert!(!saved.to_string().contains("# Resumption"));
+}
+
+#[tokio::test]
+async fn disabled_and_print_modes_do_not_advertise_or_run_auto_compaction() {
+    for print in [false, true] {
+        let env = pipe_env("no-auto-compact");
+        let server = test_utils::StubHttpServer::sequence(vec![model_answer("done", 80_000)]).await;
+        configure_compact(&env, &server, print);
+        let args = if print { vec!["-p", "task"] } else { vec![] };
+        let stdout = run_myco(&env, &args, b"task\n/quit\n").await;
+        assert_eq!(server.connections(), 1, "{stdout}");
+        let request = server.captured().await.body.to_string();
+        assert!(!request.contains("# Automatic compaction"), "{request}");
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_does_not_compact_from_its_last_successful_tool_round() {
+    let env = pipe_env("failed-turn");
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"command":"printf done"}), 80_000),
+        test_utils::StubHttpServer::status_response(400, r#"{"error":{"message":"bad request"}}"#),
+    ])
+    .await;
+    configure_compact(&env, &server, true);
+    let stdout = run_myco(&env, &[], b"task\n/quit\n").await;
+    assert!(stdout.contains("ERROR"), "{stdout}");
+    assert!(!stdout.contains("auto-compacting"), "{stdout}");
+    assert_eq!(server.connections(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_during_a_turn_or_compaction_never_resumes() {
+    for during_compaction in [false, true] {
+        let env = pipe_env("cancel-compact");
+        let marker = env.dir.join("tool-started");
+        let mut responses = vec![];
+        if during_compaction {
+            responses.push(model_answer("working", 80_000));
+        }
+        responses.push(model_tool(
+            "bash",
+            serde_json::json!({
+                "command":format!("touch '{}' && sleep 30", marker.display()),
+            }),
+            80_000,
+        ));
+        let server = test_utils::StubHttpServer::sequence(responses).await;
+        configure_compact(&env, &server, true);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+            .env("MYCO_HOME", &env.dir)
+            .env("MYCO_PROFILE", "default")
+            .env("MYCO_CONFIG", &env.config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"task\n/quit\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tool must start before cancellation");
+        let status = tokio::process::Command::new("kill")
+            .args(["-INT", &child.id().unwrap().to_string()])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .expect("cancelled REPL must exit promptly")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(!stdout.contains("resuming after"), "{stdout}");
+        assert_eq!(server.connections(), if during_compaction { 2 } else { 1 });
+        let saved = session_json(&env.dir, &announced_session_id(&stdout));
+        assert_eq!(saved["threads"].as_array().unwrap().len(), 1);
+        assert!(!saved.to_string().contains("# Resumption"));
+    }
+}

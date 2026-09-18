@@ -21,10 +21,44 @@ pub struct SessionTurnOutcome {
 pub async fn run_session_turn(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
-    mut input: Vec<Content>,
+    input: Vec<Content>,
     forked: bool,
     cancel: CancelToken,
     accepted_at: DateTime<Utc>,
+    on_warning: impl Fn(&str) + Send + Sync + 'static,
+) -> SessionTurnOutcome {
+    run_turn(
+        agent,
+        runtime,
+        input,
+        forked,
+        cancel,
+        Some(accepted_at),
+        on_warning,
+    )
+    .await
+}
+
+/// Continue on the compacted thread without recording a new human submission.
+pub async fn resume_after_compaction(
+    agent: &mut Agent,
+    runtime: &Arc<SessionRuntime>,
+    cancel: CancelToken,
+    on_warning: impl Fn(&str) + Send + Sync + 'static,
+) -> SessionTurnOutcome {
+    let input = vec![Content::Text {
+        text: prompts::COMPACTION_RESUMPTION.into(),
+    }];
+    run_turn(agent, runtime, input, false, cancel, None, on_warning).await
+}
+
+async fn run_turn(
+    agent: &mut Agent,
+    runtime: &Arc<SessionRuntime>,
+    mut input: Vec<Content>,
+    forked: bool,
+    cancel: CancelToken,
+    accepted_at: Option<DateTime<Utc>>,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
     let session = runtime.session();
@@ -36,15 +70,17 @@ pub async fn run_session_turn(
     runtime.bind_agent(agent);
     let on_warning = std::sync::Arc::new(on_warning);
     let checkpoint_warning = on_warning.clone();
-    let accepted = Some((agent.history().len(), accepted_at));
+    let accepted = accepted_at.map(|time| (agent.history().len(), time));
     wire_checkpoint_at(agent, session, accepted, move |warning| {
         checkpoint_warning(warning)
     });
-    if let Err(error) = auto_title(session, &input) {
-        on_warning(&format!("could not auto-title session: {error}"));
-    }
-    if needs_session_stamp(agent.history(), forked) {
-        stamp_input(session, &mut input);
+    if accepted_at.is_some() {
+        if let Err(error) = auto_title(session, &input) {
+            on_warning(&format!("could not auto-title session: {error}"));
+        }
+        if needs_session_stamp(agent.history(), forked) {
+            stamp_input(session, &mut input);
+        }
     }
     let result = super::interact(agent, input, cancel).await;
     if let Err(error) = persist_session(agent, session, true) {

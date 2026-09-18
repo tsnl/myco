@@ -5,7 +5,9 @@ use crate::core::CancelToken;
 use crate::generative_model::{Content, Message};
 
 mod session_turn;
-pub use session_turn::{SessionTurnOutcome, persist_session, run_session_turn, wire_checkpoint};
+pub use session_turn::{
+    SessionTurnOutcome, persist_session, resume_after_compaction, run_session_turn, wire_checkpoint,
+};
 
 mod compact_worker;
 pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
