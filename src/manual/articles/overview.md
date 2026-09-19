@@ -59,6 +59,22 @@ A recorded tool result remains an observation from its original thread: a shell 
 may have changed since then. `/new` or switching to another session uses fresh tool
 ownership. Resuming saved history after process exit does not restore tools.
 
+Hidden `runtime` system parts record the runtime owner, observation time, model key,
+API model/protocol and effort when known, and owned tool resources. Inventory covers
+retained bash sessions (including exited processes with captured output) and editor read
+fingerprints. Local state is observed directly; connected remote hosts are queried with
+a bounded wait. Inventory never connects a lazy remote. Failed queries retain explicitly
+last-known data rather than claiming the host is empty. This is an inventory of tool
+handles, not every OS process or file created by a command.
+
+A new runtime records which previously observed handles are unavailable here. External
+side effects may survive: inspect them before retrying work, and re-read files before
+editing. Model and effort changes produce a new notice. Compaction and rejected-input
+recovery carry the latest runtime facts forward; earlier threads retain the original
+observations. The session's top-level `model` is its initial catalog key; runtime records
+identify the model used afterward. These parts reach the model but are omitted from
+transcript replay, readline history, titles, and human acceptance timestamps.
+
 State checkpoints fail closed: a save error stops further model/tool work. An interrupted
 tool batch is recovered with explicit unknown outcomes and a hidden runtime notice, since
 the calls may have taken effect before their results were saved. Inspect external state
@@ -246,9 +262,10 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
-**Auto-compaction** runs in the interactive REPL and is configured per model:
-`auto_compact_at = 0.8` triggers when a successful user turn's reported prompt
-size reaches 80% of `context_window`. The system prompt tells the agent this
+**Auto-compaction** runs through the shared session runner in interactive and print
+mode. `auto_compact_at = 0.8` triggers when reported prompt size reaches 80% of
+`context_window`, at a settled boundary between tool rounds or after a normal answer.
+The system prompt tells the agent this
 threshold. Unset (the default) disables automatic compaction; the fraction must
 be greater than 0 and less than 1.
 
@@ -261,12 +278,14 @@ entry. It is a continuation, not startup: completed actions should not be
 repeated. Opening a saved session with `--resume` or `/resume` still waits for
 user input and does not restore live tools from a previous process.
 
-Each user submission can trigger one automatic compact-and-resume cycle; the
-continuation does not trigger another, even if retained context remains above
-the threshold. Failed or cancelled turns do not trigger compaction. If automatic
-compaction fails or is cancelled, it is disabled until another session is
-opened; `/compact` remains available. Manual `/compact` waits for the next user
-input. Print mode (`-p`) and compaction workers do not run auto-compaction.
+Long tool loops can compact repeatedly when the context shrinks then grows again.
+A completed answer triggers at most one compact-and-continue cycle per submission.
+If the next usage report remains above the threshold, or summarization fails,
+automatic compaction is disabled until manual compaction succeeds or another session
+is opened. Failed generation, cancellation, refusal, and an exhausted truncation cap
+do not start automatic continuation. Manual `/compact` waits for the next user input.
+Compaction workers do not run auto-compaction. Each committed successor retains the
+same live tool owner and the run's usage and truncation accounting.
 
 **Retry** is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:

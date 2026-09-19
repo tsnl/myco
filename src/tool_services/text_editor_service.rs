@@ -50,6 +50,20 @@ impl ToolService for TextEditorService {
             .remove(&owner);
     }
 
+    fn resources(&self, owner: uuid::Uuid) -> Vec<ToolResource> {
+        let owners = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        owners
+            .get(&owner)
+            .into_iter()
+            .flat_map(|files| files.keys())
+            .map(|path| ToolResource {
+                tool: "str_replace_based_edit_tool".into(),
+                id: path.to_string_lossy().into_owned(),
+                details: serde_json::json!({"state":"read_fingerprint"}),
+            })
+            .collect()
+    }
+
     fn dispatch_tool_use(
         self: Arc<Self>,
         tool_use: generative_model::ToolUse,

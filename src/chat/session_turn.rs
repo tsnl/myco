@@ -4,15 +4,16 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use super::runner::Workflow;
 use crate::SessionRuntime;
-use crate::agent::{Agent, AgentInteractionError};
+use crate::agent::{Agent, AgentInteractionError, RunOutcome};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
 use crate::prompts;
 use crate::session::{ActiveSession, SessionWriter};
 
 pub struct SessionTurnOutcome {
-    pub result: Result<Vec<Content>, AgentInteractionError>,
+    pub result: Result<RunOutcome, AgentInteractionError>,
     pub rewound: Option<Vec<Content>>,
 }
 
@@ -31,39 +32,37 @@ pub async fn run_session_turn(
     run_turn(
         agent,
         runtime,
-        input,
-        forked,
+        Submission {
+            input,
+            forked,
+            accepted_at: Some(accepted_at),
+        },
+        &mut Workflow::default(),
         cancel,
-        Some(accepted_at),
         on_warning,
     )
     .await
 }
 
-/// Continue on the compacted thread without recording a new human submission.
-pub async fn resume_after_compaction(
-    agent: &mut Agent,
-    runtime: &Arc<SessionRuntime>,
-    cancel: CancelToken,
-    on_warning: impl Fn(&str) + Send + Sync + 'static,
-) -> SessionTurnOutcome {
-    let input = vec![Content::System {
-        kind: "continuation".into(),
-        text: prompts::COMPACTION_RESUMPTION.into(),
-        data: serde_json::json!({"reason":"auto_compaction"}),
-    }];
-    run_turn(agent, runtime, input, false, cancel, None, on_warning).await
+pub(super) struct Submission {
+    pub input: Vec<Content>,
+    pub forked: bool,
+    pub accepted_at: Option<DateTime<Utc>>,
 }
 
-async fn run_turn(
+pub(super) async fn run_turn(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
-    mut input: Vec<Content>,
-    forked: bool,
+    submission: Submission,
+    workflow: &mut Workflow,
     cancel: CancelToken,
-    accepted_at: Option<DateTime<Utc>>,
-    on_warning: impl Fn(&str) + Send + Sync + 'static,
+    on_warning: impl Fn(&str) + Send + Sync,
 ) -> SessionTurnOutcome {
+    let Submission {
+        mut input,
+        forked,
+        accepted_at,
+    } = submission;
     let session = runtime.session();
     let writer = tokio::select! {
         biased;
@@ -86,14 +85,31 @@ async fn run_turn(
             stamp_input(session, &mut input);
         }
     }
-    let result = super::interact(agent, input, cancel).await;
+    if let Some(notice) = workflow.runtime_notice(agent, runtime).await {
+        input.push(notice);
+    }
+    let result = match agent.append_input(Message::UserMessage { content: input }) {
+        Ok(()) => workflow.drive(agent, runtime, &writer, cancel, true).await,
+        Err(error) => Err(error),
+    };
+    finish_turn(agent, runtime, &writer, result, on_warning)
+}
+
+pub(super) fn finish_turn(
+    agent: &mut Agent,
+    runtime: &Arc<SessionRuntime>,
+    writer: &SessionWriter,
+    result: Result<RunOutcome, AgentInteractionError>,
+    on_warning: impl Fn(&str),
+) -> SessionTurnOutcome {
+    let session = runtime.session();
     if let Err(error) = persist_session(agent, session, true) {
         return SessionTurnOutcome {
             result: Err(AgentInteractionError::Checkpoint(error)),
             rewound: None,
         };
     }
-    let rewound = match rewind_rejected_input(agent, runtime, &writer, &result) {
+    let rewound = match rewind_rejected_input(agent, runtime, writer, &result) {
         Ok(rewound) => rewound,
         Err(error) => {
             on_warning(&format!(
@@ -141,7 +157,7 @@ fn rewind_rejected_input(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
     writer: &SessionWriter,
-    result: &Result<Vec<Content>, AgentInteractionError>,
+    result: &Result<RunOutcome, AgentInteractionError>,
 ) -> Result<Option<Vec<Content>>, String> {
     if !matches!(result, Err(error) if error.recovery() == Recovery::OmitLastMessage) {
         return Ok(None);
@@ -152,13 +168,34 @@ fn rewind_rejected_input(
     let Message::UserMessage { content } = &agent.history()[index] else {
         unreachable!()
     };
-    let dropped = content.clone();
+    let dropped = content
+        .iter()
+        .filter(|part| !matches!(part, Content::System { .. }))
+        .cloned()
+        .collect();
     let original = runtime.session().snapshot();
     let mut successor = original.active_thread().clone();
     successor.id = uuid::Uuid::new_v4().as_simple().to_string();
     successor.created_at = chrono::Utc::now();
     successor.predecessor_id = Some(original.active_thread().id.clone());
     successor.messages = agent.history()[..index].to_vec();
+    if let Some(part) = crate::core::latest_runtime_part(agent.history())
+        && crate::core::latest_runtime_part(&successor.messages) != Some(part)
+    {
+        successor.messages.push(Message::UserMessage {
+            content: vec![part.clone()],
+        });
+    }
+    if agent.history()[index..]
+        .iter()
+        .any(|message| matches!(message, Message::ToolResults { .. }))
+    {
+        successor.messages.push(Message::UserMessage { content: vec![Content::System {
+            kind: "recovery".into(),
+            text: format!("The latest submission was removed from model context after a size rejection. Tools had already returned results in predecessor thread {} of session {}. Their external effects were not undone. Inspect those observations with session_history before repeating actions.", original.active_thread().id, original.id),
+            data: serde_json::json!({"reason":"rejected_input", "predecessor_id":original.active_thread().id, "from_index":index}),
+        }] });
+    }
     successor.user_turn_timestamps.retain(|&key, _| key < index);
     successor.last_usage = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
@@ -194,8 +231,15 @@ fn wire_checkpoint_at(
     accepted: Option<(usize, DateTime<Utc>)>,
 ) {
     let thread_id = session.with(|session| session.active_thread().id.clone());
+    let epoch = session.begin_checkpoints();
     let session = session.clone();
     agent.set_checkpoint(Some(Box::new(move |state| {
+        if !session.checkpoint_is_current(epoch) {
+            return Err(
+                "agent checkpoint was superseded by another session writer; reload saved context"
+                    .into(),
+            );
+        }
         session.persist_agent_state(&thread_id, state, false, accepted)
     })));
 }
@@ -207,6 +251,7 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
     if history.is_empty() && !session.snapshot().json_path().exists() {
         return Ok(());
     }
+    agent.checkpoint().map_err(|error| error.to_string())?;
     let thread_id = agent
         .context()
         .thread_id
@@ -217,7 +262,7 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
 
 // Forks inherit a parent's stamp and need their own; resumes keep the existing one.
 fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    history.is_empty() || forked
+    !history.iter().any(Message::is_user_turn) || forked
 }
 
 #[cfg(test)]
@@ -376,8 +421,15 @@ mod tests {
         assert!(
             matches!(outcome.rewound.as_deref(), Some([Content::Text { text }]) if text == "task")
         );
-        assert_eq!(saved_messages(&session), expected);
-        assert_eq!(serde_json::to_value(agent.history()).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(&agent.history()[..2]).unwrap(),
+            expected
+        );
+        assert!(crate::RuntimeRecord::latest(agent.history()).is_some());
+        assert_eq!(
+            saved_messages(&session),
+            serde_json::to_value(agent.history()).unwrap()
+        );
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         assert_eq!(saved.threads().len(), 2);
         assert_eq!(saved.threads()[0].messages.len(), 3);
@@ -420,7 +472,18 @@ mod tests {
             saved.threads()[0].messages.last(),
             Some(Message::ToolResults { .. })
         ));
-        assert!(saved.active_thread().messages.is_empty());
+        assert!(
+            !saved
+                .active_thread()
+                .messages
+                .iter()
+                .any(Message::is_user_turn)
+        );
+        assert!(
+            serde_json::to_string(&saved.active_thread().messages)
+                .unwrap()
+                .contains("external effects were not undone")
+        );
         assert!(saved.active_thread().user_turn_timestamps.is_empty());
         assert_eq!(saved.threads()[0].user_turn_timestamps.len(), 1);
         let original = serde_json::to_value(&saved.threads()[0]).unwrap();

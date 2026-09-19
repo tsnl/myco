@@ -25,9 +25,13 @@ pub fn compact_thread(
     summary_markdown: &str,
 ) -> Result<(super::Thread, CompactOutcome), String> {
     let predecessor = session.active_thread();
-    if predecessor.pending_operation.is_some() {
-        return Err("cannot compact a thread with an outstanding operation".into());
+    if matches!(
+        predecessor.pending_operation,
+        Some(crate::agent::PendingOperation::Tools { .. })
+    ) {
+        return Err("cannot compact an unanswered tool batch".into());
     }
+    crate::agent::validate_context(&predecessor.messages).map_err(|error| error.to_string())?;
     if predecessor.messages.is_empty() {
         return Err("cannot compact an empty thread".into());
     }
@@ -68,6 +72,13 @@ pub fn compact_thread(
         if let Some(time) = predecessor.user_turn_timestamps.get(&old_index) {
             successor.user_turn_timestamps.insert(index, *time);
         }
+    }
+    // Runtime state is independent of the human tail. Keep only the latest
+    // observation, after the tail, so an older notice cannot override it.
+    if let Some(part) = crate::core::latest_runtime_part(&predecessor.messages) {
+        successor.messages.push(Message::UserMessage {
+            content: vec![part.clone()],
+        });
     }
     let outcome = CompactOutcome {
         session_id: session.id.clone(),
@@ -126,7 +137,7 @@ fn select_tail_indexed(
     for (_, message) in &mut out {
         if let Message::UserMessage { content } = message {
             content
-                .retain(|part| !matches!(part, Content::System { kind, .. } if kind == "session"));
+                .retain(|part| !matches!(part, Content::System { kind, .. } if kind == "session" || kind == "runtime"));
         }
         truncate_message_bodies(message, tool_body_max);
     }

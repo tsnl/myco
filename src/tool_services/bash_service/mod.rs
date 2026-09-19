@@ -205,6 +205,25 @@ impl ToolService for BashService {
         lines.sort();
         lines
     }
+
+    fn resources(&self, agent_id: Uuid) -> Vec<crate::core::ToolResource> {
+        self.sessions()
+            .iter()
+            .filter(|(_, session)| session.owner == agent_id)
+            .map(|(id, session)| {
+                let buffer = lock_unpoisoned(&session.shared.buffer);
+                crate::core::ToolResource {
+                    tool: "bash".into(),
+                    id: id.clone(),
+                    details: serde_json::json!({
+                        "command": session.cmdline, "pid": session.pid,
+                        "process_exited": buffer.exited, "output_closed": buffer.is_finished(),
+                        "exit_code": buffer.exit_code, "exit_signal": buffer.exit_signal,
+                    }),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Cmdline for a one-line session summary: first line only, capped.

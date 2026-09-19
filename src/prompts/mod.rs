@@ -23,13 +23,14 @@ pub fn auto_compact_notice(threshold: Option<u64>, context_window: u64) -> Strin
     let percent = threshold as f64 * 100.0 / context_window as f64;
     format!(
         "# Automatic compaction\n\n\
-         After a successful user turn, a reported prompt size of {threshold} tokens \
+         Between completed tool rounds or after a normal answer, a reported prompt size of {threshold} tokens \
          ({percent}% of the {context_window}-token context window) triggers the same \
          compaction as `/compact`. It creates a new thread within this session and keeps \
          live tools running. A `# Resumption` message then asks you to continue. \
-         This automatic continuation does not itself trigger another compaction. \
-         If compaction fails or is cancelled, automatic compaction is disabled until \
-         another session is opened."
+         Long tool loops can compact repeatedly as context grows. An answer triggers at most \
+         one compact-and-continue cycle per submission. If compaction fails or the next \
+         reported prompt remains above the threshold, automatic compaction is disabled until \
+         manual compaction succeeds or another session is opened. Cancellation stops continuation."
     )
 }
 

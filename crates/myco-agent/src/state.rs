@@ -47,6 +47,11 @@ enum Next {
 #[derive(Debug, Clone)]
 enum Phase {
     Ready,
+    Finished {
+        answer: Vec<Content>,
+        reason: TurnEndReason,
+    },
+    Cancelled,
     Generating(OperationId),
     Tools {
         operation: OperationId,
@@ -75,6 +80,7 @@ pub struct AgentState {
     last_usage: Option<TokenUsage>,
     phase: Phase,
     sequence: u64,
+    executing: bool,
     run_usage: Option<TokenUsage>,
     truncations: u32,
     max_truncated_resumes: u32,
@@ -87,6 +93,7 @@ impl Default for AgentState {
             last_usage: None,
             phase: Phase::Ready,
             sequence: 0,
+            executing: false,
             run_usage: None,
             truncations: 0,
             max_truncated_resumes: crate::DEFAULT_MAX_TRUNCATED_RESUMES,
@@ -108,12 +115,15 @@ impl AgentState {
     }
 
     pub fn is_idle(&self) -> bool {
-        matches!(self.phase, Phase::Ready)
+        matches!(
+            self.phase,
+            Phase::Ready | Phase::Finished { .. } | Phase::Cancelled
+        )
     }
 
     pub fn pending_operation(&self) -> Option<PendingOperation> {
         match self.phase {
-            Phase::Ready => None,
+            Phase::Ready | Phase::Finished { .. } | Phase::Cancelled => None,
             Phase::Generating(operation) => Some(PendingOperation::Generation { operation }),
             Phase::Tools { operation, .. } => Some(PendingOperation::Tools { operation }),
         }
@@ -125,10 +135,94 @@ impl AgentState {
         !matches!(self.phase, Phase::Tools { .. })
     }
 
+    /// The next effect, or terminal outcome, without advancing the controller.
+    pub fn effect(&self) -> Option<Effect> {
+        match &self.phase {
+            Phase::Ready => None,
+            Phase::Generating(operation) => Some(Effect::Generate {
+                operation: *operation,
+            }),
+            Phase::Tools { operation, .. } => {
+                let Some(Message::AssistantMessage { tool_uses, .. }) = self.history.last() else {
+                    unreachable!()
+                };
+                Some(Effect::ExecuteTools {
+                    operation: *operation,
+                    calls: tool_uses.clone(),
+                })
+            }
+            Phase::Finished { answer, reason } => Some(Effect::Finished {
+                answer: answer.clone(),
+                reason: reason.clone(),
+            }),
+            Phase::Cancelled => Some(Effect::Cancelled),
+        }
+    }
+
+    /// An interpreter must not dispatch a dropped future's operation again.
+    pub fn begin_effect(&mut self, operation: OperationId) -> Result<(), StateError> {
+        if self.executing {
+            return Err(StateError::Busy);
+        }
+        match self.pending_operation() {
+            Some(
+                PendingOperation::Generation {
+                    operation: expected,
+                }
+                | PendingOperation::Tools {
+                    operation: expected,
+                },
+            ) if expected == operation => {
+                self.executing = true;
+                Ok(())
+            }
+            _ => Err(StateError::UnexpectedCompletion),
+        }
+    }
+
+    pub fn can_replace_at_boundary(&self) -> bool {
+        matches!(self.phase, Phase::Generating(_) | Phase::Finished { .. }) && !self.executing
+    }
+
+    pub fn cancel_at_boundary(&mut self) -> Result<(), StateError> {
+        if !self.can_replace_at_boundary() {
+            return Err(StateError::Busy);
+        }
+        self.phase = Phase::Cancelled;
+        Ok(())
+    }
+
+    /// Install derived context between generations while retaining run policy
+    /// counters. The old operation identity can no longer complete this state.
+    pub fn replace_at_boundary(
+        &mut self,
+        history: Vec<Message>,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), StateError> {
+        if !self.can_replace_at_boundary() {
+            return Err(StateError::Busy);
+        }
+        validate_context(&history)?;
+        self.history = history;
+        self.last_usage = usage;
+        self.generate();
+        Ok(())
+    }
+
+    /// Explicitly abandon work whose future was dropped. Completed observations
+    /// survive; an executing tool batch is reconciled as unknown, never replayed.
+    pub fn recover_interrupted(&mut self) -> Result<(), StateError> {
+        self.history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+        self.phase = Phase::Ready;
+        self.executing = false;
+        Ok(())
+    }
+
     fn require_ready(&self) -> Result<(), StateError> {
-        match self.phase {
-            Phase::Ready => Ok(()),
-            _ => Err(StateError::Busy),
+        if self.is_idle() {
+            Ok(())
+        } else {
+            Err(StateError::Busy)
         }
     }
 
@@ -141,6 +235,7 @@ impl AgentState {
         validate_context(&history)?;
         self.history = history;
         self.last_usage = usage;
+        self.phase = Phase::Ready;
         Ok(())
     }
 
@@ -151,7 +246,30 @@ impl AgentState {
                 "input must be a user message".into(),
             ));
         }
+        self.phase = Phase::Ready;
         self.history.push(message);
+        Ok(())
+    }
+
+    /// Record runtime observations at a settled boundary without changing the
+    /// run's result, usage, or truncation counters.
+    pub fn append_system(&mut self, parts: Vec<Content>) -> Result<(), StateError> {
+        if self.executing || !self.is_model_boundary() {
+            return Err(StateError::Busy);
+        }
+        if parts.is_empty()
+            || parts
+                .iter()
+                .any(|part| !matches!(part, Content::System { .. }))
+        {
+            return Err(StateError::InvalidContext(
+                "runtime observations must be system parts".into(),
+            ));
+        }
+        self.history.push(Message::UserMessage { content: parts });
+        if matches!(self.phase, Phase::Generating(_)) {
+            self.generate();
+        }
         Ok(())
     }
 
@@ -163,6 +281,7 @@ impl AgentState {
         validate_context(prefix)?;
         let dropped = self.history.split_off(index);
         self.last_usage = None;
+        self.phase = Phase::Ready;
         Ok(dropped)
     }
 
@@ -193,6 +312,7 @@ impl AgentState {
     fn generate(&mut self) -> Effect {
         let operation = self.operation();
         self.phase = Phase::Generating(operation);
+        self.executing = false;
         Effect::Generate { operation }
     }
 
@@ -202,6 +322,7 @@ impl AgentState {
             return Err(StateError::UnexpectedCompletion);
         }
         self.phase = Phase::Ready;
+        self.executing = false;
         Ok(())
     }
 
@@ -236,6 +357,7 @@ impl AgentState {
         if !matches!(self.phase, Phase::Generating(id) if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
+        self.executing = false;
         if output
             .content
             .iter()
@@ -330,11 +452,12 @@ impl AgentState {
             )));
         }
         let next = next.clone();
+        self.executing = false;
         self.history.push(Message::ToolResults {
             tool_use_results: results,
         });
         if cancelled {
-            self.phase = Phase::Ready;
+            self.phase = Phase::Cancelled;
             Ok(Effect::Cancelled)
         } else {
             Ok(self.advance(next))
@@ -345,7 +468,10 @@ impl AgentState {
         match next {
             Next::Generate => self.generate(),
             Next::Finish { answer, reason } => {
-                self.phase = Phase::Ready;
+                self.phase = Phase::Finished {
+                    answer: answer.clone(),
+                    reason: reason.clone(),
+                };
                 Effect::Finished { answer, reason }
             }
         }

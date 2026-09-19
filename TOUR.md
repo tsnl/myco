@@ -108,65 +108,46 @@ commit stamp using local Git.
 
 ## 3. Cross from chat into the agent
 
-Read `run_session_turn` in [src/chat/session_turn.rs](src/chat/session_turn.rs),
-then [src/chat/mod.rs](src/chat/mod.rs) and `Agent::run` in
-[crates/myco-agent/src/lib.rs](crates/myco-agent/src/lib.rs).
+Read `SessionRunner` in [src/chat/runner.rs](src/chat/runner.rs), then its
+[submission adapter](src/chat/session_turn.rs) and the pure
+[AgentState](crates/myco-agent/src/state.rs).
 
-Both CLI modes resolve attachments through
-[src/session/attach.rs](src/session/attach.rs), then call `run_session_turn`.
-This shared operation acquires the session writer and binds the latest thread
-after any queued work completes. It derives a title from input, adds the session
-and thread stamp when needed, submits the turn, rewinds input rejected for size,
-and saves the resulting history. Its outcome includes the agent result and any removed input;
-the caller renders those and receives nonfatal save warnings through a callback.
+Interactive and print mode resolve attachments, then call `SessionRunner::submit`.
+The runner holds the session writer across submission, model/tool execution, and
+compaction. It binds the latest context, stamps real input, persists observations,
+and recovers size-rejected input into a successor thread. An injected `Compactor`
+lets scripted workflows use the same automatic compaction and continuation policy.
+See [WORKFLOWS.md](WORKFLOWS.md) and the
+[offline eval example](examples/scripted_session.rs).
 
-`chat::interact` is the smaller entry point underneath: append a user message,
-checkpoint that input, and run the agent. It does not require a saved session.
+`AgentState` contains only context and control state. Synchronous transitions
+return `Effect::Generate`, `Effect::ExecuteTools`, or a terminal result. Operation
+identities reject stale completions. `Agent::step` interprets one effect using a
+supplied model, tool executor, and event sink; `run_with_outcome` drives it to a
+stop reason and reports measured usage. Neither library crate depends on the
+application. A caller can replay transitions with fixed observations or run an
+in-memory eval with a supplied `ToolExecutor`.
 
-`Agent::run` operates on the context already supplied to it. A headless caller
-can install messages and their usage estimate together with `replace_context`
-and drive the agent directly; see [tests/headless_agent.rs](tests/headless_agent.rs).
-Replacing context keeps the agent identity and tool executor.
-The run future can execute in its own Tokio task; a raw `run` caller owns scheduling.
+A session-backed agent uses [SessionRuntime](src/session_runtime.rs) as its tool
+executor. Its owner UUID identifies bash sessions and editor read fingerprints
+across agent replacements and compactions. Session binding installs context and
+trace attribution. Runtime observations include model/effort changes, inventories,
+and handles unavailable on restart, stored as hidden system parts. Changing
+context does not pretend to restore resources.
 
-`ToolExecutor` is the agent's entire tool interface: return tool specifications
-and asynchronously dispatch a call with cancellation. It says nothing about
-hosts, files, sessions, or chat. An evaluator can supply an in-memory environment;
-the application supplies [SessionRuntime](src/session_runtime.rs), which routes
-through the harness using its resource owner UUID.
+Checkpoints persist intent before dispatch and results before another effect.
+Failure stops execution. Tools run concurrently; `join_all` keeps result order
+matched to call order. Cancellation records a result for every call, with unknown
+effects when cleanup is not acknowledged. Dropping a step also requires explicit
+reconciliation before execution can continue. The runner guards checkpoints against
+older writers, even when they refer to the same thread.
 
-Create a runtime with `SessionRuntime::new(harness, active_session)`, retain its
-`Arc`, and pass clones to `Agent::new(model, runtime, sink)`. Replacing an agent
-then keeps shells and editor read stamps alive. `SessionRuntime::bind_agent`
-installs its tools, latest thread context, and event attribution, clearing the
-previous checkpoint before the chat adapter wires a new one. Changing sessions
-creates a different runtime and tool owner. `TraceContext` carries agent,
-session, and thread attribution; session/thread IDs remain optional opaque
-labels in the agent crate.
-
-`run` emits one `TurnFinished` event after `run_loop` returns, including on
-failure or cancellation. Read `run_loop` as this sequence:
-
-1. Generate an assistant response and accumulate its usage.
-2. Append the assistant message, including any tool calls, to history.
-3. Execute the calls concurrently and append their results in call order.
-4. Generate again if tools or a bounded `max_tokens` continuation require it;
-   otherwise return the answer.
-
-The named operations make the boundaries explicit: `record_usage` accounts for
-generations, `record_assistant` appends the response, `answer_tools` completes a
-tool round, and `resume_truncated` bounds continuation.
-
-The key invariant is **tool calls and tool results stay paired in history**.
-Tools may finish in any order, but `join_all` preserves the ordering used to
-construct the results message. Checkpoints happen at replayable boundaries,
-such as after a completed tool round. A cancellation during tools still records
-a result for every call, using synthetic cancelled results where necessary.
-
-The tests near the bottom of this file use an in-memory tool executor, without
-depending on the application. Start with
-`checkpoint_fires_only_at_well_formed_boundaries` and
-`cancel_during_slow_tool_records_cancelled_result`.
+For direct execution without a session, `chat::interact` appends input and invokes
+`Agent::run`. Or install context with `replace_context` and call the agent directly;
+see [tests/headless_agent.rs](tests/headless_agent.rs). For fine scheduling use
+`start_run`, `step`, and `replace_at_boundary`; the latter preserves run usage and
+truncation policy. The agent tests cover stale completions, failed checkpoints,
+concurrent calls, and cancellation without application dependencies.
 
 ## 4. Follow one generation to the provider
 
@@ -297,8 +278,9 @@ predecessors refer to earlier threads in the same session.
 Storage is rooted at `myco_home()` in [src/core/fs.rs](src/core/fs.rs), normally
 `~/.myco`, with `MYCO_HOME` available for isolation. All threads live in one JSON
 document, rewritten on save: compaction bounds model context, while the saved
-session continues growing. Version 2 loads as one initial thread; saves use
-version 3. Reading alone does not rewrite an existing file.
+session continues growing. Saves use schema version 5, including pending operation
+intent and structured system parts; versions 2–4 have explicit upgrades on load.
+Reading alone does not rewrite an existing file.
 
 The chat adapter's `wire_checkpoint` binds a checkpoint to a particular thread.
 Stale callbacks cannot overwrite a successor. `run_session_turn` force-saves
@@ -324,7 +306,7 @@ Compaction crosses three boundaries while holding the session writer:
    sheds old identity stamps; the original thread remains intact.
 3. `SessionWriter::commit_thread` checks the predecessor, appends the thread to
    the latest session metadata, and saves atomically before switching the live
-   document. The CLI binds the agent to that thread and rewires checkpoints.
+   document. The runner binds the agent to that thread and rewires checkpoints.
 
 The session ID, writer lock, readline history, console mirror, and runtime stay
 in place. [SessionHistoryTool](src/tool_services/session_history_service.rs)
@@ -338,8 +320,9 @@ notifies the harness to release its resources. The
 compaction and agent replacement, checks inherited shell variables and immutable
 old output, rejects access from another session, and checks final cleanup.
 
-Auto-compaction is a CLI policy: find `maybe_auto_compact`. It checks reported
-prompt usage after a turn and invokes the same compaction path. Nested agents
+Auto-compaction belongs to `SessionRunner`. It checks reported prompt usage at
+settled boundaries, including between tool rounds, and uses the same compaction
+path in interactive, print, and scripted workflows. Nested agents
 are separate local `myco` processes launched through bash, linked with
 `--parent-session`; `--fork` seeds their context from a saved checkpoint.
 

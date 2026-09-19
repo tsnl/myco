@@ -130,6 +130,8 @@ hidden and parented, exactly as in the live-session recipe). `@path` image
 mentions in the PROMPT argument attach images exactly as in the REPL
 (attachment note on stderr); piped stdin is data and is never parsed for
 attachments. No console mirror is written in print mode.
+Print mode uses the same automatic-compaction policy as the REPL; a long tool loop
+can compact and continue before the process exits.
 
 ### Models & config (quick)
 
@@ -214,6 +216,9 @@ hosts are not queried, one-shot `exec` commands are not retained, and descendant
 close or redirect both output streams cannot be tracked after the launched process exits.
 Use bash `list` with a `host` to inspect that host's sessions. For managed background
 work, use bash `start` and keep the program in the foreground of that session.
+Separately, hidden runtime records observe local and connected remote tool resources
+at settled execution boundaries. After restart they tell the model which recorded
+handles are unavailable. They do not appear in these status lines or transcript replay.
 
 ### Console mirror (`{id}.console`)
 

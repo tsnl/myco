@@ -26,6 +26,7 @@ pub use search::{SessionSearchReport, search_sessions};
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -208,6 +209,7 @@ impl LinkCounts {
 pub struct ActiveSession {
     inner: Arc<Mutex<Session>>,
     writer: Arc<tokio::sync::Mutex<()>>,
+    checkpoint_epoch: Arc<AtomicU64>,
 }
 
 impl ActiveSession {
@@ -215,6 +217,7 @@ impl ActiveSession {
         Self {
             inner: Arc::new(Mutex::new(session)),
             writer: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -226,8 +229,17 @@ impl ActiveSession {
     }
 
     pub fn replace(&self, session: Session) {
+        self.begin_checkpoints();
         let mut guard = self.lock();
         *guard = session;
+    }
+
+    pub(crate) fn begin_checkpoints(&self) -> u64 {
+        self.checkpoint_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn checkpoint_is_current(&self, epoch: u64) -> bool {
+        self.checkpoint_epoch.load(Ordering::SeqCst) == epoch
     }
 
     pub fn snapshot(&self) -> Session {

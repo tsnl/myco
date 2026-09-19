@@ -794,7 +794,7 @@ impl TuiProducer {
         max_attempts: u32,
         delay: std::time::Duration,
     ) {
-        self.turn_finished();
+        self.flush_output();
         let body = format!(
             "Attempt {}/{} in {:.1}s\n{}",
             attempt + 1,
@@ -805,7 +805,7 @@ impl TuiProducer {
         self.headed_section(Style::WARNING, "RETRY", &body);
     }
 
-    fn turn_finished(&self) {
+    pub fn flush_output(&self) {
         let events = self.with_state(|st| {
             let mut events = Vec::new();
             finish_thinking_line(st, &mut events);
@@ -846,7 +846,7 @@ impl EventSink for TuiProducer {
             } => self.tool_started(&tool_use.name, &tool_use.input),
             AgentEvent::TurnFinished {
                 context: TraceContext { depth: 0, .. },
-            } => self.turn_finished(),
+            } => self.flush_output(),
             _ => {}
         }
     }

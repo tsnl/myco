@@ -397,6 +397,44 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     assert!(own[0].contains(&child_id), "{own:?}");
 }
 
+#[tokio::test]
+async fn effort_changes_and_restart_are_durable_without_appearing_in_transcript_replay() {
+    let env = pipe_env("runtime-notices");
+    let first = run_myco(&env, &[], b"record this task\n/effort low\n/quit\n").await;
+    let id = announced_session_id(&first);
+    let saved =
+        myco::Session::from_json(&serde_json::to_vec(&session_json(&env.dir, &id)).unwrap())
+            .unwrap();
+    let record = myco::RuntimeRecord::latest(&saved.active_thread().messages).unwrap();
+    assert_eq!(
+        record.model.effort,
+        Some(myco::generative_model::Effort::Low)
+    );
+    assert_eq!(
+        record.previous_model.unwrap().effort,
+        Some(myco::generative_model::Effort::High)
+    );
+    let times = saved.active_thread().user_turn_timestamps.clone();
+    let replay = run_myco(&env, &["--resume", &id, "--effort", "max"], b"/quit\n").await;
+    assert!(replay.contains("record this task"));
+    for output in [&first, &replay] {
+        assert!(!output.contains("Current runtime observations"), "{output}");
+        assert!(!output.contains("Session resumed; use"), "{output}");
+        assert!(!output.contains("Model or effort changed"), "{output}");
+    }
+    let saved =
+        myco::Session::from_json(&serde_json::to_vec(&session_json(&env.dir, &id)).unwrap())
+            .unwrap();
+    let resumed = myco::RuntimeRecord::latest(&saved.active_thread().messages).unwrap();
+    assert_ne!(resumed.runtime_id, record.runtime_id);
+    assert!(resumed.resumed);
+    assert_eq!(
+        resumed.model.effort,
+        Some(myco::generative_model::Effort::Max)
+    );
+    assert_eq!(saved.active_thread().user_turn_timestamps, times);
+}
+
 fn model_answer(text: &str, input_tokens: u64) -> Vec<u8> {
     test_utils::StubHttpServer::sse_response(vec![
         serde_json::json!({"type":"response.output_text.delta", "delta":text}),
@@ -534,6 +572,26 @@ async fn automatic_compaction_resumes_once_without_inventing_user_input() {
 }
 
 #[tokio::test]
+async fn print_mode_compacts_and_continues_the_same_session() {
+    let env = pipe_env("print-auto");
+    let session = compact_test_session(&env);
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_answer("working", 80_000),
+        write_summary_response(&session),
+        model_answer("summary ready", 100),
+        model_answer("finished autonomously", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, true);
+    let stdout = run_myco(&env, &["--resume", &session.id, "-p", "task"], b"").await;
+    assert!(stdout.contains("finished autonomously"), "{stdout}");
+    assert!(!stdout.contains("# Resumption"), "{stdout}");
+    assert_eq!(server.connections(), 4);
+    let saved = session_json(&env.dir, &session.id);
+    assert_eq!(saved["threads"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn manual_compaction_does_not_resume_automatically() {
     let env = pipe_env("manual-compact");
     let session = compact_test_session(&env);
@@ -561,7 +619,7 @@ async fn failed_auto_compaction_keeps_the_thread_and_does_not_resume() {
     .await;
     configure_compact(&env, &server, true);
     let stdout = run_myco(&env, &[], b"task\n/quit\n").await;
-    assert!(stdout.contains("auto-compact disabled"), "{stdout}");
+    assert!(stdout.contains("auto-compaction failed"), "{stdout}");
     assert_eq!(server.connections(), 2);
     let saved = session_json(&env.dir, &announced_session_id(&stdout));
     assert_eq!(saved["threads"].as_array().unwrap().len(), 1);
@@ -569,11 +627,11 @@ async fn failed_auto_compaction_keeps_the_thread_and_does_not_resume() {
 }
 
 #[tokio::test]
-async fn disabled_and_print_modes_do_not_advertise_or_run_auto_compaction() {
+async fn disabling_auto_compaction_applies_to_interactive_and_print_modes() {
     for print in [false, true] {
         let env = pipe_env("no-auto-compact");
         let server = test_utils::StubHttpServer::sequence(vec![model_answer("done", 80_000)]).await;
-        configure_compact(&env, &server, print);
+        configure_compact(&env, &server, false);
         let args = if print { vec!["-p", "task"] } else { vec![] };
         let stdout = run_myco(&env, &args, b"task\n/quit\n").await;
         assert_eq!(server.connections(), 1, "{stdout}");
@@ -583,18 +641,19 @@ async fn disabled_and_print_modes_do_not_advertise_or_run_auto_compaction() {
 }
 
 #[tokio::test]
-async fn failed_turn_does_not_compact_from_its_last_successful_tool_round() {
+async fn failed_generation_does_not_start_compaction() {
     let env = pipe_env("failed-turn");
-    let server = test_utils::StubHttpServer::sequence(vec![
-        model_tool("bash", serde_json::json!({"command":"printf done"}), 80_000),
-        test_utils::StubHttpServer::status_response(400, r#"{"error":{"message":"bad request"}}"#),
-    ])
-    .await;
+    let server =
+        test_utils::StubHttpServer::sequence(vec![test_utils::StubHttpServer::status_response(
+            400,
+            r#"{"error":{"message":"bad request"}}"#,
+        )])
+        .await;
     configure_compact(&env, &server, true);
     let stdout = run_myco(&env, &[], b"task\n/quit\n").await;
     assert!(stdout.contains("ERROR"), "{stdout}");
     assert!(!stdout.contains("auto-compacting"), "{stdout}");
-    assert_eq!(server.connections(), 2);
+    assert_eq!(server.connections(), 1);
 }
 
 #[cfg(unix)]

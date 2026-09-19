@@ -37,9 +37,12 @@ pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, RunOutcome, ToolExecutor,
     TraceContext,
 };
-pub use chat::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
+pub use chat::{
+    CompactWorkerError, Compactor, ModelCompactor, SessionRunner, WorkflowEvent,
+    compact_subagent_prompt, run_compact_worker,
+};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
-pub use core::{CancelToken, uuid_simple_hex};
+pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
     SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
@@ -51,7 +54,7 @@ pub use session::{
     ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
     SessionLink, SessionListEntry, Thread, compact_thread, select_tail,
 };
-pub use session_runtime::SessionRuntime;
+pub use session_runtime::{RuntimeRecord, SessionRuntime};
 pub use tool_services::{
     HostDispatchContext, ListRecentService, PreludeTool, SessionHistoryTool, SessionMetaTool,
     ToolService,

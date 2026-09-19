@@ -23,6 +23,7 @@
 //! run `cargo run -p myco-agent --example headless` for an offline model/tool round.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::future;
 use myco_model::{
@@ -189,6 +190,7 @@ pub struct Agent {
     context_window_tokens: u64,
     checkpoint: Option<Checkpoint>,
     before_generation_notice: Option<BeforeGenerationNotice>,
+    checkpoint_failed: AtomicBool,
 }
 
 impl Agent {
@@ -216,6 +218,7 @@ impl Agent {
             context_window_tokens: 200_000,
             checkpoint: None,
             before_generation_notice: None,
+            checkpoint_failed: AtomicBool::new(false),
         }
     }
 
@@ -239,10 +242,22 @@ impl Agent {
     }
 
     fn emit_checkpoint(&self) -> Result<(), AgentInteractionError> {
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint(&self.state).map_err(AgentInteractionError::Checkpoint)?;
-        }
-        Ok(())
+        let result = self
+            .checkpoint
+            .as_ref()
+            .map_or(Ok(()), |checkpoint| checkpoint(&self.state));
+        self.checkpoint_failed
+            .store(result.is_err(), Ordering::Relaxed);
+        result.map_err(AgentInteractionError::Checkpoint)
+    }
+
+    pub fn checkpoint_failed(&self) -> bool {
+        self.checkpoint_failed.load(Ordering::Relaxed)
+    }
+
+    /// Retry persistence without advancing or replaying an effect.
+    pub fn checkpoint(&self) -> Result<(), AgentInteractionError> {
+        self.emit_checkpoint()
     }
 
     pub fn history(&self) -> &[Message] {
@@ -276,6 +291,11 @@ impl Agent {
         self.state.append_input(message)?;
         self.emit_checkpoint()?;
         Ok(())
+    }
+
+    pub fn append_system(&mut self, parts: Vec<Content>) -> Result<(), AgentInteractionError> {
+        self.state.append_system(parts)?;
+        self.emit_checkpoint()
     }
 
     pub fn truncate_history(
@@ -332,56 +352,120 @@ impl Agent {
         &mut self,
         cancel: CancelToken,
     ) -> Result<RunOutcome, AgentInteractionError> {
-        let result = self.run_loop(cancel).await;
+        if let Err(error) = self.start_run() {
+            self.finish_output();
+            return Err(error);
+        }
+        self.continue_run(cancel).await
+    }
+
+    pub fn start_run(&mut self) -> Result<(), AgentInteractionError> {
+        self.state.start()?;
+        Ok(())
+    }
+
+    /// Continue after a checkpoint failure without repeating completed effects.
+    /// A dropped in-flight effect requires explicit `recover_interrupted` first.
+    pub async fn continue_run(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<RunOutcome, AgentInteractionError> {
+        loop {
+            if let Some(outcome) = self.step(cancel.clone()).await? {
+                return Ok(outcome);
+            }
+        }
+    }
+
+    pub fn replace_at_boundary(
+        &mut self,
+        history: Vec<Message>,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), StateError> {
+        self.state.replace_at_boundary(history, usage)
+    }
+
+    pub fn recover_interrupted(&mut self) -> Result<(), AgentInteractionError> {
+        self.state.recover_interrupted()?;
+        self.emit_checkpoint()
+    }
+
+    pub fn cancel_at_boundary(&mut self) -> Result<(), AgentInteractionError> {
+        self.state.cancel_at_boundary()?;
+        self.finish_output();
+        self.emit_checkpoint()
+    }
+
+    /// Execute one generation or tool batch and checkpoint its outcome. `None`
+    /// yields to the caller at the next effect, allowing compaction or inspection.
+    pub async fn step(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<Option<RunOutcome>, AgentInteractionError> {
+        let result = self.step_effect(cancel).await;
         let result = match self.emit_checkpoint() {
             Ok(()) => result,
             Err(error) => Err(error),
         };
-        self.sink.emit(AgentEvent::TurnFinished {
-            context: self.context.clone(),
-        });
+        if !matches!(result, Ok(None)) {
+            self.finish_output();
+        }
         result
     }
 
-    async fn run_loop(&mut self, cancel: CancelToken) -> Result<RunOutcome, AgentInteractionError> {
-        let mut effect = self.state.start()?;
-        loop {
-            self.emit_checkpoint()?;
-            effect = match effect {
-                Effect::Generate { operation } => {
-                    let output = match async {
-                        self.append_pending_notice(operation, &cancel).await?;
-                        generation::generate(self, cancel.clone()).await
+    fn finish_output(&self) {
+        self.sink.emit(AgentEvent::TurnFinished {
+            context: self.context.clone(),
+        });
+    }
+
+    async fn step_effect(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<Option<RunOutcome>, AgentInteractionError> {
+        self.emit_checkpoint()?;
+        let effect = self
+            .state
+            .effect()
+            .ok_or(StateError::UnexpectedCompletion)?;
+        let next = match effect {
+            Effect::Generate { operation } => {
+                self.state.begin_effect(operation)?;
+                let output = match async {
+                    self.append_pending_notice(operation, &cancel).await?;
+                    generation::generate(self, cancel).await
+                }
+                .await
+                {
+                    Ok(output) => output,
+                    Err(error) => {
+                        self.state.generation_failed(operation)?;
+                        return Err(error);
                     }
-                    .await
-                    {
-                        Ok(output) => output,
-                        Err(error) => {
-                            self.state.generation_failed(operation)?;
-                            return Err(error);
-                        }
-                    };
-                    self.state.generated(operation, output)?
-                }
-                Effect::ExecuteTools { operation, calls } => {
-                    let results = future::join_all(
-                        calls
-                            .into_iter()
-                            .map(|call| self.dispatch_tool_use(call, cancel.clone())),
-                    )
-                    .await;
-                    self.state
-                        .tools_completed(operation, results, cancel.is_cancelled())?
-                }
-                Effect::Finished { answer, reason } => {
-                    return Ok(RunOutcome {
-                        answer,
-                        reason,
-                        usage: self.state.run_usage(),
-                    });
-                }
-                Effect::Cancelled => return Err(AgentInteractionError::Cancelled),
-            };
+                };
+                self.state.generated(operation, output)?
+            }
+            Effect::ExecuteTools { operation, calls } => {
+                self.state.begin_effect(operation)?;
+                let results = future::join_all(
+                    calls
+                        .into_iter()
+                        .map(|call| self.dispatch_tool_use(call, cancel.clone())),
+                )
+                .await;
+                self.state
+                    .tools_completed(operation, results, cancel.is_cancelled())?
+            }
+            terminal => terminal,
+        };
+        match next {
+            Effect::Finished { answer, reason } => Ok(Some(RunOutcome {
+                answer,
+                reason,
+                usage: self.state.run_usage(),
+            })),
+            Effect::Cancelled => Err(AgentInteractionError::Cancelled),
+            _ => Ok(None),
         }
     }
 
@@ -452,6 +536,8 @@ pub enum AgentInteractionError {
     State(StateError),
     #[error("could not persist agent state; execution stopped: {0}")]
     Checkpoint(String),
+    #[error("compaction failed: {0}")]
+    Compaction(String),
 }
 
 impl From<StateError> for AgentInteractionError {
@@ -474,9 +560,9 @@ impl AgentInteractionError {
             AgentInteractionError::GenerateError(e) => e.recovery(),
             // History is well-formed after a cancel; the same turn can be re-sent.
             AgentInteractionError::Cancelled => Recovery::Retry,
-            AgentInteractionError::State(_) | AgentInteractionError::Checkpoint(_) => {
-                Recovery::Stop
-            }
+            AgentInteractionError::State(_)
+            | AgentInteractionError::Checkpoint(_)
+            | AgentInteractionError::Compaction(_) => Recovery::Stop,
         }
     }
 }
@@ -518,7 +604,7 @@ mod tests {
             TestTools::new(vec![]),
             Arc::new(NullEventSink),
         );
-        agent.replace_context(vec![user("task")], None);
+        agent.replace_context(vec![user("task")], None).unwrap();
         agent.set_before_generation_notice(Some(Box::new({
             let started = started.clone();
             let release = release.clone();
@@ -547,7 +633,12 @@ mod tests {
         let saved = Arc::new(Mutex::new(Vec::new()));
         agent.set_checkpoint(Some(Box::new({
             let saved = saved.clone();
-            move |history, _| *saved.lock().unwrap() = history.to_vec()
+            move |state| {
+                if state.pending_operation().is_some() {
+                    *saved.lock().unwrap() = state.history().to_vec();
+                }
+                Ok(())
+            }
         })));
         release.cancel();
         agent.run(CancelToken::new()).await.unwrap();
@@ -830,15 +921,23 @@ mod tests {
             starts: starts.clone(),
             ends: Arc::new(Mutex::new(Vec::new())),
         });
-        let model = ScriptedModel::new(vec![GenerateOutput {
-            content: vec![],
-            tool_uses: vec![ToolUse {
-                name: "effect".into(),
-                input: json!({}),
-            }],
-            turn_end_reason: TurnEndReason::ToolUse,
-            usage: None,
-        }]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    name: "effect".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
         let mut agent = Agent::new(model, TestTools::new(vec![tool]), Arc::new(NullEventSink));
         agent.set_checkpoint(Some(Box::new(|state| {
             if matches!(
@@ -868,9 +967,12 @@ mod tests {
         ));
         assert!(matches!(
             agent.run(CancelToken::new()).await,
-            Err(AgentInteractionError::Checkpoint(_))
+            Err(AgentInteractionError::State(StateError::Busy))
         ));
         assert!(starts.lock().unwrap().is_empty());
+        agent.set_checkpoint(None);
+        agent.continue_run(CancelToken::new()).await.unwrap();
+        assert_eq!(starts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -882,15 +984,23 @@ mod tests {
             starts: starts.clone(),
             ends: Arc::new(Mutex::new(Vec::new())),
         });
-        let model = ScriptedModel::new(vec![GenerateOutput {
-            content: vec![],
-            tool_uses: vec![ToolUse {
-                name: "effect".into(),
-                input: json!({}),
-            }],
-            turn_end_reason: TurnEndReason::ToolUse,
-            usage: None,
-        }]);
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    name: "effect".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
         let mut agent = Agent::new(model, TestTools::new(vec![tool]), Arc::new(NullEventSink));
         agent.set_checkpoint(Some(Box::new(|state| {
             if matches!(state.history().last(), Some(Message::ToolResults { .. })) {
@@ -917,6 +1027,61 @@ mod tests {
             agent.state().pending_operation(),
             Some(PendingOperation::Generation { .. })
         ));
+        agent.set_checkpoint(None);
+        agent.continue_run(CancelToken::new()).await.unwrap();
+        assert_eq!(starts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_tool_step_requires_explicit_recovery_and_never_replays_it() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(SlowService {
+            name: "effect".into(),
+            delay: Duration::from_secs(60),
+            starts: starts.clone(),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let model = ScriptedModel::new(vec![
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    name: "effect".into(),
+                    input: json!({}),
+                }],
+                turn_end_reason: TurnEndReason::ToolUse,
+                usage: None,
+            },
+            GenerateOutput {
+                content: vec![],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let mut agent = Agent::new(model, TestTools::new(vec![tool]), Arc::new(NullEventSink));
+        agent
+            .append_input(Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "task".into(),
+                }],
+            })
+            .unwrap();
+        agent.start_run().unwrap();
+        assert!(agent.step(CancelToken::new()).await.unwrap().is_none());
+        {
+            let step = agent.step(CancelToken::new());
+            futures::pin_mut!(step);
+            assert!(futures::poll!(step).is_pending());
+        }
+        assert_eq!(starts.lock().unwrap().len(), 1);
+        assert!(matches!(
+            agent.continue_run(CancelToken::new()).await,
+            Err(AgentInteractionError::State(StateError::Busy))
+        ));
+        agent.recover_interrupted().unwrap();
+        assert!(agent.history().iter().any(|message| matches!(message, Message::ToolResults { tool_use_results } if tool_use_results[0].is_error)));
+        agent.run(CancelToken::new()).await.unwrap();
+        assert_eq!(starts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

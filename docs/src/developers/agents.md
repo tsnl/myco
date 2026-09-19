@@ -68,19 +68,21 @@ The model's advertised catalog and your executor must agree. `set_tools`
 changes execution only; it does not update a previously constructed model's
 tool schemas. Rebuild and replace the model when its advertised tools change.
 
-## Persist at replayable boundaries
+## Persist effects and observations
 
-`set_checkpoint` installs a synchronous callback receiving history and optional
-usage. It runs after input is appended and after a completed tool round, never
-between tool calls and their results. Keep callbacks short. If persistence is
-queued asynchronously, your application must decide how and when to confirm
-durability; the callback cannot return a save error to `run`.
+`set_checkpoint` installs a synchronous callback receiving `AgentState` and
+returning `Result<(), String>`. It runs before effects begin and after their
+observations settle, including the final answer. Persistence failure stops
+execution; callbacks should complete their atomic write before returning.
+Your storage layer owns locking, schema versioning, and stale-writer rejection.
 
-Save the final history after `run` returns, on both success and failure:
-a final assistant-only answer does **not** trigger the mid-turn callback.
-Your storage layer owns locking, schema versioning, atomic writes, and recovery.
-`replace_context` trusts the history you provide; install complete call/result
-pairs at valid boundaries.
+Persist the history, usage, and `pending_operation` together. A checkpoint with
+pending tool calls records uncertain external effects and is not valid model
+input. `recover_checkpoint` records unknown outcomes for those calls;
+`replace_context` validates complete call/result pairs before accepting history.
+`start_run` and `step` expose individual generations and tool batches for callers
+that need to compact or schedule work at settled boundaries. Myco's
+`SessionRunner` supplies the application persistence and recovery workflow.
 
 ## Cancellation and observation
 

@@ -6,7 +6,7 @@ composition; `myco-model` and `myco-agent` remain sufficient for a custom
 environment.
 
 ```text
-CLI / chat adapter
+CLI / SessionRunner
   ├── Agent (myco-agent)
   │     └── GenerativeModel (myco-model)
   └── SessionRuntime (ToolExecutor + live resource ownership)
@@ -32,10 +32,11 @@ Reloading a saved document after process exit does not recreate those resources.
 [`SessionRuntime::bind_agent`](../api/myco/session_runtime/struct.SessionRuntime.html#method.bind_agent)
 binds the active thread and attribution and clears the previous checkpoint.
 The chat adapter wires persistence back in. For a CLI-like turn, use
-[`chat::run_session_turn`](../api/myco/chat/fn.run_session_turn.html): it owns
-session writer coordination, stamps, input submission, size-rejection recovery,
-and final saving. Lower-level `chat::interact` only appends user input and runs
-the agent.
+[`SessionRunner`](../api/myco/chat/struct.SessionRunner.html): it owns the agent,
+session writer coordination, input submission, recovery, and compaction policy.
+It preserves live tools when threads change and rejects stale checkpoints.
+Lower-level `chat::run_session_turn` submits one durable turn; `chat::interact`
+only appends user input and runs the agent.
 
 ## Extend tools at the right layer
 

@@ -39,6 +39,14 @@ each generation step. Its text is attached to the latest user input or tool resu
 and checkpointed before generation. The system prompt stays fixed; retries reuse
 the same input, and cancellation can interrupt polling for a notice.
 
+`start_run` and `step` yield between individual generations and concurrent tool
+batches. `replace_at_boundary` swaps settled model context while retaining run
+usage and truncation counters. A dropped step cannot be dispatched again without
+explicit `recover_interrupted`; it records unknown tool outcomes. After a failed
+checkpoint, `continue_run` retries persistence and continues preserved live state.
+`checkpoint` retries only persistence. Callers can reject superseded writers in
+their checkpoint callback; the application session runner does so.
+
 Run `cargo test -p myco-agent` for the standalone execution and cancellation tests.
 
 The [agent guide](https://tsnl.github.io/myco/developers/agents.html) covers

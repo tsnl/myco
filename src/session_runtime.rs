@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::agent::{Agent, BeforeGenerationNotice, ToolExecutor};
-use crate::core::{Async, CancelToken};
+use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{Content, Message, ToolResult, ToolSpec, ToolUse};
 use crate::harness::Harness;
 use crate::prelude::{self, PreludeEntry};
 use crate::session::ActiveSession;
+
+mod lifecycle;
+pub use lifecycle::RuntimeRecord;
 
 struct PreludeObservation {
     entries: Vec<PreludeEntry>,
@@ -105,10 +108,17 @@ impl SessionRuntime {
         &self.session_id
     }
 
+    /// Bind or recover the latest saved context while holding the session writer.
+    /// Superseded checkpoints cannot discard or overwrite newer observations.
     pub fn bind_agent(
         self: &Arc<Self>,
         agent: &mut Agent,
     ) -> Result<(), crate::agent::AgentInteractionError> {
+        // Preserve unsaved observations only while this agent still owns the
+        // checkpoint. A superseded writer must not overwrite newer history.
+        if agent.checkpoint_failed() {
+            agent.checkpoint()?;
+        }
         let session = self.session.snapshot();
         assert_eq!(
             self.session_id, session.id,
@@ -117,15 +127,6 @@ impl SessionRuntime {
         let thread = session.active_thread();
         if !agent.state().is_idle() {
             return Err(crate::agent::StateError::Busy.into());
-        }
-        if agent.context().session_id.as_deref() == Some(&session.id)
-            && agent.context().thread_id.as_deref() == Some(&thread.id)
-        {
-            // A failed checkpoint may leave newer observations in this agent.
-            // Rebinding the same thread must not overwrite them with older disk state.
-            agent.set_tools(self.clone());
-            agent.set_checkpoint(None);
-            return Ok(());
         }
         let history =
             crate::agent::recover_checkpoint(thread.messages.clone(), thread.pending_operation)?;
@@ -146,8 +147,38 @@ impl SessionRuntime {
         Ok(())
     }
 
+    pub(crate) fn install_compacted_context(
+        self: &Arc<Self>,
+        agent: &mut Agent,
+        continuing: bool,
+    ) -> Result<(), crate::agent::AgentInteractionError> {
+        let session = self.session.snapshot();
+        let thread = session.active_thread();
+        if continuing {
+            agent.replace_at_boundary(thread.messages.clone(), thread.last_usage)?;
+        } else {
+            agent.replace_context(thread.messages.clone(), thread.last_usage)?;
+        }
+        let mut context = agent.context().clone();
+        context.session_id = Some(session.id.clone());
+        context.thread_id = Some(thread.id.clone());
+        agent.set_context(context);
+        agent.set_checkpoint(None);
+        Ok(())
+    }
+
     pub fn running_tool_summaries(&self) -> Vec<String> {
         self.harness.running_tool_summaries(self.owner_id)
+    }
+
+    pub async fn observe(
+        &self,
+        history: &[crate::generative_model::Message],
+        model: ModelInfo,
+        resume: bool,
+    ) -> Option<crate::generative_model::Content> {
+        let resources = self.harness.resources(self.owner_id).await;
+        RuntimeRecord::observe(history, self.owner_id, model, resources, resume)
     }
 }
 
@@ -332,7 +363,12 @@ mod tests {
             let rewound = serde_json::to_string(&outcome.rewound.unwrap()).unwrap();
             assert!(rewound.contains("user task"), "{rewound}");
             assert!(rewound.contains("Prelude changes"), "{rewound}");
-            assert!(agent.history().is_empty());
+            assert!(!agent.history().iter().any(Message::is_user_turn));
+            assert!(
+                !serde_json::to_string(agent.history())
+                    .unwrap()
+                    .contains("Prelude changes")
+            );
             let model = Arc::new(RecordingModel {
                 inner: ScriptedModel::new(vec![done()]),
                 requests: Mutex::default(),

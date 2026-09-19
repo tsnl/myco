@@ -70,12 +70,13 @@ hosts, or lies about resume.
 
 ```
 myco (interactive) / chat adapter
-  ├── Agent (myco-agent) → GenerativeModel (myco-model)
-  └── SessionRuntime (session binding + ToolExecutor)
-      └── Harness (host routing)
-          ├── HostController "local"  → in-process HostWorker (always on)
-          └── HostController "…"      → ssh … myco --mode host (lazy remote)
-                └── standard tools: bash, editor, view_image
+  └── SessionRunner (submission, lifecycle, checkpoints, compaction)
+      ├── Agent / AgentState (myco-agent) → GenerativeModel (myco-model)
+      └── SessionRuntime (session binding + ToolExecutor)
+          └── Harness (host routing)
+              ├── HostController "local"  → in-process HostWorker (always on)
+              └── HostController "…"      → ssh … myco --mode host (lazy remote)
+                    └── standard tools: bash, editor, view_image
 ```
 
 Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
@@ -94,7 +95,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `crates/myco-agent/` | Pure `AgentState` transitions and their async model/tool interpreter; fallible effect checkpoints; no application dependency |
 | `src/session_runtime.rs` | Binds agents to a session, implements `ToolExecutor` over Harness, and owns live tools across thread changes |
-| `src/chat/` | Session-turn submission, checkpoints, recovery, and the `/compact` worker; operates on a separately owned agent |
+| `src/chat/` | `SessionRunner`: shared interactive/scripted submission, lifecycle, recovery, and manual/automatic compaction with an injected compactor |
 | `src/session/` | Persistent sessions: ordered `Thread` histories, shared metadata, search, writer locks, and compaction document logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
@@ -125,12 +126,16 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   Pending tool batches recovered from disk receive unknown outcomes; never
   silently replay them. Malformed historical records remain inspectable but
   cannot become model input.
+- **Runtime records are observations** — hidden system parts describe model/effort,
+  tool resources, and handles unavailable after restart. Inventory queries keep
+  remotes lazy; failed queries preserve explicitly last-known state. Compaction
+  carries current facts forward without rewriting earlier threads.
 - **Builds are offline** beyond the crates.io fetch — `build.rs` shells out to
   local `git` for the commit that keys the manual export and does nothing else;
   no network at compile time. Ship platform-matched binaries; do not scp across
   glibc/arch boundaries.
 - **Local and remote myco run the same version** — connect fails loud on
-  package-version skew, which is what keeps the assumed tool catalog and the
+  package or host-protocol version skew, which keeps the assumed tool catalog and the
   NDJSON protocol sound.
 - **The crate graph is acyclic:** `myco-model` → `myco-agent` → `myco`.
   Application modules compose the lower crates through their public interfaces;

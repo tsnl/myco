@@ -10,9 +10,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use crate::core::CancelToken;
+use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{self, ToolUse};
-use crate::host::protocol::{Request, Response};
+use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
 use crate::tool_services::{
     BashService, HostDispatchContext, TextEditorService, ToolService, ViewImageService,
 };
@@ -113,6 +113,16 @@ impl HostWorker {
             .collect()
     }
 
+    pub fn resources(&self, agent_id: uuid::Uuid) -> Vec<ToolResource> {
+        let mut resources: Vec<_> = self
+            .services
+            .iter()
+            .flat_map(|service| service.resources(agent_id))
+            .collect();
+        resources.sort_by(|a, b| (&a.tool, &a.id).cmp(&(&b.tool, &b.id)));
+        resources
+    }
+
     /// Handle one decoded request and write the reply through `writer`.
     async fn handle_request<W>(
         self: Arc<Self>,
@@ -126,9 +136,19 @@ impl HostWorker {
             Request::Hello => {
                 let response = Response::HelloOk {
                     version: env!("CARGO_PKG_VERSION").to_string(),
+                    protocol: HOST_PROTOCOL_VERSION,
                 };
                 if let Err(e) = write_locked(&writer, &response).await {
                     eprintln!("host worker: write hello failed: {e}");
+                }
+            }
+            Request::Resources { id, agent_id } => {
+                let response = Response::Resources {
+                    id,
+                    resources: self.resources(agent_id),
+                };
+                if let Err(e) = write_locked(&writer, &response).await {
+                    eprintln!("host worker: write resource inventory failed: {e}");
                 }
             }
             Request::ToolCall {

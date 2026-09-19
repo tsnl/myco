@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::core::{Async, CancelToken};
+use crate::core::{Async, CancelToken, ToolResource};
 use crate::generative_model;
 
 pub mod bash_service;
@@ -170,6 +170,12 @@ pub trait ToolService: Send + Sync + 'static {
     /// `agent_id` (e.g. live bash sessions), for prompt-time display between
     /// turns. Must not block. Default: none.
     fn running_tool_summaries(&self, _agent_id: uuid::Uuid) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Stable inventory of retained state owned by one session runtime.
+    /// Implementations must not perform IO or consume buffered output.
+    fn resources(&self, _agent_id: uuid::Uuid) -> Vec<ToolResource> {
         Vec::new()
     }
 }

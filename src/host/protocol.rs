@@ -4,7 +4,10 @@
 //! - [`Request`]  — controller → worker
 //! - [`Response`] — worker → controller
 
+use crate::core::ToolResource;
 use crate::generative_model::{ToolResult, ToolUse};
+
+pub const HOST_PROTOCOL_VERSION: u32 = 2;
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -12,6 +15,8 @@ use crate::generative_model::{ToolResult, ToolUse};
 pub enum Request {
     /// First message after connect; worker replies with [`Response::HelloOk`].
     Hello,
+    /// Inspect retained state without executing a tool or connecting another host.
+    Resources { id: String, agent_id: uuid::Uuid },
     /// Execute one tool use. Worker responds with [`Response::ToolResult`].
     ToolCall {
         /// Correlation id (unique per in-flight call on this pipe).
@@ -48,6 +53,12 @@ impl Request {
 pub enum Response {
     HelloOk {
         version: String,
+        #[serde(default)]
+        protocol: u32,
+    },
+    Resources {
+        id: String,
+        resources: Vec<ToolResource>,
     },
     ToolResult {
         id: String,
