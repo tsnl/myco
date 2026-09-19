@@ -115,10 +115,9 @@ impl BashService {
                 `status: exited` means that process exited and both output streams closed. \
                 Descendants may keep output open; use `read` for later output or `close` \
                 to stop the process group.\n\n\
-                **Working directory:** pass optional `cwd` on `exec` / `start` to set the \
-                process working directory. Prefer `cwd` over prefixing commands with `cd … &&`. \
-                A leading `cd` still runs, but the result nudges you toward `cwd`. (`write` stdin \
-                may still send interactive `cd` into a live shell.)",
+                **Working directory:** use `cd /path && command` in `exec` / `start`. \
+                A directory change in an exec call affects only that call; a live shell \
+                session keeps directory changes made through `write`.",
                 exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
                 exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
                 session_default_s = DEFAULT_TIMEOUT_MS / 1000,
@@ -252,17 +251,15 @@ impl BashService {
         match action {
             Action::Exec {
                 command,
-                cwd,
                 timeout_ms,
                 max_bytes,
             } => {
-                self.run_oneshot(&command, cwd.as_deref(), timeout_ms, max_bytes, cancel)
+                self.run_oneshot(&command, timeout_ms, max_bytes, cancel)
                     .await
             }
             Action::Start {
                 session_id,
                 command,
-                cwd,
                 stdin,
                 timeout_ms,
                 idle_ms,
@@ -272,7 +269,6 @@ impl BashService {
                     &session_id,
                     owner,
                     command.as_deref(),
-                    cwd.as_deref(),
                     stdin.as_deref(),
                     timeout_ms,
                     idle_ms,
@@ -344,7 +340,6 @@ impl BashService {
     async fn run_oneshot(
         &self,
         command: &str,
-        cwd: Option<&str>,
         timeout_ms: u64,
         max_bytes: usize,
         cancel: crate::core::CancelToken,
@@ -360,15 +355,11 @@ impl BashService {
             .kill_on_drop(true)
             // Own process group so timeout/cancel can kill grandchildren too.
             .process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(error) => {
                 return generative_model::ToolResult::err(format!(
-                    "Error spawning command{}: {error}",
-                    cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
+                    "Error spawning command: {error}"
                 ));
             }
         };
@@ -456,7 +447,6 @@ impl BashService {
         session_id: &str,
         owner: Uuid,
         command: Option<&str>,
-        cwd: Option<&str>,
         stdin: Option<&str>,
         timeout_ms: u64,
         idle_ms: u64,
@@ -492,15 +482,11 @@ impl BashService {
             .env("PYTHONUNBUFFERED", "1")
             // Own process group so close/reap can kill the whole tree.
             .process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return generative_model::ToolResult::err(format!(
-                    "failed to spawn session command {cmdline:?}{}: {e}",
-                    cwd.map(|d| format!(" (cwd={d:?})")).unwrap_or_default()
+                    "failed to spawn session command {cmdline:?}: {e}"
                 ));
             }
         };
@@ -1507,14 +1493,8 @@ pub struct Input {
     #[serde(default)]
     action: Option<ActionKind>,
     /// Command line. For `exec`: run via `bash -c`. For `start`: program line (default `bash -i`).
-    ///
-    /// Prefer [`Self::cwd`] over starting this with `cd`.
     #[serde(default)]
     command: Option<String>,
-    /// Working directory for `exec` / `start` (process `current_dir`). Prefer this over
-    /// prefixing `command` with `cd … &&`.
-    #[serde(default)]
-    cwd: Option<String>,
     /// Agent-chosen session name for start/write/read/close.
     #[serde(default)]
     session_id: Option<String>,
@@ -1593,14 +1573,12 @@ impl SignalKind {
 enum Action {
     Exec {
         command: String,
-        cwd: Option<String>,
         timeout_ms: u64,
         max_bytes: usize,
     },
     Start {
         session_id: String,
         command: Option<String>,
-        cwd: Option<String>,
         stdin: Option<String>,
         timeout_ms: u64,
         idle_ms: u64,
@@ -1645,12 +1623,7 @@ impl Action {
 /// Guidance attached to a completed command that bypasses a first-class bash
 /// field. The command still runs; its result teaches the next call.
 fn command_nudge(command: &str) -> Option<&'static str> {
-    if command_starts_with_word(command, "cd") {
-        Some(
-            "pass the working directory as bash's `cwd` field instead of starting `command` \
-             with `cd`; this keeps the working directory visible to myco.",
-        )
-    } else if command_starts_with_word(command, "ssh") {
+    if command_starts_with_word(command, "ssh") {
         Some(
             "for a configured myco host, pass its alias as bash's `host` field instead of \
              invoking `ssh`; direct SSH is for setup, diagnosis, or unconfigured machines.",
@@ -1674,7 +1647,7 @@ fn command_starts_with_word(command: &str, word: &str) -> bool {
 /// missing action. Name the actual problem, and show what a usable call
 /// looks like.
 const EMPTY_INPUT_ERROR: &str = "empty bash input: the tool use carried no parameters. \
-     Pass `command` for a one-shot run (e.g. {\"command\": \"ls -la\", \"cwd\": \"/repo\"}), \
+     Pass `command` for a one-shot run (e.g. {\"command\": \"cd /repo && ls -la\"}), \
      or `action` with its parameters (exec/start/write/read/signal/close/list; every \
      session action but `list` also needs `session_id`).";
 
@@ -1696,7 +1669,6 @@ fn is_empty_object(input: &Input) -> bool {
     let Input {
         action,
         command,
-        cwd,
         session_id,
         stdin,
         signal,
@@ -1706,7 +1678,6 @@ fn is_empty_object(input: &Input) -> bool {
     } = input;
     action.is_none()
         && command.is_none()
-        && cwd.is_none()
         && session_id.is_none()
         && stdin.is_none()
         && signal.is_none()
@@ -1725,24 +1696,9 @@ fn require_non_blank(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_cwd(cwd: Option<&String>) -> Result<Option<String>, String> {
-    match cwd {
-        None => Ok(None),
-        Some(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                Err("`cwd` must be a non-empty path when provided".into())
-            } else {
-                Ok(Some(s.to_string()))
-            }
-        }
-    }
-}
-
 fn resolve_action(input: &Input) -> Result<Action, String> {
     let idle_ms = input.idle_ms.unwrap_or(DEFAULT_IDLE_MS);
     let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    let cwd = normalize_cwd(input.cwd.as_ref())?;
 
     let kind = match &input.action {
         Some(k) => k.clone(),
@@ -1800,7 +1756,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             require_non_blank("command", &command)?;
             Ok(Action::Exec {
                 command,
-                cwd,
                 timeout_ms: exec_timeout(input)?,
                 max_bytes,
             })
@@ -1817,7 +1772,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             Ok(Action::Start {
                 session_id,
                 command: input.command.clone(),
-                cwd,
                 stdin: input.stdin.clone(),
                 timeout_ms: session_timeout(input)?,
                 idle_ms,
@@ -1825,9 +1779,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Write => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
             let session_id = input
                 .session_id
                 .clone()
@@ -1846,9 +1797,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Read => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
             let session_id = input
                 .session_id
                 .clone()
@@ -1862,9 +1810,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Signal => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
             let session_id = input
                 .session_id
                 .clone()
@@ -1879,9 +1824,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             })
         }
         ActionKind::Close => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
             let session_id = input
                 .session_id
                 .clone()
@@ -1889,12 +1831,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             require_non_blank("session_id", &session_id)?;
             Ok(Action::Close { session_id })
         }
-        ActionKind::List => {
-            if cwd.is_some() {
-                return Err("`cwd` is only valid on `exec` / `start`".into());
-            }
-            Ok(Action::List)
-        }
+        ActionKind::List => Ok(Action::List),
     }
 }
 

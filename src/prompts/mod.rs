@@ -78,8 +78,6 @@ Quick map (details in the manual):
   does ask for a new machine — bringing one online for the first time is the usual case — raw
   `ssh` to add the alias, install `myco`, and verify it attaches (`harness-ops.md`) is the task;
   go back to `host` once it is a real host.
-- `bash`: prefer optional `cwd` on `exec`/`start` over `cd … &&`; a leading `cd` still runs,
-  but its result nudges you back toward `cwd`.
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
   guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs (`.claude/skills`, `SKILL.md`
   folders) — read them with the editor or `rg` when the task touches how this project works.
@@ -195,8 +193,8 @@ fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -
     );
     if let Some(cwd) = cwd {
         block.push_str(&format!(
-            "- Launch directory: `{}` — where myco was started, so `bash` on the local host \
-             begins there unless a call passes `cwd`.\n",
+            "- Launch directory: `{}` — local `bash` exec calls and new shell sessions \
+             begin here. Use `cd /path && command` to work elsewhere.\n",
             cwd.display()
         ));
     }

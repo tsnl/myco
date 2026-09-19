@@ -187,8 +187,7 @@ async fn profile_selection_reaches_nested_agents_after_a_cwd_change() {
     .unwrap();
     let executable = env!("CARGO_BIN_EXE_myco").replace('\'', "'\\''");
     let arguments = json!({
-        "command": format!("'{executable}' -p child --parent-session {}", parent.id),
-        "cwd": "/",
+        "command": format!("cd / && '{executable}' -p child --parent-session {}", parent.id),
     });
     let done = || {
         StubHttpServer::sse_response(vec![

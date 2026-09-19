@@ -146,6 +146,13 @@ context_window = 500_000
   an interactive login can resolve a different binary than the host worker.
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
+Bash `exec` and `start` inherit the host process's working directory. Use
+`cd /path && command` to run elsewhere; quote paths as shell arguments.
+An `exec` directory change lasts only for that call. To keep shell state across
+calls, `start` a shell (for example, `cd /path && bash --noprofile --norc`) and
+send commands through `write`. The bash tool has no separate working-directory
+argument; unsupported fields are rejected before execution.
+
 ## Models & credentials (the catalog)
 
 Myco ships **no built-in models**: the `[gateways]` / `[models]` tables in
