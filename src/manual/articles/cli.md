@@ -33,8 +33,11 @@ use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
 Accepted user turns carry a persisted UTC acceptance time, shown as `Accepted:`
-below the input in live output and replay. Older turns and synthetic compaction
-input have unknown timestamps; their creation time is not substituted.
+below the input in live output and replay. Older human turns have unknown
+timestamps; their creation time is not substituted. Runtime context (session
+identity, compaction summaries, and automatic continuation instructions) is
+stored as system parts. The model receives their text, but transcript replay
+omits them and they do not count as human submissions.
 
 Archiving hides a session from ordinary listings and bare resume. It preserves
 all threads, metadata, search, and links; it does not cancel a run or close tools.
@@ -188,7 +191,8 @@ ERROR section (live only; not stored in session history).
 its predecessor, the retained message count, and the summary path. Older threads stay in
 the session file and can be read through `session_history` with `thread_id`. Live shells
 and editor read stamps continue across compaction. The console mirror keeps the whole
-run, and Ctrl-L reprints the active thread's summary + retained context.
+run, and Ctrl-L reprints the active thread's visible retained context. Read the
+summary through `session_history` or the summary path shown in the banner.
 
 Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,
 compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`

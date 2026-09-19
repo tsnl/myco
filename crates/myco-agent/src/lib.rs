@@ -12,8 +12,8 @@
 //!
 //! The executor owns live resources independently of agent history. Calls within
 //! a round run concurrently; results are recorded in call order. Checkpoints
-//! expose replayable intermediate histories. Persist final history after `run`
-//! returns as well: an assistant-only final answer does not emit a checkpoint.
+//! persist pending effects and their settled observations. Pending tool batches
+//! are durable intent, not replayable model context; recover them before reuse.
 //!
 //! Cancel a clone of the run's [`CancelToken`] and await the run future to let
 //! cleanup finish. Aborting the task bypasses that cooperative completion path.
@@ -27,11 +27,16 @@ use std::sync::Arc;
 use futures::future;
 use myco_model::{
     self as generative_model, Content, GenerateError, GenerationFailure, GenerativeModel, Message,
-    Recovery, RetryPolicy, TokenUsage, ToolResult, ToolUse, TurnEndReason, answer_content,
+    Recovery, RetryPolicy, TokenUsage, ToolResult, ToolUse, TurnEndReason,
 };
 use uuid::Uuid;
 
 mod generation;
+mod state;
+pub use state::{
+    AgentState, Effect, OperationId, PendingOperation, StateError, recover_checkpoint,
+    validate_checkpoint, validate_context,
+};
 
 pub use tokio_util::sync::CancellationToken as CancelToken;
 pub type Async<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
@@ -134,16 +139,10 @@ impl EventSink for NullEventSink {
 // Agent
 //
 
-/// Callback invoked at well-formed mid-turn history boundaries (after the user
-/// message is pushed and after each ToolResults push) so callers can persist
-/// the conversation before the turn completes. Not called between an assistant
-/// tool_use message and its results — that prefix is rejected by providers, so
-/// it must never be the snapshot a context fork inherits.
-///
-/// This callback is synchronous and cannot report save errors to the agent.
-/// Final assistant-only output is not a checkpoint; save [`Agent::history`]
-/// again after [`Agent::run`] returns, including when it returns an error.
-pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
+/// Persist context and pending intent before effects begin, and completed
+/// observations before the next effect. Failure stops execution. A pending tool
+/// batch is a durable observation, not a valid model input or context fork.
+pub type Checkpoint = Box<dyn Fn(&AgentState) -> Result<(), String> + Send + Sync>;
 
 /// Supply a pending runtime notice before a generation step. The returned text
 /// is appended to the latest user input or tool result and checkpointed before
@@ -155,7 +154,7 @@ pub type BeforeGenerationNotice =
 
 /// How long a cancelled tool dispatch may keep running to do its own
 /// cleanup (process-group kill, buffer drain) before the agent abandons it
-/// and records a synthetic cancelled result.
+/// and records an unknown outcome.
 const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The user turn sent to resume a reply that `max_tokens` cut off mid-text.
@@ -163,8 +162,16 @@ const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 /// A plain "Continue" invites the model to acknowledge the instruction or start
 /// the thought over; naming the requirement keeps the seam invisible in the
 /// finished answer.
-const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
+pub const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
      and do not acknowledge this message.";
+
+/// A run ending at an output cap is distinct from a completed model turn.
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub answer: Vec<Content>,
+    pub reason: TurnEndReason,
+    pub usage: Option<TokenUsage>,
+}
 
 /// A headless model/tool loop over caller-supplied context and capabilities.
 ///
@@ -177,16 +184,10 @@ pub struct Agent {
     tools: Arc<dyn ToolExecutor>,
     sink: Arc<dyn EventSink>,
     context: TraceContext,
-    history: Vec<Message>,
-    /// Last turn's usage: input = final request's prompt (context estimate for
-    /// the next USER header), output = summed across that turn's generate calls.
-    last_usage: Option<TokenUsage>,
+    state: AgentState,
     /// Context window for the active model (tokens).
     context_window_tokens: u64,
-    /// Consecutive `max_tokens` resumes allowed within one turn, from the
-    /// active model's `max_truncated_resumes`.
-    max_truncated_resumes: u32,
-    checkpoint: Option<HistoryCheckpoint>,
+    checkpoint: Option<Checkpoint>,
     before_generation_notice: Option<BeforeGenerationNotice>,
 }
 
@@ -211,10 +212,8 @@ impl Agent {
             tools,
             sink,
             context,
-            history: Vec::new(),
-            last_usage: None,
+            state: AgentState::default(),
             context_window_tokens: 200_000,
-            max_truncated_resumes: DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
             before_generation_notice: None,
         }
@@ -230,8 +229,8 @@ impl Agent {
         self.context = context;
     }
 
-    /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
-    pub fn set_checkpoint(&mut self, checkpoint: Option<HistoryCheckpoint>) {
+    /// Install the durable effect checkpoint (see [`Checkpoint`]).
+    pub fn set_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
         self.checkpoint = checkpoint;
     }
 
@@ -239,21 +238,28 @@ impl Agent {
         self.before_generation_notice = notice;
     }
 
-    fn emit_checkpoint(&self) {
+    fn emit_checkpoint(&self) -> Result<(), AgentInteractionError> {
         if let Some(checkpoint) = &self.checkpoint {
-            checkpoint(&self.history, self.last_usage);
+            checkpoint(&self.state).map_err(AgentInteractionError::Checkpoint)?;
         }
+        Ok(())
     }
 
     pub fn history(&self) -> &[Message] {
-        &self.history
+        self.state.history()
     }
 
     /// Replace model context and its usage estimate without changing live tool state.
-    /// The caller must supply a replayable history. This does not emit a checkpoint.
-    pub fn replace_context(&mut self, history: Vec<Message>, usage: Option<TokenUsage>) {
-        self.history = history;
-        self.last_usage = usage;
+    pub fn replace_context(
+        &mut self,
+        history: Vec<Message>,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), StateError> {
+        self.state.replace_context(history, usage)
+    }
+
+    pub fn state(&self) -> &AgentState {
+        &self.state
     }
 
     pub fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
@@ -266,16 +272,19 @@ impl Agent {
     }
 
     /// Append input at a well-formed context boundary and checkpoint it.
-    pub fn append_input(&mut self, message: Message) {
-        self.history.push(message);
-        self.emit_checkpoint();
+    pub fn append_input(&mut self, message: Message) -> Result<(), AgentInteractionError> {
+        self.state.append_input(message)?;
+        self.emit_checkpoint()?;
+        Ok(())
     }
 
-    pub fn truncate_history(&mut self, index: usize) -> Vec<Message> {
-        let dropped = self.history.split_off(index);
-        self.last_usage = None;
-        self.emit_checkpoint();
-        dropped
+    pub fn truncate_history(
+        &mut self,
+        index: usize,
+    ) -> Result<Vec<Message>, AgentInteractionError> {
+        let dropped = self.state.truncate_history(index)?;
+        self.emit_checkpoint()?;
+        Ok(dropped)
     }
 
     /// Set the model context budget available to callers.
@@ -290,12 +299,12 @@ impl Agent {
     /// Set how many consecutive `max_tokens` truncations one turn resumes
     /// through (the active model's `max_truncated_resumes`; `0` never resumes).
     pub fn set_max_truncated_resumes(&mut self, resumes: u32) {
-        self.max_truncated_resumes = resumes;
+        self.state.set_max_truncated_resumes(resumes);
     }
 
     /// Last observed prompt/context token usage (from the provider), if any.
     pub fn last_usage(&self) -> Option<TokenUsage> {
-        self.last_usage
+        self.state.last_usage()
     }
 
     pub fn context(&self) -> &TraceContext {
@@ -307,46 +316,78 @@ impl Agent {
     ///
     /// Returns answer content from the final generation; intervening responses
     /// and tool rounds remain in [`Self::history`]. Emits [`AgentEvent::TurnFinished`]
-    /// on success, error, or cooperative cancellation. Persist history after this
-    /// returns rather than relying only on mid-turn checkpoints.
+    /// on success, error, or cooperative cancellation. Checkpoints persist both
+    /// pending effects and the final settled state.
     pub async fn run(
         &mut self,
         cancel: CancelToken,
     ) -> Result<Vec<Content>, AgentInteractionError> {
+        self.run_with_outcome(cancel)
+            .await
+            .map(|outcome| outcome.answer)
+    }
+
+    /// Drive context and retain the stop reason and measured usage for evaluators.
+    pub async fn run_with_outcome(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<RunOutcome, AgentInteractionError> {
         let result = self.run_loop(cancel).await;
+        let result = match self.emit_checkpoint() {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        };
         self.sink.emit(AgentEvent::TurnFinished {
             context: self.context.clone(),
         });
         result
     }
 
-    async fn run_loop(
-        &mut self,
-        cancel: CancelToken,
-    ) -> Result<Vec<Content>, AgentInteractionError> {
-        let mut output_tokens = 0;
-        let mut truncations = 0;
+    async fn run_loop(&mut self, cancel: CancelToken) -> Result<RunOutcome, AgentInteractionError> {
+        let mut effect = self.state.start()?;
         loop {
-            self.append_pending_notice(&cancel).await?;
-            let output = generation::generate(self, cancel.clone()).await?;
-            self.record_usage(output.usage, &mut output_tokens);
-            let answer = answer_content(&output.content);
-            let reason = output.turn_end_reason;
-            let has_tools = !output.tool_uses.is_empty();
-            self.record_assistant(output.content, &output.tool_uses, reason.clone())?;
-            self.answer_tools(output.tool_uses, cancel.clone()).await?;
-            let resume = self.resume_truncated(&reason, &mut truncations);
-            if resume && !has_tools {
-                self.append_continuation();
-            }
-            if !matches!(reason, TurnEndReason::ToolUse) && !resume {
-                return Ok(answer);
-            }
+            self.emit_checkpoint()?;
+            effect = match effect {
+                Effect::Generate { operation } => {
+                    let output = match async {
+                        self.append_pending_notice(operation, &cancel).await?;
+                        generation::generate(self, cancel.clone()).await
+                    }
+                    .await
+                    {
+                        Ok(output) => output,
+                        Err(error) => {
+                            self.state.generation_failed(operation)?;
+                            return Err(error);
+                        }
+                    };
+                    self.state.generated(operation, output)?
+                }
+                Effect::ExecuteTools { operation, calls } => {
+                    let results = future::join_all(
+                        calls
+                            .into_iter()
+                            .map(|call| self.dispatch_tool_use(call, cancel.clone())),
+                    )
+                    .await;
+                    self.state
+                        .tools_completed(operation, results, cancel.is_cancelled())?
+                }
+                Effect::Finished { answer, reason } => {
+                    return Ok(RunOutcome {
+                        answer,
+                        reason,
+                        usage: self.state.run_usage(),
+                    });
+                }
+                Effect::Cancelled => return Err(AgentInteractionError::Cancelled),
+            };
         }
     }
 
     async fn append_pending_notice(
         &mut self,
+        operation: OperationId,
         cancel: &CancelToken,
     ) -> Result<(), AgentInteractionError> {
         let Some(poll_notice) = &self.before_generation_notice else {
@@ -355,104 +396,19 @@ impl Agent {
         let note = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(AgentInteractionError::Cancelled),
-            note = poll_notice(&self.context, &self.history) => note,
+            note = poll_notice(&self.context, self.state.history()) => note,
         };
-        let Some(text) = note else {
-            return Ok(());
-        };
-        let content = Content::Text { text };
-        // Keep notices inside the current input so rewind and compaction still
-        // count actual user turns, and tool calls keep their matching results.
-        match self.history.last_mut() {
-            Some(Message::UserMessage { content: input }) => input.push(content),
-            Some(Message::ToolResults { tool_use_results }) if !tool_use_results.is_empty() => {
-                tool_use_results.last_mut().unwrap().content.push(content);
-            }
-            _ => self.history.push(Message::UserMessage {
-                content: vec![content],
-            }),
-        }
-        self.emit_checkpoint();
-        Ok(())
-    }
-
-    fn record_usage(&mut self, usage: Option<TokenUsage>, output_tokens: &mut u64) {
-        if let Some(usage) = usage {
-            // Input describes the latest prompt; output spans every request in the run.
-            *output_tokens += usage.output_tokens;
-            self.last_usage = Some(TokenUsage {
-                output_tokens: *output_tokens,
-                ..usage
-            });
-        }
-    }
-
-    fn record_assistant(
-        &mut self,
-        content: Vec<Content>,
-        tool_uses: &[ToolUse],
-        reason: TurnEndReason,
-    ) -> Result<(), AgentInteractionError> {
-        let missing_tools = matches!(reason, TurnEndReason::ToolUse) && tool_uses.is_empty();
-        self.history.push(Message::AssistantMessage {
-            content,
-            tool_uses: tool_uses.to_vec(),
-            turn_end_reason: Some(reason),
-        });
-        if missing_tools {
-            return Err(AgentInteractionError::GenerateError(
-                GenerateError::MalformedResponseError(
-                    "turn ended in tool_use but streamed zero tool uses".into(),
-                ),
-            ));
+        if let Some(text) = note {
+            self.state.append_generation_notice(operation, text)?;
+            self.emit_checkpoint()?;
         }
         Ok(())
-    }
-
-    async fn answer_tools(
-        &mut self,
-        tool_uses: Vec<ToolUse>,
-        cancel: CancelToken,
-    ) -> Result<(), AgentInteractionError> {
-        if tool_uses.is_empty() {
-            return Ok(());
-        }
-        // Even truncated calls need results. join_all preserves call order;
-        // checkpoint and cancellation must wait until every call has a result.
-        let tool_use_results = future::join_all(
-            tool_uses
-                .into_iter()
-                .map(|tool_use| self.dispatch_tool_use(tool_use, cancel.clone())),
-        )
-        .await;
-        self.history.push(Message::ToolResults { tool_use_results });
-        self.emit_checkpoint();
-        if cancel.is_cancelled() {
-            return Err(AgentInteractionError::Cancelled);
-        }
-        Ok(())
-    }
-
-    fn resume_truncated(&self, reason: &TurnEndReason, truncations: &mut u32) -> bool {
-        if matches!(reason, TurnEndReason::MaxTokens) {
-            *truncations += 1;
-            *truncations <= self.max_truncated_resumes
-        } else {
-            *truncations = 0;
-            false
-        }
-    }
-
-    fn append_continuation(&mut self) {
-        // A user continuation avoids the assistant-prefill shape Anthropic rejects.
-        self.append_input(Message::UserMessage {
-            content: vec![Content::Text {
-                text: CONTINUE_PROMPT.to_string(),
-            }],
-        });
     }
 
     async fn dispatch_tool_use(&self, tool_use: ToolUse, cancel: CancelToken) -> ToolResult {
+        if cancel.is_cancelled() {
+            return ToolResult::err("cancelled before dispatch");
+        }
         self.sink.emit(AgentEvent::ToolStarted {
             tool_use: tool_use.clone(),
             context: self.context.clone(),
@@ -476,7 +432,7 @@ impl Agent {
             _ = cancel.cancelled() => {
                 match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
                     Ok(result) => result,
-                    Err(_) => ToolResult::err("cancelled"),
+                    Err(_) => ToolResult::err("cancel requested; tool did not acknowledge before the deadline; effects are unknown"),
                 }
             }
             result = &mut work => result,
@@ -489,9 +445,24 @@ pub enum AgentInteractionError {
     #[error("Error during generation: {0}")]
     GenerateError(#[from] generative_model::GenerateError),
     /// In-flight turn aborted (e.g. Ctrl-C). History is left well-formed when tools
-    /// had already started (synthetic cancelled tool results are recorded).
+    /// had already started (unacknowledged cancellations record unknown effects).
     #[error("cancelled")]
     Cancelled,
+    #[error("{0}")]
+    State(StateError),
+    #[error("could not persist agent state; execution stopped: {0}")]
+    Checkpoint(String),
+}
+
+impl From<StateError> for AgentInteractionError {
+    fn from(error: StateError) -> Self {
+        match error {
+            StateError::InvalidResponse(message) => {
+                Self::GenerateError(GenerateError::MalformedResponseError(message))
+            }
+            error => Self::State(error),
+        }
+    }
 }
 
 impl AgentInteractionError {
@@ -503,6 +474,9 @@ impl AgentInteractionError {
             AgentInteractionError::GenerateError(e) => e.recovery(),
             // History is well-formed after a cancel; the same turn can be re-sent.
             AgentInteractionError::Cancelled => Recovery::Retry,
+            AgentInteractionError::State(_) | AgentInteractionError::Checkpoint(_) => {
+                Recovery::Stop
+            }
         }
     }
 }
@@ -520,6 +494,7 @@ mod tests {
     use futures::stream;
     use myco_model::{
         ContentDelta, GenerateError, GenerateOutput, GenerationEvent, MessagePart, ToolSpec,
+        TurnEndReason,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -774,11 +749,10 @@ mod tests {
         );
     }
 
-    /// Checkpoints fire after the user push and after ToolResults — never
-    /// between an assistant tool_use and its results, a prefix providers
-    /// reject and a context fork must never inherit.
+    /// Tool intent must be durable before dispatch, and its result durable
+    /// before the following generation.
     #[tokio::test]
-    async fn checkpoint_fires_only_at_well_formed_boundaries() {
+    async fn checkpoints_include_tool_intent_and_completed_observations() {
         let slow = Arc::new(SlowService {
             name: "slow_a".into(),
             delay: Duration::from_millis(1),
@@ -806,10 +780,12 @@ mod tests {
             },
         ]);
         let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
-        let snapshots: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snapshots: Arc<Mutex<Vec<AgentState>>> = Arc::new(Mutex::new(Vec::new()));
         let record = snapshots.clone();
-        agent.set_checkpoint(Some(Box::new(move |history, _usage| {
-            record.lock().unwrap().push(history.to_vec());
+        agent.set_checkpoint(Some(Box::new(move |state| {
+            validate_checkpoint(state.history(), state.pending_operation()).unwrap();
+            record.lock().unwrap().push(state.clone());
+            Ok(())
         })));
 
         interact(
@@ -821,12 +797,126 @@ mod tests {
         .expect("interact");
 
         let snapshots = snapshots.lock().unwrap();
-        assert_eq!(snapshots.len(), 2, "{snapshots:?}");
-        assert_eq!(snapshots[0].len(), 1);
-        assert!(matches!(snapshots[0][0], Message::UserMessage { .. }));
-        assert_eq!(snapshots[1].len(), 3);
-        assert!(matches!(snapshots[1][1], Message::AssistantMessage { .. }));
-        assert!(matches!(snapshots[1][2], Message::ToolResults { .. }));
+        let intent = snapshots
+            .iter()
+            .position(|state| {
+                matches!(
+                    state.pending_operation(),
+                    Some(PendingOperation::Tools { .. })
+                )
+            })
+            .unwrap();
+        let observed = snapshots
+            .iter()
+            .position(|state| matches!(state.history().last(), Some(Message::ToolResults { .. })))
+            .unwrap();
+        assert!(intent < observed);
+        assert!(matches!(
+            snapshots[observed].pending_operation(),
+            Some(PendingOperation::Generation { .. })
+        ));
+        assert_eq!(snapshots.first().unwrap().history().len(), 1);
+        let finished = snapshots.last().unwrap();
+        assert!(finished.pending_operation().is_none());
+        assert_eq!(finished.history().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn failed_intent_checkpoint_prevents_tool_dispatch_and_another_generation() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(SlowService {
+            name: "effect".into(),
+            delay: Duration::ZERO,
+            starts: starts.clone(),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                name: "effect".into(),
+                input: json!({}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, TestTools::new(vec![tool]), Arc::new(NullEventSink));
+        agent.set_checkpoint(Some(Box::new(|state| {
+            if matches!(
+                state.pending_operation(),
+                Some(PendingOperation::Tools { .. })
+            ) {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        })));
+        let error = interact(
+            &mut agent,
+            vec![Content::Text {
+                text: "task".into(),
+            }],
+            CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentInteractionError::Checkpoint(_)));
+        assert_eq!(error.recovery(), Recovery::Stop);
+        assert!(starts.lock().unwrap().is_empty());
+        assert!(matches!(
+            agent.state().pending_operation(),
+            Some(PendingOperation::Tools { .. })
+        ));
+        assert!(matches!(
+            agent.run(CancelToken::new()).await,
+            Err(AgentInteractionError::Checkpoint(_))
+        ));
+        assert!(starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_result_checkpoint_retains_observations_and_stops_before_the_next_model_call() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(SlowService {
+            name: "effect".into(),
+            delay: Duration::ZERO,
+            starts: starts.clone(),
+            ends: Arc::new(Mutex::new(Vec::new())),
+        });
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![ToolUse {
+                name: "effect".into(),
+                input: json!({}),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, TestTools::new(vec![tool]), Arc::new(NullEventSink));
+        agent.set_checkpoint(Some(Box::new(|state| {
+            if matches!(state.history().last(), Some(Message::ToolResults { .. })) {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        })));
+        let error = interact(
+            &mut agent,
+            vec![Content::Text {
+                text: "task".into(),
+            }],
+            CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentInteractionError::Checkpoint(_)));
+        assert_eq!(starts.lock().unwrap().len(), 1);
+        assert!(
+            matches!(agent.history().last(), Some(Message::ToolResults { tool_use_results }) if !tool_use_results[0].is_error)
+        );
+        assert!(matches!(
+            agent.state().pending_operation(),
+            Some(PendingOperation::Generation { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1026,7 +1116,7 @@ mod tests {
                 assert_eq!(tool_use_results.len(), 1);
                 assert!(tool_use_results[0].is_error);
                 let text = result_text(&tool_use_results[0]);
-                assert!(text.contains("cancelled"), "{text}");
+                assert!(text.contains("effects are unknown"), "{text}");
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
@@ -1231,7 +1321,10 @@ mod tests {
         assert_eq!(agent.history().len(), 4);
         match &agent.history()[2] {
             Message::UserMessage { content } => match content.as_slice() {
-                [Content::Text { text }] => assert_eq!(text, CONTINUE_PROMPT),
+                [Content::System { text, kind, .. }] => {
+                    assert_eq!(text, CONTINUE_PROMPT);
+                    assert_eq!(kind, "continuation");
+                }
                 other => panic!("expected one text block, got {other:?}"),
             },
             other => panic!("expected the continuation user turn, got {other:?}"),
@@ -1372,18 +1465,20 @@ mod tests {
         let tools = TestTools::new(vec![]);
         let model = ScriptedModel::new(vec![]);
         let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
-        agent.replace_context(
-            vec![
-                user("first"),
-                assistant("ok"),
-                user("second"),
-                assistant_tool(None, "noop", json!({})),
-                tool_results(&["done"]),
-            ],
-            None,
-        );
+        agent
+            .replace_context(
+                vec![
+                    user("first"),
+                    assistant("ok"),
+                    user("second"),
+                    assistant_tool(None, "noop", json!({})),
+                    tool_results(&["done"]),
+                ],
+                None,
+            )
+            .unwrap();
 
-        let dropped = agent.truncate_history(2);
+        let dropped = agent.truncate_history(2).unwrap();
         assert!(
             matches!(&dropped[0], Message::UserMessage { content } if matches!(&content[0], Content::Text { text } if text == "second"))
         );
@@ -1418,7 +1513,7 @@ mod tests {
             usage: None,
         }]);
         let mut resumed = Agent::new(resume_model, tools, Arc::new(NullEventSink));
-        resumed.replace_context(snapshot, None);
+        resumed.replace_context(snapshot, None).unwrap();
 
         // Continue by interacting with a follow-up user message (CLI would re-prompt);
         // history already has tool_results so a fresh user turn is the normal path.

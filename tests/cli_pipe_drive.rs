@@ -132,7 +132,7 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
     assert!(stdout.contains("archived:  false"), "{stdout}");
     assert!(stdout.contains("[archived]"), "{stdout}");
     let session = only_session(&env.dir);
-    assert_eq!(session["version"], 4);
+    assert_eq!(session["version"], myco::SESSION_FILE_VERSION);
     let time = chrono::DateTime::parse_from_rfc3339(
         session["threads"][0]["user_turn_timestamps"]["0"]
             .as_str()
@@ -148,6 +148,8 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
     )
     .await;
     assert!(replay.contains(&line), "{replay}");
+    assert!(!replay.contains("# Session"), "{replay}");
+    assert!(!replay.contains("Launch directory:"), "{replay}");
 }
 
 #[tokio::test]
@@ -335,7 +337,12 @@ async fn session_id_is_stamped_on_the_first_user_message() {
             .as_array()
             .expect("user message content")
             .iter()
-            .filter_map(|c| Some(c["Text"]["text"].as_str()?.to_string()))
+            .filter_map(|c| {
+                c["Text"]["text"]
+                    .as_str()
+                    .or_else(|| c["System"]["text"].as_str())
+                    .map(str::to_owned)
+            })
             .collect()
     };
 
@@ -349,6 +356,10 @@ async fn session_id_is_stamped_on_the_first_user_message() {
     assert!(first[0].starts_with("# Session"), "{first:?}");
     assert!(first[0].contains(&parent_id), "{first:?}");
     assert!(first[1].contains("parent-marker-alpha"), "{first:?}");
+    assert_eq!(
+        parent["threads"][0]["messages"][0]["UserMessage"]["content"][0]["System"]["kind"],
+        "session"
+    );
     // The first message only: later turns carry the user's words alone, so
     // one conversation states its session once.
     let later = parent["threads"][0]["messages"]
@@ -515,6 +526,11 @@ async fn automatic_compaction_resumes_once_without_inventing_user_input() {
         .join(format!("{}.history", session.id));
     let history = std::fs::read_to_string(history).unwrap();
     assert!(!history.contains("# Resumption"), "{history}");
+    let replay = run_myco(&env, &["--resume", &session.id], b"/quit\n").await;
+    assert!(replay.contains("finish task"), "{replay}");
+    assert!(replay.contains("continued task"), "{replay}");
+    assert!(!replay.contains("# Resumption"), "{replay}");
+    assert!(!replay.contains("# Compaction resume"), "{replay}");
 }
 
 #[tokio::test]

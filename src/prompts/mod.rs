@@ -145,8 +145,6 @@ pub fn model_stamp(model_key: &str) -> String {
     )
 }
 
-/// Heading of the block [`session_stamp`] builds, and the marker that tells a
-/// stamp apart from something a user typed.
 const SESSION_STAMP_HEADING: &str = "# Session";
 
 /// Where this agent is running, as a block for the **first user message** of a
@@ -206,13 +204,6 @@ pub fn thread_stamp(session_id: &str, thread_id: &str, started_at: DateTime<Utc>
         "{}- Thread id: `{thread_id}`. Use `session_history` with `session_id` and `thread_id` to read this thread or older threads.\n",
         session_stamp(session_id, started_at)
     )
-}
-
-/// Whether a user-message text block is a [`session_stamp`] rather than the
-/// user's own words. Session labels and search snippets read the first user
-/// message, and the stamp is myco's payload, not something anyone typed.
-pub fn is_session_stamp(text: &str) -> bool {
-    text.starts_with(SESSION_STAMP_HEADING)
 }
 
 /// Cap used when `config.toml` sets no `max_prelude_bytes`.
@@ -776,8 +767,7 @@ mod tests {
         assert!(stamp.contains(&format!("`{id}`")), "{stamp}");
         assert!(stamp.contains(&format!("--parent-session {id}")), "{stamp}");
         assert!(stamp.contains("`/home/user/myco`"), "{stamp}");
-        assert!(is_session_stamp(&stamp), "{stamp}");
-        assert!(!is_session_stamp("please compact the session"));
+        assert!(stamp.starts_with(SESSION_STAMP_HEADING), "{stamp}");
 
         // The rendered time is the session's start instant, whatever zone the
         // machine renders it in, and it says so — a session open for days must

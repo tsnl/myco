@@ -34,7 +34,8 @@ pub mod tui;
 pub(crate) mod test_support;
 
 pub use agent::{
-    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, ToolExecutor, TraceContext,
+    Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, RunOutcome, ToolExecutor,
+    TraceContext,
 };
 pub use chat::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
 pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};

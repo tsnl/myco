@@ -35,9 +35,10 @@ myco (interactive) / chat adapter
   construction; the child reaches remotes through its own host pool, its session is hidden
   (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
   supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
-  supervisor's prompt cache, and sessions are checkpointed mid-turn (after each user message and
-  completed tool round) so forks start from the freshest replayable snapshot — never between a
-  tool call and its result. A fork inherits the supervisor's stamped first message and stamps its
+  supervisor's prompt cache. Checkpoints include pending operations before execution and
+  completed observations before further work. A fork that inherits an unfinished tool batch
+  records unknown outcomes before generating; it never replays the parent's calls.
+  A fork inherits the supervisor's stamped first message and stamps its
   own id on the first message it adds, so the newest `# Session` block is the running session's.
   Remotes stay config/key-free hands.
 
@@ -58,6 +59,12 @@ A recorded tool result remains an observation from its original thread: a shell 
 may have changed since then. `/new` or switching to another session uses fresh tool
 ownership. Resuming saved history after process exit does not restore tools.
 
+State checkpoints fail closed: a save error stops further model/tool work. An interrupted
+tool batch is recovered with explicit unknown outcomes and a hidden runtime notice, since
+the calls may have taken effect before their results were saved. Inspect external state
+before retrying those actions. Stored histories remain readable for inspection, but
+malformed call/result pairs cannot be used as executable context.
+
 Use `session_history` to read saved threads without loading all of them into context:
 
 - `{"session_id":"…","action":"threads"}` lists threads, newest first.
@@ -65,10 +72,11 @@ Use `session_history` to read saved threads without loading all of them into con
 - `{"session_id":"…","thread_id":"…","action":"expand","index":12}` reads an original message.
 
 Omitting `thread_id` selects the active thread. Older threads are read-only.
-Session files use schema version 4, including archive status and per-user-turn acceptance
-times. Version 2 files load as one initial thread; versions 2 and 3 are written as
-version 4 on the next save. Older turns keep unknown timestamps. Older binaries
-reject version 4. Existing predecessor/successor session links
+Session files use schema version 5, including archive status, per-user-turn acceptance
+times, and structured system content. System parts carry model-visible runtime context
+without appearing in transcript replay. Formats 2 through 4 are accepted and upgraded
+on read; loading alone does not rewrite their files. Older turns keep unknown timestamps.
+Older binaries reject version 5. Existing predecessor/successor session links
 remain metadata; separate saved sessions are not automatically combined.
 
 `/archive` and `/restore` change a session's browsing visibility while retaining

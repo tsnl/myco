@@ -707,7 +707,7 @@ fn anthropic_image_source(source: String) -> AnthropicImageSource {
 /// (module invariant), so `Content::Thinking` yields `None`.
 fn answer_block(content: Content) -> Option<AnthropicContent> {
     match content {
-        Content::Text { text } => Some(AnthropicContent::Text {
+        Content::Text { text } | Content::System { text, .. } => Some(AnthropicContent::Text {
             text,
             cache_control: None,
         }),
@@ -869,6 +869,31 @@ mod tests {
             && id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn system_parts_reach_the_provider_in_text_and_image_messages_without_metadata() {
+        for with_image in [false, true] {
+            let mut content = vec![Content::System {
+                kind: "private_kind".into(),
+                text: "runtime notice".into(),
+                data: serde_json::json!({"private_metadata":true}),
+            }];
+            if with_image {
+                content.push(Content::Image {
+                    source: "data:image/png;base64,AAAA".into(),
+                });
+            }
+            content.push(Content::Text {
+                text: "human request".into(),
+            });
+            let input = [Message::UserMessage { content }];
+            let wire = serde_json::to_string(&convert_messages(&input).unwrap()).unwrap();
+            assert!(wire.contains("runtime notice"), "{wire}");
+            assert!(wire.contains("human request"), "{wire}");
+            assert!(!wire.contains("private_kind"), "{wire}");
+            assert!(!wire.contains("private_metadata"), "{wire}");
+        }
     }
 
     #[test]

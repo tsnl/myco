@@ -69,9 +69,9 @@ pub async fn run_compact_worker(
         "compact {}",
         &predecessor.id[..8.min(predecessor.id.len())]
     ));
-    if let Err(e) = worker_session.save() {
-        eprintln!("warning: could not save compact worker session: {e}");
-    }
+    worker_session.save().map_err(|error| {
+        CompactWorkerError::Failed(format!("could not save compact worker session: {error}"))
+    })?;
 
     // What the summary file holds before the worker runs, so a worker that never
     // writes one cannot have stale text compacted in (see `read_fresh_summary`).
@@ -101,12 +101,13 @@ pub async fn run_compact_worker(
     };
 
     let sink = Arc::new(NullEventSink);
+    let runtime = crate::SessionRuntime::new(
+        harness.clone(),
+        crate::session::ActiveSession::new(worker_session.clone()),
+    );
     let mut worker = Agent::with_context(
         model,
-        crate::SessionRuntime::new(
-            harness.clone(),
-            crate::session::ActiveSession::new(worker_session.clone()),
-        ),
+        runtime.clone(),
         sink,
         TraceContext {
             agent_id: worker_id,
@@ -121,16 +122,15 @@ pub async fn run_compact_worker(
     worker.set_retry_policy(catalog_model.backend.retry_policy());
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
+    super::wire_checkpoint(&mut worker, runtime.session());
 
     let prompt = compact_subagent_prompt(&predecessor.id, &predecessor.active_thread().id);
     let result =
         crate::chat::interact(&mut worker, vec![Content::Text { text: prompt }], cancel).await;
 
-    worker_session.active_thread_mut().messages = worker.history().to_vec();
-    worker_session.touch();
-    if let Err(e) = worker_session.save() {
-        eprintln!("warning: could not save compact worker session: {e}");
-    }
+    super::persist_session(&worker, runtime.session(), true).map_err(|error| {
+        CompactWorkerError::Failed(format!("could not save compact worker state: {error}"))
+    })?;
 
     match result {
         Ok(_) => {}

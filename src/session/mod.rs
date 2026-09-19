@@ -34,8 +34,8 @@ use uuid::Uuid;
 use crate::core::{atomically_write, myco_home, uuid_simple_hex};
 use crate::generative_model::{Message, TokenUsage};
 
-/// Written schema version; versions 2 and 3 are also accepted on read.
-pub const SESSION_FILE_VERSION: u32 = 4;
+/// Written schema version; versions 2 through 4 are upgraded on read.
+pub const SESSION_FILE_VERSION: u32 = 5;
 pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
@@ -272,8 +272,8 @@ impl ActiveSession {
         Ok(id)
     }
 
-    /// Persist messages + last usage when either changed (or `force`). A `None`
-    /// usage keeps the stored value rather than clearing it.
+    /// Persist the supplied context and usage. `None` explicitly invalidates
+    /// the old usage estimate, as after a rewind or context replacement.
     pub fn persist_messages(
         &self,
         messages: &[Message],
@@ -291,7 +291,24 @@ impl ActiveSession {
         last_usage: Option<TokenUsage>,
         force: bool,
     ) -> Result<(), String> {
-        self.persist_thread_messages_at(thread_id, messages, last_usage, force, None)
+        self.persist_thread_messages_at(thread_id, messages, last_usage, force, None, None)
+    }
+
+    pub fn persist_agent_state(
+        &self,
+        thread_id: &str,
+        state: &crate::agent::AgentState,
+        force: bool,
+        accepted: Option<(usize, DateTime<Utc>)>,
+    ) -> Result<(), String> {
+        self.persist_thread_messages_at(
+            thread_id,
+            state.history(),
+            state.last_usage(),
+            force,
+            accepted,
+            state.pending_operation(),
+        )
     }
 
     pub(crate) fn persist_thread_messages_at(
@@ -301,6 +318,7 @@ impl ActiveSession {
         last_usage: Option<TokenUsage>,
         force: bool,
         accepted: Option<(usize, DateTime<Utc>)>,
+        pending: Option<crate::agent::PendingOperation>,
     ) -> Result<(), String> {
         let mut session = self.lock();
         if session.active_thread().id != thread_id {
@@ -308,24 +326,28 @@ impl ActiveSession {
                 "thread {thread_id} is no longer active; refusing a stale checkpoint"
             ));
         }
-        let usage_changed =
-            last_usage.is_some() && last_usage != session.active_thread().last_usage;
-        if force || messages.len() != session.active_thread().messages.len() || usage_changed {
-            session.active_thread_mut().messages = messages.to_vec();
-            let times = &mut session.active_thread_mut().user_turn_timestamps;
-            times.retain(|&index, _| {
-                matches!(messages.get(index), Some(Message::UserMessage { .. }))
-            });
+        let usage_changed = last_usage != session.active_thread().last_usage;
+        if force
+            || messages != session.active_thread().messages
+            || usage_changed
+            || pending != session.active_thread().pending_operation
+        {
+            crate::agent::validate_checkpoint(messages, pending)
+                .map_err(|error| error.to_string())?;
+            let mut updated = session.clone();
+            updated.active_thread_mut().messages = messages.to_vec();
+            updated.active_thread_mut().pending_operation = pending;
+            let times = &mut updated.active_thread_mut().user_turn_timestamps;
+            times.retain(|&index, _| messages.get(index).is_some_and(Message::is_user_turn));
             if let Some((index, time)) = accepted
-                && matches!(messages.get(index), Some(Message::UserMessage { .. }))
+                && messages.get(index).is_some_and(Message::is_user_turn)
             {
                 times.entry(index).or_insert(time);
             }
-            if last_usage.is_some() {
-                session.active_thread_mut().last_usage = last_usage;
-            }
-            session.touch();
-            session.save()?;
+            updated.active_thread_mut().last_usage = last_usage;
+            updated.touch();
+            updated.save()?;
+            *session = updated;
         }
         Ok(())
     }
@@ -337,9 +359,11 @@ impl ActiveSession {
             return Ok(false);
         }
         if let Some(title) = auto_title_from_text(text) {
-            session.title = Some(title);
-            session.touch();
-            session.save()?;
+            let mut updated = session.clone();
+            updated.title = Some(title);
+            updated.touch();
+            updated.save()?;
+            *session = updated;
             return Ok(true);
         }
         Ok(false)
@@ -357,6 +381,10 @@ pub struct SessionWriter {
 
 impl SessionWriter {
     pub fn commit_thread(&self, thread: Thread) -> Result<(), String> {
+        crate::agent::validate_context(&thread.messages).map_err(|error| error.to_string())?;
+        if thread.pending_operation.is_some() {
+            return Err("cannot install a successor with an outstanding operation".into());
+        }
         let mut session = self.session.lock();
         if thread.predecessor_id.as_deref() != Some(&session.active_thread().id) {
             return Err("compaction predecessor is no longer the active thread".into());
@@ -433,6 +461,7 @@ impl Session {
         let thread = self.active_thread_mut();
         thread.messages = messages;
         thread.last_usage = usage;
+        thread.pending_operation = None;
         thread.user_turn_timestamps.clear();
     }
 
@@ -471,6 +500,7 @@ impl Session {
         child.parent_session_id = Some(self.id.clone());
         child.active_thread_mut().messages = self.active_thread().messages.clone();
         child.active_thread_mut().last_usage = self.active_thread().last_usage;
+        child.active_thread_mut().pending_operation = self.active_thread().pending_operation;
         child.active_thread_mut().user_turn_timestamps =
             self.active_thread().user_turn_timestamps.clone();
         child
@@ -513,17 +543,21 @@ impl Session {
     pub fn from_json(data: &[u8]) -> Result<Self, String> {
         let mut value: serde_json::Value =
             serde_json::from_slice(data).map_err(|e| e.to_string())?;
+        let legacy = matches!(value["version"].as_u64(), Some(2..=4));
         match value["version"].as_u64() {
             Some(2) => thread::upgrade_v2(&mut value)?,
-            Some(3) => value["version"] = serde_json::json!(SESSION_FILE_VERSION),
-            Some(4) => {}
+            Some(3 | 4) => value["version"] = serde_json::json!(SESSION_FILE_VERSION),
+            Some(5) => {}
             version => {
                 return Err(format!(
-                    "unsupported session version {version:?}; expected 2, 3 or {SESSION_FILE_VERSION}"
+                    "unsupported session version {version:?}; expected 2 through {SESSION_FILE_VERSION}"
                 ));
             }
         }
-        let session: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let mut session: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if legacy {
+            thread::upgrade_system_parts(&mut session.threads);
+        }
         if session.id.is_empty() {
             return Err("session has empty id".into());
         }
@@ -932,11 +966,7 @@ pub fn first_user_text_from_messages(messages: &[Message]) -> Option<String> {
             let text: String = content
                 .iter()
                 .filter_map(|c| match c {
-                    crate::generative_model::Content::Text { text }
-                        if !crate::prompts::is_session_stamp(text) =>
-                    {
-                        Some(text.as_str())
-                    }
+                    crate::generative_model::Content::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -1389,7 +1419,9 @@ mod tests {
     fn first_user_text_skips_the_session_stamp() {
         let messages = vec![Message::UserMessage {
             content: vec![
-                Content::Text {
+                Content::System {
+                    kind: "session".into(),
+                    data: serde_json::json!({}),
                     text: crate::prompts::session_stamp(
                         "aa00bb11cc22dd33ee44ff5566778899",
                         Utc::now(),
@@ -1465,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_messages_records_usage_and_none_keeps_last() {
+    fn context_persistence_records_equal_length_changes_and_invalidates_usage() {
         let _home = temp_home("session-persist");
 
         let usage = TokenUsage {
@@ -1488,14 +1520,18 @@ mod tests {
         );
 
         active
-            .persist_messages(&[user("hi"), user("more")], None, true)
+            .persist_messages(&[user("replaced")], None, false)
             .unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id)
                 .unwrap()
                 .active_thread()
                 .last_usage,
-            Some(usage)
+            None
+        );
+        assert_eq!(
+            active.snapshot().active_thread().messages,
+            vec![user("replaced")]
         );
     }
 

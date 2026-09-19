@@ -16,7 +16,8 @@ pub struct SessionTurnOutcome {
     pub rewound: Option<Vec<Content>>,
 }
 
-/// Submit already-expanded input. Nonfatal persistence failures reach `on_warning`.
+/// Submit already-expanded input. State persistence failures stop execution;
+/// nonfatal metadata/recovery failures reach `on_warning`.
 /// The caller keeps ownership of the agent, session lock, and cancellation source.
 pub async fn run_session_turn(
     agent: &mut Agent,
@@ -46,8 +47,10 @@ pub async fn resume_after_compaction(
     cancel: CancelToken,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) -> SessionTurnOutcome {
-    let input = vec![Content::Text {
+    let input = vec![Content::System {
+        kind: "continuation".into(),
         text: prompts::COMPACTION_RESUMPTION.into(),
+        data: serde_json::json!({"reason":"auto_compaction"}),
     }];
     run_turn(agent, runtime, input, false, cancel, None, on_warning).await
 }
@@ -67,13 +70,14 @@ async fn run_turn(
         writer = session.writer() => writer,
         _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
     };
-    runtime.bind_agent(agent);
-    let on_warning = std::sync::Arc::new(on_warning);
-    let checkpoint_warning = on_warning.clone();
+    if let Err(error) = runtime.bind_agent(agent) {
+        return SessionTurnOutcome {
+            result: Err(error),
+            rewound: None,
+        };
+    }
     let accepted = accepted_at.map(|time| (agent.history().len(), time));
-    wire_checkpoint_at(agent, session, accepted, move |warning| {
-        checkpoint_warning(warning)
-    });
+    wire_checkpoint_at(agent, session, accepted);
     if accepted_at.is_some() {
         if let Err(error) = auto_title(session, &input) {
             on_warning(&format!("could not auto-title session: {error}"));
@@ -84,9 +88,8 @@ async fn run_turn(
     }
     let result = super::interact(agent, input, cancel).await;
     if let Err(error) = persist_session(agent, session, true) {
-        on_warning(&format!("could not save session: {error}"));
         return SessionTurnOutcome {
-            result,
+            result: Err(AgentInteractionError::Checkpoint(error)),
             rewound: None,
         };
     }
@@ -100,7 +103,7 @@ async fn run_turn(
         }
     };
     if rewound.is_some() {
-        wire_checkpoint(agent, session, move |warning| on_warning(warning));
+        wire_checkpoint(agent, session);
     }
     SessionTurnOutcome { result, rewound }
 }
@@ -119,7 +122,19 @@ fn stamp_input(session: &ActiveSession, input: &mut Vec<Content>) {
     let text = session.with(|session| {
         prompts::thread_stamp(&session.id, &session.active_thread().id, session.created_at)
     });
-    input.insert(0, Content::Text { text });
+    input.insert(
+        0,
+        Content::System {
+            kind: "session".into(),
+            text,
+            data: session.with(|session| {
+                serde_json::json!({
+                    "session_id":session.id, "thread_id":session.active_thread().id,
+                    "created_at":session.created_at,
+                })
+            }),
+        },
+    );
 }
 
 fn rewind_rejected_input(
@@ -131,11 +146,7 @@ fn rewind_rejected_input(
     if !matches!(result, Err(error) if error.recovery() == Recovery::OmitLastMessage) {
         return Ok(None);
     }
-    let Some(index) = agent
-        .history()
-        .iter()
-        .rposition(|message| matches!(message, Message::UserMessage { .. }))
-    else {
+    let Some(index) = agent.history().iter().rposition(Message::is_user_turn) else {
         return Ok(None);
     };
     let Message::UserMessage { content } = &agent.history()[index] else {
@@ -152,43 +163,40 @@ fn rewind_rejected_input(
     successor.last_usage = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
-            if let Content::Text { text } = part
-                && prompts::is_session_stamp(text)
+            if let Content::System { kind, text, data } = part
+                && kind == "session"
             {
                 *text = prompts::thread_stamp(&original.id, &successor.id, original.created_at);
+                *data = serde_json::json!({
+                    "session_id": original.id, "thread_id": successor.id,
+                    "created_at": original.created_at,
+                });
             }
         }
     }
     // Commit the repaired context before installing it; the predecessor retains
     // every observation, including actions taken during the rejected turn.
     writer.commit_thread(successor)?;
-    runtime.bind_agent(agent);
+    runtime
+        .bind_agent(agent)
+        .map_err(|error| error.to_string())?;
     Ok(Some(dropped))
 }
 
-/// Save well-formed history boundaries; warnings do not interrupt a run.
-pub fn wire_checkpoint(
-    agent: &mut Agent,
-    session: &ActiveSession,
-    on_warning: impl Fn(&str) + Send + Sync + 'static,
-) {
-    wire_checkpoint_at(agent, session, None, on_warning);
+/// Persist every effect boundary. A failed save stops the agent before more work.
+pub fn wire_checkpoint(agent: &mut Agent, session: &ActiveSession) {
+    wire_checkpoint_at(agent, session, None);
 }
 
 fn wire_checkpoint_at(
     agent: &mut Agent,
     session: &ActiveSession,
     accepted: Option<(usize, DateTime<Utc>)>,
-    on_warning: impl Fn(&str) + Send + Sync + 'static,
 ) {
     let thread_id = session.with(|session| session.active_thread().id.clone());
     let session = session.clone();
-    agent.set_checkpoint(Some(Box::new(move |messages, usage| {
-        if let Err(error) =
-            session.persist_thread_messages_at(&thread_id, messages, usage, false, accepted)
-        {
-            on_warning(&format!("mid-turn session save failed: {error}"));
-        }
+    agent.set_checkpoint(Some(Box::new(move |state| {
+        session.persist_agent_state(&thread_id, state, false, accepted)
     })));
 }
 
@@ -199,10 +207,12 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
     if history.is_empty() && !session.snapshot().json_path().exists() {
         return Ok(());
     }
-    match agent.context().thread_id.as_deref() {
-        Some(id) => session.persist_thread_messages(id, history, agent.last_usage(), force),
-        None => session.persist_messages(history, agent.last_usage(), force),
-    }
+    let thread_id = agent
+        .context()
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| session.snapshot().active_thread().id.clone());
+    session.persist_agent_state(&thread_id, agent.state(), force, None)
 }
 
 // Forks inherit a parent's stamp and need their own; resumes keep the existing one.
@@ -257,6 +267,64 @@ mod tests {
     }
 
     #[test]
+    fn failed_input_save_stops_generation_and_preserves_input_for_the_live_runtime() {
+        let home = temp_home("input-save-failure");
+        let session = ActiveSession::new(Session::new("test"));
+        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }]);
+        let mut agent = agent(model.clone());
+        std::fs::write(home.path().join("session"), "blocks writes").unwrap();
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let outcome = executor.block_on(run_session_turn(
+            &mut agent,
+            &runtime,
+            vec![Content::Text {
+                text: "first accepted input".into(),
+            }],
+            false,
+            CancelToken::new(),
+            Utc::now(),
+            |_| {},
+        ));
+        assert!(matches!(
+            outcome.result,
+            Err(AgentInteractionError::Checkpoint(_))
+        ));
+        assert_eq!(model.remaining(), 1);
+        assert!(session.snapshot().active_thread().messages.is_empty());
+        assert!(session.snapshot().title.is_none());
+        std::fs::remove_file(home.path().join("session")).unwrap();
+        executor
+            .block_on(run_session_turn(
+                &mut agent,
+                &runtime,
+                vec![Content::Text {
+                    text: "continue after storage repair".into(),
+                }],
+                false,
+                CancelToken::new(),
+                Utc::now(),
+                |warning| panic!("{warning}"),
+            ))
+            .result
+            .unwrap();
+        let saved = Session::load(&session.snapshot().json_path()).unwrap();
+        let messages = &saved.active_thread().messages;
+        assert_eq!(messages.len(), 3);
+        assert!(
+            serde_json::to_string(&messages[0])
+                .unwrap()
+                .contains("first accepted input")
+        );
+        assert!(saved.active_thread().pending_operation.is_none());
+    }
+
+    #[test]
     fn user_turn_acceptance_times_survive_restart_and_context_forks() {
         let _home = temp_home("turn-timestamps");
         let session = ActiveSession::new(Session::new("test"));
@@ -298,9 +366,11 @@ mod tests {
             ScriptedModel::new(vec![])
                 .then_fail(GenerateError::RequestTooLargeError("oversized".into())),
         );
-        agent.replace_context(document.active_thread().messages.clone(), None);
+        agent
+            .replace_context(document.active_thread().messages.clone(), None)
+            .unwrap();
         let session = ActiveSession::new(document);
-        wire_checkpoint(&mut agent, &session, |warning| panic!("{warning}"));
+        wire_checkpoint(&mut agent, &session);
         let outcome = submit(&mut agent, &session, CancelToken::new());
         assert!(outcome.result.is_err());
         assert!(
@@ -375,7 +445,7 @@ mod tests {
         let session = ActiveSession::new(document);
         let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
         let mut agent = agent(ScriptedModel::new(vec![]));
-        runtime.bind_agent(&mut agent);
+        runtime.bind_agent(&mut agent).unwrap();
         std::fs::write(home.path().join("session"), "blocks writes").unwrap();
         let executor = tokio::runtime::Runtime::new().unwrap();
         let writer = executor.block_on(session.writer());
@@ -404,7 +474,7 @@ mod tests {
         assert_eq!(saved.title.as_deref(), Some("task"));
         assert!(
             matches!(&saved.active_thread().messages[0], Message::UserMessage { content }
-            if matches!(&content[0], Content::Text { text } if text.contains(&saved.id)))
+            if matches!(&content[0], Content::System { text, .. } if text.contains(&saved.id)))
         );
         assert_eq!(
             saved_messages(&session),
@@ -482,7 +552,7 @@ mod tests {
             );
             assert!(
                 matches!(&agent.history()[0], Message::UserMessage { content }
-                if matches!(&content[1], Content::Text { text } if text.contains("compacted goal")))
+                if matches!(&content[1], Content::System { text, .. } if text.contains("compacted goal")))
             );
         });
     }

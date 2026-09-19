@@ -659,10 +659,11 @@ async fn boot<S: EventSink + 'static>(
     agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
-    runtime.bind_agent(&mut agent);
-    // Mid-turn checkpoints: context forks and crash recovery see finished
-    // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
-    wire_checkpoint(&mut agent, &session, session_warning);
+    if let Err(error) = runtime.bind_agent(&mut agent) {
+        eprintln!("myco: cannot bind session: {error}");
+        std::process::exit(1);
+    }
+    wire_checkpoint(&mut agent, &session);
 
     (
         Boot {
@@ -1200,10 +1201,7 @@ impl ReplSession {
             _ = cancel.cancelled() => return false,
             writer = self.session.writer() => writer,
         };
-        if let Err(e) =
-            self.session
-                .persist_messages(self.agent.history(), self.agent.last_usage(), true)
-        {
+        if let Err(e) = persist_session(&self.agent, &self.session, true) {
             self.ui
                 .error_section(&format!("compact: failed to persist current session: {e}"));
             return false;
@@ -1251,8 +1249,12 @@ impl ReplSession {
             self.ui.error_section(&format!("compact: {error}"));
             return false;
         }
-        self.runtime.bind_agent(&mut self.agent);
-        wire_checkpoint(&mut self.agent, &self.session, session_warning);
+        if let Err(error) = self.runtime.bind_agent(&mut self.agent) {
+            self.ui
+                .error_section(&format!("cannot bind session: {error}"));
+            return false;
+        }
+        wire_checkpoint(&mut self.agent, &self.session);
 
         clear_screen();
         self.ui.compacted_banner(&outcome);
@@ -1359,11 +1361,10 @@ impl ReplSession {
                 .ui
                 .error_section(&format!("Unknown command: {head}  (try /help)")),
             MetaCommand::Session => {
-                let _ = self.session.persist_messages(
-                    self.agent.history(),
-                    self.agent.last_usage(),
-                    false,
-                );
+                if let Err(error) = persist_session(&self.agent, &self.session, false) {
+                    self.ui
+                        .error_section(&format!("could not save session: {error}"));
+                }
                 self.ui
                     .myco_section(&format_session_detail(&self.session.snapshot()));
             }
@@ -1409,11 +1410,10 @@ impl ReplSession {
                 let mut fresh = Session::new(self.catalog_model.spec.key.clone());
                 fresh.kind = snapshot.kind;
                 fresh.parent_session_id = snapshot.parent_session_id.clone();
-                if let Err(msg) = self.relock_session(&fresh.id) {
+                if let Err(msg) = self.install_session(&fresh) {
                     self.ui.error_section(&format!("new session failed: {msg}"));
                     return;
                 }
-                self.install_session(&fresh);
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
                 // (the Session: line carries the fresh id).
@@ -1425,11 +1425,10 @@ impl ReplSession {
                 self.save_before_switch();
                 match resolve_resume_session(arg) {
                     Ok(loaded) => {
-                        if let Err(msg) = self.relock_session(&loaded.id) {
+                        if let Err(msg) = self.install_session(&loaded) {
                             self.ui.error_section(&format!("resume failed: {msg}"));
                             return;
                         }
-                        self.install_session(&loaded);
                         self.ui.myco_section(&format!(
                             "resumed session={}  messages={}",
                             self.session.id(),
@@ -1542,14 +1541,26 @@ impl ReplSession {
 
     /// Make `loaded` the live session: swap it into the shared handle, reset
     /// agent history/usage, and reload readline history.
-    fn install_session(&mut self, loaded: &Session) {
+    fn install_session(&mut self, loaded: &Session) -> Result<(), String> {
+        myco::agent::validate_checkpoint(
+            &loaded.active_thread().messages,
+            loaded.active_thread().pending_operation,
+        )
+        .map_err(|error| error.to_string())?;
+        if !self.agent.state().is_idle() {
+            return Err("cannot switch sessions while an agent operation is outstanding".into());
+        }
+        self.relock_session(&loaded.id)?;
         self.session.replace(loaded.clone());
         if self.runtime.session_id() != loaded.id {
             self.runtime = myco::SessionRuntime::new(self.harness.clone(), self.session.clone());
         }
-        self.runtime.bind_agent(&mut self.agent);
-        wire_checkpoint(&mut self.agent, &self.session, session_warning);
+        self.runtime
+            .bind_agent(&mut self.agent)
+            .map_err(|error| error.to_string())?;
+        wire_checkpoint(&mut self.agent, &self.session);
         load_readline_history(&mut self.editor, &self.session);
+        Ok(())
     }
 }
 

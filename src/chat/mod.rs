@@ -19,18 +19,15 @@ pub async fn interact(
 ) -> Result<Vec<Content>, AgentInteractionError> {
     agent.append_input(Message::UserMessage {
         content: user_input,
-    });
+    })?;
     agent.run(cancel).await
 }
 
 /// Remove the latest user turn and its descendants after a size rejection.
 /// The earlier context remains a well-formed prefix; usage is invalidated.
 pub fn rewind_last_user_turn(agent: &mut Agent) -> Option<Vec<Content>> {
-    let index = agent
-        .history()
-        .iter()
-        .rposition(|message| matches!(message, Message::UserMessage { .. }))?;
-    match agent.truncate_history(index).remove(0) {
+    let index = agent.history().iter().rposition(Message::is_user_turn)?;
+    match agent.truncate_history(index).ok()?.remove(0) {
         Message::UserMessage { content } => Some(content),
         _ => unreachable!("index identifies a user message"),
     }

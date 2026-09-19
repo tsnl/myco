@@ -87,7 +87,7 @@ pub(super) fn text_of(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
+            Content::Text { text } | Content::System { text, .. } => Some(text.as_str()),
             Content::Image { .. } | Content::Thinking { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -122,7 +122,7 @@ pub(super) fn user_content_parts<P>(
         content
             .iter()
             .filter_map(|c| match c {
-                Content::Text { text: t } => Some(text(t)),
+                Content::Text { text: t } | Content::System { text: t, .. } => Some(text(t)),
                 Content::Image { source } => Some(image(source)),
                 Content::Thinking { .. } => None,
             })
@@ -136,7 +136,7 @@ pub(super) fn images_of(content: &[Content]) -> Vec<&str> {
         .iter()
         .filter_map(|c| match c {
             Content::Image { source } => Some(source.as_str()),
-            Content::Text { .. } | Content::Thinking { .. } => None,
+            Content::Text { .. } | Content::System { .. } | Content::Thinking { .. } => None,
         })
         .collect()
 }

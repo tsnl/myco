@@ -20,6 +20,10 @@ pub struct Thread {
     pub user_turn_timestamps: BTreeMap<usize, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<TokenUsage>,
+    /// Intent saved before external work. It is reconciled before model input
+    /// after restart; a pending tool batch must never be dispatched again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<crate::agent::PendingOperation>,
 }
 
 impl Thread {
@@ -31,6 +35,7 @@ impl Thread {
             messages: Vec::new(),
             user_turn_timestamps: BTreeMap::new(),
             last_usage: None,
+            pending_operation: None,
         }
     }
 }
@@ -49,11 +54,17 @@ pub(super) fn validate_threads(threads: &[Thread]) -> Result<(), String> {
     }
     let mut seen = HashSet::new();
     for thread in threads {
+        // Historical observations remain readable even if malformed. Execution
+        // validates full context; an explicit pending intent must be consistent.
+        if thread.pending_operation.is_some() {
+            crate::agent::validate_checkpoint(&thread.messages, thread.pending_operation)
+                .map_err(|error| format!("thread {}: {error}", thread.id))?;
+        }
         if thread.user_turn_timestamps.keys().any(|&index| {
-            !matches!(
-                thread.messages.get(index),
-                Some(Message::UserMessage { .. })
-            )
+            !thread
+                .messages
+                .get(index)
+                .is_some_and(Message::is_user_turn)
         }) {
             return Err("user turn timestamps must refer to user messages".into());
         }
@@ -103,10 +114,111 @@ pub(super) fn upgrade_v2(value: &mut serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Convert the runtime text shapes written by formats 2–4. Model-facing text
+/// and message positions stay identical; genuine submissions keep their times.
+pub(super) fn upgrade_system_parts(threads: &mut [Thread]) {
+    use crate::generative_model::{Content, TurnEndReason};
+    for thread in threads {
+        let mut truncated = false;
+        for (index, message) in thread.messages.iter_mut().enumerate() {
+            if let Message::UserMessage { content } = message {
+                let submitted = thread.user_turn_timestamps.contains_key(&index);
+                for part in content {
+                    let Content::Text { text } = part else {
+                        continue;
+                    };
+                    let kind = if text.starts_with("# Session\n\n- Session id: `")
+                        && text.contains("\n- Started: ")
+                    {
+                        "session"
+                    } else if index == 0
+                        && thread.predecessor_id.is_some()
+                        && text.starts_with("# Compaction resume\n\n")
+                    {
+                        "compaction"
+                    } else if !submitted
+                        && (text == crate::prompts::COMPACTION_RESUMPTION
+                            || (truncated && text == crate::agent::CONTINUE_PROMPT))
+                    {
+                        "continuation"
+                    } else {
+                        continue;
+                    };
+                    *part = Content::System {
+                        kind: kind.into(),
+                        text: text.clone(),
+                        data: serde_json::json!({"legacy":true}),
+                    };
+                }
+            }
+            truncated = matches!(
+                message,
+                Message::AssistantMessage {
+                    turn_end_reason: Some(TurnEndReason::MaxTokens),
+                    ..
+                }
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::session::Session;
     use crate::test_support::temp_dir;
+
+    #[test]
+    fn upgrading_runtime_text_preserves_model_text_and_real_submissions() {
+        use crate::generative_model::{Content, Message};
+        use crate::test_support::{assistant, user};
+        let dir = temp_dir("hidden-upgrade");
+        let path = dir.path().join("session.json");
+        let mut session = Session::new("test");
+        let stamp = crate::prompts::thread_stamp(
+            &session.id,
+            &session.active_thread().id,
+            session.created_at,
+        );
+        session.active_thread_mut().messages = vec![
+            Message::UserMessage {
+                content: vec![
+                    Content::Text {
+                        text: stamp.clone(),
+                    },
+                    Content::Text {
+                        text: "human task".into(),
+                    },
+                ],
+            },
+            assistant("done"),
+            user(crate::prompts::COMPACTION_RESUMPTION),
+            user(crate::prompts::COMPACTION_RESUMPTION),
+        ];
+        let accepted = chrono::Utc::now();
+        session
+            .active_thread_mut()
+            .user_turn_timestamps
+            .insert(3, accepted);
+        let mut json = serde_json::to_value(session).unwrap();
+        json["version"] = 4.into();
+        let original = serde_json::to_vec(&json).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let upgraded = Session::load(&path).unwrap();
+        let messages = &upgraded.active_thread().messages;
+        assert!(matches!(&messages[0], Message::UserMessage { content }
+            if matches!(&content[0], Content::System { text, kind, .. } if text == &stamp && kind == "session")));
+        assert!(!messages[2].is_user_turn());
+        assert!(messages[3].is_user_turn());
+        assert_eq!(upgraded.active_thread().user_turn_timestamps[&3], accepted);
+        assert_eq!(
+            crate::session::first_user_text_from_messages(messages).as_deref(),
+            Some("human task")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let encoded = serde_json::to_vec(&upgraded).unwrap();
+        let restored = Session::from_json(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+    }
 
     #[test]
     fn loading_v2_preserves_the_source_file_and_gives_the_initial_thread_a_stable_id() {
