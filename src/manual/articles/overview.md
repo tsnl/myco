@@ -141,7 +141,9 @@ context_window = 500_000
   wildcard (`*`/`?`) and negated (`!`) patterns are ignored. The alias `local`
   is reserved (skipped).
 - Remotes need `myco` on the **remote** PATH used by non-interactive SSH
-  (`~/.local/bin` and `~/.cargo/bin` are common).
+  (`~/.local/bin` and `~/.cargo/bin` are common). Verify with
+  `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`;
+  an interactive login can resolve a different binary than the host worker.
 - Missing files → local-only (safe default). There is no `default_host` setting; default is always `local`.
 
 ## Models & credentials (the catalog)
@@ -321,8 +323,7 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 ## Nested agents (the recipe)
 
 There is no subagent tool: a supervisor runs `myco` itself, on the **local host**, as an ordinary
-bash command. The system prompt carries the shape and the one hang that bites immediately; this is
-the working detail.
+bash command. The system prompt carries the short guidance; this is the working detail.
 
 **Live session** — for real back-and-forth:
 
@@ -338,9 +339,15 @@ the working detail.
    off automatically when piped.
 4. `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The child cancels its
    in-flight turn, returns to its prompt, and stays writable — use it when a child runs long or
-   goes down the wrong path, and keep driving the same session.
+   goes down the wrong path, and keep driving the same session. The signal reaches the entire
+   session process group. Other programs may exit on SIGINT; do not assume an SSH process or
+   shell will behave like the interactive myco child.
 5. `close` when done. Ask for terse summaries: the point of nesting is to spend the child's
    context instead of yours.
+
+**Task brief.** Give the child a bounded task, constraints, expected result, and whether it may
+delegate further. Ask for completion evidence (such as test results and a PR URL) or a specific
+blocker. Keep bulk output in files and return their paths with a concise summary.
 
 **One-shot** — for a single self-contained task, skip the live session: `myco -p "<task>"
 --parent-session <id>` runs one turn and exits. Stdout is the answer text alone (no headers to
@@ -350,6 +357,10 @@ but each pays full process startup, so prefer a live session for real back-and-f
 **live** bash session, append `</dev/null`: with a prompt argument `-p` still drains piped stdin
 as context, and a live session's open stdin never EOFs. One-shot `bash` runs are safe — their
 stdin is null.
+
+Exit 0 means the turn completed; turn failures exit 1 and cancellation exits 130. Check stderr
+for errors and the session id, then verify the answer and artifacts against the task. Answer
+length and a successful exit alone do not establish that the requested work is complete.
 
 **Context forking.** `--fork` seeds the child with your session's saved conversation instead of a
 blank context. Fork when the task needs what you already know (decisions so far, investigation,
@@ -361,15 +372,21 @@ is checkpointed mid-turn after each user message and completed tool round, so a 
 current user request and finished tool rounds — never tool calls still in flight, its own launch
 included; put anything newer in the first prompt line you write to it.
 
-The child's session is hidden (`kind: subagent`, parented to yours) in the shared
-`~/.myco/profiles/default/session/` store — read it later via `session_meta` get-by-id, or `list` with
-`include_hidden: true`.
+The child's session is hidden (`kind: subagent`, parented to yours) in the selected profile's
+`session/` store. Local children inherit `MYCO_PROFILE` and `MYCO_HOME`; preserve those selectors
+so they share the parent's session store. Read a child's session later via `session_meta`
+get-by-id, or `list` with `include_hidden: true`.
+
+**Timeouts.** `bash` `exec` waits up to 60 s by default (`timeout_ms`, max 30 min). Timeout or
+cancellation kills its process group. Raise the timeout for a longer finite command, or use
+`start` with the program in the foreground of that session. A `read` timeout only ends that
+output wait; the session remains available for later `read`, `write`, `signal`, or `close` calls.
 
 ## Agent workspace
 
-`~/.myco/profiles/default/workspace/` is the agents' own directory — free-form files maintained with
-the ordinary tools (no required format), persistent across sessions and shared by
-every agent on the machine. `workspace/prelude/` is the one special place: it holds
+`workspace/` under the selected profile root is the agents' own directory — free-form
+files maintained with the ordinary tools (no required format), persistent across sessions and shared by
+every agent using that profile. `workspace/prelude/` is the one special place: it holds
 the agent's prelude as maildir-style entries — one write-once `*.md` file each, never
 edited in place. Every visible entry is rendered, in filename order under a
 `[prelude entry <name>]` label, into the `# Prelude` section of every agent system
@@ -402,9 +419,10 @@ The rest of the workspace is listed, not quoted: a `# Workspace Files` section
 gives each visible file's path (relative to `workspace/`), the UTC day it last
 changed, and its title (first markdown heading, else first non-empty line). Hidden
 names, symlinks, `prelude/` itself, and binary titles are skipped; the walk and the
-rendered block are bounded (4 levels, 200 files, 8 KiB) with a marker when files
-are left out. The prompt's appended blocks run least to most volatile — project
-guidance, then the prelude, then this listing. Guidance leads because it changes
+rendered block are bounded (4 levels, 200 files, 8 KiB). A marker reports known omissions,
+but the listing is not exhaustive even without one: search the profile's `workspace/`
+when an expected note is missing. The prompt's appended blocks run least to most volatile —
+project guidance, then the prelude, then this listing. Guidance leads because it changes
 only when the repo's own file does, while agents are asked to record into the
 prelude eagerly; ordering it that way keeps a recorded finding from invalidating
 the cached guidance block for every agent that follows. The listing likewise uses
