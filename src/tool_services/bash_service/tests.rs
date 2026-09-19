@@ -103,12 +103,10 @@ fn bare_command_resolves_to_exec() {
     match action {
         Action::Exec {
             command,
-            cwd,
             timeout_ms,
             max_bytes,
         } => {
             assert_eq!(command, "echo hi");
-            assert_eq!(cwd, None);
             assert_eq!(timeout_ms, DEFAULT_EXEC_TIMEOUT_MS);
             assert_eq!(max_bytes, DEFAULT_MAX_BYTES);
         }
@@ -212,6 +210,15 @@ fn tool_description_states_actual_defaults() {
 }
 
 #[test]
+fn bash_schema_and_parser_reject_cwd() {
+    let spec = BashService::new().tool_specs().remove(0);
+    assert!(spec.input_schema["properties"].get("cwd").is_none());
+    let error =
+        serde_json::from_value::<Input>(json!({"command":"pwd", "cwd":"/tmp"})).unwrap_err();
+    assert!(error.to_string().contains("unknown field `cwd`"));
+}
+
+#[test]
 fn accepts_command_starting_with_cd() {
     for command in [
         "cd /tmp && ls",
@@ -229,9 +236,9 @@ fn accepts_command_starting_with_cd() {
 }
 
 #[test]
-fn command_nudges_match_only_leading_cd_or_ssh_words() {
-    assert!(command_nudge("cd /tmp && pwd").is_some());
-    assert!(command_nudge("  cd\t/tmp").is_some());
+fn command_nudges_match_only_leading_ssh_words() {
+    assert!(command_nudge("cd /tmp && pwd").is_none());
+    assert!(command_nudge("  cd\t/tmp").is_none());
     assert!(command_nudge("ssh devbox uname -a").is_some());
     assert!(command_nudge("ssh").is_some());
     for command in ["cdo thing", "ssh-add -l", "echo ssh devbox", "pwd"] {
@@ -240,62 +247,12 @@ fn command_nudges_match_only_leading_cd_or_ssh_words() {
 }
 
 #[tokio::test]
-async fn detected_commands_run_and_return_routing_nudges() {
-    for (command, output, field) in [
-        ("cd / && printf command-ran", "command-ran", "`cwd`"),
-        ("ssh -V", "OpenSSH", "`host`"),
-    ] {
-        let result = dispatch_json(harness(), json!({"command": command})).await;
-
-        assert!(!result.is_error, "command={command:?}: {result:?}");
-        let text = result_text(&result);
-        assert!(text.contains(output), "command={command:?}: {text}");
-        assert!(
-            text.contains("Nudge:") && text.contains(field),
-            "command={command:?}: {text}"
-        );
-    }
-}
-
-#[test]
-fn rejects_cwd_on_non_spawn_actions() {
-    for action in ["write", "read", "signal", "close", "list"] {
-        let input: Input = serde_json::from_value(json!({
-            "action": action,
-            "cwd": "/tmp",
-        }))
-        .unwrap();
-        let err = resolve_action(&input).unwrap_err();
-        assert!(
-            err.contains("`cwd` is only valid"),
-            "action={action} err={err}"
-        );
-    }
-}
-
-#[test]
-fn cwd_resolves_on_exec_and_start() {
-    let input: Input = serde_json::from_value(json!({
-        "command": "pwd",
-        "cwd": " /tmp ",
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Exec { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/tmp")),
-        _ => panic!("expected Exec"),
-    }
-
-    let input: Input = serde_json::from_value(json!({
-        "action": "start",
-        "session_id": "s",
-        "command": "bash --noprofile --norc",
-        "cwd": "/var",
-    }))
-    .unwrap();
-    match resolve_action(&input).unwrap() {
-        Action::Start { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/var")),
-        _ => panic!("expected Start"),
-    }
+async fn direct_ssh_runs_and_returns_a_host_routing_nudge() {
+    let result = dispatch_json(harness(), json!({"command": "ssh -V"})).await;
+    assert!(!result.is_error, "{result:?}");
+    let text = result_text(&result);
+    assert!(text.contains("OpenSSH"), "{text}");
+    assert!(text.contains("Nudge:") && text.contains("`host`"), "{text}");
 }
 
 /// Shared timeout-resolution contract for one action shape: the default
@@ -957,20 +914,20 @@ async fn stderr_captured() {
 }
 
 #[tokio::test]
-async fn exec_respects_cwd() {
+async fn exec_changes_directory_with_cd_without_a_nudge() {
     let dir = temp_dir("cwd");
     let dir_str = dir.path().to_string_lossy().into_owned();
 
     let result = dispatch_json(
         harness(),
         json!({
-            "command": "pwd",
-            "cwd": &dir_str,
+            "command": format!("cd '{}' && pwd", dir_str),
         }),
     )
     .await;
     assert!(!result.is_error, "{}", result_text(&result));
     let text = result_text(&result);
+    assert!(!text.contains("Nudge:"), "{text}");
     // macOS /var is often a symlink to /private/var; compare canonical paths.
     let expected = std::fs::canonicalize(dir.path()).unwrap();
     let expected_s = expected.to_string_lossy();
@@ -1030,7 +987,7 @@ async fn dispatch_rejects_session_timeout_above_max() {
 }
 
 #[tokio::test]
-async fn session_start_respects_cwd() {
+async fn session_retains_directory_set_by_start_command() {
     let harness = harness();
     let id = unique_id("cwd");
     let dir = temp_dir("sess-cwd");
@@ -1041,8 +998,7 @@ async fn session_start_respects_cwd() {
         json!({
             "action": "start",
             "session_id": id,
-            "command": "bash --noprofile --norc",
-            "cwd": &dir_str,
+            "command": format!("cd '{}' && bash --noprofile --norc", dir_str),
             "idle_ms": 200,
             "timeout_ms": 1000,
         }),

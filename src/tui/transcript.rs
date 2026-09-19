@@ -528,8 +528,8 @@ mod tests {
         assert!(rendered.contains(&format!("{SECTION_RULE}\nASSISTANT\n\nhi there\n")));
         assert!(!rendered.contains("TOOL\n"));
         assert!(!rendered.contains("RESPONSE\n"));
-        // Pretty-printed tool JSON as an ASSISTANT paragraph (blank line after text).
-        assert!(rendered.contains("hi there\n\nbash({\n  \"command\": \"echo hi\"\n})\n"));
+        // Tool commands are ASSISTANT paragraphs, separated from text.
+        assert!(rendered.contains("hi there\n\nbash()\n$ echo hi\n"));
         // Blank line before section rule/header.
         assert!(rendered.contains("\n\n────────────────────────────────"));
         // Tool results silent (no tool-use id leaks).
@@ -573,8 +573,8 @@ mod tests {
         )));
         assert!(rendered.contains("Thinking: step a\nstep b\n\nanswer\n"));
         // Tools are paragraphs inside ASSISTANT, blank-separated.
-        assert!(rendered.contains("answer\n\nbash({\n  \"command\": \"echo 1\"\n})\n"));
-        assert!(rendered.contains(")\n\nbash({\n  \"command\": \"echo 2\"\n})\n"));
+        assert!(rendered.contains("answer\n\nbash()\n$ echo 1\n"));
+        assert!(rendered.contains("echo 1\n\nbash()\n$ echo 2\n"));
         assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
@@ -683,6 +683,22 @@ mod tests {
         };
         assert_eq!(render("one line"), render("one line\n"));
         assert!(render("one line").ends_with("one line\n"));
+    }
+
+    #[test]
+    fn bash_commands_display_in_full_with_line_breaks_and_options() {
+        let command = format!(
+            "cd '/a very long path/{}' && cat <<'EOF'\nhello \"world\"\nEOF",
+            "x".repeat(100)
+        );
+        let input = json!({"command":command, "host":"devbox", "timeout_ms":5000});
+        let original = input.clone();
+        let rendered = render_tool_invocation("bash", &input, Palette::plain());
+        assert_eq!(
+            rendered,
+            format!("bash({{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}})\n$ {command}\n")
+        );
+        assert_eq!(input, original);
     }
 
     #[test]
@@ -816,8 +832,8 @@ mod tests {
             &json!({"command": "echo hi"}),
             Palette::colored(true),
         );
-        assert!(rendered.starts_with("\x1b[0;1;33mbash\x1b[0m({"));
-        assert!(rendered.contains("\"command\": \"echo hi\""));
+        assert!(rendered.starts_with("\x1b[0;1;33mbash\x1b[0m()"));
+        assert!(rendered.contains("$ echo hi\n"));
         assert!(!rendered.contains("echo hi\x1b"));
     }
 

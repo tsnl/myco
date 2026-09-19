@@ -147,6 +147,10 @@ attachments. No console mirror is written in print mode.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
+- Bash commands appear in full below their tool options, prefixed with `$`, with
+  line breaks and quoting preserved. Host, session, and timeout options remain
+  visible above the command. Live output, history replay, and the console mirror
+  use the same format. Other tool strings use bounded JSON previews.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
   when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
   delimiters *removed* (the styling conveys them), `#` headers keep their

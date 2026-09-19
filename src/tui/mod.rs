@@ -302,8 +302,8 @@ pub(crate) fn section_open_events(
     events.push(TuiEvent::Text("\n".into()));
 }
 
-/// `name(<pretty json>)` with only the name styled — the tool paragraph
-/// inside ASSISTANT, shared by the live producer and history replay.
+/// Tool arguments shared by live output and replay. Bash commands appear
+/// verbatim below their options; other strings use bounded JSON previews.
 pub(crate) fn tool_invocation_events(
     events: &mut Vec<TuiEvent>,
     name: &str,
@@ -312,14 +312,29 @@ pub(crate) fn tool_invocation_events(
     events.push(TuiEvent::Style(Style::WARNING));
     events.push(TuiEvent::Text(name.to_string()));
     events.push(TuiEvent::Style(Style::RESET));
-    let display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
+    let command = (name == "bash")
+        .then(|| input.get("command")?.as_str())
+        .flatten();
+    let mut display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
+    if command.is_some() {
+        display.as_object_mut().unwrap().remove("command");
+    }
     let body = match &display {
+        serde_json::Value::Object(fields) if command.is_some() && fields.is_empty() => {
+            String::new()
+        }
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
             serde_json::to_string_pretty(&display).unwrap_or_else(|_| display.to_string())
         }
         other => other.to_string(),
     };
     events.push(TuiEvent::Text(format!("({body})\n")));
+    if let Some(command) = command {
+        events.push(TuiEvent::Text(format!("$ {command}")));
+        if !command.ends_with('\n') {
+            events.push(TuiEvent::Text("\n".into()));
+        }
+    }
 }
 
 /// Section/paragraph layout state shared by the live producer and history
@@ -1119,12 +1134,12 @@ mod tests {
         finish(&producer);
         let plain = encode_plain(&terminal.events());
         assert!(
-            plain.contains("running now\n\nbash({\n  \"command\": \"echo hi\"\n})\n\nand after\n"),
+            plain.contains("running now\n\nbash()\n$ echo hi\n\nand after\n"),
             "{plain:?}"
         );
-        // Only the tool name is styled (bold yellow), the JSON body is plain.
+        // Only the tool name is styled (bold yellow).
         let ansi = encode_ansi(&terminal.events(), true);
-        assert!(ansi.contains("\x1b[0;1;33mbash\x1b[0m({"), "{ansi:?}");
+        assert!(ansi.contains("\x1b[0;1;33mbash\x1b[0m()"), "{ansi:?}");
     }
 
     #[test]
