@@ -229,15 +229,27 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
-**Auto-compaction** is per model, because the trigger is a share of *that*
-model's window: `auto_compact_at = 0.8` compacts as soon as a turn's prompt
-reaches 80% of `context_window`, running exactly what `/compact` runs and
-switching the REPL to the successor. It must be greater than 0 and less than 1;
-anything else is a startup error. Unset (the default) means no automatic
-compaction — `/compact` still works. The check runs after each turn against the
-provider's own reported prompt size, so it acts on a measured number rather than
-an estimate; if an automatic compaction fails, it is not retried for the rest of
-that session (the note says so, and `/compact` remains available).
+**Auto-compaction** runs in the interactive REPL and is configured per model:
+`auto_compact_at = 0.8` triggers when a successful user turn's reported prompt
+size reaches 80% of `context_window`. The system prompt tells the agent this
+threshold. Unset (the default) disables automatic compaction; the fraction must
+be greater than 0 and less than 1.
+
+It runs the same compaction as `/compact`, creating a successor thread in the
+same session with live tools intact. After success, a `# Resumption` message
+asks the agent to continue the pending task from the summary and retained
+context, or stop if the task is complete or needs user input. This message is
+stored in the conversation without a human acceptance timestamp or readline
+entry. It is a continuation, not startup: completed actions should not be
+repeated. Opening a saved session with `--resume` or `/resume` still waits for
+user input and does not restore live tools from a previous process.
+
+Each user submission can trigger one automatic compact-and-resume cycle; the
+continuation does not trigger another, even if retained context remains above
+the threshold. Failed or cancelled turns do not trigger compaction. If automatic
+compaction fails or is cancelled, it is disabled until another session is
+opened; `/compact` remains available. Manual `/compact` waits for the next user
+input. Print mode (`-p`) and compaction workers do not run auto-compaction.
 
 **Retry** is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:

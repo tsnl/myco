@@ -10,7 +10,8 @@ use std::{
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use myco::chat::{
-    CompactWorkerError, persist_session, run_compact_worker, run_session_turn, wire_checkpoint,
+    CompactWorkerError, SessionTurnOutcome, persist_session, resume_after_compaction,
+    run_compact_worker, run_session_turn, wire_checkpoint,
 };
 use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
@@ -649,6 +650,7 @@ async fn boot<S: EventSink + 'static>(
         &harness,
         args.debug_dump_api_requests,
         args.effort,
+        args.print.is_none(),
     );
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
     let mut agent = Agent::new(model, runtime.clone(), sink.clone());
@@ -770,6 +772,7 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
+    interactive: bool,
 ) -> Arc<dyn generative_model::GenerativeModel> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
@@ -795,6 +798,13 @@ fn build_model(
             SYSTEM_PROMPT_PROLOGUE.to_string(),
             prompts::agent_prompt_epilogue(),
             prompts::model_stamp(&catalog_model.spec.key),
+            prompts::auto_compact_notice(
+                catalog_model
+                    .spec
+                    .auto_compact_at_tokens
+                    .filter(|_| interactive),
+                catalog_model.spec.context_window_tokens,
+            ),
         ]
         .join("\n"),
         backend_config,
@@ -983,7 +993,9 @@ impl ReplSession {
             }
             if let Some(cmd) = parse_meta(&input) {
                 if matches!(cmd, MetaCommand::Compact) {
-                    self.run_compact().await;
+                    let cancel = self.turn_cancel.arm();
+                    self.run_compact(cancel).await;
+                    self.turn_cancel.disarm();
                 } else {
                     self.handle_meta(cmd);
                 }
@@ -1123,11 +1135,29 @@ impl ReplSession {
             &self.runtime,
             content,
             std::mem::take(&mut self.forked),
-            cancel,
+            cancel.clone(),
             accepted_at,
             session_warning,
         )
         .await;
+        let succeeded = outcome.result.is_ok();
+        self.show_turn_outcome(outcome);
+
+        if succeeded && !cancel.is_cancelled() && self.maybe_auto_compact(cancel.clone()).await {
+            self.ui.note("resuming after automatic compaction …");
+            let outcome =
+                resume_after_compaction(&mut self.agent, &self.runtime, cancel, session_warning)
+                    .await;
+            self.show_turn_outcome(outcome);
+        }
+        self.turn_cancel.disarm();
+
+        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
+            eprintln!("warning: could not save history: {e}");
+        }
+    }
+
+    fn show_turn_outcome(&self, outcome: SessionTurnOutcome) {
         match outcome.result {
             Ok(_) => self.ui.blank_line(),
             Err(myco::AgentInteractionError::Cancelled) => self.ui.cancelled(),
@@ -1139,7 +1169,7 @@ impl ReplSession {
                 let mut message = e.to_string();
                 if let Some(dropped) = outcome.rewound {
                     message.push_str(&format!(
-                        "\n\nThe last user turn was removed from active context so the session \
+                        "\n\nThe last input was removed from active context so the session \
                          can continue{}. Its recorded actions remain in the predecessor thread.",
                         describe_dropped_images(&dropped)
                     ));
@@ -1148,16 +1178,6 @@ impl ReplSession {
                 self.ui.blank_line();
             }
         }
-
-        self.turn_cancel.disarm();
-
-        if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
-            eprintln!("warning: could not save history: {e}");
-        }
-
-        // After persisting, so a compaction that switches sessions inherits a
-        // saved predecessor.
-        self.maybe_auto_compact().await;
     }
 }
 
@@ -1167,9 +1187,12 @@ impl ReplSession {
 
 impl ReplSession {
     /// Commit a successor thread without changing the session or its tools.
-    /// Failure disables automatic compaction until the next session.
-    async fn run_compact(&mut self) -> bool {
-        let writer = self.session.writer().await;
+    async fn run_compact(&mut self, cancel: myco::CancelToken) -> bool {
+        let writer = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            writer = self.session.writer() => writer,
+        };
         if let Err(e) =
             self.session
                 .persist_messages(self.agent.history(), self.agent.last_usage(), true)
@@ -1193,16 +1216,17 @@ impl ReplSession {
             predecessor.active_thread().id
         ));
 
-        // Ctrl-C during compaction cancels the worker turn like any user turn.
-        let cancel = self.turn_cancel.arm();
         let result = run_compact_worker(
             &predecessor,
             &self.catalog_model,
             self.harness.clone(),
-            cancel,
+            cancel.clone(),
         )
         .await;
-        self.turn_cancel.disarm();
+        if cancel.is_cancelled() {
+            self.ui.note("compact: cancelled (session unchanged)");
+            return false;
+        }
 
         let (successor, outcome) = match result {
             Ok(v) => v,
@@ -1228,42 +1252,36 @@ impl ReplSession {
         true
     }
 
-    /// Compact without being asked once the prompt reaches the model's
-    /// `auto_compact_at` share of its context window.
-    ///
-    /// Checked *after* a turn, against `last_usage`: that is the provider's own
-    /// count for the request just sent, so the trigger uses a measured prompt
-    /// size rather than a guess at the next one. The successor starts from a
-    /// summary, so its usage falls far below the threshold and this cannot
-    /// re-fire on the following turn.
-    async fn maybe_auto_compact(&mut self) {
+    async fn maybe_auto_compact(&mut self, cancel: myco::CancelToken) -> bool {
         let Some(threshold) = self.catalog_model.spec.auto_compact_at_tokens else {
-            return;
+            return false;
         };
         if self.auto_compact_failed {
-            return;
+            return false;
         }
         // No usage means nothing measured to act on: a resumed session before
         // its first turn, or a turn that failed before the provider reported.
         let Some(usage) = self.agent.last_usage() else {
-            return;
+            return false;
         };
         let used = usage.context_tokens();
         if used < threshold {
-            return;
+            return false;
         }
 
         self.ui.note(&format!(
             "auto-compacting: prompt reached {used} tokens of {} (threshold {threshold}) …",
             self.agent.context_window_tokens()
         ));
-        if !self.run_compact().await {
+        if !self.run_compact(cancel).await {
             self.auto_compact_failed = true;
             self.ui.note(
                 "auto-compact disabled for this session after the failure above; \
                  run /compact to retry",
             );
+            return false;
         }
+        true
     }
 }
 
@@ -1432,6 +1450,7 @@ impl ReplSession {
                             &self.harness,
                             self.debug_dump_api_requests,
                             self.effort,
+                            true,
                         );
                         self.agent.set_model(model);
                         self.agent.set_context_window_tokens(

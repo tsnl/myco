@@ -9,6 +9,30 @@ use std::path::Path;
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 
+pub const COMPACTION_RESUMPTION: &str = "# Resumption\n\n\
+    Automatic compaction has replaced the earlier context with a summary and recent messages. \
+    This is a continuation of the same session, not startup or a new user request. \
+    Live tools, including bash sessions, remain available. Continue the user's pending task \
+    from the summary and retained context without repeating completed actions. \
+    If the task is already complete or needs user input, report that and stop.";
+
+pub fn auto_compact_notice(threshold: Option<u64>, context_window: u64) -> String {
+    let Some(threshold) = threshold else {
+        return String::new();
+    };
+    let percent = threshold as f64 * 100.0 / context_window as f64;
+    format!(
+        "# Automatic compaction\n\n\
+         After a successful user turn, a reported prompt size of {threshold} tokens \
+         ({percent}% of the {context_window}-token context window) triggers the same \
+         compaction as `/compact`. It creates a new thread within this session and keeps \
+         live tools running. A `# Resumption` message then asks you to continue. \
+         This automatic continuation does not itself trigger another compaction. \
+         If compaction fails or is cancelled, automatic compaction is disabled until \
+         another session is opened."
+    )
+}
+
 /// Epilogue appended to every agent system prompt.
 pub const DEFAULT_AGENT_PROMPT_EPILOGUE: &str = concat!(
     r#"
