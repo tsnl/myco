@@ -148,7 +148,12 @@ attachments. No console mirror is written in print mode.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
 - Bash commands appear in full below their tool options, prefixed with `$`, with
-  line breaks and quoting preserved. Host, session, and timeout options remain
+  line breaks, indentation, and quoting preserved. Text sent to a running Bash
+  session appears in full under `stdin:`, prefixed with `>`. Long lines wrap at
+  the `--wrap` width; `↪` marks a display continuation, while source lines are
+  indented by two spaces. Long paths and other unbroken arguments also wrap.
+  `--wrap off` and piped output add no wrapping. Control characters other than
+  tabs and newlines appear as escapes. Host, session, and timeout options remain
   visible above the command. Live output, history replay, and the console mirror
   use the same format. Other tool strings use bounded JSON previews.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
