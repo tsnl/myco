@@ -4,8 +4,8 @@
 //! that emulate it and never shipped the newer Responses API (llama.cpp,
 //! Ollama, vLLM, LM Studio, DeepSeek, Groq, Together, …).
 //!
-//! Ref: https://platform.openai.com/docs/api-reference/chat/create
-//! Streaming: https://platform.openai.com/docs/api-reference/chat-streaming
+//! Ref: <https://platform.openai.com/docs/api-reference/chat/create>
+//! Streaming: <https://platform.openai.com/docs/api-reference/chat-streaming>
 //!
 //! Three dialect choices worth knowing:
 //!

@@ -110,12 +110,12 @@ impl HostController {
     }
 
     /// Create a remote/subprocess controller. The worker is **not** started until
-    /// the first [`call`].
+    /// the first [`Self::call`].
     pub fn new(config: HostConfig, max_image_base64_bytes: u64) -> Arc<Self> {
         Self::with_timeout(config, 10, max_image_base64_bytes)
     }
 
-    /// Like [`new`] with an explicit connect timeout (`0` disables it) and the
+    /// Like [`Self::new`] with an explicit connect timeout (`0` disables it) and the
     /// image cap the remote is spawned with — advertised before connecting, so
     /// it must match the `--max-image-base64-bytes` in `config.command`.
     pub fn with_timeout(
@@ -192,7 +192,7 @@ impl HostController {
     ///
     /// **Subprocess:** cancel is forwarded to the worker before this waiter is
     /// abandoned. Connect happens on first use; concurrent callers only
-    /// serialize briefly in [`submit`].
+    /// serialize briefly while submitting the request.
     pub async fn call(
         &self,
         agent_id: uuid::Uuid,

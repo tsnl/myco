@@ -3,6 +3,10 @@
 [![Crates.io](https://img.shields.io/crates/v/myco.svg)](https://crates.io/crates/myco)
 [![CI](https://github.com/tsnl/myco/actions/workflows/ci.yml/badge.svg)](https://github.com/tsnl/myco/actions/workflows/ci.yml)
 
+[User guide & manual](https://tsnl.github.io/myco/) ·
+[Build with Myco](https://tsnl.github.io/myco/developers/) ·
+[Rust API reference](https://tsnl.github.io/myco/developers/reference.html)
+
 A minimalist coding agent that works across your machines over SSH.
 
 Run `myco` on your laptop. It edits files, runs shells, and searches code on
@@ -70,6 +74,8 @@ non-interactive SSH. Runtime details: `myco --help overview`.
 ## Develop
 
 New to the codebase? Start with the [guided tour](TOUR.md).
+The [Myco Book](https://tsnl.github.io/myco/) covers daily use and library reuse;
+see [contributing to the docs](docs/src/contributing.md) to build it locally.
 
 ```bash
 cargo test --locked --lib

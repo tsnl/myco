@@ -1,9 +1,9 @@
 //! OpenAI Responses API backend (also used by xAI / Grok and OpenRouter gateways).
 //!
-//! Ref: https://platform.openai.com/docs/api-reference/responses
-//! Streaming: https://platform.openai.com/docs/guides/streaming-responses?api-mode=responses
-//! xAI: https://docs.x.ai/docs/guides/function-calling
-//! OpenRouter: https://openrouter.ai/docs/api/api-reference/responses/create-responses
+//! Ref: <https://platform.openai.com/docs/api-reference/responses>
+//! Streaming: <https://platform.openai.com/docs/guides/streaming-responses?api-mode=responses>
+//! xAI: <https://docs.x.ai/docs/guides/function-calling>
+//! OpenRouter: <https://openrouter.ai/docs/api/api-reference/responses/create-responses>
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

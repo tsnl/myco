@@ -1,5 +1,26 @@
 //! Drive model context through generation and tool calls at replayable boundaries.
 //! Callers supply tool execution, event sinks, context, and persistence callbacks.
+//!
+//! # Embedding
+//!
+//! Construct [`Agent`] with a [`GenerativeModel`], [`ToolExecutor`], and [`EventSink`].
+//! Supply input with [`Agent::append_input`] or install history with
+//! [`Agent::replace_context`], then await [`Agent::run`]. The crate does not read
+//! Myco configuration or create sessions, prompts, hosts, or terminal output.
+//!
+//! # Ownership and persistence
+//!
+//! The executor owns live resources independently of agent history. Calls within
+//! a round run concurrently; results are recorded in call order. Checkpoints
+//! expose replayable intermediate histories. Persist final history after `run`
+//! returns as well: an assistant-only final answer does not emit a checkpoint.
+//!
+//! Cancel a clone of the run's [`CancelToken`] and await the run future to let
+//! cleanup finish. Aborting the task bypasses that cooperative completion path.
+//! [`EventSink`] provides live observations, not a complete durable event log.
+//!
+//! See the [agent guide](https://tsnl.github.io/myco/developers/agents.html) and
+//! run `cargo run -p myco-agent --example headless` for an offline model/tool round.
 
 use std::sync::Arc;
 
@@ -18,7 +39,11 @@ pub const DEFAULT_MAX_TRUNCATED_RESUMES: u32 = 3;
 
 /// Capabilities available to this execution. Ownership and routing belong to the caller.
 pub trait ToolExecutor: Send + Sync {
+    /// Schemas to pass into the model's configuration. Changing the executor
+    /// does not update schemas on a model that was already constructed.
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec>;
+    /// Execute a call, validating its input and returning failures as tool results.
+    /// Calls in a round may overlap. Observe cancellation and clean up owned work.
     fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult>;
 }
 
@@ -93,6 +118,7 @@ pub enum AgentEvent {
 
 /// Consumer of [`AgentEvent`]s (CLI, TUI, metrics, …).
 pub trait EventSink: Send + Sync {
+    /// Observe an event synchronously. Avoid blocking the execution task.
     fn emit(&self, event: AgentEvent);
 }
 
@@ -113,6 +139,10 @@ impl EventSink for NullEventSink {
 /// the conversation before the turn completes. Not called between an assistant
 /// tool_use message and its results — that prefix is rejected by providers, so
 /// it must never be the snapshot a context fork inherits.
+///
+/// This callback is synchronous and cannot report save errors to the agent.
+/// Final assistant-only output is not a checkpoint; save [`Agent::history`]
+/// again after [`Agent::run`] returns, including when it returns an error.
 pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
 
 /// How long a cancelled tool dispatch may keep running to do its own
@@ -128,6 +158,11 @@ const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
      and do not acknowledge this message.";
 
+/// A headless model/tool loop over caller-supplied context and capabilities.
+///
+/// Resource lifetime belongs to [`ToolExecutor`]; persistence belongs to the
+/// caller. The context-window setting is informational and does not enforce a
+/// token limit or perform automatic compaction.
 pub struct Agent {
     retry_policy: RetryPolicy,
     model: Arc<dyn GenerativeModel>,
@@ -175,6 +210,8 @@ impl Agent {
         }
     }
 
+    /// Replace dispatch capabilities without rebuilding the model's tool catalog.
+    /// Keep both in sync when adding or removing advertised tools.
     pub fn set_tools(&mut self, tools: Arc<dyn ToolExecutor>) {
         self.tools = tools;
     }
@@ -199,6 +236,7 @@ impl Agent {
     }
 
     /// Replace model context and its usage estimate without changing live tool state.
+    /// The caller must supply a replayable history. This does not emit a checkpoint.
     pub fn replace_context(&mut self, history: Vec<Message>, usage: Option<TokenUsage>) {
         self.history = history;
         self.last_usage = usage;
@@ -252,6 +290,11 @@ impl Agent {
 
     /// Drive the existing model context to completion. The caller supplies input separately.
     /// The supplied tool executor determines the lifetime of live resources.
+    ///
+    /// Returns answer content from the final generation; intervening responses
+    /// and tool rounds remain in [`Self::history`]. Emits [`AgentEvent::TurnFinished`]
+    /// on success, error, or cooperative cancellation. Persist history after this
+    /// returns rather than relying only on mid-turn checkpoints.
     pub async fn run(
         &mut self,
         cancel: CancelToken,

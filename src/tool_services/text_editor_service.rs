@@ -13,7 +13,7 @@ const MAX_VIEW_BYTES: u64 = 256 * 1024;
 /// Tracks content fingerprints of files the agent has read so mutations fail if the file changed
 /// on disk outside the tool (or was never read).
 ///
-/// Cf https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool
+/// Cf <https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool>
 #[derive(Default)]
 pub struct TextEditorService {
     /// Read fingerprints partitioned by session runtime owner.
@@ -493,14 +493,14 @@ pub enum Command {
 /// Wire / JSON-Schema shape for the text-editor tool: one flat object with all fields.
 ///
 /// Anthropic requires `input_schema.type == "object"`. Schemars emits that for this struct.
-/// Per-command required fields stay `Option` here; [`TextEditorService::execute`] validates
+/// Per-command required fields stay `Option` here; the tool's dispatch validates
 /// them in its match arms, naming any missing field.
 ///
 /// ```json
 /// { "command": "view", "path": "primes.py" }
 /// ```
 ///
-/// See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool
+/// See: <https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool>
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
