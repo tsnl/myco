@@ -443,6 +443,42 @@ fn configure_compact(env: &PipeEnv, server: &test_utils::StubHttpServer, enabled
 }
 
 #[tokio::test]
+async fn prelude_changes_are_checkpointed_between_cli_tool_rounds() {
+    let env = pipe_env("prelude-updates");
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool(
+            "prelude",
+            serde_json::json!({"action": "add", "text": "new build command"}),
+            100,
+        ),
+        model_answer("recorded", 100),
+        model_answer("continued", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, false);
+    let stdout = run_myco(&env, &[], b"record a fact\n/effort high\ncontinue\n/quit\n").await;
+    assert!(stdout.contains("continued"), "{stdout}");
+    assert_eq!(server.connections(), 3, "{stdout}");
+    let saved = only_session(&env.dir);
+    let thread = &saved["threads"][0];
+    let messages = thread["messages"].as_array().unwrap();
+    let results = &messages[2]["ToolResults"]["tool_use_results"];
+    assert!(
+        results.to_string().contains("[myco: Prelude changes]"),
+        "{results}"
+    );
+    assert!(results.to_string().contains("- added:"), "{results}");
+    assert_eq!(
+        serde_json::to_string(messages)
+            .unwrap()
+            .matches("Prelude changes")
+            .count(),
+        1
+    );
+    assert_eq!(thread["user_turn_timestamps"].as_object().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn automatic_compaction_resumes_once_without_inventing_user_input() {
     let env = pipe_env("auto-resume");
     let session = compact_test_session(&env);

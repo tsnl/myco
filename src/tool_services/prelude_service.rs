@@ -36,8 +36,10 @@ Actions (`action` is required):
   `max_prelude_bytes`. The `# Prelude` in your prompt is a snapshot from model build time;
   `list` is the current state — check it before curating.
 
-Edits reach the *next* built agent prompt (session start, model switch, every nested
-agent and worker spawn) — your current conversation keeps its snapshot.
+Running agents scan for changes before each model step, including after tool results.
+A small notice lists added, modified, and removed files; read changed files on the local
+host as needed, or use action=list for the full live state. The system prompt keeps its
+snapshot, and newly built models receive the full current prelude.
 "#;
 
 /// Local tool over the prelude directory; carries the resolved `max_prelude_bytes`

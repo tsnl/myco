@@ -645,7 +645,7 @@ async fn boot<S: EventSink + 'static>(
     )
     .await;
 
-    let model = build_model(
+    let (model, prelude) = build_model(
         &catalog_model,
         &harness,
         args.debug_dump_api_requests,
@@ -654,6 +654,7 @@ async fn boot<S: EventSink + 'static>(
     );
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
     let mut agent = Agent::new(model, runtime.clone(), sink.clone());
+    agent.set_context_refresh(Some(myco::session_runtime::prelude_refresh(prelude)));
     agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
@@ -773,7 +774,10 @@ fn build_model(
     debug_dump_api_requests: bool,
     effort: Effort,
     interactive: bool,
-) -> Arc<dyn generative_model::GenerativeModel> {
+) -> (
+    Arc<dyn generative_model::GenerativeModel>,
+    Vec<myco::prelude::PreludeEntry>,
+) {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
         BackendConfig::Anthropic(c) => {
@@ -791,12 +795,13 @@ fn build_model(
         }
     }
 
-    generative_model::new(GenerativeModelConfig {
+    let (epilogue, prelude) = prompts::agent_prompt_epilogue();
+    let model = generative_model::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs(),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
-            prompts::agent_prompt_epilogue(),
+            epilogue,
             prompts::model_stamp(&catalog_model.spec.key),
             prompts::auto_compact_notice(
                 catalog_model
@@ -812,7 +817,8 @@ fn build_model(
     .unwrap_or_else(|e| {
         eprintln!("Failed to create model: {e}");
         std::process::exit(1);
-    })
+    });
+    (model, prelude)
 }
 
 /// Ctrl-L handler: when the input buffer is empty, submit an empty line and
@@ -1445,7 +1451,7 @@ impl ReplSession {
                         .myco_section(&format!("effort={}  (unchanged)", self.effort)),
                     Ok(next) => {
                         self.effort = next;
-                        let model = build_model(
+                        let (model, prelude) = build_model(
                             &self.catalog_model,
                             &self.harness,
                             self.debug_dump_api_requests,
@@ -1453,6 +1459,9 @@ impl ReplSession {
                             true,
                         );
                         self.agent.set_model(model);
+                        self.agent.set_context_refresh(Some(
+                            myco::session_runtime::prelude_refresh(prelude),
+                        ));
                         self.agent.set_context_window_tokens(
                             self.catalog_model.spec.context_window_tokens,
                         );

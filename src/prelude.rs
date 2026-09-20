@@ -60,22 +60,78 @@ pub fn entries(dir: &Path) -> Vec<PreludeEntry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<PreludeEntry> = read
+    let mut out: Vec<_> = read
         .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.to_string();
-            if !is_entry_name(&name) || !entry.path().is_file() {
-                return None;
-            }
-            let text = std::fs::read_to_string(entry.path())
-                .ok()?
-                .trim()
-                .to_string();
-            (!text.is_empty()).then_some(PreludeEntry { name, text })
-        })
+        .filter_map(|entry| read_entry(entry).ok().flatten())
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// A failed scan must not be mistaken for removed entries by a running agent.
+pub(crate) fn scan(dir: &Path) -> std::io::Result<Vec<PreludeEntry>> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        if let Some(entry) = read_entry(entry?)? {
+            out.push(entry);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn read_entry(entry: std::fs::DirEntry) -> std::io::Result<Option<PreludeEntry>> {
+    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        return Ok(None);
+    };
+    if !is_entry_name(&name) {
+        return Ok(None);
+    }
+    let read = || -> std::io::Result<Option<PreludeEntry>> {
+        if !std::fs::metadata(entry.path())?.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(entry.path())?.trim().to_string();
+        Ok((!text.is_empty()).then_some(PreludeEntry { name, text }))
+    };
+    match read() {
+        // A concurrent replacement may remove a file after read_dir.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        result => result,
+    }
+}
+
+pub(crate) fn change_notice(before: &[PreludeEntry], after: &[PreludeEntry]) -> Option<String> {
+    let before: std::collections::BTreeMap<_, _> =
+        before.iter().map(|e| (&e.name, &e.text)).collect();
+    let after: std::collections::BTreeMap<_, _> =
+        after.iter().map(|e| (&e.name, &e.text)).collect();
+    let names: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+    let mut changes = String::new();
+    for name in names {
+        let kind = match (before.get(name), after.get(name)) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "removed",
+            (Some(a), Some(b)) if a != b => "modified",
+            _ => continue,
+        };
+        changes.push_str(&format!("- {kind}: {name}\n"));
+    }
+    (!changes.is_empty()).then(|| {
+        format!(
+            "\n\n[myco: Prelude changes]\n\
+             The prelude has changed since the snapshot in your context. Files under the \
+             profile's workspace/prelude/:\n{changes}\n\
+             Read added or modified files on the local host as needed, or use prelude action=list \
+             for the full current prelude. Removed entries no longer apply; current entries \
+             supersede the old snapshot."
+        )
+    })
 }
 
 /// The prelude as it reads in a prompt (and in `prelude` action=list): each entry
@@ -206,6 +262,58 @@ mod tests {
 
     /// For tests about storage mechanics rather than the size cap.
     const NO_CAP: usize = usize::MAX;
+
+    #[test]
+    fn change_notices_compare_visible_contents_and_name_additions_edits_and_removals() {
+        let temp = crate::test_support::temp_dir("prelude-changes");
+        let dir = temp.path();
+        std::fs::write(dir.join("edited.md"), "old").unwrap();
+        std::fs::write(dir.join("removed.md"), "gone").unwrap();
+        std::fs::write(dir.join("unchanged.md"), "keep").unwrap();
+        let before = scan(dir).unwrap();
+        std::fs::write(dir.join("edited.md"), "new").unwrap();
+        std::fs::remove_file(dir.join("removed.md")).unwrap();
+        std::fs::write(dir.join("added.md"), "added contents").unwrap();
+        std::fs::write(dir.join("unchanged.md"), " keep\n").unwrap();
+        std::fs::write(dir.join(".tmp-hidden.md"), "not published").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not an entry").unwrap();
+        std::fs::write(dir.join("empty.md"), " \n").unwrap();
+        std::fs::create_dir(dir.join("directory.md")).unwrap();
+        let after = scan(dir).unwrap();
+        let notice = change_notice(&before, &after).unwrap();
+        assert!(
+            notice.contains("- added: added.md\n- modified: edited.md\n- removed: removed.md\n"),
+            "{notice}"
+        );
+        for excluded in [
+            "unchanged.md",
+            "hidden.md",
+            "notes.txt",
+            "empty.md",
+            "directory.md",
+            "added contents",
+        ] {
+            assert!(!notice.contains(excluded), "{notice}");
+        }
+        assert!(change_notice(&after, &after).is_none());
+        assert!(
+            change_notice(&after, &[])
+                .unwrap()
+                .contains("removed: edited.md")
+        );
+    }
+
+    #[test]
+    fn failed_scans_do_not_report_an_empty_prelude() {
+        let temp = crate::test_support::temp_dir("prelude-scan-failure");
+        let dir = temp.path();
+        assert!(scan(&dir.join("missing")).unwrap().is_empty());
+        std::fs::write(dir.join("valid.md"), "known").unwrap();
+        std::fs::write(dir.join("invalid.md"), [0xff]).unwrap();
+        assert!(scan(dir).is_err());
+        assert_eq!(entries(dir).len(), 1);
+        assert!(scan(&dir.join("valid.md")).is_err());
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

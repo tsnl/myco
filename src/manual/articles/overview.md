@@ -399,6 +399,22 @@ edited in place. Every visible entry is rendered, in filename order under a
 `[prelude entry <name>]` label, into the `# Prelude` section of every agent system
 prompt, read at model build time (session start, model switch, worker spawn).
 
+Running agents scan the selected profile's prelude before each model step, including
+between tool rounds in a long turn. When visible entry contents change, myco appends
+a small `[myco: Prelude changes]` note listing added, modified, and removed filenames
+to the latest user input or tool result and checkpoints it before the next request.
+The agent can read changed files on the local host or use `prelude` action=list;
+current entries supersede the prompt snapshot, and removed entries no longer apply.
+This covers edits from other sessions as well as the agent's own prelude tool calls.
+The system prompt stays fixed so its cached prefix remains reusable.
+
+Scanning happens at model-step boundaries: it does not interrupt an in-flight request
+or tool call, and an idle session picks up changes when it next runs. Hidden temporary
+files, non-Markdown files, and empty entries are ignored. Failed scans keep the last
+known snapshot and are retried at the next step. If rewind or compaction drops a
+notice, or the agent moves to another thread after receiving updates, the next step
+asks it to reload the full live prelude.
+
 The root-only `prelude` tool (local in-process worker, like `session_meta`) is the
 edit path: `add` a new entry, `replace` an entry (the replacement lands as a new
 file before the old id is dropped), `remove` one, or `list` the live state. The

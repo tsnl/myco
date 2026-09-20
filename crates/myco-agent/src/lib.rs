@@ -115,6 +115,13 @@ impl EventSink for NullEventSink {
 /// it must never be the snapshot a context fork inherits.
 pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
 
+/// Read external context before a generation step. A returned note is appended
+/// to the latest input (user message or tool result) and checkpointed before
+/// generation. Retries reuse that same context. Callbacks must not consume an
+/// update until their future completes, since cancellation can drop the future.
+pub type ContextRefresh =
+    Box<dyn Fn(&TraceContext, &[Message]) -> Async<Option<String>> + Send + Sync>;
+
 /// How long a cancelled tool dispatch may keep running to do its own
 /// cleanup (process-group kill, buffer drain) before the agent abandons it
 /// and records a synthetic cancelled result.
@@ -144,6 +151,7 @@ pub struct Agent {
     /// active model's `max_truncated_resumes`.
     max_truncated_resumes: u32,
     checkpoint: Option<HistoryCheckpoint>,
+    context_refresh: Option<ContextRefresh>,
 }
 
 impl Agent {
@@ -172,6 +180,7 @@ impl Agent {
             context_window_tokens: 200_000,
             max_truncated_resumes: DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
+            context_refresh: None,
         }
     }
 
@@ -186,6 +195,10 @@ impl Agent {
     /// Install the mid-turn history checkpoint (see [`HistoryCheckpoint`]).
     pub fn set_checkpoint(&mut self, checkpoint: Option<HistoryCheckpoint>) {
         self.checkpoint = checkpoint;
+    }
+
+    pub fn set_context_refresh(&mut self, refresh: Option<ContextRefresh>) {
+        self.context_refresh = refresh;
     }
 
     fn emit_checkpoint(&self) {
@@ -270,6 +283,7 @@ impl Agent {
         let mut output_tokens = 0;
         let mut truncations = 0;
         loop {
+            self.refresh_context(&cancel).await?;
             let output = generation::generate(self, cancel.clone()).await?;
             self.record_usage(output.usage, &mut output_tokens);
             let answer = answer_content(&output.content);
@@ -285,6 +299,34 @@ impl Agent {
                 return Ok(answer);
             }
         }
+    }
+
+    async fn refresh_context(&mut self, cancel: &CancelToken) -> Result<(), AgentInteractionError> {
+        let Some(refresh) = &self.context_refresh else {
+            return Ok(());
+        };
+        let note = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AgentInteractionError::Cancelled),
+            note = refresh(&self.context, &self.history) => note,
+        };
+        let Some(text) = note else {
+            return Ok(());
+        };
+        let content = Content::Text { text };
+        // Keep notices inside the current input so rewind and compaction still
+        // count actual user turns, and tool calls keep their matching results.
+        match self.history.last_mut() {
+            Some(Message::UserMessage { content: input }) => input.push(content),
+            Some(Message::ToolResults { tool_use_results }) if !tool_use_results.is_empty() => {
+                tool_use_results.last_mut().unwrap().content.push(content);
+            }
+            _ => self.history.push(Message::UserMessage {
+                content: vec![content],
+            }),
+        }
+        self.emit_checkpoint();
+        Ok(())
     }
 
     fn record_usage(&mut self, usage: Option<TokenUsage>, output_tokens: &mut u64) {
@@ -438,6 +480,63 @@ mod tests {
 
     #[derive(Default)]
     struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    #[tokio::test]
+    async fn cancelling_context_refresh_preserves_the_update_for_the_next_run() {
+        let started = CancelToken::new();
+        let release = CancelToken::new();
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(
+            model.clone(),
+            TestTools::new(vec![]),
+            Arc::new(NullEventSink),
+        );
+        agent.replace_context(vec![user("task")], None);
+        agent.set_context_refresh(Some(Box::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |_, _| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.cancel();
+                    release.cancelled().await;
+                    Some("updated context".into())
+                })
+            }
+        })));
+        let cancel = CancelToken::new();
+        let (outcome, ()) = tokio::join!(agent.run(cancel.clone()), async {
+            started.cancelled().await;
+            cancel.cancel();
+        });
+        assert!(matches!(outcome, Err(AgentInteractionError::Cancelled)));
+        assert_eq!(model.remaining(), 1);
+        assert_eq!(
+            serde_json::to_value(agent.history()).unwrap(),
+            serde_json::to_value([user("task")]).unwrap()
+        );
+
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        agent.set_checkpoint(Some(Box::new({
+            let saved = saved.clone();
+            move |history, _| *saved.lock().unwrap() = history.to_vec()
+        })));
+        release.cancel();
+        agent.run(CancelToken::new()).await.unwrap();
+        assert_eq!(model.remaining(), 0);
+        let snapshot = saved.lock().unwrap();
+        assert!(
+            matches!(snapshot.as_slice(), [Message::UserMessage { content }]
+            if matches!(content.last(), Some(Content::Text { text }) if text == "updated context"))
+        );
+        assert_eq!(agent.history().len(), 2);
+    }
 
     impl EventSink for EventLog {
         fn emit(&self, event: AgentEvent) {

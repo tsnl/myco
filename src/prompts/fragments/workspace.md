@@ -14,8 +14,12 @@ file per entry, edited only through the `prelude` tool (add / replace / remove
 under its `[prelude entry …]` label, into the `# Prelude` section of every
 agent system prompt (root, nested agents, workers). The prelude is read when an
 agent's model is built (session start, model switch, worker spawn), so the
-`# Prelude` above is a snapshot: edits apply from the next agent's prompt, and
-`prelude` action=list shows the live state.
+`# Prelude` above is a snapshot. Before each model step, myco scans the live
+prelude and attaches a small `[myco: Prelude changes]` note listing added,
+modified, and removed files when it changes, including during a tool loop.
+Read changed files on the local host as needed; `prelude` action=list shows the live state
+in full. Current entries supersede the snapshot; removed
+entries no longer apply. The system prompt itself stays fixed.
 
 Write-once entries are what make concurrent agents safe: adds cannot collide,
 and two agents replacing the same entry leave two candidate entries — a
