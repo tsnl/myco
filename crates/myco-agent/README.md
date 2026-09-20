@@ -8,6 +8,11 @@ session binding, resource lifetime, and persistence.
 run concurrently, while their recorded results retain call order. Cancellation
 leaves matched tool-call/result pairs at checkpoint boundaries.
 
+An optional `BeforeGenerationNotice` callback supplies a pending runtime notice before
+each generation step. Its text is attached to the latest user input or tool result
+and checkpointed before generation. The system prompt stays fixed; retries reuse
+the same input, and cancellation can interrupt polling for a notice.
+
 Run `cargo test -p myco-agent` for the standalone execution and cancellation tests.
 
 The [agent guide](https://tsnl.github.io/myco/developers/agents.html) covers

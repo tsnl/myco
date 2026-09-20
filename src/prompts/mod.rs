@@ -286,8 +286,15 @@ fn human_bytes(n: usize) -> String {
 /// of the rest of the workspace, when present. Read at model build time —
 /// session start, model switch, each worker spawn — so a running agent's prompt
 /// never changes mid-conversation and the cached conversation prefix stays valid.
-pub fn agent_prompt_epilogue() -> String {
-    epilogue_with(crate::core::myco_home().ok(), std::env::current_dir().ok())
+/// Returns the exact prelude snapshot used to seed live change notifications.
+pub fn agent_prompt_epilogue() -> (String, Vec<crate::prelude::PreludeEntry>) {
+    let home = crate::core::myco_home().ok();
+    let prelude = home
+        .as_ref()
+        .map(|home| crate::prelude::entries(&home.join("workspace/prelude")))
+        .unwrap_or_default();
+    let prompt = epilogue_with(home, std::env::current_dir().ok(), &prelude);
+    (prompt, prelude)
 }
 
 /// Whether the prelude on disk is over the `max_prelude_bytes` cap. Startup
@@ -329,20 +336,6 @@ fn project_guidance(dir: &std::path::Path) -> Option<(String, String)> {
     None
 }
 
-/// The prelude as it goes into a prompt: every entry, whole. `None` when
-/// there is nothing recorded.
-///
-/// Renders whatever is on disk. `max_prelude_bytes` is enforced where it can
-/// still be acted on — the `prelude` tool refuses an oversized edit, startup
-/// refuses an oversized directory — so by the time a prompt is built the
-/// invariant holds. The one way past both gates is another process growing the
-/// prelude mid-session; rendering that in full keeps the failure visible, and
-/// the next startup reports it.
-fn rendered_prelude(dir: &std::path::Path) -> Option<String> {
-    let entries = crate::prelude::entries(dir);
-    (!entries.is_empty()).then(|| crate::prelude::rendered_body(&entries))
-}
-
 /// Truncate to `max` bytes on a char boundary, appending `marker` when cut.
 /// Returns whether anything was cut, so callers can report it.
 fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
@@ -372,7 +365,11 @@ fn cap_bytes(text: &mut String, max: usize, marker: &str) -> bool {
 /// Hence the prelude sits *after* project guidance: recording a finding must
 /// not invalidate the cached guidance block (up to `MAX_GUIDANCE_BYTES`) for
 /// every agent that follows.
-fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
+fn epilogue_with(
+    home: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    prelude: &[crate::prelude::PreludeEntry],
+) -> String {
     let mut prompt = DEFAULT_AGENT_PROMPT_EPILOGUE.to_string();
     if let Some(home) = home.as_deref() {
         prompt.push_str(&manual_section(&crate::manual::dir(home)));
@@ -388,14 +385,13 @@ fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBu
             "\n---\n\n# Project guidance ({name})\n\n{guidance}\n"
         ));
     }
-    let prelude = workspace
-        .as_deref()
-        .and_then(|ws| rendered_prelude(&ws.join("prelude")));
-    if let Some(prelude) = prelude {
+    if !prelude.is_empty() {
+        let prelude = crate::prelude::rendered_body(prelude);
         prompt.push_str(&format!(
             "\n---\n\n# Prelude\n\n(entries under the profile's `workspace/prelude/`, a snapshot from when \
              this agent's model was built — edit with the `prelude` tool; action=list shows the \
-             live state)\n\n{prelude}\n"
+             live state; `[myco: Prelude changes]` notices announce later updates as described \
+             in Workspace & prelude)\n\n{prelude}\n"
         ));
     }
     if let Some(listing) = workspace.as_deref().and_then(workspace_listing) {
@@ -589,6 +585,14 @@ fn clean_title(title: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::test_support::{TempDir, temp_dir};
+
+    fn epilogue_with(home: Option<std::path::PathBuf>, cwd: Option<std::path::PathBuf>) -> String {
+        let prelude = home
+            .as_ref()
+            .map(|home| crate::prelude::entries(&home.join("workspace/prelude")))
+            .unwrap_or_default();
+        super::epilogue_with(home, cwd, &prelude)
+    }
 
     /// Temp home-shaped dir with `workspace/prelude/` created — the layout the
     /// prelude/workspace fixtures build on. Panic-safe cleanup via [`TempDir`].
@@ -914,7 +918,7 @@ mod tests {
         );
 
         // Rendering is unaffected by the cap: the body comes back whole.
-        let rendered = rendered_prelude(&prelude_dir).expect("entries render");
+        let rendered = crate::prelude::rendered_body(&crate::prelude::entries(&prelude_dir));
         assert_eq!(
             rendered,
             format!("[prelude entry 20260101T0000-aaaa.md]\n{body}")
