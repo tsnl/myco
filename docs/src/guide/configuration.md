@@ -69,7 +69,7 @@ gateway's corresponding value rather than merging individual fields.
 | --- | --- |
 | `max_output_tokens` | Output budget per model request; default 8192 |
 | `max_truncated_resumes` | Consecutive continuations after output truncation; default 3, `0` disables |
-| `auto_compact_at` | Optional fraction of the context window; interactive auto-compaction only |
+| `auto_compact_at` | Optional fraction of the context window; automatic compaction threshold |
 | `max_image_base64_bytes` | Per-image uploaded base64 limit; default 5 MiB |
 | `attach_timeout_secs` | Remote connection timeout; default 10, `0` disables |
 

@@ -645,9 +645,10 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
             c.debug_dump_api_requests = false;
         }
     }
+    let (epilogue, prelude) = crate::prompts::agent_prompt_epilogue();
     let model = generative_model::new(GenerativeModelConfig {
         model: catalog.spec.clone(), tools: harness.tool_specs(), backend_config: catalog.backend.clone(),
-        system_prompt: format!("You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.", crate::prompts::agent_prompt_epilogue(), crate::prompts::model_stamp(&job.model), crate::prompts::auto_compact_notice(catalog.spec.auto_compact_at_tokens, catalog.spec.context_window_tokens), job.output.join("workspace").display()),
+        system_prompt: format!("You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.", epilogue, crate::prompts::model_stamp(&job.model), crate::prompts::auto_compact_notice(catalog.spec.auto_compact_at_tokens, catalog.spec.context_window_tokens), job.output.join("workspace").display()),
     }).map_err(|error| error.to_string())?;
     let recorder = Recorder::new(
         job.max_requests,
@@ -656,6 +657,9 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     );
     let model = with_images(recorder.wrap(model, false), image_store);
     let mut agent = Agent::new(model.clone(), runtime.clone(), recorder.clone());
+    agent.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
+        prelude,
+    )));
     agent.set_retry_policy(catalog.backend.retry_policy());
     agent.set_context_window_tokens(catalog.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog.spec.max_truncated_resumes);

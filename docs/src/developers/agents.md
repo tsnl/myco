@@ -92,12 +92,12 @@ period, then supplies cancelled results for unfinished calls. This preserves
 tool-call/result pairing. Forcefully aborting the Tokio task bypasses this
 cooperative completion path.
 
-An `EventSink` receives text/thinking deltas, tool starts, failure/retry notices,
+An `EventSink` receives text/thinking deltas, tool starts and outcomes, failure/retry notices,
 and `TurnFinished`. `TraceContext` attributes events to an agent and optional
 session/thread labels. The sink is synchronous, so avoid blocking I/O in `emit`.
 `TurnFinished` is emitted after `run` completes on success, error, or cooperative
 cancellation; inspect the returned result to determine which occurred.
 
-Events currently omit tool results and are not a durable replay format.
-Use complete history and executor-owned observations when you need those data.
+Tool outcomes include the returned result and factual process status. Events
+are not a durable replay format; preserve complete history for replay.
 For Myco's existing persistent composition, see [application architecture](architecture.md).
