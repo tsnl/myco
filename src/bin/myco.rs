@@ -13,7 +13,7 @@ use myco::chat::{
     ModelCompactor, SessionRunner, SessionTurnOutcome, WorkflowEvent, persist_session,
 };
 use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
+    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, ModelCatalog,
 };
 use myco::host::HostWorker;
 use myco::session::{
@@ -60,6 +60,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/hosts",
     "/resume",
     "/effort",
+    "/model",
     "/title",
     "/compact",
     "/archive",
@@ -638,8 +639,13 @@ async fn boot<S: EventSink + 'static>(
         &harness,
         args.debug_dump_api_requests,
         args.effort,
-    );
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("myco: {error}");
+        std::process::exit(1);
+    });
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
+    runtime.set_max_image_base64_bytes(catalog_model.spec.max_image_base64_bytes);
     let mut agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
     agent
         .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
@@ -723,6 +729,12 @@ async fn run_interactive(args: Args) {
     let wrap = effective_wrap_width(app_config.wrap_max);
     let ctrl_l = Arc::new(AtomicBool::new(false));
     let mut editor = build_editor(ctrl_l.clone());
+    editor.helper_mut().unwrap().model_keys = app_config
+        .models
+        .keys()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
 
     load_readline_history(&mut editor, &active_session);
 
@@ -771,6 +783,7 @@ async fn run_interactive(args: Args) {
         editor,
         harness,
         catalog_model,
+        catalog: app_config.models,
         effort: args.effort,
         debug_dump_api_requests: args.debug_dump_api_requests,
         ctrl_l,
@@ -801,10 +814,13 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
-) -> (
-    Arc<dyn generative_model::GenerativeModel>,
-    Vec<myco::prelude::PreludeEntry>,
-) {
+) -> Result<
+    (
+        Arc<dyn generative_model::GenerativeModel>,
+        Vec<myco::prelude::PreludeEntry>,
+    ),
+    String,
+> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
         BackendConfig::Anthropic(c) => {
@@ -838,11 +854,8 @@ fn build_model(
         .join("\n"),
         backend_config,
     })
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to create model: {e}");
-        std::process::exit(1);
-    });
-    (model, prelude)
+    .map_err(|error| format!("could not create model: {error}"))?;
+    Ok((model, prelude))
 }
 
 /// Ctrl-L handler: when the input buffer is empty, submit an empty line and
@@ -875,7 +888,7 @@ fn build_editor(ctrl_l: Arc<AtomicBool>) -> Editor<ReplHelper, DefaultHistory> {
         eprintln!("Failed to init readline: {e}");
         std::process::exit(1);
     });
-    editor.set_helper(Some(ReplHelper));
+    editor.set_helper(Some(ReplHelper { model_keys: vec![] }));
     // Multiline: insert a newline without submitting. Enter still accepts the buffer.
     // Alt-Enter arrives as ESC+CR and Ctrl-J as 0x0A, so both are distinguishable
     // in any terminal. Shift-Enter is bound too, but most terminals transmit it as
@@ -933,6 +946,7 @@ struct ReplSession {
     editor: Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
     catalog_model: CatalogModel,
+    catalog: ModelCatalog,
     effort: Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
@@ -1219,6 +1233,7 @@ enum MetaCommand<'a> {
     Resume(Option<&'a str>),
     /// `None` → print current effort; `Some` → set effort.
     Effort(Option<&'a str>),
+    Model(Option<&'a str>),
     Title(Option<&'a str>),
     Compact,
     /// Input that starts like a command (`/…` or `:…`) but names none —
@@ -1255,6 +1270,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
         (Some("restore"), arg) => Some(MetaCommand::Restore(arg)),
         (Some("hosts"), _) => Some(MetaCommand::Hosts),
         (Some("resume"), arg) => Some(MetaCommand::Resume(arg.filter(|s| !s.is_empty()))),
+        (Some("model"), arg) => Some(MetaCommand::Model(arg.filter(|s| !s.is_empty()))),
         (Some("effort"), arg) => Some(MetaCommand::Effort(arg.filter(|s| !s.is_empty()))),
         (Some("title"), arg) => Some(MetaCommand::Title(arg)),
         (Some("compact"), _) => Some(MetaCommand::Compact),
@@ -1264,6 +1280,46 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
 }
 
 impl ReplSession {
+    async fn select_model(&mut self, catalog: CatalogModel, effort: Effort) -> Result<(), String> {
+        let (model, prelude) = build_model(
+            &catalog,
+            &self.harness,
+            self.debug_dump_api_requests,
+            effort,
+        )?;
+        self.runner
+            .set_model(
+                model,
+                myco::ModelInfo::from_spec(&catalog.spec, Some(effort)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        self.runner.agent_mut().set_before_generation_notice(Some(
+            myco::session_runtime::prelude_change_notices(prelude),
+        ));
+        self.runner
+            .agent_mut()
+            .set_retry_policy(catalog.backend.retry_policy());
+        self.runner
+            .agent_mut()
+            .set_context_window_tokens(catalog.spec.context_window_tokens);
+        self.runner
+            .agent_mut()
+            .set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
+        self.runner.set_compactor(
+            Arc::new(ModelCompactor {
+                model: catalog.clone(),
+            }),
+            catalog.spec.auto_compact_at_tokens,
+        );
+        self.runner
+            .runtime()
+            .set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
+        self.catalog_model = catalog;
+        self.effort = effort;
+        Ok(())
+    }
+
     async fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
         match cmd {
             MetaCommand::Help => print_help(&self.ui),
@@ -1355,6 +1411,22 @@ impl ReplSession {
                     Err(e) => self.ui.error_section(&format!("resume failed: {e}")),
                 }
             }
+            MetaCommand::Model(arg) => match arg {
+                None => self.ui.myco_section(&format!(
+                    "model={}\nconfigured: {}\nUse /model <key> to switch.",
+                    self.catalog_model.spec.key,
+                    self.catalog.keys().join(", ")
+                )),
+                Some(key) => match self.catalog.get(key).cloned() {
+                    Ok(model) => match self.select_model(model, self.effort).await {
+                        Ok(()) => self
+                            .ui
+                            .myco_section(&format!("model={}", self.catalog_model.spec.key)),
+                        Err(error) => self.ui.error_section(&error),
+                    },
+                    Err(error) => self.ui.error_section(&error),
+                },
+            },
             MetaCommand::Effort(arg) => match arg {
                 None => self
                     .ui
@@ -1363,39 +1435,10 @@ impl ReplSession {
                     Ok(next) if next == self.effort => self
                         .ui
                         .myco_section(&format!("effort={}  (unchanged)", self.effort)),
-                    Ok(next) => {
-                        self.effort = next;
-                        let (model, prelude) = build_model(
-                            &self.catalog_model,
-                            &self.harness,
-                            self.debug_dump_api_requests,
-                            self.effort,
-                        );
-                        if let Err(error) = self
-                            .runner
-                            .set_model(
-                                model,
-                                myco::ModelInfo::from_spec(
-                                    &self.catalog_model.spec,
-                                    Some(self.effort),
-                                ),
-                            )
-                            .await
-                        {
-                            self.ui.error_section(&error.to_string());
-                        } else {
-                            self.runner.agent_mut().set_before_generation_notice(Some(
-                                myco::session_runtime::prelude_change_notices(prelude),
-                            ));
-                        }
-                        self.runner.agent_mut().set_context_window_tokens(
-                            self.catalog_model.spec.context_window_tokens,
-                        );
-                        self.runner.agent_mut().set_max_truncated_resumes(
-                            self.catalog_model.spec.max_truncated_resumes,
-                        );
-                        self.ui.myco_section(&format!("effort={}", self.effort));
-                    }
+                    Ok(next) => match self.select_model(self.catalog_model.clone(), next).await {
+                        Ok(()) => self.ui.myco_section(&format!("effort={}", self.effort)),
+                        Err(error) => self.ui.error_section(&error),
+                    },
                     Err(e) => self.ui.error_section(&e),
                 },
             },
@@ -1487,6 +1530,7 @@ impl ReplSession {
         } else {
             myco::SessionRuntime::new(self.harness.clone(), self.session.clone())
         };
+        runtime.set_max_image_base64_bytes(self.catalog_model.spec.max_image_base64_bytes);
         self.runner
             .bind_runtime(runtime)
             .await
@@ -1668,7 +1712,9 @@ fn clear_and_reprint(session: &ActiveSession, ui: &TuiProducer) {
 // rustyline: slash-command (+ /resume id) completion
 // ---------------------------------------------------------------------------
 
-struct ReplHelper;
+struct ReplHelper {
+    model_keys: Vec<String>,
+}
 
 impl Completer for ReplHelper {
     type Candidate = Pair;
@@ -1695,6 +1741,23 @@ impl Completer for ReplHelper {
                 .map(|id| Pair {
                     display: id.clone(),
                     replacement: id,
+                })
+                .collect();
+            return Ok((start, pairs));
+        }
+
+        if let Some(rest) = before.strip_prefix("/model")
+            && rest.starts_with(char::is_whitespace)
+        {
+            let prefix = rest.trim_start();
+            let start = before.len() - prefix.len();
+            let pairs = self
+                .model_keys
+                .iter()
+                .filter(|key| key.starts_with(prefix))
+                .map(|key| Pair {
+                    display: key.clone(),
+                    replacement: key.clone(),
                 })
                 .collect();
             return Ok((start, pairs));

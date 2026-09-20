@@ -19,6 +19,7 @@ You cannot press these yourself — tell the user which command to run.
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
 | `/compact` | Create a successor thread in this session (summary + recent tail) |
+| `/model [key]` | List configured models and current selection, or switch at the prompt |
 | `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
 | `/help` | Full help |
 | Alt-Enter / Ctrl-J | Multiline input |
@@ -63,6 +64,15 @@ file on disk: per image, the running model's `max_image_base64_bytes` (config.to
 `[models.KEY]`, default 5 MiB — so ~3.75 MiB on disk; `view_image` enforces the
 same cap on every host, and an image over it fails that tool use); and 20 MiB of
 attachments per message, which is myco's own budget and does not vary by model.
+
+`/model key` uses the catalog loaded at startup and keeps history, live shells,
+and editor read stamps. It updates retries, context/output policies, the
+compaction model, and attachment limits. Invalid keys or unavailable credentials
+leave the current selection intact. The switch applies to this process; set
+`--model key` or the config default when restarting. Smaller context windows may
+need `/compact`. Host image readers retain their startup ceiling; the current
+model's lower cap is also enforced on returned images. Restart to raise that
+host ceiling. Existing history is retained without resizing its images.
 A model configured above 20 MiB still gets its full per-image cap through
 `view_image` — only batching many `@path` mentions into one message is held to
 the message budget. myco does not re-encode images — an oversized file is
