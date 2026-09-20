@@ -9,7 +9,6 @@ use crate::SessionRuntime;
 use crate::agent::{Agent, AgentInteractionError, RunOutcome, StateError};
 use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{CatalogModel, Content, GenerativeModel, Message};
-use crate::harness::Harness;
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionWriter, Thread};
 
@@ -28,7 +27,6 @@ pub trait Compactor: Send + Sync {
 
 pub struct ModelCompactor {
     pub model: CatalogModel,
-    pub harness: Arc<Harness>,
 }
 
 impl Compactor for ModelCompactor {
@@ -37,9 +35,7 @@ impl Compactor for ModelCompactor {
         predecessor: Session,
         cancel: CancelToken,
     ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
-        Box::pin(async move {
-            run_compact_worker(&predecessor, &self.model, self.harness.clone(), cancel).await
-        })
+        Box::pin(async move { run_compact_worker(&predecessor, &self.model, cancel).await })
     }
 }
 
@@ -51,6 +47,9 @@ pub enum WorkflowEvent {
         automatic: bool,
     },
     Compacted(CompactOutcome),
+    CompactionProgress {
+        elapsed: std::time::Duration,
+    },
     Warning(String),
 }
 
@@ -396,7 +395,20 @@ impl Workflow {
             thread_id: predecessor.active_thread().id.clone(),
             automatic,
         });
-        let result = compactor.compact(predecessor, cancel.clone()).await;
+        let started = std::time::Instant::now();
+        let mut work = compactor.compact(predecessor, cancel.clone());
+        let mut progress = tokio::time::interval(std::time::Duration::from_secs(10));
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        progress.tick().await;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut work => break result,
+                _ = progress.tick() => (self.observer)(WorkflowEvent::CompactionProgress {
+                    elapsed: started.elapsed(),
+                }),
+            }
+        };
         if cancel.is_cancelled() {
             return Err(AgentInteractionError::Cancelled);
         }
@@ -436,6 +448,7 @@ mod tests {
     use super::*;
     use crate::agent::NullEventSink;
     use crate::generative_model::{GenerateOutput, TokenUsage, ToolUse, TurnEndReason};
+    use crate::harness::Harness;
     use crate::session::{ActiveSession, compact_thread};
     use crate::test_support::{ScriptedModel, temp_home};
     use serde_json::json;

@@ -25,7 +25,10 @@ Configure the agent's context window, retry policy, and truncation cap to match
 the supplied model. `agent_mut()` exposes those lower-level controls; direct model
 changes there bypass the runner's identity bookkeeping.
 
-`ModelCompactor` uses a catalog model to write a summary. A supplied `Compactor`
+`ModelCompactor { model }` uses a catalog model with history access restricted to
+the assigned thread and one summary write. It stops after 12 model requests or
+120 seconds. `CompactionProgress` reports elapsed time every 10 seconds.
+A supplied `Compactor`
 can implement deterministic summaries or another evaluation policy. Automatic
 compaction works between tool rounds and after normal answers. It retains the
 runtime owner, run usage, and truncation cap. Manual `compact` only commits the new
