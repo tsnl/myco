@@ -189,6 +189,11 @@ cargo test --locked --test integration_test   # and other tests/ binaries as nee
 cargo run --locked --bin myco
 ```
 
+- For runtime or CLI changes, build and run `myco` yourself to exercise the
+  affected workflow. Use an isolated `MYCO_HOME` for test sessions and prelude
+  entries. Inspect the behavior, fix what fails, and repeat until it works;
+  automated tests alone are not enough. Report what you tried and any limits
+  on the verification.
 - API credentials: see `README.md` / `myco --help overview` (Anthropic +
   xAI/OpenAI Responses env vars; `.env` loaded at startup).
 - Runtime docs for agents: `~/.myco/manual/<version>/<commit>/` (written at
