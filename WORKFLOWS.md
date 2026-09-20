@@ -1,5 +1,9 @@
 # Scripted sessions and evals
 
+For session-derived cases, repeated model comparisons, unattended runs, and
+GEPA prelude optimization, use `myco-eval` ([manual](src/manual/articles/evals.md)).
+The APIs below are the underlying workflow for custom embedders.
+
 `SessionRunner` runs the same durable workflow used by interactive and print mode.
 It owns an `Agent`, a session-bound `SessionRuntime`, and compaction policy. Supply
 a `GenerativeModel` and `EventSink`; the runtime routes tools through a `Harness`.

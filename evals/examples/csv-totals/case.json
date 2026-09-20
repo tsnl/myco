@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "csv-totals",
+  "split": "train",
+  "workspace": {"kind": "fixture"},
+  "grader": ["python3", "{case}/grader.py"],
+  "source": null
+}

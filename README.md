@@ -27,6 +27,9 @@ the local machine **and** on every concrete `Host` alias in your
   session to spin off focused agents so the main thread stays small and cheap.
 - **Project guidance is injected.** The nearest `AGENTS.md` / `CLAUDE.md` from
   your launch directory through the repository root is read at session start.
+- **Evaluate your actual tasks.** `myco-eval` turns session cutoffs into private,
+  repeatable cases with independent graders. Compare models and prelude variants,
+  or run the optional GEPA loop. See [task evals](src/manual/articles/evals.md).
 - **Coming later:** multiplayer (multiple humans in the same agent workspace).
 
 ## Install

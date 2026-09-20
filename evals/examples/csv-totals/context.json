@@ -1,0 +1,3 @@
+[
+  {"UserMessage":{"content":[{"Text":{"text":"Implement summarize.py using only the Python standard library. Usage: python3 summarize.py PATH.csv. Read UTF-8 CSV with columns team,amount. Print one JSON object mapping each team to its total in integer cents. Accept quoted team names, negative amounts, decimal amounts with one or two fractional digits, and empty files that contain only the header. Avoid floating-point rounding. Invalid amounts or missing required columns must exit nonzero with a useful stderr message and no JSON output. Read README.md and sample.csv, implement the script, and test representative cases before finishing."}}]}}
+]

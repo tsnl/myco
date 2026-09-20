@@ -17,6 +17,7 @@ pub use myco_agent as agent;
 pub mod chat;
 pub mod config;
 pub mod core;
+pub mod eval;
 pub mod external_command;
 pub use myco_model as generative_model;
 pub mod harness;

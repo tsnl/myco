@@ -11,7 +11,9 @@ mod runner;
 pub use runner::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 
 mod compact_worker;
-pub use compact_worker::{CompactWorkerError, compact_subagent_prompt, run_compact_worker};
+pub use compact_worker::{
+    CompactWorkerError, compact_subagent_prompt, run_compact_worker, run_compact_worker_with_model,
+};
 
 pub async fn interact(
     agent: &mut Agent,
