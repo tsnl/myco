@@ -1,0 +1,19 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture","status":"in_progress","output":[]}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"Checking the note."}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Ready 雪"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"path\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":2,"delta":"\"note.txt\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture","model":"test-model","status":"completed","output":[{"id":"rs_fixture","type":"reasoning","summary":[{"type":"summary_text","text":"Checking the note."}],"encrypted_content":"opaque-reasoning"},{"id":"msg_fixture","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Ready 雪","annotations":[]}]},{"id":"fc_fixture","type":"function_call","status":"completed","call_id":"call_fixture","name":"read_note","arguments":"{\"path\":\"note.txt\"}"}],"usage":{"input_tokens":12,"output_tokens":9,"input_tokens_details":{"cached_tokens":4}}}}
+
+: end of fixture

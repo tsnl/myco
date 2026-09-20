@@ -1,0 +1,513 @@
+use futures::StreamExt;
+use myco_genai::{Event, HttpModel, Message, Model, Protocol, Request};
+
+mod common;
+
+use common::*;
+use myco_genai::{DeltaKind, Error, Finish, Output, Response, Tool, Usage};
+use serde_json::{Value, json};
+
+#[tokio::test]
+async fn an_invalid_request_finishes_without_contacting_the_endpoint() {
+    let model = HttpModel::new(
+        Protocol::OpenAiResponses,
+        "http://127.0.0.1:1/responses",
+        "test",
+    )
+    .unwrap();
+    let mut request = Request::new("test-model", vec![Message::User("hello".into())], 64);
+    request
+        .provider_options
+        .insert("stream".into(), false.into());
+    let mut stream = model.generate(request);
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn request_capture_precedes_any_network_io() {
+    let model = HttpModel::new(
+        Protocol::OpenAiResponses,
+        "http://127.0.0.1:1/responses",
+        "test",
+    )
+    .unwrap();
+    let mut stream = model.generate(Request::new(
+        "test-model",
+        vec![Message::User("hello".into())],
+        64,
+    ));
+    let Event::Request { protocol, body } = stream.next().await.unwrap().unwrap() else {
+        panic!("expected request")
+    };
+    assert_eq!(protocol, Protocol::OpenAiResponses);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["input"][0]["content"], "hello");
+}
+
+#[tokio::test]
+async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() {
+    for (protocol, fixture_body) in [
+        (Protocol::OpenAiResponses, OPENAI),
+        (Protocol::AnthropicMessages, ANTHROPIC),
+    ] {
+        let (url, capture) = fixture(fixture_body, 200, "").await;
+        let model = HttpModel::new(protocol, &url, "test-key").unwrap();
+        let mut initial = request();
+        initial.instructions = "Use the supplied tools.".into();
+        initial.tools.push(Tool {
+            name: "read_note".into(),
+            description: "Read a note".into(),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        });
+        let trace = collect(&model, initial).await;
+        let reply = completed(&trace);
+        assert_eq!(reply.finish(), &Finish::ToolCalls);
+        assert_eq!(reply.usage().output_tokens, Some(9));
+        assert_eq!(
+            reply.output()[0],
+            Output::Reasoning("Checking the note.".into())
+        );
+        assert_eq!(reply.output()[1], Output::Text("Ready 雪".into()));
+        let Output::ToolCall(call) = &reply.output()[2] else {
+            panic!()
+        };
+        assert_eq!(call.id, "call_fixture");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"path":"note.txt"})
+        );
+        let arguments: String = trace
+            .iter()
+            .filter_map(|e| match e {
+                Ok(Event::Progress {
+                    delta: Some(delta), ..
+                }) if delta.kind == DeltaKind::ToolArguments => Some(delta.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arguments, call.arguments);
+        let captured = capture.await.unwrap();
+        let Ok(Event::Request { body, .. }) = &trace[0] else {
+            panic!()
+        };
+        assert_eq!(body, &captured.body);
+        assert!(!body.to_string().contains("test-key"));
+        assert!(captured.headers.starts_with("POST /inference HTTP/1.1"));
+
+        let native = reply.provider().unwrap();
+        assert_eq!(
+            Response::from_provider(protocol, native.body.clone()).unwrap(),
+            *reply
+        );
+        let mut next = request();
+        next.messages.extend([
+            Message::Assistant(reply.clone()),
+            Message::User("Continue.".into()),
+            Message::ToolResult {
+                call_id: call.id.clone(),
+                output: "Note content".into(),
+                is_error: false,
+            },
+        ]);
+        let body = model.request_body(&next).unwrap();
+        match protocol {
+            Protocol::OpenAiResponses => {
+                assert!(captured.headers.contains("authorization: Bearer test-key"));
+                assert_eq!(reply.usage().input_tokens, Some(12));
+                assert_eq!(body["input"][1], native.body["output"][0]);
+                assert_eq!(body["input"][1]["encrypted_content"], "opaque-reasoning");
+                assert_eq!(body["input"][3]["call_id"], "call_fixture");
+                assert_eq!(body["input"][5]["call_id"], "call_fixture");
+            }
+            Protocol::AnthropicMessages => {
+                assert!(captured.headers.contains("x-api-key: test-key"));
+                assert!(captured.headers.contains("anthropic-version: 2023-06-01"));
+                assert_eq!(reply.usage().input_tokens, Some(11));
+                assert_eq!(body["messages"][1]["content"], native.body["content"]);
+                assert_eq!(
+                    body["messages"][1]["content"][0]["signature"],
+                    "signed-reasoning"
+                );
+                assert_eq!(
+                    body["messages"][1]["content"][1]["data"],
+                    "opaque-reasoning"
+                );
+                assert_eq!(
+                    body["messages"][2]["content"][0]["tool_use_id"],
+                    "call_fixture"
+                );
+                assert_eq!(body["messages"][2]["content"][1]["text"], "Continue.");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_response_is_authoritative_even_without_text_deltas() {
+    let mut raw = text_response("full response");
+    raw["extra_provider_field"] = json!({"evidence":"retained"});
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(&[
+            json!({"type":"future_event","payload":"retained"}),
+            json!({"type":"response.completed","response":raw}),
+        ]),
+    )
+    .await;
+    let reply = completed(&trace);
+    assert_eq!(reply.output(), &[Output::Text("full response".into())]);
+    assert_eq!(reply.usage().input_tokens, None);
+    assert_eq!(reply.provider().unwrap().body, raw);
+    assert!(trace.iter().any(
+        |e| matches!(e, Ok(Event::Progress { raw, delta: None }) if raw["type"] == "future_event")
+    ));
+}
+
+#[tokio::test]
+async fn output_limits_and_refusals_are_not_normal_completion() {
+    let mut raw = text_response("partial");
+    raw["status"] = "incomplete".into();
+    raw["incomplete_details"] = json!({"reason":"max_output_tokens"});
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(&[json!({"type":"response.incomplete","response":raw})]),
+    )
+    .await;
+    assert_eq!(completed(&trace).finish(), &Finish::Length);
+    let trace = run(
+        Protocol::AnthropicMessages,
+        &ANTHROPIC.replace(
+            "\"tool_use\",\"stop_sequence\"",
+            "\"max_tokens\",\"stop_sequence\"",
+        ),
+    )
+    .await;
+    assert_eq!(completed(&trace).finish(), &Finish::Length);
+    let raw = json!({"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"Cannot comply"}]}]});
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(&[json!({"type":"response.completed","response":raw})]),
+    )
+    .await;
+    assert_eq!(completed(&trace).finish(), &Finish::Refusal);
+}
+
+#[tokio::test]
+async fn a_closed_connection_or_done_marker_does_not_imply_completion() {
+    for (protocol, body) in [
+        (
+            Protocol::OpenAiResponses,
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
+        ),
+        (Protocol::OpenAiResponses, "data: [DONE]\n\n"),
+        (Protocol::AnthropicMessages, "data: {\"type\":\"ping\"}\n\n"),
+    ] {
+        let trace = run(protocol, body).await;
+        assert!(
+            matches!(trace.last(), Some(Err(Error::Protocol(_)))),
+            "{trace:?}"
+        );
+        assert!(!trace.iter().any(|e| matches!(e, Ok(Event::Completed(_)))));
+    }
+}
+
+#[tokio::test]
+async fn http_failures_keep_status_request_id_and_retry_advice() {
+    let (url, capture) = fixture(
+        "rate limit",
+        429,
+        "x-request-id: req_fixture\r\nRetry-After: 3\r\n",
+    )
+    .await;
+    let model = HttpModel::new(Protocol::OpenAiResponses, &url, "test-key").unwrap();
+    let trace = collect(&model, request()).await;
+    assert_eq!(trace.len(), 2);
+    let Err(Error::Http {
+        status,
+        body,
+        request_id,
+        retry_after,
+    }) = &trace[1]
+    else {
+        panic!("{trace:?}")
+    };
+    assert_eq!(*status, 429);
+    assert_eq!(body, "rate limit");
+    assert_eq!(request_id.as_deref(), Some("req_fixture"));
+    assert_eq!(retry_after.as_deref(), Some("3"));
+    capture.await.unwrap();
+}
+
+#[tokio::test]
+async fn provider_failures_preserve_the_last_event_and_never_complete() {
+    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+        let error = json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}});
+        let trace = run(protocol, &events(std::slice::from_ref(&error))).await;
+        assert!(matches!(trace.last(), Some(Err(Error::Provider(raw))) if raw == &error));
+        assert!(
+            trace
+                .iter()
+                .any(|e| matches!(e, Ok(Event::Progress { raw, .. }) if raw == &error))
+        );
+        assert!(!trace.iter().any(|e| matches!(e, Ok(Event::Completed(_)))));
+    }
+}
+
+#[tokio::test]
+async fn malformed_terminal_output_still_has_a_trace_record() {
+    let event = json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c","name":"read","arguments":"{"}]}});
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(std::slice::from_ref(&event)),
+    )
+    .await;
+    assert!(matches!(trace.last(), Some(Err(Error::Protocol(_)))));
+    assert!(
+        trace
+            .iter()
+            .any(|e| matches!(e, Ok(Event::Progress { raw, .. }) if raw == &event))
+    );
+}
+
+#[tokio::test]
+async fn malformed_anthropic_sequences_fail_without_a_completed_message() {
+    let start = json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"stop_reason":null}});
+    let block =
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
+    for sequence in [
+        vec![start.clone(), start.clone()],
+        vec![start.clone(), block.clone(), block.clone()],
+        vec![start.clone(), block.clone(), json!({"type":"message_stop"})],
+        vec![
+            start.clone(),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lost"}}),
+        ],
+        vec![
+            start.clone(),
+            block,
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_stop"}),
+        ],
+    ] {
+        let trace = run(Protocol::AnthropicMessages, &events(&sequence)).await;
+        assert!(
+            matches!(trace.last(), Some(Err(Error::Protocol(_)))),
+            "{trace:?}"
+        );
+        assert!(!trace.iter().any(|e| matches!(e, Ok(Event::Completed(_)))));
+    }
+}
+
+#[tokio::test]
+async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
+    let trace = run(Protocol::AnthropicMessages, ANTHROPIC).await;
+    let response = completed(&trace).clone();
+    let model = HttpModel::new(
+        Protocol::OpenAiResponses,
+        "http://127.0.0.1:1/responses",
+        "",
+    )
+    .unwrap();
+    let mut input = request();
+    input.messages.push(Message::Assistant(response));
+    assert!(matches!(
+        model.request_body(&input),
+        Err(Error::InvalidRequest(_))
+    ));
+    input.messages = vec![Message::ToolResult {
+        call_id: "missing".into(),
+        output: "orphan".into(),
+        is_error: false,
+    }];
+    assert!(matches!(
+        model.request_body(&input),
+        Err(Error::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_scripted_model_needs_no_http_or_serialization_implementation() {
+    struct Scripted;
+    impl Model for Scripted {
+        fn generate(&self, _: Request) -> myco_genai::GenerationStream {
+            futures::stream::iter([Ok(Event::Completed(Response::new(
+                vec![Output::Text("scripted".into())],
+                Finish::Stop,
+                Usage::default(),
+            )))])
+            .boxed()
+        }
+    }
+    let trace = collect(&Scripted, request()).await;
+    assert_eq!(
+        completed(&trace).output(),
+        &[Output::Text("scripted".into())]
+    );
+}
+
+#[tokio::test]
+async fn dropping_an_incomplete_stream_closes_the_http_request() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let progress = events(&[
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"started"}),
+        ]);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        socket
+            .write_all(format!("{:x}\r\n{progress}\r\n", progress.len()).as_bytes())
+            .await
+            .unwrap();
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut [0; 1]))
+                .await
+                .unwrap();
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "client kept the unfinished connection alive"
+        );
+    });
+    let model = HttpModel::new(Protocol::OpenAiResponses, &endpoint, "").unwrap();
+    let mut stream = model.generate(request());
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(event, Event::Progress { delta: Some(_), .. }) {
+            break;
+        }
+    }
+    drop(stream);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn two_requests_share_a_client_without_serializing_or_mixing_outputs() {
+    use std::sync::Arc;
+    use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Barrier};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handlers = vec![];
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let barrier = barrier.clone();
+            handlers.push(tokio::spawn(async move {
+                let captured = read_request(&mut socket).await;
+                barrier.wait().await;
+                let text = captured.body["input"][0]["content"].as_str().unwrap();
+                let body = events(&[json!({"type":"response.completed","response":text_response(text)})]);
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n", body.len());
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+    let model = HttpModel::new(Protocol::OpenAiResponses, &endpoint, "").unwrap();
+    let a = Request::new("test-model", vec![Message::User("a".into())], 64);
+    let b = Request::new("test-model", vec![Message::User("b".into())], 64);
+    let (a, b) = tokio::join!(collect(&model, a), collect(&model, b));
+    assert_eq!(completed(&a).output(), &[Output::Text("a".into())]);
+    assert_eq!(completed(&b).output(), &[Output::Text("b".into())]);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_calls_cannot_be_mistaken_for_distinct_operations() {
+    let call = json!({"type":"function_call","call_id":"same","name":"read","arguments":"{}"});
+    let raw = json!({"status":"completed","output":[call.clone(),call]});
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(&[json!({"type":"response.completed","response":raw})]),
+    )
+    .await;
+    assert!(matches!(trace.last(), Some(Err(Error::Protocol(_)))));
+}
+
+#[tokio::test]
+async fn provider_settings_are_per_request_and_cannot_replace_context() {
+    let model = HttpModel::new(
+        Protocol::OpenAiResponses,
+        "http://127.0.0.1:1/responses",
+        "",
+    )
+    .unwrap();
+    let mut input = request();
+    input
+        .provider_options
+        .insert("reasoning".into(), json!({"effort":"high"}));
+    assert_eq!(
+        model.request_body(&input).unwrap()["reasoning"],
+        json!({"effort":"high"})
+    );
+    assert!(
+        model
+            .request_body(&request())
+            .unwrap()
+            .get("reasoning")
+            .is_none()
+    );
+    for key in [
+        "model",
+        "messages",
+        "input",
+        "tools",
+        "system",
+        "instructions",
+        "store",
+        "stream",
+        "previous_response_id",
+        "conversation",
+        "background",
+    ] {
+        let mut input = request();
+        input.provider_options.insert(key.into(), Value::Null);
+        assert!(
+            matches!(model.request_body(&input), Err(Error::InvalidRequest(_))),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn visible_reasoning_and_truncated_arguments_remain_observations() {
+    let raw = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[
+        {"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"visible reasoning"}]},
+        {"type":"function_call","call_id":"c","name":"read","arguments":"{"}
+    ]});
+    let reply = Response::from_provider(Protocol::OpenAiResponses, raw).unwrap();
+    assert_eq!(reply.finish(), &Finish::Length);
+    assert_eq!(
+        reply.output()[0],
+        Output::Reasoning("visible reasoning".into())
+    );
+    let model = HttpModel::new(
+        Protocol::OpenAiResponses,
+        "http://127.0.0.1:1/responses",
+        "",
+    )
+    .unwrap();
+    let mut input = request();
+    input.messages.push(Message::Assistant(reply));
+    assert!(matches!(
+        model.request_body(&input),
+        Err(Error::InvalidRequest(_))
+    ));
+}
