@@ -330,7 +330,7 @@ pub fn history_events_at(
                 for tu in tool_uses {
                     st.ensure_assistant(&mut events, palette.wrap);
                     st.separate_paragraph_if_needed(&mut events);
-                    tool_invocation_events(&mut events, &tu.name, &tu.input);
+                    tool_invocation_events(&mut events, &tu.name, &tu.input, palette.wrap);
                     st.at_line_start = true;
                     st.need_blank = true;
                 }
@@ -417,7 +417,7 @@ mod tests {
 
     fn render_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
         let mut events = Vec::new();
-        tool_invocation_events(&mut events, name, input);
+        tool_invocation_events(&mut events, name, input, palette.wrap);
         encode_ansi(&events, palette.enabled)
     }
 
@@ -699,6 +699,84 @@ mod tests {
             format!("bash({{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}})\n$ {command}\n")
         );
         assert_eq!(input, original);
+    }
+
+    #[test]
+    fn bash_stdin_displays_in_full_below_session_options() {
+        let stdin = format!("echo '{}'\nprintf '%s\\n' done\n", "x".repeat(100));
+        let rendered = render_tool_invocation(
+            "bash",
+            &json!({"action": "send", "session_id": "shell", "stdin": stdin}),
+            Palette::plain(),
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "bash({{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}})\nstdin:\n> {stdin}"
+            )
+        );
+    }
+
+    #[test]
+    fn bash_commands_wrap_with_distinct_display_continuations() {
+        let command = "cargo test --locked --workspace --lib\necho done";
+        let input = json!({"command": command});
+        let rendered = render_tool_invocation("bash", &input, Palette::plain().with_wrap(Some(30)));
+        assert_eq!(
+            rendered,
+            "bash()\n$ cargo test --locked \n↪ --workspace --lib\n  echo done\n"
+        );
+        assert_eq!(input["command"], command);
+    }
+
+    #[test]
+    fn bash_wrapping_preserves_scripts_and_long_unicode_arguments() {
+        let command = format!(
+            "python3 - <<'PY'\n\tprint(\"{}\")\n\nPY\n\n",
+            "路径e\u{301}".repeat(30)
+        );
+        for width in [8, 20, 80] {
+            let rendered = render_tool_invocation(
+                "bash",
+                &json!({"command": command}),
+                Palette::plain().with_wrap(Some(width)),
+            );
+            let mut restored = String::new();
+            for (index, line) in rendered.lines().skip(1).enumerate() {
+                let continuation = line.starts_with("↪ ");
+                let content = line
+                    .strip_prefix("$ ")
+                    .or_else(|| line.strip_prefix("  "))
+                    .or_else(|| line.strip_prefix("↪ "))
+                    .unwrap();
+                if index > 0 && !continuation {
+                    restored.push('\n');
+                }
+                restored.push_str(content);
+                let columns = line.chars().fold(0, |col, ch| {
+                    col + if ch == '\t' {
+                        8 - col % 8
+                    } else {
+                        unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+                    }
+                });
+                assert!(columns <= width, "width={width}: {line:?}");
+            }
+            assert_eq!(format!("{restored}\n"), command);
+        }
+    }
+
+    #[test]
+    fn bash_input_controls_are_visible_without_terminal_escapes() {
+        let rendered = render_tool_invocation(
+            "bash",
+            &json!({"command": "echo \u{1b}[2J", "stdin": "hello\rworld\u{7}"}),
+            Palette::plain(),
+        );
+        assert_eq!(
+            rendered,
+            "bash()\n$ echo \\u{1b}[2J\nstdin:\n> hello\\rworld\\u{7}\n"
+        );
     }
 
     #[test]

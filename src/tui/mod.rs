@@ -23,6 +23,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use unicode_width::UnicodeWidthChar;
+
 pub mod markdown;
 pub mod transcript;
 
@@ -302,12 +304,13 @@ pub(crate) fn section_open_events(
     events.push(TuiEvent::Text("\n".into()));
 }
 
-/// Tool arguments shared by live output and replay. Bash commands appear
-/// verbatim below their options; other strings use bounded JSON previews.
+/// Tool arguments shared by live output and replay. Bash commands and stdin
+/// appear in full below their options; other strings use bounded JSON previews.
 pub(crate) fn tool_invocation_events(
     events: &mut Vec<TuiEvent>,
     name: &str,
     input: &serde_json::Value,
+    wrap: Option<usize>,
 ) {
     events.push(TuiEvent::Style(Style::WARNING));
     events.push(TuiEvent::Text(name.to_string()));
@@ -315,12 +318,20 @@ pub(crate) fn tool_invocation_events(
     let command = (name == "bash")
         .then(|| input.get("command")?.as_str())
         .flatten();
+    let stdin = (name == "bash")
+        .then(|| input.get("stdin")?.as_str())
+        .flatten();
     let mut display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
     if command.is_some() {
         display.as_object_mut().unwrap().remove("command");
     }
+    if stdin.is_some() {
+        display.as_object_mut().unwrap().remove("stdin");
+    }
     let body = match &display {
-        serde_json::Value::Object(fields) if command.is_some() && fields.is_empty() => {
+        serde_json::Value::Object(fields)
+            if (command.is_some() || stdin.is_some()) && fields.is_empty() =>
+        {
             String::new()
         }
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
@@ -330,11 +341,71 @@ pub(crate) fn tool_invocation_events(
     };
     events.push(TuiEvent::Text(format!("({body})\n")));
     if let Some(command) = command {
-        events.push(TuiEvent::Text(format!("$ {command}")));
-        if !command.ends_with('\n') {
-            events.push(TuiEvent::Text("\n".into()));
+        events.push(TuiEvent::Text(tool_text(command, "$ ", wrap)));
+    }
+    if let Some(stdin) = stdin {
+        events.push(TuiEvent::Text("stdin:\n".into()));
+        events.push(TuiEvent::Text(tool_text(stdin, "> ", wrap)));
+    }
+}
+
+/// Wrap without parsing shell syntax or dropping whitespace. The arrow marks
+/// display continuations, so they cannot be mistaken for source line breaks.
+fn tool_text(text: &str, prefix: &str, wrap: Option<usize>) -> String {
+    let mut visible = String::new();
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            visible.extend(ch.escape_default());
+        } else {
+            visible.push(ch);
         }
     }
+    let Some(width) = wrap else {
+        let newline = if visible.ends_with('\n') { "" } else { "\n" };
+        return format!("{prefix}{visible}{newline}");
+    };
+    let mut out = String::new();
+    for (index, line) in visible
+        .strip_suffix('\n')
+        .unwrap_or(&visible)
+        .split('\n')
+        .enumerate()
+    {
+        let mut prefix = if index == 0 { prefix } else { "  " };
+        let mut remaining = line;
+        loop {
+            let mut end = 0;
+            let mut boundary = 0;
+            let mut column = 2;
+            for (offset, ch) in remaining.char_indices() {
+                let char_width = if ch == '\t' {
+                    8 - column % 8
+                } else {
+                    ch.width().unwrap_or(0)
+                };
+                if column + char_width > width && end > 0 {
+                    break;
+                }
+                column += char_width;
+                end = offset + ch.len_utf8();
+                if ch == ' ' || ch == '\t' {
+                    boundary = end;
+                }
+            }
+            if end < remaining.len() && boundary > 0 {
+                end = boundary;
+            }
+            out.push_str(prefix);
+            out.push_str(&remaining[..end]);
+            out.push('\n');
+            remaining = &remaining[end..];
+            if remaining.is_empty() {
+                break;
+            }
+            prefix = "↪ ";
+        }
+    }
+    out
 }
 
 /// Section/paragraph layout state shared by the live producer and history
@@ -707,7 +778,7 @@ impl TuiProducer {
             end_text_stream(st, &mut events, self.colors);
             st.section.ensure_assistant(&mut events, st.wrap);
             st.section.separate_paragraph_if_needed(&mut events);
-            tool_invocation_events(&mut events, name, input);
+            tool_invocation_events(&mut events, name, input, st.wrap);
             st.section.at_line_start = true;
             st.in_text_stream = false;
             st.section.need_blank = true;
@@ -1140,6 +1211,36 @@ mod tests {
         // Only the tool name is styled (bold yellow).
         let ansi = encode_ansi(&terminal.events(), true);
         assert!(ansi.contains("\x1b[0;1;33mbash\x1b[0m()"), "{ansi:?}");
+    }
+
+    #[test]
+    fn bash_wrapping_matches_live_replay_and_console() {
+        let input = serde_json::json!({
+            "action": "start",
+            "session_id": "shell",
+            "command": "bash --noprofile --norc",
+            "stdin": "cargo test --locked --workspace --lib -- --nocapture\nprintf '%s\\n' '**done**'\n",
+        });
+        for wrap in [None, Some(20), Some(40)] {
+            let (producer, terminal, mirror) = producer(wrap);
+            tool(&producer, "bash", input.clone());
+            let replay = history_events(
+                &[Message::AssistantMessage {
+                    content: vec![],
+                    tool_uses: vec![ToolUse {
+                        name: "bash".into(),
+                        input: input.clone(),
+                    }],
+                    turn_end_reason: None,
+                }],
+                Palette::colored(true).with_wrap(wrap),
+            );
+            assert_eq!(terminal.events(), mirror.events());
+            assert_eq!(terminal.events(), replay);
+            let plain = encode_plain(&replay);
+            assert_eq!(plain.contains("↪ "), wrap.is_some());
+            assert_eq!(plain, strip_sgr(&encode_ansi(&replay, true)));
+        }
     }
 
     #[test]
