@@ -115,11 +115,12 @@ impl EventSink for NullEventSink {
 /// it must never be the snapshot a context fork inherits.
 pub type HistoryCheckpoint = Box<dyn Fn(&[Message], Option<TokenUsage>) + Send + Sync>;
 
-/// Read external context before a generation step. A returned note is appended
-/// to the latest input (user message or tool result) and checkpointed before
-/// generation. Retries reuse that same context. Callbacks must not consume an
-/// update until their future completes, since cancellation can drop the future.
-pub type ContextRefresh =
+/// Supply a pending runtime notice before a generation step. The returned text
+/// is appended to the latest user input or tool result and checkpointed before
+/// generation; this callback does not reload the system prompt. Retries reuse
+/// the same input. Consume the notice only when the future completes, since
+/// cancellation can drop the future.
+pub type BeforeGenerationNotice =
     Box<dyn Fn(&TraceContext, &[Message]) -> Async<Option<String>> + Send + Sync>;
 
 /// How long a cancelled tool dispatch may keep running to do its own
@@ -151,7 +152,7 @@ pub struct Agent {
     /// active model's `max_truncated_resumes`.
     max_truncated_resumes: u32,
     checkpoint: Option<HistoryCheckpoint>,
-    context_refresh: Option<ContextRefresh>,
+    before_generation_notice: Option<BeforeGenerationNotice>,
 }
 
 impl Agent {
@@ -180,7 +181,7 @@ impl Agent {
             context_window_tokens: 200_000,
             max_truncated_resumes: DEFAULT_MAX_TRUNCATED_RESUMES,
             checkpoint: None,
-            context_refresh: None,
+            before_generation_notice: None,
         }
     }
 
@@ -197,8 +198,8 @@ impl Agent {
         self.checkpoint = checkpoint;
     }
 
-    pub fn set_context_refresh(&mut self, refresh: Option<ContextRefresh>) {
-        self.context_refresh = refresh;
+    pub fn set_before_generation_notice(&mut self, notice: Option<BeforeGenerationNotice>) {
+        self.before_generation_notice = notice;
     }
 
     fn emit_checkpoint(&self) {
@@ -283,7 +284,7 @@ impl Agent {
         let mut output_tokens = 0;
         let mut truncations = 0;
         loop {
-            self.refresh_context(&cancel).await?;
+            self.append_pending_notice(&cancel).await?;
             let output = generation::generate(self, cancel.clone()).await?;
             self.record_usage(output.usage, &mut output_tokens);
             let answer = answer_content(&output.content);
@@ -301,14 +302,17 @@ impl Agent {
         }
     }
 
-    async fn refresh_context(&mut self, cancel: &CancelToken) -> Result<(), AgentInteractionError> {
-        let Some(refresh) = &self.context_refresh else {
+    async fn append_pending_notice(
+        &mut self,
+        cancel: &CancelToken,
+    ) -> Result<(), AgentInteractionError> {
+        let Some(poll_notice) = &self.before_generation_notice else {
             return Ok(());
         };
         let note = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(AgentInteractionError::Cancelled),
-            note = refresh(&self.context, &self.history) => note,
+            note = poll_notice(&self.context, &self.history) => note,
         };
         let Some(text) = note else {
             return Ok(());
@@ -482,7 +486,7 @@ mod tests {
     struct EventLog(Mutex<Vec<AgentEvent>>);
 
     #[tokio::test]
-    async fn cancelling_context_refresh_preserves_the_update_for_the_next_run() {
+    async fn cancelling_notice_poll_preserves_the_update_for_the_next_run() {
         let started = CancelToken::new();
         let release = CancelToken::new();
         let model = ScriptedModel::new(vec![GenerateOutput {
@@ -497,7 +501,7 @@ mod tests {
             Arc::new(NullEventSink),
         );
         agent.replace_context(vec![user("task")], None);
-        agent.set_context_refresh(Some(Box::new({
+        agent.set_before_generation_notice(Some(Box::new({
             let started = started.clone();
             let release = release.clone();
             move |_, _| {

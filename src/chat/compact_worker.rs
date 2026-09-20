@@ -115,7 +115,9 @@ pub async fn run_compact_worker(
             thread_id: Some(worker_session.active_thread().id.clone()),
         },
     );
-    worker.set_context_refresh(Some(crate::session_runtime::prelude_refresh(prelude)));
+    worker.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
+        prelude,
+    )));
     worker.set_retry_policy(catalog_model.backend.retry_policy());
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);

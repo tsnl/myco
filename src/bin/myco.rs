@@ -654,7 +654,8 @@ async fn boot<S: EventSink + 'static>(
     );
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
     let mut agent = Agent::new(model, runtime.clone(), sink.clone());
-    agent.set_context_refresh(Some(myco::session_runtime::prelude_refresh(prelude)));
+    agent
+        .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
     agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
@@ -1459,8 +1460,8 @@ impl ReplSession {
                             true,
                         );
                         self.agent.set_model(model);
-                        self.agent.set_context_refresh(Some(
-                            myco::session_runtime::prelude_refresh(prelude),
+                        self.agent.set_before_generation_notice(Some(
+                            myco::session_runtime::prelude_change_notices(prelude),
                         ));
                         self.agent.set_context_window_tokens(
                             self.catalog_model.spec.context_window_tokens,

@@ -390,7 +390,8 @@ fn epilogue_with(
         prompt.push_str(&format!(
             "\n---\n\n# Prelude\n\n(entries under the profile's `workspace/prelude/`, a snapshot from when \
              this agent's model was built — edit with the `prelude` tool; action=list shows the \
-             live state)\n\n{prelude}\n"
+             live state; `[myco: Prelude changes]` notices announce later updates as described \
+             in Workspace & prelude)\n\n{prelude}\n"
         ));
     }
     if let Some(listing) = workspace.as_deref().and_then(workspace_listing) {

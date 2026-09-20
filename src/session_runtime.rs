@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use crate::agent::{Agent, ContextRefresh, ToolExecutor};
+use crate::agent::{Agent, BeforeGenerationNotice, ToolExecutor};
 use crate::core::{Async, CancelToken};
 use crate::generative_model::{Content, Message, ToolResult, ToolSpec, ToolUse};
 use crate::harness::Harness;
@@ -19,7 +19,7 @@ struct PreludeObservation {
 
 /// Track changes relative to the exact prelude used to build the agent's model.
 /// The observer follows that model across session switches and thread changes.
-pub fn prelude_refresh(initial: Vec<PreludeEntry>) -> ContextRefresh {
+pub fn prelude_change_notices(initial: Vec<PreludeEntry>) -> BeforeGenerationNotice {
     let dir = prelude::dir().ok();
     let observed = Arc::new(Mutex::new(PreludeObservation {
         entries: initial,
@@ -196,7 +196,7 @@ mod tests {
                 requests: std::sync::Mutex::default(),
             });
             let mut agent = Agent::new(model.clone(), live.clone(), Arc::new(NullEventSink));
-            agent.set_context_refresh(Some(prelude_refresh(vec![])));
+            agent.set_before_generation_notice(Some(prelude_change_notices(vec![])));
             run(&mut agent, &live).await;
             run(&mut agent, &live).await;
 
@@ -228,13 +228,13 @@ mod tests {
     }
 
     #[test]
-    fn context_reset_refreshes_even_when_the_latest_notice_is_retained() {
+    fn context_reset_requests_live_prelude_even_when_the_latest_notice_is_retained() {
         let _home = temp_home("prelude-compaction");
         let dir = prelude::dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("build.md"), "old command").unwrap();
         let (prompt, initial) = crate::prompts::agent_prompt_epilogue();
-        let refresh = prelude_refresh(initial);
+        let notices = prelude_change_notices(initial);
         std::fs::write(dir.join("build.md"), "new command").unwrap();
         assert!(prompt.contains("old command"));
         assert!(!prompt.contains("new command"));
@@ -247,7 +247,7 @@ mod tests {
                 requests: Mutex::default(),
             });
             let mut agent = Agent::new(model.clone(), live.clone(), Arc::new(NullEventSink));
-            agent.set_context_refresh(Some(refresh));
+            agent.set_before_generation_notice(Some(notices));
             run(&mut agent, &live).await;
             std::fs::write(dir.join("second.md"), "another fact").unwrap();
             run(&mut agent, &live).await;
@@ -281,7 +281,7 @@ mod tests {
         let _home = temp_home("prelude-rewind");
         let dir = prelude::dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        let refresh = prelude_refresh(vec![]);
+        let notices = prelude_change_notices(vec![]);
         std::fs::write(dir.join("new.md"), "new fact").unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let session = ActiveSession::new(Session::new("test"));
@@ -290,7 +290,7 @@ mod tests {
                 crate::generative_model::GenerateError::RequestTooLargeError("too large".into()),
             );
             let mut agent = Agent::new(model, live.clone(), Arc::new(NullEventSink));
-            agent.set_context_refresh(Some(refresh));
+            agent.set_before_generation_notice(Some(notices));
             let outcome = crate::chat::run_session_turn(
                 &mut agent,
                 &live,
@@ -327,18 +327,18 @@ mod tests {
         let dir = prelude::dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("entry.md"), "before").unwrap();
-        let refresh = prelude_refresh(prelude::entries(&dir));
+        let notices = prelude_change_notices(prelude::entries(&dir));
         std::fs::write(dir.join("entry.md"), [0xff]).unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let input = vec![crate::test_support::user("task")];
             assert!(
-                refresh(&crate::agent::TraceContext::default(), &input)
+                notices(&crate::agent::TraceContext::default(), &input)
                     .await
                     .is_none()
             );
             std::fs::write(dir.join("entry.md"), "after").unwrap();
             assert!(
-                refresh(&crate::agent::TraceContext::default(), &input)
+                notices(&crate::agent::TraceContext::default(), &input)
                     .await
                     .unwrap()
                     .contains("modified: entry.md")
