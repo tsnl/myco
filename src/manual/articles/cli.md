@@ -188,6 +188,13 @@ summary inside a unified ASSISTANT section; it is stored in session history for 
 but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
 ERROR section (live only; not stored in session history).
 
+Tool failures and process outcomes appear as short `↳` lines identifying the
+tool, host, and command or session. They come from the tool result, independently
+of the assistant's answer, and appear again on replay. Successful tool output
+stays in history without being printed; bash process exits show their exit code
+or signal. A running shell's status does not imply that each command sent to its
+stdin succeeded. Cancellation reports partial results or unknown effects.
+
 `/compact` creates a successor thread in the current session. It clears the screen
 (scrollback included) and prints a **COMPACTED** banner listing the session, the new thread,
 its predecessor, the retained message count, and the summary path. Older threads stay in

@@ -335,7 +335,20 @@ pub fn history_events_at(
                     st.need_blank = true;
                 }
             }
-            Message::ToolResults { .. } => {}
+            Message::ToolResults { tool_use_results } => {
+                if let Some(Message::AssistantMessage { tool_uses, .. }) =
+                    index.checked_sub(1).and_then(|i| messages.get(i))
+                {
+                    for (tool, result) in tool_uses.iter().zip(tool_use_results) {
+                        if let Some(line) = super::tool_outcome_line(tool, result) {
+                            st.ensure_assistant(&mut events, palette.wrap);
+                            styled_line(&mut events, Style::WARNING, &line);
+                            st.at_line_start = true;
+                            st.need_blank = true;
+                        }
+                    }
+                }
+            }
         }
     }
     events

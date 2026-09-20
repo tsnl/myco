@@ -47,6 +47,22 @@ fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().as_simple())
 }
 
+#[tokio::test]
+async fn process_outcomes_come_from_exit_status_not_stdout() {
+    let host = harness();
+    for (command, expected) in [
+        ("echo 'exit 0'; exit 7", "exit 7"),
+        ("kill -TERM $$", "signal 15"),
+    ] {
+        let result = dispatch_json(host.clone(), json!({"command":command})).await;
+        assert_eq!(result.status.as_deref(), Some(expected));
+    }
+    let result = dispatch_json(host.clone(), json!({"command":"sleep 30", "timeout_ms":20})).await;
+    assert!(result.status.unwrap().contains("timed out"));
+    let result = dispatch_json(host, json!({"action":"start", "session_id":"failed", "command":"exit 3", "idle_ms":100, "timeout_ms":1000})).await;
+    assert_eq!(result.status.as_deref(), Some("exit 3"));
+}
+
 // Session-lifecycle helpers with default fast test timings. Tests where the
 // timings or extra fields ARE the claim build their own json via
 // `dispatch_json` instead.

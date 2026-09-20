@@ -946,10 +946,12 @@ mod tests {
                     ToolResult {
                         content: vec![Content::Text { text: "ra".into() }],
                         is_error: false,
+                        status: None,
                     },
                     ToolResult {
                         content: vec![Content::Text { text: "rb".into() }],
                         is_error: false,
+                        status: None,
                     },
                 ],
             },
@@ -983,6 +985,7 @@ mod tests {
                         source: "data:image/png;base64,AAAA".into(),
                     }],
                     is_error: false,
+                    status: None,
                 }],
             },
         ];

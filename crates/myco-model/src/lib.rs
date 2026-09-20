@@ -494,6 +494,9 @@ pub struct ToolUse {
 pub struct ToolResult {
     pub content: Vec<Content>,
     pub is_error: bool,
+    /// Brief tool-authored outcome for transcripts, independent of model narration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 impl ToolResult {
@@ -501,6 +504,7 @@ impl ToolResult {
         Self {
             content,
             is_error: false,
+            status: None,
         }
     }
 
@@ -508,6 +512,7 @@ impl ToolResult {
         Self {
             content: vec![Content::Text { text: text.into() }],
             is_error: false,
+            status: None,
         }
     }
 
@@ -515,7 +520,13 @@ impl ToolResult {
         Self {
             content: vec![Content::Text { text: text.into() }],
             is_error: true,
+            status: None,
         }
+    }
+
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
     }
 }
 
@@ -1197,6 +1208,7 @@ mod tests {
                         text: "done".into(),
                     }],
                     is_error: false,
+                    status: None,
                 }],
             },
             Message::AssistantMessage {

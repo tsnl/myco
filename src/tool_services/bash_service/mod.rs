@@ -438,6 +438,9 @@ impl BashService {
                      stderr:\n{err}\n\
                      (exec timed out after {timeout_ms}ms; process group killed)\n"
                 ))
+                .with_status(format!(
+                    "timed out after {timeout_ms}ms; process group killed"
+                ))
             }
             Outcome::Status(status) => {
                 drain_capture(stdout_task, stderr_task).await;
@@ -451,7 +454,11 @@ impl BashService {
                          stderr:\n{err}",
                         status.code(),
                         status.signal(),
-                    )),
+                    ))
+                    .with_status(
+                        process_status(status.code(), status.signal())
+                            .unwrap_or_else(|| "process exited".into()),
+                    ),
                     Err(error) => generative_model::ToolResult::err(format!(
                         "Error executing command: {error}"
                     )),
@@ -596,7 +603,7 @@ impl BashService {
             )
             .await;
         match snapshot {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
+            Ok(s) => s.tool_result(),
             Err(e) => generative_model::ToolResult::err(e),
         }
     }
@@ -622,7 +629,7 @@ impl BashService {
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
             .await
         {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
+            Ok(s) => s.tool_result(),
             Err(e) => generative_model::ToolResult::err(e),
         }
     }
@@ -643,7 +650,7 @@ impl BashService {
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
             .await
         {
-            Ok(s) => generative_model::ToolResult::text(s.format()),
+            Ok(s) => s.tool_result(),
             Err(e) => generative_model::ToolResult::err(e),
         }
     }
@@ -706,7 +713,9 @@ impl BashService {
                     "\n(sent {} to the session process group)\n",
                     signal.name()
                 ));
-                generative_model::ToolResult::text(text)
+                let mut result = s.tool_result();
+                result.content = vec![generative_model::Content::Text { text }];
+                result
             }
             Err(e) => generative_model::ToolResult::err(e),
         }
@@ -1027,7 +1036,19 @@ impl SnapshotStatus {
     }
 }
 
+fn process_status(code: Option<i32>, signal: Option<i32>) -> Option<String> {
+    signal
+        .map(|signal| format!("signal {signal}"))
+        .or_else(|| code.map(|code| format!("exit {code}")))
+}
+
 impl SessionSnapshot {
+    fn tool_result(&self) -> generative_model::ToolResult {
+        let mut result = generative_model::ToolResult::text(self.format());
+        result.status = process_status(self.exit_code, self.exit_signal);
+        result
+    }
+
     fn format(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("session_id: {}\n", self.session_id));

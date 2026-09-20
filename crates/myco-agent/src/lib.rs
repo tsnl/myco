@@ -117,6 +117,11 @@ pub enum AgentEvent {
         tool_use: ToolUse,
         context: TraceContext,
     },
+    ToolFinished {
+        tool_use: ToolUse,
+        result: ToolResult,
+        context: TraceContext,
+    },
     TurnFinished {
         context: TraceContext,
     },
@@ -498,7 +503,10 @@ impl Agent {
             context: self.context.clone(),
         });
 
-        let work = self.tools.clone().dispatch(tool_use, cancel.clone());
+        let work = self
+            .tools
+            .clone()
+            .dispatch(tool_use.clone(), cancel.clone());
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it
@@ -511,16 +519,22 @@ impl Agent {
         // expires; for subprocess hosts that only abandons this waiter —
         // the pipe demuxes by correlation id, so siblings are unaffected.
         let mut work = std::pin::pin!(work);
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 match tokio::time::timeout(CANCEL_TOOL_GRACE, &mut work).await {
-                    Ok(result) => result,
-                    Err(_) => ToolResult::err("cancel requested; tool did not acknowledge before the deadline; effects are unknown"),
+                    Ok(result) => result.with_status("cancel requested; partial result recorded"),
+                    Err(_) => ToolResult::err("cancel requested; tool did not acknowledge before the deadline; effects are unknown").with_status("cancel requested; effects unknown"),
                 }
             }
             result = &mut work => result,
-        }
+        };
+        self.sink.emit(AgentEvent::ToolFinished {
+            tool_use,
+            result: result.clone(),
+            context: self.context.clone(),
+        });
+        result
     }
 }
 

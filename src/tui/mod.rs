@@ -37,7 +37,7 @@ pub use transcript::{
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
-use crate::generative_model::{GenerateError, Message, TokenUsage};
+use crate::generative_model::{Content, GenerateError, Message, TokenUsage, ToolResult, ToolUse};
 use crate::session::ConsoleLog;
 
 // ---------------------------------------------------------------------------
@@ -288,6 +288,37 @@ pub(crate) fn styled_line(events: &mut Vec<TuiEvent>, style: Style, text: &str) 
     events.push(TuiEvent::Text(text.to_string()));
     events.push(TuiEvent::Style(Style::RESET));
     events.push(TuiEvent::Text("\n".into()));
+}
+
+fn tool_outcome_line(tool: &ToolUse, result: &ToolResult) -> Option<String> {
+    let status = result.status.as_deref().or_else(|| {
+        result.is_error.then(|| {
+            result
+                .content
+                .iter()
+                .find_map(|part| match part {
+                    Content::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("tool failed")
+        })
+    })?;
+    let mut identity = tool.name.clone();
+    for field in ["host", "action", "session_id", "command", "path"] {
+        if let Some(value) = tool.input.get(field).and_then(|v| v.as_str()) {
+            identity.push(' ');
+            identity.extend(value.escape_debug().take(60));
+        }
+    }
+    let status: String = status
+        .lines()
+        .next()
+        .unwrap_or(status)
+        .escape_debug()
+        .take(240)
+        .collect();
+    let failure = if result.is_error { "failed: " } else { "" };
+    Some(format!("↳ {identity}: {failure}{status}"))
 }
 
 /// Headed section open: blank line, thin rule, header, blank line. The one
@@ -787,6 +818,23 @@ impl TuiProducer {
         self.broadcast(events);
     }
 
+    fn tool_finished(&self, tool: &ToolUse, result: &ToolResult) {
+        let Some(line) = tool_outcome_line(tool, result) else {
+            return;
+        };
+        let events = self.with_state(|st| {
+            let mut events = Vec::new();
+            finish_thinking_line(st, &mut events);
+            end_text_stream(st, &mut events, self.colors);
+            st.section.ensure_assistant(&mut events, st.wrap);
+            styled_line(&mut events, Style::WARNING, &line);
+            st.section.at_line_start = true;
+            st.section.need_blank = true;
+            events
+        });
+        self.broadcast(events);
+    }
+
     fn retry(
         &self,
         cause: &GenerateError,
@@ -844,6 +892,11 @@ impl EventSink for TuiProducer {
                 tool_use,
                 context: TraceContext { depth: 0, .. },
             } => self.tool_started(&tool_use.name, &tool_use.input),
+            AgentEvent::ToolFinished {
+                tool_use,
+                result,
+                context: TraceContext { depth: 0, .. },
+            } => self.tool_finished(&tool_use, &result),
             AgentEvent::TurnFinished {
                 context: TraceContext { depth: 0, .. },
             } => self.flush_output(),
@@ -924,6 +977,52 @@ mod tests {
         let mirror = Arc::new(Capture::default());
         let producer = TuiProducer::new(terminal.clone(), mirror.clone(), true, wrap);
         (producer, terminal, mirror)
+    }
+
+    #[test]
+    fn factual_outcomes_are_bounded_mirrored_and_replayed_without_tool_stdout() {
+        let (p, terminal, mirror) = producer(None);
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"host":"local", "action":"exec", "command":"exit 7"}),
+        };
+        let result = ToolResult::text("large tool stdout should stay hidden").with_status("exit 7");
+        p.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: ctx(0),
+        });
+        p.emit(AgentEvent::ToolFinished {
+            tool_use: tool.clone(),
+            result: result.clone(),
+            context: ctx(0),
+        });
+        let live = encode_plain(&terminal.events());
+        assert_eq!(live, encode_plain(&mirror.events()));
+        let replay = encode_plain(&history_events(
+            &[
+                Message::AssistantMessage {
+                    content: vec![],
+                    tool_uses: vec![tool.clone()],
+                    turn_end_reason: None,
+                },
+                Message::ToolResults {
+                    tool_use_results: vec![result],
+                },
+            ],
+            Palette::plain(),
+        ));
+        let line = "↳ bash local exec exit 7: exit 7";
+        for output in [live, replay] {
+            assert!(output.contains(line), "{output}");
+            assert!(!output.contains("large tool stdout"));
+        }
+        let failure = ToolResult::err(format!("bad\x1b[31m{}\nsecond line", "x".repeat(1000)));
+        let line = tool_outcome_line(&tool, &failure).unwrap();
+        assert!(!line.contains('\x1b'));
+        assert!(!line.contains("second line"));
+        assert!(line.len() < 400);
+        assert!(line.contains("failed:"));
+        assert!(tool_outcome_line(&tool, &ToolResult::text("success")).is_none());
     }
 
     #[test]
