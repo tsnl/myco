@@ -623,6 +623,40 @@ async fn model_switch_preserves_the_shell_and_rejects_unavailable_selections() {
 }
 
 #[tokio::test]
+async fn image_attachments_and_tool_results_save_references_but_upload_data() {
+    let env = pipe_env("image-sidecars");
+    let path = env.dir.join("image.png");
+    std::fs::write(&path, [0x89, 0x50, 0x4e, 0x47]).unwrap();
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool("view_image", serde_json::json!({"path":path}), 100),
+        model_answer("Seen.", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, false);
+    let stdout = run_myco(
+        &env,
+        &[],
+        format!("inspect @{}\n/quit\n", path.display()).as_bytes(),
+    )
+    .await;
+    let saved = session_json(&env.dir, &announced_session_id(&stdout)).to_string();
+    assert_eq!(saved.matches("myco-image:sha256:").count(), 2);
+    assert!(!saved.contains("data:image"));
+    let request = server.captured().await.body.to_string();
+    assert!(request.contains("data:image/png;base64,"), "{request}");
+    assert!(!request.contains("myco-image:"));
+    let store = env.dir.join("profiles/default/images");
+    let shards: Vec<_> = std::fs::read_dir(store).unwrap().collect();
+    assert_eq!(shards.len(), 1);
+    assert_eq!(
+        std::fs::read_dir(shards[0].as_ref().unwrap().path())
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn print_mode_compacts_and_continues_the_same_session() {
     let env = pipe_env("print-auto");
     let session = compact_test_session(&env);

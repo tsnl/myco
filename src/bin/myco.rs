@@ -855,6 +855,10 @@ fn build_model(
         backend_config,
     })
     .map_err(|error| format!("could not create model: {error}"))?;
+    let model = myco::core::image_store::with_images(
+        model,
+        myco::core::image_store::ImageStore::for_profile()?,
+    );
     Ok((model, prelude))
 }
 

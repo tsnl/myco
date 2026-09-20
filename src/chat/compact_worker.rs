@@ -242,7 +242,11 @@ pub async fn run_compact_worker(
     let session = ActiveSession::new(worker_session.clone());
     let mut worker = Agent::with_context(
         Arc::new(CompactModel {
-            inner: model,
+            inner: crate::core::image_store::with_images(
+                model,
+                crate::core::image_store::ImageStore::for_profile()
+                    .map_err(CompactWorkerError::Failed)?,
+            ),
             requests: AtomicUsize::new(0),
             limit: MAX_REQUESTS,
         }),

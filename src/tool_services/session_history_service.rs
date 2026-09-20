@@ -368,9 +368,16 @@ fn content_text(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } | Content::System { text, .. } => Some(text.as_str()),
-            Content::Thinking { text, .. } if !text.is_empty() => Some(text.as_str()),
-            Content::Image { .. } => Some("[image]"),
+            Content::Text { text } | Content::System { text, .. } => Some(text.clone()),
+            Content::Thinking { text, .. } if !text.is_empty() => Some(text.clone()),
+            Content::Image { source } => Some(if crate::core::image_store::is_reference(source) {
+                crate::core::image_store::ImageStore::for_profile()
+                    .and_then(|store| store.path(source))
+                    .map(|path| format!("[image: {}]", path.display()))
+                    .unwrap_or_else(|error| format!("[image: {error}]"))
+            } else {
+                "[image]".into()
+            }),
             _ => None,
         })
         .collect::<Vec<_>>()

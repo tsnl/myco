@@ -59,6 +59,16 @@ identical live and in replay (`/resume`, Ctrl-L); the image bytes are never
 printed. A bad path or a file that is not really an image opens an ERROR
 section before the model is called; nothing is silently dropped.
 
+Saved images use content-addressed sidecar files in the profile's `images/`
+directory. Session format 6 keeps `Content::Image.source` as a
+`myco-image:sha256:<hash>:<media-type>` reference; inline data URLs and formats
+2–5 remain readable and are externalized on save. History reads and compaction
+do not load image bytes. `session_history` displays the sidecar path when an
+image is present. The model request resolves only its input images and checks
+their SHA-256 hashes; a missing or corrupt active image stops the request with
+an error. Copy `images/` together with `session/` when moving a profile. There
+is no automatic image deletion, since archived threads may still use a blob.
+
 Size limits are measured on the **base64 payload uploaded**, which is 4/3 of the
 file on disk: per image, the running model's `max_image_base64_bytes` (config.toml
 `[models.KEY]`, default 5 MiB — so ~3.75 MiB on disk; `view_image` enforces the

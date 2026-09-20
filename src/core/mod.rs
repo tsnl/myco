@@ -1,5 +1,6 @@
 mod fs;
 pub mod image;
+pub mod image_store;
 mod runtime_info;
 
 pub(crate) use runtime_info::latest_runtime_part;

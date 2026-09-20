@@ -35,8 +35,8 @@ use uuid::Uuid;
 use crate::core::{atomically_write, myco_home, uuid_simple_hex};
 use crate::generative_model::{Message, TokenUsage};
 
-/// Written schema version; versions 2 through 4 are upgraded on read.
-pub const SESSION_FILE_VERSION: u32 = 5;
+/// Written schema version; versions 2 through 5 are upgraded on read.
+pub const SESSION_FILE_VERSION: u32 = 6;
 pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
@@ -264,6 +264,7 @@ impl ActiveSession {
         let mut updated = current.clone();
         updated.archived = archived;
         updated.touch();
+        updated.externalize_images()?;
         updated.save()?;
         *current = updated;
         Ok(())
@@ -358,6 +359,7 @@ impl ActiveSession {
             }
             updated.active_thread_mut().last_usage = last_usage;
             updated.touch();
+            updated.externalize_images()?;
             updated.save()?;
             *session = updated;
         }
@@ -374,6 +376,7 @@ impl ActiveSession {
             let mut updated = session.clone();
             updated.title = Some(title);
             updated.touch();
+            updated.externalize_images()?;
             updated.save()?;
             *session = updated;
             return Ok(true);
@@ -405,6 +408,7 @@ impl SessionWriter {
         successor.threads.push(thread);
         thread::validate_threads(&successor.threads)?;
         successor.touch();
+        successor.externalize_images()?;
         successor.save()?;
         *session = successor;
         Ok(())
@@ -536,6 +540,15 @@ impl Session {
         session_file_path(&self.id, "console")
     }
 
+    pub fn externalize_images(&mut self) -> Result<(), String> {
+        let store = crate::core::image_store::ImageStore::for_profile()?;
+        for thread in &mut self.threads {
+            store.externalize_messages(&mut thread.messages)?;
+        }
+        self.version = SESSION_FILE_VERSION;
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let path = self.json_path();
         if let Some(parent) = path.parent() {
@@ -543,7 +556,9 @@ impl Session {
         }
         // Minified, not pretty-printed: the file is rewritten every turn, and
         // structured readers (`session_history`, `jq`) don't need indentation.
-        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        let mut document = self.clone();
+        document.externalize_images()?;
+        let json = serde_json::to_vec(&document).map_err(|e| e.to_string())?;
         atomically_write(&path, &json)
     }
 
@@ -558,8 +573,8 @@ impl Session {
         let legacy = matches!(value["version"].as_u64(), Some(2..=4));
         match value["version"].as_u64() {
             Some(2) => thread::upgrade_v2(&mut value)?,
-            Some(3 | 4) => value["version"] = serde_json::json!(SESSION_FILE_VERSION),
-            Some(5) => {}
+            Some(3..=5) => value["version"] = serde_json::json!(SESSION_FILE_VERSION),
+            Some(6) => {}
             version => {
                 return Err(format!(
                     "unsupported session version {version:?}; expected 2 through {SESSION_FILE_VERSION}"
