@@ -1,7 +1,7 @@
 //! Anthropic Messages API backend.
 //!
-//! Ref: https://platform.claude.com/docs/en/api/messages/create
-//! Streaming: https://platform.claude.com/docs/en/build-with-claude/streaming
+//! Ref: <https://platform.claude.com/docs/en/api/messages/create>
+//! Streaming: <https://platform.claude.com/docs/en/build-with-claude/streaming>
 //!
 //! Invariant: history thinking is never re-sent to the API; whether budget-mode
 //! thinking + tool use requires re-sending is an open question.

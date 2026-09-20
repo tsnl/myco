@@ -1,0 +1,27 @@
+[book]
+title = "The Myco Book"
+description = "Use Myco across hosts, and build with its inference and agent libraries."
+authors = ["Myco contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../target/site"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/myco.css"]
+git-repository-url = "https://github.com/tsnl/myco"
+edit-url-template = "https://github.com/tsnl/myco/edit/main/docs/{path}"
+site-url = "/myco/"
+no-section-label = true
+smart-punctuation = false
+
+[output.html.playground]
+runnable = false
+
+[output.html.search]
+use-boolean-and = true
+

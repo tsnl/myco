@@ -19,7 +19,7 @@
 //! redraws of content already in the stream — direct terminal writes, never
 //! events — which is exactly why the mirror never sees them. Saved-history
 //! replay ([`history_events`]) is built on this module's
-//! [`SectionState`] helpers, so live output and replay share one layout policy.
+//! section-state helpers, so live output and replay share one layout policy.
 
 use std::sync::{Arc, Mutex};
 

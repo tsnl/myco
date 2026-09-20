@@ -1,3 +1,18 @@
+//! Myco's application composition: profiles, sessions, host tools, and CLI support.
+//!
+//! For inference without the application, use `myco-model` (reexported as
+//! [`generative_model`]). For a headless model/tool loop, use `myco-agent`
+//! (reexported as [`agent`]). Those crates do not depend on this application.
+//!
+//! [`SessionRuntime`] binds an agent to persistent context and owns live tool
+//! resources through [`Harness`]. Its lifetime is independent of any one
+//! [`Agent`] or [`Thread`], so compaction can replace context while shells stay
+//! alive. [`chat::run_session_turn`] coordinates input submission and saving.
+//!
+//! Read the [Myco Book](https://tsnl.github.io/myco/) for setup and reuse guides,
+//! or the [code tour](https://github.com/tsnl/myco/blob/main/TOUR.md) for source
+//! entry points and invariants.
+
 pub use myco_agent as agent;
 pub mod chat;
 pub mod config;

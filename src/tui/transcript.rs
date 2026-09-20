@@ -104,9 +104,9 @@ pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
 
 /// ANSI styling and wrap width for transcript rendering. Disabled styling +
 /// no wrap → byte-identical plain output, so files, logs, and piped stdout
-/// never carry escape codes. The CLI resolves both once at startup
-/// ([`crate::config::Config::colors_enabled`] /
-/// [`crate::config::Config::wrap_width`]).
+/// never carry escape codes. The CLI resolves color at startup via
+/// [`crate::config::Config::colors_enabled`] and recomputes width from
+/// [`crate::config::WrapMode`] as the terminal resizes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Palette {
     pub enabled: bool,
@@ -233,7 +233,7 @@ pub fn attachment_note(content: &[Content]) -> Option<String> {
 }
 
 /// Event form of the saved-history replay: the same section/paragraph layout
-/// the live producer streams ([`SectionState`]), built from stored messages.
+/// the live producer streams, built from stored messages.
 ///
 /// Only USER / ASSISTANT headers. Thinking summaries and tools are paragraphs
 /// inside ASSISTANT. Thinking is stored in session history for resume, but

@@ -661,7 +661,7 @@ pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
 ///
 /// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`]) are skipped
 /// rather than failing the listing, but never silently: they are reported once
-/// per process via [`warn_about_skipped_sessions`]. A session that vanishes from
+/// per process. A session that vanishes from
 /// `/sessions` without a word is indistinguishable from one that was never
 /// there, and bare `--resume` would quietly open an *older* session instead of
 /// the newest one.

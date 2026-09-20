@@ -1,0 +1,77 @@
+/* Keep mdBook's navigation, search, and theme controls; give the book its own palette. */
+.light {
+    --bg: #faf9f5;
+    --fg: #263c34;
+    --sidebar-bg: #eef1e9;
+    --sidebar-fg: #3d5147;
+    --sidebar-active: #23704f;
+    --links: #216b4a;
+    --quote-bg: #edf2e9;
+    --quote-border: #92ad94;
+    --table-border-color: #d6ded3;
+    --table-header-bg: #e5ecdf;
+    --table-alternate-bg: #f1f3ec;
+    --code-bg: #edf0e8;
+    --inline-code-color: #304f40;
+}
+
+.navy {
+    --bg: #19241f;
+    --fg: #e0e8dd;
+    --sidebar-bg: #131d18;
+    --sidebar-fg: #b6c7b8;
+    --sidebar-active: #aad7a9;
+    --links: #aad7a9;
+    --quote-bg: #223229;
+    --quote-border: #628467;
+    --table-border-color: #3d5143;
+    --table-header-bg: #293d30;
+    --table-alternate-bg: #203027;
+    --code-bg: #223229;
+    --inline-code-color: #c2dcad;
+}
+
+:root { --content-max-width: 880px; }
+body { font-family: "Open Sans", sans-serif; }
+.content { line-height: 1.75; }
+.content main { padding-bottom: 4rem; }
+.content h1, .content h2, .content h3 { line-height: 1.25; }
+.content h1 { letter-spacing: -0.035em; }
+.content h2 { margin-top: 2.5em; }
+.content pre { line-height: 1.55; border-radius: 6px; }
+.content table { display: block; overflow-x: auto; }
+.content th, .content td { padding: 0.6em 0.9em; }
+.sidebar .chapter { line-height: 1.7; }
+.sidebar .part-title { letter-spacing: 0.05em; font-size: 0.85em; text-transform: uppercase; }
+.menu-title { font-weight: 600; }
+
+.book-intro { font-size: 1.25em; max-width: 38em; }
+.book-paths { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 2rem 0; }
+.book-path {
+    display: block;
+    padding: 1.25rem;
+    border: 1px solid var(--quote-border);
+    border-radius: 8px;
+    color: var(--fg);
+    text-decoration: none;
+}
+.book-path strong { display: block; margin-bottom: 0.5rem; color: var(--links); }
+.book-path:hover, .book-path:focus-visible { background: var(--quote-bg); }
+.manual-note, .status-note {
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+    background: var(--quote-bg);
+    border-left: 3px solid var(--quote-border);
+    border-radius: 0 6px 6px 0;
+}
+.manual-note { font-size: 0.9em; }
+
+@media (max-width: 700px) {
+    .book-paths { grid-template-columns: 1fr; }
+    .content { padding: 0 18px; }
+}
+
+@media print {
+    .book-paths { display: block; }
+    .book-path { margin: 1rem 0; }
+}
