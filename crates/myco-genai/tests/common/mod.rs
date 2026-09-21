@@ -1,7 +1,6 @@
 use std::time::Duration;
 
-use futures::StreamExt;
-use myco_genai::{Error, Event, HttpModel, Message, Model, Protocol, Request, Response};
+use myco_genai::{Client, Config, Error, Event, Message, Protocol, Request, Response};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -90,31 +89,41 @@ pub fn request() -> Request {
     )
 }
 
-pub async fn collect(model: &dyn Model, request: Request) -> Vec<Result<Event, Error>> {
-    tokio::time::timeout(Duration::from_secs(5), model.generate(request).collect())
+pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<Client, Error> {
+    let endpoint = endpoint.into();
+    let api_key = key.into();
+    Client::new(match protocol {
+        Protocol::OpenAiResponses => Config::OpenAi { endpoint, api_key },
+        Protocol::AnthropicMessages => Config::Anthropic { endpoint, api_key },
+    })
+}
+
+#[derive(Debug)]
+pub struct Trace {
+    pub events: Vec<Event>,
+    pub result: Result<Response, Error>,
+}
+
+pub async fn collect(client: &Client, request: Request) -> Trace {
+    let mut events = Vec::new();
+    let generation = client.generate(request, |event| {
+        events.push(event);
+        std::future::ready(Ok(()))
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), generation)
         .await
-        .unwrap()
+        .unwrap();
+    Trace { events, result }
 }
 
-pub async fn run(protocol: Protocol, body: &str) -> Vec<Result<Event, Error>> {
+pub async fn run(protocol: Protocol, body: &str) -> Trace {
     let (url, _capture) = fixture(body, 200, "").await;
-    let model = HttpModel::new(protocol, &url, "test-key").unwrap();
-    collect(&model, request()).await
+    let client = client(protocol, &url, "test-key").unwrap();
+    collect(&client, request()).await
 }
 
-pub fn completed(events: &[Result<Event, Error>]) -> &Response {
-    assert!(events.iter().all(Result::is_ok), "{events:?}");
-    assert_eq!(
-        events
-            .iter()
-            .filter(|e| matches!(e, Ok(Event::Completed(_))))
-            .count(),
-        1
-    );
-    let Some(Ok(Event::Completed(response))) = events.last() else {
-        panic!("missing final response: {events:?}")
-    };
-    response
+pub fn completed(trace: &Trace) -> &Response {
+    trace.result.as_ref().unwrap()
 }
 
 pub fn events(values: &[Value]) -> String {

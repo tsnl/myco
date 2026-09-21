@@ -5,8 +5,7 @@ use crate::Error;
 #[derive(Default)]
 pub(crate) struct Sse {
     bytes: Vec<u8>,
-    data: Vec<String>,
-    saw_line: bool,
+    fields: Fields,
 }
 
 impl Sse {
@@ -14,39 +13,63 @@ impl Sse {
         self.bytes.extend_from_slice(bytes);
         let mut events = vec![];
         let mut start = 0;
-        while let Some(offset) = self.bytes[start..]
-            .iter()
-            .position(|b| matches!(b, b'\r' | b'\n'))
-        {
-            let end = start + offset;
-            if self.bytes[end] == b'\r' && end + 1 == self.bytes.len() && !eof {
-                break;
-            }
-            let mut line = std::str::from_utf8(&self.bytes[start..end])
-                .map_err(|e| Error::Protocol(format!("SSE is not UTF-8: {e}")))?;
-            if !self.saw_line {
-                line = line.strip_prefix('\u{feff}').unwrap_or(line);
-                self.saw_line = true;
-            }
-            if line.is_empty() {
-                if !self.data.is_empty() {
-                    events.push(self.data.join("\n"));
-                    self.data.clear();
-                }
-            } else {
-                let (name, value) = line.split_once(':').unwrap_or((line, ""));
-                if name == "data" {
-                    self.data
-                        .push(value.strip_prefix(' ').unwrap_or(value).into());
-                }
-            }
-            start = end + 1;
-            if self.bytes[end] == b'\r' && self.bytes.get(start) == Some(&b'\n') {
-                start += 1;
-            }
+        while let Some((end, next)) = line_bounds(&self.bytes, start, eof) {
+            events.extend(self.fields.line(&self.bytes[start..end])?);
+            start = next;
         }
         self.bytes.drain(..start);
         Ok(events)
+    }
+}
+
+fn line_bounds(bytes: &[u8], start: usize, eof: bool) -> Option<(usize, usize)> {
+    let offset = bytes[start..]
+        .iter()
+        .position(|b| matches!(b, b'\r' | b'\n'))?;
+    let end = start + offset;
+    if bytes[end] == b'\r' && end + 1 == bytes.len() && !eof {
+        return None;
+    }
+    let crlf = bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n');
+    Some((end, end + 1 + usize::from(crlf)))
+}
+
+#[derive(Default)]
+struct Fields {
+    data: Vec<String>,
+    saw_line: bool,
+}
+
+impl Fields {
+    fn line(&mut self, bytes: &[u8]) -> Result<Option<String>, Error> {
+        let mut line = std::str::from_utf8(bytes)
+            .map_err(|e| Error::Protocol(format!("SSE is not UTF-8: {e}")))?;
+        if !self.saw_line {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+            self.saw_line = true;
+        }
+        Ok(self.field(line))
+    }
+
+    fn field(&mut self, line: &str) -> Option<String> {
+        if line.is_empty() {
+            return self.finish();
+        }
+        let (name, value) = line.split_once(':').unwrap_or((line, ""));
+        if name == "data" {
+            self.data
+                .push(value.strip_prefix(' ').unwrap_or(value).into());
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let event = self.data.join("\n");
+        self.data.clear();
+        Some(event)
     }
 }
 

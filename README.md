@@ -10,7 +10,7 @@ GUI is a separate application.
 
 The current implementation is the standalone
 [`myco-genai`](crates/myco-genai/README.md) crate. Start review at its
-[public interface](crates/myco-genai/src/lib.rs) and
+[public client](crates/myco-genai/src/client.rs) and
 [request/response types](crates/myco-genai/src/types.rs).
 
 ```sh

@@ -1,63 +1,63 @@
 # myco-genai
 
 One inference attempt, independent of agent behavior, storage, and tool execution.
-`Model` is the injectable interface; `HttpModel` implements OpenAI Responses and
-Anthropic Messages over HTTP. Model names, credentials, endpoint URLs, and
-generation limits are supplied by the caller.
+`Client` is a concrete type; `Config` selects OpenAI Responses or Anthropic
+Messages over HTTP. Model names, credentials, endpoint URLs, and generation
+limits are supplied by the caller. Backend drivers are private.
 
 ```no_run
-use futures::StreamExt;
-use myco_genai::{Event, HttpModel, Message, Model, Protocol, Request};
+use myco_genai::{Client, Config, Event, Message, Request};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let model = HttpModel::new(
-    Protocol::OpenAiResponses,
-    "https://api.openai.com/v1/responses",
-    &std::env::var("OPENAI_API_KEY")?,
-)?;
+let client = Client::new(Config::OpenAi {
+    endpoint: "https://api.openai.com/v1/responses".into(),
+    api_key: std::env::var("OPENAI_API_KEY")?,
+})?;
 let request = Request::new(
     std::env::var("OPENAI_MODEL")?,
     vec![Message::User("Explain this repository.".into())],
     1024,
 );
-let mut stream = model.generate(request);
-while let Some(event) = stream.next().await {
-    match event? {
-        Event::Request { body, .. } => {
-            // The application may record the exact input before dispatch.
-            let _ = body;
-        }
-        Event::Progress { delta: Some(delta), .. } => print!("{}", delta.text),
-        Event::Completed(response) => println!("\nFinish: {:?}", response.finish()),
-        _ => {}
+let response = client.generate(request, |event| async move {
+    if let Event::Progress { delta: Some(delta), .. } = event {
+        print!("{}", delta.text);
     }
-}
+    Ok(())
+}).await?;
+println!("\nFinish: {:?}", response.finish());
 # Ok(())
 # }
 ```
 
-For Anthropic, use `Protocol::AnthropicMessages` and the complete endpoint
+For Anthropic, use `Config::Anthropic` and the complete endpoint
 `https://api.anthropic.com/v1/messages`. An empty key omits authentication for a
-local compatible endpoint. The caller supplies a Tokio runtime when polling HTTP
-streams. Additional provider settings, such as `reasoning` or `thinking`, go in
+local compatible endpoint. The caller supplies a Tokio runtime. Share a client
+by reference or through `Arc<Client>` for concurrent requests. Additional
+provider settings, such as `reasoning` or `thinking`, go in
 `Request::provider_options`; these cannot replace the managed context, tool, or
 stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the crate.
 
 ## Contract
 
-- Calling `generate` prepares a request without sending it. Its first successful
-  event captures the request body, excluding authentication headers. Polling
-  further starts the HTTP request. Validation failures produce one error.
-- Each stream represents one attempt. There are no automatic retries, redirects,
+- `generate` is an async function. Polling it validates the request and awaits a
+  `Request` observation with the exact body, excluding authentication headers,
+  before dispatch. Validation failures return an error without observations.
+  `Client::request_body` inspects the payload without starting generation.
+- Each call represents one attempt. There are no automatic retries, redirects,
   background tasks, or shared conversation state. The caller owns retry policy
   and overall/idle deadlines; the connection timeout is 30 seconds.
 - `Progress` carries provider JSON and an optional text/reasoning/tool-argument
   projection. Valid JSON error events are delivered before the error ends the
-  stream, so the application can retain the evidence. Streaming tool arguments
+  attempt, so the application can retain the evidence. Streaming tool arguments
   are provisional.
-- Only `Completed` supplies a final `Response`. `Finish::Length`, `Refusal`, and
-  `Other` remain distinct from normal completion. EOF and `[DONE]` without a
+- Observations are awaited in order, including the provider's terminal event.
+  Slow observers apply backpressure. An observer failure immediately returns
+  `Error::Observer` with the application's boxed error; no further observations
+  or successful response follow. The observer can persist each event before
+  allowing generation to proceed.
+- Only the return value supplies a final `Response`. `Finish::Length`, `Refusal`,
+  and `Other` remain distinct from normal completion. EOF and `[DONE]` without a
   provider terminal event are errors. Malformed tool JSON fails explicitly; in
   an Anthropic stream this can happen before a later output-limit indication.
 - A completed response exposes ordered output, optional usage counters, and its
@@ -68,12 +68,20 @@ embedded in the crate.
   and provider call IDs are preserved. Continuation with another protocol is
   rejected. Applications may reconstruct recorded provider responses through
   `Response::from_provider`; public types have no prescribed storage encoding.
-- Dropping the stream drops its HTTP request. This releases local resources; it
-  is not an acknowledgement that the provider stopped computing or billing.
+- Dropping the generation future drops its HTTP request. This releases local
+  resources; it is not an acknowledgement that the provider stopped computing
+  or billing.
 
-Scripted models can implement `Model` using `Response::new`. The application
-chooses how request events, raw progress, final responses, and failures enter its
-own records.
+For evaluations, the application's effect interpreter can supply scripted
+responses using `Response::new`. The application chooses how request events,
+raw progress, final responses, and failures enter its own records.
+
+## Implementation
+
+`client` exposes the public API and holds a private `Box<dyn Driver>`. `request`
+validates shared input contracts; `http` owns request dispatch and awaited
+observations; `sse` decodes event framing. Each backend separates request
+encoding, stream interpretation, and response normalization into small modules.
 
 ## Scope and validation
 
@@ -86,8 +94,9 @@ silently corrupting continuation data.
 
 Tests use local HTTP fixtures and need no API credentials. They cover fragmented
 SSE, Unicode, both providers, continuation, cumulative usage, truncation, errors,
-concurrent requests, and cancellation. They establish protocol behavior; live
-provider/account compatibility has not been exercised.
+observer ordering and failures, concurrent requests, and cancellation. They
+establish protocol behavior; live provider/account compatibility has not been
+exercised.
 
 Protocol references:
 

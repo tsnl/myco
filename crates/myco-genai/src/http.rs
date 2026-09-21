@@ -1,326 +1,180 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
-use futures::{StreamExt, stream};
 use reqwest::{
     Client, Url,
     header::{HeaderMap, HeaderValue},
 };
 use serde_json::Value;
 
-use crate::{Error, Event, GenerationStream, Message, Model, Output, Protocol, Request, Response};
-use crate::{anthropic, openai, sse::Sse, types::field};
+use crate::driver::{Decoded, Observer};
+use crate::{Error, Event, Protocol, Response, sse::Sse};
 
-/// Reusable transport. The endpoint is the complete URL, including `/responses`
-/// or `/messages`; credentials and model selection are supplied by the caller.
-#[derive(Clone)]
-pub struct HttpModel {
-    protocol: Protocol,
-    endpoint: Url,
+pub(crate) struct Transport {
     client: Client,
+    endpoint: Url,
 }
 
-impl HttpModel {
+impl Transport {
     pub fn new(protocol: Protocol, endpoint: &str, api_key: &str) -> Result<Self, Error> {
-        let endpoint = Url::parse(endpoint)
-            .map_err(|e| Error::InvalidRequest(format!("invalid endpoint: {e}")))?;
-        if !matches!(endpoint.scheme(), "http" | "https") {
-            return Err(Error::InvalidRequest(
-                "endpoint must use HTTP or HTTPS".into(),
-            ));
-        }
-        let mut headers = HeaderMap::new();
-        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
-        if !api_key.is_empty() {
-            let (name, value) = match protocol {
-                Protocol::OpenAiResponses => ("authorization", format!("Bearer {api_key}")),
-                Protocol::AnthropicMessages => ("x-api-key", api_key.into()),
-            };
-            let mut value = HeaderValue::from_str(&value).map_err(|_| {
-                Error::InvalidRequest("API key is not a valid HTTP header value".into())
-            })?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
-        if protocol == Protocol::AnthropicMessages {
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        }
+        let endpoint = endpoint_url(endpoint)?;
         let client = Client::builder()
-            .default_headers(headers)
+            .default_headers(headers(protocol, api_key)?)
             .connect_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .build()?;
-        Ok(Self {
-            protocol,
-            endpoint,
-            client,
-        })
+        Ok(Self { client, endpoint })
     }
 
-    /// Inspect the exact provider payload without opening a connection.
-    pub fn request_body(&self, request: &Request) -> Result<Value, Error> {
-        if request.model.is_empty() || request.messages.is_empty() || request.max_output_tokens == 0
-        {
-            return Err(Error::InvalidRequest(
-                "model, messages, and a positive output limit are required".into(),
-            ));
+    pub async fn generate(
+        &self,
+        protocol: Protocol,
+        body: Value,
+        observer: &mut dyn Observer,
+        decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send,
+    ) -> Result<Response, Error> {
+        let request = self
+            .client
+            .post(self.endpoint.clone())
+            .json(&body)
+            .build()?;
+        observer.observe(Event::Request { protocol, body }).await?;
+        let response = self.send(request).await?;
+        read_response(Events::new(response), protocol, observer, decode).await
+    }
+
+    async fn send(&self, request: reqwest::Request) -> Result<reqwest::Response, Error> {
+        let response = self.client.execute(request).await?;
+        if !response.status().is_success() {
+            return Err(http_error(response).await?);
         }
-        let mut names = HashSet::new();
-        for tool in &request.tools {
-            if tool.name.is_empty() || !names.insert(&tool.name) || !tool.parameters.is_object() {
-                return Err(Error::InvalidRequest(
-                    "tools require unique nonempty names and object schemas".into(),
-                ));
-            }
-        }
-        let mut calls = HashSet::new();
-        let mut results = HashSet::new();
-        for message in &request.messages {
-            match message {
-                Message::Assistant(response) => {
-                    if response
-                        .provider()
-                        .is_some_and(|p| p.protocol != self.protocol)
-                    {
-                        return Err(Error::InvalidRequest(
-                            "assistant continuation belongs to another provider protocol".into(),
-                        ));
-                    }
-                    for output in response.output() {
-                        if let Output::ToolCall(call) = output {
-                            call.validate()
-                                .map_err(|e| Error::InvalidRequest(e.to_string()))?;
-                            if !calls.insert(&call.id) {
-                                return Err(Error::InvalidRequest(format!(
-                                    "duplicate tool call ID {}",
-                                    call.id
-                                )));
-                            }
-                        }
-                    }
-                }
-                Message::ToolResult { call_id, .. } => {
-                    if !calls.contains(call_id) || !results.insert(call_id) {
-                        return Err(Error::InvalidRequest(format!(
-                            "unmatched or duplicate tool result {call_id}"
-                        )));
-                    }
-                }
-                Message::User(_) => {}
-            }
-        }
-        if calls.len() != results.len() {
-            return Err(Error::InvalidRequest(
-                "history has tool calls without results".into(),
-            ));
-        }
-        let mut body = match self.protocol {
-            Protocol::OpenAiResponses => openai::request(request)?,
-            Protocol::AnthropicMessages => anthropic::request(request)?,
-        };
-        for (name, value) in &request.provider_options {
-            if matches!(
-                name.as_str(),
-                "model"
-                    | "input"
-                    | "messages"
-                    | "instructions"
-                    | "system"
-                    | "tools"
-                    | "max_tokens"
-                    | "max_output_tokens"
-                    | "stream"
-                    | "store"
-                    | "include"
-                    | "previous_response_id"
-                    | "conversation"
-                    | "background"
-            ) {
-                return Err(Error::InvalidRequest(format!(
-                    "provider option {name} overrides a managed request field"
-                )));
-            }
-            body[name] = value.clone();
-        }
-        Ok(body)
+        validate_content_type(response.headers())?;
+        Ok(response)
     }
 }
 
-impl Model for HttpModel {
-    fn generate(&self, request: Request) -> GenerationStream {
-        let prepared = self.request_body(&request).and_then(|body| {
-            let request = self
-                .client
-                .post(self.endpoint.clone())
-                .json(&body)
-                .build()?;
-            Ok((body, request))
-        });
-        let (body, request) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return stream::once(async { Err(error) }).boxed(),
-        };
-        let state = State {
-            client: self.client.clone(),
-            protocol: self.protocol,
-            request: Some(request),
-            response: None,
-            pending: VecDeque::from([Event::Request {
-                protocol: self.protocol,
-                body,
-            }]),
-            frames: VecDeque::new(),
+fn endpoint_url(endpoint: &str) -> Result<Url, Error> {
+    let url = Url::parse(endpoint)
+        .map_err(|e| Error::InvalidRequest(format!("invalid endpoint: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::InvalidRequest(
+            "endpoint must use HTTP or HTTPS".into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn headers(protocol: Protocol, api_key: &str) -> Result<HeaderMap, Error> {
+    let mut headers = HeaderMap::new();
+    headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+    if !api_key.is_empty() {
+        authenticate(&mut headers, protocol, api_key)?;
+    }
+    if protocol == Protocol::AnthropicMessages {
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+    Ok(headers)
+}
+
+fn authenticate(headers: &mut HeaderMap, protocol: Protocol, key: &str) -> Result<(), Error> {
+    let (name, value) = match protocol {
+        Protocol::OpenAiResponses => ("authorization", format!("Bearer {key}")),
+        Protocol::AnthropicMessages => ("x-api-key", key.into()),
+    };
+    let mut value = HeaderValue::from_str(&value)
+        .map_err(|_| Error::InvalidRequest("API key is not a valid HTTP header value".into()))?;
+    value.set_sensitive(true);
+    headers.insert(name, value);
+    Ok(())
+}
+
+fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name)?.to_str().ok().map(str::to_owned)
+}
+
+async fn http_error(response: reqwest::Response) -> Result<Error, Error> {
+    Ok(Error::Http {
+        status: response.status().as_u16(),
+        request_id: header(response.headers(), "x-request-id")
+            .or_else(|| header(response.headers(), "request-id")),
+        retry_after: header(response.headers(), "retry-after"),
+        body: response.text().await?,
+    })
+}
+
+fn validate_content_type(headers: &HeaderMap) -> Result<(), Error> {
+    let valid = header(headers, "content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    if !valid {
+        return Err(Error::Protocol(
+            "expected text/event-stream content type".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_response(
+    mut events: Events,
+    protocol: Protocol,
+    observer: &mut dyn Observer,
+    mut decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send,
+) -> Result<Response, Error> {
+    while let Some(raw) = events.next().await? {
+        let decoded = decode(&raw);
+        let delta = decoded.as_ref().ok().and_then(Decoded::delta);
+        // Record valid JSON even when decoding or final normalization fails.
+        observer.observe(Event::Progress { raw, delta }).await?;
+        if let Decoded::Completed(body) = decoded? {
+            return Response::from_provider(protocol, body);
+        }
+    }
+    Err(Error::Protocol(
+        "stream ended before its terminal event".into(),
+    ))
+}
+
+struct Events {
+    response: reqwest::Response,
+    sse: Sse,
+    frames: VecDeque<String>,
+}
+
+impl Events {
+    fn new(response: reqwest::Response) -> Self {
+        Self {
+            response,
             sse: Sse::default(),
-            anthropic: anthropic::Accumulator::default(),
-            eof: false,
-            finished: false,
-            failure: None,
-        };
-        stream::try_unfold(state, |mut state| async move {
-            loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Ok(Some((event, state)));
-                }
-                if let Some(error) = state.failure.take() {
-                    return Err(error);
-                }
-                if state.finished {
-                    return Ok(None);
-                }
-                if let Some(frame) = state.frames.pop_front() {
-                    if frame.is_empty() {
-                        continue;
-                    }
-                    let event: Value = serde_json::from_str(&frame)
-                        .map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))?;
-                    let (delta, completed) = match state.event(&event) {
-                        Ok(decoded) => decoded,
-                        Err(error) => {
-                            state.failure = Some(error);
-                            state.finished = true;
-                            (None, None)
-                        }
-                    };
-                    // Keep the offending provider event observable before an
-                    // error ends the stream, including malformed final output.
-                    state
-                        .pending
-                        .push_back(Event::Progress { raw: event, delta });
-                    if let Some(response) = completed {
-                        state.pending.push_back(Event::Completed(response));
-                        state.finished = true;
-                    }
-                    if state.finished {
-                        state.response = None;
-                        state.frames.clear();
-                    }
+            frames: VecDeque::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<Value>, Error> {
+        loop {
+            if let Some(frame) = self.frames.pop_front() {
+                if frame.is_empty() {
                     continue;
                 }
-                if state.eof {
-                    return Err(Error::Protocol(
-                        "stream ended before its terminal event".into(),
-                    ));
-                }
-                if let Some(request) = state.request.take() {
-                    let response = state.client.execute(request).await?;
-                    if !response.status().is_success() {
-                        let status = response.status().as_u16();
-                        let header = |name| {
-                            response
-                                .headers()
-                                .get(name)
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_owned)
-                        };
-                        let request_id = header("x-request-id").or_else(|| header("request-id"));
-                        let retry_after = header("retry-after");
-                        return Err(Error::Http {
-                            status,
-                            body: response.text().await?,
-                            request_id,
-                            retry_after,
-                        });
-                    }
-                    let is_sse = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|v| {
-                            v.split(';')
-                                .next()
-                                .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
-                        });
-                    if !is_sse {
-                        return Err(Error::Protocol(
-                            "expected text/event-stream content type".into(),
-                        ));
-                    }
-                    state.response = Some(response);
-                }
-                let chunk = state
-                    .response
-                    .as_mut()
-                    .expect("request opened")
-                    .chunk()
-                    .await?;
-                state.eof = chunk.is_none();
-                state.frames.extend(
-                    state
-                        .sse
-                        .push(chunk.as_deref().unwrap_or_default(), state.eof)?,
-                );
+                return decode_frame(&frame).map(Some);
             }
-        })
-        .boxed()
+            if !self.read_chunk().await? && self.frames.is_empty() {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn read_chunk(&mut self) -> Result<bool, Error> {
+        let chunk = self.response.chunk().await?;
+        let eof = chunk.is_none();
+        self.frames
+            .extend(self.sse.push(chunk.as_deref().unwrap_or_default(), eof)?);
+        Ok(!eof)
     }
 }
 
-struct State {
-    client: Client,
-    protocol: Protocol,
-    request: Option<reqwest::Request>,
-    response: Option<reqwest::Response>,
-    pending: VecDeque<Event>,
-    frames: VecDeque<String>,
-    sse: Sse,
-    anthropic: anthropic::Accumulator,
-    eof: bool,
-    finished: bool,
-    failure: Option<Error>,
-}
-
-impl State {
-    fn event(&mut self, event: &Value) -> Result<(Option<crate::Delta>, Option<Response>), Error> {
-        let (delta, body) = match self.protocol {
-            Protocol::OpenAiResponses => match field(event, "type")? {
-                "error" | "response.failed" => return Err(Error::Provider(event.clone())),
-                "response.completed" | "response.incomplete" => {
-                    let body = event
-                        .get("response")
-                        .ok_or_else(|| Error::Protocol("missing final response".into()))?;
-                    let expected = if event["type"] == "response.completed" {
-                        "completed"
-                    } else {
-                        "incomplete"
-                    };
-                    if body["status"] != expected {
-                        return Err(Error::Protocol(
-                            "terminal event disagrees with response status".into(),
-                        ));
-                    }
-                    (None, Some(body.clone()))
-                }
-                _ => (openai::delta(event)?, None),
-            },
-            Protocol::AnthropicMessages => self.anthropic.event(event)?,
-        };
-        Ok((
-            delta,
-            body.map(|body| Response::from_provider(self.protocol, body))
-                .transpose()?,
-        ))
-    }
+fn decode_frame(frame: &str) -> Result<Value, Error> {
+    serde_json::from_str(frame).map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))
 }

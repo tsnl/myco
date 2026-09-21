@@ -63,6 +63,10 @@ impl ToolCall {
         if self.id.is_empty() || self.name.is_empty() {
             return Err(Error::Protocol("tool call has an empty ID or name".into()));
         }
+        self.validate_arguments()
+    }
+
+    fn validate_arguments(&self) -> Result<(), Error> {
         let arguments: Value = serde_json::from_str(&self.arguments).map_err(|e| {
             Error::Protocol(format!("invalid arguments for tool call {}: {e}", self.id))
         })?;
@@ -122,7 +126,7 @@ pub struct ProviderResponse {
 }
 
 impl Response {
-    /// Construct a response for a scripted model, without provider state.
+    /// Construct a response without provider state, for example in an evaluation.
     pub fn new(output: Vec<Output>, finish: Finish, usage: Usage) -> Self {
         Self {
             output,
@@ -137,8 +141,14 @@ impl Response {
             Protocol::OpenAiResponses => crate::openai::response(&body)?,
             Protocol::AnthropicMessages => crate::anthropic::response(&body)?,
         };
+        response.validate_call_ids()?;
+        response.provider = Some(ProviderResponse { protocol, body });
+        Ok(response)
+    }
+
+    fn validate_call_ids(&self) -> Result<(), Error> {
         let mut calls = std::collections::HashSet::new();
-        for output in &response.output {
+        for output in &self.output {
             if let Output::ToolCall(call) = output
                 && !calls.insert(&call.id)
             {
@@ -148,8 +158,7 @@ impl Response {
                 )));
             }
         }
-        response.provider = Some(ProviderResponse { protocol, body });
-        Ok(response)
+        Ok(())
     }
 
     pub fn output(&self) -> &[Output] {
@@ -186,18 +195,14 @@ pub struct Delta {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Exact JSON request body, without authentication headers.
-    Request {
-        protocol: Protocol,
-        body: Value,
-    },
+    Request { protocol: Protocol, body: Value },
     /// Provider event plus an optional projection suitable for live rendering.
     /// Partial tool arguments are observations, not executable calls.
-    Progress {
-        raw: Value,
-        delta: Option<Delta>,
-    },
-    Completed(Response),
+    Progress { raw: Value, delta: Option<Delta> },
 }
+
+/// Application failures while recording or forwarding an observation.
+pub type ObserverError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -216,6 +221,8 @@ pub enum Error {
     Protocol(String),
     #[error("provider reported an inference failure: {0}")]
     Provider(Value),
+    #[error("inference observer failed: {0}")]
+    Observer(#[source] ObserverError),
 }
 
 pub(crate) fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str, Error> {
@@ -230,4 +237,11 @@ pub(crate) fn array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>, 
         .get(name)
         .and_then(Value::as_array)
         .ok_or_else(|| Error::Protocol(format!("missing array field {name}")))
+}
+
+pub(crate) fn index(value: &Value, name: &str) -> Result<usize, Error> {
+    value[name]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::Protocol(format!("missing {name}")))
 }
