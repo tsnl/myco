@@ -9,8 +9,9 @@ flowchart LR
     subgraph Server
         server[myco-server] --> kernel[myco-kernel]
         kernel --> agent[myco-agent]
-        kernel --> genai[myco-genai]
-        kernel --> tools[myco-tools]
+        kernel --> genai[myco-genai-service]
+        kernel --> bash[myco-bash-service]
+        kernel -.-> browser["myco-web-browser-service (future)"]
     end
     subgraph Protocol
         protocol[myco-protocol]
@@ -25,21 +26,27 @@ flowchart LR
 | Crate | Responsibility |
 | --- | --- |
 | `myco-agent` | Typed, pure-functional state-machine transitions governing agent logic. No effects applied directly. |
-| `myco-genai` | Single-turn inference through a concrete async `Client`; a `Config` enum selects private backend drivers. |
-| `myco-tools` | Shared tool instances, workers, operation records, and observation streams through `Harness`. |
-| `myco-kernel` | Async Rust API, session interpreters, branch writers, workspaces, storage, event delivery, and supervision. |
+| `myco-genai-service` | Single-turn inference through a concrete async `Client`; a `Config` enum selects private backend drivers. |
+| `myco-bash-service` | Terminal/process APIs, shared bash instances, operation records, cancellation, and output streams. |
+| `myco-web-browser-service` (future) | Browser control and observation APIs. |
+| `myco-kernel` | Async Rust API, agent tool catalog and adapters, session interpreters, branch writers, workspaces, storage, and supervision. |
 | `myco-server` | HTTP adapter over the kernel: wire conversion, endpoints, streams, and application startup/shutdown. |
 | `myco-protocol` | Versioned HTTP and streamed-event schemas, independent of engine types and storage formats. |
-| `myco-gui` | Yew client for conversations and shared tools. |
+| `myco-gui` | Yew client for conversations and shared service instances. |
 
 `myco-kernel` exposes Rust operations for event submission, state reads,
-workspaces, shared tools, and observation streams. It owns or re-exports the domain
-types its callers need and runs without an HTTP listener. `myco-server` maps
+workspaces, service controls, and observation streams. It owns or re-exports the
+domain types its callers need and runs without an HTTP listener. `myco-server` maps
 between this API and `myco-protocol`; the kernel has no wire-protocol dependency.
 
-`myco-agent`, `myco-genai`, and `myco-tools` are independent; kernel interpreters
-translate between them. Services execute capabilities; tools expose capabilities
-to a model. Generation is an effect regardless of whether it is also a tool.
+Services are independent crates with APIs suited to their capabilities. There is
+no common service trait or aggregate services crate. They do not depend on the
+agent's session language or tool catalog.
+
+Agent tools live in `myco-kernel`: definitions, argument schemas, and adapters
+that call service APIs and translate results. GUI controls also use service APIs
+through the kernel and server, sharing the same instances and observations.
+Generation remains an effect whether or not the kernel also exposes it as a tool.
 
 `Client::generate` returns `Result<Response, Error>` and awaits a fallible callback
 for ordered request/progress observations. Request recording precedes dispatch.
@@ -64,10 +71,14 @@ the interpretation boundary. The kernel's generation interpreter:
 
 1. Resolves the fixed state's instructions, context, capabilities, and policy,
    plus its versioned binding to model/backend configuration and provider options.
-2. Constructs a `myco_genai::Request` and records the resolved configuration and
-   exact request before dispatch.
+2. Constructs a `myco_genai_service::Request` and records the resolved configuration
+   and exact request before dispatch.
 3. Invokes `Client`, retains observations and the outcome, and translates them
-   into session events. Tool services follow the same interpretation boundary.
+   into session events.
+
+For `InvokeTool`, a kernel adapter validates arguments against the pinned tool
+schema, calls the relevant service API, and translates the outcome into
+`ToolFinished`. GUI operations use kernel service controls directly.
 
 `agent::step` validates operation correlation, target transcript revision, and
 conversation policy before accepting a candidate or requesting tools. Completion,
@@ -182,7 +193,7 @@ to the current thread's vector during the transition.
 
 `Phase` and `AgentEvent` are ordinary enums. Transitions validate phase/event
 combinations and operation correlations at runtime. Phase payloads retain pending
-operation data; `AwaitingTools` records missing observations, while the tool service
+operation data; `AwaitingTools` records missing observations, while the service
 owns live execution status.
 
 | Phase | Event | Successor | Effects |
@@ -301,7 +312,7 @@ wakeup cannot lose work.
   later outcomes remain evidence but cannot continue the turn. Return to `Ready`
   only after all outstanding outcomes are terminal. Claiming an effect and checking
   cancellation must be atomic; claimed requests can still race with cancellation.
-  Tools remember cancellation by operation ID even before submission.
+  The bash service remembers cancellation by operation ID even before submission.
 - Busy branches reject `Start`; the kernel may queue inputs without blocking
   outcome/cancellation events. Duplicate events do not repeat transitions. Late or
   mismatched outcomes remain linked to their original operations.
@@ -320,20 +331,21 @@ The kernel starts by validating state, acquiring branch writers, and
 reconciling operations. Shutdown stops intake, finishes or reconciles commits,
 applies cancellation policy, and supervises workers. The server starts the kernel
 and HTTP listeners and forwards shutdown signals. Rust applications can manage
-the same kernel lifecycle directly. Clients do not own branch or tool lifetimes.
+the same kernel lifecycle directly. Clients do not own branch or service lifetimes.
 Agent policy defines triggers; clocks, watchers, and HTTP deliver them.
 
-The HTTP API covers workspaces, conversations, branches, tools, and observations.
-Mutations carry deduplication IDs; acceptance and completion are separate.
+The HTTP API covers workspaces, conversations, branches, service controls, and
+observations. Mutations carry deduplication IDs; acceptance and completion are separate.
 Stream cursors support reconnecting clients. The Yew GUI uses this API; there is
-no interactive CLI. Tool instances belong to workspaces and can be shared by
+no interactive CLI. Terminals belong to workspaces and can be shared by
 humans and agents; workspace membership alone provides no filesystem isolation.
 
 State cloning is valid in any phase. Runnable forks initially require settled
 states and commit fresh branch/thread identities with source lineage and new
 operation IDs. They copy all threads and history; they do not copy writers,
-futures, or live tools. Making pending states runnable requires an explicit policy
-for their outstanding operations; restoring the original branch reconciles existing IDs.
+futures, or service instances. Making pending states runnable requires an explicit
+policy for their outstanding operations; restoring the original branch reconciles
+existing IDs.
 
 Search can generate and score independent candidates from the same state,
 then select a continuation or fork. Branches must isolate tool workspaces or defer
@@ -341,24 +353,24 @@ tool effects until selection. The ordinary agent keeps its single-generation pol
 
 Evaluations use pure transitions with state fixtures or the kernel's Rust API
 with budgets, interpreters, and graders. Neither needs an HTTP server. Scripted
-session events need no genai or tool-service dependency. Real interpreters retain
-exact inputs, outcomes, and tool evidence. GEPA consumes trial scores, traces,
-and diagnostic feedback.
+session events need no service dependencies. Real interpreters retain exact inputs,
+outcomes, and tool evidence. GEPA consumes trial scores, traces, and diagnostic feedback.
 
 ## Review sequence
 
 1. **Interfaces:** crate boundaries, session language, state, transitions,
    commit semantics, and recovery.
-2. **Genai:** concrete client and private drivers; local HTTP fixtures for awaited
-   observations, native continuation, incomplete outcomes, and cancellation.
+2. **Genai service:** concrete client and private drivers; local HTTP fixtures for
+   awaited observations, native continuation, incomplete outcomes, and cancellation.
 3. **Agent:** owned vector state, enum-based transitions, in-memory store,
    scripted events, and bounded compaction. Check independent clones, determinism,
    invalid phase/event rejection, commit gating, cancellation, and duplicates.
-4. **Tools:** shared terminal, human/agent observers, durable operation records,
-   cancellation, deduplication, and worker supervision.
-5. **Kernel:** Rust API, interpreters, durable storage, delivery, reconciliation,
-   and shutdown. Test fixed-context request construction, outcome translation,
-   continuation restoration, and invocation-ID mapping without HTTP.
+4. **Bash service:** shared terminal, control APIs, output streams, durable operation
+   records, cancellation, deduplication, and worker supervision.
+5. **Kernel:** Rust API, agent tool catalog/adapters, interpreters, durable storage,
+   delivery, reconciliation, and shutdown. Test fixed-context request construction,
+   argument validation, outcome translation, continuation restoration, and
+   invocation-ID mapping without HTTP.
 6. **Server/protocol:** HTTP schemas, endpoints, and streams over the kernel API.
-7. **GUI:** session/thread browsing and shared tools in Yew.
+7. **GUI:** session/thread browsing and shared service controls in Yew.
 8. **Evaluation/GEPA:** isolated task fixtures and inspectable optimizer feedback.
