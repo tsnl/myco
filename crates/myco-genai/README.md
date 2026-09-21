@@ -38,6 +38,14 @@ provider settings, such as `reasoning` or `thinking`, go in
 stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the crate.
 
+An effect interpreter can use this client as a generation service, retaining
+operation, turn, and thread correlations outside the crate. Observations and the
+returned outcome become inputs to the conversation controller. The controller
+decides whether a response extends a thread; generation itself performs no
+transcript writes. Concurrent calls can produce independent candidates from the
+same context. Exposing generation through a model's tool catalog is a separate
+application choice.
+
 ## Contract
 
 - `generate` is an async function. Polling it validates the request and awaits a
