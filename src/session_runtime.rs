@@ -1,5 +1,6 @@
 //! Session-bound tool ownership and agent binding, independent of the frontend.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -88,6 +89,7 @@ pub struct SessionRuntime {
     owner_id: Uuid,
     session_id: String,
     session: ActiveSession,
+    max_image_base64_bytes: AtomicU64,
 }
 
 impl SessionRuntime {
@@ -97,11 +99,16 @@ impl SessionRuntime {
             owner_id: Uuid::new_v4(),
             session_id: session.id(),
             session,
+            max_image_base64_bytes: AtomicU64::new(u64::MAX),
         })
     }
 
     pub fn session(&self) -> &ActiveSession {
         &self.session
+    }
+
+    pub fn set_max_image_base64_bytes(&self, limit: u64) {
+        self.max_image_base64_bytes.store(limit, Ordering::Relaxed);
     }
 
     pub fn session_id(&self) -> &str {
@@ -188,9 +195,20 @@ impl ToolExecutor for SessionRuntime {
     }
 
     fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
-        self.harness
-            .clone()
-            .dispatch_tool_use(tool, self.owner_id, cancel)
+        Box::pin(async move {
+            let result = self
+                .harness
+                .clone()
+                .dispatch_tool_use(tool, self.owner_id, cancel)
+                .await;
+            let limit = self.max_image_base64_bytes.load(Ordering::Relaxed);
+            if result.content.iter().any(|part| matches!(part,
+                crate::generative_model::Content::Image { source }
+                if source.split_once(',').map_or(source.len(), |(_, data)| data.len()) as u64 > limit)) {
+                return ToolResult::err(format!("image exceeds the current model's {limit}-byte base64 limit; resize it before viewing"));
+            }
+            result
+        })
     }
 }
 

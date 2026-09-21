@@ -115,17 +115,33 @@ impl SessionRunner {
         }
         let session = self.runtime.session().clone();
         let _writer = session.writer().await;
-        if crate::RuntimeRecord::latest(self.agent.history()).is_some_and(|old| old.model != info) {
-            self.agent
-                .replace_context(self.agent.history().to_vec(), None)?;
+        if self.agent.checkpoint_failed() {
+            self.agent.checkpoint()?;
         }
+        let mut next = self.agent.state().clone();
+        if crate::RuntimeRecord::latest(self.agent.history()).is_some_and(|old| old.model != info) {
+            next.replace_context(self.agent.history().to_vec(), None)?;
+        }
+        if !self.agent.history().is_empty() {
+            if let Some(notice) = self
+                .runtime
+                .observe(next.history(), info.clone(), self.workflow.resume_notice)
+                .await
+            {
+                next.append_system(vec![notice])?;
+            }
+            let thread = self.agent.context().thread_id.as_deref().ok_or_else(|| {
+                AgentInteractionError::Checkpoint("agent is not bound to a thread".into())
+            })?;
+            session
+                .persist_agent_state(thread, &next, false, None)
+                .map_err(AgentInteractionError::Checkpoint)?;
+        }
+        self.agent
+            .replace_context(next.history().to_vec(), next.last_usage())?;
         self.agent.set_model(model);
         self.workflow.model_info = Some(info);
-        if !self.agent.history().is_empty() {
-            self.workflow
-                .record_runtime(&mut self.agent, &self.runtime)
-                .await?;
-        }
+        self.workflow.resume_notice = false;
         Ok(())
     }
 
@@ -619,6 +635,43 @@ mod tests {
             );
             assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
             assert_eq!(model.remaining(), 0);
+        });
+    }
+
+    #[test]
+    fn failed_model_change_keeps_the_original_model_history_and_usage() {
+        let home = temp_home("model-change-save");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut runner, old) = setup(
+                vec![output(20, None, TurnEndReason::EndTurn); 2],
+                Arc::new(Summarizer::default()),
+            )
+            .await;
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            let history = runner.agent().history().to_vec();
+            let usage = runner.agent().last_usage();
+            let replacement = ScriptedModel::new(vec![output(30, None, TurnEndReason::EndTurn)]);
+            std::fs::rename(home.path().join("session"), home.path().join("saved")).unwrap();
+            std::fs::write(home.path().join("session"), "store unavailable").unwrap();
+            assert!(
+                runner
+                    .set_model(replacement.clone(), ModelInfo::named("replacement"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(runner.agent().history(), history);
+            assert_eq!(runner.agent().last_usage(), usage);
+            std::fs::remove_file(home.path().join("session")).unwrap();
+            std::fs::rename(home.path().join("saved"), home.path().join("session")).unwrap();
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(old.remaining(), 0);
+            assert_eq!(replacement.remaining(), 1);
         });
     }
 

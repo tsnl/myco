@@ -593,6 +593,36 @@ async fn failing_process_status_remains_visible_when_the_model_calls_it_successf
 }
 
 #[tokio::test]
+async fn model_switch_preserves_the_shell_and_rejects_unavailable_selections() {
+    let env = pipe_env("model-switch");
+    let artifact = env.dir.join("kept-shell");
+    let first = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"action":"start", "session_id":"kept", "command":"bash --noprofile --norc", "idle_ms":10}), 100),
+        model_answer("Shell ready.", 100),
+    ]).await;
+    let second = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"action":"write", "session_id":"kept", "stdin":format!("printf retained > '{}'; echo done\n", artifact.display()), "idle_ms":10}), 100),
+        model_answer("Still the same shell.", 100),
+    ]).await;
+    configure_compact(&env, &first, false);
+    let config = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, format!("{config}\n[models.second]\nprotocol = \"openai-responses\"\nbase_url = {:?}\nauth = {{ source = \"none\" }}\ncontext_window = 300000\n\n[models.unavailable]\nprotocol = \"openai-responses\"\nbase_url = {:?}\nauth = {{ source = \"file\", path = {:?} }}\ncontext_window = 100000\n", second.base_url(), second.base_url(), env.dir.join("missing-key"))).unwrap();
+    let stdout = run_myco(&env, &[], b"start shell\n/model missing\n/model unavailable\n/model\n/model second\nuse shell\n/quit\n").await;
+    assert!(stdout.contains("unknown model"), "{stdout}");
+    assert!(stdout.contains("missing-key"), "{stdout}");
+    assert!(stdout.contains("model=pipetest"), "{stdout}");
+    assert!(stdout.contains("model=second"), "{stdout}");
+    assert!(stdout.contains("/300k"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(artifact).unwrap(), "retained");
+    assert_eq!(first.connections(), 2);
+    assert_eq!(second.connections(), 2);
+    let request = second.captured().await;
+    assert_eq!(request.body["model"], "second");
+    let session = session_json(&env.dir, &announced_session_id(&stdout));
+    assert!(session.to_string().contains("previous_model"));
+}
+
+#[tokio::test]
 async fn print_mode_compacts_and_continues_the_same_session() {
     let env = pipe_env("print-auto");
     let session = compact_test_session(&env);
