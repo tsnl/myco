@@ -10,7 +10,8 @@ flowchart LR
         server[myco-server] --> kernel[myco-kernel]
         kernel --> agent[myco-agent]
         kernel --> gen_ai[myco-gen-ai-service]
-        kernel --> bash[myco-bash-service]
+        kernel --> terminal[myco-terminal-service]
+        kernel --> filesystem[myco-filesystem-service]
         kernel -.-> browser["myco-web-browser-service (future)"]
     end
     subgraph Protocol
@@ -25,32 +26,120 @@ flowchart LR
 
 | Crate | Responsibility |
 | --- | --- |
-| `myco-agent` | Typed, pure-functional state-machine transitions governing agent logic. No effects applied directly. |
+| `myco-agent` | Conversation state and synchronous state-machine methods that mutate state and return explicit effects. |
 | `myco-gen-ai-service` | Single-turn inference through a concrete async `GenAiClient`; a `Config` enum selects private backend drivers. |
-| `myco-bash-service` | `BashClient` API for terminals/processes, shared bash instances, operation records, cancellation, and output streams. |
+| `myco-terminal-service` | `TerminalClient` API for shared terminals/processes, operation records, cancellation, and output streams. |
+| `myco-filesystem-service` | `FilesystemClient` API for reading, creating, and editing files with version checks. |
 | `myco-web-browser-service` (future) | Browser control and observation APIs. |
-| `myco-kernel` | Async Rust API, agent tool catalog and adapters, session interpreters, branch writers, workspaces, storage, and supervision. |
+| `myco-kernel` | Agent runtimes, tool adapters, interpretation, persistence, supervision, workspace routing, and service discovery. |
 | `myco-server` | HTTP adapter over the kernel: wire conversion, endpoints, streams, and application startup/shutdown. |
 | `myco-protocol` | Versioned HTTP and streamed-event schemas, independent of engine types and storage formats. |
 | `myco-gui` | Yew client for conversations and shared service instances. |
 
-`myco-kernel` exposes Rust operations for event submission, state reads,
-workspaces, service controls, and observation streams. It owns or re-exports the
-domain types its callers need and runs without an HTTP listener. `myco-server` maps
-between this API and `myco-protocol`; the kernel has no wire-protocol dependency.
+`myco-kernel` exposes Rust operations for agent creation, messaging, state reads,
+workspaces, service discovery/controls, and observation streams. It owns or
+re-exports the domain types its callers need and runs without an HTTP listener.
+`myco-server` maps between this API and `myco-protocol`; the kernel has no
+wire-protocol dependency.
 
 Services are independent crates with APIs suited to their capabilities. There is
 no common service trait or aggregate services crate. They do not depend on the
 agent's session language or tool catalog.
 
 Agent tools live in `myco-kernel`: definitions, argument schemas, and adapters
-that call service APIs and translate results. GUI controls also use service APIs
-through the kernel and server, sharing the same instances and observations.
+that call service APIs or internal kernel operations and translate results. GUI
+controls also use service APIs through the kernel and server, sharing the same
+instances and observations.
 Generation remains an effect whether or not the kernel also exposes it as a tool.
 
 `GenAiClient::generate` returns `Result<Response, Error>` and awaits a fallible callback
 for ordered request/progress observations. Request recording precedes dispatch.
 Backend dispatch uses a private `Driver` trait; there is no public model trait.
+
+## Workspaces and service APIs
+
+The kernel registers service instances within workspaces. Discovery lists instance
+IDs, service kinds, and API versions; resolution checks the workspace and expected
+kind before returning a bound client. A binding identifies the instance and its
+configuration, including host and working directory/root where applicable.
+Different services keep their own request/result types. The kernel maps operation
+IDs into service records and pins bindings for retries; discovery never silently
+substitutes another instance for an unavailable target.
+
+Agents run within the kernel, using `myco-agent` for transitions. Supervisor and
+subagent are roles of ordinary agents, with parent/child metadata. Kernel tools
+can create, fork, message, inspect, or cancel another agent in the workspace.
+Creation is deduplicated by operation ID; message acceptance and the recipient's
+eventual response are separate observations. These tools call kernel operations
+directly. Inference remains the responsibility of `myco-gen-ai-service`.
+
+### Terminal
+
+`TerminalClient` addresses a workspace-bound service instance. Processes have
+stable `ProcessId`s independent of agent conversations:
+
+```rust
+impl TerminalClient {
+    pub async fn start(&self, request: StartProcess) -> Result<ProcessId, TerminalError>;
+    pub async fn control(&self, request: ControlProcess) -> Result<ControlReceipt, TerminalError>;
+    pub async fn read(&self, request: ReadOutput) -> Result<OutputPage, TerminalError>;
+    pub async fn list(&self) -> Result<Vec<ProcessInfo>, TerminalError>;
+    pub async fn inspect(&self, process: ProcessId) -> Result<ProcessInfo, TerminalError>;
+    pub async fn operation(&self, id: OperationId) -> Result<OperationRecord, TerminalError>;
+}
+```
+
+`StartProcess` supplies an operation ID, command, working directory, environment,
+and pipe or PTY mode. Start returns after durable acceptance; process exit is
+observed later. `ControlProcess` carries its own operation ID and a command:
+write input, resize a PTY, signal, close/reap, or cancel a target operation.
+Cancellation can arrive before start; repeated identical requests reuse their
+records. Writes are serialized per process, and receipts report partial delivery.
+An input receipt does not imply that a command finished.
+
+`ReadOutput` supplies a cursor, byte limit, and bounded wait. `OutputPage` contains
+bytes tagged by stream, the next cursor, retention gaps, process status, and
+end-of-output status; PTY output is merged. Readers have independent cursors, so
+a GUI and several agents do not consume each other's output. Slow readers cannot block process
+draining. Exit status includes code or signal; an idle wait is not an exit.
+Lost workers require reconciliation, not a claim that process state was restored.
+
+The kernel's `bash` adapter builds finite execution and interactive waits from
+these operations. GUI terminals use the same process IDs and output records.
+Processes belong to the workspace and survive client disconnects and compaction.
+
+### Filesystem
+
+`FilesystemClient` exposes file operations independently of agent tool schemas:
+
+```rust
+impl FilesystemClient {
+    pub async fn read(&self, request: ReadFile) -> Result<FileContent, FilesystemError>;
+    pub async fn list(&self, request: ListDirectory) -> Result<DirectoryPage, FilesystemError>;
+    pub async fn create(&self, request: CreateFile) -> Result<FileVersion, FilesystemError>;
+    pub async fn edit(&self, request: EditFile) -> Result<FileVersion, FilesystemError>;
+    pub async fn operation(&self, id: OperationId) -> Result<EditRecord, FilesystemError>;
+}
+```
+
+Reads return bounded bytes or a text range, explicit truncation, and a version of
+the whole file; directory listings are paginated. Mutations carry operation IDs.
+Create requires an absent path. Edit requires an expected file version and selects
+literal replacement, insertion after a line, or whole-file write for GUI saves.
+Replacement requires a nonempty search string with exactly one match; insertion
+uses one-based lines, with zero meaning the beginning of the file.
+
+The kernel's `str_replace_based_edit_tool` adapter maps view/create/replace/insert
+onto these operations. It supplies the expected version from that agent's recorded
+read or successful mutation. GUI saves supply their own observed version. File
+versions are explicit API values, not a service-side per-agent read cache.
+
+The service serializes edits to each resolved target, rejects stale versions, and
+publishes complete files atomically while preserving permissions and symlink
+targets. Version checks detect observed external changes; they cannot exclude
+arbitrary writers that bypass the service. Records retain mutation intent and
+before/after versions for reconciliation; an ambiguous insert is not blindly
+replayed. Filesystem and terminal bindings can address the same host/files.
 
 ## Session language and interpretation
 
@@ -77,10 +166,10 @@ the interpretation boundary. The kernel's generation interpreter:
    into session events.
 
 For `InvokeTool`, a kernel adapter validates arguments against the pinned tool
-schema, calls the relevant service API, and translates the outcome into
-`ToolFinished`. GUI operations use kernel service controls directly.
+schema, calls a service API or internal kernel operation, and translates the
+outcome into `ToolFinished`. GUI operations use kernel service controls directly.
 
-`agent::step` validates operation correlation, target transcript revision, and
+`State::step` validates operation correlation, target transcript revision, and
 conversation policy before accepting a candidate or requesting tools. Completion,
 refusal, truncation, failure, and budget usage have session-level meanings.
 Progress and incomplete tool arguments cannot authorize execution. Stale or
@@ -99,13 +188,14 @@ Interpreter bindings and translation versions are pinned for recovery and replay
 | --- | --- |
 | `Session` | Conversation identity, configuration, and metadata at a fixed version; groups related threads. |
 | `Thread` | Ordered transcript at a fixed revision, with source lineage. |
-| `State` | Owned session/thread data, phase, configuration, and operation correlations at a fixed branch revision. Updated by consuming transitions. |
+| `State` | Owned session/thread data, phase, configuration, and operation correlations. Methods mutate the working state; cloning copies it. |
 
 State owns a dense `Vec<Thread>`; each thread owns a `Vec<Entry>`. Cloning copies
 all metadata and conversation entries across every thread, including older threads
-retained after compaction. A transition consumes the state, mutates its existing
-buffers, and returns it. Published revisions and separately cloned values remain
-unchanged. Private constructors validate the selected thread and other invariants.
+retained after compaction. Methods take `&mut self` and update the existing buffers.
+Callers explicitly clone when they need to preserve or explore a separate value.
+Published revisions and separately cloned values remain unchanged. Private
+constructors validate the selected thread and other invariants.
 
 ```rust
 #[derive(Clone)]
@@ -134,13 +224,12 @@ pub enum Phase {
 }
 ```
 
-Accepted content can append through an internal consuming helper:
+Accepted content appends through an ordinary internal helper:
 
 ```rust
 impl State {
-    fn push(mut self, entry: Entry) -> Self {
+    fn push(&mut self, entry: Entry) {
         self.threads[self.current_thread].entries.push(entry);
-        self
     }
 }
 ```
@@ -172,24 +261,22 @@ pub enum AgentEvent {
     Cancel(Cancel),
 }
 
-pub fn step(
-    state: State,
-    event: Event,
-) -> Result<Transition, Rejected>;
-
-pub struct Rejected {
-    pub state: State,
-    pub event: Event,
-    pub error: StepError,
+impl State {
+    pub fn step(&mut self, event: &Event) -> Result<Vec<Effect>, StepError>;
 }
 ```
 
-The kernel loads state before calling the pure, synchronous `agent::step`.
-Reads and commits use async I/O outside the transition; time and random choices
-are explicit inputs. Validate before mutation: an invalid event returns the
-original state and event through `Rejected`, without effects or a defensive clone.
-Service failures arrive as outcome events. An accepted generation candidate appends
-to the current thread's vector during the transition.
+The kernel loads a working state and calls `State::step`. The method validates the
+whole event before mutation, updates state and its working revision in place, and
+returns the requested effects. Rejection leaves state unchanged and requests no
+work, without a defensive clone. Time and random choices are explicit inputs.
+The agent calls no services or injected handlers; reads, commits, and execution
+belong to the kernel.
+
+An accepted generation candidate appends to the current thread's vector. Service
+results arrive as later events. Rust's mutable borrow prevents overlapping calls
+on the same value; the kernel's branch writer spans the complete read/step/commit
+cycle, including async I/O. Cloned values still require commit revision checks.
 
 `Phase` and `AgentEvent` are ordinary enums. Transitions validate phase/event
 combinations and operation correlations at runtime. Phase payloads retain pending
@@ -234,71 +321,72 @@ pub enum Action {
 name the successor published by the same commit, so generation includes newly
 accepted input. `ToolInvocation` resolves through its pinned capability binding.
 
-The agent defines semantic storage contracts; the kernel supplies encodings and
-storage implementations:
+The kernel owns persistence and dispatch. A commit borrows the proposed state
+and its effects, keeping them unchanged during async storage:
 
 ```rust
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-pub trait StateReader: Send + Sync {
-    fn read(&self, at: StateVersion) -> BoxFuture<'_, Result<State, StateError>>;
-}
-
-pub trait StateStore: StateReader {
-    fn commit<'a>(
-        &'a self,
-        proposal: &'a Commit,
-    ) -> BoxFuture<'a, Result<(), StateError>>;
+pub struct Commit<'a> {
+    pub expected: StateVersion,
+    pub event: &'a Event,
+    pub state: &'a State,
+    pub effects: &'a [Effect],
 }
 ```
 
-`StateVersion` identifies a branch and revision. `Commit` specifies the branch,
-expected revision, consumed event, successor state, trace changes, and effects.
-
-`StateStore::commit` atomically stores the successor state, advances the branch head,
-and records the event, trace changes, and durable effect outbox. Repeating an
-identical event/proposal is idempotent; conflicting proposals are rejected.
-Persistence precedes effect execution, including generation and tool invocation.
-
-`Transition` holds the commit proposal. Callers can inspect or clone its proposed
-state; only confirmed commit publishes it and releases executable effects:
+`Commit`, `Store`, and `CommittedEffects` belong to `myco-kernel`. The agent has
+no storage dependency or serialization format:
 
 ```rust
-impl Transition {
-    pub fn state(&self) -> &State;
-    pub fn proposal(&self) -> &Commit;
+impl Store {
+    pub async fn read(&self, at: StateVersion) -> Result<State, StateError>;
 
     pub async fn commit(
-        self,
-        store: &dyn StateStore,
-    ) -> Result<(State, CommittedEffects), CommitFailure>;
-}
-
-pub struct CommitFailure {
-    pub transition: Transition,
-    pub error: StateError,
+        &self,
+        proposal: &Commit<'_>,
+    ) -> Result<CommittedEffects, StateError>;
 }
 ```
 
-`CommittedEffects` has a private constructor. Failure retains the proposal for
-retry or reconciliation. An ambiguous commit requires checking the event ID;
-a revision conflict requires reload. Neither permits dispatch or branch advancement.
+`StateVersion` identifies a branch and revision. Commit checks the expected
+revision, stores the successor state, advances the branch head, and records the
+event, trace changes, and effects in a durable outbox atomically. Operation IDs
+are stable across retries. Repeating an identical event/proposal is idempotent;
+conflicting proposals are rejected.
 
-The kernel pumps events through this boundary:
+Returned effects are requests. Only confirmed commit yields `CommittedEffects`,
+whose constructor is private to the kernel; the executor accepts this handle.
+Persistence precedes execution, including generation and tool invocation.
+
+The kernel keeps the mutated state private until commit succeeds. On storage
+failure it retains the exact proposal for retry or discards it and reloads durable
+state before processing another event. An ambiguous commit requires checking the
+event ID; a revision conflict requires reload. No local mutation proves that a
+revision committed.
 
 ```rust
-let state = store.read(version).await?;
-let transition = agent::step(state, event1)?;
-let (state, effects) = transition.commit(&store).await?;
-executor.wake(effects);
-
-let transition = agent::step(state, event2)?;
-let (state, effects) = transition.commit(&store).await?;
-executor.wake(effects);
+let mut state = store.read(version).await?;
+let expected = state.version();
+let effects = state.step(&event)?;
+let proposal = Commit {
+    expected,
+    event: &event,
+    state: &state,
+    effects: &effects,
+};
+executor.wake(store.commit(&proposal).await?);
 ```
 
-The executor drains the durable outbox separately from the event pump. A lost
-wakeup cannot lose work.
+The executor drains the durable outbox independently. A lost wakeup cannot lose
+work. The kernel's async loop selects ready service outcomes or incoming input,
+including cancellation, and applies one event at a time. It does not await
+operations in submission order or let progress streams starve control input.
+The server submits input and supervises this loop; it does not drive individual
+operation completions. Live futures stay outside `State`.
+
+Inputs and observations are durable before delivery, and events remain
+unacknowledged until their transitions commit. Dropping an idle wait cannot lose
+an event or cancel an operation; recovery reconciles service records and resumes
+observation.
 
 ## Cancellation and recovery
 
@@ -312,13 +400,14 @@ wakeup cannot lose work.
   later outcomes remain evidence but cannot continue the turn. Return to `Ready`
   only after all outstanding outcomes are terminal. Claiming an effect and checking
   cancellation must be atomic; claimed requests can still race with cancellation.
-  The bash service remembers cancellation by operation ID even before submission.
+  The terminal service remembers cancellation by operation ID even before submission.
 - Busy branches reject `Start`; the kernel may queue inputs without blocking
   outcome/cancellation events. Duplicate events do not repeat transitions. Late or
   mismatched outcomes remain linked to their original operations.
-- Cancellation waits for the current bounded read/step/commit. After an aborted
-  pump, reload durable state under the branch writer and reconcile any ambiguous
-  commit before resuming or dispatching work.
+- Cancellation wakes the kernel's idle wait and otherwise follows the current
+  bounded read/step/commit. After an aborted pump, reload durable state under the
+  branch writer and reconcile any ambiguous commit before resuming or dispatching
+  work.
 - Retain both session traces and service records, linked by operation ID. A crash
   can leave a missing observation after a tool has completed. Query its record to
   recover the result or resume observation; unresolved work stays unresolved.
@@ -327,10 +416,11 @@ wakeup cannot lose work.
 
 ## Runtime, forking, and evaluation
 
-The kernel starts by validating state, acquiring branch writers, and
-reconciling operations. Shutdown stops intake, finishes or reconciles commits,
-applies cancellation policy, and supervises workers. The server starts the kernel
-and HTTP listeners and forwards shutdown signals. Rust applications can manage
+The kernel starts by resolving workspace service bindings, validating state,
+acquiring branch writers, and reconciling operations. Shutdown stops intake,
+finishes or reconciles commits, applies cancellation policy, and supervises
+workers. The server starts the kernel and HTTP listeners and forwards shutdown
+signals. Rust applications can manage
 the same kernel lifecycle directly. Clients do not own branch or service lifetimes.
 Agent policy defines triggers; clocks, watchers, and HTTP deliver them.
 
@@ -351,10 +441,11 @@ Search can generate and score independent candidates from the same state,
 then select a continuation or fork. Branches must isolate tool workspaces or defer
 tool effects until selection. The ordinary agent keeps its single-generation policy.
 
-Evaluations use pure transitions with state fixtures or the kernel's Rust API
-with budgets, interpreters, and graders. Neither needs an HTTP server. Scripted
-session events need no service dependencies. Real interpreters retain exact inputs,
-outcomes, and tool evidence. GEPA consumes trial scores, traces, and diagnostic feedback.
+Evaluations call state methods with scripted events and assert both the updated
+state and returned effects, or use the kernel's Rust API with budgets, interpreters,
+and graders. Neither needs an HTTP server. Scripted session events need no service
+dependencies. Real interpreters retain exact inputs, outcomes, and tool evidence.
+GEPA consumes trial scores, traces, and diagnostic feedback.
 
 ## Review sequence
 
@@ -362,15 +453,21 @@ outcomes, and tool evidence. GEPA consumes trial scores, traces, and diagnostic 
    commit semantics, and recovery.
 2. **Gen AI service:** `GenAiClient` and private drivers; local HTTP fixtures for
    awaited observations, native continuation, incomplete outcomes, and cancellation.
-3. **Agent:** owned vector state, enum-based transitions, in-memory store,
-   scripted events, and bounded compaction. Check independent clones, determinism,
-   invalid phase/event rejection, commit gating, cancellation, and duplicates.
-4. **Bash service:** `BashClient`, shared terminal, output streams, durable operation
-   records, cancellation, deduplication, and worker supervision.
-5. **Kernel:** Rust API, agent tool catalog/adapters, interpreters, durable storage,
+3. **Agent:** owned vector state, mutable methods, explicit effects, scripted
+   events, and bounded compaction. Check independent clones, determinism, unchanged
+   state on rejection, cancellation, and duplicates.
+4. **Terminal service:** `TerminalClient`, shared processes, cursor-based output,
+   cancellation, deduplication, and worker supervision. Check independent readers,
+   input ordering, PTY controls, and worker loss.
+5. **Filesystem service:** `FilesystemClient`, bounded reads, create/edit, and
+   operation records. Check stale edits, ambiguous matches, symlink targets,
+   create conflicts, and recovery after interrupted writes.
+6. **Kernel:** Rust API, agent tool catalog/adapters, interpreters, durable storage,
    delivery, reconciliation, and shutdown. Test fixed-context request construction,
    argument validation, outcome translation, continuation restoration, and
-   invocation-ID mapping without HTTP.
-6. **Server/protocol:** HTTP schemas, endpoints, and streams over the kernel API.
-7. **GUI:** session/thread browsing and shared service controls in Yew.
-8. **Evaluation/GEPA:** isolated task fixtures and inspectable optimizer feedback.
+   invocation-ID mapping without HTTP. Check commit gating, dropped waits,
+   completion multiplexing, cancellation while operations are pending, workspace
+   discovery, and internal subagent creation/messaging.
+7. **Server/protocol:** HTTP schemas, endpoints, and streams over the kernel API.
+8. **GUI:** session/thread browsing and shared service controls in Yew.
+9. **Evaluation/GEPA:** isolated task fixtures and inspectable optimizer feedback.
