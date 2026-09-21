@@ -81,6 +81,12 @@ impl StubHttpServer {
         Self::spawn_sequence(responses).await
     }
 
+    pub async fn sequence_then_pending(responses: Vec<Vec<u8>>) -> Self {
+        let mut connections: Vec<_> = responses.into_iter().map(|r| vec![r]).collect();
+        connections.push(vec![]);
+        Self::spawn_inner(connections).await
+    }
+
     /// An SSE success response, as the bytes [`Self::sequence`] takes.
     pub fn sse_response(events: Vec<serde_json::Value>) -> Vec<u8> {
         let mut out =
@@ -144,6 +150,9 @@ impl StubHttpServer {
                 // Only the first request is reported; retries resend it verbatim.
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(captured);
+                }
+                if writes.is_empty() {
+                    let _ = stream.read_u8().await;
                 }
                 for write in writes {
                     stream.write_all(&write).await.expect("write response");

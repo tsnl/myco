@@ -666,7 +666,6 @@ async fn boot<S: EventSink + 'static>(
     runner.set_compactor(
         Arc::new(ModelCompactor {
             model: catalog_model.clone(),
-            harness: harness.clone(),
         }),
         catalog_model.spec.auto_compact_at_tokens,
     );
@@ -756,6 +755,10 @@ async fn run_interactive(args: Args) {
                 if automatic { "auto-" } else { "" }
             ));
         }
+        WorkflowEvent::CompactionProgress { elapsed } => workflow_ui.note(&format!(
+            "compacting: {}s elapsed (Ctrl-C to cancel)",
+            elapsed.as_secs()
+        )),
         WorkflowEvent::Compacted(outcome) => {
             clear_screen();
             workflow_ui.compacted_banner(&outcome);

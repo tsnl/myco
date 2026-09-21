@@ -663,17 +663,19 @@ async fn cancellation_during_a_turn_or_compaction_never_resumes() {
         let env = pipe_env("cancel-compact");
         let marker = env.dir.join("tool-started");
         let mut responses = vec![];
-        if during_compaction {
-            responses.push(model_answer("working", 80_000));
-        }
-        responses.push(model_tool(
-            "bash",
-            serde_json::json!({
-                "command":format!("touch '{}' && sleep 30", marker.display()),
-            }),
-            80_000,
-        ));
-        let server = test_utils::StubHttpServer::sequence(responses).await;
+        let server = if during_compaction {
+            test_utils::StubHttpServer::sequence_then_pending(vec![model_answer("working", 80_000)])
+                .await
+        } else {
+            responses.push(model_tool(
+                "bash",
+                serde_json::json!({
+                    "command":format!("touch '{}' && sleep 30", marker.display()),
+                }),
+                80_000,
+            ));
+            test_utils::StubHttpServer::sequence(responses).await
+        };
         configure_compact(&env, &server, true);
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
             .env("MYCO_HOME", &env.dir)
@@ -693,12 +695,16 @@ async fn cancellation_during_a_turn_or_compaction_never_resumes() {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !marker.exists() {
+            while if during_compaction {
+                server.connections() < 2
+            } else {
+                !marker.exists()
+            } {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("tool must start before cancellation");
+        .expect("work must start before cancellation");
         let status = tokio::process::Command::new("kill")
             .args(["-INT", &child.id().unwrap().to_string()])
             .status()

@@ -196,6 +196,12 @@ and editor read stamps continue across compaction. The console mirror keeps the 
 run, and Ctrl-L reprints the active thread's visible retained context. Read the
 summary through `session_history` or the summary path shown in the banner.
 
+The compaction worker can only read its assigned thread and write one summary
+(at most 8,000 characters). It has no shell, editor, prelude, or host access.
+Compaction stops after 12 model requests (including retries) or 120 seconds;
+the CLI reports elapsed time every 10 seconds. Ctrl-C cancels it. A failed or
+cancelled compaction leaves the current thread intact.
+
 Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,
 compact-formatted (`63.8k/200k`). `used` is 0 until a provider usage report arrives, and `?`
 (no percentage) on sessions resumed from before usage tracking. Once a turn has finished, a
