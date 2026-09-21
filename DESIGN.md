@@ -9,17 +9,16 @@ review sequence at the end of this document.
 | Crate | Responsibility |
 | --- | --- |
 | `myco-genai` | One generative inference attempt through a concrete `Client`, configured by a backend `Config` enum. OpenAI Responses and Anthropic Messages drivers are private implementation details. |
-| `myco-agent` | Session and thread logic, immutable checkpoints, typed state transitions, context assembly, and autocompaction. Stateless transition functions return proposed checkpoints and effects; the crate defines persistence contracts without prescribing storage formats. |
+| `myco-agent` | The session language: thread entries, immutable checkpoints, typed state transitions, context selection, and autocompaction policy. Stateless transition functions return proposed checkpoints and effects; the crate defines persistence contracts without prescribing storage formats. |
 | `myco-tools` | Shared tool instances, worker lifetimes, operation records, observation streams, and human/agent control through `Harness`. |
 | `myco-protocol` | Versioned HTTP request/response and streamed-event schemas shared by server and clients. Wire types are separate from agent and tool implementation types. |
-| `myco-server` | Application crate composing state transitions, generation, tools, storage, and protocol. Its runtime owns branch writers, workspaces, persistence formats, event delivery, effect dispatch, task supervision, HTTP endpoints, and process lifecycle. |
+| `myco-server` | Application crate composing state transitions, generation, tools, storage, and protocol. Its interpreters translate the session language into service requests and translate results into session events. Its runtime owns branch writers, workspaces, persistence formats, event delivery, task supervision, HTTP endpoints, and process lifecycle. |
 | `myco-gui` | Yew frontend using `myco-protocol` to interact with agents and shared tools. |
 
 ```mermaid
 flowchart TD
     server[myco-server] --> agent[myco-agent]
     server --> genai[myco-genai]
-    agent --> genai
     server --> tools[myco-tools]
     server --> protocol[myco-protocol]
     gui[myco-gui / Yew] --> protocol
@@ -28,13 +27,15 @@ flowchart TD
 Arrows denote Rust dependencies. `myco-protocol` is usable in the browser and
 does not import the server or the agent engine. The server maps between wire
 types and domain types. Lower crates have no dependency on application storage,
-HTTP routing, or UI code. `myco-agent` uses generative request/response types but
-does not call model or tool services during a transition.
+HTTP routing, or UI code. `myco-agent` has no dependency on `myco-genai` or
+`myco-tools`, including their request, response, and tool-call types. Those
+service crates likewise have no dependency on the session language.
 
-The direct `myco-server` dependency on `myco-genai` is intentional: the server's
-effect interpreter invokes the generation client after commit. The agent crate
-decides what to generate and how to interpret the outcome. Service execution
-does not live inside `agent::step`.
+The server composes these independent domains. Its effect interpreter constructs
+service requests after commit and translates service outcomes into session
+events. The agent crate decides what work to request and whether the resulting
+candidate may advance the conversation. Service execution and translation do
+not live inside `agent::step`.
 
 `Client::generate` is an async operation returning one `Result<Response, Error>`.
 An async, fallible observation callback receives request evidence and provider
@@ -60,8 +61,9 @@ semantics. The shared runtime handles operation correlation and supervision;
 there is no universal service protocol or combined services crate in this design.
 
 The `agent` module supplies the default conversation policy through stateless
-transition functions. All state affecting prompts, context, compaction, tool
-requests, outcome interpretation, and turn completion is explicit in checkpoints.
+transition functions. Instructions, context selection, permitted tools,
+compaction policy, and turn completion are explicit in checkpoints.
+The interpreter renders that context for the selected service.
 A running branch comprises a mailbox, an exclusively owned `State<P>`, and the
 runtime's operation tracking. Checkpoints record which outcomes are awaited;
 service clients and live execution handles belong to the runtime and services.
@@ -70,10 +72,10 @@ service clients and live execution handles belong to the runtime and services.
 flowchart LR
     event[Incoming event] --> controller[Controller: decide transition]
     controller --> commit[Runtime: commit state and effects]
-    commit --> dispatch[Runtime: dispatch effects]
+    commit --> dispatch[Interpreter: translate and dispatch effects]
     dispatch --> generation[Generation service]
     dispatch --> tools[Tool services]
-    generation --> outcome[Progress and outcome events]
+    generation --> outcome[Interpreter: session events]
     tools --> outcome
     outcome --> event
 ```
@@ -81,6 +83,64 @@ flowchart LR
 The event pump remains available while services run. Each branch handles one
 event at a time; independent operations and branches may run concurrently.
 Only state transitions can propose changes to the accepted transcript.
+
+## Session language and interpretation
+
+The session language is typed data owned by `myco-agent`: conversation entries,
+operation intents, and the events that settle those operations. It describes
+what happened and what should happen next without choosing an inference API's
+message format.
+
+| Session concept | Meaning |
+| --- | --- |
+| Thread entry | Accepted conversation content, such as user input, assistant text, a tool invocation, or its result. |
+| `GenerationIntent` | Request a reply or compaction from one fixed checkpoint. |
+| Candidate | Proposed ordered conversation content with a completion status; acceptance requires a transition. |
+| `GenerationFinished` | Correlate a candidate or failure with its operation and retained evidence. |
+| `ToolInvocation` | Name a logical capability, complete structured arguments, and a session invocation ID. |
+| `ToolFinished` | Associate a result or failure with the requested invocation and operation. |
+
+These types express conversation semantics. They are not aliases for, or
+wrappers around, `myco_genai::Request`, `Response`, `Message`, or `ToolCall`.
+Checkpoints, state views, traces, and events contain session values and opaque
+evidence references; they do not embed service payloads. Completion status and
+usage needed for turn policy or budgets are session values too. Raw finish codes,
+transport errors, and provider metadata remain in interpreter records.
+
+The generation interpreter in `myco-server` performs this translation:
+
+1. Resolve the intent's fixed checkpoint and its versioned interpreter binding.
+   The checkpoint selects instructions, context, tool capabilities, and policy;
+   the binding supplies model/backend configuration and provider options.
+2. Construct a `myco_genai::Request`, including messages and tool schemas, and
+   record the resolved configuration and exact request before dispatch.
+3. Invoke `myco_genai::Client`, retaining observations and the final response or
+   failure. Translate progress and completion into session events.
+4. Deliver the correlated event. The controller validates it and proposes
+   acceptance, tool execution, compaction, or turn completion through a new commit.
+
+The interpreter preserves completion, refusal, truncation, and failure as distinct
+semantic outcomes. Provisional output and incomplete tool arguments cannot become
+executable invocations. Translating a tool call does not authorize its execution;
+the controller still validates the selected capability and conversation policy.
+Tool-service requests and results cross the same interpretation boundary.
+
+Provider-native continuation data is retained even when it has no session-level
+meaning. Interpreter records keep the exact response, opaque reasoning state,
+provider call IDs, and their mapping to session invocation IDs. Replaying an
+outcome preserves those mappings and IDs. Session entries reference this evidence
+by immutable ID/version. The interpreter restores native continuation when
+constructing later requests; the state machine does not decode it. Retaining or
+forking a checkpoint retains the reachability of its evidence,
+without requiring those records to remain resident in memory. Missing or
+incompatible continuation is an explicit error, never silently discarded.
+
+An operation's interpreter binding and translation version are pinned and recorded
+so recovery does not reinterpret it using the latest configuration. Evidence is
+durable before a delivered event can commit a reference to it. A scripted
+interpreter can produce session events directly, allowing controller evaluations
+without inference clients. Translation tests separately check how real service
+payloads map to and from the session language.
 
 ## Sessions, threads, and immutable checkpoints
 
@@ -135,8 +195,9 @@ same historical values rather than substituting the latest session metadata.
 ## Generation and transcript acceptance
 
 Generation does not mutate a thread directly. A committed generation operation
-records its originating turn, target thread, input transcript revision, and
-purpose. Progress is retained as evidence; it does not advance that transcript
+records its originating turn, target thread, source checkpoint, and purpose.
+The source fixes the input transcript revision and interpreter binding.
+Progress is retained as evidence; it does not advance that transcript
 revision. On completion, the controller checks the operation's correlation and
 target revision before proposing an append. The store commits that append with
 the controller transition and any follow-up effects. Repeated terminal outcomes
@@ -282,9 +343,10 @@ or policies can refine the graph without exposing arbitrary state mutation.
 
 The event's phase is a static check for typed callers. Turn IDs, operation IDs,
 the remaining number of tool results, and whether a generation requested tools
-are runtime facts. Those require validation even in the typed API. A provider's
-tool-call ID is retained for inference history but is not used as a globally
-unique execution ID.
+are runtime facts. Those require validation even in the typed API. Session
+invocation IDs correlate transcript entries and tool results. Provider call IDs
+remain in the interpreter's mapping records; neither replaces the operation ID
+used for execution and deduplication.
 
 The server receives an `AgentEvent` enum from runtime sources. A `RuntimeState`
 enum holds the possible typed owners and routes each event through the same
@@ -328,12 +390,24 @@ pub struct Effect {
     pub action: Action,
 }
 
+pub struct GenerationIntent {
+    pub source: StateVersion,
+    pub purpose: GenerationPurpose,
+}
+
 pub enum Action {
-    Generate { purpose: GenerationPurpose, request: myco_genai::Request },
-    InvokeTool { call: myco_genai::ToolCall },
+    Generate(GenerationIntent),
+    InvokeTool(ToolInvocation),
     Cancel { target: OperationId },
 }
 ```
+
+`GenerationIntent::source` identifies an immutable checkpoint, not a branch's
+moving head. It can name the successor proposed by the same transition: commit
+publishes that checkpoint and the intent atomically. A `Start` therefore includes
+its newly accepted input in the generation context. The effect carries no
+preassembled genai request. `ToolInvocation` belongs to the session vocabulary
+and resolves through the capability binding pinned for the operation.
 
 Generation and tool invocation use the same commit/dispatch/outcome cycle while
 retaining distinct typed payloads. Service completion does not execute returned
@@ -423,10 +497,10 @@ This example uses `RuntimeState` implementing `Step<AgentEvent>`; a typed
 caller matches branching successor enums between steps. The effect interpreter
 runs committed requests separately from the event pump in `myco-server`. A
 wakeup only prompts it to drain the durable queue, so a crash between commit
-and notification does not lose work. It invokes a configured
-`myco_genai::Client` and injected `myco_tools::Harness` implementations and
-delivers correlated progress/outcomes as later events. Evaluations can
-substitute the interpreter's generation behavior with scripted responses.
+and notification does not lose work. It translates session intents into requests
+for a configured `myco_genai::Client` or injected `myco_tools::Harness`, then
+delivers progress/outcomes in the session language as later events. Evaluations can
+substitute an interpreter that produces scripted session events.
 Different effects and different branches can execute concurrently. In-memory
 evaluation stores implement the same commit contract without requiring disk
 storage.
@@ -499,16 +573,17 @@ supervises workers. Client connections do not own branch or tool lifetimes.
 Trigger semantics live in the `agent` module; clocks, watchers, and HTTP
 requests deliver trigger events from outside it.
 
-The server supervises service-operation futures and routes their observations
-back through the event pump. The common agent interface can remain convenient
-without embedding generation inside a consuming state transition. Runtime
-supervision and conversation decisions remain separate responsibilities even
-when one application hosts both.
+The server supervises service-operation futures and translates their observations
+into session events for the event pump. The common agent interface can remain
+convenient without embedding generation inside a consuming state transition.
+Runtime supervision and conversation decisions remain separate responsibilities
+even when one application hosts both.
 
 `myco-protocol` covers workspace, session, thread, branch, and tool operations
 and their observation streams. Mutating requests carry request IDs for deduplication;
 acceptance is distinct from completion. Stream cursors support reconnecting
-clients. Wire versions and storage versions are independent. `myco-gui` is a Yew
+clients. The wire schemas do not re-export genai request/response types.
+Wire versions and storage versions are independent. `myco-gui` is a Yew
 client of this HTTP API, using the same operations available to machine callers.
 There is no interactive CLI in this application.
 
@@ -563,8 +638,8 @@ is selected in this design layer.
 ## Review sequence
 
 1. **Architecture and interfaces.** Review the crate graph, typed/dynamic
-   transition boundary, state/effect commit contract, service execution,
-   cancellation, recovery, and immutable checkpoint/branch ownership.
+   transition boundary, session language and interpretation, state/effect commit
+   contract, cancellation, recovery, and immutable checkpoint/branch ownership.
 2. **Generative AI boundary.** Implement `myco-genai`: a concrete async client,
    private backend drivers, awaited observations, native continuation,
    explicit incomplete/error outcomes, and future-drop cancellation. Validate
@@ -576,12 +651,15 @@ is selected in this design layer.
    unchanged; checkpoint clones cannot step or dispatch; rejection preserves
    ownership; illegal typed transitions fail to compile; the dynamic facade
    matches typed behavior; and no dispatch precedes commit. Check cancellation,
-   duplicate outcomes, and recovery preserve transcript integrity.
+   duplicate outcomes, and recovery preserve transcript integrity. Build and test
+   the agent crate without dependencies on genai or tool-service types.
 4. **Shared tools.** Implement `myco-tools` with one workspace terminal,
    independent observers, human/agent control, operation records, cancellation,
    and worker supervision. Test deduplication and ambiguous execution outcomes.
 5. **Protocol and server.** Define `myco-protocol` wire contracts and implement
-   `myco-server`, durable state, effect delivery, reconciliation, and shutdown.
+   `myco-server`, session interpreters, durable state, effect delivery,
+   reconciliation, and shutdown. Test request construction from fixed checkpoints,
+   outcome translation, native continuation restoration, and invocation-ID mapping.
 6. **Yew GUI.** Implement `myco-gui` for session/thread browsing and shared tools.
 7. **Evaluation and GEPA.** Run isolated task fixtures through the same agent
    interfaces and emit inspectable results and optimizer feedback.
