@@ -139,7 +139,8 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
             .unwrap(),
     )
     .unwrap();
-    let line = myco::tui::transcript::acceptance_line(Some(time.with_timezone(&chrono::Utc)));
+    let line =
+        myco::tui::transcript::turn_header("ASSISTANT", Some(time.with_timezone(&chrono::Utc)));
     assert!(stdout.contains(&line), "{stdout}");
     let replay = run_myco(
         &env,
@@ -147,7 +148,12 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
         b"/quit\n",
     )
     .await;
-    assert!(replay.contains(&line), "{replay}");
+    assert!(
+        replay.contains(&line.replace("ASSISTANT", "USER")),
+        "{replay}"
+    );
+    assert!(!stdout.contains("Accepted:"));
+    assert!(!replay.contains("Accepted:"));
     assert!(!replay.contains("# Session"), "{replay}");
     assert!(!replay.contains("Launch directory:"), "{replay}");
 }

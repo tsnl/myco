@@ -33,8 +33,10 @@ plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
-Accepted user turns carry a persisted UTC acceptance time, shown as `Accepted:`
-below the input in live output and replay. Older human turns have unknown
+Accepted user turns carry a persisted UTC acceptance time in their ASSISTANT
+banner, for example `ASSISTANT · 2026-09-21T22:00:00Z`. Replay also puts that time
+in the corresponding USER banner. The live USER prompt appears before submission;
+the timestamped ASSISTANT banner opens when the input is accepted. Older human turns have unknown
 timestamps; their creation time is not substituted. Runtime context (session
 identity, compaction summaries, and automatic continuation instructions) is
 stored as system parts. The model receives their text, but transcript replay
@@ -175,10 +177,10 @@ can compact and continue before the process exits.
 - Bash commands appear in full below their tool options, prefixed with `$`, with
   line breaks, indentation, and quoting preserved. Text sent to a running Bash
   session appears in full under `stdin:`, prefixed with `>`. Long lines wrap at
-  the `--wrap` width; `↪` marks a display continuation, while source lines are
+  the box width; `↪` marks a display continuation, while source lines are
   indented by two spaces. Long paths and other unbroken arguments also wrap.
-  `--wrap off` and piped output add no wrapping. Control characters other than
-  tabs and newlines appear as escapes. Host, session, and timeout options remain
+  With prose wrapping off or piped output, boxes use 72 columns. Control characters
+  other than newlines (including tabs) appear as escapes. Host, session, and timeout options remain
   visible above the command. Live output, history replay, and the console mirror
   use the same format. Other tool strings use bounded JSON previews.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
@@ -208,13 +210,22 @@ summary inside a unified ASSISTANT section; it is stored in session history for 
 but stripped from provider requests. Generate failures (e.g. context overflow) open a headed
 ERROR section (live only; not stored in session history).
 
-Tool failures and process outcomes appear as short `↳` lines identifying the
+Tool inputs and outcomes share a rounded box with the tool name in its top
+border. Concurrent tools use titled separators inside the same box. Commands
+appear immediately in cyan, options are dim, and tool failures and nonzero bash
+exits are red. Frames use the wrap width, or 72 columns when prose wrapping is
+off; `↪` marks continued display lines. The console mirror and replay use the
+same layout without adding terminal escapes to the mirror.
+
+Tool failures and process outcomes appear inside the box as short `↳` lines identifying the
 tool, host, and command or session. They come from the tool result, independently
 of the assistant's answer, and appear again on replay. Successful tool output
 stays in history without being printed; bash process exits show their exit code
 or signal. A running shell's status does not imply that each command sent to its
 stdin succeeded. Cancellation reports partial results or unknown effects.
 
+Manual and automatic compaction open a **COMPACTING** system section showing
+the session, thread, and cancellation hint; elapsed-time updates stay within it.
 `/compact` creates a successor thread in the current session. It clears the screen
 (scrollback included) and prints a **COMPACTED** banner listing the session, the new thread,
 its predecessor, the retained message count, and the summary path. Older threads stay in

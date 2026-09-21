@@ -18,7 +18,7 @@ use super::markdown::{MarkdownRenderer, render_block};
 use crate::generative_model::{Content, Message, TokenUsage};
 use crate::tui::{
     SectionState, Style, TuiEvent, encode_ansi, encoded_ends_with_newline, section_open_events,
-    styled_line, tool_invocation_events,
+    styled_line,
 };
 
 /// Thin 72-col rule before ASSISTANT / MYCO / ERROR / WARNING section headers
@@ -245,9 +245,9 @@ pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
     history_events_at(messages, palette, &std::collections::BTreeMap::new())
 }
 
-pub fn acceptance_line(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
+pub fn turn_header(role: &str, time: Option<chrono::DateTime<chrono::Utc>>) -> String {
     format!(
-        "Accepted: {}",
+        "{role} · {}",
         time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "unknown".into())
     )
@@ -275,8 +275,10 @@ pub fn history_events_at(
                 if text.is_empty() && note.is_none() {
                     continue;
                 }
+                st.finish_tools(&mut events);
+                let time = times.get(&index).copied();
                 styled_line(&mut events, Style::USER, &user_rule(palette.wrap));
-                styled_line(&mut events, Style::USER, "USER");
+                styled_line(&mut events, Style::USER, &turn_header("USER", time));
                 events.push(TuiEvent::Text("\n".into()));
                 // Wrap-only (no markdown styling): the user's own words replay
                 // as typed, at the transcript width — same as the live echo.
@@ -291,12 +293,9 @@ pub fn history_events_at(
                 if let Some(note) = note {
                     events.push(TuiEvent::Text(format!("{note}\n")));
                 }
-                events.push(TuiEvent::Text(format!(
-                    "{}\n",
-                    acceptance_line(times.get(&index).copied())
-                )));
                 // Next assistant turn opens a fresh ASSISTANT section.
                 st = SectionState::new();
+                st.turn_time = time;
             }
             Message::AssistantMessage {
                 content, tool_uses, ..
@@ -328,9 +327,7 @@ pub fn history_events_at(
                     }
                 }
                 for tu in tool_uses {
-                    st.ensure_assistant(&mut events, palette.wrap);
-                    st.separate_paragraph_if_needed(&mut events);
-                    tool_invocation_events(&mut events, &tu.name, &tu.input, palette.wrap);
+                    st.start_tool(&mut events, &tu.name, &tu.input, palette.wrap);
                     st.at_line_start = true;
                     st.need_blank = true;
                 }
@@ -340,17 +337,13 @@ pub fn history_events_at(
                     index.checked_sub(1).and_then(|i| messages.get(i))
                 {
                     for (tool, result) in tool_uses.iter().zip(tool_use_results) {
-                        if let Some(line) = super::tool_outcome_line(tool, result) {
-                            st.ensure_assistant(&mut events, palette.wrap);
-                            styled_line(&mut events, Style::WARNING, &line);
-                            st.at_line_start = true;
-                            st.need_blank = true;
-                        }
+                        st.tool_result(&mut events, tool, result, palette.wrap);
                     }
                 }
             }
         }
     }
+    st.finish_tools(&mut events);
     events
 }
 
@@ -429,9 +422,23 @@ mod tests {
     }
 
     fn render_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
+        encode_ansi(&tool_events(name, input, palette.wrap), palette.enabled)
+    }
+
+    fn tool_events(name: &str, input: &serde_json::Value, wrap: Option<usize>) -> Vec<TuiEvent> {
         let mut events = Vec::new();
-        tool_invocation_events(&mut events, name, input, palette.wrap);
-        encode_ansi(&events, palette.enabled)
+        let frame = super::super::tool_box::ToolBox::open(&mut events, name, wrap);
+        frame.input(&mut events, name, input);
+        frame.close(&mut events);
+        events
+    }
+
+    fn box_body(text: &str) -> String {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("│ ")?.strip_suffix(" │"))
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -535,21 +542,24 @@ mod tests {
         let rendered = render_history(&tool_loop(), Palette::plain());
 
         assert!(rendered.contains(&user_rule(None)));
-        assert!(rendered.contains("USER\n\nhello\n"));
+        assert!(rendered.contains("USER · unknown\n\nhello\n"));
         assert!(!rendered.contains("> hello"));
         // Tools live inside ASSISTANT (no TOOL header). One ASSISTANT open per turn.
-        assert!(rendered.contains(&format!("{SECTION_RULE}\nASSISTANT\n\nhi there\n")));
+        assert!(rendered.contains(&format!(
+            "{SECTION_RULE}\nASSISTANT · unknown\n\nhi there\n"
+        )));
         assert!(!rendered.contains("TOOL\n"));
         assert!(!rendered.contains("RESPONSE\n"));
         // Tool commands are ASSISTANT paragraphs, separated from text.
-        assert!(rendered.contains("hi there\n\nbash()\n$ echo hi\n"));
+        assert!(rendered.contains("hi there\n\n╭─ bash "));
+        assert!(rendered.contains("│ $ echo hi "));
         // Blank line before section rule/header.
         assert!(rendered.contains("\n\n────────────────────────────────"));
         // Tool results silent (no tool-use id leaks).
         assert!(!rendered.contains("t1"));
         // Multi-step assistant messages (tool loop) stay in one ASSISTANT section.
         assert!(rendered.contains("done\n"));
-        assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
+        assert_eq!(rendered.matches("ASSISTANT · unknown\n").count(), 1);
     }
 
     #[test]
@@ -582,13 +592,15 @@ mod tests {
         assert!(!rendered.contains("TOOL\n"));
         // Thinking replayed as an ASSISTANT paragraph (same prefix as live UI).
         assert!(rendered.contains(&format!(
-            "{SECTION_RULE}\nASSISTANT\n\nThinking: step a\nstep b\n"
+            "{SECTION_RULE}\nASSISTANT · unknown\n\nThinking: step a\nstep b\n"
         )));
         assert!(rendered.contains("Thinking: step a\nstep b\n\nanswer\n"));
         // Tools are paragraphs inside ASSISTANT, blank-separated.
-        assert!(rendered.contains("answer\n\nbash()\n$ echo 1\n"));
-        assert!(rendered.contains("echo 1\n\nbash()\n$ echo 2\n"));
-        assert_eq!(rendered.matches("ASSISTANT\n").count(), 1);
+        assert!(rendered.contains("answer\n\n╭─ bash "));
+        assert!(rendered.contains("│ $ echo 1 "));
+        assert!(rendered.contains("├─ bash "));
+        assert!(rendered.contains("│ $ echo 2 "));
+        assert_eq!(rendered.matches("ASSISTANT · unknown\n").count(), 1);
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
@@ -706,10 +718,14 @@ mod tests {
         );
         let input = json!({"command":command, "host":"devbox", "timeout_ms":5000});
         let original = input.clone();
-        let rendered = render_tool_invocation("bash", &input, Palette::plain());
+        let rendered =
+            render_tool_invocation("bash", &input, Palette::plain().with_wrap(Some(240)));
         assert_eq!(
-            rendered,
-            format!("bash({{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}})\n$ {command}\n")
+            box_body(&rendered),
+            format!(
+                "{{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}}\n$ {}",
+                command.replace('\n', "\n  ")
+            )
         );
         assert_eq!(input, original);
     }
@@ -720,12 +736,13 @@ mod tests {
         let rendered = render_tool_invocation(
             "bash",
             &json!({"action": "send", "session_id": "shell", "stdin": stdin}),
-            Palette::plain(),
+            Palette::plain().with_wrap(Some(240)),
         );
         assert_eq!(
-            rendered,
+            box_body(&rendered),
             format!(
-                "bash({{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}})\nstdin:\n> {stdin}"
+                "{{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}}\nstdin:\n> {}",
+                stdin.trim_end_matches('\n').replace('\n', "\n  ")
             )
         );
     }
@@ -737,7 +754,7 @@ mod tests {
         let rendered = render_tool_invocation("bash", &input, Palette::plain().with_wrap(Some(30)));
         assert_eq!(
             rendered,
-            "bash()\n$ cargo test --locked \n↪ --workspace --lib\n  echo done\n"
+            "╭─ bash ─────────────────────╮\n│ $ cargo test --locked      │\n│ ↪ --workspace --lib        │\n│   echo done                │\n╰────────────────────────────╯\n"
         );
         assert_eq!(input["command"], command);
     }
@@ -749,13 +766,23 @@ mod tests {
             "路径e\u{301}".repeat(30)
         );
         for width in [8, 20, 80] {
-            let rendered = render_tool_invocation(
-                "bash",
-                &json!({"command": command}),
-                Palette::plain().with_wrap(Some(width)),
-            );
+            let events = tool_events("bash", &json!({"command": command}), Some(width));
+            let rendered = super::super::encode_plain(&events);
+            for line in rendered.lines() {
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(line),
+                    width,
+                    "{line:?}"
+                );
+            }
             let mut restored = String::new();
-            for (index, line) in rendered.lines().skip(1).enumerate() {
+            let rows = events.windows(2).filter_map(|pair| match pair {
+                [TuiEvent::Style(style), TuiEvent::Text(line)] if *style == Style::USER => {
+                    Some(line)
+                }
+                _ => None,
+            });
+            for (index, line) in rows.enumerate() {
                 let continuation = line.starts_with("↪ ");
                 let content = line
                     .strip_prefix("$ ")
@@ -766,16 +793,8 @@ mod tests {
                     restored.push('\n');
                 }
                 restored.push_str(content);
-                let columns = line.chars().fold(0, |col, ch| {
-                    col + if ch == '\t' {
-                        8 - col % 8
-                    } else {
-                        unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
-                    }
-                });
-                assert!(columns <= width, "width={width}: {line:?}");
             }
-            assert_eq!(format!("{restored}\n"), command);
+            assert_eq!(format!("{restored}\n"), command.replace('\t', "\\t"));
         }
     }
 
@@ -787,8 +806,8 @@ mod tests {
             Palette::plain(),
         );
         assert_eq!(
-            rendered,
-            "bash()\n$ echo \\u{1b}[2J\nstdin:\n> hello\\rworld\\u{7}\n"
+            box_body(&rendered),
+            "$ echo \\u{1b}[2J\nstdin:\n> hello\\rworld\\u{7}"
         );
     }
 
@@ -800,17 +819,17 @@ mod tests {
             Palette::plain(),
         );
         assert_eq!(
-            rendered,
-            "bash({\n  \"action\": \"start\",\n  \"session_id\": \"s\",\n  \"timeout_ms\": 1000\n})\n"
+            box_body(&rendered),
+            "{\n  \"action\": \"start\",\n  \"session_id\": \"s\",\n  \"timeout_ms\": 1000\n}"
         );
         // Scalars stay compact.
         assert_eq!(
-            render_tool_invocation("x", &json!(42), Palette::plain()),
-            "x(42)\n"
+            box_body(&render_tool_invocation("x", &json!(42), Palette::plain())),
+            "42"
         );
         assert_eq!(
-            render_tool_invocation("x", &json!("hi"), Palette::plain()),
-            "x(\"hi\")\n"
+            box_body(&render_tool_invocation("x", &json!("hi"), Palette::plain())),
+            "\"hi\""
         );
     }
 
@@ -827,21 +846,21 @@ mod tests {
             }),
             Palette::plain(),
         );
-        assert!(rendered.starts_with("write({"));
+        assert!(rendered.starts_with("╭─ write "));
         assert!(rendered.contains("\"path\": \"f.txt\""));
         // Truncated values end with ellipsis inside the JSON string.
         assert!(rendered.contains('…'));
         // Full original length must not appear.
         assert!(!rendered.contains(&"a".repeat(TOOL_DISPLAY_STRING_MAX + 50)));
         // Short strings unchanged.
-        assert!(rendered.contains("\"items\": [\n    \"short\","));
+        assert!(box_body(&rendered).contains("\"items\": [\n    \"short\","));
         // Scalar long string.
         let scalar = render_tool_invocation(
             "echo",
             &json!("d".repeat(TOOL_DISPLAY_STRING_MAX + 5)),
             Palette::plain(),
         );
-        assert!(scalar.starts_with("echo(\""));
+        assert!(scalar.starts_with("╭─ echo "));
         assert!(scalar.contains('…'));
         assert!(!scalar.contains(&"d".repeat(TOOL_DISPLAY_STRING_MAX + 5)));
     }
@@ -879,8 +898,8 @@ mod tests {
         assert!(rendered.contains("human request"));
         assert!(!rendered.contains("runtime notice"));
         assert!(!rendered.contains("private inventory"));
-        assert_eq!(rendered.matches("USER\n").count(), 1);
-        assert_eq!(rendered.matches("Accepted:").count(), 1);
+        assert_eq!(rendered.matches("USER · unknown\n").count(), 1);
+        assert!(!rendered.contains("Accepted:"));
     }
 
     #[test]
@@ -905,7 +924,7 @@ mod tests {
             rendered.contains("Thinking: secret-thought-aaa\n\nThinking: secret-thought-bbb\n")
         );
         assert!(rendered.contains("Thinking: secret-thought-bbb\n\ndone\n"));
-        assert!(rendered.contains("ASSISTANT\n"));
+        assert!(rendered.contains("ASSISTANT · unknown\n"));
     }
 
     #[test]
@@ -927,9 +946,9 @@ mod tests {
         let rendered = render_history(&tool_loop(), palette);
 
         // Headers and rules are wrapped in SGR sequences…
-        assert!(rendered.contains("\x1b[0;1;36mUSER\x1b[0m\n"));
+        assert!(rendered.contains("\x1b[0;1;36mUSER · unknown\x1b[0m\n"));
         assert!(rendered.contains(&format!("\x1b[0;1;36m{}\x1b[0m\n", user_rule(None))));
-        assert!(rendered.contains("\x1b[0;1;32mASSISTANT\x1b[0m\n"));
+        assert!(rendered.contains("\x1b[0;1;32mASSISTANT · unknown\x1b[0m\n"));
         // …while message bodies stay plain.
         assert!(rendered.contains("\nhello\n"));
         assert!(rendered.contains("\nhi there\n"));
@@ -948,15 +967,14 @@ mod tests {
     }
 
     #[test]
-    fn colored_tool_invocation_styles_only_the_name() {
+    fn colored_tool_invocation_distinguishes_frame_and_command() {
         let rendered = render_tool_invocation(
             "bash",
             &json!({"command": "echo hi"}),
             Palette::colored(true),
         );
-        assert!(rendered.starts_with("\x1b[0;1;33mbash\x1b[0m()"));
-        assert!(rendered.contains("$ echo hi\n"));
-        assert!(!rendered.contains("echo hi\x1b"));
+        assert!(rendered.starts_with("\x1b[0;1;33m╭─ bash "));
+        assert!(rendered.contains("\x1b[0;1;36m$ echo hi\x1b"));
     }
 
     #[test]

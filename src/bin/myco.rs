@@ -350,7 +350,7 @@ async fn run_print(args: Args) {
     let accepted_at = chrono::Utc::now();
     eprintln!(
         "{}",
-        myco::tui::transcript::acceptance_line(Some(accepted_at))
+        myco::tui::transcript::turn_header("USER", Some(accepted_at))
     );
     let outcome = runner.submit(content, accepted_at, cancel).await;
     sigint_task.abort();
@@ -763,10 +763,7 @@ async fn run_interactive(args: Args) {
             automatic,
         } => {
             workflow_ui.flush_output();
-            workflow_ui.note(&format!(
-                "{}compacting session={session_id} thread={thread_id} …",
-                if automatic { "auto-" } else { "" }
-            ));
+            workflow_ui.compacting_banner(&session_id, &thread_id, automatic);
         }
         WorkflowEvent::CompactionProgress { elapsed } => workflow_ui.note(&format!(
             "compacting: {}s elapsed (Ctrl-C to cancel)",
@@ -1169,8 +1166,7 @@ impl ReplSession {
         }
         let cancel = self.turn_cancel.arm();
         let accepted_at = chrono::Utc::now();
-        self.ui
-            .note(&myco::tui::transcript::acceptance_line(Some(accepted_at)));
+        self.ui.accepted_turn(accepted_at);
 
         let outcome = self.runner.submit(content, accepted_at, cancel).await;
         self.show_turn_outcome(outcome);
