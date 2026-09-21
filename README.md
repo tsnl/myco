@@ -1,6 +1,6 @@
 # myco
 
-An agent server with shared services and a web GUI.
+A programmable conversation server with shared services and a web GUI.
 
 The implementation is organized into separately reviewable steps in
 [DESIGN.md](DESIGN.md). The first implementation step is the standalone
