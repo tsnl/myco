@@ -761,6 +761,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    status: None,
                 }],
             },
         ];
@@ -785,6 +786,7 @@ mod tests {
                         source: "data:image/png;base64,AAAA".into(),
                     }],
                     is_error: false,
+                    status: None,
                 }],
             },
         ];

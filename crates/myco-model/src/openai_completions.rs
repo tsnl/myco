@@ -692,10 +692,12 @@ mod tests {
                             source: "data:image/png;base64,AAAA".into(),
                         }],
                         is_error: false,
+                        status: None,
                     },
                     ToolResult {
                         content: vec![Content::Text { text: "ok".into() }],
                         is_error: false,
+                        status: None,
                     },
                 ],
             },

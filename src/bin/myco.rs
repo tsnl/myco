@@ -1826,6 +1826,7 @@ mod tests {
                         text: "hi\n".into(),
                     }],
                     is_error: false,
+                    status: None,
                 }],
             },
         ]

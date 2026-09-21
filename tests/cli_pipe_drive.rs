@@ -572,6 +572,27 @@ async fn automatic_compaction_resumes_once_without_inventing_user_input() {
 }
 
 #[tokio::test]
+async fn failing_process_status_remains_visible_when_the_model_calls_it_successful() {
+    let env = pipe_env("tool-outcome");
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"command":"exit 7"}), 100),
+        model_answer("Everything succeeded.", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, false);
+    let stdout = run_myco(&env, &[], b"run task\n/quit\n").await;
+    assert!(stdout.contains("↳ bash exit 7: exit 7"), "{stdout}");
+    assert!(stdout.contains("Everything succeeded."));
+    let replay = run_myco(
+        &env,
+        &["--resume", &announced_session_id(&stdout)],
+        b"/quit\n",
+    )
+    .await;
+    assert!(replay.contains("↳ bash exit 7: exit 7"), "{replay}");
+}
+
+#[tokio::test]
 async fn print_mode_compacts_and_continues_the_same_session() {
     let env = pipe_env("print-auto");
     let session = compact_test_session(&env);
