@@ -175,15 +175,13 @@ can compact and continue before the process exits.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
-- Bash commands appear first in their box, prefixed with `$`, with
-  line breaks, indentation, and quoting preserved. Text sent to a running Bash
-  session appears under `stdin:`, prefixed with `>`. Long lines wrap at
-  the box width; `↪` marks a display continuation, while source lines are
-  indented by two spaces. Long paths and other unbroken arguments also wrap.
-  With prose wrapping off or piped output, boxes use 72 columns. Control characters
-  other than newlines (including tabs) appear as escapes. Host, session, and timeout
-  options follow the command. Live output, history replay, and the console mirror
-  use the same format. `/verbose` expands the full inputs and recorded text output.
+- Every tool displays its arguments as formatted JSON, with cyan keys and dim
+  values. This includes bash `command` and `stdin` fields. Strings retain their
+  JSON escapes for newlines, tabs, quotes, and control characters. Long lines,
+  paths, and unbroken arguments wrap at the box width; `↪` marks a display
+  continuation. With prose wrapping off or piped output, boxes use 72 columns.
+  Live output, history replay, and the console mirror use the same layout.
+  `/verbose` expands the full inputs and recorded text output.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
   when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
   delimiters *removed* (the styling conveys them), `#` headers keep their
@@ -212,8 +210,8 @@ but stripped from provider requests. Generate failures (e.g. context overflow) o
 ERROR section (live only; not stored in session history).
 
 Tool inputs and outcomes share a rounded box with the tool name in its top
-border. Concurrent tools use titled separators inside the same box. Commands
-appear immediately in cyan, options are dim, and tool failures and nonzero bash
+border. Concurrent tools use titled separators inside the same box. Arguments
+appear immediately with cyan keys and dim values; tool failures and nonzero process
 exits are red. Frames use the wrap width, or 72 columns when prose wrapping is
 off; `↪` marks continued display lines. The console mirror and replay use the
 same layout without adding terminal escapes to the mirror.

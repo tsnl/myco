@@ -401,7 +401,7 @@ mod tests {
     fn tool_events(name: &str, input: &serde_json::Value, palette: Palette) -> Vec<TuiEvent> {
         let mut events = Vec::new();
         let mut frame = super::super::tool_box::ToolBox::open(&mut events, name, palette);
-        frame.input(&mut events, name, input);
+        frame.input(&mut events, input);
         frame.close(&mut events);
         events
     }
@@ -525,7 +525,7 @@ mod tests {
         assert!(!rendered.contains("RESPONSE\n"));
         // Tool commands are ASSISTANT paragraphs, separated from text.
         assert!(rendered.contains("hi there\n\n╭─ bash "));
-        assert!(rendered.contains("│ $ echo hi "));
+        assert!(rendered.contains("\"command\": \"echo hi\""));
         // Blank line before section rule/header.
         assert!(rendered.contains("\n\n────────────────────────────────"));
         // Tool results silent (no tool-use id leaks).
@@ -570,9 +570,9 @@ mod tests {
         assert!(rendered.contains("Thinking: step a\nstep b\n\nanswer\n"));
         // Tools are paragraphs inside ASSISTANT, blank-separated.
         assert!(rendered.contains("answer\n\n╭─ bash "));
-        assert!(rendered.contains("│ $ echo 1 "));
+        assert!(rendered.contains("\"command\": \"echo 1\""));
         assert!(rendered.contains("├─ bash "));
-        assert!(rendered.contains("│ $ echo 2 "));
+        assert!(rendered.contains("\"command\": \"echo 2\""));
         assert_eq!(rendered.matches("ASSISTANT · unknown\n").count(), 1);
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
@@ -684,12 +684,49 @@ mod tests {
     }
 
     #[test]
-    fn bash_commands_display_in_full_with_line_breaks_and_options() {
+    fn tool_argument_layout_and_styles_do_not_depend_on_the_tool_name() {
+        let input = json!({
+            "command": "printf '%s\\n' '路径'\necho done",
+            "stdin": "first\nsecond\n",
+            "host": "remote",
+            "options": {"timeout_ms": 1000},
+        });
+        for verbose in [false, true] {
+            for width in [8, 20, 72] {
+                let palette = Palette::colored(true)
+                    .with_wrap(Some(width))
+                    .with_verbose(verbose);
+                let render = |name| {
+                    tool_events(name, &input, palette)
+                        .into_iter()
+                        .map(|event| match event {
+                            TuiEvent::Text(text) if text.starts_with('╭') => {
+                                TuiEvent::Text("tool heading".into())
+                            }
+                            event => event,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let expected = render("custom");
+                for name in ["bash", "editor", "view_image", "session_meta"] {
+                    assert_eq!(
+                        render(name),
+                        expected,
+                        "{name}, width {width}, verbose {verbose}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verbose_arguments_preserve_scripts_stdin_and_options() {
         let command = format!(
             "cd '/a very long path/{}' && cat <<'EOF'\nhello \"world\"\nEOF",
             "x".repeat(100)
         );
-        let input = json!({"command":command, "host":"devbox", "timeout_ms":5000});
+        let input =
+            json!({"command":command, "stdin":"echo done\n", "host":"devbox", "timeout_ms":5000});
         let original = input.clone();
         let rendered = render_tool_invocation(
             "bash",
@@ -698,45 +735,30 @@ mod tests {
         );
         assert_eq!(
             box_body(&rendered),
-            format!(
-                "$ {}\n{{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}}",
-                command.replace('\n', "\n  ")
-            )
+            serde_json::to_string_pretty(&input).unwrap()
         );
         assert_eq!(input, original);
     }
 
     #[test]
-    fn verbose_bash_stdin_displays_in_full_with_session_options() {
-        let stdin = format!("echo '{}'\nprintf '%s\\n' done\n", "x".repeat(100));
-        let rendered = render_tool_invocation(
-            "bash",
-            &json!({"action": "send", "session_id": "shell", "stdin": stdin}),
-            Palette::plain().with_wrap(Some(240)).with_verbose(true),
-        );
-        assert_eq!(
-            box_body(&rendered),
-            format!(
-                "stdin:\n> {}\n{{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}}",
-                stdin.trim_end_matches('\n').replace('\n', "\n  ")
-            )
-        );
-    }
-
-    #[test]
-    fn bash_commands_wrap_with_distinct_display_continuations() {
+    fn tool_arguments_wrap_with_distinct_display_continuations() {
         let command = "cargo test --locked --workspace --lib\necho done";
         let input = json!({"command": command});
-        let rendered = render_tool_invocation("bash", &input, Palette::plain().with_wrap(Some(30)));
-        assert_eq!(
-            rendered,
-            "╭─ bash ─────────────────────╮\n│ $ cargo test --locked      │\n│ ↪ --workspace --lib        │\n│   echo done                │\n╰────────────────────────────╯\n"
+        let rendered = render_tool_invocation(
+            "bash",
+            &input,
+            Palette::plain().with_wrap(Some(30)).with_verbose(true),
         );
+        assert!(rendered.contains("│ ↪ "), "{rendered}");
+        assert!(rendered.contains("\\necho done"), "{rendered}");
+        for line in rendered.lines() {
+            assert_eq!(unicode_width::UnicodeWidthStr::width(line), 30);
+        }
         assert_eq!(input["command"], command);
     }
 
     #[test]
-    fn bash_wrapping_preserves_scripts_and_long_unicode_arguments() {
+    fn tool_wrapping_preserves_scripts_and_long_unicode_arguments() {
         let command = format!(
             "python3 - <<'PY'\n\tprint(\"{}\")\n\nPY\n\n",
             "路径e\u{301}".repeat(30)
@@ -756,30 +778,41 @@ mod tests {
                 );
             }
             let mut restored = String::new();
-            let rows = events.windows(2).filter_map(|pair| match pair {
-                [TuiEvent::Style(style), TuiEvent::Text(line)] if *style == Style::USER => {
-                    Some(line)
+            let mut rows = Vec::new();
+            let mut row = None;
+            for event in &events {
+                match event {
+                    TuiEvent::Text(text) if text == "│ " => row = Some(String::new()),
+                    TuiEvent::Style(style) if *style == Style::WARNING => {
+                        if let Some(row) = row.take() {
+                            rows.push(row);
+                        }
+                    }
+                    TuiEvent::Text(text) => {
+                        if let Some(row) = &mut row {
+                            row.push_str(text);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => None,
-            });
-            for (index, line) in rows.enumerate() {
+            }
+            for (index, line) in rows.iter().enumerate() {
                 let continuation = line.starts_with("↪ ");
-                let content = line
-                    .strip_prefix("$ ")
-                    .or_else(|| line.strip_prefix("  "))
-                    .or_else(|| line.strip_prefix("↪ "))
-                    .unwrap();
+                let content = line.strip_prefix("↪ ").unwrap_or(line);
                 if index > 0 && !continuation {
                     restored.push('\n');
                 }
                 restored.push_str(content);
             }
-            assert_eq!(format!("{restored}\n"), command.replace('\t', "\\t"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+                json!({"command": command})
+            );
         }
     }
 
     #[test]
-    fn bash_input_controls_are_visible_without_terminal_escapes() {
+    fn tool_input_controls_are_visible_without_terminal_escapes() {
         let rendered = render_tool_invocation(
             "bash",
             &json!({"command": "echo \u{1b}[2J", "stdin": "hello\rworld\u{7}"}),
@@ -787,7 +820,7 @@ mod tests {
         );
         assert_eq!(
             box_body(&rendered),
-            "$ echo \\u{1b}[2J\nstdin:\n> hello\\rworld\\u{7}"
+            "{\n  \"command\": \"echo \\u001b[2J\",\n  \"stdin\": \"hello\\rworld\\u0007\"\n}"
         );
     }
 
@@ -927,14 +960,38 @@ mod tests {
     }
 
     #[test]
-    fn colored_tool_invocation_distinguishes_frame_and_command() {
+    fn colored_tool_invocation_distinguishes_frame_keys_and_values() {
         let rendered = render_tool_invocation(
             "bash",
             &json!({"command": "echo hi"}),
             Palette::colored(true),
         );
         assert!(rendered.starts_with("\x1b[0;1;33m╭─ bash "));
-        assert!(rendered.contains("\x1b[0;1;36m$ echo hi\x1b"));
+        assert!(rendered.contains("\x1b[0;1;36m  \"command\":\x1b[0;2m \"echo hi\""));
+    }
+
+    #[test]
+    fn wrapped_and_escaped_json_keys_keep_their_color_without_coloring_values() {
+        let input = json!({"outer": {"te\"xt:": "not a \"key\": value"}});
+        for width in [8, 20, 72] {
+            let events = tool_events(
+                "editor",
+                &input,
+                Palette::colored(true)
+                    .with_wrap(Some(width))
+                    .with_verbose(true),
+            );
+            let keys = events
+                .windows(2)
+                .filter_map(|pair| match pair {
+                    [TuiEvent::Style(style), TuiEvent::Text(text)] if *style == Style::USER => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(keys, "  \"outer\":    \"te\\\"xt:\":", "width {width}");
+        }
     }
 
     #[test]

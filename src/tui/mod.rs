@@ -409,7 +409,7 @@ impl SectionState {
                 tool_box::ToolBox::open(events, name, palette)
             }
         };
-        frame.input(events, name, input);
+        frame.input(events, input);
         self.tool_box = Some(frame);
         self.at_line_start = true;
         self.need_blank = true;
@@ -428,12 +428,11 @@ impl SectionState {
             self.start_tool(events, &tool.name, &tool.input, palette);
         }
         let status = result.status.as_deref().unwrap_or("");
-        let process_failed = tool.name == "bash"
-            && (status.starts_with("signal ")
-                || status
-                    .strip_prefix("exit ")
-                    .and_then(|code| code.parse::<i32>().ok())
-                    .is_some_and(|code| code != 0));
+        let process_failed = status.starts_with("signal ")
+            || status
+                .strip_prefix("exit ")
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| code != 0);
         let style = if result.is_error || process_failed {
             Style::ERROR
         } else if status.contains("cancel") {
@@ -446,9 +445,9 @@ impl SectionState {
         for content in &result.content {
             match content {
                 Content::Text { text } if !text.is_empty() => {
-                    frame.text(events, text, "", Style::RESET)
+                    frame.text(events, text, Style::RESET)
                 }
-                Content::Image { .. } => frame.text(events, "[image output]", "", Style::THINKING),
+                Content::Image { .. } => frame.text(events, "[image output]", Style::THINKING),
                 _ => {}
             }
         }
@@ -988,7 +987,7 @@ mod tests {
         let (p, terminal, _) = producer(Some(48));
         let tool = ToolUse {
             name: "bash".into(),
-            input: serde_json::json!({"host":"local", "action":"exec", "command": (1..=10).map(|i| format!("echo input-{i}")).collect::<Vec<_>>().join("\n")}),
+            input: serde_json::json!({"content": (1..=10).map(|i| format!("input-{i}")).collect::<Vec<_>>()}),
         };
         p.emit(AgentEvent::ToolStarted {
             tool_use: tool.clone(),
@@ -1002,8 +1001,8 @@ mod tests {
         });
         finish(&p);
         let output = encode_plain(&terminal.events());
-        assert!(output.contains("│   echo input-5"), "{output}");
-        assert!(!output.contains("│   echo input-6"), "{output}");
+        assert!(output.contains("\"input-3\""), "{output}");
+        assert!(!output.contains("\"input-4\""), "{output}");
         assert!(!output.contains("output-6"), "{output}");
         assert!(output.contains("… /verbose"), "{output}");
         assert!(output.contains("exit 7"), "{output}");
@@ -1020,7 +1019,7 @@ mod tests {
             tool_use: tool.clone(),
             context: ctx(0),
         });
-        assert!(encode_plain(&terminal.events()).contains("$ exit 7"));
+        assert!(encode_plain(&terminal.events()).contains("\"command\": \"exit 7\""));
         p.emit(AgentEvent::ToolFinished {
             tool_use: tool,
             result: ToolResult::text("hidden stdout").with_status("exit 7"),
@@ -1034,7 +1033,7 @@ mod tests {
         assert!(!output.contains("bash("), "{output}");
         let start = output.find('╭').unwrap();
         let end = output.find('╰').unwrap();
-        assert!(output[start..end].contains("$ exit 7"));
+        assert!(output[start..end].contains("\"command\": \"exit 7\""));
         assert!(output[start..end].contains("exit 7: exit 7"));
         for line in output[start..].lines() {
             assert_eq!(unicode_width::UnicodeWidthStr::width(line), 48, "{line}");
@@ -1441,7 +1440,7 @@ mod tests {
         let plain = encode_plain(&terminal.events());
         assert!(
             plain.contains("running now\n\n╭─ bash ")
-                && plain.contains("│ $ echo hi ")
+                && plain.contains("\"command\": \"echo hi\"")
                 && plain.contains("╯\n\nand after\n"),
             "{plain:?}"
         );
@@ -1480,7 +1479,7 @@ mod tests {
                 assert_eq!(terminal.events(), replay);
                 let plain = encode_plain(&replay);
                 if verbose {
-                    assert_eq!(plain.contains("↪ "), wrap.is_some());
+                    assert!(plain.contains("↪ "));
                 }
                 assert_eq!(plain, strip_sgr(&encode_ansi(&replay, true)));
             }
@@ -1509,8 +1508,8 @@ mod tests {
         ];
         p.replay_history(&messages);
         let compact = terminal.events();
-        assert!(encode_plain(&compact).contains("output-4"));
-        assert!(!encode_plain(&compact).contains("output-5"));
+        assert!(encode_plain(&compact).contains("output-2"));
+        assert!(!encode_plain(&compact).contains("output-3"));
         assert!(p.toggle_verbose());
         p.replay_history(&messages);
         let full_events = terminal.events();

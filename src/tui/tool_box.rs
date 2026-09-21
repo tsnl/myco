@@ -53,67 +53,73 @@ impl ToolBox {
         );
     }
 
-    pub fn input(&mut self, events: &mut Vec<TuiEvent>, name: &str, input: &serde_json::Value) {
-        let command = (name == "bash")
-            .then(|| input.get("command")?.as_str())
-            .flatten();
-        let stdin = (name == "bash")
-            .then(|| input.get("stdin")?.as_str())
-            .flatten();
-        let mut display = input.clone();
-        if command.is_some() {
-            display.as_object_mut().unwrap().remove("command");
-        }
-        if stdin.is_some() {
-            display.as_object_mut().unwrap().remove("stdin");
-        }
-        if let Some(command) = command {
-            self.text(events, command, "$ ", Style::USER);
-        }
-        if let Some(stdin) = stdin {
-            self.text(events, "stdin:", "", Style::THINKING);
-            self.text(events, stdin, "> ", Style::USER);
-        }
-        if !display.as_object().is_some_and(|fields| fields.is_empty()) {
-            self.text(
-                events,
-                &serde_json::to_string_pretty(&display).unwrap(),
-                "",
-                Style::THINKING,
-            );
-        }
+    pub fn input(&mut self, events: &mut Vec<TuiEvent>, input: &serde_json::Value) {
+        self.content(
+            events,
+            &serde_json::to_string_pretty(input).unwrap(),
+            Style::THINKING,
+            true,
+        );
     }
 
-    pub fn text(&mut self, events: &mut Vec<TuiEvent>, text: &str, prefix: &str, style: Style) {
+    pub fn text(&mut self, events: &mut Vec<TuiEvent>, text: &str, style: Style) {
+        self.content(events, text, style, false);
+    }
+
+    fn content(&mut self, events: &mut Vec<TuiEvent>, text: &str, style: Style, json_keys: bool) {
         if self.truncated {
             return;
         }
-        let body = tool_text(text, prefix, self.width - 4);
-        for line in body.lines() {
-            if self.remaining == Some(0) {
-                self.status(events, "… /verbose", Style::THINKING);
-                self.truncated = true;
-                break;
-            }
-            self.line(events, line, style);
-            if let Some(remaining) = &mut self.remaining {
-                *remaining -= 1;
+        for source in text.strip_suffix('\n').unwrap_or(text).split('\n') {
+            let key_end = json_keys.then(|| json_key_end(source)).flatten();
+            let mut consumed = 0;
+            for (index, line) in tool_text(source, self.width - 4).lines().enumerate() {
+                if self.remaining == Some(0) {
+                    self.status(events, "… /verbose", Style::THINKING);
+                    self.truncated = true;
+                    return;
+                }
+                let prefix = if index == 0 { 0 } else { "↪ ".len() };
+                let length = line.len() - prefix;
+                let key = key_end.and_then(|end| {
+                    let count = end.saturating_sub(consumed).min(length);
+                    (count > 0).then_some((prefix, prefix + count))
+                });
+                self.line(events, line, style, key);
+                consumed += length;
+                if let Some(remaining) = &mut self.remaining {
+                    *remaining -= 1;
+                }
             }
         }
     }
 
     /// Factual outcomes remain visible even when the content preview is exhausted.
     pub fn status(&self, events: &mut Vec<TuiEvent>, text: &str, style: Style) {
-        for line in tool_text(text, "", self.width - 4).lines() {
-            self.line(events, line, style);
+        for line in tool_text(text, self.width - 4).lines() {
+            self.line(events, line, style, None);
         }
     }
 
-    fn line(&self, events: &mut Vec<TuiEvent>, line: &str, style: Style) {
+    fn line(
+        &self,
+        events: &mut Vec<TuiEvent>,
+        line: &str,
+        style: Style,
+        key: Option<(usize, usize)>,
+    ) {
         events.push(TuiEvent::Style(Style::WARNING));
         events.push(TuiEvent::Text("│ ".into()));
         events.push(TuiEvent::Style(style));
-        events.push(TuiEvent::Text(line.to_string()));
+        if let Some((start, end)) = key {
+            events.push(TuiEvent::Text(line[..start].into()));
+            events.push(TuiEvent::Style(Style::USER));
+            events.push(TuiEvent::Text(line[start..end].into()));
+            events.push(TuiEvent::Style(style));
+            events.push(TuiEvent::Text(line[end..].into()));
+        } else {
+            events.push(TuiEvent::Text(line.to_string()));
+        }
         events.push(TuiEvent::Style(Style::WARNING));
         events.push(TuiEvent::Text(format!(
             "{} │",
@@ -132,9 +138,17 @@ impl ToolBox {
     }
 }
 
-/// Wrap without parsing shell syntax or dropping whitespace. The arrow marks
+fn json_key_end(line: &str) -> Option<usize> {
+    line.match_indices("\":").find_map(|(index, _)| {
+        serde_json::from_str::<String>(&line[..index + 1])
+            .ok()
+            .map(|_| index + 2)
+    })
+}
+
+/// Wrap without dropping whitespace. The arrow marks
 /// display continuations, so they cannot be mistaken for source line breaks.
-fn tool_text(text: &str, prefix: &str, width: usize) -> String {
+fn tool_text(text: &str, width: usize) -> String {
     let mut visible = String::new();
     for ch in text.chars() {
         if ch.is_control() && ch != '\n' {
@@ -144,14 +158,8 @@ fn tool_text(text: &str, prefix: &str, width: usize) -> String {
         }
     }
     let mut out = String::new();
-    for (index, line) in visible
-        .strip_suffix('\n')
-        .unwrap_or(&visible)
-        .split('\n')
-        .enumerate()
-    {
-        let indent = " ".repeat(prefix.len());
-        let mut prefix = if index == 0 { prefix } else { &indent };
+    for line in visible.strip_suffix('\n').unwrap_or(&visible).split('\n') {
+        let mut prefix = "";
         let mut remaining = line;
         loop {
             let mut end = 0;
