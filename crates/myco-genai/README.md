@@ -39,12 +39,14 @@ stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the crate.
 
 An effect interpreter can use this client as a generation service, retaining
-operation, turn, and thread correlations outside the crate. Observations and the
-returned outcome become inputs to the conversation controller. The controller
-decides whether a response extends a thread; generation itself performs no
-transcript writes. Concurrent calls can produce independent candidates from the
-same context. Exposing generation through a model's tool catalog is a separate
-application choice.
+operation, turn, and checkpoint correlations outside the crate. Observations and
+the returned outcome become inputs to the agent's state-transition functions.
+They decide whether to accept a response into a new immutable checkpoint;
+generation itself performs no transcript writes. Concurrent calls can produce
+independent candidates from the same checkpoint context while its session and
+thread snapshots remain unchanged. Checkpoint storage and memory-sharing choices
+belong to the caller. Exposing generation through a model's tool catalog is a
+separate application choice.
 
 ## Contract
 
