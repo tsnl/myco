@@ -9,10 +9,10 @@ review sequence at the end of this document.
 | Crate | Responsibility |
 | --- | --- |
 | `myco-genai` | One generative inference attempt through a concrete `Client`, configured by a backend `Config` enum. OpenAI Responses and Anthropic Messages drivers are private implementation details. |
-| `myco-agent` | The default conversation controller: context assembly, compaction, triggers, response interpretation, and typed transitions for **one agent**. Returns state changes and effects; defines semantic state access without a persistence format. |
+| `myco-agent` | Session and thread logic, immutable checkpoints, typed state transitions, context assembly, and autocompaction. Stateless transition functions return proposed checkpoints and effects; the crate defines persistence contracts without prescribing storage formats. |
 | `myco-tools` | Shared tool instances, worker lifetimes, operation records, observation streams, and human/agent control through `Harness`. |
 | `myco-protocol` | Versioned HTTP request/response and streamed-event schemas shared by server and clients. Wire types are separate from agent and tool implementation types. |
-| `myco-server` | Application crate hosting controllers and composing generation, tools, storage, and protocol. Its runtime owns workspaces, persistence formats, event delivery, effect dispatch, task supervision, HTTP endpoints, and process lifecycle. |
+| `myco-server` | Application crate composing state transitions, generation, tools, storage, and protocol. Its runtime owns branch writers, workspaces, persistence formats, event delivery, effect dispatch, task supervision, HTTP endpoints, and process lifecycle. |
 | `myco-gui` | Yew frontend using `myco-protocol` to interact with agents and shared tools. |
 
 ```mermaid
@@ -34,7 +34,7 @@ does not call model or tool services during a transition.
 The direct `myco-server` dependency on `myco-genai` is intentional: the server's
 effect interpreter invokes the generation client after commit. The agent crate
 decides what to generate and how to interpret the outcome. Service execution
-does not live inside `Agent::step`.
+does not live inside `agent::step`.
 
 `Client::generate` is an async operation returning one `Result<Response, Error>`.
 An async, fallible observation callback receives request evidence and provider
@@ -59,12 +59,12 @@ retain their own request types, lifetimes, retry constraints, and cancellation
 semantics. The shared runtime handles operation correlation and supervision;
 there is no universal service protocol or combined services crate in this design.
 
-The default agent controls prompts, context, compaction, tool requests, outcome
-interpretation, and turn completion. Its runtime supervises the resulting work.
-A running agent actor comprises a mailbox, its exclusively owned controller,
-and the runtime's operation tracking. The controller records which outcomes it
-awaits; service clients and live execution handles belong to the runtime and
-services. This keeps the state machine independent of sockets and subprocesses.
+The `agent` module supplies the default conversation policy through stateless
+transition functions. All state affecting prompts, context, compaction, tool
+requests, outcome interpretation, and turn completion is explicit in checkpoints.
+A running branch comprises a mailbox, an exclusively owned `State<P>`, and the
+runtime's operation tracking. Checkpoints record which outcomes are awaited;
+service clients and live execution handles belong to the runtime and services.
 
 ```mermaid
 flowchart LR
@@ -78,29 +78,61 @@ flowchart LR
     outcome --> event
 ```
 
-The event pump remains available while services run. Each controller handles
-one event at a time; independent operations and controllers may run concurrently.
-Only controller transitions can propose changes to the accepted transcript.
+The event pump remains available while services run. Each branch handles one
+event at a time; independent operations and branches may run concurrently.
+Only state transitions can propose changes to the accepted transcript.
 
-## Conversation identity and thread ownership
+## Sessions, threads, and immutable checkpoints
 
-The signatures below use `Agent<S>` for the default controller and currently
-attach its durable identity, threads, and execution traces to that owner. A
-separate durable conversation container is an open modeling choice:
-
-| Proposed concept | Responsibility |
+| Concept | Responsibility |
 | --- | --- |
-| `Session` | Own the durable conversation identity, thread relationships, controller checkpoints, and operation traces. Its lifetime is independent of clients and running tasks. |
-| `Thread` | Identify an ordered transcript with a revision and an optional parent prefix for branching. |
-| `Agent` controller | Implement the ordinary conversation policy: choose effects and decide which outcomes extend the conversation. |
+| `Session` | Describe conversation identity, configuration, and session metadata at a fixed version. Group related threads and operation traces independently of client and task lifetimes. |
+| `Thread` | Describe an ordered transcript at a fixed revision, with lineage identifying its source history. |
+| `Checkpoint<P>` | Capture consistent session and thread snapshots, execution phase `P`, and all other state needed to resume decisions. Cloneable data with no execution authority. |
+| `State<P>` | Own a checkpoint and the exclusive right to advance its running branch. Consumed by transitions; not cloneable. |
+| `agent` module | Apply the conversation policy to explicit state and events, returning proposed checkpoints and effects. |
 | Generation operation | Produce a candidate continuation from a specified context and retain its evidence. |
 
-This would separate stored conversations from the policy driving them. Renaming
-the controller itself to `Session` would still leave it responsible for prompts,
-tool sequencing, compaction, and outcome interpretation. The ownership question
-to resolve before implementing the controller is whether `Session` becomes the
-durable container, with `Agent<S>` naming only its default controller. The
-signature sketches do not yet introduce session types or IDs.
+A checkpoint is logically immutable. Its session version, thread revision,
+configuration, phase, and correlations retain the same observable values for
+its lifetime. A transition proposes a new checkpoint; commit publishes it as
+the branch's current checkpoint. Previously retained snapshots remain unchanged.
+Session and thread constructors are private so callers cannot pair incompatible
+snapshots or bypass their invariants. Each checkpoint selects its current thread;
+branches do not share a mutable current-thread pointer.
+
+`Checkpoint<P>::clone` copies the same snapshot, including its identity and
+version. It neither starts work nor creates another writer. Activating a fork
+assigns new writable branch and thread identities through an explicit commit.
+This separates cheap speculative copies from permission to change durable state.
+
+The public contract does not prescribe `Arc<Checkpoint>`, `Arc<Session>`, or a
+particular history collection. A checkpoint can be a small owned value sharing
+immutable roots internally. `Arc` provides shared ownership; private APIs must
+still enforce immutability. Shared mutable session/thread payloads would violate
+the snapshot contract. The execution phase is explicit even though the transition
+logic itself is stateless.
+
+Thread history can share immutable prefixes. Appending constructs a new tail
+whose parent points backward to the existing history; it never fills in a
+forward link on a previously published node. Forks share their source prefix:
+
+```mermaid
+flowchart RL
+    d[Branch 1: D] --> c[C]
+    e[Branch 2: E] --> c
+    c --> b[B]
+    b --> a[A]
+```
+
+Immutable chunks or persistent collections can implement this sharing without
+requiring one allocation per message. A checkpoint need not retain the entire
+preceding checkpoint. Durable references use stable IDs and versions; `Arc`
+shares resident data only. Compaction can retain source lineage by ID while
+allowing old history to leave memory. Restoring an older checkpoint loads the
+same historical values rather than substituting the latest session metadata.
+
+## Generation and transcript acceptance
 
 Generation does not mutate a thread directly. A committed generation operation
 records its originating turn, target thread, input transcript revision, and
@@ -110,20 +142,44 @@ target revision before proposing an append. The store commits that append with
 the controller transition and any follow-up effects. Repeated terminal outcomes
 are reconciled by operation ID so they cannot append the same response twice.
 An obsolete or unselected response remains evidence without extending the thread.
-Each writable thread has one controller owner. A session container could group
-several branches without serializing their service execution; it would not give
-several controllers authority to append to the same thread.
+Each writable thread has one branch owner. A session can group several branches
+without serializing their service execution; session membership does not give
+several owners authority to append to the same thread.
 
 Tool instances belong to workspaces and can be shared by controllers and humans.
-Workspace membership alone is not filesystem isolation. Adding a session
-container would not make it the owner of live terminals, workers, or connections.
+Workspace membership alone is not filesystem isolation. A session does not own
+live terminals, workers, or connections.
 
 ## One owner, one transition
 
-`Agent<S>` owns the state of one agent in phase `S`. It is neither `Clone` nor
-`Copy`; its fields and phase constructors are private. A step takes `self` by
-value, so even constructing its future moves the agent. No second step can use
-that instance until ownership returns from the first step.
+`State<P>` owns one branch in phase `P`. It is neither `Clone` nor `Copy`; its
+fields and constructors are private. A step takes this owner by value, so even
+constructing its future moves the state. No second step can use that owner until
+ownership returns. Sharing or cloning its checkpoint grants no stepping rights.
+
+The representation below names private implementation types without fixing their
+storage layout. `Checkpoint<P>` implements `Clone`; `BranchOwner` does not.
+
+```rust
+pub struct Checkpoint<P> {
+    snapshot: Snapshot<P>,
+}
+
+impl<P> Checkpoint<P> {
+    pub fn session(&self) -> &Session;
+    pub fn thread(&self) -> &Thread;
+    pub fn phase(&self) -> &P;
+}
+
+pub struct State<P> {
+    checkpoint: Checkpoint<P>,
+    owner: BranchOwner,
+}
+
+impl<P> State<P> {
+    pub fn checkpoint(&self) -> &Checkpoint<P>;
+}
+```
 
 The core API has a typed event input and an associated successor type:
 
@@ -134,36 +190,55 @@ pub trait Step<E>: Sized + Send + private::Sealed {
     fn step(
         self,
         event: Event<E>,
-        state: &dyn StateReader,
+        reader: &dyn StateReader,
     ) -> impl Future<Output = Result<Transition<Self::Next>, Rejected<Self, E>>> + Send;
 }
 
-pub struct Rejected<A, E> {
-    pub agent: A,
+pub struct Rejected<S, E> {
+    pub state: S,
     pub event: Event<E>,
     pub error: StepError,
 }
 ```
 
-`Event<E>` pairs a stable event ID with payload `E`. State reads use the agent's
-committed revision and return immutable views. A step may await these reads; it
-never waits for model completion, tool completion, another event, or a clock.
-All externally visible writes are returned as data. Time and random choices
-needed for a decision are explicit inputs so a recorded transition can be replayed.
+The stateless module entry point delegates to the same sealed implementations:
 
-Rejection returns the unchanged agent and event with no state changes or effects.
-An invalid event or failed state read must not lose ownership. Provider and tool
-failures are normal outcome events that the state machine records and handles;
-they are not automatically transition errors.
+```rust
+pub async fn step<S, E>(
+    state: S,
+    event: Event<E>,
+    reader: &dyn StateReader,
+) -> Result<Transition<S::Next>, Rejected<S, E>>
+where
+    S: Step<E>,
+    E: Send,
+{
+    state.step(event, reader).await
+}
+```
 
-Ownership guarantees apply to an instance, not globally to an agent ID. The
-server maintains one owner per loaded agent, and storage checks the expected
+`Event<E>` pairs a stable event ID with payload `E`. State reads resolve the
+checkpoint's fixed versions and return immutable views. A step may await those
+reads; it never waits for model completion, tool completion, another event, or
+a clock. All externally visible writes are returned as data. Time and random
+choices needed for a decision are explicit inputs so a recorded transition can
+be replayed.
+
+Rejection returns the unchanged state owner and event with no state changes or
+effects. An invalid event or failed state read must not lose ownership. Provider
+and tool failures are normal outcome events that the state machine records and
+handles; they are not automatically transition errors.
+
+Ownership guarantees apply to an instance, not globally to a branch ID. The
+server maintains one owner per loaded branch, and storage checks the expected
 revision on commit. A stale owner cannot commit or launch effects. Restore
-validates the phase and its correlations before constructing a typed agent.
+validates the checkpoint's snapshots, phase, and correlations before constructing
+a typed owner under the runtime's writer gate. Loading a checkpoint for inspection
+or evaluation does not acquire that authority.
 
 ## Typed phases and runtime events
 
-The initial phases distinguish what the agent is waiting to observe:
+The initial phases distinguish what the branch is waiting to observe:
 
 - `Ready`: accepts a new turn from a user or trigger.
 - `AwaitingModel`: expects an outcome for an issued generation operation.
@@ -173,7 +248,7 @@ The initial phases distinguish what the agent is waiting to observe:
 
 These types carry required correlation data, not just marker names.
 `AwaitingTools` retains references to requested observations, derived from the
-agent trace. It does not assert that a tool is running or own any live tool
+operation trace. It does not assert that a tool is running or own any live tool
 resource. The tool service owns execution status.
 
 | Phase | Event | Successor | Executable effects |
@@ -186,22 +261,23 @@ resource. The tool service owns execution status.
 | `Ready` / `Cancelling` | `Cancel` for the same turn | Same phase | None; cancellation is idempotent. |
 | Any phase expecting an operation | Correlated progress | Same phase | None; retain provisional evidence. |
 
-For example, `Step<Start> for Agent<Ready>` has
-`type Next = Agent<AwaitingModel>`. There is no
-`Step<GenerationFinished> for Agent<Ready>`. A transition with several possible
+For example, `Step<Start> for State<Ready>` has
+`type Next = State<AwaitingModel>`. There is no
+`Step<GenerationFinished> for State<Ready>`. A transition with several possible
 successors returns an enum whose variants each contain the corresponding typed
-agent. The caller must match that enum before using state-specific operations:
+owner. The caller must match that enum before using state-specific operations:
 
 ```rust
 pub enum AfterGeneration {
-    Ready(Agent<Ready>),
-    Tools(Agent<AwaitingTools>),
-    Model(Agent<AwaitingModel>),
+    Ready(State<Ready>),
+    Tools(State<AwaitingTools>),
+    Model(State<AwaitingModel>),
 }
 ```
 
-Each generation carries its purpose (reply or compaction). Compaction changes
-the active thread only after its successful outcome is committed. Other phases
+Each generation carries its purpose (reply or compaction). Compaction proposes
+a checkpoint selecting a new thread and publishes it only after successful
+commit. Older checkpoints retain their original thread and history. Other phases
 or policies can refine the graph without exposing arbitrary state mutation.
 
 The event's phase is a static check for typed callers. Turn IDs, operation IDs,
@@ -210,23 +286,23 @@ are runtime facts. Those require validation even in the typed API. A provider's
 tool-call ID is retained for inference history but is not used as a globally
 unique execution ID.
 
-The server receives an `AgentEvent` enum from runtime sources. A `RuntimeAgent`
-enum holds the possible typed agents and routes each event through the same
+The server receives an `AgentEvent` enum from runtime sources. A `RuntimeState`
+enum holds the possible typed owners and routes each event through the same
 `Step<E>` implementations. An optional object-safe facade hides that enum from
 callers storing heterogeneous implementations:
 
 ```rust
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type DynStepResult = Result<
-    Transition<Box<dyn DynAgent>>,
-    Rejected<Box<dyn DynAgent>, AgentEvent>,
+    Transition<Box<dyn DynState>>,
+    Rejected<Box<dyn DynState>, AgentEvent>,
 >;
 
-pub trait DynAgent: Send {
+pub trait DynState: Send {
     fn step<'a>(
         self: Box<Self>,
         event: Event<AgentEvent>,
-        state: &'a dyn StateReader,
+        reader: &'a dyn StateReader,
     ) -> BoxFuture<'a, DynStepResult>
     where
         Self: 'a;
@@ -234,7 +310,7 @@ pub trait DynAgent: Send {
 ```
 
 The dynamic boundary checks event legality at runtime and returns the original
-boxed agent on rejection. It does not duplicate transition logic. `Box<Self>`
+boxed owner on rejection. It does not duplicate transition logic. `Box<Self>`
 and an explicitly boxed future make the facade
 [dyn-compatible](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility).
 The typed layer uses ordinary trait implementations for concrete states, not
@@ -264,10 +340,11 @@ retaining distinct typed payloads. Service completion does not execute returned
 tool calls or append an assistant response. Those decisions require another
 controller transition and commit.
 
-`Transition<Next>` contains the proposed successor, semantic state changes, and
-effects. Its fields are private. Inspection borrows the proposal; it cannot
-extract an agent capable of another step or an executable effect batch before
-commit. This is a second use of typestate: proposed versus committed work.
+`Transition<Next>` contains the proposed successor checkpoint and owner, state
+changes, and effects. Its fields are private. Inspection borrows the proposal;
+it cannot extract an owner capable of another step or an executable effect
+batch before commit. This is a second use of typestate: proposed versus
+committed work.
 
 State access is injected through domain interfaces in `myco-agent`:
 
@@ -284,18 +361,22 @@ pub trait StateStore: StateReader {
 }
 ```
 
-`StateVersion` identifies an agent and revision. `StateView` contains semantic
-thread/trace data at that revision. `Commit` describes the agent, consumed event,
-expected revision, successor state, trace changes, and effect requests. None of
-these types prescribes JSON, database tables, or a serialization format. The
-server supplies the storage implementation and chooses versioned encodings.
+`StateVersion` identifies a branch and its committed checkpoint revision.
+`StateView` resolves that checkpoint's session, thread, and trace data at fixed
+versions. `Commit` describes the branch, consumed event, expected revision,
+successor checkpoint, trace changes, and effect requests. `myco-agent` owns these
+semantic persistence contracts; the server supplies the storage implementation
+and chooses versioned encodings. No pointer address or `Arc` reference count is
+part of the durable format.
 
 Saving state is a required commit phase, rather than an optional `SaveState`
-item mixed into an unordered effect list. `StateStore::commit` atomically saves
-the successor state, consumed event, trace changes, and a durable queue of effect
-requests (an outbox). It checks the expected revision and is idempotent for the
-same event and identical proposal; a conflicting proposal is rejected. Only
-after confirmed commit can effects be dispatched.
+item mixed into an unordered effect list. `StateStore::commit` atomically stores
+the new immutable snapshots, advances the branch's current-checkpoint reference,
+and saves the consumed event, trace changes, and durable effect requests (an
+outbox). It checks the expected revision and is idempotent for the same event and
+identical proposal; a conflicting proposal is rejected. Publishing a successor
+does not rewrite earlier snapshots. Only after confirmed commit can effects be
+dispatched.
 
 Storage is a service in the architectural vocabulary, but committing state is
 a prerequisite for executing the proposed effects. It is not an independently
@@ -309,7 +390,7 @@ impl<Next> Transition<Next> {
 
     pub async fn commit(
         self,
-        state: &dyn StateStore,
+        store: &dyn StateStore,
     ) -> Result<(Next, CommittedEffects), CommitFailure<Next>>;
 }
 
@@ -329,24 +410,26 @@ requires reload. Neither permits blind dispatch or continued stepping.
 The caller sequences owned values:
 
 ```rust
-let transition = agent.step(event1, &state).await?;
-let (agent, effects) = transition.commit(&state).await?;
+let transition = agent::step(state, event1, &store).await?;
+let (state, effects) = transition.commit(&store).await?;
 executor.wake(effects);
 
-let transition = agent.step(event2, &state).await?;
-let (agent, effects) = transition.commit(&state).await?;
+let transition = agent::step(state, event2, &store).await?;
+let (state, effects) = transition.commit(&store).await?;
 executor.wake(effects);
 ```
 
-This example uses the dynamic facade; a typed caller matches branching successor
-enums between steps. The effect interpreter runs committed requests separately
-from the event pump in `myco-server`. A wakeup only prompts it to drain the durable
-queue, so a crash between commit and notification does not lose work. It invokes
-a configured `myco_genai::Client` and injected `myco_tools::Harness` implementations
-and delivers correlated progress/outcomes as later events. Evaluations can substitute the
-interpreter's generation behavior with scripted responses. Different effects and
-different agents can execute concurrently. In-memory evaluation stores implement
-the same commit contract without requiring disk storage.
+This example uses `RuntimeState` implementing `Step<AgentEvent>`; a typed
+caller matches branching successor enums between steps. The effect interpreter
+runs committed requests separately from the event pump in `myco-server`. A
+wakeup only prompts it to drain the durable queue, so a crash between commit
+and notification does not lose work. It invokes a configured
+`myco_genai::Client` and injected `myco_tools::Harness` implementations and
+delivers correlated progress/outcomes as later events. Evaluations can
+substitute the interpreter's generation behavior with scripted responses.
+Different effects and different branches can execute concurrently. In-memory
+evaluation stores implement the same commit contract without requiring disk
+storage.
 
 These guarantees assume the injected store and interpreter obey their contracts;
 Rust types do not prove that an external database or tool has done so.
@@ -373,7 +456,7 @@ in flight and can race with cancellation. The tool service remembers cancellatio
 by target operation ID even if it arrives before submission, so delayed delivery
 cannot start an operation that it has already cancelled.
 
-Busy agents reject new `Start` events; the server may queue those inputs outside
+Busy branches reject new `Start` events; the server may queue those inputs outside
 the machine without blocking progress, result, or cancellation events. Duplicate
 events are acknowledged without applying their transition twice. Late or
 mismatched outcomes cannot advance the current turn; their evidence stays linked
@@ -383,19 +466,21 @@ only a validated completion becomes an assistant response in the transcript.
 A cancellation event cannot interrupt a currently awaited step or commit. Those
 operations must be bounded and do no long-running external work. The supervisor
 awaits the boundary and then pumps cancellation. Dropping a consuming future
-also drops its in-memory agent; that is an abort/recovery path, not ordinary
-user cancellation. Before commit, reload the last durable revision. During an
-ambiguous commit, reconcile its event ID before resuming or dispatching work.
+also drops its in-memory owner; retained checkpoint clones remain immutable data,
+not replacement writers. This is an abort/recovery path, not ordinary user
+cancellation. Before commit, reload the last durable revision and reacquire the
+writer through the runtime. During an ambiguous commit, reconcile its event ID
+before resuming or dispatching work.
 
-Both agent traces and tool-service records are retained and linked by operation
-ID. For example:
+Both session operation traces and tool-service records are retained and linked
+by operation ID. For example:
 
-1. The agent commits a tool request and its effect.
+1. The runtime commits a branch's tool request and its effect.
 2. The tool service accepts it, performs the work, and records the result.
-3. The server crashes before committing that result to the agent trace.
+3. The server crashes before committing that result to the branch checkpoint and trace.
 
-On restart, the agent trace contains a request without a result even though the
-tool finished. The server queries the tool record using the same operation ID
+On restart, the operation trace contains a request without a result even though
+the tool finished. The server queries the tool record using the same operation ID
 and delivers the recorded result. If it is still running, the server resumes
 observation. If the tool service cannot establish what happened, the operation
 remains unresolved; the server does not rerun it under a new ID or invent a
@@ -405,13 +490,14 @@ likewise cannot assume provider-side deduplication after an ambiguous disconnect
 
 ## Application lifecycle, protocols, and evaluation
 
-`myco-server` owns per-agent mailboxes and owners, effect dispatch, tool workers,
-storage, and HTTP listeners. Startup restores and validates agents, reconciles
-committed effects and tool records, then resumes pumping. Shutdown stops intake,
-finishes or reconciles in-progress commits, records cancellation policy for
-outstanding work, and supervises workers. Client connections do not own agent
-or tool lifetimes. Trigger semantics live in the agent; clocks, watchers, and
-HTTP requests deliver trigger events from outside it.
+`myco-server` owns per-branch mailboxes and writers, effect dispatch, tool
+workers, storage, and HTTP listeners. Startup restores and validates committed
+checkpoints, acquires their branch owners, reconciles effects and tool
+records, then resumes pumping. Shutdown stops intake, finishes or reconciles
+in-progress commits, records cancellation policy for outstanding work, and
+supervises workers. Client connections do not own branch or tool lifetimes.
+Trigger semantics live in the `agent` module; clocks, watchers, and HTTP
+requests deliver trigger events from outside it.
 
 The server supervises service-operation futures and routes their observations
 back through the event pump. The common agent interface can remain convenient
@@ -419,8 +505,8 @@ without embedding generation inside a consuming state transition. Runtime
 supervision and conversation decisions remain separate responsibilities even
 when one application hosts both.
 
-`myco-protocol` covers workspace, agent, thread, and tool operations and their
-observation streams. Mutating requests carry request IDs for deduplication;
+`myco-protocol` covers workspace, session, thread, branch, and tool operations
+and their observation streams. Mutating requests carry request IDs for deduplication;
 acceptance is distinct from completion. Stream cursors support reconnecting
 clients. Wire versions and storage versions are independent. `myco-gui` is a Yew
 client of this HTTP API, using the same operations available to machine callers.
@@ -442,16 +528,23 @@ Each candidate has its own operation ID; candidates are not appended sequentiall
 to a shared input transcript. The default agent can retain its single-generation
 policy without acquiring search-specific phases.
 
-A fork records its source thread and revision and creates a distinct writable
-thread. An independently running branch gets its own controller identity and
-fresh operation IDs. It does not clone a live `Agent`, running futures, or pending
-operations. Forking from a settled checkpoint is the initial contract; forks
-during unresolved work require an explicit policy for the outstanding outcomes.
-Shared transcript prefixes can stay immutable. Branches that execute tools need
-isolated workspaces or must defer those effects until selection; forking
-conversation state alone does not isolate external side effects.
+Cloning a checkpoint is valid in any phase for inspection or speculative work.
+A runnable fork is created by explicitly committing a new branch and thread
+identity with lineage to the source checkpoint. The source session and history
+snapshots can be shared; each successor remains independent. The runtime acquires
+one new owner after commit, and subsequent effects receive fresh operation IDs.
+A snapshot clone does not copy writer authority, running futures, or service
+resources, and does not resubmit recorded effects.
 
-Search and fork APIs follow the ordinary controller implementation. The reusable
+Execution forks initially require settled checkpoints. A checkpoint containing
+pending requests retains them as evidence; making such a clone runnable requires
+an explicit policy for those correlations and outstanding outcomes. Restoring the
+original branch reconciles its existing operation IDs rather than allocating a
+fork. Branches that execute tools need isolated workspaces or must defer those
+effects until selection; immutable conversation data does not isolate external
+side effects.
+
+Search orchestration follows the ordinary transition implementation. The reusable
 boundary is effect execution; no generic workflow-controller trait is required
 before a second controller establishes the shared interface.
 
@@ -471,24 +564,25 @@ is selected in this design layer.
 
 1. **Architecture and interfaces.** Review the crate graph, typed/dynamic
    transition boundary, state/effect commit contract, service execution,
-   cancellation, and recovery. Resolve durable conversation ownership before
-   introducing controller/session types in code.
+   cancellation, recovery, and immutable checkpoint/branch ownership.
 2. **Generative AI boundary.** Implement `myco-genai`: a concrete async client,
    private backend drivers, awaited observations, native continuation,
    explicit incomplete/error outcomes, and future-drop cancellation. Validate
    with local HTTP fixtures without API credentials.
-3. **Default conversation controller.** Implement the reviewed interfaces with
-   an in-memory store and scripted effect interpreter, then threads and bounded
-   compaction.
-   Check rejection preserves ownership; illegal typed transitions fail to compile;
-   the dynamic facade matches typed behavior; no dispatch precedes commit; and
-   cancellation, duplicate outcomes, and recovery preserve transcript integrity.
+3. **Checkpoints and state transitions.** Implement session/thread snapshots,
+   phase-typed checkpoints, branch ownership, and stateless transition functions
+   with an in-memory store and scripted effect interpreter, then bounded
+   compaction. Check retained snapshots survive append, fork, and compaction
+   unchanged; checkpoint clones cannot step or dispatch; rejection preserves
+   ownership; illegal typed transitions fail to compile; the dynamic facade
+   matches typed behavior; and no dispatch precedes commit. Check cancellation,
+   duplicate outcomes, and recovery preserve transcript integrity.
 4. **Shared tools.** Implement `myco-tools` with one workspace terminal,
    independent observers, human/agent control, operation records, cancellation,
    and worker supervision. Test deduplication and ambiguous execution outcomes.
 5. **Protocol and server.** Define `myco-protocol` wire contracts and implement
    `myco-server`, durable state, effect delivery, reconciliation, and shutdown.
-6. **Yew GUI.** Implement `myco-gui` for agent/thread browsing and shared tools.
+6. **Yew GUI.** Implement `myco-gui` for session/thread browsing and shared tools.
 7. **Evaluation and GEPA.** Run isolated task fixtures through the same agent
    interfaces and emit inspectable results and optimizer feedback.
 
