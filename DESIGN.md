@@ -148,7 +148,7 @@ replayed. Filesystem and terminal bindings can address the same host/files.
 | Concept | Meaning |
 | --- | --- |
 | Thread entry | Accepted user input, assistant content, tool invocation, or tool result. |
-| `GenerationIntent` | Request a reply or compaction from a fixed state version. |
+| `GenerationIntent` | Target thread, agent-selected instructions, and context from fixed history versions. |
 | Candidate | Proposed ordered content and completion status. |
 | `GenerationFinished` | Candidate or failure, correlated with its operation and evidence. |
 | `ToolInvocation` | Logical capability, complete structured arguments, and session invocation ID. |
@@ -158,8 +158,8 @@ State, traces, and events contain session values and opaque evidence
 references. Gen AI request, response, message, and tool-call types exist only at
 the interpretation boundary. The kernel's generation interpreter:
 
-1. Resolves the fixed state's instructions, context, capabilities, and policy,
-   plus its versioned binding to model/backend configuration and provider options.
+1. Resolves the agent's selected instructions, history references, and capabilities,
+   plus the fixed state's binding to model/backend configuration and provider options.
 2. Constructs a `myco_gen_ai_service::Request` and records the resolved configuration
    and exact request before dispatch.
 3. Invokes `GenAiClient`, retains observations and the outcome, and translates them
@@ -181,14 +181,15 @@ are distinct from execution operation IDs. Evidence is durable before an event
 can commit a reference to it. Retained states keep their evidence reachable;
 later requests restore it or report missing/incompatible continuation explicitly.
 Interpreter bindings and translation versions are pinned for recovery and replay.
+Native continuation is reusable only when it represents the selected context.
 
 ## State
 
 | Type | Meaning |
 | --- | --- |
 | `Session` | Conversation identity, configuration, and metadata at a fixed version; groups related threads. |
-| `Thread` | Ordered transcript at a fixed revision, with source lineage. |
-| `State` | Owned session/thread data, phase, configuration, and operation correlations. Methods mutate the working state; cloning copies it. |
+| `Thread` | Ordered transcript, its revision, phase, pending operations, and source lineage. |
+| `State` | Owned session and threads, with one foreground thread. Methods mutate the working state; cloning copies it. |
 
 State owns a dense `Vec<Thread>`; each thread owns a `Vec<Entry>`. Cloning copies
 all metadata and conversation entries across every thread, including older threads
@@ -203,15 +204,30 @@ pub struct State {
     version: StateVersion,
     session: Session,
     threads: Vec<Thread>,
-    current_thread: usize,
-    phase: Phase,
+    foreground: ThreadId,
 }
 
 impl State {
     pub fn version(&self) -> StateVersion;
     pub fn session(&self) -> &Session;
     pub fn threads(&self) -> &[Thread];
-    pub fn thread(&self) -> &Thread;
+    pub fn thread(&self, id: ThreadId) -> Option<&Thread>;
+    pub fn foreground(&self) -> &Thread;
+}
+
+#[derive(Clone)]
+pub struct Thread {
+    id: ThreadId,
+    revision: ThreadRevision,
+    entries: Vec<Entry>,
+    phase: Phase,
+    origin: Option<HistoryRef>,
+}
+
+impl Thread {
+    pub fn id(&self) -> ThreadId;
+    pub fn revision(&self) -> ThreadRevision;
+    pub fn entries(&self) -> &[Entry];
     pub fn phase(&self) -> &Phase;
 }
 
@@ -220,16 +236,18 @@ pub enum Phase {
     Ready,
     AwaitingModel(PendingGeneration),
     AwaitingTools(PendingTools),
+    Compacting(PendingCompaction),
     Cancelling(PendingCancellation),
+    Archived,
 }
 ```
 
 Accepted content appends through an ordinary internal helper:
 
 ```rust
-impl State {
+impl Thread {
     fn push(&mut self, entry: Entry) {
-        self.threads[self.current_thread].entries.push(entry);
+        self.entries.push(entry);
     }
 }
 ```
@@ -249,6 +267,7 @@ execution authority; speculative transitions can be computed freely.
 #[derive(Clone)]
 pub struct Event {
     pub id: EventId,
+    pub thread: ThreadId,
     pub payload: AgentEvent,
 }
 
@@ -273,27 +292,59 @@ work, without a defensive clone. Time and random choices are explicit inputs.
 The agent calls no services or injected handlers; reads, commits, and execution
 belong to the kernel.
 
-An accepted generation candidate appends to the current thread's vector. Service
-results arrive as later events. Rust's mutable borrow prevents overlapping calls
-on the same value; the kernel's branch writer spans the complete read/step/commit
-cycle, including async I/O. Cloned values still require commit revision checks.
+An accepted generation candidate appends to its target thread's vector. Transcript
+changes advance that thread's revision; any accepted event advances the state
+revision. Service results arrive as later events. Rust's mutable borrow prevents
+overlapping calls on the same value; the kernel's branch writer spans the complete
+read/step/commit cycle, including async I/O. Cloned values still require commit
+revision checks.
 
-`Phase` and `AgentEvent` are ordinary enums. Transitions validate phase/event
-combinations and operation correlations at runtime. Phase payloads retain pending
-operation data; `AwaitingTools` records missing observations, while the service
-owns live execution status.
+`Phase` belongs to each thread. Transitions validate its event, pending operation
+ID, and transcript revision. Sibling thread progress can advance `StateVersion`
+without invalidating a pending generation. State revision checks still serialize
+commits. `AwaitingTools` records missing observations; the service owns live status.
 
 | Phase | Event | Successor | Effects |
 | --- | --- | --- | --- |
-| `Ready` | `Start` | `AwaitingModel` | Generate a reply or compact first. |
-| `AwaitingModel` | `GenerationFinished` | `Ready`, `AwaitingTools`, or `AwaitingModel` | None; invoke tools; or reply after compaction. |
-| `AwaitingTools` | `ToolFinished` | `AwaitingTools` or `AwaitingModel` | Generate once all required results are recorded. |
-| `AwaitingModel` / `AwaitingTools` | `Cancel` | `Cancelling` | Cancel outstanding operations. |
+| `Ready` | `Start` | `AwaitingModel` or `Compacting` | Generate a reply or start a compaction thread. |
+| `AwaitingModel` | `GenerationFinished` | `Ready`, `AwaitingTools`, or `Archived` | Finish a reply, invoke tools, or complete compaction. |
+| `AwaitingTools` | `ToolFinished` | `AwaitingTools`, `AwaitingModel`, or `Compacting` | Once all results are recorded, reply or compact first. |
+| `Compacting` | Working thread completes | `Archived` | Publish a new foreground thread and resume generation there. |
+| `Compacting` | Working thread fails | `Ready` | Retain the source and report failure. |
+| `AwaitingModel` / `AwaitingTools` / `Compacting` | `Cancel` | `Cancelling` | Cancel outstanding operations, including compaction work. |
 | `Cancelling` | Terminal outcome | `Cancelling` or `Ready` | None; wait for all outstanding outcomes. |
 | `Ready` / `Cancelling` | Repeated `Cancel` for the same turn | Same | None. |
 | Any phase expecting an operation | Correlated progress | Same | None; retain evidence. |
 
-Compaction selects a new thread; retained states keep their original histories.
+One event may update its target and related threads, such as finishing a compaction
+worker and publishing its parent's successor. Validate the whole transition before
+mutating any thread. Archived transcripts accept no new content.
+
+## Context and compaction
+
+A thread is stored history; generation context is an agent-selected view. The
+agent supplies the instructions and additional history inputs. The kernel renders
+the target thread's conversation and resolves those inputs without choosing the
+compaction prompt or deciding what to summarize.
+
+Inline history is quoted source material, not replayed as new live turns. Readable
+history is advertised by name through a history-reading tool. The interpreter
+binds that name to a concrete locator, such as a path; its durable identity is the
+fixed history reference. Resolving a readable input does not insert its full text
+into the prompt. The history-reading tool authorizes only advertised references.
+
+For compaction, the agent freezes the source transcript at a settled boundary and
+creates a working thread. The source's `PendingCompaction` retains the worker ID,
+fixed source range, and the suffix to preserve. The worker uses ordinary generation
+and tool events with an agent-selected prompt and inline or readable source history.
+
+When the worker finishes, the agent seeds a new foreground thread with its summary
+and the preserved suffix, then resumes generation. Context cuts preserve complete
+tool invocation/result groups. Source and worker histories remain archived. Failure
+or cancellation keeps the source foreground and its entries intact, returning it
+to `Ready` after outstanding operations settle. Cancellation cannot publish a
+summary or resume the cancelled turn. Other threads can continue while this work is
+pending; all transitions still pass through one state writer.
 
 ## Effects and persistence
 
@@ -307,7 +358,22 @@ pub struct Effect {
 
 pub struct GenerationIntent {
     pub source: StateVersion,
+    pub thread: ThreadId,
     pub purpose: GenerationPurpose,
+    pub instructions: String,
+    pub context: Vec<HistoryInput>,
+}
+
+#[derive(Clone)]
+pub struct HistoryRef {
+    pub state: StateVersion,
+    pub thread: ThreadId,
+    pub entries: std::ops::Range<usize>,
+}
+
+pub enum HistoryInput {
+    Inline(HistoryRef),
+    Readable { name: String, history: HistoryRef },
 }
 
 pub enum Action {
@@ -317,9 +383,11 @@ pub enum Action {
 }
 ```
 
-`source` fixes a state revision, including the interpreter binding. It can
-name the successor published by the same commit, so generation includes newly
-accepted input. `ToolInvocation` resolves through its pinned capability binding.
+`source` fixes the target conversation and interpreter binding; history inputs
+can reference other threads and versions. It can name the successor published by
+the same commit, so generation includes newly accepted input. Pending generation
+records its target transcript revision as well as its operation ID.
+`ToolInvocation` resolves through its pinned capability binding.
 
 The kernel owns persistence and dispatch. A commit borrows the proposed state
 and its effects, keeping them unchanged during async storage:
@@ -401,7 +469,7 @@ observation.
   only after all outstanding outcomes are terminal. Claiming an effect and checking
   cancellation must be atomic; claimed requests can still race with cancellation.
   The terminal service remembers cancellation by operation ID even before submission.
-- Busy branches reject `Start`; the kernel may queue inputs without blocking
+- Busy threads reject `Start`; the kernel may queue inputs without blocking
   outcome/cancellation events. Duplicate events do not repeat transitions. Late or
   mismatched outcomes remain linked to their original operations.
 - Cancellation wakes the kernel's idle wait and otherwise follows the current
@@ -437,9 +505,11 @@ futures, or service instances. Making pending states runnable requires an explic
 policy for their outstanding operations; restoring the original branch reconciles
 existing IDs.
 
-Search can generate and score independent candidates from the same state,
-then select a continuation or fork. Branches must isolate tool workspaces or defer
-tool effects until selection. The ordinary agent keeps its single-generation policy.
+Search can create candidate threads from a fixed source and generate concurrently,
+then select a continuation. Per-thread correlations keep results separate. Cloning
+`State` instead copies the whole agent for an independent branch. Candidates must
+isolate tool workspaces or defer tool effects until selection; the default reply
+policy uses one foreground conversation.
 
 Evaluations call state methods with scripted events and assert both the updated
 state and returned effects, or use the kernel's Rust API with budgets, interpreters,
@@ -454,8 +524,9 @@ GEPA consumes trial scores, traces, and diagnostic feedback.
 2. **Gen AI service:** `GenAiClient` and private drivers; local HTTP fixtures for
    awaited observations, native continuation, incomplete outcomes, and cancellation.
 3. **Agent:** owned vector state, mutable methods, explicit effects, scripted
-   events, and bounded compaction. Check independent clones, determinism, unchanged
-   state on rejection, cancellation, and duplicates.
+   events, and bounded compaction. Check independent clones, unchanged state on
+   rejection, sibling completion correlation, context selection, compaction
+   success/failure/cancellation, and duplicates.
 4. **Terminal service:** `TerminalClient`, shared processes, cursor-based output,
    cancellation, deduplication, and worker supervision. Check independent readers,
    input ordering, PTY controls, and worker loss.
