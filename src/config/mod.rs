@@ -54,6 +54,9 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 /// Default per-remote connect timeout (seconds) when the config file sets none.
 pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 
+/// Default model request budget for one compaction, including retries.
+pub const DEFAULT_COMPACTION_MAX_REQUESTS: usize = 64;
+
 /// Default cap on consecutive `max_tokens` resumes within one turn when a model
 /// entry sets no `max_truncated_resumes`.
 ///
@@ -270,6 +273,8 @@ pub struct Config {
     /// Passed to [`crate::prompts::agent_prompt_epilogue`] at every model
     /// build, and checked at startup so a cut prelude is warned about.
     pub max_prelude_bytes: usize,
+    /// Maximum model requests per manual or automatic compaction, including retries.
+    pub compaction_max_requests: usize,
 }
 
 impl Config {
@@ -336,6 +341,14 @@ impl Config {
         let max_prelude_bytes = file
             .max_prelude_bytes
             .unwrap_or(crate::prompts::DEFAULT_MAX_PRELUDE_BYTES);
+        let compaction_max_requests = file
+            .compaction_max_requests
+            .unwrap_or(DEFAULT_COMPACTION_MAX_REQUESTS);
+        if compaction_max_requests == 0 {
+            return Err(with_path(
+                "compaction_max_requests must be greater than zero".into(),
+            ));
+        }
         // Host workers enforce the image cap where the file is read, so they
         // are spawned with the cap of the model this process will run — fixed
         // for the process, since the model is chosen once at startup.
@@ -362,6 +375,7 @@ impl Config {
             models,
             model,
             max_prelude_bytes,
+            compaction_max_requests,
         })
     }
 }
@@ -1390,6 +1404,28 @@ context_window = 200_000
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
         assert_eq!(cfg.harness.remote_hosts.len(), 1);
         assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
+    }
+
+    #[test]
+    fn compaction_request_budget_accepts_positive_config_values() {
+        let resolve = |value: &str| {
+            resolve_toml(
+                format!(
+                    "compaction_max_requests = {value}\n{}",
+                    model_toml("m", &[])
+                ),
+                ConfigUserSettings::default(),
+                env_of(&[]),
+            )
+        };
+        assert_eq!(resolve("96").unwrap().compaction_max_requests, 96);
+        assert_eq!(resolve("1").unwrap().compaction_max_requests, 1);
+        assert_eq!(resolve_catalog_cfg(&[]).compaction_max_requests, 64);
+        let error = resolve("0").unwrap_err();
+        assert!(error.contains("compaction_max_requests"), "{error}");
+        assert!(error.contains("greater than zero"), "{error}");
+        assert!(error.contains("config:"), "{error}");
+        assert!(resolve("-1").is_err());
     }
 
     #[test]

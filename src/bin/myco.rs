@@ -672,6 +672,7 @@ async fn boot<S: EventSink + 'static>(
     runner.set_compactor(
         Arc::new(ModelCompactor {
             model: catalog_model.clone(),
+            max_requests: app_config.compaction_max_requests,
         }),
         catalog_model.spec.auto_compact_at_tokens,
     );
@@ -784,6 +785,7 @@ async fn run_interactive(args: Args) {
         harness,
         catalog_model,
         catalog: app_config.models,
+        compaction_max_requests: app_config.compaction_max_requests,
         effort: args.effort,
         debug_dump_api_requests: args.debug_dump_api_requests,
         ctrl_l,
@@ -951,6 +953,7 @@ struct ReplSession {
     harness: Arc<Harness>,
     catalog_model: CatalogModel,
     catalog: ModelCatalog,
+    compaction_max_requests: usize,
     effort: Effort,
     debug_dump_api_requests: bool,
     ctrl_l: Arc<AtomicBool>,
@@ -1313,6 +1316,7 @@ impl ReplSession {
         self.runner.set_compactor(
             Arc::new(ModelCompactor {
                 model: catalog.clone(),
+                max_requests: self.compaction_max_requests,
             }),
             catalog.spec.auto_compact_at_tokens,
         );

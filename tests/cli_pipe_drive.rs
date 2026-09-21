@@ -677,6 +677,42 @@ async fn print_mode_compacts_and_continues_the_same_session() {
 }
 
 #[tokio::test]
+async fn compaction_uses_the_configured_request_budget_and_preserves_failed_threads() {
+    for limit in [None, Some(2)] {
+        let env = pipe_env("compact-budget");
+        let session = compact_test_session(&env);
+        let mut responses = vec![model_answer("done", 100)];
+        responses.extend((0..13).map(|_| model_tool("session_history", serde_json::json!({
+            "action": "stats", "session_id": session.id, "thread_id": session.active_thread().id,
+        }), 100)));
+        responses.push(write_summary_response(&session));
+        responses.push(model_answer("summary ready", 100));
+        let server = test_utils::StubHttpServer::sequence(responses).await;
+        configure_compact(&env, &server, false);
+        if let Some(limit) = limit {
+            let config = std::fs::read_to_string(&env.config).unwrap();
+            std::fs::write(
+                &env.config,
+                format!("compaction_max_requests = {limit}\n{config}"),
+            )
+            .unwrap();
+        }
+        let stdout = run_myco(&env, &["--resume", &session.id], b"task\n/compact\n/quit\n").await;
+        let saved = session_json(&env.dir, &session.id);
+        if limit.is_some() {
+            assert!(stdout.contains("2-request limit"), "{stdout}");
+            assert_eq!(server.connections(), 3);
+            assert_eq!(saved["threads"].as_array().unwrap().len(), 1);
+            assert_eq!(saved["threads"][0]["id"], session.active_thread().id);
+        } else {
+            assert!(stdout.contains("COMPACTED"), "{stdout}");
+            assert_eq!(server.connections(), 16);
+            assert_eq!(saved["threads"].as_array().unwrap().len(), 2);
+        }
+    }
+}
+
+#[tokio::test]
 async fn manual_compaction_does_not_resume_automatically() {
     let env = pipe_env("manual-compact");
     let session = compact_test_session(&env);

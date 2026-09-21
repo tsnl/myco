@@ -43,6 +43,9 @@ pub struct FileConfig {
     /// [`crate::prompts::DEFAULT_MAX_PRELUDE_BYTES`] applies at resolve.
     #[serde(default)]
     pub max_prelude_bytes: Option<usize>,
+    /// Maximum model requests per compaction, including retries. Must be positive.
+    #[serde(default)]
+    pub compaction_max_requests: Option<usize>,
 }
 
 /// `[gateways.NAME]`: one place models are served from.
