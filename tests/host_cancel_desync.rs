@@ -158,3 +158,43 @@ async fn drop_midcall_then_next_call_succeeds() {
         tool_text(&result)
     );
 }
+
+#[tokio::test]
+async fn remote_inventory_preserves_lazy_connections_and_partitions_resources_by_owner() {
+    let client = subprocess_host();
+    let owner = uuid::Uuid::new_v4();
+    assert!(
+        client
+            .resources(owner)
+            .await
+            .unwrap_err()
+            .contains("not connected")
+    );
+    assert!(!client.is_connected());
+    let result = client.call(owner, ToolUse { name: "bash".into(), input: json!({
+        "action":"start", "session_id":"retained", "command":"cat", "idle_ms":10, "timeout_ms":1000,
+    }) }, CancelToken::new()).await;
+    assert!(!result.is_error, "{result:?}");
+    let resources = client.resources(owner).await.unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].id, "retained");
+    assert_eq!(resources[0].details["process_exited"], false);
+    assert!(
+        client
+            .resources(uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"action":"close", "session_id":"retained"}),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(client.resources(owner).await.unwrap().is_empty());
+}

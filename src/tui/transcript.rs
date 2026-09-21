@@ -840,6 +840,37 @@ mod tests {
     }
 
     #[test]
+    fn system_parts_never_render_or_create_human_turn_headers() {
+        let hidden = Content::System {
+            kind: "resume".into(),
+            text: "runtime notice".into(),
+            data: json!({"service":"private inventory"}),
+        };
+        let messages = [
+            Message::UserMessage {
+                content: vec![hidden.clone()],
+            },
+            Message::UserMessage {
+                content: vec![
+                    hidden.clone(),
+                    Content::Text {
+                        text: "human request".into(),
+                    },
+                ],
+            },
+            Message::UserMessage {
+                content: vec![hidden],
+            },
+        ];
+        let rendered = render_history(&messages, Palette::plain());
+        assert!(rendered.contains("human request"));
+        assert!(!rendered.contains("runtime notice"));
+        assert!(!rendered.contains("private inventory"));
+        assert_eq!(rendered.matches("USER\n").count(), 1);
+        assert_eq!(rendered.matches("Accepted:").count(), 1);
+    }
+
+    #[test]
     fn thinking_blocks_are_replayed_from_history() {
         let messages = vec![Message::AssistantMessage {
             content: vec![

@@ -60,7 +60,7 @@ fn retry_delay(agent: &Agent, failed: &FailedAttempt, attempt: u32) -> Option<st
 }
 
 async fn generate_attempt(agent: &Agent) -> Result<GenerateOutput, FailedAttempt> {
-    let mut stream = agent.model.generate(&agent.history);
+    let mut stream = agent.model.generate(agent.history());
     let mut accumulator = MessageAccumulator::default();
     let mut started = false;
     while let Some(event) = stream.next().await {
@@ -168,7 +168,7 @@ mod tests {
             initial_backoff: Duration::ZERO,
             ..Default::default()
         });
-        agent.replace_context(vec![user("task")], None);
+        agent.replace_context(vec![user("task")], None).unwrap();
         (agent, model)
     }
 

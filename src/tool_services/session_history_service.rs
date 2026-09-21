@@ -368,7 +368,7 @@ fn content_text(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
+            Content::Text { text } | Content::System { text, .. } => Some(text.as_str()),
             Content::Thinking { text, .. } if !text.is_empty() => Some(text.as_str()),
             Content::Image { .. } => Some("[image]"),
             _ => None,

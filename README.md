@@ -90,6 +90,19 @@ headless execution using supplied tools and event sinks. The `myco` package
 assembles sessions, host tools, and the CLI. Workspace packages share a version and lockfile.
 Run `cargo test --locked --workspace` to test all packages.
 
+For scripted sessions and evals, `SessionRunner` supplies submission, durable
+checkpoints, automatic compaction, and continuation with an injected model and
+compactor. Interactive and print mode use this same runner. Run the offline
+[scripted session example](examples/scripted_session.rs):
+
+```bash
+cargo run --locked --example scripted_session
+```
+
+It uses real local tools in a temporary workspace, grades a file artifact,
+compacts during execution, then reloads the saved session and verifies its restart
+notice. See [scripted workflows](WORKFLOWS.md) for the API and recovery contract.
+
 ## Release
 
 The Publish workflow bumps the shared workspace version and exact internal

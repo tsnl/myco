@@ -1,5 +1,9 @@
 mod fs;
 pub mod image;
+mod runtime_info;
+
+pub(crate) use runtime_info::latest_runtime_part;
+pub use runtime_info::{HostResources, ModelInfo, ToolResource};
 
 pub(crate) use fs::myco_home_with;
 pub use fs::{atomically_write, myco_home, validate_profile};

@@ -163,7 +163,9 @@ When tools fail or the user asks why something is broken, investigate with tools
      the selected profile's `config.toml` (or `$MYCO_CONFIG`) only for knobs.
    - On remote: `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` via the
      **local** host's bash. Compare that path and version with the expected install;
-     an interactive login may use a different PATH. If missing/outdated: install a
+     connection requires matching package and host-protocol versions. A protocol
+     mismatch names the host to rebuild before tool calls can run.
+     An interactive login may use a different PATH. If missing/outdated: install a
      **binary built for that platform** (matching release asset), or **build on that host**
      from source. Do not copy binaries across mismatched OS/arch/glibc.
    - Confirm SSH alias works: `ssh -o BatchMode=yes <alias> true`.

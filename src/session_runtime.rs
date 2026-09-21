@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::agent::{Agent, BeforeGenerationNotice, ToolExecutor};
-use crate::core::{Async, CancelToken};
+use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{Content, Message, ToolResult, ToolSpec, ToolUse};
 use crate::harness::Harness;
 use crate::prelude::{self, PreludeEntry};
 use crate::session::ActiveSession;
+
+mod lifecycle;
+pub use lifecycle::RuntimeRecord;
 
 struct PreludeObservation {
     entries: Vec<PreludeEntry>,
@@ -105,24 +108,77 @@ impl SessionRuntime {
         &self.session_id
     }
 
-    pub fn bind_agent(self: &Arc<Self>, agent: &mut Agent) {
+    /// Bind or recover the latest saved context while holding the session writer.
+    /// Superseded checkpoints cannot discard or overwrite newer observations.
+    pub fn bind_agent(
+        self: &Arc<Self>,
+        agent: &mut Agent,
+    ) -> Result<(), crate::agent::AgentInteractionError> {
+        // Preserve unsaved observations only while this agent still owns the
+        // checkpoint. A superseded writer must not overwrite newer history.
+        if agent.checkpoint_failed() {
+            agent.checkpoint()?;
+        }
         let session = self.session.snapshot();
         assert_eq!(
             self.session_id, session.id,
             "a runtime belongs to one session"
         );
         let thread = session.active_thread();
+        if !agent.state().is_idle() {
+            return Err(crate::agent::StateError::Busy.into());
+        }
+        let history =
+            crate::agent::recover_checkpoint(thread.messages.clone(), thread.pending_operation)?;
+        if thread.pending_operation.is_some() {
+            let mut recovered = crate::agent::AgentState::default();
+            recovered.replace_context(history.clone(), thread.last_usage)?;
+            self.session
+                .persist_agent_state(&thread.id, &recovered, true, None)
+                .map_err(crate::agent::AgentInteractionError::Checkpoint)?;
+        }
+        agent.replace_context(history, thread.last_usage)?;
         let mut context = agent.context().clone();
         context.session_id = Some(session.id.clone());
         context.thread_id = Some(thread.id.clone());
         agent.set_context(context);
         agent.set_tools(self.clone());
-        agent.replace_context(thread.messages.clone(), thread.last_usage);
         agent.set_checkpoint(None);
+        Ok(())
+    }
+
+    pub(crate) fn install_compacted_context(
+        self: &Arc<Self>,
+        agent: &mut Agent,
+        continuing: bool,
+    ) -> Result<(), crate::agent::AgentInteractionError> {
+        let session = self.session.snapshot();
+        let thread = session.active_thread();
+        if continuing {
+            agent.replace_at_boundary(thread.messages.clone(), thread.last_usage)?;
+        } else {
+            agent.replace_context(thread.messages.clone(), thread.last_usage)?;
+        }
+        let mut context = agent.context().clone();
+        context.session_id = Some(session.id.clone());
+        context.thread_id = Some(thread.id.clone());
+        agent.set_context(context);
+        agent.set_checkpoint(None);
+        Ok(())
     }
 
     pub fn running_tool_summaries(&self) -> Vec<String> {
         self.harness.running_tool_summaries(self.owner_id)
+    }
+
+    pub async fn observe(
+        &self,
+        history: &[crate::generative_model::Message],
+        model: ModelInfo,
+        resume: bool,
+    ) -> Option<crate::generative_model::Content> {
+        let resources = self.harness.resources(self.owner_id).await;
+        RuntimeRecord::observe(history, self.owner_id, model, resources, resume)
     }
 }
 
@@ -307,7 +363,12 @@ mod tests {
             let rewound = serde_json::to_string(&outcome.rewound.unwrap()).unwrap();
             assert!(rewound.contains("user task"), "{rewound}");
             assert!(rewound.contains("Prelude changes"), "{rewound}");
-            assert!(agent.history().is_empty());
+            assert!(!agent.history().iter().any(Message::is_user_turn));
+            assert!(
+                !serde_json::to_string(agent.history())
+                    .unwrap()
+                    .contains("Prelude changes")
+            );
             let model = Arc::new(RecordingModel {
                 inner: ScriptedModel::new(vec![done()]),
                 requests: Mutex::default(),
@@ -382,6 +443,97 @@ mod tests {
         .await
         .result
         .unwrap();
+    }
+
+    #[test]
+    fn restart_records_unknown_outcomes_without_reexecuting_a_saved_tool_batch() {
+        let home = temp_home("pending-recovery");
+        let effect_path = home.path().join("external-effect");
+        let mut state = crate::agent::AgentState::default();
+        state
+            .append_input(crate::test_support::user("task"))
+            .unwrap();
+        let crate::agent::Effect::Generate { operation } = state.start().unwrap() else {
+            panic!()
+        };
+        state
+            .generated(
+                operation,
+                bash(json!({"command":format!("printf replayed >> '{}'", effect_path.display())})),
+            )
+            .unwrap();
+        let original = ActiveSession::new(Session::new("test"));
+        let thread = original.snapshot().active_thread().id.clone();
+        original
+            .persist_agent_state(&thread, &state, true, None)
+            .unwrap();
+        // The crash window includes tools that have executed but whose results
+        // never reached the store. Restart cannot distinguish this from no dispatch.
+        std::fs::write(&effect_path, "executed once").unwrap();
+        let loaded = Session::load(&original.snapshot().json_path()).unwrap();
+        assert!(loaded.active_thread().pending_operation.is_some());
+        let active = ActiveSession::new(loaded);
+        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), active.clone());
+        let mut agent = Agent::new(
+            ScriptedModel::new(vec![done()]),
+            runtime.clone(),
+            Arc::new(NullEventSink),
+        );
+        runtime.bind_agent(&mut agent).unwrap();
+        let recovered = Session::load(&active.snapshot().json_path()).unwrap();
+        assert!(recovered.active_thread().pending_operation.is_none());
+        assert!(
+            matches!(&agent.history()[2], crate::generative_model::Message::ToolResults { tool_use_results }
+            if tool_use_results[0].is_error && serde_json::to_string(tool_use_results).unwrap().contains("effects are unknown"))
+        );
+        assert!(!agent.history().last().unwrap().is_user_turn());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(agent.run(CancelToken::new()))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(effect_path).unwrap(),
+            "executed once"
+        );
+    }
+
+    #[test]
+    fn a_failed_checkpoint_does_not_change_the_active_session_or_claim_recovery() {
+        let home = temp_home("pending-save-failure");
+        let mut state = crate::agent::AgentState::default();
+        state
+            .append_input(crate::test_support::user("task"))
+            .unwrap();
+        state.start().unwrap();
+        let session = ActiveSession::new(Session::new("test"));
+        let thread = session.snapshot().active_thread().id.clone();
+        let original = serde_json::to_value(session.snapshot()).unwrap();
+        std::fs::write(home.path().join("session"), "blocks the store").unwrap();
+        assert!(
+            session
+                .persist_agent_state(&thread, &state, true, None)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(session.snapshot()).unwrap(), original);
+        std::fs::remove_file(home.path().join("session")).unwrap();
+        session
+            .persist_agent_state(&thread, &state, true, None)
+            .unwrap();
+        let pending = serde_json::to_value(session.snapshot()).unwrap();
+        std::fs::rename(home.path().join("session"), home.path().join("saved-store")).unwrap();
+        std::fs::write(home.path().join("session"), "blocks recovery").unwrap();
+        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
+        let mut agent = Agent::new(
+            ScriptedModel::new(vec![]),
+            runtime.clone(),
+            Arc::new(NullEventSink),
+        );
+        assert!(matches!(
+            runtime.bind_agent(&mut agent),
+            Err(crate::agent::AgentInteractionError::Checkpoint(_))
+        ));
+        assert!(agent.history().is_empty());
+        assert_eq!(serde_json::to_value(session.snapshot()).unwrap(), pending);
     }
 
     #[test]

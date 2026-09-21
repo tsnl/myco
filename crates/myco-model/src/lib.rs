@@ -442,7 +442,7 @@ pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, Mo
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     UserMessage {
         content: Vec<Content>,
@@ -455,6 +455,14 @@ pub enum Message {
         tool_uses: Vec<ToolUse>,
         turn_end_reason: Option<TurnEndReason>,
     },
+}
+
+impl Message {
+    /// Runtime-only input does not represent a human submission.
+    pub fn is_user_turn(&self) -> bool {
+        matches!(self, Self::UserMessage { content }
+            if content.is_empty() || content.iter().any(|part| !matches!(part, Content::System { .. })))
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnEndReason {
@@ -476,13 +484,13 @@ pub struct ToolSpec {
 /// its position (message index + ordinal), and the `j`-th entry of the next
 /// message's `tool_use_results` answers it. Providers that need ids on the
 /// wire get minted ones from the driver.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolUse {
     pub name: String,
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
     pub content: Vec<Content>,
     pub is_error: bool,
@@ -511,10 +519,18 @@ impl ToolResult {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Content {
     Text {
         text: String,
+    },
+    /// Runtime-authored context. Providers receive `text` at this position in
+    /// the message; transcript renderers omit the entire part. `data` retains
+    /// structured lifecycle facts independently of their model-facing wording.
+    System {
+        kind: String,
+        text: String,
+        data: serde_json::Value,
     },
     Image {
         source: String,
@@ -1215,6 +1231,8 @@ pub enum Recovery {
     /// identically — drop the last user message (typically the one carrying an
     /// oversized attachment) and the session can go on.
     OmitLastMessage,
+    /// An execution contract was violated. Resolve it before issuing more work.
+    Stop,
 }
 
 /// Ceiling on one serialized API request body, checked before upload.

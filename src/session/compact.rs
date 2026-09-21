@@ -25,6 +25,13 @@ pub fn compact_thread(
     summary_markdown: &str,
 ) -> Result<(super::Thread, CompactOutcome), String> {
     let predecessor = session.active_thread();
+    if matches!(
+        predecessor.pending_operation,
+        Some(crate::agent::PendingOperation::Tools { .. })
+    ) {
+        return Err("cannot compact an unanswered tool batch".into());
+    }
+    crate::agent::validate_context(&predecessor.messages).map_err(|error| error.to_string())?;
     if predecessor.messages.is_empty() {
         return Err("cannot compact an empty thread".into());
     }
@@ -47,10 +54,16 @@ pub fn compact_thread(
     );
     successor.messages = vec![Message::UserMessage {
         content: vec![
-            Content::Text {
+            Content::System {
+                kind: "session".into(),
                 text: prompts::thread_stamp(&session.id, &successor.id, session.created_at),
+                data: serde_json::json!({"session_id":session.id, "thread_id":successor.id, "created_at":session.created_at}),
             },
-            Content::Text { text: resume },
+            Content::System {
+                kind: "compaction".into(),
+                text: resume,
+                data: serde_json::json!({"predecessor_id":predecessor.id, "summary_path":session.summary_path()}),
+            },
         ],
     }];
     for (old_index, message) in tail {
@@ -59,6 +72,13 @@ pub fn compact_thread(
         if let Some(time) = predecessor.user_turn_timestamps.get(&old_index) {
             successor.user_turn_timestamps.insert(index, *time);
         }
+    }
+    // Runtime state is independent of the human tail. Keep only the latest
+    // observation, after the tail, so an older notice cannot override it.
+    if let Some(part) = crate::core::latest_runtime_part(&predecessor.messages) {
+        successor.messages.push(Message::UserMessage {
+            content: vec![part.clone()],
+        });
     }
     let outcome = CompactOutcome {
         session_id: session.id.clone(),
@@ -90,7 +110,7 @@ fn select_tail_indexed(
     let user_idxs: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter_map(|(i, m)| matches!(m, Message::UserMessage { .. }).then_some(i))
+        .filter_map(|(i, m)| m.is_user_turn().then_some(i))
         .collect();
     if user_idxs.is_empty() {
         return Vec::new();
@@ -116,9 +136,8 @@ fn select_tail_indexed(
         .collect();
     for (_, message) in &mut out {
         if let Message::UserMessage { content } = message {
-            content.retain(
-                |part| !matches!(part, Content::Text { text } if prompts::is_session_stamp(text)),
-            );
+            content
+                .retain(|part| !matches!(part, Content::System { kind, .. } if kind == "session" || kind == "runtime"));
         }
         truncate_message_bodies(message, tool_body_max);
     }
@@ -172,7 +191,11 @@ mod tests {
             vec![
                 Message::UserMessage {
                     content: vec![
-                        Content::Text { text: stamp },
+                        Content::System {
+                            kind: "session".into(),
+                            text: stamp,
+                            data: serde_json::json!({}),
+                        },
                         Content::Text {
                             text: "task".into(),
                         },
@@ -195,7 +218,7 @@ mod tests {
             })
             .flatten()
             .filter_map(|part| match part {
-                Content::Text { text } if prompts::is_session_stamp(text) => Some(text),
+                Content::System { text, kind, .. } if kind == "session" => Some(text),
                 _ => None,
             })
             .collect();
@@ -237,7 +260,7 @@ mod tests {
         assert!(saved.active_thread().last_usage.is_none());
         assert!(
             matches!(&saved.active_thread().messages[0], Message::UserMessage { content }
-            if matches!(&content[1], Content::Text { text } if text.contains("Continue work")))
+            if matches!(&content[1], Content::System { text, kind, .. } if kind == "compaction" && text.contains("Continue work")))
         );
     }
 
@@ -326,6 +349,33 @@ mod tests {
         assert!(saved.archived);
         assert_eq!(saved.threads()[0].user_turn_timestamps[&2], time);
         assert_eq!(saved.active_thread().user_turn_timestamps[&3], time);
+    }
+
+    #[test]
+    fn hidden_continuations_do_not_consume_the_compaction_tail_turn_budget() {
+        let continuation = Message::UserMessage {
+            content: vec![Content::System {
+                kind: "continuation".into(),
+                text: "continue".into(),
+                data: serde_json::json!({}),
+            }],
+        };
+        let messages = vec![
+            user("older"),
+            assistant("done"),
+            user("latest"),
+            assistant("partial"),
+            continuation.clone(),
+            assistant("partial"),
+            continuation,
+            assistant("done"),
+        ];
+        let tail = select_tail(&messages, 1, 1000);
+        assert_eq!(tail.len(), 6);
+        assert_eq!(
+            crate::session::first_user_text_from_messages(&tail).as_deref(),
+            Some("latest")
+        );
     }
 
     #[test]

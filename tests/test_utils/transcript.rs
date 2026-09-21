@@ -51,6 +51,7 @@ fn message_kind(msg: &Message) -> &'static str {
 fn format_content(c: &Content) -> String {
     match c {
         Content::Text { text } => format!("text: {text}\n"),
+        Content::System { kind, text, .. } => format!("system:{kind}: {text}\n"),
         Content::Image { .. } => "image: <omitted>\n".into(),
         Content::Thinking { text, redacted, .. } => {
             if *redacted {

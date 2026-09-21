@@ -18,10 +18,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::core::CancelToken;
+use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 use crate::host::HostWorker;
-use crate::host::protocol::{Request, Response};
+use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
 use crate::tool_services::HostDispatchContext;
 
 /// A remote tool gets its requested timeout plus this much time to return its
@@ -171,6 +171,40 @@ impl HostController {
         }
     }
 
+    /// Query only an existing connection. An unavailable inventory is not empty
+    /// and must never cause a lazy remote to connect or restart.
+    pub async fn resources(&self, agent_id: uuid::Uuid) -> Result<Vec<ToolResource>, String> {
+        if let Backend::InProcess { worker } = &self.backend {
+            return Ok(worker.resources(agent_id));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        let query = async {
+            let rx = self
+                .submit(
+                    &id,
+                    &Request::Resources {
+                        id: id.clone(),
+                        agent_id,
+                    },
+                    false,
+                )
+                .await?;
+            match rx.await {
+                Ok(Response::Resources { resources, .. }) => Ok(resources),
+                Ok(Response::Error { message, .. }) => Err(message),
+                Ok(_) => Err("unexpected resource inventory response".into()),
+                Err(_) => Err("host connection closed".into()),
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(2), query).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.abandon(&id).await;
+                Err("resource inventory timed out; host state is unknown".into())
+            }
+        }
+    }
+
     /// Last connect failure, if any (cleared after a successful connect).
     /// Always `None` for in-process hosts.
     pub fn last_error(&self) -> Option<String> {
@@ -225,7 +259,7 @@ impl HostController {
             tool_use,
         };
 
-        let rx = match self.submit(&id, &request).await {
+        let rx = match self.submit(&id, &request, true).await {
             Ok(rx) => rx,
             Err(e) => {
                 return ToolResult::err(format!("host {:?}: {e}", self.name));
@@ -237,7 +271,7 @@ impl HostController {
             _ = cancel.cancelled() => {
                 self.cancel_remote(&id).await;
                 self.abandon(&id).await;
-                return ToolResult::err("cancelled");
+                return ToolResult::err("cancelled while awaiting host acknowledgement; effects are unknown");
             }
             r = rx => r,
             _ = tokio::time::sleep(response_timeout) => {
@@ -258,7 +292,7 @@ impl HostController {
             Ok(Response::Error { message, .. }) => {
                 ToolResult::err(format!("host {:?}: {message}", self.name))
             }
-            Ok(Response::HelloOk { .. }) => unreachable!("hello is consumed during connect"),
+            Ok(_) => ToolResult::err("unexpected tool response"),
             Err(_closed) => ToolResult::err(format!("host {:?}: connection closed", self.name)),
         }
     }
@@ -302,6 +336,7 @@ impl HostController {
         &self,
         id: &str,
         request: &Request,
+        connect_if_needed: bool,
     ) -> Result<oneshot::Receiver<Response>, String> {
         let Backend::Subprocess {
             config,
@@ -326,6 +361,9 @@ impl HostController {
                 *slot = None;
             }
             if slot.is_none() {
+                if !connect_if_needed {
+                    return Err("host is not connected; inventory unavailable".into());
+                }
                 match connect_with_timeout(config, *connect_timeout_secs).await {
                     Ok(c) => {
                         if let Ok(mut err) = last_error.lock() {
@@ -509,8 +547,8 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
     let line = read_line(&mut stdout).await?;
     let reply = Response::decode(&line)?;
 
-    let version = match reply {
-        Response::HelloOk { version } => version,
+    let (version, protocol) = match reply {
+        Response::HelloOk { version, protocol } => (version, protocol),
         Response::Error { message, .. } => {
             let _ = child.start_kill();
             return Err(format!("hello error: {message}"));
@@ -530,6 +568,13 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
         return Err(format!(
             "remote myco {version} does not match local {local_version}; \
              rebuild myco on host {:?} (see harness-ops.md in the manual)",
+            config.name
+        ));
+    }
+    if protocol != HOST_PROTOCOL_VERSION {
+        let _ = child.start_kill();
+        return Err(format!(
+            "remote host protocol {protocol} does not match local {HOST_PROTOCOL_VERSION}; rebuild myco on host {:?}",
             config.name
         ));
     }
@@ -636,7 +681,7 @@ async fn run_reader(
         };
 
         match &msg {
-            Response::ToolResult { id, .. } => {
+            Response::ToolResult { id, .. } | Response::Resources { id, .. } => {
                 let mut pending = pending.lock().await;
                 if let Some(tx) = pending.remove(id) {
                     let _ = tx.send(msg);
@@ -691,7 +736,9 @@ mod tests {
 
     /// One `hello_ok` NDJSON line claiming `version`.
     fn hello_line(version: &str) -> String {
-        format!("{{\"type\":\"hello_ok\",\"version\":\"{version}\"}}")
+        format!(
+            "{{\"type\":\"hello_ok\",\"version\":\"{version}\",\"protocol\":{HOST_PROTOCOL_VERSION}}}"
+        )
     }
 
     async fn bash_call(ctl: &HostController, command: &str) -> ToolResult {
@@ -851,6 +898,20 @@ mod tests {
         let text = text_parts(&result).join("");
         assert!(text.contains("0.0.1"), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains("rebuild"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_older_host_protocol_is_rejected_before_tool_dispatch() {
+        let hello = serde_json::json!({"type":"hello_ok", "version":env!("CARGO_PKG_VERSION")});
+        let ctl = scripted_host(
+            "old-protocol",
+            format!("read -r _line; printf '%s\\n' '{hello}'; sleep 5"),
+        );
+        let result = bash_call(&ctl, "true").await;
+        assert!(result.is_error);
+        let text = text_parts(&result).join("");
+        assert!(text.contains("protocol 0"), "{text}");
         assert!(text.contains("rebuild"), "{text}");
     }
 

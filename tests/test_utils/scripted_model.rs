@@ -44,6 +44,9 @@ impl GenerativeModel for ScriptedModel {
         let mut parts = vec![MessagePart::MessageStart];
         for (i, c) in output.content.iter().enumerate() {
             match c {
+                Content::System { .. } => {
+                    panic!("system parts are runtime input, not model output")
+                }
                 Content::Text { text } => {
                     parts.push(MessagePart::ContentStart(ContentStart::Text { index: i }));
                     parts.push(MessagePart::ContentDelta(ContentDelta::Text {

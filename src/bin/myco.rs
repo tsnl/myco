@@ -10,8 +10,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use myco::chat::{
-    CompactWorkerError, SessionTurnOutcome, persist_session, resume_after_compaction,
-    run_compact_worker, run_session_turn, wire_checkpoint,
+    ModelCompactor, SessionRunner, SessionTurnOutcome, WorkflowEvent, persist_session,
 };
 use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
@@ -312,8 +311,7 @@ async fn run_print(args: Args) {
         session: active_session,
         // Bound, not dropped: the guard must outlive the turn.
         session_lock: _session_lock,
-        mut agent,
-        runtime,
+        mut runner,
         catalog_model,
         ..
     } = boot;
@@ -353,20 +351,11 @@ async fn run_print(args: Args) {
         "{}",
         myco::tui::transcript::acceptance_line(Some(accepted_at))
     );
-    let outcome = run_session_turn(
-        &mut agent,
-        &runtime,
-        content,
-        args.fork,
-        cancel,
-        accepted_at,
-        session_warning,
-    )
-    .await;
+    let outcome = runner.submit(content, accepted_at, cancel).await;
     sigint_task.abort();
     sink.finish();
 
-    if !agent.history().is_empty() || active_session.snapshot().json_path().exists() {
+    if !runner.agent().history().is_empty() || active_session.snapshot().json_path().exists() {
         eprintln!("session={}", active_session.id());
     }
 
@@ -591,8 +580,7 @@ struct Boot {
     /// `None` when locking is unavailable on this filesystem.
     session_lock: Option<SessionWriteLock>,
     harness: Arc<Harness>,
-    agent: Agent,
-    runtime: Arc<myco::SessionRuntime>,
+    runner: SessionRunner,
 }
 
 /// Shared startup for `-p/--print` and the interactive REPL. The one genuinely
@@ -650,19 +638,43 @@ async fn boot<S: EventSink + 'static>(
         &harness,
         args.debug_dump_api_requests,
         args.effort,
-        args.print.is_none(),
     );
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
-    let mut agent = Agent::new(model, runtime.clone(), sink.clone());
+    let mut agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
     agent
         .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
     agent.set_retry_policy(catalog_model.backend.retry_policy());
     agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
-    runtime.bind_agent(&mut agent);
-    // Mid-turn checkpoints: context forks and crash recovery see finished
-    // tool rounds; the end-of-turn force-saves in both modes stay the backstop.
-    wire_checkpoint(&mut agent, &session, session_warning);
+    let mut runner = SessionRunner::new(agent, runtime)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("myco: cannot bind session: {error}");
+            std::process::exit(1);
+        });
+    runner
+        .set_model(
+            model,
+            myco::ModelInfo::from_spec(&catalog_model.spec, Some(args.effort)),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("myco: cannot record runtime: {error}");
+            std::process::exit(1);
+        });
+    runner.set_forked(args.fork);
+    runner.set_compactor(
+        Arc::new(ModelCompactor {
+            model: catalog_model.clone(),
+            harness: harness.clone(),
+        }),
+        catalog_model.spec.auto_compact_at_tokens,
+    );
+    runner.set_observer(Arc::new(|event| {
+        if let WorkflowEvent::Warning(message) = event {
+            session_warning(&message);
+        }
+    }));
 
     (
         Boot {
@@ -672,8 +684,7 @@ async fn boot<S: EventSink + 'static>(
             session,
             session_lock,
             harness,
-            agent,
-            runtime,
+            runner,
         },
         sink,
     )
@@ -708,8 +719,7 @@ async fn run_interactive(args: Args) {
         session: active_session,
         session_lock,
         harness,
-        agent,
-        runtime,
+        mut runner,
     } = boot;
     let wrap = effective_wrap_width(app_config.wrap_max);
     let ctrl_l = Arc::new(AtomicBool::new(false));
@@ -733,11 +743,27 @@ async fn run_interactive(args: Args) {
         active_session.with(|session| ui.replay_thread(session.active_thread()));
     }
 
-    // Thinking/reasoning is always requested; UI shows summary lines only
-    // (not stored).
+    let workflow_ui = ui.clone();
+    runner.set_observer(Arc::new(move |event| match event {
+        WorkflowEvent::Compacting {
+            session_id,
+            thread_id,
+            automatic,
+        } => {
+            workflow_ui.flush_output();
+            workflow_ui.note(&format!(
+                "{}compacting session={session_id} thread={thread_id} …",
+                if automatic { "auto-" } else { "" }
+            ));
+        }
+        WorkflowEvent::Compacted(outcome) => {
+            clear_screen();
+            workflow_ui.compacted_banner(&outcome);
+        }
+        WorkflowEvent::Warning(message) => workflow_ui.warning_section(&message),
+    }));
     let mut repl = ReplSession {
-        agent,
-        runtime,
+        runner,
         session: active_session,
         editor,
         harness,
@@ -750,13 +776,11 @@ async fn run_interactive(args: Args) {
         repaint: app_config.repaint_enabled,
         ui: ui.clone(),
         turn_cancel: TurnCancel::default(),
-        forked: args.fork,
         session_lock,
-        auto_compact_failed: false,
     };
     repl.run_repl().await;
 
-    if let Err(e) = persist_session(&repl.agent, &repl.session, /*force*/ true) {
+    if let Err(e) = persist_session(repl.runner.agent(), &repl.session, /*force*/ true) {
         eprintln!("warning: could not save session on exit: {e}");
     }
     if let Err(e) = save_readline_history(&mut repl.editor, &repl.session) {
@@ -764,7 +788,7 @@ async fn run_interactive(args: Args) {
     }
     // Only announce a session id if we actually wrote one (non-empty history);
     // a note under the USER header the quit was typed at.
-    if !repl.agent.history().is_empty() || repl.session.snapshot().json_path().exists() {
+    if !repl.runner.agent().history().is_empty() || repl.session.snapshot().json_path().exists() {
         ui.note(&format!("session={}", repl.session.id()));
     }
 }
@@ -774,7 +798,6 @@ fn build_model(
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
-    interactive: bool,
 ) -> (
     Arc<dyn generative_model::GenerativeModel>,
     Vec<myco::prelude::PreludeEntry>,
@@ -805,10 +828,7 @@ fn build_model(
             epilogue,
             prompts::model_stamp(&catalog_model.spec.key),
             prompts::auto_compact_notice(
-                catalog_model
-                    .spec
-                    .auto_compact_at_tokens
-                    .filter(|_| interactive),
+                catalog_model.spec.auto_compact_at_tokens,
                 catalog_model.spec.context_window_tokens,
             ),
         ]
@@ -905,8 +925,7 @@ fn load_resume_session_or_exit(id_or_prefix: Option<&str>) -> Session {
 /// helpers: the agent with its live session and line editor, the resolved
 /// model and UI handles, and the REPL-scoped knobs.
 struct ReplSession {
-    agent: Agent,
-    runtime: Arc<myco::SessionRuntime>,
+    runner: SessionRunner,
     session: ActiveSession,
     editor: Editor<ReplHelper, DefaultHistory>,
     harness: Arc<Harness>,
@@ -920,18 +939,10 @@ struct ReplSession {
     repaint: bool,
     ui: Arc<TuiProducer>,
     turn_cancel: TurnCancel,
-    /// This run started as a context fork, whose inherited first message
-    /// carries the *parent's* session stamp — cleared once this session has
-    /// stamped its own id on its first submitted turn.
-    forked: bool,
     /// Single-writer guard on the live session, swapped whenever the REPL
     /// switches sessions (`/new`, `/resume`, `/compact`). `None` when locking is
     /// unavailable on this filesystem.
     session_lock: Option<SessionWriteLock>,
-    /// Set when an *automatic* compaction fails, to stop every later turn
-    /// paying for a worker run that just failed. `/compact` still works, and a
-    /// session switch (`/new`, `/resume`) clears it with the rest of the state.
-    auto_compact_failed: bool,
 }
 
 impl ReplSession {
@@ -949,19 +960,19 @@ impl ReplSession {
             if wrap != last_wrap {
                 last_wrap = wrap;
                 self.ui.set_wrap(wrap);
-                if self.repaint && !self.agent.history().is_empty() {
+                if self.repaint && !self.runner.agent().history().is_empty() {
                     clear_and_reprint(&self.session, &self.ui);
                 }
             }
-            let max = self.agent.context_window_tokens();
-            let usage = self.agent.last_usage();
+            let max = self.runner.agent().context_window_tokens();
+            let usage = self.runner.agent().last_usage();
             // `None` (→ `?`) = resumed before usage was tracked; `0` = genuinely empty session.
             let used = match usage {
                 Some(u) => Some(u.context_tokens()),
-                None if self.agent.history().is_empty() => Some(0),
+                None if self.runner.agent().history().is_empty() => Some(0),
                 None => None,
             };
-            let running = self.runtime.running_tool_summaries();
+            let running = self.runner.runtime().running_tool_summaries();
             self.ui.user_header(used, max, usage, &running);
             // No "> " prefix; body is typed on the line after the USER header.
             // Multiline: Alt-Enter / Ctrl-J inserts a newline in-buffer; plain Enter
@@ -1004,7 +1015,7 @@ impl ReplSession {
                     self.run_compact(cancel).await;
                     self.turn_cancel.disarm();
                 } else {
-                    self.handle_meta(cmd);
+                    self.handle_meta(cmd).await;
                 }
                 // Same gap every finished turn ends with: block, blank line,
                 // next USER rule.
@@ -1137,26 +1148,8 @@ impl ReplSession {
         self.ui
             .note(&myco::tui::transcript::acceptance_line(Some(accepted_at)));
 
-        let outcome = run_session_turn(
-            &mut self.agent,
-            &self.runtime,
-            content,
-            std::mem::take(&mut self.forked),
-            cancel.clone(),
-            accepted_at,
-            session_warning,
-        )
-        .await;
-        let succeeded = outcome.result.is_ok();
+        let outcome = self.runner.submit(content, accepted_at, cancel).await;
         self.show_turn_outcome(outcome);
-
-        if succeeded && !cancel.is_cancelled() && self.maybe_auto_compact(cancel.clone()).await {
-            self.ui.note("resuming after automatic compaction …");
-            let outcome =
-                resume_after_compaction(&mut self.agent, &self.runtime, cancel, session_warning)
-                    .await;
-            self.show_turn_outcome(outcome);
-        }
         self.turn_cancel.disarm();
 
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
@@ -1193,102 +1186,18 @@ impl ReplSession {
 // ---------------------------------------------------------------------------
 
 impl ReplSession {
-    /// Commit a successor thread without changing the session or its tools.
     async fn run_compact(&mut self, cancel: myco::CancelToken) -> bool {
-        let writer = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return false,
-            writer = self.session.writer() => writer,
-        };
-        if let Err(e) =
-            self.session
-                .persist_messages(self.agent.history(), self.agent.last_usage(), true)
-        {
-            self.ui
-                .error_section(&format!("compact: failed to persist current session: {e}"));
-            return false;
-        }
-        let predecessor = self.session.snapshot();
-        if predecessor.active_thread().messages.is_empty() {
-            self.ui.error_section("compact: session is empty");
-            return false;
-        }
-
-        // Progress note under the USER header, not chrome: the COMPACTED
-        // banner replaces it on success, and it survives on screen (and in
-        // the mirror) when the worker fails.
-        self.ui.note(&format!(
-            "compacting session={} thread={} …",
-            predecessor.id,
-            predecessor.active_thread().id
-        ));
-
-        let result = run_compact_worker(
-            &predecessor,
-            &self.catalog_model,
-            self.harness.clone(),
-            cancel.clone(),
-        )
-        .await;
-        if cancel.is_cancelled() {
-            self.ui.note("compact: cancelled (session unchanged)");
-            return false;
-        }
-
-        let (successor, outcome) = match result {
-            Ok(v) => v,
-            Err(CompactWorkerError::Cancelled) => {
-                self.ui.note("compact: cancelled (session unchanged)");
-                return false;
+        match self.runner.compact(cancel).await {
+            Ok(_) => true,
+            Err(myco::AgentInteractionError::Cancelled) => {
+                self.ui.note("compact: cancelled");
+                false
             }
-            Err(CompactWorkerError::Failed(reason)) => {
-                self.ui.error_section(&format!("compact: {reason}"));
-                return false;
+            Err(error) => {
+                self.ui.error_section(&error.to_string());
+                false
             }
-        };
-
-        if let Err(error) = writer.commit_thread(successor) {
-            self.ui.error_section(&format!("compact: {error}"));
-            return false;
         }
-        self.runtime.bind_agent(&mut self.agent);
-        wire_checkpoint(&mut self.agent, &self.session, session_warning);
-
-        clear_screen();
-        self.ui.compacted_banner(&outcome);
-        true
-    }
-
-    async fn maybe_auto_compact(&mut self, cancel: myco::CancelToken) -> bool {
-        let Some(threshold) = self.catalog_model.spec.auto_compact_at_tokens else {
-            return false;
-        };
-        if self.auto_compact_failed {
-            return false;
-        }
-        // No usage means nothing measured to act on: a resumed session before
-        // its first turn, or a turn that failed before the provider reported.
-        let Some(usage) = self.agent.last_usage() else {
-            return false;
-        };
-        let used = usage.context_tokens();
-        if used < threshold {
-            return false;
-        }
-
-        self.ui.note(&format!(
-            "auto-compacting: prompt reached {used} tokens of {} (threshold {threshold}) …",
-            self.agent.context_window_tokens()
-        ));
-        if !self.run_compact(cancel).await {
-            self.auto_compact_failed = true;
-            self.ui.note(
-                "auto-compact disabled for this session after the failure above; \
-                 run /compact to retry",
-            );
-            return false;
-        }
-        true
     }
 }
 
@@ -1352,18 +1261,17 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
 }
 
 impl ReplSession {
-    fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
+    async fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
         match cmd {
             MetaCommand::Help => print_help(&self.ui),
             MetaCommand::Unknown(head) => self
                 .ui
                 .error_section(&format!("Unknown command: {head}  (try /help)")),
             MetaCommand::Session => {
-                let _ = self.session.persist_messages(
-                    self.agent.history(),
-                    self.agent.last_usage(),
-                    false,
-                );
+                if let Err(error) = persist_session(self.runner.agent(), &self.session, false) {
+                    self.ui
+                        .error_section(&format!("could not save session: {error}"));
+                }
                 self.ui
                     .myco_section(&format_session_detail(&self.session.snapshot()));
             }
@@ -1403,17 +1311,18 @@ impl ReplSession {
             }
             MetaCommand::Hosts => self.ui.myco_section(&format_host_status(&self.harness)),
             MetaCommand::New => {
-                self.save_before_switch();
+                if !self.save_before_switch() {
+                    return;
+                }
                 // A nested run stays nested across /new: carry kind + parent lineage.
                 let snapshot = self.session.snapshot();
                 let mut fresh = Session::new(self.catalog_model.spec.key.clone());
                 fresh.kind = snapshot.kind;
                 fresh.parent_session_id = snapshot.parent_session_id.clone();
-                if let Err(msg) = self.relock_session(&fresh.id) {
+                if let Err(msg) = self.install_session(&fresh).await {
                     self.ui.error_section(&format!("new session failed: {msg}"));
                     return;
                 }
-                self.install_session(&fresh);
                 // Fresh canvas for a fresh session: the same clear + banner
                 // open as startup, so the new screen begins under a banner
                 // (the Session: line carries the fresh id).
@@ -1422,18 +1331,19 @@ impl ReplSession {
                     .startup_banner(&self.catalog_model.spec.key, &session_label(&self.session));
             }
             MetaCommand::Resume(arg) => {
-                self.save_before_switch();
+                if !self.save_before_switch() {
+                    return;
+                }
                 match resolve_resume_session(arg) {
                     Ok(loaded) => {
-                        if let Err(msg) = self.relock_session(&loaded.id) {
+                        if let Err(msg) = self.install_session(&loaded).await {
                             self.ui.error_section(&format!("resume failed: {msg}"));
                             return;
                         }
-                        self.install_session(&loaded);
                         self.ui.myco_section(&format!(
                             "resumed session={}  messages={}",
                             self.session.id(),
-                            self.agent.history().len()
+                            self.runner.agent().history().len()
                         ));
                         self.session
                             .with(|session| self.ui.replay_thread(session.active_thread()));
@@ -1457,16 +1367,28 @@ impl ReplSession {
                             &self.harness,
                             self.debug_dump_api_requests,
                             self.effort,
-                            true,
                         );
-                        self.agent.set_model(model);
-                        self.agent.set_before_generation_notice(Some(
-                            myco::session_runtime::prelude_change_notices(prelude),
-                        ));
-                        self.agent.set_context_window_tokens(
+                        if let Err(error) = self
+                            .runner
+                            .set_model(
+                                model,
+                                myco::ModelInfo::from_spec(
+                                    &self.catalog_model.spec,
+                                    Some(self.effort),
+                                ),
+                            )
+                            .await
+                        {
+                            self.ui.error_section(&error.to_string());
+                        } else {
+                            self.runner.agent_mut().set_before_generation_notice(Some(
+                                myco::session_runtime::prelude_change_notices(prelude),
+                            ));
+                        }
+                        self.runner.agent_mut().set_context_window_tokens(
                             self.catalog_model.spec.context_window_tokens,
                         );
-                        self.agent.set_max_truncated_resumes(
+                        self.runner.agent_mut().set_max_truncated_resumes(
                             self.catalog_model.spec.max_truncated_resumes,
                         );
                         self.ui.myco_section(&format!("effort={}", self.effort));
@@ -1512,13 +1434,17 @@ impl ReplSession {
         }
     }
 
-    fn save_before_switch(&mut self) {
-        if let Err(e) = persist_session(&self.agent, &self.session, /*force*/ false) {
-            eprintln!("warning: could not save current session: {e}");
+    fn save_before_switch(&mut self) -> bool {
+        if let Err(e) = persist_session(self.runner.agent(), &self.session, /*force*/ false) {
+            self.ui.error_section(&format!(
+                "could not save current session; session switch stopped: {e}"
+            ));
+            return false;
         }
         if let Err(e) = save_readline_history(&mut self.editor, &self.session) {
             eprintln!("warning: could not save history: {e}");
         }
+        true
     }
 
     /// Move the single-writer guard to `next_id` before that session goes live.
@@ -1542,14 +1468,28 @@ impl ReplSession {
 
     /// Make `loaded` the live session: swap it into the shared handle, reset
     /// agent history/usage, and reload readline history.
-    fn install_session(&mut self, loaded: &Session) {
-        self.session.replace(loaded.clone());
-        if self.runtime.session_id() != loaded.id {
-            self.runtime = myco::SessionRuntime::new(self.harness.clone(), self.session.clone());
+    async fn install_session(&mut self, loaded: &Session) -> Result<(), String> {
+        myco::agent::validate_checkpoint(
+            &loaded.active_thread().messages,
+            loaded.active_thread().pending_operation,
+        )
+        .map_err(|error| error.to_string())?;
+        if !self.runner.agent().state().is_idle() {
+            return Err("cannot switch sessions while an agent operation is outstanding".into());
         }
-        self.runtime.bind_agent(&mut self.agent);
-        wire_checkpoint(&mut self.agent, &self.session, session_warning);
+        self.relock_session(&loaded.id)?;
+        self.session.replace(loaded.clone());
+        let runtime = if self.runner.runtime().session_id() == loaded.id {
+            self.runner.runtime().clone()
+        } else {
+            myco::SessionRuntime::new(self.harness.clone(), self.session.clone())
+        };
+        self.runner
+            .bind_runtime(runtime)
+            .await
+            .map_err(|error| error.to_string())?;
         load_readline_history(&mut self.editor, &self.session);
+        Ok(())
     }
 }
 

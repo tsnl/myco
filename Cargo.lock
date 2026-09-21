@@ -929,6 +929,7 @@ version = "0.3.0"
 dependencies = [
  "futures",
  "myco-model",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

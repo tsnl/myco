@@ -351,6 +351,23 @@ impl Harness {
             .collect()
     }
 
+    /// Connected hosts are observed concurrently; disconnected remotes stay lazy.
+    pub async fn resources(&self, agent_id: uuid::Uuid) -> Vec<crate::core::HostResources> {
+        futures::future::join_all(self.host_names().into_iter().map(|host| async move {
+            let result = self.hosts[&host].resources(agent_id).await;
+            let (resources, error) = match result {
+                Ok(resources) => (Some(resources), None),
+                Err(error) => (None, Some(error)),
+            };
+            crate::core::HostResources {
+                host,
+                resources,
+                error,
+            }
+        }))
+        .await
+    }
+
     /// Notify all hosts that `agent_id`'s session ended.
     ///
     /// Safe to call from [`Drop`]: schedules work on the current tokio runtime when

@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         content: vec![Content::Text {
             text: "Use echo to say hello.".into(),
         }],
-    });
+    })?;
 
     let answer = agent.run(CancelToken::new()).await?;
     for content in answer {
