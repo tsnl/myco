@@ -38,15 +38,19 @@ provider settings, such as `reasoning` or `thinking`, go in
 stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the crate.
 
-An effect interpreter can use this client as a generation service, retaining
-operation, turn, and checkpoint correlations outside the crate. Observations and
-the returned outcome become inputs to the agent's state-transition functions.
-They decide whether to accept a response into a new immutable checkpoint;
+An effect interpreter uses this client by translating the session language into
+a `Request` and translating observations and the returned `Response` into session
+events and candidates. These genai types exist at the interpretation boundary;
+the agent crate does not depend on them. The interpreter retains native provider
+continuation and call-ID mappings as evidence referenced by the session. It
+restores that evidence when assembling later requests.
+
+Operation, turn, and checkpoint correlations remain outside this crate. State
+transitions decide whether to accept a candidate into a new immutable checkpoint;
 generation itself performs no transcript writes. Concurrent calls can produce
-independent candidates from the same checkpoint context while its session and
-thread snapshots remain unchanged. Checkpoint storage and memory-sharing choices
-belong to the caller. Exposing generation through a model's tool catalog is a
-separate application choice.
+independent candidates from the same checkpoint context. Checkpoint storage and
+memory-sharing choices belong to the caller. Exposing generation through a
+model's tool catalog is a separate application choice.
 
 ## Contract
 
@@ -82,9 +86,10 @@ separate application choice.
   resources; it is not an acknowledgement that the provider stopped computing
   or billing.
 
-For evaluations, the application's effect interpreter can supply scripted
-responses using `Response::new`. The application chooses how request events,
-raw progress, final responses, and failures enter its own records.
+Controller evaluations can supply scripted session events without this crate.
+Tests of the interpreter's response translation can use `Response::new`. The
+application chooses how request events, raw progress, final responses, and
+failures enter its own records.
 
 ## Implementation
 
