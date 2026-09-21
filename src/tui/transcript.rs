@@ -99,9 +99,6 @@ pub fn usage_line(u: TokenUsage) -> String {
     line
 }
 
-/// Max chars for string values inside pretty-printed tool inputs (display only).
-pub const TOOL_DISPLAY_STRING_MAX: usize = 72;
-
 /// ANSI styling and wrap width for transcript rendering. Disabled styling +
 /// no wrap → byte-identical plain output, so files, logs, and piped stdout
 /// never carry escape codes. The CLI resolves color at startup via
@@ -112,6 +109,8 @@ pub struct Palette {
     pub enabled: bool,
     /// Word-wrap prose (and size rules) to this column width; `None` = off.
     pub wrap: Option<usize>,
+    /// Expand tool inputs and recorded output instead of showing a short preview.
+    pub verbose: bool,
 }
 
 impl Palette {
@@ -120,6 +119,7 @@ impl Palette {
         Self {
             enabled: false,
             wrap: None,
+            verbose: false,
         }
     }
 
@@ -127,11 +127,16 @@ impl Palette {
         Self {
             enabled,
             wrap: None,
+            verbose: false,
         }
     }
 
     pub const fn with_wrap(self, wrap: Option<usize>) -> Self {
         Self { wrap, ..self }
+    }
+
+    pub const fn with_verbose(self, verbose: bool) -> Self {
+        Self { verbose, ..self }
     }
 }
 
@@ -327,7 +332,7 @@ pub fn history_events_at(
                     }
                 }
                 for tu in tool_uses {
-                    st.start_tool(&mut events, &tu.name, &tu.input, palette.wrap);
+                    st.start_tool(&mut events, &tu.name, &tu.input, palette);
                     st.at_line_start = true;
                     st.need_blank = true;
                 }
@@ -337,7 +342,7 @@ pub fn history_events_at(
                     index.checked_sub(1).and_then(|i| messages.get(i))
                 {
                     for (tool, result) in tool_uses.iter().zip(tool_use_results) {
-                        st.tool_result(&mut events, tool, result, palette.wrap);
+                        st.tool_result(&mut events, tool, result, palette);
                     }
                 }
             }
@@ -367,38 +372,6 @@ fn replay_paragraph(
     st.need_blank = true;
 }
 
-/// Truncate a display string to `max_chars` (including a trailing `…` when shortened).
-fn truncate_display_string(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let trimmed: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{trimmed}…")
-}
-
-/// Deep-copy JSON, replacing long string values with truncated versions for display.
-pub fn truncate_json_strings(value: &serde_json::Value, max_chars: usize) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => {
-            serde_json::Value::String(truncate_display_string(s, max_chars))
-        }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .map(|v| truncate_json_strings(v, max_chars))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                out.insert(k.clone(), truncate_json_strings(v, max_chars));
-            }
-            serde_json::Value::Object(out)
-        }
-        other => other.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,12 +395,12 @@ mod tests {
     }
 
     fn render_tool_invocation(name: &str, input: &serde_json::Value, palette: Palette) -> String {
-        encode_ansi(&tool_events(name, input, palette.wrap), palette.enabled)
+        encode_ansi(&tool_events(name, input, palette), palette.enabled)
     }
 
-    fn tool_events(name: &str, input: &serde_json::Value, wrap: Option<usize>) -> Vec<TuiEvent> {
+    fn tool_events(name: &str, input: &serde_json::Value, palette: Palette) -> Vec<TuiEvent> {
         let mut events = Vec::new();
-        let frame = super::super::tool_box::ToolBox::open(&mut events, name, wrap);
+        let mut frame = super::super::tool_box::ToolBox::open(&mut events, name, palette);
         frame.input(&mut events, name, input);
         frame.close(&mut events);
         events
@@ -718,12 +691,15 @@ mod tests {
         );
         let input = json!({"command":command, "host":"devbox", "timeout_ms":5000});
         let original = input.clone();
-        let rendered =
-            render_tool_invocation("bash", &input, Palette::plain().with_wrap(Some(240)));
+        let rendered = render_tool_invocation(
+            "bash",
+            &input,
+            Palette::plain().with_wrap(Some(240)).with_verbose(true),
+        );
         assert_eq!(
             box_body(&rendered),
             format!(
-                "{{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}}\n$ {}",
+                "$ {}\n{{\n  \"host\": \"devbox\",\n  \"timeout_ms\": 5000\n}}",
                 command.replace('\n', "\n  ")
             )
         );
@@ -731,17 +707,17 @@ mod tests {
     }
 
     #[test]
-    fn bash_stdin_displays_in_full_below_session_options() {
+    fn verbose_bash_stdin_displays_in_full_with_session_options() {
         let stdin = format!("echo '{}'\nprintf '%s\\n' done\n", "x".repeat(100));
         let rendered = render_tool_invocation(
             "bash",
             &json!({"action": "send", "session_id": "shell", "stdin": stdin}),
-            Palette::plain().with_wrap(Some(240)),
+            Palette::plain().with_wrap(Some(240)).with_verbose(true),
         );
         assert_eq!(
             box_body(&rendered),
             format!(
-                "{{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}}\nstdin:\n> {}",
+                "stdin:\n> {}\n{{\n  \"action\": \"send\",\n  \"session_id\": \"shell\"\n}}",
                 stdin.trim_end_matches('\n').replace('\n', "\n  ")
             )
         );
@@ -766,7 +742,11 @@ mod tests {
             "路径e\u{301}".repeat(30)
         );
         for width in [8, 20, 80] {
-            let events = tool_events("bash", &json!({"command": command}), Some(width));
+            let events = tool_events(
+                "bash",
+                &json!({"command": command}),
+                Palette::plain().with_wrap(Some(width)).with_verbose(true),
+            );
             let rendered = super::super::encode_plain(&events);
             for line in rendered.lines() {
                 assert_eq!(
@@ -834,41 +814,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_invocation_truncates_long_strings() {
-        let long = "a".repeat(TOOL_DISPLAY_STRING_MAX + 50);
+    fn verbose_tool_inputs_keep_long_json_strings() {
+        let long = "a".repeat(180);
+        let input = json!({"content": long, "path": "f.txt"});
         let rendered = render_tool_invocation(
             "write",
-            &json!({
-                "path": "f.txt",
-                "content": long,
-                "nested": { "blob": "b".repeat(TOOL_DISPLAY_STRING_MAX + 10) },
-                "items": ["short", "c".repeat(TOOL_DISPLAY_STRING_MAX + 1)],
-            }),
-            Palette::plain(),
+            &input,
+            Palette::plain().with_wrap(Some(240)).with_verbose(true),
         );
-        assert!(rendered.starts_with("╭─ write "));
-        assert!(rendered.contains("\"path\": \"f.txt\""));
-        // Truncated values end with ellipsis inside the JSON string.
-        assert!(rendered.contains('…'));
-        // Full original length must not appear.
-        assert!(!rendered.contains(&"a".repeat(TOOL_DISPLAY_STRING_MAX + 50)));
-        // Short strings unchanged.
-        assert!(box_body(&rendered).contains("\"items\": [\n    \"short\","));
-        // Scalar long string.
-        let scalar = render_tool_invocation(
-            "echo",
-            &json!("d".repeat(TOOL_DISPLAY_STRING_MAX + 5)),
-            Palette::plain(),
-        );
-        assert!(scalar.starts_with("╭─ echo "));
-        assert!(scalar.contains('…'));
-        assert!(!scalar.contains(&"d".repeat(TOOL_DISPLAY_STRING_MAX + 5)));
-    }
-
-    #[test]
-    fn truncate_json_strings_leaves_short_values() {
-        let v = json!({"n": 1, "s": "ok", "a": [true, null]});
-        assert_eq!(truncate_json_strings(&v, 10), v);
+        assert!(rendered.contains(&long));
+        assert!(rendered.contains("f.txt"));
+        assert!(!rendered.contains("… /verbose"));
+        let compact = render_tool_invocation("write", &input, Palette::plain().with_wrap(Some(20)));
+        assert!(compact.contains("… /verbose"));
+        assert!(!compact.contains("f.txt"));
+        assert_eq!(input["content"], long);
     }
 
     #[test]

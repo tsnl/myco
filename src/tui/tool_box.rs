@@ -3,17 +3,26 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{Style, TOOL_DISPLAY_STRING_MAX, TuiEvent, styled_line, truncate_json_strings};
+use super::{Palette, Style, TuiEvent, styled_line};
+
+const PREVIEW_LINES: usize = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ToolBox {
     width: usize,
+    remaining: Option<usize>,
+    truncated: bool,
 }
 
 impl ToolBox {
-    pub fn open(events: &mut Vec<TuiEvent>, name: &str, wrap: Option<usize>) -> Self {
+    pub fn open(events: &mut Vec<TuiEvent>, name: &str, palette: Palette) -> Self {
         let frame = Self {
-            width: wrap.unwrap_or(super::transcript::DEFAULT_RULE_WIDTH).max(8),
+            width: palette
+                .wrap
+                .unwrap_or(super::transcript::DEFAULT_RULE_WIDTH)
+                .max(8),
+            remaining: (!palette.verbose).then_some(PREVIEW_LINES),
+            truncated: false,
         };
         frame.heading(events, name, '╭', '╮');
         frame
@@ -44,19 +53,26 @@ impl ToolBox {
         );
     }
 
-    pub fn input(&self, events: &mut Vec<TuiEvent>, name: &str, input: &serde_json::Value) {
+    pub fn input(&mut self, events: &mut Vec<TuiEvent>, name: &str, input: &serde_json::Value) {
         let command = (name == "bash")
             .then(|| input.get("command")?.as_str())
             .flatten();
         let stdin = (name == "bash")
             .then(|| input.get("stdin")?.as_str())
             .flatten();
-        let mut display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
+        let mut display = input.clone();
         if command.is_some() {
             display.as_object_mut().unwrap().remove("command");
         }
         if stdin.is_some() {
             display.as_object_mut().unwrap().remove("stdin");
+        }
+        if let Some(command) = command {
+            self.text(events, command, "$ ", Style::USER);
+        }
+        if let Some(stdin) = stdin {
+            self.text(events, "stdin:", "", Style::THINKING);
+            self.text(events, stdin, "> ", Style::USER);
         }
         if !display.as_object().is_some_and(|fields| fields.is_empty()) {
             self.text(
@@ -66,30 +82,45 @@ impl ToolBox {
                 Style::THINKING,
             );
         }
-        if let Some(command) = command {
-            self.text(events, command, "$ ", Style::USER);
+    }
+
+    pub fn text(&mut self, events: &mut Vec<TuiEvent>, text: &str, prefix: &str, style: Style) {
+        if self.truncated {
+            return;
         }
-        if let Some(stdin) = stdin {
-            self.text(events, "stdin:", "", Style::THINKING);
-            self.text(events, stdin, "> ", Style::USER);
+        let body = tool_text(text, prefix, self.width - 4);
+        for line in body.lines() {
+            if self.remaining == Some(0) {
+                self.status(events, "… /verbose", Style::THINKING);
+                self.truncated = true;
+                break;
+            }
+            self.line(events, line, style);
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= 1;
+            }
         }
     }
 
-    pub fn text(&self, events: &mut Vec<TuiEvent>, text: &str, prefix: &str, style: Style) {
-        let body = tool_text(text, prefix, self.width - 4);
-        for line in body.lines() {
-            events.push(TuiEvent::Style(Style::WARNING));
-            events.push(TuiEvent::Text("│ ".into()));
-            events.push(TuiEvent::Style(style));
-            events.push(TuiEvent::Text(line.to_string()));
-            events.push(TuiEvent::Style(Style::WARNING));
-            events.push(TuiEvent::Text(format!(
-                "{} │",
-                " ".repeat((self.width - 4).saturating_sub(line.width()))
-            )));
-            events.push(TuiEvent::Style(Style::RESET));
-            events.push(TuiEvent::Text("\n".into()));
+    /// Factual outcomes remain visible even when the content preview is exhausted.
+    pub fn status(&self, events: &mut Vec<TuiEvent>, text: &str, style: Style) {
+        for line in tool_text(text, "", self.width - 4).lines() {
+            self.line(events, line, style);
         }
+    }
+
+    fn line(&self, events: &mut Vec<TuiEvent>, line: &str, style: Style) {
+        events.push(TuiEvent::Style(Style::WARNING));
+        events.push(TuiEvent::Text("│ ".into()));
+        events.push(TuiEvent::Style(style));
+        events.push(TuiEvent::Text(line.to_string()));
+        events.push(TuiEvent::Style(Style::WARNING));
+        events.push(TuiEvent::Text(format!(
+            "{} │",
+            " ".repeat((self.width - 4).saturating_sub(line.width()))
+        )));
+        events.push(TuiEvent::Style(Style::RESET));
+        events.push(TuiEvent::Text("\n".into()));
     }
 
     pub fn close(self, events: &mut Vec<TuiEvent>) {

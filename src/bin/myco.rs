@@ -63,6 +63,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/model",
     "/title",
     "/compact",
+    "/verbose",
     "/archive",
     "/restore",
 ];
@@ -1227,6 +1228,7 @@ impl ReplSession {
 
 enum MetaCommand<'a> {
     Help,
+    Verbose,
     New,
     Session,
     Sessions(bool),
@@ -1264,6 +1266,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     let cmd = head.strip_prefix('/').or_else(|| head.strip_prefix(':'));
     match (cmd, rest) {
         (Some("help"), _) => Some(MetaCommand::Help),
+        (Some("verbose"), None) => Some(MetaCommand::Verbose),
         (None, _) if head == "help" => Some(MetaCommand::Help),
         (Some("new"), _) => Some(MetaCommand::New),
         (Some("session"), _) => Some(MetaCommand::Session),
@@ -1327,6 +1330,15 @@ impl ReplSession {
     async fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
         match cmd {
             MetaCommand::Help => print_help(&self.ui),
+            MetaCommand::Verbose => {
+                let verbose = self.ui.toggle_verbose();
+                clear_and_reprint(&self.session, &self.ui);
+                self.ui.myco_section(if verbose {
+                    "verbose: on"
+                } else {
+                    "verbose: off"
+                });
+            }
             MetaCommand::Unknown(head) => self
                 .ui
                 .error_section(&format!("Unknown command: {head}  (try /help)")),
@@ -1699,6 +1711,9 @@ fn format_session_list(list: &[SessionListEntry]) -> String {
 /// conversation ([`clear_and_reprint`]) or a fresh banner (`/compact`).
 /// Terminal-only: cursor codes never reach the console mirror.
 fn clear_screen() {
+    if !std::io::stdout().is_terminal() || std::env::var("TERM").as_deref() == Ok("dumb") {
+        return;
+    }
     print!("\x1B[3J\x1B[2J\x1B[1;1H");
     let _ = std::io::stdout().flush();
 }
@@ -1945,6 +1960,7 @@ mod tests {
     #[test]
     fn parse_meta_reports_unknown_commands_instead_of_printing() {
         assert!(matches!(parse_meta("/help"), Some(MetaCommand::Help)));
+        assert!(matches!(parse_meta("/verbose"), Some(MetaCommand::Verbose)));
         assert!(matches!(parse_meta("help"), Some(MetaCommand::Help)));
         assert!(matches!(
             parse_meta(":sessions"),

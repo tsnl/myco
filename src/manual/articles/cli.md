@@ -19,6 +19,7 @@ You cannot press these yourself — tell the user which command to run.
 | `/new` | Fresh session (saves current) |
 | `/title [text]` | Show or set session title |
 | `/compact` | Create a successor thread in this session (summary + recent tail) |
+| `/verbose` | Toggle full tool details and clear/reprint the active conversation |
 | `/model [key]` | List configured models and current selection, or switch at the prompt |
 | `/effort [level]` | Show or set reasoning effort (`low\|medium\|high\|max`) |
 | `/help` | Full help |
@@ -174,15 +175,15 @@ can compact and continue before the process exits.
 - `.env` in cwd is loaded at startup. Full format: `myco --help overview`.
 - Section headers / thinking / tool names are colored when stdout is a TTY;
   `--color auto|always|never` overrides (`NO_COLOR` / `CLICOLOR_FORCE` honored).
-- Bash commands appear in full below their tool options, prefixed with `$`, with
+- Bash commands appear first in their box, prefixed with `$`, with
   line breaks, indentation, and quoting preserved. Text sent to a running Bash
-  session appears in full under `stdin:`, prefixed with `>`. Long lines wrap at
+  session appears under `stdin:`, prefixed with `>`. Long lines wrap at
   the box width; `↪` marks a display continuation, while source lines are
   indented by two spaces. Long paths and other unbroken arguments also wrap.
   With prose wrapping off or piped output, boxes use 72 columns. Control characters
-  other than newlines (including tabs) appear as escapes. Host, session, and timeout options remain
-  visible above the command. Live output, history replay, and the console mirror
-  use the same format. Other tool strings use bounded JSON previews.
+  other than newlines (including tabs) appear as escapes. Host, session, and timeout
+  options follow the command. Live output, history replay, and the console mirror
+  use the same format. `/verbose` expands the full inputs and recorded text output.
 - Prose (answer text, thinking) is word-wrapped and lightly markdown-styled
   when stdout is a TTY: `**bold**`, `*italic*`, `` `code` `` render with the
   delimiters *removed* (the styling conveys them), `#` headers keep their
@@ -217,10 +218,20 @@ exits are red. Frames use the wrap width, or 72 columns when prose wrapping is
 off; `↪` marks continued display lines. The console mirror and replay use the
 same layout without adding terminal escapes to the mirror.
 
+By default, each box shows its first five content lines, with `… /verbose` when
+more is hidden. Factual status and failure lines remain visible. `/verbose`
+toggles full tool inputs and recorded text output, clears the terminal, and
+reprints the active thread. Toggle again to return to previews. The choice also
+applies to subsequent output, resume, and Ctrl-L until the CLI exits; it starts
+off on each launch. Replay does not rerun tools or append duplicate output to the
+console mirror. Stored conversation data and model context are unaffected.
+Images appear as placeholders, and tool-side output limits still apply to what
+was recorded. In pipes or `TERM=dumb`, replay appends without cursor escapes.
+
 Tool failures and process outcomes appear inside the box as short `↳` lines identifying the
 tool, host, and command or session. They come from the tool result, independently
-of the assistant's answer, and appear again on replay. Successful tool output
-stays in history without being printed; bash process exits show their exit code
+of the assistant's answer, and appear again on replay. Text output shares the
+box's preview budget; bash process exits show their exit code
 or signal. A running shell's status does not imply that each command sent to its
 stdin succeeded. Cancellation reports partial results or unknown effects.
 

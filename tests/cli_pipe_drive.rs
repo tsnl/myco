@@ -578,6 +578,46 @@ async fn automatic_compaction_resumes_once_without_inventing_user_input() {
 }
 
 #[tokio::test]
+async fn verbose_redraws_saved_tool_output_without_reexecuting_tools_or_model_requests() {
+    let env = pipe_env("verbose");
+    let counter = env.dir.join("executions");
+    let command = format!(
+        "printf x >> '{}'; for n in {{1..12}}; do printf 'output-%s\\n' \"$n\"; done",
+        counter.display()
+    );
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"command":command}), 100),
+        model_answer("Done.", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, false);
+    let stdout = run_myco(
+        &env,
+        &["--color", "never"],
+        b"run task\n/verbose\n/verbose\n/quit\n",
+    )
+    .await;
+    assert!(stdout.contains("verbose: on"), "{stdout}");
+    assert!(stdout.contains("verbose: off"), "{stdout}");
+    assert_eq!(stdout.matches("output-12").count(), 1, "{stdout}");
+    assert_eq!(stdout.matches("ASSISTANT ·").count(), 3, "{stdout}");
+    assert_eq!(stdout.matches("… /verbose").count(), 2, "{stdout}");
+    assert!(!stdout.contains('\x1b'), "{stdout}");
+    assert_eq!(server.connections(), 2);
+    assert_eq!(std::fs::read_to_string(counter).unwrap(), "x");
+    let id = announced_session_id(&stdout);
+    let saved = session_json(&env.dir, &id);
+    assert_eq!(
+        saved["threads"][0]["user_turn_timestamps"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(saved.to_string().contains("output-12"));
+}
+
+#[tokio::test]
 async fn failing_process_status_remains_visible_when_the_model_calls_it_successful() {
     let env = pipe_env("tool-outcome");
     let server = test_utils::StubHttpServer::sequence(vec![
