@@ -135,8 +135,11 @@ impl SessionRuntime {
         if !agent.state().is_idle() {
             return Err(crate::agent::StateError::Busy.into());
         }
-        let history =
+        let mut history =
             crate::agent::recover_checkpoint(thread.messages.clone(), thread.pending_operation)?;
+        crate::core::image_store::ImageStore::for_profile()
+            .and_then(|store| store.externalize_messages(&mut history))
+            .map_err(crate::agent::AgentInteractionError::Checkpoint)?;
         if thread.pending_operation.is_some() {
             let mut recovered = crate::agent::AgentState::default();
             recovered.replace_context(history.clone(), thread.last_usage)?;
@@ -196,7 +199,7 @@ impl ToolExecutor for SessionRuntime {
 
     fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
         Box::pin(async move {
-            let result = self
+            let mut result = self
                 .harness
                 .clone()
                 .dispatch_tool_use(tool, self.owner_id, cancel)
@@ -206,6 +209,11 @@ impl ToolExecutor for SessionRuntime {
                 crate::generative_model::Content::Image { source }
                 if source.split_once(',').map_or(source.len(), |(_, data)| data.len()) as u64 > limit)) {
                 return ToolResult::err(format!("image exceeds the current model's {limit}-byte base64 limit; resize it before viewing"));
+            }
+            if let Err(error) = crate::core::image_store::ImageStore::for_profile()
+                .and_then(|store| store.externalize(&mut result.content))
+            {
+                return ToolResult::err(format!("could not store tool image: {error}"));
             }
             result
         })

@@ -77,6 +77,14 @@ pub(super) async fn run_turn(
     }
     let accepted = accepted_at.map(|time| (agent.history().len(), time));
     wire_checkpoint_at(agent, session, accepted);
+    if let Err(error) = crate::core::image_store::ImageStore::for_profile()
+        .and_then(|store| store.externalize(&mut input))
+    {
+        return SessionTurnOutcome {
+            result: Err(AgentInteractionError::Checkpoint(error)),
+            rewound: None,
+        };
+    }
     if accepted_at.is_some() {
         if let Err(error) = auto_title(session, &input) {
             on_warning(&format!("could not auto-title session: {error}"));

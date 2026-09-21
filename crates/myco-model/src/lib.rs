@@ -458,6 +458,17 @@ pub enum Message {
 }
 
 impl Message {
+    pub fn content(&self) -> impl Iterator<Item = &Content> {
+        let (content, results): (&[Content], &[ToolResult]) = match self {
+            Self::UserMessage { content } | Self::AssistantMessage { content, .. } => {
+                (content, &[])
+            }
+            Self::ToolResults { tool_use_results } => (&[], tool_use_results),
+        };
+        content
+            .iter()
+            .chain(results.iter().flat_map(|result| &result.content))
+    }
     /// Runtime-only input does not represent a human submission.
     pub fn is_user_turn(&self) -> bool {
         matches!(self, Self::UserMessage { content }
@@ -544,6 +555,8 @@ pub enum Content {
         data: serde_json::Value,
     },
     Image {
+        /// Data URL, remote URL, or legacy base64. Application-local
+        /// `myco-image:` references must be resolved before provider dispatch.
         source: String,
     },
     /// Model thinking text (session history + live UI).
@@ -590,6 +603,14 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
 /// request is sent: guessing the pairing would corrupt the conversation
 /// silently.
 pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, GenerateError> {
+    if input.iter().flat_map(Message::content).any(|part| {
+        matches!(part,
+        Content::Image { source } if source.starts_with("myco-image:"))
+    }) {
+        return Err(GenerateError::ExecutionError(
+            "resolve local image references before calling a provider".into(),
+        ));
+    }
     let mut out: Vec<Vec<String>> = Vec::with_capacity(input.len());
     for (i, message) in input.iter().enumerate() {
         let ids = match message {

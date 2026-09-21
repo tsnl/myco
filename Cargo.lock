@@ -911,6 +911,7 @@ dependencies = [
  "libc",
  "myco-agent",
  "myco-model",
+ "ring",
  "rustyline",
  "schemars",
  "serde",

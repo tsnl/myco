@@ -6,6 +6,12 @@ a `GenerativeModel` and `EventSink`; the runtime routes tools through a `Harness
 Use `Harness::local_with_services` to add fixture services, or use the lower
 `myco-agent` crate directly with a supplied `ToolExecutor` for an in-memory eval.
 
+Application models should be wrapped with `core::image_store::with_images(model,
+ImageStore::for_profile()?)`. `SessionRunner` and `SessionRuntime` externalize
+image input and tool results; the wrapper resolves references only for provider
+requests. Protocol drivers reject unresolved references. Session JSON and the
+profile's `images/` directory form one portable store.
+
 ```rust,ignore
 let session = ActiveSession::new(Session::new("candidate"));
 let runtime = SessionRuntime::new(harness, session);
