@@ -26,8 +26,8 @@ flowchart LR
 | Crate | Responsibility |
 | --- | --- |
 | `myco-agent` | Typed, pure-functional state-machine transitions governing agent logic. No effects applied directly. |
-| `myco-genai-service` | Single-turn inference through a concrete async `Client`; a `Config` enum selects private backend drivers. |
-| `myco-bash-service` | Terminal/process APIs, shared bash instances, operation records, cancellation, and output streams. |
+| `myco-genai-service` | Single-turn inference through a concrete async `GenaiClient`; a `Config` enum selects private backend drivers. |
+| `myco-bash-service` | `BashClient` API for terminals/processes, shared bash instances, operation records, cancellation, and output streams. |
 | `myco-web-browser-service` (future) | Browser control and observation APIs. |
 | `myco-kernel` | Async Rust API, agent tool catalog and adapters, session interpreters, branch writers, workspaces, storage, and supervision. |
 | `myco-server` | HTTP adapter over the kernel: wire conversion, endpoints, streams, and application startup/shutdown. |
@@ -48,7 +48,7 @@ that call service APIs and translate results. GUI controls also use service APIs
 through the kernel and server, sharing the same instances and observations.
 Generation remains an effect whether or not the kernel also exposes it as a tool.
 
-`Client::generate` returns `Result<Response, Error>` and awaits a fallible callback
+`GenaiClient::generate` returns `Result<Response, Error>` and awaits a fallible callback
 for ordered request/progress observations. Request recording precedes dispatch.
 Backend dispatch uses a private `Driver` trait; there is no public model trait.
 
@@ -73,7 +73,7 @@ the interpretation boundary. The kernel's generation interpreter:
    plus its versioned binding to model/backend configuration and provider options.
 2. Constructs a `myco_genai_service::Request` and records the resolved configuration
    and exact request before dispatch.
-3. Invokes `Client`, retains observations and the outcome, and translates them
+3. Invokes `GenaiClient`, retains observations and the outcome, and translates them
    into session events.
 
 For `InvokeTool`, a kernel adapter validates arguments against the pinned tool
@@ -360,12 +360,12 @@ outcomes, and tool evidence. GEPA consumes trial scores, traces, and diagnostic 
 
 1. **Interfaces:** crate boundaries, session language, state, transitions,
    commit semantics, and recovery.
-2. **Genai service:** concrete client and private drivers; local HTTP fixtures for
+2. **Genai service:** `GenaiClient` and private drivers; local HTTP fixtures for
    awaited observations, native continuation, incomplete outcomes, and cancellation.
 3. **Agent:** owned vector state, enum-based transitions, in-memory store,
    scripted events, and bounded compaction. Check independent clones, determinism,
    invalid phase/event rejection, commit gating, cancellation, and duplicates.
-4. **Bash service:** shared terminal, control APIs, output streams, durable operation
+4. **Bash service:** `BashClient`, shared terminal, output streams, durable operation
    records, cancellation, deduplication, and worker supervision.
 5. **Kernel:** Rust API, agent tool catalog/adapters, interpreters, durable storage,
    delivery, reconciliation, and shutdown. Test fixed-context request construction,
