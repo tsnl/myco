@@ -49,6 +49,11 @@ jobs:
           cargo check --locked -p myco-agent --lib
       - name: Release version and CI gate tests
         run: python3 -m unittest discover -s scripts -p '*_test.py'
+      - name: GEPA adapter tests (no model calls)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/gepa"
+          "$RUNNER_TEMP/gepa/bin/pip" install -r evals/gepa/requirements.txt
+          "$RUNNER_TEMP/gepa/bin/python" -m unittest discover -s evals/gepa -p 'test_*.py'
       - name: cargo test (offline)
         # Full suite, no live provider calls. Live Anthropic/xAI tests are
         # #[ignore] — run locally with: cargo test -- --ignored

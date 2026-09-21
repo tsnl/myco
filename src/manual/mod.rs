@@ -42,6 +42,12 @@ pub const ARTICLES: &[Article] = &[
         summary: "Find hosts, install from releases or git source, diagnosis checklist",
         body: include_str!("articles/harness-ops.md"),
     },
+    Article {
+        id: "evals",
+        title: "Task evals and prelude optimization",
+        summary: "Build private evals from sessions, compare models, and optimize preludes with GEPA",
+        body: include_str!("articles/evals.md"),
+    },
 ];
 
 /// Build identity of the exported copy: package version and the git commit
@@ -138,7 +144,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), ARTICLES.len(), "duplicate article ids");
-        assert_eq!(ids, ["cli", "harness-ops", "overview"]); // sorted unique
+        assert_eq!(ids, ["cli", "evals", "harness-ops", "overview"]); // sorted unique
         for a in ARTICLES {
             assert!(!a.body.trim().is_empty(), "empty body: {}", a.id);
             assert!(!a.title.is_empty());

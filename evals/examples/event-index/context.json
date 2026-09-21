@@ -1,0 +1,3 @@
+[
+  {"UserMessage":{"content":[{"Text":{"text":"Implement index_events.py using only the Python standard library. Usage: python3 index_events.py PATH.jsonl. Each nonblank UTF-8 line is a JSON object with string id and integer sequence. Print one JSON object mapping each id to its entire latest event, using the greatest sequence; ties choose the last line. Ignore blank lines. Empty input produces {}. A malformed JSON line or invalid id/sequence must exit nonzero, print a useful error with its one-based line number on stderr, and emit no partial JSON on stdout. Preserve additional fields on each selected event. Test the sample and edge cases before finishing."}}]}}
+]

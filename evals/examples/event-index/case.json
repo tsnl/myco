@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "event-index",
+  "split": "validation",
+  "workspace": {"kind": "fixture"},
+  "grader": ["python3", "{case}/grader.py"],
+  "source": null
+}

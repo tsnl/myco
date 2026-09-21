@@ -16,6 +16,7 @@
 - [Myco overview](manual/overview.md)
 - [CLI reference](manual/cli.md)
 - [Harness operations](manual/harness-ops.md)
+- [Task evals](manual/evals.md)
 
 # Build with Myco
 
@@ -23,7 +24,7 @@
 - [Inference API](developers/inference.md)
 - [Agent API](developers/agents.md)
 - [Application architecture](developers/architecture.md)
-- [Evaluations (WIP)](developers/evaluations.md)
+- [Evaluations](developers/evaluations.md)
 - [Rust API reference](developers/reference.md)
 
 ---

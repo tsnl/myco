@@ -48,6 +48,15 @@ pub static BASH: ExternalCommand = ExternalCommand {
     fallback_dirs: &[],
 };
 
+pub static GIT: ExternalCommand = ExternalCommand {
+    name: "git",
+    purpose: "eval workspaces cannot be prepared",
+    install_hint: "install git",
+    startup_check: StartupCheck::Never,
+    env_override: None,
+    fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
+};
+
 pub static SSH: ExternalCommand = ExternalCommand {
     name: "ssh",
     purpose: "remote hosts cannot connect",
@@ -107,7 +116,7 @@ pub static FZF: ExternalCommand = ExternalCommand {
 };
 
 /// Every registered program; the startup preflight iterates this.
-pub static ALL: &[&ExternalCommand] = &[&BASH, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS];
+pub static ALL: &[&ExternalCommand] = &[&BASH, &TMUX, &FZF, &SSH, &SSH_ADD, &SSH_KEYGEN, &PS, &GIT];
 
 /// Registry entries the startup preflight expects, in `ALL` order.
 pub fn expected_at_startup(

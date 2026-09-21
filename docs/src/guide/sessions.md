@@ -34,7 +34,7 @@ summary and bounded recent context. The predecessor keeps its original messages
 and tool results. Live shells and editor read stamps continue through
 compaction, as do the title, links, and scratchpad.
 
-With `auto_compact_at` configured, the interactive CLI can compact after a
+With `auto_compact_at` configured, the CLI can compact after a
 successful turn reaches the threshold, then ask the agent to continue the
 pending task. Each user submission can trigger one such cycle. Manual
 `/compact` waits for your next input; reopening a saved session also waits.
@@ -65,3 +65,12 @@ history, but omits cursor repaints. It is a display log, not an execution trace.
 Use the CLI and session tools to change metadata. The
 [manual](../manual/overview.md#sessions-and-threads) describes the persisted
 format and thread semantics in more detail.
+
+## Image storage
+
+Session images live in content-addressed files under the profile's `images/`
+directory; histories contain SHA-256 references. Keep that directory with
+session backups. Legacy inline images remain readable. Compaction and history
+inspection avoid loading archived image payloads; an active request fails
+clearly if a referenced file is missing or corrupt. Blobs are not automatically
+garbage-collected.

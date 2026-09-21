@@ -202,6 +202,16 @@ pub async fn run_compact_worker(
     catalog_model: &CatalogModel,
     cancel: CancelToken,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    run_compact_worker_with_model(predecessor, catalog_model, cancel, |model| model).await
+}
+
+/// Instrument compaction requests with the same telemetry/budget as a headless run.
+pub async fn run_compact_worker_with_model(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    cancel: CancelToken,
+    wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
     let mut worker_session = Session::new_hidden(
@@ -243,7 +253,7 @@ pub async fn run_compact_worker(
     let mut worker = Agent::with_context(
         Arc::new(CompactModel {
             inner: crate::core::image_store::with_images(
-                model,
+                wrap_model(model),
                 crate::core::image_store::ImageStore::for_profile()
                     .map_err(CompactWorkerError::Failed)?,
             ),

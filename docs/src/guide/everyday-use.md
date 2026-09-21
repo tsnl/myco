@@ -22,6 +22,7 @@ remain notes the agent can read as needed.
 | Cancel the line or running turn | Ctrl-C |
 | Reprint the conversation | Ctrl-L at an empty prompt |
 | Inspect tools and hosts | `/hosts` |
+| List or switch configured models | `/model`, `/model KEY` |
 | Change reasoning effort | `/effort low`, `medium`, `high`, or `max` |
 | Save and quit | `/exit` or Ctrl-D |
 
@@ -57,7 +58,8 @@ parsed for image attachments.
 
 Print-mode sessions persist. Continue with `myco --resume ID`, or
 `myco --resume ID -p "Follow up on the previous answer"`. Print mode does not
-run automatic compaction and does not write a console mirror.
+write a console mirror. It shares the interactive runner's configured automatic
+compaction and recovery behavior.
 
 ## Nested work
 
