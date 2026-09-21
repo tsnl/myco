@@ -9,10 +9,10 @@ review sequence at the end of this document.
 | Crate | Responsibility |
 | --- | --- |
 | `myco-genai` | One generative inference attempt through a concrete `Client`, configured by a backend `Config` enum. OpenAI Responses and Anthropic Messages drivers are private implementation details. |
-| `myco-agent` | A state machine for **one agent**: threads, context assembly, compaction, triggers, and typed transitions. Returns state changes and effects; defines semantic state access without a persistence format. |
+| `myco-agent` | The default conversation controller: context assembly, compaction, triggers, response interpretation, and typed transitions for **one agent**. Returns state changes and effects; defines semantic state access without a persistence format. |
 | `myco-tools` | Shared tool instances, worker lifetimes, operation records, observation streams, and human/agent control through `Harness`. |
 | `myco-protocol` | Versioned HTTP request/response and streamed-event schemas shared by server and clients. Wire types are separate from agent and tool implementation types. |
-| `myco-server` | Application crate composing agents, model adapters, tools, and protocol. Owns workspaces, persistence formats, event delivery, effect execution, HTTP endpoints, and process lifecycle. |
+| `myco-server` | Application crate hosting controllers and composing generation, tools, storage, and protocol. Its runtime owns workspaces, persistence formats, event delivery, effect dispatch, task supervision, HTTP endpoints, and process lifecycle. |
 | `myco-gui` | Yew frontend using `myco-protocol` to interact with agents and shared tools. |
 
 ```mermaid
@@ -31,6 +31,11 @@ types and domain types. Lower crates have no dependency on application storage,
 HTTP routing, or UI code. `myco-agent` uses generative request/response types but
 does not call model or tool services during a transition.
 
+The direct `myco-server` dependency on `myco-genai` is intentional: the server's
+effect interpreter invokes the generation client after commit. The agent crate
+decides what to generate and how to interpret the outcome. Service execution
+does not live inside `Agent::step`.
+
 `Client::generate` is an async operation returning one `Result<Response, Error>`.
 An async, fallible observation callback receives request evidence and provider
 progress in order; recording the request completes before dispatch. Dropping the
@@ -39,9 +44,79 @@ an internal `Driver` trait. The public client has no backend type parameters or
 implementable model trait. Scripted evaluation behavior belongs in the effect
 interpreter; provider tests exercise the concrete client through HTTP fixtures.
 
-An agent is a durable identity with threads and execution traces. There is no
-session container. Tool instances belong to workspaces and can be shared by
-agents and humans. Workspace membership alone is not filesystem isolation.
+## Controllers, effects, and services
+
+| Concept | Responsibility | Example |
+| --- | --- | --- |
+| Controller | Decide how an event changes conversation state and what work to request next. | The ordinary agent loop or a search policy. |
+| Effect | Describe a requested operation with stable correlation data. | Generate a reply from specified context. |
+| Service | Execute a capability and report observations and outcomes. | Inference, bash, or storage. |
+| Tool | Expose a capability through the model's tool catalog. | Execute a command or consult another model. |
+
+`Generate` is an effect whether or not inference is exposed as a tool. A service
+can serve model tool calls, controller requests, and human interfaces. Services
+retain their own request types, lifetimes, retry constraints, and cancellation
+semantics. The shared runtime handles operation correlation and supervision;
+there is no universal service protocol or combined services crate in this design.
+
+The default agent controls prompts, context, compaction, tool requests, outcome
+interpretation, and turn completion. Its runtime supervises the resulting work.
+A running agent actor comprises a mailbox, its exclusively owned controller,
+and the runtime's operation tracking. The controller records which outcomes it
+awaits; service clients and live execution handles belong to the runtime and
+services. This keeps the state machine independent of sockets and subprocesses.
+
+```mermaid
+flowchart LR
+    event[Incoming event] --> controller[Controller: decide transition]
+    controller --> commit[Runtime: commit state and effects]
+    commit --> dispatch[Runtime: dispatch effects]
+    dispatch --> generation[Generation service]
+    dispatch --> tools[Tool services]
+    generation --> outcome[Progress and outcome events]
+    tools --> outcome
+    outcome --> event
+```
+
+The event pump remains available while services run. Each controller handles
+one event at a time; independent operations and controllers may run concurrently.
+Only controller transitions can propose changes to the accepted transcript.
+
+## Conversation identity and thread ownership
+
+The signatures below use `Agent<S>` for the default controller and currently
+attach its durable identity, threads, and execution traces to that owner. A
+separate durable conversation container is an open modeling choice:
+
+| Proposed concept | Responsibility |
+| --- | --- |
+| `Session` | Own the durable conversation identity, thread relationships, controller checkpoints, and operation traces. Its lifetime is independent of clients and running tasks. |
+| `Thread` | Identify an ordered transcript with a revision and an optional parent prefix for branching. |
+| `Agent` controller | Implement the ordinary conversation policy: choose effects and decide which outcomes extend the conversation. |
+| Generation operation | Produce a candidate continuation from a specified context and retain its evidence. |
+
+This would separate stored conversations from the policy driving them. Renaming
+the controller itself to `Session` would still leave it responsible for prompts,
+tool sequencing, compaction, and outcome interpretation. The ownership question
+to resolve before implementing the controller is whether `Session` becomes the
+durable container, with `Agent<S>` naming only its default controller. The
+signature sketches do not yet introduce session types or IDs.
+
+Generation does not mutate a thread directly. A committed generation operation
+records its originating turn, target thread, input transcript revision, and
+purpose. Progress is retained as evidence; it does not advance that transcript
+revision. On completion, the controller checks the operation's correlation and
+target revision before proposing an append. The store commits that append with
+the controller transition and any follow-up effects. Repeated terminal outcomes
+are reconciled by operation ID so they cannot append the same response twice.
+An obsolete or unselected response remains evidence without extending the thread.
+Each writable thread has one controller owner. A session container could group
+several branches without serializing their service execution; it would not give
+several controllers authority to append to the same thread.
+
+Tool instances belong to workspaces and can be shared by controllers and humans.
+Workspace membership alone is not filesystem isolation. Adding a session
+container would not make it the owner of live terminals, workers, or connections.
 
 ## One owner, one transition
 
@@ -184,6 +259,11 @@ pub enum Action {
 }
 ```
 
+Generation and tool invocation use the same commit/dispatch/outcome cycle while
+retaining distinct typed payloads. Service completion does not execute returned
+tool calls or append an assistant response. Those decisions require another
+controller transition and commit.
+
 `Transition<Next>` contains the proposed successor, semantic state changes, and
 effects. Its fields are private. Inspection borrows the proposal; it cannot
 extract an agent capable of another step or an executable effect batch before
@@ -216,6 +296,10 @@ the successor state, consumed event, trace changes, and a durable queue of effec
 requests (an outbox). It checks the expected revision and is idempotent for the
 same event and identical proposal; a conflicting proposal is rejected. Only
 after confirmed commit can effects be dispatched.
+
+Storage is a service in the architectural vocabulary, but committing state is
+a prerequisite for executing the proposed effects. It is not an independently
+scheduled sibling of `Generate` or `InvokeTool`.
 
 The consuming commit operation has this contract:
 
@@ -256,10 +340,10 @@ executor.wake(effects);
 
 This example uses the dynamic facade; a typed caller matches branching successor
 enums between steps. The effect interpreter runs committed requests separately
-from the event pump. A wakeup only prompts it to drain the durable queue, so a
-crash between commit and notification does not lose work. It invokes a configured
-`myco_genai::Client` and injected `myco_tools::Harness` implementations and delivers
-correlated progress/outcomes as later events. Evaluations can substitute the
+from the event pump in `myco-server`. A wakeup only prompts it to drain the durable
+queue, so a crash between commit and notification does not lose work. It invokes
+a configured `myco_genai::Client` and injected `myco_tools::Harness` implementations
+and delivers correlated progress/outcomes as later events. Evaluations can substitute the
 interpreter's generation behavior with scripted responses. Different effects and
 different agents can execute concurrently. In-memory evaluation stores implement
 the same commit contract without requiring disk storage.
@@ -329,6 +413,12 @@ outstanding work, and supervises workers. Client connections do not own agent
 or tool lifetimes. Trigger semantics live in the agent; clocks, watchers, and
 HTTP requests deliver trigger events from outside it.
 
+The server supervises service-operation futures and routes their observations
+back through the event pump. The common agent interface can remain convenient
+without embedding generation inside a consuming state transition. Runtime
+supervision and conversation decisions remain separate responsibilities even
+when one application hosts both.
+
 `myco-protocol` covers workspace, agent, thread, and tool operations and their
 observation streams. Mutating requests carry request IDs for deduplication;
 acceptance is distinct from completion. Stream cursors support reconnecting
@@ -342,6 +432,28 @@ data can be inspected, replayed, or replaced without instrumentation hooks insid
 the agent. Trials retain exact inference inputs, outcomes, candidate identity,
 and tool evidence. GEPA consumes scores, traces, and diagnostic feedback through
 an adapter over those evaluations.
+
+## Forking and search
+
+Generation effects make inference available independently of the ordinary agent
+loop. A search controller can request several candidates from the same immutable
+context, score their outcomes, and select which continuation to accept or fork.
+Each candidate has its own operation ID; candidates are not appended sequentially
+to a shared input transcript. The default agent can retain its single-generation
+policy without acquiring search-specific phases.
+
+A fork records its source thread and revision and creates a distinct writable
+thread. An independently running branch gets its own controller identity and
+fresh operation IDs. It does not clone a live `Agent`, running futures, or pending
+operations. Forking from a settled checkpoint is the initial contract; forks
+during unresolved work require an explicit policy for the outstanding outcomes.
+Shared transcript prefixes can stay immutable. Branches that execute tools need
+isolated workspaces or must defer those effects until selection; forking
+conversation state alone does not isolate external side effects.
+
+Search and fork APIs follow the ordinary controller implementation. The reusable
+boundary is effect execution; no generic workflow-controller trait is required
+before a second controller establishes the shared interface.
 
 ## State-machine library choice
 
@@ -358,13 +470,16 @@ is selected in this design layer.
 ## Review sequence
 
 1. **Architecture and interfaces.** Review the crate graph, typed/dynamic
-   transition boundary, state/effect commit contract, cancellation, and recovery.
+   transition boundary, state/effect commit contract, service execution,
+   cancellation, and recovery. Resolve durable conversation ownership before
+   introducing controller/session types in code.
 2. **Generative AI boundary.** Implement `myco-genai`: a concrete async client,
    private backend drivers, awaited observations, native continuation,
    explicit incomplete/error outcomes, and future-drop cancellation. Validate
    with local HTTP fixtures without API credentials.
-3. **Agent state machine.** Implement the reviewed interfaces with an in-memory
-   store and scripted effect interpreter, then threads and bounded compaction.
+3. **Default conversation controller.** Implement the reviewed interfaces with
+   an in-memory store and scripted effect interpreter, then threads and bounded
+   compaction.
    Check rejection preserves ownership; illegal typed transitions fail to compile;
    the dynamic facade matches typed behavior; no dispatch precedes commit; and
    cancellation, duplicate outcomes, and recovery preserve transcript integrity.
