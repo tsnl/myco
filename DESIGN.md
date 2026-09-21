@@ -8,7 +8,7 @@ review sequence at the end of this document.
 
 | Crate | Responsibility |
 | --- | --- |
-| `myco-genai` | One generative inference attempt: context and settings in; provider progress and a response out. Implements OpenAI Responses and Anthropic Messages behind `Model`. |
+| `myco-genai` | One generative inference attempt through a concrete `Client`, configured by a backend `Config` enum. OpenAI Responses and Anthropic Messages drivers are private implementation details. |
 | `myco-agent` | A state machine for **one agent**: threads, context assembly, compaction, triggers, and typed transitions. Returns state changes and effects; defines semantic state access without a persistence format. |
 | `myco-tools` | Shared tool instances, worker lifetimes, operation records, observation streams, and human/agent control through `Harness`. |
 | `myco-protocol` | Versioned HTTP request/response and streamed-event schemas shared by server and clients. Wire types are separate from agent and tool implementation types. |
@@ -30,6 +30,14 @@ does not import the server or the agent engine. The server maps between wire
 types and domain types. Lower crates have no dependency on application storage,
 HTTP routing, or UI code. `myco-agent` uses generative request/response types but
 does not call model or tool services during a transition.
+
+`Client::generate` is an async operation returning one `Result<Response, Error>`.
+An async, fallible observation callback receives request evidence and provider
+progress in order; recording the request completes before dispatch. Dropping the
+generation future releases its HTTP request. Backend polymorphism stays behind
+an internal `Driver` trait. The public client has no backend type parameters or
+implementable model trait. Scripted evaluation behavior belongs in the effect
+interpreter; provider tests exercise the concrete client through HTTP fixtures.
 
 An agent is a durable identity with threads and execution traces. There is no
 session container. Tool instances belong to workspaces and can be shared by
@@ -249,11 +257,12 @@ executor.wake(effects);
 This example uses the dynamic facade; a typed caller matches branching successor
 enums between steps. The effect interpreter runs committed requests separately
 from the event pump. A wakeup only prompts it to drain the durable queue, so a
-crash between commit and notification does not lose work. It invokes injected
-`myco_genai::Model` and `myco_tools::Harness` implementations and delivers
-correlated progress/outcomes as later events. Different effects and different
-agents can execute concurrently. In-memory evaluation stores implement the same
-commit contract without requiring disk storage.
+crash between commit and notification does not lose work. It invokes a configured
+`myco_genai::Client` and injected `myco_tools::Harness` implementations and delivers
+correlated progress/outcomes as later events. Evaluations can substitute the
+interpreter's generation behavior with scripted responses. Different effects and
+different agents can execute concurrently. In-memory evaluation stores implement
+the same commit contract without requiring disk storage.
 
 These guarantees assume the injected store and interpreter obey their contracts;
 Rust types do not prove that an external database or tool has done so.
@@ -266,8 +275,8 @@ intent before effects are requested. The interpreter suppresses undispatched
 operations and requests cancellation of dispatched operations. A cancellation
 acknowledgement is distinct from a terminal outcome; successful cancellation
 does not undo a tool's earlier side effects. Unknown outcomes remain unresolved.
-Closing a model stream settles the local inference attempt as cancelled; it is
-not an acknowledgement that the provider stopped computing or billing.
+Dropping a generation future settles the local inference attempt as cancelled;
+it is not an acknowledgement that the provider stopped computing or billing.
 
 Ordering decides a completion/cancellation race. If completion commits first,
 its result remains recorded. If cancellation commits first, later outcomes are
@@ -350,9 +359,9 @@ is selected in this design layer.
 
 1. **Architecture and interfaces.** Review the crate graph, typed/dynamic
    transition boundary, state/effect commit contract, cancellation, and recovery.
-2. **Generative AI boundary.** Implement `myco-genai`: injectable inference,
-   both HTTP adapters, streaming output and tool calls, native continuation,
-   explicit incomplete/error outcomes, and stream-drop cancellation. Validate
+2. **Generative AI boundary.** Implement `myco-genai`: a concrete async client,
+   private backend drivers, awaited observations, native continuation,
+   explicit incomplete/error outcomes, and future-drop cancellation. Validate
    with local HTTP fixtures without API credentials.
 3. **Agent state machine.** Implement the reviewed interfaces with an in-memory
    store and scripted effect interpreter, then threads and bounded compaction.
