@@ -90,7 +90,13 @@ fn session_document(entry: &SessionListEntry) -> String {
         doc.push('\n');
         doc.push_str(head(&session.scratchpad, SCRATCHPAD_CAP));
     }
-    if let Some(tail) = read_tail(&entry.path.with_extension("console"), CONSOLE_TAIL_CAP) {
+    let console = entry.path.with_extension("console");
+    let console = if console.exists() {
+        console
+    } else {
+        super::session_file_path(&entry.id, "console")
+    };
+    if let Some(tail) = read_tail(&console, CONSOLE_TAIL_CAP) {
         doc.push('\n');
         doc.push_str(&tail);
     }

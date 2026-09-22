@@ -28,6 +28,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 busy: false,
                 status: "Ready".into(),
                 tasks: vec![],
+                queued: VecDeque::new(),
                 blocks: vec![],
             },
             cancel: None,
@@ -102,6 +103,101 @@ fn action_request() -> ActionRequest {
             text: "task".into(),
         },
     }
+}
+
+#[test]
+fn queued_messages_run_in_order_once_and_preserve_acceptance_time() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    let first = work.try_recv().unwrap();
+    let mut second = action_request();
+    second.action = Action::Submit {
+        text: "second".into(),
+    };
+    let mut third = action_request();
+    third.action = Action::Submit {
+        text: "third".into(),
+    };
+    for request in [&second, &third, &second] {
+        app.accept(request.clone()).unwrap();
+    }
+    assert!(
+        work.try_recv().is_err(),
+        "queued messages must wait for the current turn"
+    );
+    let snapshot = app.snapshot().change;
+    assert_eq!(snapshot["snapshot"]["queued"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["snapshot"]["queued"][0]["text"], "second");
+    let accepted_at = app.live.lock().unwrap().snapshot.queued[0].accepted_at;
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    let next = work.try_recv().unwrap();
+    assert_eq!(next.request, second);
+    assert_eq!(next.accepted_at, accepted_at);
+    assert!(!first.cancel.is_cancelled());
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    assert_eq!(work.try_recv().unwrap().request, third);
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], false);
+    app.accept(second).unwrap();
+    assert!(work.try_recv().is_err());
+}
+
+#[test]
+fn cancellation_clears_followups_and_queue_limits_leave_requests_retryable() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    let current = work.try_recv().unwrap();
+    for _ in 0..MAX_QUEUED_MESSAGES {
+        app.accept(action_request()).unwrap();
+    }
+    let overflow = action_request();
+    assert!(matches!(
+        app.accept(overflow.clone()),
+        Err(Error::Conflict(_))
+    ));
+    assert!(
+        !app.live
+            .lock()
+            .unwrap()
+            .accepted
+            .contains_key(&overflow.request_id)
+    );
+    app.cancel("session").unwrap();
+    assert!(current.cancel.is_cancelled());
+    assert!(app.live.lock().unwrap().snapshot.queued.is_empty());
+    assert!(matches!(
+        app.accept(overflow.clone()),
+        Err(Error::Conflict(_))
+    ));
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    app.live.lock().unwrap().snapshot.status = "Ready".into();
+    assert!(work.try_recv().is_err());
+    app.accept(overflow).unwrap();
+    assert!(work.try_recv().is_ok());
+}
+
+#[test]
+fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
+    let (app, _) = app();
+    let active = ActiveSession::new(Session::new_with_id("test", "session"));
+    active.with_mut(|session| {
+        session
+            .set_title(Some("Renamed while running".into()))
+            .unwrap()
+    });
+    app.live.lock().unwrap().snapshot.busy = true;
+    let mut updates = app.events.subscribe();
+    app.refresh(&active, vec![]);
+    let update = updates.try_recv().unwrap();
+    assert_eq!(update.change["meta"]["title"], "Renamed while running");
+    assert_eq!(update.change["meta"]["busy"], true);
+    assert_eq!(app.generation.load(Ordering::Relaxed), 1);
+    app.refresh(&active, vec![]);
+    assert!(updates.try_recv().is_err());
+    assert_eq!(
+        app.snapshot().change["snapshot"]["title"],
+        "Renamed while running"
+    );
 }
 
 #[test]
@@ -192,6 +288,7 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
     assert!(work.try_recv().is_err());
     let mut different = request.clone();
     different.request_id = Uuid::new_v4();
+    different.action = Action::Compact;
     assert_eq!(
         app.accept(different).unwrap_err().into_response().status(),
         StatusCode::CONFLICT

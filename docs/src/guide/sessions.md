@@ -51,6 +51,12 @@ not delete the session's older threads from disk.
 again. Explicitly resuming an archived ID does not automatically restore it.
 Archiving does not stop tools or archive child sessions.
 
+Archived sessions and their history, transcript, and summary files live under
+`session/archived/` in the selected profile. Restore moves them back to the active
+store. Startup moves existing archived sessions into that folder too, skipping
+sessions open in another process. Ordinary browsing skips the archive folder,
+so old archives do not slow down the active session list.
+
 `/new` saves the current session and starts a fresh one with fresh tool ownership.
 A running process owns its session's writer lock; use that process to change
 the session while it is open.

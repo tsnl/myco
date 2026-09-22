@@ -240,6 +240,11 @@ fn main() {
         );
         std::process::exit(2);
     }
+    if args.mode != Mode::Host
+        && let Err(error) = myco::session::migrate_archived_sessions()
+    {
+        eprintln!("warning: could not organize archived sessions: {error}");
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

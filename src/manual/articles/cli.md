@@ -52,6 +52,15 @@ Use `/sessions archived`, `myco --mode session-browser --archived`, or
 session without changing its status. Another running process owns its session's
 writer lock; archive or restore that session in its own CLI or `session_meta`.
 
+Archiving moves the session JSON, readline history, console transcript, and
+thread summaries to `session/archived/{shard}/` within the selected profile;
+restoring moves them back. Writer-lock files stay in their original locations.
+Startup also moves archived sessions still in the active store, skipping sessions
+held by another process and reporting move failures. Normal listings and bare
+resume do not scan the archive directory. Images remain in the shared `images/`
+store. If a move is interrupted, the session remains readable; repeating archive
+or restore completes the move without overwriting existing files.
+
 Mentioning `@<path>` in a message attaches that file as image input (extensions
 png/jpg/jpeg/gif/webp pick out the mention, but the media type is read from the
 file's magic number, so a mislabeled file is caught here rather than by the

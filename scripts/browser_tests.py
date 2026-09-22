@@ -25,10 +25,10 @@ def reply(text):
              "content_index": 0, "delta": text}]
 
 
-def tool(arguments):
+def tool(arguments, name="bash"):
     return [
         {"type": "response.output_item.added", "output_index": 0,
-         "item": {"type": "function_call", "name": "bash",
+         "item": {"type": "function_call", "name": name,
                   "call_id": str(uuid.uuid4()), "arguments": ""}},
         {"type": "response.function_call_arguments.done", "output_index": 0,
          "arguments": json.dumps(arguments)},
@@ -50,7 +50,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1]
@@ -58,8 +58,13 @@ class Provider(http.server.BaseHTTPRequestHandler):
         fixture.turns[prompt] = count + 1
         name = "Alpha" if "Alpha" in prompt else "Beta"
         root = fixture.home
-        if count:
+        if count == 1 and "rename" in prompt:
+            release = shlex.quote(str(root / (name + "-rename-release")))
+            events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done", "timeout_ms": 60000})
+        elif count:
             events = reply(f"{name} finished.")
+        elif "rename" in prompt:
+            events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
         elif "shell" in prompt:
             events = tool({"action": "start", "session_id": "kept",
                            "command": f"MYCO_TEST_MARKER={name} bash --noprofile --norc",
@@ -71,7 +76,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "wait" in prompt:
             release = shlex.quote(str(root / (name + "-release")))
             done = shlex.quote(str(root / (name + "-done")))
-            events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done; printf done > {done}",
+            events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done\nprintf done > {done}", "host": "local",
                            "timeout_ms": 60000})
         elif "stream" in prompt:
             events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
@@ -189,7 +194,7 @@ context_window = 100000
         previous = page.url
         page.click("#new-session")
         page.wait_for_url(lambda url: str(url) != previous and re.fullmatch(r".*/sessions/[a-f0-9]{32}", str(url)))
-        expect(page.locator("#send")).to_be_enabled()
+        expect(page.locator("#model")).to_be_enabled()
         return page
 
     def submit(self, page, text):
@@ -201,12 +206,12 @@ context_window = 100000
         page = self.session(self.page)
         self.submit(page, "Alpha shell")
         expect(page.locator(".tool.done")).to_have_count(1)
-        expect(page.locator("#send")).to_be_enabled()
+        expect(page.locator("#model")).to_be_enabled()
         page.locator(".tool summary").click()
         node = page.locator(".tool").element_handle()
         self.submit(page, "Alpha markdown")
         expect(page.locator(".markdown table")).to_have_count(1)
-        expect(page.locator("#send")).to_be_enabled()
+        expect(page.locator("#model")).to_be_enabled()
         body = page.locator(".markdown").last.element_handle()
         page.select_option("#model", "second")
         expect(page.locator("#model")).to_be_enabled()
@@ -214,6 +219,69 @@ context_window = 100000
         self.assertTrue(node.evaluate("node => node.isConnected"), "Unchanged tools must keep their DOM nodes")
         self.assertTrue(body.evaluate("node => node.isConnected"), "Metadata snapshots must retain rendered Markdown")
         expect(page.locator(".tool")).to_have_attribute("open", "")
+
+    def test_queued_messages_survive_refresh_and_run_in_submission_order(self):
+        page = self.session(self.page)
+        self.submit(page, "Alpha wait")
+        expect(page.locator(".tool.running")).to_have_count(1)
+        expect(page.locator("#send")).to_have_text("Queue ↵")
+        for text in ["Alpha markdown", "Alpha stream"]:
+            page.fill("#prompt", text)
+            page.press("#prompt", "Enter")
+            expect(page.locator("#prompt")).to_have_value("")
+        expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown", "Alpha stream"])
+        expect(page.locator(".user")).to_have_count(1)
+        page.screenshot(path=str(self.artifacts / "queued-messages.png"))
+        page.reload()
+        expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown", "Alpha stream"])
+        (self.home / "Alpha-release").touch()
+        expect(page.locator(".user .body")).to_have_text(["Alpha wait", "Alpha markdown", "Alpha stream"])
+        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator("#queued")).to_be_hidden()
+        expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
+
+    def test_cancel_clears_queued_messages_without_submitting_them(self):
+        page = self.session(self.page)
+        self.submit(page, "Alpha wait")
+        expect(page.locator(".tool.running")).to_have_count(1)
+        page.fill("#prompt", "Alpha markdown")
+        page.press("#prompt", "Enter")
+        expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown"])
+        expect(page.locator("#cancel")).to_have_text("Cancel run & queue")
+        page.click("#cancel")
+        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator("#queued")).to_be_hidden()
+        expect(page.locator(".user")).to_have_count(1)
+        expect(page.locator(".tool.failed")).to_have_count(1)
+        self.assertNotIn("Alpha markdown", self.turns)
+
+    def test_titles_update_during_turns_and_tool_inputs_use_labeled_fields(self):
+        page = self.session(self.page)
+        self.submit(page, "Alpha wait")
+        expect(page.locator(".tool.running")).to_have_count(1)
+        expect(page.locator("#session-title")).to_have_text("Alpha wait")
+        expect(page).to_have_title("Alpha wait · myco")
+        page.locator(".tool summary").click()
+        fields = page.locator(".tool .arguments")
+        expect(fields.locator("dt strong")).to_have_text(["command", "host", "timeout_ms"])
+        expect(fields.locator("dd").nth(1)).to_have_text("local")
+        self.assertIn("\nprintf done", fields.locator("dd pre").first.inner_text())
+        self.assertNotIn('"command":', page.locator(".tool summary").inner_text())
+        page.screenshot(path=str(self.artifacts / "tool-inputs.png"))
+        (self.home / "Alpha-release").touch()
+        expect(page.locator("#model")).to_be_enabled()
+        self.submit(page, "Alpha rename")
+        expect(page.locator(".tool.running")).to_have_count(1)
+        expect(page.locator("#session-title")).to_have_text("Renamed Alpha")
+        expect(page).to_have_title("Renamed Alpha · myco")
+        home = self.context.new_page()
+        home.goto(self.origin)
+        expect(home.locator(".session-name")).to_have_text("Renamed Alpha")
+        page.reload()
+        expect(page).to_have_title("Renamed Alpha · myco")
+        expect(page.locator(".tool.running")).to_have_count(1)
+        (self.home / "Alpha-rename-release").touch()
+        expect(page.locator("#model")).to_be_enabled()
 
     def test_home_refresh_keeps_links_and_focus(self):
         self.session(self.page)
@@ -237,7 +305,7 @@ context_window = 100000
         page.route("**/api/markdown", lambda route: route.abort(), times=1)
         with page.expect_event("requestfailed", predicate=lambda request: request.url.endswith("/api/markdown")):
             self.submit(page, "Alpha markdown")
-        expect(page.locator("#send")).to_be_enabled()
+        expect(page.locator("#model")).to_be_enabled()
         body = page.locator(".markdown").element_handle()
         page.select_option("#model", "second")
         expect(page.locator(".markdown table")).to_have_count(1)
@@ -250,7 +318,7 @@ context_window = 100000
         self.addCleanup(lambda: [route.abort() for route in held])
         page.route("**/api/markdown", lambda route: held.append(route))
         self.submit(page, "Alpha stream")
-        expect(page.locator("#send")).to_be_enabled()
+        expect(page.locator("#model")).to_be_enabled()
         page.wait_for_timeout(200)
         self.assertEqual(len(held), 1, "Only one render of the streaming block may be in flight")
         first = held.pop()
@@ -271,7 +339,7 @@ context_window = 100000
         for page, name in [(alpha, "Alpha"), (beta, "Beta")]:
             self.submit(page, f"{name} shell")
             expect(page.locator("#background-list li")).to_have_count(1)
-            expect(page.locator("#send")).to_be_enabled()
+            expect(page.locator("#model")).to_be_enabled()
             self.submit(page, f"{name} wait")
             expect(page.locator(".tool.running")).to_have_count(1)
             expect(page.locator("#model")).to_be_disabled()
@@ -281,18 +349,18 @@ context_window = 100000
         expect(duplicate.locator("#model")).to_have_value("first")
         beta.click("#cancel")
         expect(beta.locator(".tool.failed")).to_have_count(1)
-        expect(beta.locator("#send")).to_be_enabled()
+        expect(beta.locator("#model")).to_be_enabled()
         expect(alpha.locator(".tool.running")).to_have_count(1)
         (self.home / "Alpha-release").touch()
         for page in [alpha, duplicate]:
-            expect(page.locator("#send")).to_be_enabled()
+            expect(page.locator("#model")).to_be_enabled()
             expect(page.locator(".tool.done")).to_have_count(2)
         self.assertTrue((self.home / "Alpha-done").exists())
         self.assertFalse((self.home / "Beta-done").exists())
         for page, name in [(alpha, "Alpha"), (beta, "Beta")]:
             self.submit(page, f"{name} read marker")
             expect(page.locator(".tool")).to_have_count(3)
-            expect(page.locator("#send")).to_be_enabled()
+            expect(page.locator("#model")).to_be_enabled()
             self.assertEqual((self.home / f"{name}-marker").read_text(), name)
         self.assertEqual({request["model"] for request in self.requests}, {"first", "second"})
 
@@ -307,7 +375,7 @@ context_window = 100000
         alpha = self.context.new_page()
         alpha.goto(original)
         expect(alpha.locator(".tool.done")).to_have_count(1)
-        expect(alpha.locator("#send")).to_be_enabled()
+        expect(alpha.locator("#model")).to_be_enabled()
         targets = self.context.new_cdp_session(alpha).send("Target.getTargets")["targetInfos"]
         self.assertEqual(len([t for t in targets if t["type"] == "shared_worker" and t["url"].startswith(self.origin)]), 1)
         back = tabs[0]
@@ -315,7 +383,7 @@ context_window = 100000
         self.session(back)
         first_new = back.url
         back.go_back()
-        expect(back.locator("#send")).to_be_enabled()
+        expect(back.locator("#model")).to_be_enabled()
         self.assertEqual(back.url, previous)
         self.session(back)
         self.assertNotEqual(back.url, first_new)
@@ -328,7 +396,7 @@ context_window = 100000
         expect(restored.locator(".tool.done")).to_have_count(1)
         self.assertEqual(restored.url, original)
         for page in [alpha, *tabs]:
-            expect(page.locator("#send")).to_be_enabled(timeout=15000)
+            expect(page.locator("#model")).to_be_enabled(timeout=15000)
         self.assertTrue(node.evaluate("node => node.isConnected"))
         self.assertEqual(len(self.requests), requests)
 
@@ -368,7 +436,7 @@ context_window = 100000
         expect(home.locator("#session-list a")).to_have_attribute("href", urlsplit(url).path)
         (self.home / "Alpha-release").touch()
         expect(session.locator(".tool.done")).to_have_count(1)
-        expect(session.locator("#send")).to_be_enabled()
+        expect(session.locator("#model")).to_be_enabled()
         requests = len(self.requests)
         self.stop(self.process)
         self.process, launch = self.launch(urlsplit(self.origin).port)
@@ -382,7 +450,7 @@ context_window = 100000
         expect(home.locator("#session-list a")).to_have_attribute("href", urlsplit(url).path)
         home.locator("#session-list a").click()
         expect(home.locator(".tool.done")).to_have_count(1)
-        expect(home.locator("#send")).to_be_enabled()
+        expect(home.locator("#model")).to_be_enabled()
         self.assertEqual(len(self.requests), requests)
 
 

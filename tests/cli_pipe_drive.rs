@@ -120,6 +120,42 @@ fn only_session(dir: &Path) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn startup_migrates_archived_files_and_explicit_resume_still_works() {
+    let env = pipe_env("archive-startup");
+    let mut session = myco::Session::new("pipetest");
+    session.archived = true;
+    let shard = &session.id[..2];
+    let root = env.dir.join("profiles/default/session");
+    let old = root.join(shard).join(format!("{}.json", session.id));
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    let bytes = serde_json::to_vec(&session).unwrap();
+    std::fs::write(&old, &bytes).unwrap();
+    std::fs::write(old.with_extension("history"), "old input\n").unwrap();
+    let stdout = run_myco(&env, &[], b"/sessions archived\n/quit\n").await;
+    assert!(stdout.contains("[archived]"), "{stdout}");
+    let archived = root
+        .join("archived")
+        .join(shard)
+        .join(format!("{}.json", session.id));
+    assert!(!old.exists());
+    assert_eq!(std::fs::read(&archived).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read_to_string(archived.with_extension("history")).unwrap(),
+        "old input\n"
+    );
+    let restored = run_myco(
+        &env,
+        &["--resume", &session.id],
+        b"/session\n/restore\n/session\n/quit\n",
+    )
+    .await;
+    assert!(restored.contains("archived:  true"), "{restored}");
+    assert!(restored.contains("archived:  false"), "{restored}");
+    assert!(old.exists());
+    assert!(!archived.exists());
+}
+
+#[tokio::test]
 async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
     let env = pipe_env("visibility");
     let stdout = run_myco(

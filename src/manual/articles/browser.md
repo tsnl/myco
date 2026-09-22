@@ -40,11 +40,22 @@ Shift-Enter or Alt-Enter inserts a newline. Mention `@path/to/image.png` to atta
 an image using the CLI's attachment rules and limits. Image paths with spaces
 are not supported as attachments.
 
-Each tool appears as soon as execution starts, with a truncated JSON argument
+During a turn, **Queue** accepts follow-up messages in submission order. The
+composer shows pending messages; each starts a separate turn after the previous
+one finishes. Up to 20 messages can wait per session, shared across its tabs and
+preserved when a tab refreshes or closes. **Cancel run & queue** cancels the
+current turn and discards its pending messages. Queues live in the running server
+and are not restored after a server restart. A rejected submission keeps its draft.
+
+The page heading and browser tab title follow the session title, including the
+first-message title and agent renames during a running turn.
+
+Each tool appears as soon as execution starts, with a truncated argument
 preview in its collapsed header. Running calls are cyan; completed calls turn
 green, and failures red. Expand a block to inspect its complete recorded input,
-output, images, and outcome. All tools show their arguments as JSON, with
-colored keys. There is no browser verbose mode.
+output, images, and outcome. Input shows each top-level key as a bold label above
+its value. Strings retain their newlines without JSON quoting; nested objects and
+arrays retain JSON structure. There is no browser verbose mode.
 
 **Activity** opens a right-hand drawer with separate sections for active tool
 calls and local background tasks, such as bash sessions that continue between
