@@ -1,9 +1,11 @@
-//! Embedded browser resources. Authentication and response policy belong to HTTP.
+//! Embedded browser resources. Origin checks and response policy belong to HTTP.
 
 use axum::{Router, http::header, routing::get};
 
 const ASSETS: &[(&str, &str)] = &[
     ("/", include_str!("assets/home.html")),
+    ("/new", include_str!("assets/new.html")),
+    ("/new.js", include_str!("assets/new.js")),
     ("/sessions/{id}", include_str!("assets/index.html")),
     ("/app.js", include_str!("assets/app.js")),
     ("/home.js", include_str!("assets/home.js")),

@@ -310,7 +310,7 @@ old output, rejects access from another session, and checks final cleanup.
 Auto-compaction belongs to `SessionRunner`. It checks reported prompt usage at
 settled boundaries, including between tool rounds, and uses the same compaction
 path in server and scripted workflows. Nested agents are independent session
-workers created through the authenticated API with `parent_session`; `fork: true`
+workers created through the loopback API with `parent_session`; `fork: true`
 seeds their context from a saved checkpoint.
 
 ## 8. Pick your next reading path

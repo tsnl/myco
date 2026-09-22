@@ -79,7 +79,7 @@ myco browser / terminal adapters
                     └── standard tools: bash, editor, view_image
 ```
 
-Nested agents are independent workers created through the authenticated server
+Nested agents are independent workers created through the loopback server
 API with `parent_session` and optional `fork: true`. They share the server's
 profile and catalog, with separate runners and live tools. Child sessions are
 hidden from normal browsing. Remotes stay tool workers without model keys.
@@ -87,7 +87,7 @@ hidden from normal browsing. Remotes stay tool workers without model keys.
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | Server/CLI launcher, session composition, and `--mode host` worker |
-| `src/bin/browser/` | HTTP server and browser frontend over the shared session runner; embedded assets, transcript projection, and authenticated browser actions |
+| `src/bin/browser/` | HTTP server and browser frontend over the shared session runner; embedded assets, transcript projection, and browser actions with origin checks |
 | `src/bin/cli/` | One-shot `-p` prompts and scrolling terminal chat over the shared session runner |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults |
 | `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |

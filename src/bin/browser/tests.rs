@@ -1,13 +1,13 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     response::IntoResponse,
 };
 use futures::StreamExt;
 use myco::generative_model::{Content, Message, ToolResult};
 
-use super::super::http::{Server, SessionRequest, allowed, events, session_action, session_cancel};
+use super::super::http::{Server, SessionRequest, events, session_action, session_cancel};
 use super::*;
 
 fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
@@ -89,8 +89,6 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         .map_or_else(|| broadcast::channel(4).0, |app| app.events.clone());
     Arc::new(Server::new(
         sessions,
-        "http://127.0.0.1:8765".into(),
-        "/".into(),
         super::super::files::Files::open(&std::env::current_dir().unwrap()).unwrap(),
     ))
 }
@@ -246,6 +244,51 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     assert_eq!(blocks[1]["status"], "done");
     assert_eq!(blocks[1]["text"], "saved");
     assert!(blocks[1]["elapsed_ms"].is_u64());
+}
+
+#[test]
+fn tool_first_replies_have_one_heading_before_parallel_tools_live_and_replayed() {
+    let (app, _) = app();
+    let time = "2026-09-22T22:00:00Z";
+    let content = vec![Content::Text {
+        text: "inspect".into(),
+    }];
+    app.live
+        .lock()
+        .unwrap()
+        .snapshot
+        .blocks
+        .push(Block::message("user", &content, Some(time.into())));
+    let tool = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"pwd"}),
+    };
+    for _ in 0..2 {
+        app.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: Default::default(),
+        });
+    }
+    let live = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(live[1]["kind"], "assistant_heading");
+    assert_eq!(live[1]["time"], time);
+    assert_eq!(live[2]["kind"], "tool");
+    assert_eq!(live[3]["kind"], "tool");
+    let mut thread = Session::new("test").active_thread().clone();
+    thread.messages = vec![
+        Message::UserMessage { content },
+        Message::AssistantMessage {
+            content: vec![],
+            tool_uses: vec![tool.clone(), tool],
+            turn_end_reason: None,
+        },
+    ];
+    thread.user_turn_timestamps.insert(0, time.parse().unwrap());
+    let replay = serde_json::to_value(view::history(&thread)).unwrap();
+    assert_eq!(replay[1], live[1]);
+    assert_eq!(replay[2]["kind"], "tool");
+    assert_eq!(replay[3]["kind"], "tool");
+    assert_eq!(replay.as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -566,120 +609,6 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
     server.sessions.stop().await;
     assert!(second_call.cancel.is_cancelled());
     assert!(first.shutdown.is_cancelled() && second.shutdown.is_cancelled());
-}
-
-#[tokio::test]
-async fn browser_actions_require_the_launch_cookie_and_same_origin() {
-    let app = server(&[]);
-    let mut headers = HeaderMap::new();
-    headers.insert(header::HOST, "127.0.0.1:8765".parse().unwrap());
-    assert!(!allowed(&headers, &app.auth, false));
-    headers.insert(
-        header::COOKIE,
-        format!("other=value; myco_8765={}", app.auth.token)
-            .parse()
-            .unwrap(),
-    );
-    assert!(allowed(&headers, &app.auth, false));
-    headers.insert(header::COOKIE, "other=value".parse().unwrap());
-    headers.append(
-        header::COOKIE,
-        format!("myco_8765={}", app.auth.token).parse().unwrap(),
-    );
-    assert!(
-        allowed(&headers, &app.auth, false),
-        "multiple cookie headers are accepted"
-    );
-    assert!(!allowed(&headers, &app.auth, true));
-    headers.insert(header::ORIGIN, app.auth.origin.parse().unwrap());
-    assert!(allowed(&headers, &app.auth, true));
-    headers.insert(header::ORIGIN, "https://other.example".parse().unwrap());
-    assert!(!allowed(&headers, &app.auth, true));
-    headers.insert(header::HOST, "other.example:1".parse().unwrap());
-    assert!(!allowed(&headers, &app.auth, false));
-}
-
-#[tokio::test]
-async fn loopback_origins_support_different_forwarded_ports() {
-    let app = server(&[]);
-    for host in ["localhost:9876", "127.0.0.1:9876", "[::1]:9876"] {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, host.parse().unwrap());
-        headers.insert(
-            header::COOKIE,
-            format!("myco_9876={}", app.auth.token).parse().unwrap(),
-        );
-        assert!(allowed(&headers, &app.auth, false), "{host}");
-        assert!(!allowed(&headers, &app.auth, true));
-        headers.insert(header::ORIGIN, app.auth.origin.parse().unwrap());
-        assert!(!allowed(&headers, &app.auth, true));
-        headers.insert(header::ORIGIN, format!("http://{host}").parse().unwrap());
-        assert!(allowed(&headers, &app.auth, true));
-        headers.insert(
-            header::COOKIE,
-            format!("myco_8765={}", app.auth.token).parse().unwrap(),
-        );
-        assert!(!allowed(&headers, &app.auth, false));
-    }
-}
-
-#[tokio::test]
-async fn non_loopback_hosts_are_refused_even_with_a_valid_credential() {
-    let app = server(&[]);
-    for host in [
-        "other.example:8765",
-        "localhost.evil:8765",
-        "192.168.1.10:8765",
-        "[2001:db8::1]:8765",
-        "0.0.0.0:8765",
-        "[::]:8765",
-    ] {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, host.parse().unwrap());
-        headers.insert(header::ORIGIN, format!("http://{host}").parse().unwrap());
-        headers.insert(
-            header::COOKIE,
-            format!("myco_8765={}", app.auth.token).parse().unwrap(),
-        );
-        assert!(!allowed(&headers, &app.auth, false), "{host}");
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {}", app.auth.token).parse().unwrap(),
-        );
-        assert!(!allowed(&headers, &app.auth, true), "{host}");
-    }
-}
-
-#[tokio::test]
-async fn bearer_authentication_rejects_malformed_tokens_and_cross_origin_requests() {
-    let app = server(&[]);
-    let mut headers = HeaderMap::new();
-    headers.insert(header::HOST, "127.0.0.1:8765".parse().unwrap());
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {}", app.auth.token).parse().unwrap(),
-    );
-    assert!(allowed(&headers, &app.auth, true));
-    headers.insert(header::ORIGIN, "https://other.example".parse().unwrap());
-    assert!(!allowed(&headers, &app.auth, false));
-    headers.remove(header::ORIGIN);
-    for credential in [
-        "Bearer",
-        "Basic wrong",
-        "Bearer wrong",
-        &format!("Bearer {} extra", app.auth.token),
-    ] {
-        headers.insert(header::AUTHORIZATION, credential.parse().unwrap());
-        assert!(!allowed(&headers, &app.auth, false));
-    }
-    headers.insert(
-        header::COOKIE,
-        format!("myco_8765={}", app.auth.token).parse().unwrap(),
-    );
-    assert!(
-        !allowed(&headers, &app.auth, false),
-        "an invalid explicit credential must not fall back to a cookie"
-    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 export const $ = (id) => document.getElementById(id);
 
 // Request ids deduplicate retries, so they must be unique, not unguessable.
-// Keep the fallback for browsers where the local certificate is not yet trusted.
+// Keep the fallback for browsers that do not expose randomUUID.
 export const requestId = () =>
   crypto.randomUUID?.() ??
   '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (c) =>
@@ -21,16 +21,6 @@ export async function api(path, body) {
   return response;
 }
 
-let createId = null;
-let creating = false;
-export async function newSession() {
-  if (creating) return;
-  creating = true; $('new-session').disabled = true;
-  createId ||= requestId();
-  try {
-    const session = await (await api('/api/sessions', { request_id: createId })).json();
-    location.assign(`/sessions/${encodeURIComponent(session.id)}`);
-  } catch (e) { creating = false; $('new-session').disabled = false; error(e.message); }
+export function newSession() {
+  window.open('/new', '_blank', 'noopener');
 }
-$('new-session').onclick = newSession;
-window.addEventListener('pageshow', () => { creating = false; createId = null; $('new-session').disabled = false; });

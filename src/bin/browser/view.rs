@@ -36,6 +36,9 @@ impl Serialize for ToolTimer {
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Block {
+    AssistantHeading {
+        time: Option<String>,
+    },
     Message {
         role: String,
         text: String,
@@ -150,6 +153,22 @@ fn visible(content: &[Content]) -> (String, Vec<String>) {
     (text.join("\n"), images)
 }
 
+/// Tools are assistant output even when no text preceded them. Keep the same
+/// heading in live projection and replay without adding a saved model message.
+pub(super) fn assistant_heading(blocks: &[Block]) -> Option<Block> {
+    for block in blocks.iter().rev() {
+        match block {
+            Block::AssistantHeading { .. } => return None,
+            Block::Message { role, .. } if role == "assistant" => return None,
+            Block::Message { role, time, .. } if role == "user" => {
+                return Some(Block::AssistantHeading { time: time.clone() });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(super) fn history(thread: &Thread) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut time = None;
@@ -185,6 +204,11 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
                         )),
                         _ => {}
                     }
+                }
+                if !tool_uses.is_empty()
+                    && let Some(heading) = assistant_heading(&blocks)
+                {
+                    blocks.push(heading);
                 }
                 pending.clear();
                 for tool in tool_uses {

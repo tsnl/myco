@@ -40,7 +40,7 @@ rain. Captured from the [workspace-files preview](https://github.com/tsnl/myco/p
 - **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
   conversation history live under `~/.myco/` — pick up later from the session browser.
 - **Independent sessions.** Work in several browser tabs, or create hidden child
-  sessions through the authenticated server API.
+  sessions through the server API.
 - **Project guidance is injected.** The nearest `AGENTS.md` / `CLAUDE.md` from
   your launch directory through the repository root is read at session start.
 - **Evaluate your actual tasks.** `myco-eval` turns session cutoffs into private,
@@ -69,7 +69,7 @@ git diff | myco -p "Summarize this diff"
 myco --mode cli          # scrolling terminal chat
 ```
 
-Myco listens only on loopback. Open the printed URL to sign in. For remote access,
+Myco listens only on loopback. Open the printed URL directly. For remote access,
 run Myco on the remote host and forward its port through SSH from your computer:
 
 ```bash
@@ -77,7 +77,8 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-
 ```
 
 Open the remote launch URL with its address changed to `http://127.0.0.1:8766`,
-keeping `/auth?token=...` intact. SSH encrypts traffic between the computers;
+keeping the session path if resuming. SSH provides authentication and encryption
+between the computers; Myco needs no browser login, token, or cookie.
 Myco does not serve HTTPS or accept non-loopback bind addresses.
 
 The browser has collapsible tool blocks, a
@@ -85,7 +86,7 @@ floating input bar, Markdown/images, and independent sessions in separate tabs.
 Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
 launching terminal stops the server and its sessions. See the
 [browser manual](src/manual/articles/browser.md), also `myco --help browser`,
-for controls, authenticated workspace files, and the HTTP API.
+for controls, workspace files, and the HTTP API.
 
 For scripts, `myco -p "prompt"` streams answer text to stdout, with diagnostics
 and the saved session ID on stderr. Bare `-p` reads the prompt from stdin;

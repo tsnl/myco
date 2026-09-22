@@ -5,10 +5,10 @@ use std::sync::Arc;
 use super::Args;
 
 mod assets;
-mod auth;
 mod files;
 mod http;
 mod markdown;
+mod origin;
 mod runtime;
 mod view;
 mod weather;
@@ -30,8 +30,6 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
         .map_or_else(|| "/".into(), |s| format!("/sessions/{}", s.id));
     let server = Arc::new(http::Server::new(
         runtime::Sessions::new(args, config, preflight),
-        format!("http://{address}"),
-        launch_path,
         files,
     ));
     if let Some(session) = initial {
@@ -41,10 +39,7 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    println!(
-        "Browser UI: {}/auth?token={}",
-        server.auth.origin, server.auth.token
-    );
+    println!("Browser UI: http://{address}{launch_path}");
     println!(
         "Listening on loopback only. Use an SSH tunnel for remote access (myco --help browser)."
     );

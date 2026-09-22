@@ -1,4 +1,4 @@
-//! Authenticated routes and browser assets over the session runtime.
+//! Loopback routes and browser assets over the session runtime.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -15,17 +15,13 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use super::{
-    auth,
     files::Files,
-    markdown,
+    markdown, origin,
     runtime::{ActionRequest, CreateSession, Error, Sessions, Update},
     weather::{Coordinates, Weather},
 };
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
-
-#[cfg(test)]
-pub(super) use super::auth::allowed;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -41,21 +37,14 @@ impl IntoResponse for Error {
 }
 
 pub(super) struct Server {
-    pub(super) auth: Arc<auth::Auth>,
     pub(super) sessions: Sessions,
     weather: Weather,
     files: Files,
 }
 
 impl Server {
-    pub(super) fn new(
-        sessions: Sessions,
-        origin: String,
-        launch_path: String,
-        files: Files,
-    ) -> Self {
+    pub(super) fn new(sessions: Sessions, files: Files) -> Self {
         Self {
-            auth: Arc::new(auth::Auth::new(origin, launch_path)),
             sessions,
             weather: Weather::new(),
             files,
@@ -77,11 +66,7 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/image", get(image))
         .route("/files/{*path}", get(workspace_file))
         .route("/files/", get(workspace_index))
-        .route_layer(middleware::from_fn_with_state(
-            server.auth.clone(),
-            auth::authorize,
-        ))
-        .route("/auth", get(auth::login).with_state(server.auth.clone()))
+        .route_layer(middleware::from_fn(origin::guard))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(headers))
         .with_state(server)
