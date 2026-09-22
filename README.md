@@ -92,6 +92,20 @@ cargo run --locked --bin myco
 bash scripts/install-pre-commit-hooks.sh   # optional: CI bar (fmt + clippy) pre-commit
 ```
 
+Browser regression tests run Chromium against an isolated profile, a local
+scripted model, and real local tools. They require no API credentials:
+
+```bash
+cargo build --locked --bin myco
+python3 -m venv /tmp/myco-browser-tests
+/tmp/myco-browser-tests/bin/pip install -r scripts/browser-requirements.txt
+/tmp/myco-browser-tests/bin/python -m playwright install --with-deps chromium
+/tmp/myco-browser-tests/bin/python scripts/browser_tests.py
+```
+
+Use `--binary /path/to/myco` or `--browser /path/to/chromium` for existing builds.
+Screenshots, server logs, and Playwright traces go to `target/browser-test-results`.
+
 ## Workspace
 
 `myco-model` provides backend drivers and message types. `myco-agent` drives

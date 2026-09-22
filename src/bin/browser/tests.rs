@@ -1,6 +1,13 @@
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
+};
 use futures::StreamExt;
 use myco::generative_model::{Content, Message, ToolResult};
 
+use super::super::http::{Server, SessionRequest, allowed, events, session_action, session_cancel};
 use super::*;
 
 fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
@@ -29,13 +36,14 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
         events,
         work,
         shutdown: CancelToken::new(),
+        generation: Arc::new(AtomicU64::new(0)),
     });
     (app, receiver)
 }
 
 fn server(apps: &[Arc<App>]) -> Arc<Server> {
     let config = Config::resolve_with(
-        super::super::ConfigUserSettings {
+        crate::ConfigUserSettings {
             config_path: Some("/unused/config.toml".into()),
             ..Default::default()
         },
@@ -57,32 +65,33 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         |_| unreachable!(),
     )
     .unwrap();
-    Arc::new(Server {
-        token: "test-token".into(),
-        origin: "http://127.0.0.1:8765".into(),
-        cookie: "myco_8765".into(),
-        launch_path: "/".into(),
-        args: Arc::new(<Args as clap::Parser>::parse_from(["myco", "--web"])),
+    let mut sessions = Sessions::new(
+        <Args as clap::Parser>::parse_from(["myco", "--web"]),
         config,
-        preflight: StartupPreflight::default(),
-        sessions: tokio::sync::Mutex::new(
-            apps.iter()
-                .map(|app| {
-                    (
-                        app.snapshot().session_id,
-                        RunningSession {
-                            app: app.clone(),
-                            worker: tokio::spawn(async {}),
-                        },
-                    )
-                })
-                .collect(),
-        ),
-        events: apps
-            .first()
-            .map_or_else(|| broadcast::channel(4).0, |app| app.events.clone()),
-        shutdown: CancelToken::new(),
-    })
+        StartupPreflight::default(),
+    );
+    sessions.running = tokio::sync::Mutex::new(
+        apps.iter()
+            .map(|app| {
+                (
+                    app.snapshot().session_id,
+                    RunningSession {
+                        app: app.clone(),
+                        session: ActiveSession::new(Session::new("test")),
+                        worker: tokio::spawn(async {}),
+                    },
+                )
+            })
+            .collect(),
+    );
+    sessions.events = apps
+        .first()
+        .map_or_else(|| broadcast::channel(4).0, |app| app.events.clone());
+    Arc::new(Server::new(
+        sessions,
+        "127.0.0.1:8765".parse().unwrap(),
+        "/".into(),
+    ))
 }
 
 fn action_request() -> ActionRequest {
@@ -177,37 +186,20 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
     let (app, mut work) = app();
     let request = action_request();
     for _ in 0..2 {
-        assert_eq!(
-            action(State(app.clone()), Json(request.clone()))
-                .await
-                .unwrap(),
-            StatusCode::ACCEPTED
-        );
+        app.accept(request.clone()).unwrap();
     }
     let accepted = work.try_recv().unwrap();
     assert!(work.try_recv().is_err());
     let mut different = request.clone();
     different.request_id = Uuid::new_v4();
     assert_eq!(
-        action(State(app.clone()), Json(different))
-            .await
-            .unwrap_err()
-            .0,
+        app.accept(different).unwrap_err().into_response().status(),
         StatusCode::CONFLICT
     );
-    cancel(
-        State(app.clone()),
-        Json(SessionRequest {
-            session_id: "session".into(),
-        }),
-    )
-    .await
-    .unwrap();
+    app.cancel("session").unwrap();
     assert!(accepted.cancel.is_cancelled());
     app.live.lock().unwrap().snapshot.busy = false;
-    action(State(app.clone()), Json(request.clone()))
-        .await
-        .unwrap();
+    app.accept(request.clone()).unwrap();
     assert!(
         work.try_recv().is_err(),
         "A completed request must not run again"
@@ -215,16 +207,13 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
     let mut reused = request;
     reused.action = Action::Compact;
     assert_eq!(
-        action(State(app.clone()), Json(reused))
-            .await
-            .unwrap_err()
-            .0,
+        app.accept(reused).unwrap_err().into_response().status(),
         StatusCode::CONFLICT
     );
     let mut stale = action_request();
     stale.session_id = "another-session".into();
     assert_eq!(
-        action(State(app.clone()), Json(stale)).await.unwrap_err().0,
+        app.accept(stale).unwrap_err().into_response().status(),
         StatusCode::CONFLICT
     );
     assert!(work.try_recv().is_err());
@@ -239,24 +228,22 @@ async fn model_selection_requires_an_idle_current_session() {
     };
     app.live.lock().unwrap().snapshot.busy = true;
     assert_eq!(
-        action(State(app.clone()), Json(request.clone()))
-            .await
+        app.accept(request.clone())
             .unwrap_err()
-            .0,
+            .into_response()
+            .status(),
         StatusCode::CONFLICT
     );
     app.live.lock().unwrap().snapshot.busy = false;
     let mut stale = request.clone();
     stale.session_id = "another-session".into();
     assert_eq!(
-        action(State(app.clone()), Json(stale)).await.unwrap_err().0,
+        app.accept(stale).unwrap_err().into_response().status(),
         StatusCode::CONFLICT
     );
     assert!(work.try_recv().is_err());
     for _ in 0..2 {
-        action(State(app.clone()), Json(request.clone()))
-            .await
-            .unwrap();
+        app.accept(request.clone()).unwrap();
     }
     assert_eq!(work.try_recv().unwrap().request.action, request.action);
     assert!(work.try_recv().is_err());
@@ -268,17 +255,15 @@ async fn model_selection_requires_an_idle_current_session() {
 #[tokio::test]
 async fn stopping_cancels_the_active_turn_and_rejects_new_work() {
     let (app, mut work) = app();
-    action(State(app.clone()), Json(action_request()))
-        .await
-        .unwrap();
+    app.accept(action_request()).unwrap();
     let accepted = work.try_recv().unwrap();
     app.stop();
     assert!(accepted.cancel.is_cancelled());
     assert_eq!(
-        action(State(app.clone()), Json(action_request()))
-            .await
+        app.accept(action_request())
             .unwrap_err()
-            .0,
+            .into_response()
+            .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     assert!(work.try_recv().is_err());
@@ -289,10 +274,10 @@ async fn an_unavailable_worker_does_not_accept_a_turn() {
     let (app, receiver) = app();
     drop(receiver);
     assert_eq!(
-        action(State(app.clone()), Json(action_request()))
-            .await
+        app.accept(action_request())
             .unwrap_err()
-            .0,
+            .into_response()
+            .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     let live = app.live.lock().unwrap();
@@ -313,9 +298,7 @@ fn event_data(bytes: &[u8]) -> Value {
 async fn reconnect_and_slow_observers_receive_state_without_replaying_work() {
     let (app, mut work) = app();
     let server = server(std::slice::from_ref(&app));
-    action(State(app.clone()), Json(action_request()))
-        .await
-        .unwrap();
+    app.accept(action_request()).unwrap();
     let _accepted = work.try_recv().unwrap();
     app.delta("assistant", "hello".into());
     for _ in 0..2 {
@@ -371,7 +354,8 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
         )
         .await
         .unwrap_err()
-        .0,
+        .into_response()
+        .status(),
         StatusCode::CONFLICT
     );
     assert!(first_work.try_recv().is_err());
@@ -403,7 +387,7 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
     assert!(first_call.cancel.is_cancelled());
     assert!(!second_call.cancel.is_cancelled());
     assert_eq!(second.snapshot().change["snapshot"]["status"], "Running");
-    server.stop().await;
+    server.sessions.stop().await;
     assert!(second_call.cancel.is_cancelled());
     assert!(first.shutdown.is_cancelled() && second.shutdown.is_cancelled());
 }
@@ -416,7 +400,9 @@ async fn browser_actions_require_the_launch_cookie_and_same_origin() {
     assert!(!allowed(&headers, &app, false));
     headers.insert(
         header::COOKIE,
-        "other=value; myco_8765=test-token".parse().unwrap(),
+        format!("other=value; {}={}", app.cookie, app.token)
+            .parse()
+            .unwrap(),
     );
     assert!(allowed(&headers, &app, false));
     assert!(!allowed(&headers, &app, true));

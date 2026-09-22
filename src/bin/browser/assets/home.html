@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sessions · myco</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/home.js" defer></script>
+  <script src="/home.js" type="module"></script>
 </head>
 <body>
   <header class="toolbar home-toolbar">
@@ -16,6 +16,10 @@
   <main id="session-browser">
     <label for="search">Find a session</label>
     <input id="search" type="search" placeholder="Search by title, model, or session ID" autocomplete="off">
+    <select id="archive-filter" aria-label="Session visibility">
+      <option value="active">Active sessions</option>
+      <option value="archived">Archived sessions</option>
+    </select>
     <p id="session-count" role="status">Loading sessions…</p>
     <p id="error" role="alert" hidden></p>
     <ul id="session-list" aria-label="Sessions"></ul>

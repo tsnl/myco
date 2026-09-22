@@ -58,3 +58,17 @@ jobs:
         # Full suite, no live provider calls. Live Anthropic/xAI tests are
         # #[ignore] — run locally with: cargo test -- --ignored
         run: cargo test --locked --workspace
+      - name: Browser regression tests (local scripted model)
+        run: |
+          cargo build --locked --bin myco
+          for asset in src/bin/browser/assets/*.js; do node --input-type=module --check < "$asset"; done
+          python3 -m venv "$RUNNER_TEMP/browser"
+          "$RUNNER_TEMP/browser/bin/pip" install -r scripts/browser-requirements.txt
+          "$RUNNER_TEMP/browser/bin/python" -m playwright install --with-deps chromium
+          "$RUNNER_TEMP/browser/bin/python" scripts/browser_tests.py
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-test-results
+          path: target/browser-test-results
+          if-no-files-found: ignore
