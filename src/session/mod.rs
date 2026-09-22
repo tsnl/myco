@@ -13,7 +13,6 @@
 mod archive;
 mod attach;
 mod compact;
-mod console_log;
 mod lock;
 mod search;
 mod thread;
@@ -23,7 +22,6 @@ pub use thread::Thread;
 pub use archive::migrate_archived_sessions;
 pub use attach::{MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
 pub use compact::{CompactOutcome, compact_thread, select_tail};
-pub use console_log::ConsoleLog;
 pub use lock::{SessionLockError, SessionWriteLock};
 pub use search::{SessionSearchReport, search_sessions};
 
@@ -52,7 +50,7 @@ pub enum SessionKind {
     /// Interactive / user-visible conversation.
     #[default]
     User,
-    /// Nested agent run (`myco --parent-session <id>`; also written by the
+    /// Nested agent run (server API `parent_session`; also written by the
     /// removed `subagent` tool). Hidden by default in listings.
     Subagent,
     /// Compaction worker. Hidden by default in listings.
@@ -89,7 +87,7 @@ pub struct Session {
     pub archived: bool,
     #[serde(deserialize_with = "thread::deserialize_threads")]
     threads: Vec<Thread>,
-    /// Short human label; agent/CLI maintained.
+    /// Short human label; agent maintained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Associated PRs / worktrees (any repo / host).
@@ -207,7 +205,7 @@ impl LinkCounts {
     }
 }
 
-/// Shared handle so the CLI and `session_meta` tool mutate the same live session.
+/// Shared handle so the server and `session_meta` tool mutate the same live session.
 #[derive(Clone)]
 pub struct ActiveSession {
     inner: Arc<Mutex<Session>>,
@@ -431,7 +429,7 @@ impl SessionWriter {
 
 impl Session {
     /// `model` is the catalog key from config.toml (recorded as metadata; a
-    /// resumed session runs on whatever model the CLI selects).
+    /// resumed session runs on whatever model the server selects).
     pub fn new(model: impl Into<String>) -> Self {
         Self::new_with_id(model, uuid_simple_hex(Uuid::new_v4()))
     }
@@ -548,8 +546,7 @@ impl Session {
         session_file_path(&self.id, "history")
     }
 
-    /// Sibling plain-text console mirror written live by the interactive CLI
-    /// ([`ConsoleLog`]): `{id}.console`.
+    /// Legacy plain-text console mirror, retained for transcript search: `{id}.console`.
     pub fn console_path(&self) -> PathBuf {
         session_file_path(&self.id, "console")
     }
@@ -1877,8 +1874,7 @@ mod tests {
         fs::write(&summary, "thread summary").unwrap();
         let active = ActiveSession::new(session);
         let lock = SessionWriteLock::acquire(&id).unwrap();
-        let log = ConsoleLog::new(active.clone(), true);
-        log.append("before archive\n");
+        fs::write(active.snapshot().console_path(), "legacy console needle\n").unwrap();
 
         active.set_archived(true).unwrap();
         let saved = Session::load_by_id_or_prefix(&id[..12]).unwrap();
@@ -1899,7 +1895,6 @@ mod tests {
             fs::read_to_string(saved.thread_summary_path(&saved.active_thread().id)).unwrap(),
             "thread summary"
         );
-        log.append("archived console needle\n");
         active
             .persist_messages(&[user("continued while archived")], None, true)
             .unwrap();
@@ -1911,12 +1906,11 @@ mod tests {
         );
 
         active.set_archived(false).unwrap();
-        log.append("after restore\n");
         assert!(original.exists());
         assert!(!archive.join(format!("{id}.json")).exists());
         assert_eq!(
             fs::read_to_string(original.with_extension("console")).unwrap(),
-            "before archive\narchived console needle\nafter restore\n"
+            "legacy console needle\n"
         );
         assert!(matches!(
             SessionWriteLock::acquire(&id),

@@ -3,14 +3,14 @@
 Start the server, then open the URL it prints:
 
 ```bash
-myco --web
-myco --web 8766 --profile research
-myco --web 0 --config /path/to/config.toml --resume <session-id>
-myco --web --web-bind 0.0.0.0
+myco
+myco --port 8766 --profile research
+myco --port 0 --config /path/to/config.toml --resume <session-id>
+myco --bind 0.0.0.0
 ```
 
-`--web` uses port 8765 by default; `--web 0` picks a free port. The server binds
-to `127.0.0.1` unless `--web-bind` names another address. Its launch URL signs
+The server uses port 8765 by default; `--port 0` picks a free port. The server binds
+to `127.0.0.1` unless `--bind` names another address. Its launch URL signs
 this browser into this server; keep that URL private. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
@@ -63,7 +63,7 @@ as last available, and discard them after two hours. Device location requires
 browser permission and HTTPS or localhost; city search works over remote HTTP.
 Weather failures do not affect conversations.
 
-`--web-bind 0.0.0.0` listens on every interface, so the UI answers any machine
+`--bind 0.0.0.0` listens on every interface, so the UI answers any machine
 that can route here, under whatever name they dial. The launch token is then the
 only thing between them and these sessions — and a session is a shell on your
 machine. There is no TLS and no user model: treat the URL as the credential,
@@ -85,17 +85,18 @@ by another myco process must be archived from that process or after it closes.
 The list refreshes while the home page is visible; changes made outside this
 server can take up to ten seconds to appear.
 
-The browser uses the same model configuration, profile, session store, tools,
-and compaction runner as the CLI. `--model`, `--effort`, `--profile`, `--config`,
-and `--resume <id>` apply at startup. Bare `--resume` and print/host modes do
-not combine with `--web`. Effort and configuration-file changes require
-restarting the server.
+`--model`, `--effort`, `--profile`, `--config`, and `--resume <id>` apply at
+startup. Effort and configuration-file changes require restarting the server.
+The launcher options are documented in `cli`.
 
 ## Conversation controls
 
 The floating input bar stays pinned while the conversation scrolls. Enter sends;
 Shift-Enter or Alt-Enter inserts a newline. Mention `@path/to/image.png` to attach
-an image using the CLI's attachment rules and limits. Image paths with spaces
+an image. Supported extensions are PNG, JPEG, GIF, and WebP; bytes determine
+the media type. Each image is limited by the model’s `max_image_base64_bytes`
+(default 5 MiB of base64), and attachments in one message have a 20 MiB budget.
+Bad paths or oversized images fail before the model request. Image paths with spaces
 are not supported as attachments.
 
 During a turn, **Queue** accepts follow-up messages in submission order. The
@@ -133,7 +134,7 @@ turns. The drawer starts closed; its button shows the current activity count.
 Click an active call to close the drawer and open its block. Close the drawer
 with its close button, Escape, or a click outside it. Background-task summaries
 refresh every second without consuming tool output, and disappear when the task
-ends. As in the CLI, background summaries cover the local host; active calls
+ends. Background summaries cover the local host; active calls
 include remote tools too.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
@@ -158,8 +159,7 @@ startup default.
 **New** opens a fresh session in the current tab; the previous session continues
 running on the server. **Compact** creates a successor thread without changing
 the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
-in the input; `/resume` navigates only the current tab. Other CLI slash commands
-are not available in this frontend.
+in the input; `/resume` navigates only the current tab. Other slash commands are not available.
 
 Automatic compaction is enabled per model with `auto_compact_at`, a fraction of
 its context window (for example, `0.8`). Without this setting it is disabled.
@@ -175,7 +175,7 @@ change; cancellation preserves the source thread.
 One server can run several sessions concurrently. Each has its own runner, model
 selection, cancellation, tool state, and writer lock. Tabs on different session
 URLs work independently; tabs on the same URL observe the same run. Changing a
-model or compacting is disabled during that session's turn. Another CLI or browser
+model or compacting is disabled during that session's turn. Another browser
 server cannot write an opened session while this server holds its writer lock.
 An unavailable or locked session shows an error without interrupting other tabs.
 
@@ -192,4 +192,67 @@ not old bash processes or editor state. Uncertain tool outcomes from an
 interrupted process are recorded without rerunning their effects. Compaction
 within a running session preserves live tools. After a server restart, open the
 new launch URL once to sign in again, then reopen your saved session URLs. Keep
-the same port to reuse bookmarks (`--web 0` chooses a new port each time).
+the same port to reuse bookmarks (`--port 0` chooses a new port each time).
+
+## Server API and automation
+
+Automated clients use the same authenticated HTTP API as the browser. Sign in
+by requesting the printed `/auth?token=...` URL and retaining its cookie.
+POST requests also require an `Origin` header equal to the server origin, such
+as `http://127.0.0.1:8765`. A server restart changes the credential. The API
+has the same access to sessions and tools as an authenticated browser.
+
+| Request | Body / result |
+| --- | --- |
+| `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
+| `GET /api/sessions` | Visible sessions; add `?archived=true` for archives |
+| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, and `queued` |
+| `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
+| `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
+| `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
+| `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
+| `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
+
+Use a fresh UUID per operation and reuse it when retrying that operation.
+Creation uses the UUID as the session ID and survives restart without creating
+a duplicate. Action deduplication lasts for the running session worker; after
+restart, inspect the saved snapshot before deciding whether to submit again.
+A 202 response means accepted, not finished. Wait until the snapshot is idle,
+then inspect its output and errors and verify the task's artifacts.
+
+To create a hidden child, include `"parent_session":"PARENT_ID"` in the
+creation body. The parent must exist in this server's profile. Add `"fork":true`
+to copy its saved context; a fork requires a parent. Children have independent
+runners and tool state, remain hidden from both normal and archived listings,
+and can be opened directly by ID. Retrying creation keeps its original context.
+Model selection is a separate action before submission.
+
+For example, a Python client can authenticate and create a session using only
+the standard library. Supply the launch URL through `MYCO_LAUNCH_URL`:
+
+```python
+import http.cookiejar, json, os, urllib.parse, urllib.request, uuid
+
+launch = os.environ["MYCO_LAUNCH_URL"]
+url = urllib.parse.urlsplit(launch)
+origin = f"{url.scheme}://{url.netloc}"
+client = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+client.open(launch).close()
+
+def post(path, payload):
+    request = urllib.request.Request(origin + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Origin": origin})
+    with client.open(request) as response:
+        return response.read()
+
+session = json.loads(post("/api/sessions", {"request_id": str(uuid.uuid4())}))["id"]
+post(f"/api/sessions/{session}/action", {
+    "request_id": str(uuid.uuid4()), "session_id": session,
+    "action": {"kind": "submit", "text": "Explain this repository"}})
+```
+
+Clients must be given the launch credential by their operator. The server does
+not inject it into model context. API-created sessions use the server's launch
+directory and profile; no new process or model configuration is needed per child.

@@ -2,7 +2,7 @@
 
 `myco-agent` drives model context through generation and tool rounds.
 The extracted crate is usable today; higher-level service and orchestration
-interfaces are still evolving. It does not start a CLI, create sessions, read
+interfaces are still evolving. It does not start a server, create sessions, read
 project guidance, install tools, or persist anything by itself.
 
 The core interfaces are [`Agent`](../api/myco_agent/struct.Agent.html),

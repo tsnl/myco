@@ -1,4 +1,4 @@
-//! Myco's application composition: profiles, sessions, host tools, and CLI support.
+//! Myco's application composition: profiles, sessions, host tools, and server support.
 //!
 //! For inference without the application, use `myco-model` (reexported as
 //! [`generative_model`]). For a headless model/tool loop, use `myco-agent`
@@ -26,10 +26,8 @@ pub mod manual;
 pub mod prelude;
 pub mod prompts;
 pub mod session;
-pub mod session_browser;
 pub mod session_runtime;
 pub mod tool_services;
-pub mod tui;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -42,7 +40,7 @@ pub use chat::{
     CompactWorkerError, Compactor, ModelCompactor, SessionRunner, WorkflowEvent,
     compact_subagent_prompt, run_compact_worker,
 };
-pub use config::{ColorMode, Config, ConfigUserSettings, WrapMode, load_file_config};
+pub use config::{Config, ConfigUserSettings, load_file_config};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
     ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
@@ -52,8 +50,8 @@ pub use harness::{
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
-    ActiveSession, CompactOutcome, ConsoleLog, SESSION_FILE_VERSION, Session, SessionKind,
-    SessionLink, SessionListEntry, Thread, compact_thread, select_tail,
+    ActiveSession, CompactOutcome, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
+    SessionListEntry, Thread, compact_thread, select_tail,
 };
 pub use session_runtime::{RuntimeRecord, SessionRuntime};
 pub use tool_services::{

@@ -1,4 +1,4 @@
-//! Image file policy shared by REPL `@path` attachments and the `view_image`
+//! Image file policy shared by browser `@path` attachments and the `view_image`
 //! tool: magic-number type detection and file → `data:` URL reading, under a
 //! size cap the caller supplies.
 //!
@@ -28,7 +28,7 @@ const SUPPORTED_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif"
 
 /// Whether a path *looks* like an image by extension.
 ///
-/// Only for deciding which REPL `@token`s are attachment mentions — that call
+/// Only for deciding which browser `@token`s are attachment mentions — that call
 /// happens before the file is read. The media type actually sent to the
 /// provider always comes from the bytes ([`read_image_data_url`]).
 pub fn looks_like_image_path(path: &str) -> bool {
@@ -50,7 +50,7 @@ pub fn looks_like_image_path(path: &str) -> bool {
 /// The media type comes from the file's magic number, not its name: a `.png`
 /// that is really a JPEG would otherwise reach the provider tagged
 /// `image/png` and be rejected by a decoder we cannot see. `label` is how the
-/// path appears in error messages (the REPL uses `@path`, `view_image` quotes
+/// path appears in error messages (the browser uses `@path`, `view_image` quotes
 /// it).
 pub fn read_image_data_url(
     path: &Path,

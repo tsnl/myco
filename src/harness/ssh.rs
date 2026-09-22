@@ -10,7 +10,7 @@
 //! - `ssh -G` IdentityFile discovery (host names double as the ssh aliases)
 //! - existing-agent queries (`ssh-add -l`) and interactive unlock (`ssh-add`,
 //!   `--apple-load-keychain` / `--apple-use-keychain` on macOS)
-//! - CLI-facing preflight report + WARNING-section body (silent when clean;
+//! - Frontend preflight report + WARNING-section body (silent when clean;
 //!   folded into the combined [`super::StartupPreflight`] block)
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -89,7 +89,7 @@ impl SshAgentPreflightReport {
 /// 3. On macOS, try `ssh-add --apple-load-keychain` once if anything is missing.
 /// 4. For each still-missing key, run interactive `ssh-add` on `/dev/tty` when available.
 ///
-/// Never fatally errors for soft-fail hosts: returns a report the CLI can print.
+/// Never fatally errors for soft-fail hosts: returns a report the server can display.
 /// Returns `Err` only when the preflight machinery itself is unusable in a
 /// surprising way (rare); callers may still continue attach.
 pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightReport {

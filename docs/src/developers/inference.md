@@ -2,7 +2,7 @@
 
 `myco-model` provides backend-independent messages and streaming drivers for
 Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions. It has no
-dependency on Myco's CLI, profile configuration, tool runtime, or session store.
+dependency on Myco's server, profile configuration, tool runtime, or session store.
 
 Start with [`GenerativeModel`](../api/myco_model/trait.GenerativeModel.html),
 [`GenerativeModelConfig`](../api/myco_model/struct.GenerativeModelConfig.html),

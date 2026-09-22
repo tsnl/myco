@@ -13,23 +13,23 @@ durable entries appended to every agent system prompt. Ask the agent to use
 the `prelude` tool for persistent personal guidance. Ordinary workspace files
 remain notes the agent can read as needed.
 
-## Work interactively
+## Work in the browser
 
 | Action | Control |
 | --- | --- |
-| Submit a message | Enter |
-| Insert a newline | Alt-Enter or Ctrl-J |
-| Cancel the line or running turn | Ctrl-C |
-| Reprint the conversation | Ctrl-L at an empty prompt |
-| Inspect tools and hosts | `/hosts` |
-| List or switch configured models | `/model`, `/model KEY` |
-| Change reasoning effort | `/effort low`, `medium`, `high`, or `max` |
-| Save and quit | `/exit` or Ctrl-D |
+| Submit a message | Enter or Send |
+| Insert a newline | Shift-Enter or Alt-Enter |
+| Queue a follow-up while busy | Enter or Queue |
+| Cancel the running turn | Cancel |
+| Inspect tool input and output | Expand its tool block |
+| Inspect running tools and background shells | Activity |
+| Switch configured models | Model selector between turns |
+| Compact context | Compact or `/compact` |
+| Open another session | New or a session link on the home page |
 
-Most terminals send Shift-Enter as ordinary Enter. Use the multiline controls
-above when composing longer instructions. Output wraps to the terminal width
-with an 80-column cap by default; `--wrap 100` changes the cap and `--wrap off`
-disables wrapping. `--color auto|always|never` controls color.
+Set reasoning effort with `--effort` when launching the server. A tab can be
+closed or refreshed while work continues. Open the session URL again to observe
+its output. Ctrl-C in the launching terminal stops the server.
 
 ## Attach an image
 
@@ -43,30 +43,15 @@ size. The default per-image cap is 5 MiB, and attachments in one message have
 a separate 20 MiB budget. Downscale large images before attaching them. The
 agent can also call `view_image` on a selected host.
 
-## Use Myco in a pipeline
+## Automate sessions
 
-```bash
-myco -p "Explain the repository layout"
-git diff | myco -p "Review this diff for correctness"
-printf '%s\n' "Summarize the public API" | myco -p
-```
+Use the authenticated server API to create sessions, submit work, observe output,
+compact, and cancel. Clients retain the launch cookie and send an `Origin` header
+on writes. A successful submission means accepted; wait for an idle snapshot and
+inspect the result. The [browser manual](../manual/browser.md#server-api-and-automation)
+contains the request formats and a Python example.
 
-Print mode runs one turn and exits. Answer text streams to stdout; warnings,
-errors, and `session=<id>` go to stderr. With an explicit prompt, piped stdin
-becomes context. Without one, stdin is the prompt. Piped content is never
-parsed for image attachments.
-
-Print-mode sessions persist. Continue with `myco --resume ID`, or
-`myco --resume ID -p "Follow up on the previous answer"`. Print mode does not
-write a console mirror. It shares the interactive runner's configured automatic
-compaction and recovery behavior.
-
-## Nested work
-
-Myco can launch another local `myco` process through bash. `--parent-session ID`
-links the child's hidden session to its parent; adding `--fork` starts it from
-the parent's saved context. Each child has its own conversation and host pool.
-The selected profile is inherited. The
-[runtime overview](../manual/overview.md) documents the agent-facing recipe.
-
-For the full command table, see the [CLI manual](../manual/cli.md).
+Include `parent_session` to create a hidden child; add `fork: true` to seed it
+with saved parent context. Each child has its own runner and tools while sharing
+the server's profile. The [overview](../manual/overview.md#nested-agents-the-recipe)
+describes context and ownership rules.

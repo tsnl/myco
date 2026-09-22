@@ -4,7 +4,7 @@ For session-derived cases, repeated model comparisons, unattended runs, and
 GEPA prelude optimization, use `myco-eval` ([manual](src/manual/articles/evals.md)).
 The APIs below are the underlying workflow for custom embedders.
 
-`SessionRunner` runs the same durable workflow used by interactive and print mode.
+`SessionRunner` runs the same durable workflow used by server sessions.
 It owns an `Agent`, a session-bound `SessionRuntime`, and compaction policy. Supply
 a `GenerativeModel` and `EventSink`; the runtime routes tools through a `Harness`.
 Use `Harness::local_with_services` to add fixture services, or use the lower
@@ -64,7 +64,7 @@ temporary path. It makes no model-provider calls.
 ## Persistence and recovery
 
 All operations share the `ActiveSession` writer gate. Independent processes using
-the same store must also hold `session::SessionWriteLock`, as the CLI does. A
+the same store must also hold `session::SessionWriteLock`, as the server does. A
 checkpoint saves intent before effects and observations before further work.
 Save failures stop execution and retain newer in-memory observations. After
 repairing storage, `continue_run` retries the current boundary without adding
@@ -82,7 +82,7 @@ Load `Session`, create a new `ActiveSession` and `SessionRuntime`, then construc
 a runner to resume after restart. Construction reconciles pending tool batches
 as unknown, never by replaying them. `submit` appends actual input; `resume` adds
 a hidden continuation and drives the existing task without a human timestamp.
-CLI `--resume` opens history and waits for input instead of invoking this method.
+Server `--resume` opens history and waits for input instead of invoking this method.
 
 Hidden `Content::System` parts store session identity, continuations, compaction,
 recovery, and `RuntimeRecord` observations. The model receives their text in order;

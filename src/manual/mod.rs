@@ -32,8 +32,8 @@ pub const ARTICLES: &[Article] = &[
     },
     Article {
         id: "cli",
-        title: "User-facing CLI",
-        summary: "Slash-commands and keybindings the agent cannot press",
+        title: "Server launcher",
+        summary: "Server launch options, profiles, and internal host worker",
         body: include_str!("articles/cli.md"),
     },
     Article {

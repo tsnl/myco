@@ -4,14 +4,14 @@ Guidance for humans and coding agents working on **myco**.
 
 ## Premise
 
-**myco** is a multi-host coding agent: one interactive process (model + harness +
+**myco** is a multi-host coding agent: one server process (model + harness +
 conversation) drives tools on an always-on **local** host (in-process) and on
 optional **remote** hosts (`ssh … myco --mode host` over NDJSON).
 
 Primary goal: a **personal daily driver** that can replace Claude Code / Codex /
 OpenCode-class workflows — long sessions you trust, real computer use, and one
 conversation across machines. Multi-host execution and nested-agent orchestration
-(myco driving myco over bash sessions) are the product wedge; cluster/GUI work must not outrank CLI trust and long-session
+(independent server sessions) are the product wedge; preserve session integrity and long-session
 viability (`TODO.md`).
 
 This is **not** an educational textbook repo (unlike resin/unit). Prefer clarity
@@ -26,7 +26,7 @@ When goals conflict, rank them:
    no silent corruption on long runs.
 2. **Simplicity** — minimum code that solves the real problem.
 3. **Operability** — agents and humans can diagnose hosts, config, and failures
-   (the on-disk manual, `/hosts`, clear errors).
+   (the on-disk manual, tool diagnostics, clear errors).
 4. **Features / cleverness / premature generality** — last.
 
 A plainer design that stays reliable beats a flexible one that hangs, desyncs
@@ -69,7 +69,7 @@ hosts, or lies about resume.
 ## Architecture (current)
 
 ```
-myco (interactive) / chat adapter
+myco server / chat adapter
   └── SessionRunner (submission, lifecycle, checkpoints, compaction)
       ├── Agent / AgentState (myco-agent) → GenerativeModel (myco-model)
       └── SessionRuntime (session binding + ToolExecutor)
@@ -79,24 +79,21 @@ myco (interactive) / chat adapter
                     └── standard tools: bash, editor, view_image
 ```
 
-Nested agents have no dedicated tool: a supervisor starts `myco` itself inside a
-bash session on the **local** host (piped stdin/stdout; wrap/color auto-off),
-passing `--parent-session <supervisor session id>` so the child's session is
-hidden and linked, and reads turns off the `USER n/m` headers — or runs
-`myco -p "<task>" --parent-session <id>` for a one-shot turn (answer on stdout,
-exit is the boundary). Nesting is local-only by doctrine: brains (config, keys,
-gateway access, session store) stay on the user's machine; remotes stay hands.
+Nested agents are independent workers created through the authenticated server
+API with `parent_session` and optional `fork: true`. They share the server's
+profile and catalog, with separate runners and live tools. Child sessions are
+hidden from normal browsing. Remotes stay tool workers without model keys.
 
 | Area | Role |
 |------|------|
-| `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
-| `src/bin/browser/` | `--web` loopback frontend over the shared session runner; embedded assets, transcript projection, and authenticated browser actions |
-| `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
+| `src/bin/myco.rs` | Server launcher, session composition, and `--mode host` worker |
+| `src/bin/browser/` | HTTP server and browser frontend over the shared session runner; embedded assets, transcript projection, and authenticated browser actions |
+| `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults |
 | `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
 | `crates/myco-agent/` | Pure `AgentState` transitions and their async model/tool interpreter; fallible effect checkpoints; no application dependency |
 | `src/session_runtime.rs` | Binds agents to a session, implements `ToolExecutor` over Harness, and owns live tools across thread changes |
-| `src/chat/` | `SessionRunner`: shared interactive/scripted submission, lifecycle, recovery, and manual/automatic compaction with an injected compactor |
+| `src/chat/` | `SessionRunner`: shared server/scripted submission, lifecycle, recovery, and manual/automatic compaction with an injected compactor |
 | `src/session/` | Persistent sessions: ordered `Thread` histories, shared metadata, search, writer locks, and compaction document logic |
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
@@ -105,7 +102,6 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + prelude / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/prelude.rs` | The agent prelude (always-in-prompt knowledge, not a Rust re-export module): maildir-style write-once entries under `~/.myco/workspace/prelude/`, rendered into every prompt and edited via the root-only `prelude` tool |
-| `src/tui/` | The whole rendering pipeline: `TuiProducer` (EventSink) → terminal + console-mirror sinks, the streaming markdown renderer (`markdown/`), and section/transcript layout + `Palette` (`transcript.rs`) that live output and replay share |
 | `tests/` | Integration tests (bash sessions, concurrent host tools, composed cancel, …) |
 
 **Invariants worth protecting**
@@ -143,7 +139,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
   lower crates must not depend on the application, including in tests.
   Within `myco`, dependencies flow through `core` → `manual` → `prelude` →
   `prompts` → `session` → `tool_services` → `host` → `harness` →
-  `session_runtime` → `chat` → `tui`. Shared data belongs below its callers;
+  `session_runtime` → `chat` → browser frontend. Shared data belongs below its callers;
   rendering belongs above the data it presents.
 
 ## Code style
@@ -212,7 +208,7 @@ cargo run --locked --bin myco
 ## What not to do
 
 - Don’t rename the **host** domain (`host` tool field, `--mode host`,
-  `/hosts`, `src/host/`) for cosmetic synonyms without an
+  `src/host/`) for cosmetic synonyms without an
   explicit, breakage-aware migration plan.
 - Don’t scp prebuilt `myco` binaries across mismatched OS/arch/libc; build on
   the target or use a matching asset (`harness-ops`).

@@ -1,17 +1,16 @@
 # Myco overview
 
-**myco** is a coding agent CLI: one conversation can drive tools on your laptop and on remote
-machines over SSH. Tools run on **hosts** (local or remote); for nested agents, myco drives
-itself as an ordinary command (see below).
+**myco** is a coding agent server: one conversation can drive tools on your laptop and on remote
+machines over SSH. Tools run on **hosts** (local or remote); nested sessions use the authenticated server API (see below).
 
 ## Architecture (one sentence)
 
 **Agents orchestrate; hosts run tools on machines.** The **local** host is always enabled
 **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
-`myco` binary runs the agent (`--mode interactive`) and the remote host runtime (`--mode host`).
+`myco` binary runs the server (the default mode) and the remote host runtime (`--mode host`).
 
 ```
-myco (interactive) / chat adapter
+myco server / chat adapter
   ├── Agent (model context and run loop)
   └── SessionRuntime (session binding + tool ownership)
       └── Harness (routing, config, root-configured services)
@@ -20,27 +19,16 @@ myco (interactive) / chat adapter
                 └── bash, str_replace_based_edit_tool, view_image (per host)
 ```
 
-- **Agent process:** model, conversation history, cancel, event sink, and the in-process
+- **Server process:** model, conversation history, cancel, event sink, and the in-process
   **local** host worker (standard tools plus root-only services such as `session_meta`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor,
   `view_image`) over NDJSON via SSH.
-- **Nested agents:** there is no subagent tool — a supervisor starts `myco` itself in a bash
-  session **on the local host**, passing `--parent-session <its own session id>` (myco stamps
-  that id in a `# Session` block on the first user message of every session, so an agent needs
-  no lookup; `session_meta` get still reports it), writes one
-  prompt per line, and reads until the next `USER n/m` header (the turn boundary; colors/wrapping
-  auto-off when piped). For a single self-contained task, print mode is the one-shot form:
-  `myco -p "<task>" --parent-session <id>` runs one turn, streams the answer to stdout, and
-  exits (`session=<id>` on stderr). Nesting locally shares config, keys, network, and the session store by
-  construction; the child reaches remotes through its own host pool, its session is hidden
-  (`kind: subagent`) and parented to the supervisor's. Adding `--fork` seeds the child with the
-  supervisor's saved conversation (a context fork): launched with the same `--model` it rides the
-  supervisor's prompt cache. Checkpoints include pending operations before execution and
-  completed observations before further work. A fork that inherits an unfinished tool batch
-  records unknown outcomes before generating; it never replays the parent's calls.
-  A fork inherits the supervisor's stamped first message and stamps its
-  own id on the first message it adds, so the newest `# Session` block is the running session's.
-  Remotes stay config/key-free hands.
+- **Nested agents:** authenticated clients create a hidden child through
+  `POST /api/sessions` with `parent_session` and optional `fork: true`. The
+  child shares the server's profile and model catalog, with its own runner and
+  tools. Forks inherit saved context; unresolved parent tool calls receive unknown
+  outcomes, never replay. The child's first submission stamps its own identity,
+  including when it was created before a server restart. Remotes stay tool workers.
 
 ## Sessions and threads
 
@@ -50,8 +38,7 @@ works on one thread at a time, and session turns and compaction share a writer g
 
 `/compact` creates a successor thread in the same session. Its first message contains
 the summary, followed by bounded recent context. The predecessor retains its original
-messages and tool output. Title, links, scratchpad, readline history, and console mirror
-remain attached to the same session.
+messages and tool output. Title, links, and scratchpad remain attached to the same session.
 
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.
@@ -73,7 +60,7 @@ editing. Model and effort changes produce a new notice. Compaction and rejected-
 recovery carry the latest runtime facts forward; earlier threads retain the original
 observations. The session's top-level `model` is its initial catalog key; runtime records
 identify the model used afterward. These parts reach the model but are omitted from
-transcript replay, readline history, titles, and human acceptance timestamps.
+transcript replay, titles, and human acceptance timestamps.
 
 State checkpoints fail closed: a save error stops further model/tool work. An interrupted
 tool batch is recovered with explicit unknown outcomes and a hidden runtime notice, since
@@ -95,9 +82,9 @@ on read; loading alone does not rewrite their files. Older turns keep unknown ti
 Older binaries reject version 5. Existing predecessor/successor session links
 remain metadata; separate saved sessions are not automatically combined.
 
-`/archive` and `/restore` change a session's browsing visibility while retaining
+The browser’s Archive and Restore controls change a session's browsing visibility while retaining
 every thread and live tool. Archive status belongs to the named session only;
-children and legacy compaction-linked sessions are independent. See `cli` for
+children and legacy compaction-linked sessions are independent. See `browser` for
 archive filters and restoration.
 
 ## Config & paths
@@ -108,11 +95,9 @@ and exported manual under `~/.myco/profiles/NAME/`. `MYCO_HOME` changes the pare
 installation directory, so test runs can use `MYCO_HOME=/tmp/myco-test`.
 Profile names contain letters, digits, hyphens, or underscores.
 
-Local nested agents inherit the selected profile through `MYCO_PROFILE` and
-`MYCO_HOME`, including children launched from a different working directory.
-Preserve those variables when using `--parent-session` or `--fork`. The tmux
-session browser receives the same selectors. Remote hosts remain tool workers;
-the profile's config and credentials stay local.
+All sessions hosted by a server share its profile. Local tool processes inherit
+`MYCO_PROFILE` and absolute `MYCO_HOME` across working-directory changes. Remote
+hosts remain tool workers; config and credentials stay with the server.
 
 For an existing installation, stop myco and move its `config.toml`, `session/`,
 and `workspace/` into `~/.myco/profiles/default/` before restarting. Files are
@@ -125,8 +110,8 @@ The manual is regenerated on startup. The paths below show the default profile.
 | `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/profiles/default/images/{shard}/{sha256}` | Immutable raw image sidecars, shared by all threads and sessions in this profile. Back up this directory together with `session/`. |
-| `~/.myco/profiles/default/session/{shard}/{id}.history` | Readline history for that session. |
-| `~/.myco/profiles/default/session/archived/{shard}/` | Archived session JSON, readline history, console transcripts, and thread summaries. Restore moves these files back; writer locks stay at `session/{shard}/{id}.lock`. Startup moves archived sessions out of the active store when their writer lock is available. |
+| `~/.myco/profiles/default/session/{shard}/{id}.history` | Legacy readline history, preserved when present. |
+| `~/.myco/profiles/default/session/archived/{shard}/` | Archived session JSON, thread summaries, and any legacy readline/console files. Restore moves these files back; writer locks stay at `session/{shard}/{id}.lock`. Startup moves archived sessions out of the active store when their writer lock is available. |
 | `~/.myco/profiles/default/manual/{version}/{commit}/` | These articles, copied to disk at startup for the running build (`index.md` plus one file per article). Read and search them like any other files; the agent system prompt names the directory. `myco --help <id>` prints the same text. |
 | `~/.myco/profiles/default/workspace/` | Free-form agent workspace: notes, drafts, anything, in any layout. `workspace/prelude/` holds write-once prelude entries (edited via the root-only `prelude` tool); every entry is appended to every agent system prompt, followed by a bounded listing of the other workspace files (see below). |
 
@@ -251,7 +236,7 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 (default 8192), `max_image_base64_bytes` (largest image the model accepts, as
 the name says measured on the uploaded base64 payload — 4/3 of the file on
 disk; default 5 MiB, matching Anthropic's per-image cap). The image cap is enforced locally by
-`view_image` and by REPL `@path` attachments, so an oversized image fails with a
+`view_image` and by browser `@path` attachments, so an oversized image fails with a
 clear message naming both sizes instead of a provider 400. Remote hosts are
 spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
 which keeps every host in a session on the same limit.
@@ -266,8 +251,7 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
-**Auto-compaction** runs through the shared session runner in interactive and print
-mode. `auto_compact_at = 0.8` triggers when reported prompt size reaches 80% of
+**Auto-compaction** runs through the server’s session runner. `auto_compact_at = 0.8` triggers when reported prompt size reaches 80% of
 `context_window`, at a settled boundary between tool rounds or after a normal answer.
 The system prompt tells the agent this
 threshold. Unset (the default) disables automatic compaction; the fraction must
@@ -277,8 +261,7 @@ It runs the same compaction as `/compact`, creating a successor thread in the
 same session with live tools intact. After success, a `# Resumption` message
 asks the agent to continue the pending task from the summary and retained
 context, or stop if the task is complete or needs user input. This message is
-stored in the conversation without a human acceptance timestamp or readline
-entry. It is a continuation, not startup: completed actions should not be
+stored in the conversation without a human acceptance timestamp. It is a continuation, not startup: completed actions should not be
 repeated. Opening a saved session with `--resume` or `/resume` still waits for
 user input and does not restore live tools from a previous process.
 
@@ -305,10 +288,9 @@ surfaces immediately. A failure mid-stream is never retried either, because the
 already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
 is honoured when it asks for longer than the computed backoff, still bounded by
 `max_backoff_ms`. The agent starts a fresh generation attempt for each retry;
-provider drivers perform one attempt and report failures. The interactive CLI
-shows a RETRY notice with the failure reason, next attempt number, and delay. Ctrl-C cancels the request,
-including retry waits. Notices appear in the console log, but are not added to
-conversation history.
+provider drivers perform one attempt and report failures. The browser
+shows a notice describing the failure and whether it will retry. Cancel stops
+the request, including retry waits. Notices are not added to model history.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:
@@ -330,9 +312,7 @@ do not.
 
 All resolution happens in one startup step (`myco::config::Config`), which
 also loads the config file (`--config` → `$MYCO_CONFIG` →
-`~/.myco/profiles/default/config.toml`) and decides color output: sections are colored when
-stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
-`CLICOLOR_FORCE` / `TERM=dumb`.
+`~/.myco/profiles/default/config.toml`).
 
 ## Host routing
 
@@ -341,8 +321,8 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 - Bash `session_id`s are **per host** and owned by a session runtime. Do not assume a session on `local`
   exists on `devbox`.
 - **Local** is always ready. **Remotes** are lazy: SSH workers spawn on first tool use.
-- Connect failures surface as tool errors; `/hosts` shows ok (local/in-process or live remote),
-  idle, or DOWN after a failed remote connect.
+- Connect failures surface in tool output. Check the remote with the non-interactive SSH
+  commands in `harness-ops` before retrying.
 - **`view_image`** (per host): returns a png/jpeg/gif/webp file as an image the
   model can actually look at — screenshots, diagrams, rendered output. Size is capped at
   the running model's `max_image_base64_bytes` (default 5 MiB, measured on the base64 payload);
@@ -360,65 +340,34 @@ stdout is a TTY, controlled by `--color auto|always|never` plus `NO_COLOR` /
 
 ## Nested agents (the recipe)
 
-There is no subagent tool: a supervisor runs `myco` itself, on the **local host**, as an ordinary
-bash command. The system prompt carries the short guidance; this is the working detail.
+Use the authenticated server API on the **local host**. Read `browser.md` for
+cookie authentication, request envelopes, and polling or streaming results.
+An operator must supply the server launch credential to the client; never put
+it in model messages or commit it to the repository.
 
-**Live session** — for real back-and-forth:
+1. Create a session with a fresh `request_id` and `parent_session` set to your
+   session ID, available in the newest `# Session` block or `session_meta` get.
+2. For shared context, add `fork: true`. It seeds the child with the parent's
+   saved conversation. Use the same model key to preserve prompt-cache reuse;
+   send `select_model` before the first submission if the server default differs.
+3. Submit the bounded task through the child's action endpoint. Poll its snapshot
+   or consume `/api/events`; `busy: false` marks the end of accepted work.
+4. Cancel through the child's cancel endpoint when necessary. Closing a client
+   connection does not stop the worker. Submit further turns to the same ID.
+5. Read the child's output and verify the requested result. It remains hidden
+   from ordinary listings; open its URL or use `session_meta` with
+   `include_hidden: true` to inspect it later.
 
-1. `bash` action=start with `command: "myco --parent-session <your-session-id>"` (add
-   `--model <key>` to pick a model, `--effort` if yours was changed from the default). Your own id
-   is on the newest `# Session` block in your conversation; `session_meta` action=get also reports
-   it.
-2. `write` one prompt per line, ending each `write` with `"\n"`. Each line is a self-contained turn
-   kept to a single line, and **only the trailing newline submits it**. Stdin passes through
-   unmodified, so a first turn written without `"\n"` is the classic hang: the child never sees a
-   complete line while you wait on `read`.
-3. `read` until the next `USER n/m` header — that is the turn boundary. Colors and wrapping switch
-   off automatically when piped.
-4. `bash` action=signal (default `int`) is the Ctrl-C you cannot type. The child cancels its
-   in-flight turn, returns to its prompt, and stays writable — use it when a child runs long or
-   goes down the wrong path, and keep driving the same session. The signal reaches the entire
-   session process group. Other programs may exit on SIGINT; do not assume an SSH process or
-   shell will behave like the interactive myco child.
-5. `close` when done. Ask for terse summaries: the point of nesting is to spend the child's
-   context instead of yours.
+Give each child a bounded task, constraints, expected result, and whether it may
+delegate further. Ask for completion evidence or a specific blocker. Keep bulk
+output in files and return their paths with a concise summary. A completed turn
+alone does not prove that the task is complete.
 
-**Task brief.** Give the child a bounded task, constraints, expected result, and whether it may
-delegate further. Ask for completion evidence (such as test results and a PR URL) or a specific
-blocker. Keep bulk output in files and return their paths with a concise summary.
-
-**One-shot** — for a single self-contained task, skip the live session: `myco -p "<task>"
---parent-session <id>` runs one turn and exits. Stdout is the answer text alone (no headers to
-parse; process exit is the boundary) and stderr ends with `session=<id>` for later reads. `-p`
-composes with `--fork` and `--model`. `myco -p "…" --resume <child-id>` appends follow-up turns,
-but each pays full process startup, so prefer a live session for real back-and-forth. Inside a
-**live** bash session, append `</dev/null`: with a prompt argument `-p` still drains piped stdin
-as context, and a live session's open stdin never EOFs. One-shot `bash` runs are safe — their
-stdin is null.
-
-Exit 0 means the turn completed; turn failures exit 1 and cancellation exits 130. Check stderr
-for errors and the session id, then verify the answer and artifacts against the task. Answer
-length and a successful exit alone do not establish that the requested work is complete.
-
-**Context forking.** `--fork` seeds the child with your session's saved conversation instead of a
-blank context. Fork when the task needs what you already know (decisions so far, investigation,
-the user's intent); start blank when the task is self-contained — a fork begins at your context
-size and has less headroom. Launch forks on your own model (the catalog key stamped at the end of
-the system prompt): a same-model fork's first request re-reads your cached prompt prefix at a
-fraction of full input cost, while a different model is legal but starts cold. Your session file
-is checkpointed mid-turn after each user message and completed tool round, so a fork sees the
-current user request and finished tool rounds — never tool calls still in flight, its own launch
-included; put anything newer in the first prompt line you write to it.
-
-The child's session is hidden (`kind: subagent`, parented to yours) in the selected profile's
-`session/` store. Local children inherit `MYCO_PROFILE` and `MYCO_HOME`; preserve those selectors
-so they share the parent's session store. Read a child's session later via `session_meta`
-get-by-id, or `list` with `include_hidden: true`.
-
-**Timeouts.** `bash` `exec` waits up to 60 s by default (`timeout_ms`, max 30 min). Timeout or
-cancellation kills its process group. Raise the timeout for a longer finite command, or use
-`start` with the program in the foreground of that session. A `read` timeout only ends that
-output wait; the session remains available for later `read`, `write`, `signal`, or `close` calls.
+Forks copy checkpointed observations, including pending operations. Unfinished
+tool calls get unknown outcomes before the child generates; they are never
+replayed. Forks have their own tool ownership and cannot inherit live parent shells.
+All child sessions share the server's profile and reach remotes through SSH;
+remote workers need no model keys or session store.
 
 ## Agent workspace
 
@@ -489,5 +438,5 @@ workspace writes leave the shared prompt prefix intact for same-model forks.
 - No mid-flight cancel over the host pipe yet; Ctrl-C cancels the agent turn locally.
 - You cannot invoke slash-commands; tell the user which to run.
 - Conversation resume ≠ restored bash sessions or editor state.
-- Bash sessions die when the host process exits (CLI exit, host crash, SSH drop). Local in-process
+- Bash sessions die when the host process exits (server exit, host crash, SSH drop). Local in-process
   sessions also end when their owning session runtime is released (for example, `/new`).

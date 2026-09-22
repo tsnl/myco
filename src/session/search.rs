@@ -1,6 +1,6 @@
 //! One-shot content search over saved sessions.
 //!
-//! Backs `myco --mode session-browser --search` and `session_meta list`
+//! Backs `session_meta list`
 //! with `query`. Builds one document per session — label, first-user-message
 //! snippet, scratchpad, and the tail of the `{id}.console` mirror — so recall
 //! works on what was *discussed*, not just the title, then ranks with plain

@@ -130,7 +130,7 @@ The repository's `evals/gepa/myco_gepa.py` adapter optimizes one component:
 `{"prelude": "..."}`. GEPA evaluates candidates with `myco-eval`, reflects on
 training failures and tool traces, and selects candidates using a separate
 validation set. Both task execution and reflection use bounded Myco runs and
-are guarded by `--free-only` by default. The core CLI has no Python/GEPA dependency.
+are guarded by `--free-only` by default. The server has no Python/GEPA dependency.
 
 ```bash
 python3 -m venv .venv-gepa

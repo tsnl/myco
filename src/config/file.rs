@@ -19,7 +19,7 @@ use crate::generative_model::{Protocol, ThinkingMode};
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    /// Default model **key** for the interactive CLI (`--model` overrides).
+    /// Default model **key** for the server (`--model` overrides).
     /// Optional when exactly one `[models]` entry exists.
     #[serde(default)]
     pub model: Option<String>,

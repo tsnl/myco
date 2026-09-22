@@ -9,19 +9,17 @@ its state belongs to the current session runtime, not to a saved message.
 
 ## Find and resume work
 
-Use `/title Fix parser errors` to label the current session and `/session`
-to inspect its paths and metadata. `/sessions` lists recent visible sessions.
-`/resume` opens the picker, and `/resume ID` accepts an ID or unique prefix.
-From the shell, `myco --resume` opens the most recent eligible session.
+Ask the agent to set the session title with `session_meta`; the page heading
+and tab title update with it. The home page lists visible sessions. Search
+filters by title, model, and ID. Open links in separate tabs or use `/resume ID`.
 
 ```bash
 myco --profile work --resume SESSION_ID
-myco --profile work --mode session-browser --search "parser"
 ```
 
-Use the profile in which the session was created. Search matches titles,
-first messages, scratchpads, and transcript tails. The picker requires `fzf`;
-inside tmux it opens in a popup. Explicit IDs work without it.
+Use the profile in which the session was created. For searches across stored
+message excerpts, scratchpads, and legacy transcript tails, the agent can use
+`session_meta` with a `query`.
 
 Resume restores conversation memory. After process exit it cannot restore
 running shells, editor read stamps, or the remote filesystem as it was observed.
@@ -34,11 +32,12 @@ summary and bounded recent context. The predecessor keeps its original messages
 and tool results. Live shells and editor read stamps continue through
 compaction, as do the title, links, and scratchpad.
 
-With `auto_compact_at` configured, the CLI can compact after a
-successful turn reaches the threshold, then ask the agent to continue the
-pending task. Each user submission can trigger one such cycle. Manual
-`/compact` waits for your next input; reopening a saved session also waits.
-Automatic compaction is disabled after a failure until another session opens.
+With a per-model `auto_compact_at` threshold, the server compacts at a settled
+boundary between tool rounds or after an answer and asks the agent to continue.
+Long tool loops can compact repeatedly as context grows. A completed answer can
+trigger at most one cycle per submission. Manual compaction and reopening a
+saved session wait for input. Failure or ineffective compaction disables automatic
+compaction until a manual compaction succeeds or another session opens.
 
 The agent can inspect old threads with `session_history`, using `threads`,
 `stats`, and `expand` actions. Compaction bounds active model context; it does
@@ -46,10 +45,10 @@ not delete the session's older threads from disk.
 
 ## Organize saved work
 
-`/archive [ID]` hides a session from ordinary browsing without deleting it.
-`/sessions archived` lists archived sessions and `/restore ID` makes one visible
-again. Explicitly resuming an archived ID does not automatically restore it.
-Archiving does not stop tools or archive child sessions.
+Click **Archive** on the home page to hide a session without deleting it. Choose
+**Archived sessions** and click **Restore** to make one visible again. Opening
+an archived session URL does not restore it automatically. Archiving does not
+stop tools or archive children.
 
 Archived sessions and their history, transcript, and summary files live under
 `session/archived/` in the selected profile. Restore moves them back to the active
@@ -63,12 +62,12 @@ the session while it is open.
 
 ## What is saved
 
-Under the selected profile's `session/` directory, each session has a JSON
-document and readline history. Interactive TTY runs also append an ANSI-free
-`.console` transcript. This mirror includes notices that are absent from model
-history, but omits cursor repaints. It is a display log, not an execution trace.
+Each session has a JSON document under the selected profile's `session/`
+directory. Its threads hold messages, recorded tool outcomes, and human turn
+timestamps. Historical readline and console sidecars remain readable and move
+with archived sessions; the server writes no new terminal logs.
 
-Use the CLI and session tools to change metadata. The
+Use the browser and session tools to change metadata. The
 [manual](../manual/overview.md#sessions-and-threads) describes the persisted
 format and thread semantics in more detail.
 

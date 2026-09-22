@@ -3,28 +3,24 @@
 Living backlog. Priority tiers target **personal daily replacement** of Claude Code /
 Codex / OpenCode / Grok-class agents / Pi. Multi-host brain/hands **and** multi-level
 subagent orchestration (mycelial / self-similar agents) are the wedge — do not let
-cluster/GUI work outrank CLI trust + long-session viability.
+additional surfaces outrank server trust + long-session viability.
 
 ---
 
 ## Done / mostly done (do not re-open casually)
 
 - Dual protocol drivers: Anthropic Messages + OpenAI Responses. Models are a config.toml catalog (`[gateways]`/`[models]`; auth = literal token or env/file source) — no built-in model list; any gateway (Anthropic, xAI, OpenRouter, local) via config
-- Streaming generate + thinking; `EventSink` / `AgentEvent`; one rendering pipeline (`TuiProducer` drives terminal + console mirror; replay shares its layout helpers)
-- Host pool: local + SSH `myco --mode host`, soft-fail non-default, `/hosts`
+- Streaming generate + thinking; `EventSink` / `AgentEvent`; browser transcript projection with streaming updates and saved-history replay
+- Host pool: local + SSH `myco --mode host`, soft-fail non-default
 - Tools: `bash` (exec + sessions), `str_replace_based_edit_tool` (read-stamp)
 - Concurrent tool uses per turn (`join_all`), including concurrent host-routed tools (pipelined NDJSON + concurrent host dispatch)
-- Session message resume (`~/.myco/session/…`); readline history
+- Session message resume within profile stores
 - Session metadata v2: title, PR/worktree links, scratchpad; `session_meta` local tool;
-  `/title`; list/get any session (breaking vs old v1 files — WIP, no migration)
-- Session browser: bare `/resume` → fzf over sessions (console-mirror preview), as a tmux
-  `display-popup` running `--mode session-browser` inside tmux, inline otherwise. `tmux` +
-  `fzf` are expected on PATH (preflight warns). Deliberately composes with tmux/fzf
-  instead of an in-house TUI. Content search: `--search` / `session_meta list query` rank
-  sessions by plain keyword matching over title + first message + scratchpad + console
-  tail (nothing indexed, nothing persisted).
+  list/get any session (breaking vs old v1 files — WIP, no migration)
+- Browser session navigation, archive/restore, and metadata search. `session_meta`
+  also searches stored first messages, scratchpads, and legacy console tails.
 - Anthropic system-block prompt caching (`cache_control` on system text)
-- Local turn cancel (Ctrl-C); synthetic cancelled tool results when tools already started
+- Per-session browser cancellation; synthetic cancelled tool results when tools already started
 - `dyn GenerativeModel`; harness routing with injected `host` field
 
 ---
@@ -44,16 +40,11 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
     - `generate_error_after_tool_results_keeps_well_formed_history`
     - `generate_error_before_assistant_keeps_only_user`
     - `resume_after_tools_mid_turn_continues_cleanly`
-  - CLI `/help` documents well-formed history on generate error / cancel (no stale caveat).
-- [ ] **Paste / newline submit** — chord newlines exist (Alt-Enter, Ctrl-J; Shift-Enter
-      only on the Windows console — Unix terminals send it as plain Enter); no
-      bracketed-paste handling. Terminal paste that injects bare newlines can still
-      AcceptLine early (rustyline 15 default). Confirm on real paste; enable bracketed
-      paste / filter if so.
+  - The manual documents well-formed history on generate error / cancel (no stale caveat).
 - [x] **Remote host-side cancel** — request-id cancellation crosses the host protocol and
       reaches the worker-side token; local and remote bash execs both kill their process groups.
 - [ ] **Host liveness / reconnect** — V1 is attach-time + next tool error. Soft reconnect,
-      clearer mid-session DOWN UX (beyond `/hosts` at startup).
+      clearer mid-session DOWN UX in the browser.
 - [x] (REJECT) **Cold resume honesty** — sessions restore messages only (no bash sessions, no editor
       stamps). Banner or rehydrate hints so `/resume` does not feel broken.
   - Note: `/help` already documents “conversation memory only”; reject is for extra UX work.
@@ -77,11 +68,11 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [x] **Compaction (manual)** — `/compact` runs a hidden compact-worker agent over the
       session (`session_history` tool), writes `{id}.summary.md`, and creates a
       successor thread in the same session with the summary + a well-formed recent
-      tail. Ctrl-C cancels it.
+      tail. The Cancel button stops it.
 - [x] **Auto-compact** when approaching the context limit — per-model
       `auto_compact_at` fraction of `context_window`, checked after each turn against
       the provider's reported prompt size. Runs the same worker as `/compact` and
-      switches the REPL to the successor thread. Unset = off; a failed automatic run
+      switches the runner to the successor thread. Unset = off; a failed automatic run
       disables itself for the session rather than repeating every turn.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
@@ -165,7 +156,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 ### Invocation surface
 
 - [x] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
-- [x] **User multimodal (images)** — `@path` mentions in the REPL attach
+- [x] **User multimodal (images)** — `@path` mentions in the browser attach
       png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
       Responses sends `input_image` parts. Non-image files: see **Rich attach**.
 - [x] **Agent multimodal (images)** — `view_image` tool returns an image file as
@@ -228,7 +219,7 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
   - Still rejected as a *user-facing* feature. The narrow automatic case ships:
     a request over the provider's size cap is unretryable (every later turn
     resends it), so `AgentInteractionError::recovery()` reports
-    `Recovery::OmitLastMessage` and the CLI calls
+    `Recovery::OmitLastMessage` and the runner calls
     `Agent::rewind_last_user_turn()` to unwedge the session. No `/rewind`
     command, no branching.
 

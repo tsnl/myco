@@ -9,7 +9,7 @@
 
 A minimalist coding agent that works across your machines over SSH.
 
-Run `myco` on your laptop. It edits files, runs shells, and searches code on
+Run `myco` on your laptop and open its browser UI. It edits files, runs shells, and searches code on
 the local machine **and** on every concrete `Host` alias in your
 `~/.ssh/config` — one session, many hosts, no setup beyond SSH itself.
 
@@ -22,9 +22,9 @@ the local machine **and** on every concrete `Host` alias in your
   file editor on each host; search and browsing compose from the tools already
   on your machines (`rg`, `curl`, `lynx`, `ck` for semantic search, …) via bash.
 - **Sessions you can resume.** Titles, scratchpads, PR/worktree links, and full
-  conversation history live under `~/.myco/` — pick up later with `/resume`.
-- **Nested agents for long work.** myco drives itself: start `myco` in a bash
-  session to spin off focused agents so the main thread stays small and cheap.
+  conversation history live under `~/.myco/` — pick up later from the session browser.
+- **Independent sessions.** Work in several browser tabs, or create hidden child
+  sessions through the authenticated server API.
 - **Project guidance is injected.** The nearest `AGENTS.md` / `CLAUDE.md` from
   your launch directory through the repository root is read at session start.
 - **Evaluate your actual tasks.** `myco-eval` turns session cutoffs into private,
@@ -38,28 +38,24 @@ the local machine **and** on every concrete `Host` alias in your
 cargo install myco
 ```
 
-Needs stable Rust and `ssh`, `uv`, `bash`, `tmux`, `fzf` on `PATH`
+Needs stable Rust and `ssh`, `uv`, `bash` on `PATH`
 (`git`, `gh`, `curl` recommended; `ck` — `cargo install ck-search` — for
 semantic code search).
 
 ## Use
 
 ```bash
-myco    # runs the default model from your config.toml; --model <key> to switch
-myco --web    # open the printed URL for the local browser UI
-myco -p "explain src/host/protocol.rs"   # print mode: one turn, answer on stdout, exit
-git diff | myco -p "review this"  # piped stdin becomes context for the prompt
+myco                      # start the browser server on 127.0.0.1:8765
+myco --port 8766 --profile research
+myco --resume SESSION_ID  # open a saved session from the launch URL
 ```
 
-`-p/--print` runs one non-interactive turn: the answer streams to stdout
-(raw, pipe-friendly), everything else prints to stderr, and the session is
-saved like any other (`session=<id>` on stderr) — continue it with
-`--resume <id>`. Bare `-p` takes the prompt from piped stdin.
-
-`--web` serves a terminal-style browser UI with individually collapsible tool
-blocks, a floating input bar, and Markdown/image rendering. It shares the CLI's
-sessions and tools; refreshing the page keeps the current turn running. See the
-[browser manual](src/manual/articles/browser.md), also `myco --help browser`.
+Open the printed URL to sign in. The browser has collapsible tool blocks, a
+floating input bar, Markdown/images, and independent sessions in separate tabs.
+Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
+launching terminal stops the server and its sessions. See the
+[browser manual](src/manual/articles/browser.md), also `myco --help browser`,
+for controls and the authenticated HTTP API.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
@@ -69,12 +65,7 @@ pass to `--model`). The `auth` value is the token itself or a source such as
 at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the
 [overview article](src/manual/articles/overview.md) — also available as
 `myco --help overview` once installed. Set a default model with
-`model = "<id>"` in `~/.myco/profiles/default/config.toml` (`--model` wins). Transcript
-sections are colored when stdout is a TTY (`--color auto|always|never`;
-`NO_COLOR` / `CLICOLOR_FORCE` honored), and prose is word-wrapped with light
-markdown styling (`--wrap auto|off|COLS` caps the width at min(cap, terminal
-width), default 80; resizes reflow the transcript at the next prompt; never
-inside code blocks, never when piped).
+`model = "<id>"` in `~/.myco/profiles/default/config.toml` (`--model` wins). The browser model selector changes the model between turns.
 
 Remotes just work: myco attaches lazily with `ssh <alias> myco --mode host`,
 so a remote only needs your key in `ssh-agent` and `myco` on the PATH used by
@@ -110,12 +101,12 @@ Screenshots, server logs, and Playwright traces go to `target/browser-test-resul
 
 `myco-model` provides backend drivers and message types. `myco-agent` drives
 headless execution using supplied tools and event sinks. The `myco` package
-assembles sessions, host tools, and the CLI. Workspace packages share a version and lockfile.
+assembles sessions, host tools, and the browser server. Workspace packages share a version and lockfile.
 Run `cargo test --locked --workspace` to test all packages.
 
 For scripted sessions and evals, `SessionRunner` supplies submission, durable
 checkpoints, automatic compaction, and continuation with an injected model and
-compactor. Interactive and print mode use this same runner. Run the offline
+compactor. Server sessions use this same runner. Run the offline
 [scripted session example](examples/scripted_session.rs):
 
 ```bash

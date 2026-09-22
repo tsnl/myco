@@ -1,4 +1,4 @@
-//! Image attachments in REPL input.
+//! Image attachments in browser input.
 //!
 //! A whitespace-delimited `@<path>` token whose extension is a supported image
 //! type (png, jpg, jpeg, gif, webp) attaches that file to the user message as

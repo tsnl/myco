@@ -1,12 +1,12 @@
 # Application architecture
 
 The `myco` crate assembles the reusable libraries with profiles, prompts,
-sessions, terminal rendering, and host tools. Depend on it when you need that
+sessions, browser rendering, and host tools. Depend on it when you need that
 composition; `myco-model` and `myco-agent` remain sufficient for a custom
 environment.
 
 ```text
-CLI / SessionRunner
+HTTP / SessionRunner
   ├── Agent (myco-agent)
   │     └── GenerativeModel (myco-model)
   └── SessionRuntime (ToolExecutor + live resource ownership)
@@ -31,7 +31,7 @@ Reloading a saved document after process exit does not recreate those resources.
 
 [`SessionRuntime::bind_agent`](../api/myco/session_runtime/struct.SessionRuntime.html#method.bind_agent)
 binds the active thread and attribution and clears the previous checkpoint.
-The chat adapter wires persistence back in. For a CLI-like turn, use
+The chat adapter wires persistence back in. For a durable application turn, use
 [`SessionRunner`](../api/myco/chat/struct.SessionRunner.html): it owns the agent,
 session writer coordination, input submission, recovery, and compaction policy.
 It preserves live tools when threads change and rejects stale checkpoints.
@@ -54,7 +54,7 @@ only on the local worker. Model credentials stay with the application process.
 
 | Area | Entry point |
 | --- | --- |
-| Startup and CLI controls | `src/bin/myco.rs` |
+| Server and host-worker startup | `src/bin/myco.rs` |
 | Browser frontend, HTTP actions, and transcript projection | `src/bin/browser/` |
 | Profiles, models, authentication | `src/config/`, `src/core/fs.rs` |
 | Agent execution | `crates/myco-agent/src/lib.rs`, `generation.rs` |
@@ -62,7 +62,7 @@ only on the local worker. Model credentials stay with the application process.
 | Session turns and compaction | `src/chat/`, `src/session/` |
 | Live resource binding | `src/session_runtime.rs` |
 | Host transport and routing | `src/host/`, `src/harness/` |
-| Tools and terminal rendering | `src/tool_services/`, `src/tui/` |
+| Host tools | `src/tool_services/` |
 
 The repository's [guided code tour](https://github.com/tsnl/myco/blob/main/TOUR.md)
 follows complete execution paths and points to integration tests. The
