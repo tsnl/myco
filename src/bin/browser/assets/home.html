@@ -10,10 +10,17 @@
   <script src="/home.js" type="module"></script>
 </head>
 <body>
-  <header class="toolbar home-toolbar">
-    <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
-    <span id="session-title">Sessions</span>
-    <button id="new-session" type="button">New session</button>
+  <header class="toolbar">
+    <div class="toolbar-inner">
+      <div class="toolbar-heading">
+        <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
+        <h1 id="session-title">Sessions</h1>
+      </div>
+      <div class="toolbar-actions" role="group" aria-label="Session controls">
+        <div class="toolbar-tools"></div>
+        <button id="new-session" type="button" aria-label="New session" title="New session"><span aria-hidden="true">+</span> New</button>
+      </div>
+    </div>
   </header>
   <main id="session-browser">
     <label for="search">Find a session</label>

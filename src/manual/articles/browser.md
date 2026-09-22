@@ -95,7 +95,10 @@ Queues live in the running server and are not restored after a server restart.
 A rejected submission keeps its draft.
 
 The page heading and browser tab title follow the session title, including the
-first-message title and agent renames during a running turn.
+first-message title and agent renames during a running turn. Hover over a truncated
+heading to read its full title. The top bar aligns with the conversation and keeps
+its controls on a separate row on narrow screens. Activity counts appear only
+while tools or background sessions are running.
 
 Each tool appears as soon as execution starts, with a truncated argument
 preview in its collapsed header. Running calls are cyan; completed calls turn

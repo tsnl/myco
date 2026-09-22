@@ -248,7 +248,7 @@ function metadata() {
   }
   $('compact').disabled = disabled || !state.blocks.length;
   $('session-title').textContent = state.title || 'Session';
-  $('session-title').title = state.session_id || '';
+  $('session-title').title = state.title || 'Session';
   transcript.setAttribute('aria-busy', String(!!state.busy));
   document.title = `${state.title || 'myco'} · myco`;
 }
@@ -257,6 +257,7 @@ function activity() {
   const tasks = state.tasks || [];
   const count = calls.length + tasks.length;
   $('activity-count').textContent = count;
+  $('activity-count').hidden = !count;
   $('activity-toggle').classList.toggle('has-activity', !!count);
   $('activity-title').textContent = connected ? 'Activity' : 'Activity · reconnecting';
   $('activity-empty').hidden = !!count;
@@ -283,7 +284,10 @@ function activity() {
   for (const task of tasks) background.append(element('li', 'background-task', task));
   if ($('activity').open && focusedCall !== undefined) (list.querySelector(`[data-block-index="${focusedCall}"]`) || $('activity-close')).focus({ preventScroll: true });
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
-  $('connection').textContent = connected ? state.status === 'Cancelling' ? 'Cancelling' : current : 'Reconnecting…';
+  const status = $('connection');
+  status.textContent = connected ? state.busy ? state.status : count ? 'Active' : state.status || 'Ready' : 'Reconnecting…';
+  status.title = connected ? current : 'Reconnecting to session';
+  status.dataset.state = !connected || ['Stopped', 'Cancelling'].includes(state.status) ? 'attention' : state.busy || count ? 'busy' : 'ready';
 }
 function updateSession(update) {
   if (update.revision <= revision) return;

@@ -25,7 +25,8 @@ function controls() {
   button.id = 'sky-toggle'; button.type = 'button'; button.textContent = 'Sky';
   button.setAttribute('aria-haspopup', 'dialog');
   button.setAttribute('aria-controls', 'sky-settings');
-  document.querySelector('.toolbar').append(button);
+  button.setAttribute('aria-expanded', 'false');
+  document.querySelector('.toolbar-tools').append(button);
   const dialog = document.createElement('dialog');
   dialog.id = 'sky-settings'; dialog.setAttribute('aria-labelledby', 'sky-heading');
   dialog.innerHTML = `
@@ -38,7 +39,8 @@ function controls() {
     <p id="sky-error" role="status"></p>
     <div class="sky-attribution">Weather from <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a> · Locations from <a href="https://www.geonames.org/" target="_blank" rel="noopener noreferrer">GeoNames</a>.<p>City searches and approximate coordinates go to Open-Meteo. Your choice is saved in this browser.</p></div>`;
   document.body.append(dialog);
-  button.onclick = () => dialog.showModal();
+  button.onclick = () => { dialog.showModal(); button.setAttribute('aria-expanded', 'true'); };
+  dialog.addEventListener('close', () => button.setAttribute('aria-expanded', 'false'));
   dialog.querySelector('#sky-close').onclick = () => dialog.close();
   dialog.addEventListener('keydown', event => {
     if (event.key === 'Escape') { event.preventDefault(); dialog.close(); }

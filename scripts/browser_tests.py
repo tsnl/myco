@@ -358,7 +358,10 @@ context_window = 100000
         planes = page.locator(".sky-aircraft")
         page.clock.fast_forward(3600000)
         expect(planes).to_have_count(0)
+        # Media changes are delivered asynchronously, before the arrival timer starts.
+        page.evaluate("() => { window.motionChanged = new Promise(resolve => matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', () => resolve(), {once: true})); }")
         page.emulate_media(reduced_motion="no-preference")
+        page.evaluate("window.motionChanged")
         page.clock.fast_forward(111000)
         expect(planes.first).to_be_attached()
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
@@ -656,7 +659,7 @@ context_window = 100000
         page = self.session(self.page)
         self.submit(page, "Alpha markdown")
         expect(page.locator(".markdown table")).to_have_count(1)
-        page.wait_for_function("document.querySelector('.markdown img')?.naturalWidth === 1")
+        expect(page.locator('.markdown img')).to_have_js_property('naturalWidth', 1)
         self.assertEqual(page.locator(".markdown h1").evaluate("n => getComputedStyle(n).fontSize"),
                          page.locator(".markdown p").first.evaluate("n => getComputedStyle(n).fontSize"))
         self.assertEqual(page.locator("#composer time").count(), 0)

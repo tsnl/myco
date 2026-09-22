@@ -11,12 +11,20 @@
 </head>
 <body>
   <header class="toolbar">
-    <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
-    <span id="session-title">Session</span>
-    <button id="new-session" type="button">New</button>
-    <button id="compact" type="button">Compact</button>
-    <span id="connection" role="status">Connecting…</span>
-    <button id="activity-toggle" type="button" aria-haspopup="dialog" aria-controls="activity" aria-expanded="false">Activity <span id="activity-count">0</span></button>
+    <div class="toolbar-inner">
+      <div class="toolbar-heading">
+        <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
+        <h1 id="session-title">Session</h1>
+      </div>
+      <span id="connection" role="status" data-state="attention">Connecting…</span>
+      <div class="toolbar-actions" role="group" aria-label="Session controls">
+        <div class="toolbar-tools">
+          <button id="compact" type="button">Compact</button>
+          <button id="activity-toggle" type="button" aria-haspopup="dialog" aria-controls="activity" aria-expanded="false">Activity <span id="activity-count" hidden>0</span></button>
+        </div>
+        <button id="new-session" type="button" aria-label="New session" title="New session"><span aria-hidden="true">+</span> New</button>
+      </div>
+    </div>
   </header>
   <main id="transcript" aria-label="Conversation" aria-busy="false">
     <section class="welcome"><h1>MYCO</h1><p>Write a prompt to begin.<br>Tool inputs and output expand in place.</p></section>
