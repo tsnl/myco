@@ -106,6 +106,10 @@ impl SessionRunner {
         self.workflow.observer = observer;
     }
 
+    pub fn set_followup_handler(&mut self, handler: Option<super::FollowupHandler>) {
+        self.workflow.followups = handler;
+    }
+
     /// Change the model at an idle boundary and persist its identity before any
     /// more model work. An empty session defers the notice until its first input.
     pub async fn set_model(
@@ -269,6 +273,7 @@ pub(super) struct Workflow {
     compacted_after_completion: bool,
     awaiting_compacted_usage: bool,
     observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
+    followups: Option<super::FollowupHandler>,
 }
 
 impl Default for Workflow {
@@ -282,6 +287,7 @@ impl Default for Workflow {
             compacted_after_completion: false,
             awaiting_compacted_usage: false,
             observer: Arc::new(|_| {}),
+            followups: None,
         }
     }
 }
@@ -331,6 +337,7 @@ impl Workflow {
             self.awaiting_compacted_usage = false;
         }
         loop {
+            self.deliver_followups(agent, runtime, &cancel)?;
             let result = agent.step(cancel.clone()).await;
             if let Err(error @ AgentInteractionError::Checkpoint(_)) = result {
                 return Err(error);
@@ -383,9 +390,26 @@ impl Workflow {
                 }
             }
             if let Some(outcome) = outcome {
+                if self.deliver_followups(agent, runtime, &cancel)? {
+                    continue;
+                }
                 return Ok(outcome);
             }
         }
+    }
+
+    fn deliver_followups(
+        &self,
+        agent: &mut Agent,
+        runtime: &SessionRuntime,
+        cancel: &CancelToken,
+    ) -> Result<bool, AgentInteractionError> {
+        if cancel.is_cancelled() || !agent.state().can_replace_at_boundary() {
+            return Ok(false);
+        }
+        self.followups
+            .as_ref()
+            .map_or(Ok(false), |handler| handler(agent, runtime.session()))
     }
 
     async fn compact(
@@ -553,6 +577,119 @@ mod tests {
                 cancel,
             )
             .await
+    }
+
+    #[test]
+    fn followups_join_settled_tool_results_and_survive_automatic_compaction() {
+        let _home = temp_home("runner-followups");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for compact in [false, true] {
+                let compactor = Arc::new(Summarizer::default());
+                let (mut runner, model) = setup(
+                    vec![
+                        output(if compact { 90 } else { 20 }, Some(json!({"command":"printf observed"})), TurnEndReason::ToolUse),
+                        output(20, None, TurnEndReason::EndTurn),
+                    ],
+                    compactor.clone(),
+                ).await;
+                let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let accepted_at: DateTime<Utc> = "2026-09-22T12:00:00Z".parse().unwrap();
+                runner.set_followup_handler(Some(Arc::new({
+                    let delivered = delivered.clone();
+                    move |agent, session| {
+                        if delivered.load(Ordering::SeqCst) || !agent.history().iter().any(|message| matches!(message, Message::ToolResults { .. })) {
+                            return Ok(false);
+                        }
+                        for text in ["first follow-up", "second follow-up"] {
+                            super::super::append_followup(agent, session, vec![Content::Text { text: text.into() }], accepted_at)?;
+                            let saved = Session::load(&session.snapshot().json_path()).unwrap();
+                            assert_eq!(saved.active_thread().messages, agent.history());
+                        }
+                        delivered.store(true, Ordering::SeqCst);
+                        Ok(true)
+                    }
+                })));
+                submit(&mut runner, CancelToken::new()).await.result.unwrap();
+                assert!(delivered.load(Ordering::SeqCst));
+                assert_eq!(model.remaining(), 0);
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), usize::from(compact));
+                let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
+                let thread = saved.active_thread();
+                let followups: Vec<_> = thread.messages.iter().enumerate().filter_map(|(index, message)| {
+                    match message {
+                        Message::UserMessage { content } if matches!(&content[..], [Content::Text { text }] if text.ends_with("follow-up")) => Some(index),
+                        _ => None,
+                    }
+                }).collect();
+                assert_eq!(followups.len(), 2);
+                for index in followups {
+                    assert_eq!(thread.user_turn_timestamps[&index], accepted_at);
+                }
+                assert!(thread.pending_operation.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn a_followup_checkpoint_failure_preserves_input_for_retry_without_model_work() {
+        let home = temp_home("runner-followup-checkpoint");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut runner, model) = setup(
+                vec![output(20, None, TurnEndReason::EndTurn)],
+                Arc::new(Summarizer::default()),
+            )
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let queued = Arc::new(Mutex::new(Some(vec![Content::Text {
+                text: "keep this follow-up".into(),
+            }])));
+            runner.set_followup_handler(Some(Arc::new({
+                let path = home.path().to_owned();
+                let attempts = attempts.clone();
+                let queued = queued.clone();
+                move |agent, session| {
+                    let mut queued = queued.lock().unwrap();
+                    let Some(input) = queued.as_ref() else {
+                        return Ok(false);
+                    };
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::fs::rename(path.join("session"), path.join("saved-store")).unwrap();
+                        std::fs::write(path.join("session"), "unavailable").unwrap();
+                    }
+                    super::super::append_followup(agent, session, input.clone(), Utc::now())?;
+                    queued.take();
+                    Ok(true)
+                }
+            })));
+            assert!(matches!(
+                submit(&mut runner, CancelToken::new()).await.result,
+                Err(AgentInteractionError::Checkpoint(_))
+            ));
+            assert!(queued.lock().unwrap().is_some());
+            assert_eq!(model.remaining(), 1);
+            assert!(
+                !serde_json::to_string(runner.agent().history())
+                    .unwrap()
+                    .contains("keep this follow-up")
+            );
+            std::fs::remove_file(home.path().join("session")).unwrap();
+            std::fs::rename(home.path().join("saved-store"), home.path().join("session")).unwrap();
+            runner
+                .continue_run(CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert!(queued.lock().unwrap().is_none());
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(
+                serde_json::to_string(runner.agent().history())
+                    .unwrap()
+                    .matches("keep this follow-up")
+                    .count(),
+                1
+            );
+        });
     }
 
     #[test]

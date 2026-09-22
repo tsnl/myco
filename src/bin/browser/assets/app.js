@@ -234,10 +234,10 @@ function metadata() {
   activity();
   $('send').disabled = !connected || !state.session_id || selectingModel || sending || state.status === 'Cancelling';
   $('send').textContent = state.busy ? 'Queue ↵' : 'Send ↵';
-  $('input-hint').textContent = state.busy ? 'Enter to queue · Runs after the current turn' : 'Enter to send · Shift+Enter for a new line';
+  $('input-hint').textContent = state.busy ? 'Enter to queue · Sent after the current tools finish' : 'Enter to send · Shift+Enter for a new line';
   $('cancel').hidden = !state.busy;
   const queued = state.queued || [];
-  $('cancel').textContent = queued.length ? 'Cancel run & queue' : 'Cancel run';
+  $('cancel').textContent = queued.length ? 'Cancel & send queued' : 'Cancel run';
   $('queued').hidden = !queued.length;
   $('queued-count').textContent = `${queued.length} queued`;
   const list = $('queued-list');

@@ -144,7 +144,7 @@ fn queued_messages_run_in_order_once_and_preserve_acceptance_time() {
 }
 
 #[test]
-fn cancellation_clears_followups_and_queue_limits_leave_requests_retryable() {
+fn cancellation_preserves_followups_and_queue_limits_leave_requests_retryable() {
     let (app, mut work) = app();
     app.accept(action_request()).unwrap();
     let current = work.try_recv().unwrap();
@@ -165,16 +165,27 @@ fn cancellation_clears_followups_and_queue_limits_leave_requests_retryable() {
     );
     app.cancel("session").unwrap();
     assert!(current.cancel.is_cancelled());
-    assert!(app.live.lock().unwrap().snapshot.queued.is_empty());
+    assert_eq!(
+        app.live.lock().unwrap().snapshot.queued.len(),
+        MAX_QUEUED_MESSAGES
+    );
     assert!(matches!(
         app.accept(overflow.clone()),
         Err(Error::Conflict(_))
     ));
     app.start_next(&mut app.live.lock().unwrap()).unwrap();
-    app.live.lock().unwrap().snapshot.status = "Ready".into();
-    assert!(work.try_recv().is_err());
+    let next = work.try_recv().unwrap();
+    assert!(!next.cancel.is_cancelled());
+    assert_eq!(
+        app.live.lock().unwrap().snapshot.queued.len(),
+        MAX_QUEUED_MESSAGES - 1
+    );
     app.accept(overflow).unwrap();
-    assert!(work.try_recv().is_ok());
+    assert!(work.try_recv().is_err());
+    assert_eq!(
+        app.live.lock().unwrap().snapshot.queued.len(),
+        MAX_QUEUED_MESSAGES
+    );
 }
 
 #[test]

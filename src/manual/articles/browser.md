@@ -51,11 +51,14 @@ an image using the CLI's attachment rules and limits. Image paths with spaces
 are not supported as attachments.
 
 During a turn, **Queue** accepts follow-up messages in submission order. The
-composer shows pending messages; each starts a separate turn after the previous
-one finishes. Up to 20 messages can wait per session, shared across its tabs and
-preserved when a tab refreshes or closes. **Cancel run & queue** cancels the
-current turn and discards its pending messages. Queues live in the running server
-and are not restored after a server restart. A rejected submission keeps its draft.
+composer shows pending messages. They join the next model request after the
+current tool batch finishes, alongside its recorded results; if no tools are
+running, they are sent when the current response finishes. Up to 20 messages
+can wait per session, shared across its tabs and preserved when a tab refreshes
+or closes. **Cancel & send queued** stops the current run, records cancelled
+tool results, and sends the pending messages with a fresh cancellation token.
+Queues live in the running server and are not restored after a server restart.
+A rejected submission keeps its draft.
 
 The page heading and browser tab title follow the session title, including the
 first-message title and agent renames during a running turn.
@@ -106,6 +109,15 @@ running on the server. **Compact** creates a successor thread without changing
 the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
 in the input; `/resume` navigates only the current tab. Other CLI slash commands
 are not available in this frontend.
+
+Automatic compaction is enabled per model with `auto_compact_at`, a fraction of
+its context window (for example, `0.8`). Without this setting it is disabled.
+When the threshold is reached, the runner settles pending tools, saves a summary
+in a successor thread, and continues the task automatically. Queued follow-ups
+join that continued context. Manual **Compact** finishes after creating the
+thread and waits for your next message. Failed or ineffective automatic compaction
+shows a warning and disables further attempts until manual compaction or a session
+change; cancellation preserves the source thread.
 
 ## Running and resuming
 
