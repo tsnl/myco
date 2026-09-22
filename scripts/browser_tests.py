@@ -52,7 +52,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1]
@@ -60,6 +60,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
         fixture.turns[prompt] = count + 1
         name = "Alpha" if "Alpha" in prompt else "Beta"
         root = fixture.home
+        if "fail" in prompt:
+            self.send_error(400, "Fixture model failure")
+            return
         if count == 1 and "rename" in prompt:
             release = shlex.quote(str(root / (name + "-rename-release")))
             events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done", "timeout_ms": 60000})
@@ -87,6 +90,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
                            "timeout_ms": 60000})
         elif "stream" in prompt:
             events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
+        elif "generate" in prompt:
+            events = reply(f"{name} finished.")
         else:
             events = reply("# Heading\n\n**Bold** and _emphasis_.\n\n"
                            "| Name | Value |\n| --- | --- |\n| Tool | Ready |\n\n"
@@ -99,6 +104,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
+            if "generate" in prompt:
+                fixture.generation_releases[name].wait(30)
             for event in events:
                 self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
                 self.wfile.flush()
@@ -136,6 +143,8 @@ class BrowserTests(unittest.TestCase):
         provider.fixture = self
         self.addCleanup(provider.server_close)
         self.addCleanup(provider.shutdown)
+        self.generation_releases = {name: threading.Event() for name in ['Alpha', 'Beta']}
+        self.addCleanup(lambda: [gate.set() for gate in self.generation_releases.values()])
         threading.Thread(target=provider.serve_forever, daemon=True).start()
         (self.home / "config.toml").write_text('model = "first"\n' + "".join(f'''
 [models.{name}]
@@ -208,6 +217,121 @@ context_window = 100000
         page.fill("#prompt", text)
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
+
+    def browser_status(self, browser, session):
+        path = urlsplit(session.url).path
+        return browser.locator(f'#session-list a[href="{path}"] .session-status')
+
+    def pause_browser_polling(self, browser):
+        expect(browser.locator('#connection')).to_have_text('Live')
+        browser.clock.install()
+        browser.clock.pause_at(browser.evaluate('Date.now() / 1000 + 1'))
+
+    def test_activity_is_live_before_first_output_and_isolated_between_sessions(self):
+        home = self.page
+        alpha, beta = self.session(), self.session()
+        alpha_status, beta_status = self.browser_status(home, alpha), self.browser_status(home, beta)
+        expect(alpha_status).to_have_text('Ready')
+        expect(beta_status).to_have_text('Ready')
+        self.pause_browser_polling(home)
+        for page, status, name in [(alpha, alpha_status, 'Alpha'), (beta, beta_status, 'Beta')]:
+            self.submit(page, f'{name} generate')
+            expect(page.locator('#connection')).to_have_text('Running')
+            expect(page.locator('#connection')).to_have_attribute('data-busy', 'true')
+            expect(status).to_have_text('Running', timeout=2000)
+            expect(status).to_have_attribute('data-busy', 'true')
+            expect(page.locator('.assistant, .tool')).to_have_count(0)
+        self.assertEqual(alpha.locator('#connection').evaluate("n => getComputedStyle(n, '::before').animationName"), 'activity-pulse')
+        alpha.emulate_media(reduced_motion='reduce')
+        self.assertEqual(alpha.locator('#connection').evaluate("n => getComputedStyle(n, '::before').animationName"), 'none')
+        alpha.emulate_media(reduced_motion='no-preference')
+        alpha.screenshot(path=str(self.artifacts / 'session-running.png'))
+        home.screenshot(path=str(self.artifacts / 'sessions-running.png'))
+        self.generation_releases['Alpha'].set()
+        expect(alpha.locator('#connection')).to_have_text('Ready')
+        expect(alpha_status).to_have_text('Ready', timeout=2000)
+        expect(alpha_status).to_have_attribute('data-busy', 'false')
+        expect(beta_status).to_have_text('Running')
+        beta.click('#cancel')
+        expect(beta.locator('#connection')).to_have_attribute('data-busy', 'false')
+        expect(beta_status).to_have_attribute('data-busy', 'false', timeout=2000)
+
+    def test_background_tasks_do_not_look_like_running_generation(self):
+        home, page = self.page, self.session()
+        status = self.browser_status(home, page)
+        self.pause_browser_polling(home)
+        self.submit(page, 'Alpha shell')
+        for indicator in [page.locator('#connection'), status]:
+            expect(indicator).to_have_text('Background tasks')
+            expect(indicator).to_have_attribute('data-state', 'background')
+            expect(indicator).to_have_attribute('data-busy', 'false')
+            self.assertEqual(indicator.evaluate("n => getComputedStyle(n, '::before').animationName"), 'none')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        for indicator in [page.locator('#connection'), status]:
+            expect(indicator).to_have_text('Running')
+            expect(indicator).to_have_attribute('data-busy', 'true')
+        page.click('#cancel')
+        for indicator in [page.locator('#connection'), status]:
+            expect(indicator).to_have_text('Background tasks')
+            expect(indicator).to_have_attribute('data-busy', 'false')
+
+    def test_disconnected_activity_is_unknown_and_recovers_without_rerunning(self):
+        home, page = self.page, self.session()
+        status = self.browser_status(home, page)
+        self.pause_browser_polling(home)
+        self.submit(page, 'Alpha generate')
+        expect(status).to_have_attribute('data-busy', 'true')
+        self.stop(self.process)
+        for indicator in [page.locator('#connection'), home.locator('#connection'), status]:
+            expect(indicator).to_have_text('Reconnecting…')
+            expect(indicator).to_have_attribute('data-busy', 'false')
+        self.generation_releases['Alpha'].set()
+        self.process, _launch = self.launch(port=urlsplit(self.origin).port)
+        expect(home.locator('#connection')).to_have_text('Live', timeout=15000)
+        expect(page.locator('#connection')).to_have_text('Ready', timeout=15000)
+        expect(status).to_have_text('Ready')
+        expect(status).to_have_attribute('data-busy', 'false')
+        self.assertEqual(len(self.requests), 1)
+
+    def test_failed_generation_stops_both_activity_indicators(self):
+        home, page = self.page, self.session()
+        status = self.browser_status(home, page)
+        self.pause_browser_polling(home)
+        self.submit(page, 'Alpha fail')
+        for indicator in [page.locator('#connection'), status]:
+            expect(indicator).to_have_text('Stopped')
+            expect(indicator).to_have_attribute('data-busy', 'false')
+            expect(indicator).to_have_attribute('data-state', 'attention')
+
+    def test_completion_during_a_slow_browser_refresh_is_not_lost(self):
+        home, page = self.page, self.session()
+        status = self.browser_status(home, page)
+        self.pause_browser_polling(home)
+        self.submit(page, 'Alpha wait')
+        expect(status).to_have_attribute('data-busy', 'true')
+        held = []
+        intercepted = False
+        def hold_once(route):
+            nonlocal intercepted
+            if intercepted:
+                route.continue_()
+            else:
+                intercepted = True
+                held.append((route, route.fetch()))
+        home.route('**/api/sessions?archived=false', hold_once)
+        home.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        deadline = time.monotonic() + 5
+        while not held and time.monotonic() < deadline:
+            home.wait_for_timeout(10)
+        self.assertEqual(len(held), 1)
+        route, response = held.pop()
+        self.assertTrue(response.json()[0]['busy'])
+        page.click('#cancel')
+        expect(page.locator('#connection')).to_have_attribute('data-busy', 'false')
+        home.wait_for_timeout(100)
+        route.fulfill(response=response)
+        expect(status).to_have_attribute('data-busy', 'false', timeout=2000)
 
     def test_new_opens_an_independent_tab_and_preserves_the_running_session_and_draft(self):
         with self.context.expect_page() as opened:

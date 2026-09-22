@@ -7,6 +7,11 @@ function connection(connected) {
   for (const client of clients) client.port.postMessage({ kind: 'connection', connected });
 }
 async function load(client) {
+  if (client.list) {
+    client.port.postMessage({ kind: 'sessions_changed' });
+    client.port.postMessage({ kind: 'connection', connected: stream.readyState === EventSource.OPEN });
+    return;
+  }
   if (!client.requested) return;
   const version = ++client.version;
   client.pending = [];
@@ -33,19 +38,21 @@ function openStream() {
   stream.onopen = () => { for (const client of clients) load(client); };
   stream.onerror = () => {
     connection(false);
-    // Authentication changes after a server restart. Retry once the launch URL signs in again.
+    // Some failures close EventSource instead of scheduling its normal reconnect.
     if (stream.readyState === EventSource.CLOSED) retry = setTimeout(openStream, 2000);
   };
   stream.onmessage = ({ data }) => {
     const update = JSON.parse(data);
     for (const client of clients) {
-      if (client.pending) client.pending.push(update);
+      if (client.list) {
+        if (['snapshot', 'meta', 'tasks'].includes(update.change.kind)) client.port.postMessage({ kind: 'sessions_changed' });
+      } else if (client.pending) client.pending.push(update);
       else if (client.id === update.session_id) client.port.postMessage({ kind: 'update', update });
     }
   };
 }
 onconnect = ({ ports: [port] }) => {
-  const client = { port, id: null, requested: null, pending: [], version: 0 };
+  const client = { port, id: null, requested: null, list: false, pending: [], version: 0 };
   clients.add(client);
   if (!stream) openStream();
   port.onmessage = ({ data }) => {
@@ -54,7 +61,9 @@ onconnect = ({ ports: [port] }) => {
       if (!clients.size) { clearTimeout(retry); stream.close(); stream = null; }
       return;
     }
-    if (data.kind !== 'subscribe') return;
+    if (!['subscribe', 'subscribe_list'].includes(data.kind)) return;
+    client.list = data.kind === 'subscribe_list';
+    if (client.list) client.pending = null;
     client.requested = data.session_id;
     load(client);
   };
