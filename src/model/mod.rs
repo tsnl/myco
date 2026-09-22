@@ -56,6 +56,10 @@ impl FusedStream for Generation<'_> {
     }
 }
 
+//
+// Requests and messages
+//
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Request {
     pub model: String,
@@ -110,6 +114,10 @@ pub enum ContentPart {
     ToolCall(ToolCall),
 }
 
+//
+// Completion
+//
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finish {
     Stop,
@@ -127,6 +135,10 @@ pub struct Usage {
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
 }
+
+//
+// Events
+//
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaKind {
@@ -160,6 +172,10 @@ pub enum Event {
         usage: Usage,
     },
 }
+
+//
+// Errors
+//
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

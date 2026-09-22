@@ -8,6 +8,10 @@ use super::{
     ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
 };
 
+//
+// Backend
+//
+
 pub(super) struct Backend {
     transport: Transport,
 }
@@ -33,6 +37,10 @@ impl Driver for Backend {
             })
     }
 }
+
+//
+// Request encoding
+//
 
 fn encode_request(request: &Request) -> Result<Value, Error> {
     let mut body = json!({"model": request.model, "messages": messages(&request.messages)?,
@@ -150,6 +158,10 @@ fn tool(tool: &Tool) -> Value {
     json!({"name": tool.name, "description": tool.description, "input_schema": tool.parameters})
 }
 
+//
+// Response decoding
+//
+
 pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
     if field(body, "type")? != "message" {
         return Err(Error::Protocol("expected an Anthropic message".into()));
@@ -228,6 +240,10 @@ fn input_tokens(
         })
         .transpose()
 }
+
+//
+// Streaming
+//
 
 #[derive(Default)]
 struct Accumulator {
@@ -382,6 +398,10 @@ fn update_usage(message: &mut Value, usage: &Value) -> Result<(), Error> {
         .extend(usage.clone());
     Ok(())
 }
+
+//
+// Content blocks
+//
 
 struct Block {
     value: Value,

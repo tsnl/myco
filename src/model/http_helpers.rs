@@ -12,6 +12,10 @@ use serde_json::Value;
 use super::backend_helpers::{Decoded, EventStream, Protocol, completed};
 use super::{Error, Event};
 
+//
+// Transport
+//
+
 pub(super) struct Transport {
     client: Client,
     endpoint: Url,
@@ -190,6 +194,10 @@ impl Events {
 fn decode_frame(frame: &str) -> Result<Value, Error> {
     serde_json::from_str(frame).map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))
 }
+
+//
+// SSE
+//
 
 // EOF does not complete an unterminated SSE event.
 #[derive(Default)]

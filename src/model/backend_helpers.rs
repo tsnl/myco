@@ -12,6 +12,10 @@ use super::{
     Usage, anthropic_backend, openai_responses_backend,
 };
 
+//
+// Driver
+//
+
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
 
 pub(super) trait Driver: Send + Sync {
@@ -46,6 +50,10 @@ pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
         }
     })
 }
+
+//
+// Generation
+//
 
 pub(super) fn generate(driver: &dyn Driver, request: Request) -> Result<Generation<'_>, Error> {
     validate(&request)?;
@@ -87,6 +95,10 @@ pub(super) fn completed(protocol: Protocol, body: &Value) -> Result<Event, Error
         usage: completion.usage,
     })
 }
+
+//
+// Validation
+//
 
 fn validate_call_ids(output: &[ContentPart]) -> Result<(), Error> {
     let mut calls = HashSet::new();
@@ -208,6 +220,10 @@ impl<'a> History<'a> {
     }
 }
 
+//
+// Driver options
+//
+
 fn apply_options(body: &mut Value, request: &Request) -> Result<(), Error> {
     for (name, value) in &request.driver_options {
         if managed_field(name) {
@@ -239,6 +255,10 @@ fn managed_field(name: &str) -> bool {
             | "background"
     )
 }
+
+//
+// JSON fields
+//
 
 pub(super) fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str, Error> {
     value

@@ -8,6 +8,10 @@ use super::{
     ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
 };
 
+//
+// Backend
+//
+
 pub(super) struct Backend {
     transport: Transport,
 }
@@ -30,6 +34,10 @@ impl Driver for Backend {
             .generate(Protocol::OpenAiResponses, body, decode_event)
     }
 }
+
+//
+// Request encoding
+//
 
 fn encode_request(request: &Request) -> Result<Value, Error> {
     let input = request
@@ -101,6 +109,10 @@ fn tool(tool: &Tool) -> Value {
     json!({"type": "function", "name": tool.name, "description": tool.description,
         "parameters": tool.parameters, "strict": false})
 }
+
+//
+// Response decoding
+//
 
 pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
     let status = field(body, "status")?;
@@ -219,6 +231,10 @@ fn usage(body: &Value) -> Usage {
         cache_write_tokens: None,
     }
 }
+
+//
+// Streaming
+//
 
 fn decode_event(event: &Value) -> Result<Decoded, Error> {
     match field(event, "type")? {
