@@ -252,7 +252,7 @@ pub fn history_events(messages: &[Message], palette: Palette) -> Vec<TuiEvent> {
 
 pub fn turn_header(role: &str, time: Option<chrono::DateTime<chrono::Utc>>) -> String {
     format!(
-        "{role} · {}",
+        "{role}\n{}",
         time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "unknown".into())
     )
@@ -515,12 +515,10 @@ mod tests {
         let rendered = render_history(&tool_loop(), Palette::plain());
 
         assert!(rendered.contains(&user_rule(None)));
-        assert!(rendered.contains("USER · unknown\n\nhello\n"));
+        assert!(rendered.contains("USER\nunknown\n\nhello\n"));
         assert!(!rendered.contains("> hello"));
         // Tools live inside ASSISTANT (no TOOL header). One ASSISTANT open per turn.
-        assert!(rendered.contains(&format!(
-            "{SECTION_RULE}\nASSISTANT · unknown\n\nhi there\n"
-        )));
+        assert!(rendered.contains(&format!("{SECTION_RULE}\nASSISTANT\nunknown\n\nhi there\n")));
         assert!(!rendered.contains("TOOL\n"));
         assert!(!rendered.contains("RESPONSE\n"));
         // Tool commands are ASSISTANT paragraphs, separated from text.
@@ -532,7 +530,7 @@ mod tests {
         assert!(!rendered.contains("t1"));
         // Multi-step assistant messages (tool loop) stay in one ASSISTANT section.
         assert!(rendered.contains("done\n"));
-        assert_eq!(rendered.matches("ASSISTANT · unknown\n").count(), 1);
+        assert_eq!(rendered.matches("ASSISTANT\nunknown\n").count(), 1);
     }
 
     #[test]
@@ -565,7 +563,7 @@ mod tests {
         assert!(!rendered.contains("TOOL\n"));
         // Thinking replayed as an ASSISTANT paragraph (same prefix as live UI).
         assert!(rendered.contains(&format!(
-            "{SECTION_RULE}\nASSISTANT · unknown\n\nThinking: step a\nstep b\n"
+            "{SECTION_RULE}\nASSISTANT\nunknown\n\nThinking: step a\nstep b\n"
         )));
         assert!(rendered.contains("Thinking: step a\nstep b\n\nanswer\n"));
         // Tools are paragraphs inside ASSISTANT, blank-separated.
@@ -573,7 +571,7 @@ mod tests {
         assert!(rendered.contains("\"command\": \"echo 1\""));
         assert!(rendered.contains("├─ bash "));
         assert!(rendered.contains("\"command\": \"echo 2\""));
-        assert_eq!(rendered.matches("ASSISTANT · unknown\n").count(), 1);
+        assert_eq!(rendered.matches("ASSISTANT\nunknown\n").count(), 1);
         assert!(!rendered.contains("* "));
         assert!(!rendered.contains("+ Tool:"));
         assert!(!rendered.contains("[Tool]"));
@@ -891,7 +889,7 @@ mod tests {
         assert!(rendered.contains("human request"));
         assert!(!rendered.contains("runtime notice"));
         assert!(!rendered.contains("private inventory"));
-        assert_eq!(rendered.matches("USER · unknown\n").count(), 1);
+        assert_eq!(rendered.matches("USER\nunknown\n").count(), 1);
         assert!(!rendered.contains("Accepted:"));
     }
 
@@ -917,7 +915,7 @@ mod tests {
             rendered.contains("Thinking: secret-thought-aaa\n\nThinking: secret-thought-bbb\n")
         );
         assert!(rendered.contains("Thinking: secret-thought-bbb\n\ndone\n"));
-        assert!(rendered.contains("ASSISTANT · unknown\n"));
+        assert!(rendered.contains("ASSISTANT\nunknown\n"));
     }
 
     #[test]
@@ -939,9 +937,9 @@ mod tests {
         let rendered = render_history(&tool_loop(), palette);
 
         // Headers and rules are wrapped in SGR sequences…
-        assert!(rendered.contains("\x1b[0;1;36mUSER · unknown\x1b[0m\n"));
+        assert!(rendered.contains("\x1b[0;1;36mUSER\nunknown\x1b[0m\n"));
         assert!(rendered.contains(&format!("\x1b[0;1;36m{}\x1b[0m\n", user_rule(None))));
-        assert!(rendered.contains("\x1b[0;1;32mASSISTANT · unknown\x1b[0m\n"));
+        assert!(rendered.contains("\x1b[0;1;32mASSISTANT\nunknown\x1b[0m\n"));
         // …while message bodies stay plain.
         assert!(rendered.contains("\nhello\n"));
         assert!(rendered.contains("\nhi there\n"));

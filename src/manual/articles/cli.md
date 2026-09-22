@@ -34,11 +34,11 @@ plain Enter, so it submits the message. If the user reports this, tell them to
 use Alt-Enter or Ctrl-J instead. (Shift-Enter works only on the Windows console,
 which reports key modifiers.)
 
-Accepted user turns carry a persisted UTC acceptance time in their ASSISTANT
-banner, for example `ASSISTANT · 2026-09-21T22:00:00Z`. Replay also puts that time
-in the corresponding USER banner. The live USER prompt appears before submission;
-the timestamped ASSISTANT banner opens when the input is accepted. Older human turns have unknown
-timestamps; their creation time is not substituted. Runtime context (session
+USER and ASSISTANT banners put their UTC timestamp on the line immediately below
+the header. A live USER prompt shows when it opened; the ASSISTANT timestamp is
+the persisted acceptance time. Replay puts that saved acceptance time below both
+headers. Older human turns show `unknown`; their creation time is not substituted.
+Runtime context (session
 identity, compaction summaries, and automatic continuation instructions) is
 stored as system parts. The model receives their text, but transcript replay
 omits them and they do not count as human submissions.

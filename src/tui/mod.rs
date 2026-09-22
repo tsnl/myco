@@ -577,7 +577,11 @@ impl TuiProducer {
         let events = self.with_state(|st| {
             let mut events = Vec::new();
             styled_line(&mut events, Style::USER, &user_rule(st.wrap));
-            styled_line(&mut events, Style::USER, &user_header_line(used, max));
+            styled_line(
+                &mut events,
+                Style::USER,
+                &transcript::turn_header(&user_header_line(used, max), Some(chrono::Utc::now())),
+            );
             if let Some(u) = usage {
                 styled_line(&mut events, Style::USER, &usage_line(u));
             }
@@ -1096,7 +1100,7 @@ mod tests {
         ));
         for output in [live, replay] {
             assert!(
-                output.contains("ASSISTANT · 2026-09-21T22:00:00Z\n"),
+                output.contains("ASSISTANT\n2026-09-21T22:00:00Z\n"),
                 "{output}"
             );
             assert!(!output.contains("Accepted:"));
@@ -1317,9 +1321,12 @@ mod tests {
         let events = terminal.events();
 
         let rule = "═".repeat(24);
+        let plain = encode_plain(&events);
+        let timestamp = plain.lines().nth(2).unwrap();
+        chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
         let expected = format!(
             "\x1b[0;1;36m{rule}\x1b[0m\n\
-             \x1b[0;1;36mUSER 10/200 (5%)\x1b[0m\n\
+             \x1b[0;1;36mUSER 10/200 (5%)\n{timestamp}\x1b[0m\n\
              \x1b[0;1;36m⚙ last turn: input 10 (8 cached) · output 3\x1b[0m\n\
              \x1b[0;1;36m● bash: sleep 99 (up 3s)\x1b[0m\n\n"
         );
@@ -1400,14 +1407,14 @@ mod tests {
         text(&producer, " two");
         finish(&producer);
         let plain = encode_plain(&terminal.events());
-        assert_eq!(plain.matches("ASSISTANT · unknown\n").count(), 1);
+        assert_eq!(plain.matches("ASSISTANT\nunknown\n").count(), 1);
         assert!(plain.contains("one two\n"));
         // Next user turn reopens the section.
         producer.user_header(Some(0), 1, None, &[]);
         text(&producer, "three");
         finish(&producer);
         let plain = encode_plain(&terminal.events());
-        assert_eq!(plain.matches("ASSISTANT · unknown\n").count(), 2);
+        assert_eq!(plain.matches("ASSISTANT\nunknown\n").count(), 2);
     }
 
     #[test]
@@ -1421,7 +1428,7 @@ mod tests {
         let plain = encode_plain(&terminal.events());
         // One ASSISTANT section: thinking line, blank line, answer text.
         assert!(
-            plain.contains("ASSISTANT · unknown\n\nThinking: plan it\n\ndone\n"),
+            plain.contains("ASSISTANT\nunknown\n\nThinking: plan it\n\ndone\n"),
             "{plain:?}"
         );
         // The thinking line is dim on the terminal and closed before the answer.
@@ -1573,7 +1580,7 @@ mod tests {
         }]);
         assert!(mirror.events().is_empty());
         let plain = encode_plain(&terminal.events());
-        assert!(plain.contains("USER · unknown\n\nhello\n"), "{plain:?}");
+        assert!(plain.contains("USER\nunknown\n\nhello\n"), "{plain:?}");
     }
 
     #[test]

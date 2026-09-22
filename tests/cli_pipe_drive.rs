@@ -600,7 +600,7 @@ async fn verbose_redraws_saved_tool_output_without_reexecuting_tools_or_model_re
     assert!(stdout.contains("verbose: on"), "{stdout}");
     assert!(stdout.contains("verbose: off"), "{stdout}");
     assert_eq!(stdout.matches("output-12").count(), 1, "{stdout}");
-    assert_eq!(stdout.matches("ASSISTANT ·").count(), 3, "{stdout}");
+    assert_eq!(stdout.matches("ASSISTANT\n").count(), 3, "{stdout}");
     assert_eq!(stdout.matches("… /verbose").count(), 2, "{stdout}");
     assert!(!stdout.contains('\x1b'), "{stdout}");
     assert_eq!(server.connections(), 2);
