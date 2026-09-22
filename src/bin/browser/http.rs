@@ -125,6 +125,11 @@ pub(super) fn router(server: Arc<Server>) -> Router {
             include_str!("assets/clouds.js"),
         ),
         (
+            "/cloud-renderer.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/cloud-renderer.js"),
+        ),
+        (
             "/sky-settings.js",
             "text/javascript; charset=utf-8",
             include_str!("assets/sky-settings.js"),

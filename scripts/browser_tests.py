@@ -220,6 +220,7 @@ context_window = 100000
             {"name": "London", "admin1": "England", "country": "United Kingdom", "latitude": 51.5085, "longitude": -0.1257}]}))
         page.reload()
         expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
         self.assertEqual(calls, [], "Illustrated skies must not request a location or weather")
         page.emulate_media(reduced_motion="reduce")
         page.click("#sky-toggle")
@@ -231,8 +232,8 @@ context_window = 100000
         self.assertIn("latitude=51.51&longitude=-0.13", calls[-1])
         for layer, cover in [("high", "90"), ("mid", "65"), ("low", "0")]:
             expect(page.locator(f".cloud-{layer}")).to_have_attribute("data-cover", cover)
-        self.assertTrue(page.locator(".cloud-low .pixel-cloud").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).opacity === '0')"))
-        self.assertTrue(page.locator(".cloud-high .pixel-cloud").evaluate_all("nodes => nodes.some(n => getComputedStyle(n).opacity === '1')"))
+        self.assertTrue(page.locator(".cloud-low .cloud-sprite").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).opacity === '0')"))
+        self.assertTrue(page.locator(".cloud-high .cloud-sprite").evaluate_all("nodes => nodes.some(n => getComputedStyle(n).opacity === '1')"))
         page.press("#sky-city", "Escape")
         self.session(page)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
@@ -294,7 +295,7 @@ context_window = 100000
     def test_sky_endpoints_require_authentication_and_validate_input(self):
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js"]:
+            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401)
         finally:
             anonymous.dispose()
@@ -322,6 +323,16 @@ context_window = 100000
         after = tracks.evaluate_all("nodes => nodes.map(n => n.getBoundingClientRect().x)")
         for start, end in zip(before, after):
             self.assertLess(abs(end - start), 2, "Weather updates must not jump drifting clouds")
+
+    def test_sky_renderer_failure_keeps_the_fallback_and_conversation_usable(self):
+        self.context.route("**/cloud-renderer.js", lambda route: route.fulfill(status=503, body="Unavailable"))
+        page = self.page
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "fallback")
+        self.session(page)
+        self.submit(page, "Alpha markdown")
+        expect(page.locator(".assistant .markdown table")).to_be_visible()
+        expect(page.locator("#model")).to_be_enabled()
 
     def test_refresh_keeps_transcript_nodes_and_expanded_tools(self):
         page = self.session(self.page)

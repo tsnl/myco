@@ -1,79 +1,78 @@
-// Pixel silhouettes are generated once. CSS moves the finished layers; there
-// is no animation loop, canvas repaint, or image/service dependency.
-const NS = 'http://www.w3.org/2000/svg';
-const WIDTH = 176, HEIGHT = 88;
+// Density and lighting textures are generated once in a worker. CSS handles
+// drifting; only changes to the sky palette repaint the finished clouds.
 const LAYERS = [
-  { name: 'high', altitude: '8+', count: 8, top: 9, spread: 22, width: 470, height: 110, duration: 6800 },
-  { name: 'mid', altitude: '3–8', count: 8, top: 33, spread: 24, width: 470, height: 205, duration: 5100 },
-  { name: 'low', altitude: '0–3', count: 8, top: 62, spread: 23, width: 620, height: 310, duration: 3700 },
+  { name: 'high', altitude: '8+', count: 8, top: 9, spread: 22, width: 680, height: 135, resolution: 128, duration: 6800 },
+  { name: 'mid', altitude: '3–8', count: 8, top: 33, spread: 24, width: 650, height: 220, resolution: 192, duration: 5100 },
+  { name: 'low', altitude: '0–3', count: 8, top: 62, spread: 23, width: 740, height: 350, resolution: 288, duration: 3700 },
 ];
 
 function random(seed) {
   return () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
 }
 
-function lobes(kind, roll) {
-  if (kind === 'high') {
-    return Array.from({ length: 7 }, (_, i) => ({
-      x: 28 + i * 19, y: 55 - i * 4 + roll() * 12,
-      rx: 21 + roll() * 22, ry: 4 + roll() * 8, depth: 0.5,
-    }));
+const textures = new Map();
+let worker, currentPalette, generation = 0;
+
+function fallback(canvas, seed) {
+  const context = canvas.getContext('2d'), roll = random(seed);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  for (let i = 0; i < 9; i++) {
+    const x = canvas.width * (0.12 + i * 0.095), y = canvas.height * (0.45 + roll() * 0.18);
+    const radius = canvas.height * (0.23 + roll() * 0.12);
+    const glow = context.createRadialGradient(x, y, radius * 0.12, x, y, radius);
+    const color = currentPalette[3 + i % 3].join(' ');
+    glow.addColorStop(0, `rgb(${color} / .75)`);
+    glow.addColorStop(0.55, `rgb(${color} / .5)`);
+    glow.addColorStop(1, `rgb(${color} / 0)`);
+    context.fillStyle = glow;
+    context.fillRect(x - radius, y - radius, radius * 2, radius * 2);
   }
-  const puffs = [{ x: 87, y: 67, rx: 76, ry: 12, depth: 0.55 }];
-  for (let i = 0; i < 6; i++) {
-    const x = 27 + i * 24 + roll() * 8;
-    const rise = Math.sin((i + 1) / 7 * Math.PI);
-    puffs.push({ x, y: 62 - rise * (kind === 'low' ? 31 : 16) + roll() * 12,
-      rx: 18 + roll() * 13, ry: 11 + rise * (kind === 'low' ? 22 : 12) + roll() * 7, depth: 0.7 + roll() * 0.4 });
-  }
-  return puffs;
 }
 
-function pixel(x, y, puffs, kind, roll) {
-  let weight = 0, illumination = 0, depth = 0;
-  for (const puff of puffs) {
-    const dx = (x - puff.x) / puff.rx, dy = (y - puff.y) / puff.ry;
-    const z = Math.sqrt(Math.max(0, 1 - dx * dx - dy * dy));
-    const contribution = z ** 4 * puff.depth;
-    illumination += contribution * (-dx * 0.15 - dy * 0.3 + z * 0.3);
-    weight += contribution;
-    depth = Math.max(depth, z * puff.depth);
-  }
-  if (!weight || depth < 0.1) return -1;
-  // A few broken edge pixels and horizontal wisps soften the block silhouette.
-  const grain = roll();
-  if (depth < 0.23 && grain > depth * 3) return -1;
-  if (kind === 'high' && (grain > 0.96 || (y % 4 === 0 && grain > 0.65))) return -1;
-  const light = illumination / weight + (1 - y / HEIGHT) * 0.45;
-  const underside = Math.max(0, y - 55) / 65;
-  const dither = ((x + y) % 2 ? 1 : -1) * 0.025;
-  return Math.max(0, Math.min(5, Math.floor((light - underside + 0.25 + dither) * 5.5)));
+function renderTextures(sky) {
+  renderFallback();
+  try {
+    worker = new Worker('/cloud-renderer.js', { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      if (data.generation !== generation) return;
+      const texture = textures.get(data.id);
+      const frame = new ImageData(data.pixels, data.width, data.height);
+      for (const canvas of texture.canvases) canvas.getContext('2d').putImageData(frame, 0, 0);
+      texture.ready = true;
+      if ([...textures.values()].every(item => item.ready)) sky.dataset.clouds = 'ready';
+    };
+    worker.onerror = event => { event.preventDefault(); worker?.terminate(); worker = null; sky.dataset.clouds = 'fallback'; };
+    repaint(sky);
+    const pause = () => worker?.postMessage({ paused: document.hidden });
+    document.addEventListener('visibilitychange', pause);
+    pause();
+  } catch { sky.dataset.clouds = 'fallback'; }
 }
 
-function sprite(kind, seed) {
-  const roll = random(seed), puffs = lobes(kind, roll);
-  const paths = Array.from({ length: 6 }, () => '');
-  // Run-length encoded pixel rows keep each cloud to six SVG paths.
-  for (let y = 0; y < HEIGHT; y++) {
-    let previous = -1, start = 0;
-    for (let x = 0; x <= WIDTH; x++) {
-      const tone = x === WIDTH ? -1 : pixel(x, y, puffs, kind, roll);
-      if (tone === previous) continue;
-      if (previous >= 0) paths[previous] += `M${start} ${y}h${x - start}v1H${start}z`;
-      previous = tone; start = x;
+function renderFallback() {
+  const key = JSON.stringify(currentPalette);
+  for (const texture of textures.values()) {
+    if (texture.fallbackPalette === key) continue;
+    const [first, ...copies] = texture.canvases;
+    fallback(first, texture.spec.seed);
+    for (const canvas of copies) {
+      const context = canvas.getContext('2d');
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(first, 0, 0);
     }
+    texture.fallbackPalette = key;
   }
-  const svg = document.createElementNS(NS, 'svg');
-  svg.setAttribute('viewBox', `0 0 ${WIDTH} ${HEIGHT}`);
-  svg.setAttribute('preserveAspectRatio', 'none');
-  svg.setAttribute('focusable', 'false');
-  for (let tone = 0; tone < paths.length; tone++) {
-    const path = document.createElementNS(NS, 'path');
-    path.setAttribute('d', paths[tone]);
-    path.style.fill = `var(--cloud-${tone})`;
-    svg.append(path);
+}
+
+function repaint(sky) {
+  generation++;
+  if (worker) {
+    sky.dataset.clouds = 'painting';
+    for (const texture of textures.values()) texture.ready = false;
+    worker.postMessage({ specs: [...textures.values()].map(item => item.spec), palette: currentPalette, generation });
+  } else {
+    renderFallback();
   }
-  return svg;
 }
 
 function makeLayer(spec, index) {
@@ -86,18 +85,23 @@ function makeLayer(spec, index) {
   const roll = random(943 + index * 379);
   for (let i = 0; i < spec.count; i++) {
     const cloud = document.createElement('div');
-    cloud.className = 'pixel-cloud';
+    cloud.className = 'cloud-sprite';
     cloud.dataset.index = String(i);
     const scale = 0.75 + roll() * 0.5;
     cloud.style.width = `${spec.width * scale}px`;
     cloud.style.height = `${spec.height * scale}px`;
     cloud.style.top = `${spec.top + roll() * spec.spread}%`;
-    cloud.append(sprite(spec.name, 781 + index * 100 + i * 7));
+    const id = `${spec.name}-${i}`;
+    const texture = { spec: { id, kind: spec.name, seed: 781 + index * 100 + i * 7, width: 512, height: spec.resolution }, canvases: [] };
+    textures.set(id, texture);
     // Three copies cover both viewport edges throughout either wind direction.
     const position = (i * 61.803 + index * 23) % 100;
     for (const offset of [-100, 0, 100]) {
       const copy = cloud.cloneNode(true);
       copy.style.left = `${position + offset}%`;
+      const canvas = document.createElement('canvas');
+      canvas.width = texture.spec.width; canvas.height = texture.spec.height;
+      copy.append(canvas); texture.canvases.push(canvas);
       track.append(copy);
     }
   }
@@ -125,13 +129,14 @@ export function createClouds(sky) {
   const layers = LAYERS.map(makeLayer);
   clouds.append(...layers);
   sky.append(clouds);
+  requestAnimationFrame(() => renderTextures(sky));
   return conditions => {
     LAYERS.forEach((spec, index) => {
       const cover = conditions[`cloud_cover_${spec.name}`];
       const layer = layers[index];
       layer.dataset.cover = String(cover);
       drift(layer, spec, conditions);
-      for (const cloud of layer.querySelectorAll('.pixel-cloud')) {
+      for (const cloud of layer.querySelectorAll('.cloud-sprite')) {
         const threshold = Number(cloud.dataset.index) * 100 / spec.count;
         cloud.style.opacity = String(Math.max(0, Math.min(1, (cover - threshold) / 16)));
       }
@@ -141,18 +146,22 @@ export function createClouds(sky) {
   };
 }
 
-const DAY = ['#708aaf', '#92acc5', '#b5ccda', '#d8e3df', '#eef0df', '#fff7e3'];
+const DAY = ['#587491', '#718baa', '#9db2c5', '#cad7e1', '#e9eff1', '#fffcf3'];
 const DUSK = ['#655d91', '#8b709e', '#b98ba8', '#e1aaa9', '#f4c6ad', '#ffdfb9'];
-const NIGHT = ['#1a243e', '#263351', '#354663', '#485b77', '#617693', '#8297ad'];
+const NIGHT = ['#172238', '#263850', '#3a4f6a', '#5b7490', '#849bb0', '#b4c6d5'];
 
 const channels = hex => [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
 const blend = (a, b, weight) => a.map((value, index) => value * (1 - weight) + b[index] * weight);
+currentPalette = DAY.map(channels);
 
 export function colorClouds(sky, altitude, night) {
   const twilight = Math.max(0, 1 - Math.abs(altitude) / 0.35);
-  DAY.forEach((color, index) => {
+  const next = DAY.map((color, index) => {
     const warm = blend(channels(color), channels(DUSK[index]), twilight);
     const tones = blend(warm, channels(NIGHT[index]), night).map(Math.round);
-    sky.style.setProperty(`--cloud-${index}`, `rgb(${tones.join(' ')})`);
+    return tones;
   });
+  if (JSON.stringify(next) === JSON.stringify(currentPalette)) return;
+  currentPalette = next;
+  repaint(sky);
 }

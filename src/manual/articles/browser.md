@@ -17,7 +17,7 @@ server with Ctrl-C in the launching terminal.
 
 The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
-floating controls use background blur. Pixel-art clouds drift slowly in three
+floating controls use background blur. Soft, naturally shaded clouds drift slowly in three
 layers: high wisps near the top, middle clouds below them, and larger low clouds
 near the horizon. Colors follow the sky through daylight, sunset, and night;
 stars twinkle behind the clouds. Reduced-motion settings keep clouds and stars
