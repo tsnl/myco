@@ -8,8 +8,8 @@ use futures_core::Stream;
 use serde_json::Value;
 
 use super::{
-    Config, Delta, Error, Event, Generation, Message, Output, Protocol, ProviderResponse, Request,
-    Response, ToolCall, anthropic_backend, openai_responses_backend,
+    Config, Delta, Error, Event, Finish, Generation, Message, Output, Protocol, ProviderResponse,
+    Request, ToolCall, Usage, anthropic_backend, openai_responses_backend,
 };
 
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
@@ -23,6 +23,12 @@ pub(super) trait Driver: Send + Sync {
 pub(super) enum Decoded {
     Progress(Option<Delta>),
     Completed(Value),
+}
+
+pub(super) struct Completion {
+    pub(super) output: Vec<Output>,
+    pub(super) finish: Finish,
+    pub(super) usage: Usage,
 }
 
 impl Decoded {
@@ -64,38 +70,51 @@ pub(super) fn poll_generation(
     let next = inner.as_mut().poll_next(cx);
     if matches!(
         &next,
-        Poll::Ready(None | Some(Err(_)) | Some(Ok(Event::Completed(_))))
+        Poll::Ready(None | Some(Err(_)) | Some(Ok(Event::Completed { .. })))
     ) {
         generation.inner = None;
     }
     next
 }
 
-pub(super) fn from_provider(protocol: Protocol, body: Value) -> Result<Response, Error> {
-    let mut response = match protocol {
-        Protocol::OpenAiResponses => openai_responses_backend::decode_response(&body)?,
-        Protocol::AnthropicMessages => anthropic_backend::decode_response(&body)?,
-    };
-    response.validate_call_ids()?;
-    response.provider = Some(ProviderResponse { protocol, body });
-    Ok(response)
+pub(super) fn completed(protocol: Protocol, body: Value) -> Result<Event, Error> {
+    let Completion {
+        output,
+        finish,
+        usage,
+    } = decode(protocol, &body)?;
+    Ok(Event::Completed {
+        message: Message::Assistant {
+            output,
+            provider: Some(ProviderResponse { protocol, body }),
+        },
+        finish,
+        usage,
+    })
 }
 
-impl Response {
-    fn validate_call_ids(&self) -> Result<(), Error> {
-        let mut calls = std::collections::HashSet::new();
-        for output in &self.output {
-            if let Output::ToolCall(call) = output
-                && !calls.insert(&call.id)
-            {
-                return Err(Error::Protocol(format!(
-                    "duplicate tool call ID {}",
-                    call.id
-                )));
-            }
+fn decode(protocol: Protocol, body: &Value) -> Result<Completion, Error> {
+    let completion = match protocol {
+        Protocol::OpenAiResponses => openai_responses_backend::decode_response(body)?,
+        Protocol::AnthropicMessages => anthropic_backend::decode_response(body)?,
+    };
+    validate_call_ids(&completion.output)?;
+    Ok(completion)
+}
+
+fn validate_call_ids(output: &[Output]) -> Result<(), Error> {
+    let mut calls = HashSet::new();
+    for output in output {
+        if let Output::ToolCall(call) = output
+            && !calls.insert(&call.id)
+        {
+            return Err(Error::Protocol(format!(
+                "duplicate tool call ID {}",
+                call.id
+            )));
         }
-        Ok(())
     }
+    Ok(())
 }
 
 impl ToolCall {
@@ -166,19 +185,24 @@ struct History<'a> {
 impl<'a> History<'a> {
     fn message(&mut self, message: &'a Message, protocol: Protocol) -> Result<(), Error> {
         match message {
-            Message::Assistant(response) => self.assistant(response, protocol),
+            Message::Assistant { output, provider } => {
+                self.assistant(output, provider.as_ref(), protocol)
+            }
             Message::ToolResult { call_id, .. } => self.result(call_id),
             Message::User(_) => Ok(()),
         }
     }
 
-    fn assistant(&mut self, response: &'a Response, protocol: Protocol) -> Result<(), Error> {
-        if response.provider().is_some_and(|p| p.protocol != protocol) {
-            return Err(Error::InvalidRequest(
-                "assistant continuation belongs to another provider protocol".into(),
-            ));
+    fn assistant(
+        &mut self,
+        output: &'a [Output],
+        provider: Option<&ProviderResponse>,
+        protocol: Protocol,
+    ) -> Result<(), Error> {
+        if let Some(provider) = provider {
+            validate_provider(output, provider, protocol)?;
         }
-        for output in response.output() {
+        for output in output {
             if let Output::ToolCall(call) = output {
                 self.call(call)?;
             }
@@ -206,6 +230,26 @@ impl<'a> History<'a> {
         }
         Ok(())
     }
+}
+
+fn validate_provider(
+    output: &[Output],
+    provider: &ProviderResponse,
+    protocol: Protocol,
+) -> Result<(), Error> {
+    if provider.protocol != protocol {
+        return Err(Error::InvalidRequest(
+            "assistant continuation belongs to another provider protocol".into(),
+        ));
+    }
+    let native = decode(protocol, &provider.body)
+        .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    if native.output != output {
+        return Err(Error::InvalidRequest(
+            "assistant output does not match its provider data; clear provider data when editing output".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn apply_options(body: &mut Value, request: &Request) -> Result<(), Error> {

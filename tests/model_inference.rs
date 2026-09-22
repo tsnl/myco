@@ -5,7 +5,7 @@ use myco::model::{Event, Message, Protocol, Request};
 mod common;
 
 use common::*;
-use myco::model::{DeltaKind, Error, Finish, Output, Response, Tool, ToolCall};
+use myco::model::{DeltaKind, Error, Finish, Output, Tool, ToolCall};
 use serde_json::{Value, json};
 
 #[test]
@@ -16,11 +16,18 @@ fn invalid_input_is_rejected_before_a_stream_is_returned() {
         "test",
     )
     .unwrap();
-    let request = Request::new("", vec![Message::User("hello".into())], 64);
-    assert!(matches!(
-        model.generate(request),
-        Err(Error::InvalidRequest(_))
-    ));
+    for input in [
+        Request::default(),
+        Request {
+            model: String::new(),
+            ..request()
+        },
+    ] {
+        assert!(matches!(
+            model.generate(input),
+            Err(Error::InvalidRequest(_))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -33,7 +40,10 @@ async fn request_capture_precedes_any_network_io() {
     .unwrap();
     let trace = collect(
         &model,
-        Request::new("test-model", vec![Message::User("hello".into())], 64),
+        Request {
+            messages: vec![Message::User("hello".into())],
+            ..request()
+        },
     )
     .await;
     let Event::Request { protocol, body } = &trace.events[0] else {
@@ -62,10 +72,20 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
             Some(Ok(Event::Progress { raw, .. })) if raw == expected));
         assert!(!generation.is_terminated());
     }
-    let Some(Ok(Event::Completed(response))) = generation.next().await else {
+    let Some(Ok(Event::Completed {
+        message,
+        finish,
+        usage,
+    })) = generation.next().await
+    else {
         panic!("missing final response");
     };
-    assert_eq!(response.output(), &[Output::Text("hello".into())]);
+    let Message::Assistant { output, .. } = message else {
+        panic!("completion must contain an assistant message");
+    };
+    assert_eq!(output, [Output::Text("hello".into())]);
+    assert_eq!(finish, Finish::Stop);
+    assert_eq!(usage.input_tokens, None);
     assert!(generation.is_terminated());
     assert!(generation.next().await.is_none());
     assert!(generation.next().await.is_none());
@@ -88,14 +108,18 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
         });
         let trace = collect(&model, initial).await;
         let reply = completed(&trace);
-        assert_eq!(reply.finish(), &Finish::ToolCalls);
-        assert_eq!(reply.usage().output_tokens, Some(9));
-        assert_eq!(
-            reply.output()[0],
-            Output::Reasoning("Checking the note.".into())
-        );
-        assert_eq!(reply.output()[1], Output::Text("Ready 雪".into()));
-        let Output::ToolCall(call) = &reply.output()[2] else {
+        let Message::Assistant {
+            output,
+            provider: Some(native),
+        } = &reply.message
+        else {
+            panic!("missing assistant continuation");
+        };
+        assert_eq!(reply.finish, Finish::ToolCalls);
+        assert_eq!(reply.usage.output_tokens, Some(9));
+        assert_eq!(output[0], Output::Reasoning("Checking the note.".into()));
+        assert_eq!(output[1], Output::Text("Ready 雪".into()));
+        let Output::ToolCall(call) = &output[2] else {
             panic!()
         };
         assert_eq!(call.id, "call_fixture");
@@ -122,14 +146,9 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
         assert!(!body.to_string().contains("test-key"));
         assert!(captured.headers.starts_with("POST /inference HTTP/1.1"));
 
-        let native = reply.provider().unwrap();
-        assert_eq!(
-            Response::from_provider(protocol, native.body.clone()).unwrap(),
-            *reply
-        );
         let mut next = request();
         next.messages.extend([
-            Message::Assistant(reply.clone()),
+            reply.message.clone(),
             Message::User("Continue.".into()),
             Message::ToolResult {
                 call_id: call.id.clone(),
@@ -141,7 +160,7 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
         match protocol {
             Protocol::OpenAiResponses => {
                 assert!(captured.headers.contains("authorization: Bearer test-key"));
-                assert_eq!(reply.usage().input_tokens, Some(12));
+                assert_eq!(reply.usage.input_tokens, Some(12));
                 assert_eq!(body["input"][1], native.body["output"][0]);
                 assert_eq!(body["input"][1]["encrypted_content"], "opaque-reasoning");
                 assert_eq!(body["input"][3]["call_id"], "call_fixture");
@@ -150,7 +169,7 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
             Protocol::AnthropicMessages => {
                 assert!(captured.headers.contains("x-api-key: test-key"));
                 assert!(captured.headers.contains("anthropic-version: 2023-06-01"));
-                assert_eq!(reply.usage().input_tokens, Some(11));
+                assert_eq!(reply.usage.input_tokens, Some(11));
                 assert_eq!(body["messages"][1]["content"], native.body["content"]);
                 assert_eq!(
                     body["messages"][1]["content"][0]["signature"],
@@ -183,9 +202,16 @@ async fn terminal_response_is_authoritative_even_without_text_deltas() {
     )
     .await;
     let reply = completed(&trace);
-    assert_eq!(reply.output(), &[Output::Text("full response".into())]);
-    assert_eq!(reply.usage().input_tokens, None);
-    assert_eq!(reply.provider().unwrap().body, raw);
+    let Message::Assistant {
+        output,
+        provider: Some(native),
+    } = &reply.message
+    else {
+        panic!("missing assistant continuation");
+    };
+    assert_eq!(output, &[Output::Text("full response".into())]);
+    assert_eq!(reply.usage.input_tokens, None);
+    assert_eq!(native.body, raw);
     assert!(trace.events.iter().any(
         |e| matches!(e, Event::Progress { raw, delta: None } if raw["type"] == "future_event")
     ));
@@ -201,7 +227,7 @@ async fn output_limits_and_refusals_are_not_normal_completion() {
         &events(&[json!({"type":"response.incomplete","response":raw})]),
     )
     .await;
-    assert_eq!(completed(&trace).finish(), &Finish::Length);
+    assert_eq!(completed(&trace).finish, Finish::Length);
     let trace = run(
         Protocol::AnthropicMessages,
         &ANTHROPIC.replace(
@@ -210,14 +236,14 @@ async fn output_limits_and_refusals_are_not_normal_completion() {
         ),
     )
     .await;
-    assert_eq!(completed(&trace).finish(), &Finish::Length);
+    assert_eq!(completed(&trace).finish, Finish::Length);
     let raw = json!({"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"Cannot comply"}]}]});
     let trace = run(
         Protocol::OpenAiResponses,
         &events(&[json!({"type":"response.completed","response":raw})]),
     )
     .await;
-    assert_eq!(completed(&trace).finish(), &Finish::Refusal);
+    assert_eq!(completed(&trace).finish, Finish::Refusal);
 }
 
 #[tokio::test]
@@ -328,7 +354,7 @@ async fn malformed_anthropic_sequences_fail_without_a_completed_message() {
 #[tokio::test]
 async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
     let trace = run(Protocol::AnthropicMessages, ANTHROPIC).await;
-    let response = completed(&trace).clone();
+    let message = completed(&trace).message.clone();
     let model = client(
         Protocol::OpenAiResponses,
         "http://127.0.0.1:1/responses",
@@ -336,7 +362,7 @@ async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
     )
     .unwrap();
     let mut input = request();
-    input.messages.push(Message::Assistant(response));
+    input.messages.push(message);
     assert!(matches!(
         model.generate(input.clone()),
         Err(Error::InvalidRequest(_))
@@ -350,6 +376,33 @@ async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
         model.generate(input),
         Err(Error::InvalidRequest(_))
     ));
+}
+
+#[tokio::test]
+async fn edited_assistant_output_cannot_silently_reuse_stale_provider_data() {
+    for (protocol, fixture_body) in [
+        (Protocol::OpenAiResponses, OPENAI),
+        (Protocol::AnthropicMessages, ANTHROPIC),
+    ] {
+        let trace = run(protocol, fixture_body).await;
+        let mut message = completed(&trace).message.clone();
+        let Message::Assistant { output, .. } = &mut message else {
+            panic!("missing assistant message");
+        };
+        output[1] = Output::Text("edited text".into());
+        let mut input = request();
+        input.messages.extend([
+            message,
+            Message::ToolResult {
+                call_id: "call_fixture".into(),
+                output: "note contents".into(),
+                is_error: false,
+            },
+        ]);
+        let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
+        assert!(matches!(model.generate(input),
+            Err(Error::InvalidRequest(error)) if error.contains("does not match")));
+    }
 }
 
 #[tokio::test]
@@ -391,7 +444,7 @@ async fn completion_releases_the_http_request_without_dropping_or_polling_again(
                     .await
                     .expect("missing completion")
                     .unwrap();
-                if matches!(event, Event::Completed(_)) {
+                if matches!(event, Event::Completed { .. }) {
                     break;
                 }
             }
@@ -437,11 +490,19 @@ async fn concurrent_requests(protocol: Protocol) {
         }
     });
     let model = client(protocol, &endpoint, "").unwrap();
-    let a = Request::new("test-model", vec![Message::User("a".into())], 64);
-    let b = Request::new("test-model", vec![Message::User("b".into())], 64);
+    let a = Request {
+        messages: vec![Message::User("a".into())],
+        ..request()
+    };
+    let b = Request {
+        messages: vec![Message::User("b".into())],
+        ..request()
+    };
     let (a, b) = tokio::join!(collect(&model, a), collect(&model, b));
-    assert_eq!(completed(&a).output(), &[Output::Text("a".into())]);
-    assert_eq!(completed(&b).output(), &[Output::Text("b".into())]);
+    assert!(matches!(&completed(&a).message,
+        Message::Assistant { output, .. } if output == &[Output::Text("a".into())]));
+    assert!(matches!(&completed(&b).message,
+        Message::Assistant { output, .. } if output == &[Output::Text("b".into())]));
     server.await.unwrap();
 }
 
@@ -521,19 +582,28 @@ async fn driver_options_are_per_request_and_cannot_replace_context() {
     }
 }
 
-#[test]
-fn visible_reasoning_and_truncated_arguments_remain_observations() {
+#[tokio::test]
+async fn visible_reasoning_and_truncated_arguments_remain_observations() {
     let raw = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[
         {"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"visible reasoning"}]},
         {"type":"function_call","call_id":"c","name":"read","arguments":"{"}
     ]});
-    let reply = Response::from_provider(Protocol::OpenAiResponses, raw).unwrap();
-    assert_eq!(reply.finish(), &Finish::Length);
-    assert_eq!(
-        reply.output()[0],
-        Output::Reasoning("visible reasoning".into())
-    );
-    let Output::ToolCall(call) = &reply.output()[1] else {
+    let trace = run(
+        Protocol::OpenAiResponses,
+        &events(&[json!({"type":"response.incomplete", "response":raw})]),
+    )
+    .await;
+    let reply = completed(&trace);
+    let Message::Assistant {
+        output,
+        provider: Some(native),
+    } = &reply.message
+    else {
+        panic!("missing assistant continuation");
+    };
+    assert_eq!(reply.finish, Finish::Length);
+    assert_eq!(output[0], Output::Reasoning("visible reasoning".into()));
+    let Output::ToolCall(call) = &output[1] else {
         panic!("missing truncated call");
     };
     assert!(
@@ -541,10 +611,7 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
             .as_ref()
             .is_err_and(|error| !error.is_empty())
     );
-    assert_eq!(
-        reply.provider().unwrap().body["output"][1]["arguments"],
-        "{"
-    );
+    assert_eq!(native.body["output"][1]["arguments"], "{");
     let model = client(
         Protocol::OpenAiResponses,
         "http://127.0.0.1:1/responses",
@@ -552,7 +619,7 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
     )
     .unwrap();
     let mut input = request();
-    input.messages.push(Message::Assistant(reply));
+    input.messages.push(reply.message.clone());
     assert!(matches!(
         model.generate(input),
         Err(Error::InvalidRequest(_))
@@ -593,15 +660,14 @@ fn invalid_tool_arguments_cannot_be_used_in_continuation() {
 fn tool_history(arguments: Result<Value, String>) -> Request {
     let mut input = request();
     input.messages.extend([
-        Message::Assistant(Response::new(
-            vec![Output::ToolCall(ToolCall {
+        Message::Assistant {
+            output: vec![Output::ToolCall(ToolCall {
                 id: "call".into(),
                 name: "read".into(),
                 arguments,
             })],
-            Finish::ToolCalls,
-            Default::default(),
-        )),
+            provider: None,
+        },
         Message::ToolResult {
             call_id: "call".into(),
             output: "note contents".into(),
@@ -664,10 +730,11 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
         generation.next().await,
         Some(Ok(Event::Progress { .. }))
     ));
-    let Some(Ok(Event::Completed(response))) = generation.next().await else {
+    let Some(Ok(Event::Completed { message, .. })) = generation.next().await else {
         panic!("lost the resumed response");
     };
-    assert_eq!(response.output(), &[Output::Text("first雪".into())]);
+    assert!(matches!(message,
+        Message::Assistant { output, .. } if output == [Output::Text("first雪".into())]));
     assert!(generation.next().await.is_none());
     server.await.unwrap();
 }

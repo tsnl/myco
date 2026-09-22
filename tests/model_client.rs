@@ -5,7 +5,12 @@ use myco::model::{Config, Error, Event, GenAiClient, Message, Request};
 use tokio::{net::TcpListener, time::timeout};
 
 fn request() -> Request {
-    Request::new("test-model", vec![Message::User("hello".into())], 64)
+    Request {
+        model: "test-model".into(),
+        messages: vec![Message::User("hello".into())],
+        max_output_tokens: 64,
+        ..Default::default()
+    }
 }
 
 fn client(endpoint: String) -> GenAiClient {

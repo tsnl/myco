@@ -1,10 +1,10 @@
 use serde_json::{Map, Value, json};
 
-use super::backend_helpers::{Decoded, Driver, EventStream, array, field, index};
+use super::backend_helpers::{Completion, Decoded, Driver, EventStream, array, field, index};
 use super::http_helpers::Transport;
 use super::{
-    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, Request, Response, Tool, ToolCall,
-    Usage,
+    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, ProviderResponse, Request, Tool,
+    ToolCall, Usage,
 };
 
 pub(super) struct Backend {
@@ -72,7 +72,9 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
 fn content(message: &Message) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
         Message::User(text) => ("user", vec![json!({"type": "text", "text": text})], false),
-        Message::Assistant(response) => ("assistant", assistant(response)?, false),
+        Message::Assistant { output, provider } => {
+            ("assistant", assistant(output, provider.as_ref())?, false)
+        }
         Message::ToolResult {
             call_id,
             output,
@@ -108,11 +110,11 @@ fn merge(message: &mut Value, content: Content) {
     }
 }
 
-fn assistant(response: &Response) -> Result<Vec<Value>, Error> {
-    if let Some(native) = response.provider() {
+fn assistant(outputs: &[Output], provider: Option<&ProviderResponse>) -> Result<Vec<Value>, Error> {
+    if let Some(native) = provider {
         return Ok(array(&native.body, "content")?.clone());
     }
-    response.output().iter().map(output).collect()
+    outputs.iter().map(output).collect()
 }
 
 fn output(output: &Output) -> Result<Value, Error> {
@@ -134,7 +136,7 @@ fn tool(tool: &Tool) -> Value {
     json!({"name": tool.name, "description": tool.description, "input_schema": tool.parameters})
 }
 
-pub(super) fn decode_response(body: &Value) -> Result<Response, Error> {
+pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
     if field(body, "type")? != "message" {
         return Err(Error::Protocol("expected an Anthropic message".into()));
     }
@@ -142,7 +144,11 @@ pub(super) fn decode_response(body: &Value) -> Result<Response, Error> {
         .iter()
         .filter_map(|b| block(b).transpose())
         .collect::<Result<_, _>>()?;
-    Ok(Response::new(output, finish(body)?, usage(&body["usage"])?))
+    Ok(Completion {
+        output,
+        finish: finish(body)?,
+        usage: usage(&body["usage"])?,
+    })
 }
 
 fn finish(body: &Value) -> Result<Finish, Error> {

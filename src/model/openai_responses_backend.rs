@@ -1,10 +1,10 @@
 use serde_json::{Value, json};
 
-use super::backend_helpers::{Decoded, Driver, EventStream, array, field, index};
+use super::backend_helpers::{Completion, Decoded, Driver, EventStream, array, field, index};
 use super::http_helpers::Transport;
 use super::{
-    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, Request, Response, Tool, ToolCall,
-    Usage,
+    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, ProviderResponse, Request, Tool,
+    ToolCall, Usage,
 };
 
 pub(super) struct Backend {
@@ -51,7 +51,7 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
 fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     match message {
         Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant(response) => assistant(response),
+        Message::Assistant { output, provider } => assistant(output, provider.as_ref()),
         Message::ToolResult {
             call_id,
             output,
@@ -60,11 +60,11 @@ fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     }
 }
 
-fn assistant(response: &Response) -> Result<Vec<Value>, Error> {
-    if let Some(native) = response.provider() {
+fn assistant(outputs: &[Output], provider: Option<&ProviderResponse>) -> Result<Vec<Value>, Error> {
+    if let Some(native) = provider {
         return Ok(array(&native.body, "output")?.clone());
     }
-    response.output().iter().map(output).collect()
+    outputs.iter().map(output).collect()
 }
 
 fn output(output: &Output) -> Result<Value, Error> {
@@ -96,14 +96,18 @@ fn tool(tool: &Tool) -> Value {
         "parameters": tool.parameters, "strict": false})
 }
 
-pub(super) fn decode_response(body: &Value) -> Result<Response, Error> {
+pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
     let status = field(body, "status")?;
     if !matches!(status, "completed" | "incomplete") {
         return Err(Error::Provider(body.clone()));
     }
     let output = outputs(body, status == "completed")?;
     let finish = finish(body, &output)?;
-    Ok(Response::new(output, finish, usage(body)))
+    Ok(Completion {
+        output,
+        finish,
+        usage: usage(body),
+    })
 }
 
 fn outputs(body: &Value, complete: bool) -> Result<Vec<Output>, Error> {

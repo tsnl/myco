@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use myco::model::{
-    Config, Error, Event, GenAiClient, Generation, Message, Protocol, Request, Response,
+    Config, Error, Event, Finish, GenAiClient, Generation, Message, Protocol, Request, Usage,
 };
 use serde_json::Value;
 use tokio::{
@@ -105,11 +105,12 @@ pub async fn unfinished_body(body: String) -> (String, tokio::task::JoinHandle<(
 }
 
 pub fn request() -> Request {
-    Request::new(
-        "test-model",
-        vec![Message::User("Read the note".into())],
-        64,
-    )
+    Request {
+        model: "test-model".into(),
+        messages: vec![Message::User("Read the note".into())],
+        max_output_tokens: 64,
+        ..Default::default()
+    }
 }
 
 pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
@@ -124,7 +125,14 @@ pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<GenAiClie
 #[derive(Debug)]
 pub struct Trace {
     pub events: Vec<Event>,
-    pub result: Result<Response, Error>,
+    pub result: Result<Completion, Error>,
+}
+
+#[derive(Debug)]
+pub struct Completion {
+    pub message: Message,
+    pub finish: Finish,
+    pub usage: Usage,
 }
 
 pub async fn collect(client: &GenAiClient, request: Request) -> Trace {
@@ -151,8 +159,17 @@ async fn collect_events(mut generation: Generation<'_>) -> Trace {
         assert!(result.is_none(), "event after terminal outcome");
         match item {
             Ok(event) => {
-                if let Event::Completed(response) = &event {
-                    result = Some(Ok(response.clone()));
+                if let Event::Completed {
+                    message,
+                    finish,
+                    usage,
+                } = &event
+                {
+                    result = Some(Ok(Completion {
+                        message: message.clone(),
+                        finish: finish.clone(),
+                        usage: usage.clone(),
+                    }));
                 }
                 events.push(event);
             }
@@ -171,7 +188,7 @@ pub async fn run(protocol: Protocol, body: &str) -> Trace {
     collect(&client, request()).await
 }
 
-pub fn completed(trace: &Trace) -> &Response {
+pub fn completed(trace: &Trace) -> &Completion {
     trace.result.as_ref().unwrap()
 }
 

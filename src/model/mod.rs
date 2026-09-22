@@ -63,7 +63,7 @@ pub enum Protocol {
     AnthropicMessages,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Request {
     pub model: String,
     pub instructions: String,
@@ -73,23 +73,13 @@ pub struct Request {
     pub driver_options: Map<String, Value>,
 }
 
-impl Request {
-    pub fn new(model: impl Into<String>, messages: Vec<Message>, max_output_tokens: u32) -> Self {
-        Self {
-            model: model.into(),
-            instructions: String::new(),
-            messages,
-            tools: vec![],
-            max_output_tokens,
-            driver_options: Map::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     User(String),
-    Assistant(Response),
+    Assistant {
+        output: Vec<Output>,
+        provider: Option<ProviderResponse>,
+    },
     ToolResult {
         call_id: String,
         output: String,
@@ -138,46 +128,10 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Response {
-    output: Vec<Output>,
-    finish: Finish,
-    usage: Usage,
-    provider: Option<ProviderResponse>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderResponse {
     pub protocol: Protocol,
     /// Native Responses object or assembled Messages object.
     pub body: Value,
-}
-
-impl Response {
-    pub fn new(output: Vec<Output>, finish: Finish, usage: Usage) -> Self {
-        Self {
-            output,
-            finish,
-            usage,
-            provider: None,
-        }
-    }
-
-    pub fn from_provider(protocol: Protocol, body: Value) -> Result<Self, Error> {
-        backend_helpers::from_provider(protocol, body)
-    }
-
-    pub fn output(&self) -> &[Output] {
-        &self.output
-    }
-    pub fn finish(&self) -> &Finish {
-        &self.finish
-    }
-    pub fn usage(&self) -> &Usage {
-        &self.usage
-    }
-    pub fn provider(&self) -> Option<&ProviderResponse> {
-        self.provider.as_ref()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,9 +152,19 @@ pub struct Delta {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    Request { protocol: Protocol, body: Value },
-    Progress { raw: Value, delta: Option<Delta> },
-    Completed(Response),
+    Request {
+        protocol: Protocol,
+        body: Value,
+    },
+    Progress {
+        raw: Value,
+        delta: Option<Delta>,
+    },
+    Completed {
+        message: Message,
+        finish: Finish,
+        usage: Usage,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -14,16 +14,21 @@ let client = GenAiClient::new(Config::OpenAi {
     endpoint: "https://api.openai.com/v1/responses".into(),
     api_key: std::env::var("OPENAI_API_KEY")?,
 })?;
-let request = Request::new(
-    std::env::var("OPENAI_MODEL")?,
-    vec![Message::User("Explain this repository.".into())],
-    1024,
-);
+let mut messages = vec![Message::User("Explain this repository.".into())];
+let request = Request {
+    model: std::env::var("OPENAI_MODEL")?,
+    messages: messages.clone(),
+    max_output_tokens: 1024,
+    ..Default::default()
+};
 let mut generation = client.generate(request)?;
 while let Some(event) = generation.next().await {
     match event? {
         Event::Progress { delta: Some(delta), .. } => print!("{}", delta.text),
-        Event::Completed(response) => println!("\nFinish: {:?}", response.finish()),
+        Event::Completed { message, finish, .. } => {
+            messages.push(message);
+            println!("\nFinish: {finish:?}");
+        }
         _ => {}
     }
 }
@@ -47,9 +52,9 @@ subsequent requests. The `thread` module supplies history operations; each workf
 chooses its context and publication policy. These higher modules are specified in
 [DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
 
-Operation, turn, and attempt IDs belong to the caller. `Completed(Response)`
-is a validated inference outcome, not a persisted turn. Workflow code decides
-whether to accept it and append it to history before reporting a committed turn.
+Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
+assistant message, finish reason, and usage. Workflow code decides whether to
+accept the outcome and persist the message before reporting a committed turn.
 Concurrent calls can produce independent candidates from the same fixed history.
 
 ## Stream contract
@@ -67,7 +72,7 @@ Concurrent calls can produce independent candidates from the same fixed history.
 - `Progress` carries provider JSON and an optional text/reasoning/tool-argument
   delta. Valid JSON is yielded before decoding or final normalization errors,
   including provider failure events. Tool arguments remain provisional.
-- A successful attempt yields exactly one `Completed(Response)` and then ends.
+- A successful attempt yields exactly one `Completed { message, finish, usage }` and then ends.
   A failed attempt yields one `Err` and then ends. Repeated polling after either
   terminal outcome returns `None`. No further work requires polling after
   `Completed`; the HTTP request is released as that item is yielded.
@@ -95,14 +100,16 @@ Truncated Responses calls can retain an error while the raw arguments remain in
 provider data. Valid tool arguments must be JSON objects. Streaming argument
 deltas remain text until the response is decoded.
 
-Put a response in `Message::Assistant`, followed by linked `ToolResult` messages,
-to continue. Opaque reasoning, thinking signatures, content ordering, and provider
-call IDs are preserved. Continuation with another protocol is rejected.
-Applications can reconstruct recorded responses through `Response::from_provider`;
-public types have no prescribed storage encoding.
+Append the returned message directly to the next request, followed by linked
+`ToolResult` messages when needed. `Message::Assistant` holds output and optional
+provider data; finish reason and usage belong to the completion event. Opaque
+reasoning, thinking signatures, content ordering, and provider call IDs are
+preserved. Continuation with another protocol is rejected. Edited output must
+clear its provider data; mismatched content is rejected before dispatch.
+Applications store and reconstruct messages in their chosen format.
 
 Workflow evaluations can inject scripted inference results without HTTP.
-Adapter tests can construct outcomes using `Response::new`. The application
+Adapter tests can construct messages and completion events directly. The application
 chooses how request events, raw progress, responses, and errors enter its records.
 
 ## Implementation

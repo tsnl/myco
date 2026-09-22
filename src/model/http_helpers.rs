@@ -9,8 +9,8 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use super::backend_helpers::{Decoded, EventStream};
-use super::{Error, Event, Protocol, Response};
+use super::backend_helpers::{Decoded, EventStream, completed};
+use super::{Error, Event, Protocol};
 
 pub(super) struct Transport {
     client: Client,
@@ -137,7 +137,7 @@ fn response_events(
             // Expose valid JSON before any decoding or normalization failure.
             yield Event::Progress { raw, delta };
             if let Decoded::Completed(body) = decoded? {
-                yield Event::Completed(Response::from_provider(protocol, body)?);
+                yield completed(protocol, body)?;
                 return;
             }
         }
