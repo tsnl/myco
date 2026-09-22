@@ -298,7 +298,8 @@ context_window = 100000
     def test_sky_endpoints_require_authentication_and_validate_input(self):
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js"]:
+            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
+                         "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401)
         finally:
             anonymous.dispose()
@@ -390,8 +391,55 @@ context_window = 100000
         for start, end in zip(before, after):
             self.assertLess(abs(end - start), 2, "Weather updates must not jump drifting clouds")
 
+    def test_sky_lighting_follows_city_time_without_changing_cloud_shapes(self):
+        page = self.page
+        page.clock.install()
+        page.clock.set_fixed_time("2030-03-20T06:00:00Z")
+        report = {"utc_offset_seconds": 10800, "current": {"time": int(time.time()), "interval": 900,
+            "cloud_cover_low": 55, "cloud_cover_mid": 45, "cloud_cover_high": 60,
+            "wind_speed_10m": 5, "wind_direction_10m": 260, "rain": 0, "showers": 0, "weather_code": 2}}
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json=report))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        sky, glow = page.locator("#sky"), page.locator(".sky-glow")
+        expect(sky).to_have_attribute("data-weather", "live")
+        expect(sky).to_have_attribute("data-clouds", "ready")
+        morning = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
+        canvas = page.locator(".cloud-low canvas").first
+        # Compare rendered alpha and RGB independently: relighting must preserve
+        # every edge and opening while visibly changing the direction of shading.
+        fingerprint = """canvas => {
+            const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+            let alpha = 0, color = 0;
+            pixels.forEach((v, i) => { if (i % 4 === 3) alpha = (Math.imul(alpha, 31) + v) | 0;
+                else color = (Math.imul(color, 31) + v) | 0; });
+            return {alpha, color};
+        }"""
+        before = canvas.evaluate(fingerprint)
+        page.clock.set_fixed_time("2030-03-20T12:00:00Z")
+        page.clock.fast_forward(60000)
+        expect(sky).to_have_attribute("data-clouds", "ready")
+        afternoon = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
+        after = canvas.evaluate(fingerprint)
+        self.assertLess(morning, 50)
+        self.assertGreater(afternoon, 50)
+        self.assertEqual(before["alpha"], after["alpha"])
+        self.assertNotEqual(before["color"], after["color"])
+        page.clock.set_fixed_time("2030-03-20T21:00:00Z")
+        page.clock.fast_forward(60000)
+        expect(sky).to_have_attribute("data-phase", "night")
+        expect(sky).to_have_attribute("data-clouds", "ready")
+        self.assertEqual(before["alpha"], canvas.evaluate(fingerprint)["alpha"])
+        self.assertGreater(float(page.locator("#sky-stars").evaluate("n => n.style.opacity")), 0)
+
     def test_sky_renderer_failure_keeps_the_fallback_and_conversation_usable(self):
-        self.context.route("**/cloud-renderer.js", lambda route: route.fulfill(status=503, body="Unavailable"))
+        self.assert_sky_fallback_conversation("cloud-renderer.js")
+
+    def test_sky_worker_import_failure_keeps_the_fallback_and_conversation_usable(self):
+        self.assert_sky_fallback_conversation("cloud-field.js")
+
+    def assert_sky_fallback_conversation(self, asset):
+        self.context.route("**/" + asset, lambda route: route.fulfill(status=503, body="Unavailable"))
         page = self.page
         page.reload()
         expect(page.locator("#sky")).to_have_attribute("data-clouds", "fallback")

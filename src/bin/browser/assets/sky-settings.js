@@ -1,4 +1,4 @@
-import { weatherDescription } from '/rain.js';
+import { weatherDescription } from '/sky-weather.js';
 
 //
 // Saved location and weather requests

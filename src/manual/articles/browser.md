@@ -19,8 +19,10 @@ The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
 floating controls use background blur. Translucent clouds drift slowly in three
 layers: fine high wisps near the top, soft middle billows below them, and broader
-low clouds near the horizon. Their feathered edges and overlapping layers let the
-sky show through. Colors follow daylight, sunset, and night;
+low clouds near the horizon. Broken banks vary in shape and height; increasing
+cover adds thin, broad veils. Their feathered edges and overlapping layers let the
+sky show through. Gentle directional light travels across the clouds through the
+day, softening in overcast weather. Colors follow daylight, sunset, and night;
 stars twinkle behind the clouds. An occasional distant airplane crosses the sky,
 with a faint contrail or navigation lights after dark. These are decorative
 flybys, with at most two visible at once. Wet weather adds fine rain streaks at
@@ -40,8 +42,9 @@ the art is an impression of modelled current conditions, not a view of individua
 real clouds. Rain intensity accounts for the feed's accumulation interval; a
 drizzle or rain code can still produce light streaks when its amount rounds to
 zero. Snow-only reports do not produce rain.
-The approximate day/night cycle follows that location's clock and updates once
-a minute; it does not calculate seasonal sunrise or sunset.
+The approximate day/night cycle and direction of light follow that location's
+clock and update once a minute; they do not calculate seasonal sunrise, sunset,
+or the position of the moon.
 
 The location is saved in this browser and shared across its tabs. Coordinates
 are rounded to two decimal places before Myco forwards them to Open-Meteo.

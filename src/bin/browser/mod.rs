@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::Args;
 
+mod assets;
 mod http;
 mod markdown;
 mod runtime;
