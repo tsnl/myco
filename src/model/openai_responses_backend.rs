@@ -19,16 +19,13 @@ impl Backend {
 }
 
 impl Driver for Backend {
-    fn protocol(&self) -> Protocol {
-        Protocol::OpenAiResponses
-    }
-
     fn encode(&self, request: &Request) -> Result<Value, Error> {
         encode_request(request)
     }
 
     fn generate(&self, body: Value) -> EventStream<'_> {
-        self.transport.generate(self.protocol(), body, decode_event)
+        self.transport
+            .generate(Protocol::OpenAiResponses, body, decode_event)
     }
 }
 
@@ -50,10 +47,7 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
 fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     match message {
         Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant {
-            output,
-            continuation,
-        } => assistant(output, continuation.as_ref()),
+        Message::Assistant { output } => assistant(output),
         Message::ToolResult {
             call_id,
             output,
@@ -62,26 +56,33 @@ fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     }
 }
 
-fn assistant(outputs: &[Output], continuation: Option<&Value>) -> Result<Vec<Value>, Error> {
-    if let Some(continuation) = continuation {
-        let body = Protocol::OpenAiResponses.body(continuation)?;
-        return Ok(array(body, "output")?.clone());
-    }
-    outputs.iter().map(output).collect()
+fn assistant(outputs: &[Output]) -> Result<Vec<Value>, Error> {
+    outputs
+        .iter()
+        .filter_map(|part| output(part).transpose())
+        .collect()
 }
 
-fn output(output: &Output) -> Result<Value, Error> {
-    match output {
+fn output(output: &Output) -> Result<Option<Value>, Error> {
+    Ok(match output {
         Output::Text(text) | Output::Refusal(text) => {
-            Ok(json!({"role": "assistant", "content": text}))
+            Some(json!({"role":"assistant", "content":text}))
         }
-        Output::ToolCall(call) => Ok(
-            json!({"type": "function_call", "call_id": call.id, "name": call.name, "arguments": call.arguments()?.to_string()}),
-        ),
-        Output::Reasoning(_) => Err(Error::InvalidRequest(
-            "reasoning continuation requires the original provider response".into(),
-        )),
-    }
+        Output::ToolCall(call) => Some(json!({"type":"function_call", "call_id":call.id,
+            "name":call.name, "arguments":call.arguments()?.to_string()})),
+        Output::EncryptedReasoning { id, summary, data } => Some(json!({
+            "type":"reasoning", "id":id, "encrypted_content":data,
+            "summary":summary.iter().map(|text| json!({"type":"summary_text", "text":text})).collect::<Vec<_>>(),
+        })),
+        Output::Reasoning {
+            signature: None, ..
+        } => None,
+        _ => {
+            return Err(Error::InvalidRequest(
+                "signed reasoning belongs to another backend".into(),
+            ));
+        }
+    })
 }
 
 fn tool_result(id: &str, output: &str, is_error: bool) -> Value {
@@ -118,9 +119,9 @@ fn outputs(body: &Value, complete: bool) -> Result<Vec<Output>, Error> {
     for item in array(body, "output")? {
         match field(item, "type")? {
             "message" => output.extend(decode_message(item)?),
-            "reasoning" => output.extend(reasoning(item)),
+            "reasoning" => output.extend(reasoning(item)?),
             "function_call" => output.push(Output::ToolCall(tool_call(item, complete)?)),
-            _ => {} // Opaque items remain in the native response and continuation.
+            _ => {} // Unsupported items remain available in raw events.
         }
     }
     Ok(output)
@@ -138,19 +139,38 @@ fn decode_message(item: &Value) -> Result<Vec<Output>, Error> {
     Ok(output)
 }
 
-fn reasoning(item: &Value) -> Vec<Output> {
-    let parts = item["summary"]
+fn reasoning(item: &Value) -> Result<Vec<Output>, Error> {
+    if item.get("encrypted_content").is_some_and(|v| !v.is_null()) {
+        return Ok(vec![encrypted_reasoning(item)?]);
+    }
+    Ok(reasoning_text(item)?
+        .into_iter()
+        .map(|text| Output::Reasoning {
+            text,
+            signature: None,
+        })
+        .collect())
+}
+
+fn encrypted_reasoning(item: &Value) -> Result<Output, Error> {
+    Ok(Output::EncryptedReasoning {
+        id: field(item, "id")?.into(),
+        summary: array(item, "summary")?
+            .iter()
+            .map(|part| field(part, "text").map(str::to_owned))
+            .collect::<Result<_, _>>()?,
+        data: field(item, "encrypted_content")?.into(),
+    })
+}
+
+fn reasoning_text(item: &Value) -> Result<Vec<String>, Error> {
+    item["summary"]
         .as_array()
         .filter(|parts| !parts.is_empty())
-        .or_else(|| item["content"].as_array());
-    parts
+        .or_else(|| item["content"].as_array())
         .into_iter()
         .flatten()
-        .filter_map(|part| {
-            part["text"]
-                .as_str()
-                .map(|text| Output::Reasoning(text.into()))
-        })
+        .map(|part| field(part, "text").map(str::to_owned))
         .collect()
 }
 
@@ -227,9 +247,19 @@ fn delta(event: &Value) -> Result<Option<Delta>, Error> {
     };
     Ok(Some(Delta {
         index: index(event, "output_index")?,
+        part: part_index(event)?,
         kind,
         text: field(event, "delta")?.into(),
     }))
+}
+
+fn part_index(event: &Value) -> Result<usize, Error> {
+    ["content_index", "summary_index"]
+        .into_iter()
+        .find(|name| event.get(name).is_some())
+        .map(|name| index(event, name))
+        .transpose()
+        .map(|part| part.unwrap_or(0))
 }
 
 fn delta_kind(kind: &str) -> Option<DeltaKind> {

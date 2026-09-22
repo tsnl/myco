@@ -66,11 +66,13 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
         generation.next().await,
         Some(Ok(Event::Request { .. }))
     ));
-    for expected in [progress, terminal] {
-        assert!(matches!(generation.next().await,
-            Some(Ok(Event::Progress { raw, .. })) if raw == expected));
-        assert!(!generation.is_terminated());
-    }
+    assert!(matches!(generation.next().await,
+        Some(Ok(Event::Progress { raw })) if raw == progress));
+    assert!(matches!(generation.next().await,
+        Some(Ok(Event::Delta(delta))) if delta.text == "hello" && delta.kind == DeltaKind::Text));
+    assert!(matches!(generation.next().await,
+        Some(Ok(Event::Progress { raw })) if raw == terminal));
+    assert!(!generation.is_terminated());
     let Some(Ok(Event::Completed {
         message,
         finish,
@@ -79,10 +81,12 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
     else {
         panic!("missing final response");
     };
-    let Message::Assistant { output, .. } = message else {
-        panic!("completion must contain an assistant message");
-    };
-    assert_eq!(output, [Output::Text("hello".into())]);
+    assert_eq!(
+        message,
+        Message::Assistant {
+            output: vec![Output::Text("hello".into())]
+        }
+    );
     assert_eq!(finish, Finish::Stop);
     assert_eq!(usage.input_tokens, None);
     assert!(generation.is_terminated());
@@ -91,7 +95,7 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
 }
 
 #[tokio::test]
-async fn both_backends_restore_opaque_continuations_without_client_state() {
+async fn completed_messages_rebuild_full_history_including_reasoning_for_each_backend() {
     for (protocol, fixture_body) in [
         (Backend::OpenAiResponses, OPENAI),
         (Backend::AnthropicMessages, ANTHROPIC),
@@ -107,29 +111,28 @@ async fn both_backends_restore_opaque_continuations_without_client_state() {
         });
         let trace = collect(&model, initial).await;
         let reply = completed(&trace);
-        let Message::Assistant {
-            output,
-            continuation: Some(continuation),
-        } = &reply.message
-        else {
-            panic!("missing assistant continuation");
+        let Message::Assistant { output } = &reply.message else {
+            panic!("missing assistant message");
         };
         assert_eq!(reply.finish, Finish::ToolCalls);
         assert_eq!(reply.usage.output_tokens, Some(9));
-        assert_eq!(output[0], Output::Reasoning("Checking the note.".into()));
-        assert_eq!(output[1], Output::Text("Ready 雪".into()));
-        let Output::ToolCall(call) = &output[2] else {
-            panic!()
-        };
+        assert!(output.contains(&Output::Text("Ready 雪".into())));
+        let call = output
+            .iter()
+            .find_map(|part| match part {
+                Output::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(call.id, "call_fixture");
         assert_eq!(call.arguments, Ok(json!({"path":"note.txt"})));
         let arguments: String = trace
             .events
             .iter()
             .filter_map(|e| match e {
-                Event::Progress {
-                    delta: Some(delta), ..
-                } if delta.kind == DeltaKind::ToolArguments => Some(delta.text.as_str()),
+                Event::Delta(delta) if delta.kind == DeltaKind::ToolArguments => {
+                    Some(delta.text.as_str())
+                }
                 _ => None,
             })
             .collect();
@@ -147,10 +150,7 @@ async fn both_backends_restore_opaque_continuations_without_client_state() {
 
         let mut next = request();
         next.messages.extend([
-            Message::Assistant {
-                output: output.clone(),
-                continuation: Some(serde_json::from_str(&continuation.to_string()).unwrap()),
-            },
+            reply.message.clone(),
             Message::User("Continue.".into()),
             Message::ToolResult {
                 call_id: call.id.clone(),
@@ -166,6 +166,13 @@ async fn both_backends_restore_opaque_continuations_without_client_state() {
                 assert!(captured.headers.contains("authorization: Bearer test-key"));
                 assert_eq!(reply.usage.input_tokens, Some(12));
                 assert_eq!(body["input"][1]["encrypted_content"], "opaque-reasoning");
+                assert_eq!(body["input"][1]["id"], "rs_fixture");
+                assert_eq!(
+                    body["input"][1]["summary"],
+                    json!([
+                        {"type":"summary_text", "text":"Checking the note."}
+                    ])
+                );
                 assert_eq!(body["input"][3]["call_id"], "call_fixture");
                 assert_eq!(body["input"][5]["call_id"], "call_fixture");
             }
@@ -176,6 +183,10 @@ async fn both_backends_restore_opaque_continuations_without_client_state() {
                 assert_eq!(
                     body["messages"][1]["content"][0]["signature"],
                     "signed-reasoning"
+                );
+                assert_eq!(
+                    body["messages"][1]["content"][0]["thinking"],
+                    "Checking the note."
                 );
                 assert_eq!(
                     body["messages"][1]["content"][1]["data"],
@@ -192,7 +203,7 @@ async fn both_backends_restore_opaque_continuations_without_client_state() {
 }
 
 #[tokio::test]
-async fn terminal_output_retains_opaque_items_even_without_text_deltas() {
+async fn unknown_output_stays_in_raw_events_without_entering_history() {
     let mut raw = text_response("full response");
     raw["extra_provider_field"] = json!({"evidence":"retained"});
     raw["output"]
@@ -208,32 +219,30 @@ async fn terminal_output_retains_opaque_items_even_without_text_deltas() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant {
-        output,
-        continuation: Some(continuation),
-    } = &reply.message
-    else {
-        panic!("missing assistant continuation");
+    let Message::Assistant { output } = &reply.message else {
+        panic!("missing assistant message");
     };
     assert_eq!(output, &[Output::Text("full response".into())]);
     assert_eq!(reply.usage.input_tokens, None);
-    assert!(!continuation.is_null());
     assert!(
         trace
             .events
             .iter()
             .any(|e| matches!(e, Event::Progress { raw: event, .. } if event["response"] == raw))
     );
-    assert!(trace.events.iter().any(
-        |e| matches!(e, Event::Progress { raw, delta: None } if raw["type"] == "future_event")
-    ));
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Progress { raw } if raw["type"] == "future_event"))
+    );
     let model = client(Backend::OpenAiResponses, "http://127.0.0.1:1/inference", "").unwrap();
     let mut next = request();
     next.messages.push(reply.message.clone());
     let body = encoded_request(&model, next).await;
     assert_eq!(
         &body["input"].as_array().unwrap()[1..],
-        raw["output"].as_array().unwrap()
+        &[json!({"role":"assistant","content":"full response"})]
     );
 }
 
@@ -371,64 +380,25 @@ async fn malformed_anthropic_sequences_fail_without_a_completed_message() {
     }
 }
 
-#[tokio::test]
-async fn incompatible_continuations_and_tool_links_are_rejected_before_dispatch() {
-    for (source, target, body) in [
-        (
-            Backend::AnthropicMessages,
-            Backend::OpenAiResponses,
-            ANTHROPIC,
-        ),
-        (Backend::OpenAiResponses, Backend::AnthropicMessages, OPENAI),
-    ] {
-        let trace = run(source, body).await;
-        let model = client(target, "http://127.0.0.1:1/inference", "").unwrap();
-        let mut input = request();
-        input.messages.extend([
-            completed(&trace).message.clone(),
-            Message::ToolResult {
-                call_id: "call_fixture".into(),
-                output: "note contents".into(),
-                is_error: false,
-            },
-        ]);
-        assert!(matches!(model.generate(input.clone()),
-            Err(Error::InvalidRequest(error)) if error.contains("incompatible")));
-        input.messages = vec![Message::ToolResult {
-            call_id: "missing".into(),
-            output: "orphan".into(),
-            is_error: false,
-        }];
-        assert!(matches!(model.generate(input),
-            Err(Error::InvalidRequest(error)) if error.contains("unmatched")));
-    }
-}
-
 #[test]
-fn malformed_continuations_fail_before_a_stream_is_returned() {
+fn unmatched_and_duplicate_tool_results_are_rejected_before_dispatch() {
     for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
-        for continuation in [
-            Value::Null,
-            json!(42),
-            json!("invalid"),
-            json!([]),
-            json!({}),
-            json!({"unknown":{}}),
-        ] {
-            let mut input = request();
-            input.messages.push(Message::Assistant {
-                output: vec![Output::Text("previous reply".into())],
-                continuation: Some(continuation),
+        for id in ["missing", "call"] {
+            let mut input = tool_history(Ok(json!({})));
+            input.messages.push(Message::ToolResult {
+                call_id: id.into(),
+                output: "extra result".into(),
+                is_error: false,
             });
             assert!(matches!(model.generate(input),
-                Err(Error::InvalidRequest(error)) if error.contains("continuation")));
+                Err(Error::InvalidRequest(error)) if error.contains("unmatched or duplicate")));
         }
     }
 }
 
 #[tokio::test]
-async fn edited_assistant_output_cannot_silently_reuse_stale_continuation() {
+async fn edited_text_history_is_rebuilt_from_the_callers_content() {
     for (protocol, fixture_body) in [
         (Backend::OpenAiResponses, OPENAI),
         (Backend::AnthropicMessages, ANTHROPIC),
@@ -438,7 +408,11 @@ async fn edited_assistant_output_cannot_silently_reuse_stale_continuation() {
         let Message::Assistant { output, .. } = &mut message else {
             panic!("missing assistant message");
         };
-        output[1] = Output::Text("edited text".into());
+        let text = output
+            .iter_mut()
+            .find(|part| matches!(part, Output::Text(_)))
+            .unwrap();
+        *text = Output::Text("edited text".into());
         let mut input = request();
         input.messages.extend([
             message,
@@ -449,8 +423,9 @@ async fn edited_assistant_output_cannot_silently_reuse_stale_continuation() {
             },
         ]);
         let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
-        assert!(matches!(model.generate(input),
-            Err(Error::InvalidRequest(error)) if error.contains("does not match")));
+        let body = encoded_request(&model, input).await.to_string();
+        assert!(body.contains("edited text"));
+        assert!(!body.contains("Ready 雪"));
     }
 }
 
@@ -468,8 +443,9 @@ async fn dropping_an_incomplete_generation_closes_the_http_request() {
         ));
         assert!(matches!(
             generation.next().await,
-            Some(Ok(Event::Progress { delta: Some(_), .. }))
+            Some(Ok(Event::Progress { .. }))
         ));
+        assert!(matches!(generation.next().await, Some(Ok(Event::Delta(_)))));
     })
     .await
     .unwrap();
@@ -638,15 +614,17 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant {
-        output,
-        continuation: Some(continuation),
-    } = &reply.message
-    else {
-        panic!("missing assistant continuation");
+    let Message::Assistant { output } = &reply.message else {
+        panic!("missing assistant message");
     };
     assert_eq!(reply.finish, Finish::Length);
-    assert_eq!(output[0], Output::Reasoning("visible reasoning".into()));
+    assert_eq!(
+        output[0],
+        Output::Reasoning {
+            text: "visible reasoning".into(),
+            signature: None
+        }
+    );
     let Output::ToolCall(call) = &output[1] else {
         panic!("missing truncated call");
     };
@@ -655,7 +633,6 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
             .as_ref()
             .is_err_and(|error| !error.is_empty())
     );
-    assert!(!continuation.is_null());
     assert!(trace.events.iter().any(
         |e| matches!(e, Event::Progress { raw, .. } if raw["response"]["output"][1]["arguments"] == "{")
     ));
@@ -687,7 +664,7 @@ async fn parsed_tool_arguments_encode_in_each_providers_wire_format() {
 }
 
 #[test]
-fn invalid_tool_arguments_cannot_be_used_in_continuation() {
+fn invalid_tool_arguments_cannot_be_used_in_history() {
     for protocol in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
         for arguments in [Err("incomplete JSON".into()), Ok(json!([1, 2]))] {
@@ -708,7 +685,6 @@ fn tool_history(arguments: Result<Value, String>) -> Request {
                 name: "read".into(),
                 arguments,
             })],
-            continuation: None,
         },
         Message::ToolResult {
             call_id: "call".into(),
@@ -754,20 +730,28 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
         generation.next().await,
         Some(Ok(Event::Request { .. }))
     ));
-    assert!(
-        matches!(timeout(Duration::from_secs(5), generation.next()).await.unwrap(),
-        Some(Ok(Event::Progress { delta: Some(delta), .. })) if delta.text == "first")
-    );
+    assert!(matches!(
+        timeout(Duration::from_secs(5), generation.next())
+            .await
+            .unwrap(),
+        Some(Ok(Event::Progress { .. }))
+    ));
+    assert!(matches!(generation.next().await,
+        Some(Ok(Event::Delta(delta))) if delta.text == "first"));
     assert!(
         timeout(Duration::from_millis(30), generation.next())
             .await
             .is_err()
     );
     release.send(()).unwrap();
-    assert!(
-        matches!(timeout(Duration::from_secs(5), generation.next()).await.unwrap(),
-        Some(Ok(Event::Progress { delta: Some(delta), .. })) if delta.text == "雪")
-    );
+    assert!(matches!(
+        timeout(Duration::from_secs(5), generation.next())
+            .await
+            .unwrap(),
+        Some(Ok(Event::Progress { .. }))
+    ));
+    assert!(matches!(generation.next().await,
+        Some(Ok(Event::Delta(delta))) if delta.text == "雪"));
     assert!(matches!(
         generation.next().await,
         Some(Ok(Event::Progress { .. }))
@@ -775,8 +759,163 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
     let Some(Ok(Event::Completed { message, .. })) = generation.next().await else {
         panic!("lost the resumed response");
     };
-    assert!(matches!(message,
-        Message::Assistant { output, .. } if output == [Output::Text("first雪".into())]));
+    assert_eq!(
+        message,
+        Message::Assistant {
+            output: vec![Output::Text("first雪".into())]
+        }
+    );
     assert!(generation.next().await.is_none());
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn interleaved_deltas_keep_part_coordinates_and_completion_supplies_the_whole_message() {
+    let raw = json!({"status":"completed", "output":[{"type":"message", "content":[
+        {"type":"output_text", "text":"a雪"}, {"type":"output_text", "text":"b"}
+    ]}]});
+    let trace = run(Backend::OpenAiResponses, &events(&[
+        json!({"type":"response.output_text.delta", "output_index":0, "content_index":1, "delta":"b"}),
+        json!({"type":"response.output_text.delta", "output_index":0, "content_index":0, "delta":"a"}),
+        json!({"type":"response.completed", "response":raw}),
+    ])).await;
+    assert_eq!(
+        completed(&trace).message,
+        Message::Assistant {
+            output: vec![Output::Text("a雪".into()), Output::Text("b".into())],
+        }
+    );
+    let text: Vec<_> = trace
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Delta(delta) => Some((delta.part, delta.text.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, [(1, "b"), (0, "a")]);
+}
+
+#[tokio::test]
+async fn initial_thinking_and_signature_fragments_are_assembled_once() {
+    let body = ANTHROPIC.replace(
+        "\"thinking\":\"\",\"signature\":\"\"",
+        "\"thinking\":\"Plan. \",\"signature\":\"prefix-\"",
+    );
+    let trace = run(Backend::AnthropicMessages, &body).await;
+    let Message::Assistant { output } = &completed(&trace).message else {
+        panic!()
+    };
+    assert_eq!(
+        output[0],
+        Output::Reasoning {
+            text: "Plan. Checking the note.".into(),
+            signature: Some("prefix-signed-reasoning".into()),
+        }
+    );
+    assert_eq!(
+        output[1],
+        Output::RedactedReasoning("opaque-reasoning".into())
+    );
+}
+
+#[tokio::test]
+async fn encrypted_reasoning_survives_without_a_visible_summary() {
+    let raw = json!({"status":"completed", "output":[{
+        "type":"reasoning", "id":"rs_secret", "summary":[], "encrypted_content":"opaque",
+        "content":[{"type":"reasoning_text", "text":"internal trace"}]
+    }]});
+    let trace = run(
+        Backend::OpenAiResponses,
+        &events(&[json!({"type":"response.completed", "response":raw})]),
+    )
+    .await;
+    assert_eq!(
+        completed(&trace).message,
+        Message::Assistant {
+            output: vec![Output::EncryptedReasoning {
+                id: "rs_secret".into(),
+                summary: vec![],
+                data: "opaque".into(),
+            }],
+        }
+    );
+}
+
+#[tokio::test]
+async fn argument_whitespace_is_not_replaced_or_duplicated_at_completion() {
+    let body = ANTHROPIC
+        .replace("{\\\"path\\\":", "{ \\\"path\\\" : ")
+        .replace("\\\"note.txt\\\"}", "\\\"note.txt\\\" }");
+    let trace = run(Backend::AnthropicMessages, &body).await;
+    let arguments: String = trace
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Delta(delta) if delta.kind == DeltaKind::ToolArguments => {
+                Some(delta.text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arguments, "{ \"path\" : \"note.txt\" }");
+    assert!(trace.result.is_ok());
+}
+
+#[tokio::test]
+async fn unsigned_reasoning_is_observation_only_in_history() {
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        let mut input = request();
+        input.messages.extend([
+            Message::Assistant {
+                output: vec![Output::Reasoning {
+                    text: "private observation".into(),
+                    signature: None,
+                }],
+            },
+            Message::User("next question".into()),
+        ]);
+        let body = encoded_request(&model, input).await;
+        assert!(!body.to_string().contains("private observation"));
+        match backend {
+            Backend::OpenAiResponses => assert_eq!(body["input"].as_array().unwrap().len(), 2),
+            Backend::AnthropicMessages => assert_eq!(body["messages"].as_array().unwrap().len(), 1),
+        }
+    }
+}
+
+#[test]
+fn incompatible_reasoning_formats_fail_before_network_io() {
+    for (backend, output) in [
+        (
+            Backend::OpenAiResponses,
+            Output::Reasoning {
+                text: "summary".into(),
+                signature: Some("signed".into()),
+            },
+        ),
+        (
+            Backend::OpenAiResponses,
+            Output::RedactedReasoning("opaque".into()),
+        ),
+        (
+            Backend::AnthropicMessages,
+            Output::EncryptedReasoning {
+                id: "rs".into(),
+                summary: vec![],
+                data: "opaque".into(),
+            },
+        ),
+    ] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        let mut input = request();
+        input.messages.push(Message::Assistant {
+            output: vec![output],
+        });
+        assert!(
+            matches!(model.generate(input), Err(Error::InvalidRequest(error))
+            if error.contains("another backend"))
+        );
+    }
 }

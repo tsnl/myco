@@ -133,12 +133,16 @@ fn response_events(
         let mut events = Events::new(response);
         while let Some(raw) = events.next().await? {
             let decoded = decode(&raw);
-            let delta = decoded.as_ref().ok().and_then(Decoded::delta);
             // Expose valid JSON before any decoding or normalization failure.
-            yield Event::Progress { raw, delta };
-            if let Decoded::Completed(body) = decoded? {
-                yield completed(protocol, body)?;
-                return;
+            yield Event::Progress { raw };
+            match decoded? {
+                Decoded::Progress(delta) => if let Some(delta) = delta {
+                    yield Event::Delta(delta);
+                },
+                Decoded::Completed(body) => {
+                    yield completed(protocol, &body)?;
+                    return;
+                }
             }
         }
         Err(Error::Protocol("stream ended before its terminal event".into()))?;

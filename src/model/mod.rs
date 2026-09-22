@@ -71,7 +71,6 @@ pub enum Message {
     User(String),
     Assistant {
         output: Vec<Output>,
-        continuation: Option<Value>,
     },
     ToolResult {
         call_id: String,
@@ -97,7 +96,16 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     Text(String),
-    Reasoning(String),
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
+    EncryptedReasoning {
+        id: String,
+        summary: Vec<String>,
+        data: String,
+    },
+    RedactedReasoning(String),
     Refusal(String),
     ToolCall(ToolCall),
 }
@@ -132,6 +140,7 @@ pub enum DeltaKind {
 pub struct Delta {
     /// Provider output-item or content-block index.
     pub index: usize,
+    pub part: usize,
     pub kind: DeltaKind,
     pub text: String,
 }
@@ -143,8 +152,8 @@ pub enum Event {
     },
     Progress {
         raw: Value,
-        delta: Option<Delta>,
     },
+    Delta(Delta),
     Completed {
         message: Message,
         finish: Finish,

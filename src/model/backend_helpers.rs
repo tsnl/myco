@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
     Config, Delta, Error, Event, Finish, Generation, Message, Output, Request, ToolCall, Usage,
@@ -15,7 +15,6 @@ use super::{
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
 
 pub(super) trait Driver: Send + Sync {
-    fn protocol(&self) -> Protocol;
     fn encode(&self, request: &Request) -> Result<Value, Error>;
     fn generate(&self, body: Value) -> EventStream<'_>;
 }
@@ -24,25 +23,6 @@ pub(super) trait Driver: Send + Sync {
 pub(super) enum Protocol {
     OpenAiResponses,
     AnthropicMessages,
-}
-
-impl Protocol {
-    fn key(self) -> &'static str {
-        match self {
-            Self::OpenAiResponses => "openai_responses",
-            Self::AnthropicMessages => "anthropic_messages",
-        }
-    }
-
-    pub(super) fn body(self, continuation: &Value) -> Result<&Value, Error> {
-        continuation
-            .as_object()
-            .filter(|object| object.len() == 1)
-            .and_then(|object| object.get(self.key()))
-            .ok_or_else(|| {
-                Error::InvalidRequest("invalid or incompatible assistant continuation".into())
-            })
-    }
 }
 
 pub(super) enum Decoded {
@@ -54,15 +34,6 @@ pub(super) struct Completion {
     pub(super) output: Vec<Output>,
     pub(super) finish: Finish,
     pub(super) usage: Usage,
-}
-
-impl Decoded {
-    pub(super) fn delta(&self) -> Option<Delta> {
-        match self {
-            Self::Progress(delta) => delta.clone(),
-            Self::Completed(_) => None,
-        }
-    }
 }
 
 pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
@@ -77,7 +48,7 @@ pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
 }
 
 pub(super) fn generate(driver: &dyn Driver, request: Request) -> Result<Generation<'_>, Error> {
-    validate(&request, driver.protocol())?;
+    validate(&request)?;
     let mut body = driver.encode(&request)?;
     apply_options(&mut body, &request)?;
     Ok(Generation {
@@ -102,29 +73,19 @@ pub(super) fn poll_generation(
     next
 }
 
-pub(super) fn completed(protocol: Protocol, body: Value) -> Result<Event, Error> {
-    let Completion {
-        output,
-        finish,
-        usage,
-    } = decode(protocol, &body)?;
-    Ok(Event::Completed {
-        message: Message::Assistant {
-            output,
-            continuation: Some(json!({protocol.key(): body})),
-        },
-        finish,
-        usage,
-    })
-}
-
-fn decode(protocol: Protocol, body: &Value) -> Result<Completion, Error> {
+pub(super) fn completed(protocol: Protocol, body: &Value) -> Result<Event, Error> {
     let completion = match protocol {
         Protocol::OpenAiResponses => openai_responses_backend::decode_response(body)?,
         Protocol::AnthropicMessages => anthropic_backend::decode_response(body)?,
     };
     validate_call_ids(&completion.output)?;
-    Ok(completion)
+    Ok(Event::Completed {
+        message: Message::Assistant {
+            output: completion.output,
+        },
+        finish: completion.finish,
+        usage: completion.usage,
+    })
 }
 
 fn validate_call_ids(output: &[Output]) -> Result<(), Error> {
@@ -166,14 +127,14 @@ impl ToolCall {
     }
 }
 
-fn validate(request: &Request, protocol: Protocol) -> Result<(), Error> {
+fn validate(request: &Request) -> Result<(), Error> {
     if request.model.is_empty() || request.messages.is_empty() || request.max_output_tokens == 0 {
         return Err(Error::InvalidRequest(
             "model, messages, and a positive output limit are required".into(),
         ));
     }
     validate_tools(request)?;
-    validate_history(&request.messages, protocol)
+    validate_history(&request.messages)
 }
 
 fn validate_tools(request: &Request) -> Result<(), Error> {
@@ -188,10 +149,10 @@ fn validate_tools(request: &Request) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_history(messages: &[Message], protocol: Protocol) -> Result<(), Error> {
+fn validate_history(messages: &[Message]) -> Result<(), Error> {
     let mut history = History::default();
     for message in messages {
-        history.message(message, protocol)?;
+        history.message(message)?;
     }
     if history.calls.len() != history.results.len() {
         return Err(Error::InvalidRequest(
@@ -208,26 +169,15 @@ struct History<'a> {
 }
 
 impl<'a> History<'a> {
-    fn message(&mut self, message: &'a Message, protocol: Protocol) -> Result<(), Error> {
+    fn message(&mut self, message: &'a Message) -> Result<(), Error> {
         match message {
-            Message::Assistant {
-                output,
-                continuation,
-            } => self.assistant(output, continuation.as_ref(), protocol),
+            Message::Assistant { output } => self.assistant(output),
             Message::ToolResult { call_id, .. } => self.result(call_id),
             Message::User(_) => Ok(()),
         }
     }
 
-    fn assistant(
-        &mut self,
-        output: &'a [Output],
-        continuation: Option<&Value>,
-        protocol: Protocol,
-    ) -> Result<(), Error> {
-        if let Some(continuation) = continuation {
-            validate_continuation(output, continuation, protocol)?;
-        }
+    fn assistant(&mut self, output: &'a [Output]) -> Result<(), Error> {
         for output in output {
             if let Output::ToolCall(call) = output {
                 self.call(call)?;
@@ -256,21 +206,6 @@ impl<'a> History<'a> {
         }
         Ok(())
     }
-}
-
-fn validate_continuation(
-    output: &[Output],
-    continuation: &Value,
-    protocol: Protocol,
-) -> Result<(), Error> {
-    let native = decode(protocol, protocol.body(continuation)?)
-        .map_err(|error| Error::InvalidRequest(error.to_string()))?;
-    if native.output != output {
-        return Err(Error::InvalidRequest(
-            "assistant output does not match its continuation; clear continuation when editing output".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn apply_options(body: &mut Value, request: &Request) -> Result<(), Error> {

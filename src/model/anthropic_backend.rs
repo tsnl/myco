@@ -19,10 +19,6 @@ impl Backend {
 }
 
 impl Driver for Backend {
-    fn protocol(&self) -> Protocol {
-        Protocol::AnthropicMessages
-    }
-
     fn encode(&self, request: &Request) -> Result<Value, Error> {
         encode_request(request)
     }
@@ -30,7 +26,9 @@ impl Driver for Backend {
     fn generate(&self, body: Value) -> EventStream<'_> {
         let mut accumulator = Accumulator::default();
         self.transport
-            .generate(self.protocol(), body, move |event| accumulator.event(event))
+            .generate(Protocol::AnthropicMessages, body, move |event| {
+                accumulator.event(event)
+            })
     }
 }
 
@@ -56,6 +54,9 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
     let mut messages: Vec<Value> = vec![];
     for message in input {
         let content = content(message)?;
+        if content.blocks.is_empty() {
+            continue;
+        }
         if let Some(last) = messages
             .last_mut()
             .filter(|last| last["role"] == content.role)
@@ -71,14 +72,7 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
 fn content(message: &Message) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
         Message::User(text) => ("user", vec![json!({"type": "text", "text": text})], false),
-        Message::Assistant {
-            output,
-            continuation,
-        } => (
-            "assistant",
-            assistant(output, continuation.as_ref())?,
-            false,
-        ),
+        Message::Assistant { output } => ("assistant", assistant(output)?, false),
         Message::ToolResult {
             call_id,
             output,
@@ -114,22 +108,31 @@ fn merge(message: &mut Value, content: Content) {
     }
 }
 
-fn assistant(outputs: &[Output], continuation: Option<&Value>) -> Result<Vec<Value>, Error> {
-    if let Some(continuation) = continuation {
-        let body = Protocol::AnthropicMessages.body(continuation)?;
-        return Ok(array(body, "content")?.clone());
-    }
-    outputs.iter().map(output).collect()
+fn assistant(outputs: &[Output]) -> Result<Vec<Value>, Error> {
+    outputs
+        .iter()
+        .filter_map(|part| output(part).transpose())
+        .collect()
 }
 
-fn output(output: &Output) -> Result<Value, Error> {
-    match output {
-        Output::Text(text) | Output::Refusal(text) => Ok(json!({"type": "text", "text": text})),
-        Output::ToolCall(call) => encode_tool_call(call),
-        Output::Reasoning(_) => Err(Error::InvalidRequest(
-            "reasoning continuation requires the original provider response".into(),
-        )),
-    }
+fn output(output: &Output) -> Result<Option<Value>, Error> {
+    Ok(match output {
+        Output::Text(text) | Output::Refusal(text) => Some(json!({"type":"text", "text":text})),
+        Output::ToolCall(call) => Some(encode_tool_call(call)?),
+        Output::Reasoning {
+            text,
+            signature: Some(signature),
+        } => Some(json!({"type":"thinking", "thinking":text, "signature":signature})),
+        Output::Reasoning {
+            signature: None, ..
+        } => None,
+        Output::RedactedReasoning(data) => Some(json!({"type":"redacted_thinking", "data":data})),
+        Output::EncryptedReasoning { .. } => {
+            return Err(Error::InvalidRequest(
+                "encrypted reasoning belongs to another backend".into(),
+            ));
+        }
+    })
 }
 
 fn encode_tool_call(call: &ToolCall) -> Result<Value, Error> {
@@ -169,10 +172,11 @@ fn finish(body: &Value) -> Result<Finish, Error> {
 fn block(block: &Value) -> Result<Option<Output>, Error> {
     Ok(match field(block, "type")? {
         "text" => Some(Output::Text(field(block, "text")?.into())),
-        "thinking" => {
-            field(block, "signature")?;
-            Some(Output::Reasoning(field(block, "thinking")?.into()))
-        }
+        "thinking" => Some(Output::Reasoning {
+            text: field(block, "thinking")?.into(),
+            signature: Some(field(block, "signature")?.into()),
+        }),
+        "redacted_thinking" => Some(Output::RedactedReasoning(field(block, "data")?.into())),
         "tool_use" => Some(Output::ToolCall(decode_tool_call(block)?)),
         _ => None,
     })
@@ -429,6 +433,7 @@ impl Block {
         append_text(&mut self.value, name, text)?;
         Ok(kind.map(|kind| Delta {
             index,
+            part: 0,
             kind,
             text: text.into(),
         }))
@@ -441,6 +446,7 @@ impl Block {
             .push_str(text);
         Ok(Delta {
             index,
+            part: 0,
             kind: DeltaKind::ToolArguments,
             text: text.into(),
         })

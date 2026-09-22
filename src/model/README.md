@@ -7,7 +7,7 @@ limits are supplied by the caller. Backend drivers are private.
 
 ```no_run
 use futures_util::StreamExt;
-use myco::model::{Config, Event, GenAiClient, Message, Request};
+use myco::model::{Config, DeltaKind, Event, GenAiClient, Message, Request};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = GenAiClient::new(Config::OpenAi {
@@ -24,7 +24,7 @@ let request = Request {
 let mut generation = client.generate(request)?;
 while let Some(event) = generation.next().await {
     match event? {
-        Event::Progress { delta: Some(delta), .. } => print!("{}", delta.text),
+        Event::Delta(delta) if delta.kind == DeltaKind::Text => print!("{}", delta.text),
         Event::Completed { message, finish, .. } => {
             messages.push(message);
             println!("\nFinish: {finish:?}");
@@ -46,10 +46,10 @@ stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the model module.
 
 Workflow code in `logic` translates selected thread history into a `Request`
-and translates stream events into conversation entries. It records opaque
-continuation JSON and call-ID mappings, passing the continuation back unchanged
-when assembling subsequent requests. The `thread` module supplies history
-operations; each workflow chooses its context and publication policy. These higher modules are specified in
+and translates stream events into conversation entries. Every request supplies
+the complete history it wants the model to see; the backend rebuilds the provider
+request from that history. The `thread` module supplies history operations;
+each workflow chooses its context and publication policy. These modules are specified in
 [DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
 
 Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
@@ -69,9 +69,11 @@ Concurrent calls can produce independent candidates from the same fixed history.
   The caller can inspect and persist the request before polling again, or drop
   the stream if recording fails. Transport and provider failures arrive as stream
   errors.
-- `Progress` carries provider JSON and an optional text/reasoning/tool-argument
-  delta. Valid JSON is yielded before decoding or final normalization errors,
-  including provider failure events. Tool arguments remain provisional.
+- `Progress` carries raw provider JSON, yielded before its normalized `Delta`
+  event or any decoding error. `Delta` carries text, reasoning, refusal, or
+  tool-argument fragments. `index` identifies an output item or content block;
+  `part` identifies its text/summary part, otherwise zero. Parts may arrive
+  interleaved. Deltas are provisional and need not contain every final field.
 - A successful attempt yields exactly one `Completed { message, finish, usage }` and then ends.
   A failed attempt yields one `Err` and then ends. Repeated polling after either
   terminal outcome returns `None`. No further work requires polling after
@@ -97,23 +99,25 @@ Concurrent calls can produce independent candidates from the same fixed history.
 
 `ToolCall::arguments` is `Result<Value, String>`: parsed JSON or a parse error.
 Truncated Responses calls can retain an error while the raw arguments remain in
-the continuation. Valid tool arguments must be JSON objects. Streaming argument
+the raw progress events. Valid tool arguments must be JSON objects. Streaming argument
 deltas remain text until the response is decoded.
 
 Append the returned message directly to the next request, followed by linked
-`ToolResult` messages when needed. `Message::Assistant` holds output and
-`continuation: Option<Value>`; finish reason and usage belong to the completion
-event. Continuation is opaque JSON: store it and pass it back unchanged, without
-depending on its structure. Private backends preserve and validate reasoning,
-thinking signatures, content ordering, and call IDs. Malformed or incompatible
-continuation is rejected before dispatch, as is edited output that no longer
-matches it. Synthesized messages use `None`; editing output requires clearing
-continuation, and reasoning cannot be reconstructed without it. Applications
-store and reconstruct messages in their chosen format, without provider-specific
-response or protocol types.
+`ToolResult` messages when needed. `Message::Assistant` holds ordered output;
+finish reason and usage belong to the completion event. Every request is rebuilt
+from the supplied history. No whole native response is attached to it.
+
+Reasoning metadata is explicit in the completed message: `Output::Reasoning`
+has an optional `signature`; `EncryptedReasoning` carries its ID, summaries, and
+opaque data; `RedactedReasoning` carries a separate opaque block. Preserve these
+fields and their ordering when replaying reasoning. Only the provider can verify
+the opaque strings; editing the associated reasoning can invalidate them.
+Signed/encrypted reasoning from an incompatible backend is rejected. Unsigned
+`Reasoning` is available for display but omitted from later requests. Other
+provider metadata remains in raw progress for diagnostics.
 
 Workflow evaluations can inject scripted inference results without HTTP.
-Adapter tests can construct messages and completion events directly. The application
+Adapter tests can construct messages, deltas, and completion events directly. The application
 chooses how request events, raw progress, responses, and errors enter its records.
 
 ## Implementation
@@ -132,14 +136,14 @@ chooses how request events, raw progress, responses, and errors enter its record
 ## Scope and validation
 
 The interface covers text input/output, function tools with textual results,
-and reasoning continuation. Image/audio input, Chat Completions, provider-hosted
-tools, cross-protocol conversion, and provider-specific beta headers are outside
-this step. Unknown top-level events and opaque output items are retained;
+and signed/encrypted reasoning. Image/audio input, Chat Completions, provider-hosted
+tools, conversion between reasoning formats, and provider-specific beta headers
+are outside this step. Unknown events and output items remain in raw progress;
 unsupported Anthropic content deltas fail explicitly.
 
 Tests use local HTTP fixtures and need no credentials. They cover fragmented SSE,
-Unicode, both providers, opaque continuation round trips through fresh clients,
-invalid continuation, cumulative usage, truncation, errors,
+Unicode, both providers, reuse of completed messages through fresh clients,
+reasoning metadata, interleaved parts, cumulative usage, truncation, errors,
 request-before-dispatch, ordered completion, stream termination, concurrent calls,
 stream drop, and retaining a partial frame across a dropped `next()` wait.
 Live provider/account compatibility has not been exercised.
