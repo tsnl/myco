@@ -110,6 +110,10 @@ class BrowserTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="myco-browser-test-")
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
+        # A transient startup notice must not make later snapshots replace the conversation.
+        workspace = self.home / "profiles/default/workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "prelude").touch()
         self.artifacts = OPTIONS.artifacts / self._testMethodName
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.requests = []
@@ -241,6 +245,7 @@ context_window = 100000
 
     def test_streaming_coalesces_markdown_requests(self):
         page = self.session(self.page)
+        expect(page.locator(".notice")).to_contain_text("prelude directory unreadable")
         held = []
         self.addCleanup(lambda: [route.abort() for route in held])
         page.route("**/api/markdown", lambda route: held.append(route))

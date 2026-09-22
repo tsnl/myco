@@ -104,7 +104,6 @@ function blockNode(block) {
   if (block.kind === 'tool') {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
-    details.dataset.key = JSON.stringify(block.tool);
     const summary = element('summary');
     summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), jsonArguments(block.tool.input, true));
     const body = element('div', 'tool-content');
@@ -149,27 +148,36 @@ function replaceBlock(index, block, previous) {
     if (node.tagName === 'DETAILS' && nodes[index].tagName === 'DETAILS') node.open = nodes[index].open;
     nodes[index].replaceWith(node);
   } else {
-    if (!nodes.length) transcript.replaceChildren();
+    if (!nodes.length) transcript.querySelector('.welcome')?.remove();
     transcript.append(node);
   }
   nodes[index] = node;
   scrollLatest();
 }
+function blockKey(block) {
+  if (block.kind === 'tool') return JSON.stringify(['tool', block.tool]);
+  if (block.kind === 'message') return JSON.stringify(['message', block.role, block.time, block.images]);
+  return JSON.stringify(['notice', block.text]);
+}
 function snapshot(next) {
-  const open = new Map();
-  for (const node of nodes) if (node?.dataset.key) {
-    const queue = open.get(node.dataset.key) || []; queue.push(node.open); open.set(node.dataset.key, queue);
-  }
   const sameSession = state.session_id === next.session_id && state.thread_id === next.thread_id;
-  const previous = state;
+  const reusable = new Map();
+  if (sameSession) for (const [index, block] of state.blocks.entries()) {
+    const key = blockKey(block);
+    const queue = reusable.get(key) || [];
+    queue.push({ block, node: nodes[index] }); reusable.set(key, queue);
+  }
   state = next;
   history.replaceState(null, '', `/sessions/${encodeURIComponent(state.session_id)}`);
-  if (!sameSession) { nodes.length = 0; transcript.replaceChildren(); }
+  nodes.length = 0;
   for (const [index, block] of state.blocks.entries()) {
-    replaceBlock(index, block, sameSession ? previous.blocks[index] : undefined);
-    if (sameSession && nodes[index].dataset.key) nodes[index].open = open.get(nodes[index].dataset.key)?.shift() || false;
+    const previous = reusable.get(blockKey(block))?.shift();
+    if (previous) nodes[index] = previous.node;
+    replaceBlock(index, block, previous?.block);
+    if (transcript.children[index] !== nodes[index]) transcript.insertBefore(nodes[index], transcript.children[index] || null);
   }
-  for (const node of nodes.splice(state.blocks.length)) node.remove();
+  const retained = new Set(nodes);
+  for (const node of Array.from(transcript.children)) if (!retained.has(node)) node.remove();
   if (!nodes.length && !transcript.querySelector('.welcome')) {
     const welcome = element('section', 'welcome');
     welcome.append(element('h1', '', 'MYCO'), element('p', '', 'Write a prompt to begin. Tool inputs and output expand in place.'));
