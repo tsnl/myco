@@ -11,8 +11,8 @@ Implemented so far:
 
 - [`myco::model`](src/model/README.md): a concrete `GenAiClient`, private provider
   drivers, and a generation stream.
-- [`myco::thread`](src/thread/README.md): owned history snapshots, fixed references,
-  forks, and an injected store with an in-memory implementation.
+- [`myco::thread`](src/thread/README.md): owned conversation values with synchronous
+  appends, copies, forks, and fixed history references.
 
 Each module's public interface lives in its `mod.rs`. Workflow logic, durable
 storage, services, and the HTTP API are subsequent review steps in the design.
