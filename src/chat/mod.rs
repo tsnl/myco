@@ -7,6 +7,9 @@ use crate::generative_model::{Content, Message};
 mod session_turn;
 pub use session_turn::{SessionTurnOutcome, persist_session, run_session_turn, wire_checkpoint};
 
+mod followup;
+pub use followup::{FollowupHandler, append_followup};
+
 mod runner;
 pub use runner::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 

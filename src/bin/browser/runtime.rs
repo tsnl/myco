@@ -601,7 +601,7 @@ async fn worker(
 
 async fn execute(
     boot: &mut Boot,
-    app: &App,
+    app: &Arc<App>,
     work: Work,
     args: &Args,
 ) -> std::result::Result<(), String> {
@@ -623,7 +623,14 @@ async fn execute(
                         json!({"kind":"block", "index":index, "block":block}),
                     );
                 }
+                let followups = app.clone();
+                let image_limit = boot.catalog_model.spec.max_image_base64_bytes;
+                boot.runner
+                    .set_followup_handler(Some(Arc::new(move |agent, session| {
+                        followups.deliver_followups(agent, session, image_limit)
+                    })));
                 let outcome = boot.runner.submit(content, time, work.cancel).await;
+                boot.runner.set_followup_handler(None);
                 outcome.result.map(|_| ()).map_err(|e| e.to_string())
             }
         },
@@ -651,6 +658,57 @@ async fn execute(
 }
 
 impl App {
+    fn deliver_followups(
+        &self,
+        agent: &mut myco::agent::Agent,
+        session: &ActiveSession,
+        image_limit: u64,
+    ) -> std::result::Result<bool, myco::agent::AgentInteractionError> {
+        let queued = self.live.lock().unwrap().snapshot.queued.clone();
+        let mut delivered = false;
+        for next in queued {
+            if self.shutdown.is_cancelled()
+                || self.live.lock().unwrap().snapshot.status == "Cancelling"
+            {
+                break;
+            }
+            let content = match super::super::expand_image_attachments(&next.text, image_limit) {
+                Ok(content) => content,
+                Err(error) => {
+                    self.notice(format!("Queued message could not be sent: {error}"));
+                    self.finish_followup(next.request_id, None);
+                    continue;
+                }
+            };
+            myco::chat::append_followup(agent, session, content.clone(), next.accepted_at)?;
+            let block = Block::message("user", &content, Some(view::timestamp(&next.accepted_at)));
+            self.finish_followup(next.request_id, Some(block));
+            delivered = true;
+        }
+        Ok(delivered)
+    }
+
+    fn finish_followup(&self, request_id: Uuid, block: Option<Block>) {
+        let mut live = self.live.lock().unwrap();
+        let snapshot = &mut live.snapshot;
+        if snapshot
+            .queued
+            .front()
+            .is_some_and(|next| next.request_id == request_id)
+        {
+            snapshot.queued.pop_front();
+        }
+        if let Some(block) = block {
+            let index = snapshot.blocks.len();
+            snapshot.blocks.push(block.clone());
+            self.publish(
+                snapshot,
+                json!({"kind":"block", "index":index, "block":block}),
+            );
+        }
+        self.publish(snapshot, json!({"kind":"meta", "meta":snapshot.metadata()}));
+    }
+
     pub(super) fn accept(&self, request: ActionRequest) -> Result<()> {
         let mut live = self.live.lock().unwrap();
         if self.shutdown.is_cancelled() {
@@ -757,7 +815,6 @@ impl App {
             cancel.cancel();
             live.snapshot.status = "Cancelling".into();
         }
-        live.snapshot.queued.clear();
         let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
         self.publish(&mut live.snapshot, change);
         Ok(())

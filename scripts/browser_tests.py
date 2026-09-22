@@ -225,7 +225,7 @@ context_window = 100000
         self.assertTrue(body.evaluate("node => node.isConnected"), "Metadata snapshots must retain rendered Markdown")
         expect(page.locator(".tool")).to_have_attribute("open", "")
 
-    def test_queued_messages_survive_refresh_and_run_in_submission_order(self):
+    def test_queued_messages_survive_refresh_and_join_the_next_tool_results_in_order(self):
         page = self.session(self.page)
         self.submit(page, "Alpha wait")
         expect(page.locator(".tool.running")).to_have_count(1)
@@ -244,6 +244,13 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         expect(page.locator("#queued")).to_be_hidden()
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
+        self.assertEqual(len(self.requests), 2, "Follow-ups share the next model request after the tool result")
+        self.assertEqual(self.turns.get("Alpha wait"), 1)
+        self.assertNotIn("Alpha markdown", self.turns, "There is no separate model request for each queued message")
+        request = self.requests[-1]["input"]
+        result = next(i for i, item in enumerate(request) if item.get("type") == "function_call_output")
+        followups = [i for i, item in enumerate(request) if item.get("role") == "user" and "Alpha markdown" in json.dumps(item)]
+        self.assertTrue(followups and all(i > result for i in followups))
 
     def test_tool_timers_tick_every_tenth_and_keep_independent_durations_across_refresh(self):
         page = self.page
@@ -293,20 +300,44 @@ context_window = 100000
         page.reload()
         expect(page.locator(".tool .tool-duration")).to_have_text(stopped)
 
-    def test_cancel_clears_queued_messages_without_submitting_them(self):
+    def test_cancel_sends_queued_messages_with_the_cancelled_tool_results(self):
         page = self.session(self.page)
         self.submit(page, "Alpha wait")
         expect(page.locator(".tool.running")).to_have_count(1)
         page.fill("#prompt", "Alpha markdown")
         page.press("#prompt", "Enter")
         expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown"])
-        expect(page.locator("#cancel")).to_have_text("Cancel run & queue")
+        expect(page.locator("#cancel")).to_have_text("Cancel & send queued")
         page.click("#cancel")
         expect(page.locator("#model")).to_be_enabled()
         expect(page.locator("#queued")).to_be_hidden()
-        expect(page.locator(".user")).to_have_count(1)
+        expect(page.locator(".user .body")).to_have_text(["Alpha wait", "Alpha markdown"])
         expect(page.locator(".tool.failed")).to_have_count(1)
-        self.assertNotIn("Alpha markdown", self.turns)
+        expect(page.locator(".markdown table")).to_have_count(1)
+        self.assertEqual(self.turns.get("Alpha markdown"), 1)
+        self.assertEqual(len(self.requests), 2)
+        results = [item for item in self.requests[-1]["input"] if item.get("type") == "function_call_output"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("cancel", json.dumps(results).lower())
+
+    def test_queued_messages_wait_for_all_results_in_a_parallel_tool_batch(self):
+        page = self.session(self.page)
+        self.submit(page, "Alpha parallel")
+        expect(page.locator(".tool.running")).to_have_count(2)
+        page.fill("#prompt", "Alpha markdown")
+        page.press("#prompt", "Enter")
+        expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown"])
+        (self.home / "Alpha-release-0").touch()
+        expect(page.locator(".tool.done")).to_have_count(1)
+        page.wait_for_timeout(150)
+        expect(page.locator("#queued-list li")).to_have_text(["Alpha markdown"])
+        self.assertEqual(len(self.requests), 1)
+        (self.home / "Alpha-release-1").touch()
+        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator(".user .body")).to_have_text(["Alpha parallel", "Alpha markdown"])
+        self.assertEqual(len(self.requests), 2)
+        results = [item for item in self.requests[-1]["input"] if item.get("type") == "function_call_output"]
+        self.assertEqual(len(results), 2)
 
     def test_titles_update_during_turns_and_tool_inputs_use_labeled_fields(self):
         page = self.session(self.page)
