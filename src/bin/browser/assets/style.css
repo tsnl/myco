@@ -32,11 +32,11 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .brand { flex: none; color: var(--green); text-decoration: none; font-weight: 800; }
 .brand span { color: var(--dim); }
 #session-title { flex: 1; min-width: 0; margin: 0; padding-left: 16px; border-left: 1px solid var(--line); font: inherit; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.toolbar-actions, .toolbar-tools { display: flex; align-items: center; gap: 2px; }
+.toolbar-actions, .toolbar-tools { display: flex; align-items: center; gap: 8px; }
 .toolbar-actions { flex: none; gap: 12px; }
 .toolbar button { min-height: 36px; padding: 5px 9px; font-size: 13px; white-space: nowrap; }
-.toolbar-tools button { border-color: transparent; background: transparent; color: var(--dim); }
-.toolbar-tools button:hover:not(:disabled), .toolbar-tools button[aria-expanded="true"] { color: #e2e8f0; border-color: var(--line); background: #d8e7ff0a; }
+.toolbar-tools button { border-color: var(--glass-border); background: #0d172a66; color: var(--dim); }
+.toolbar-tools button:hover:not(:disabled), .toolbar-tools button[aria-expanded="true"] { color: #e2e8f0; border-color: var(--dim); background: #0d172a99; }
 .toolbar #new-session { color: var(--green); border-color: #a6da9538; background: #a6da950b; }
 .toolbar #new-session:hover { border-color: #a6da9570; background: #a6da9517; }
 #session-browser { max-width: 980px; margin: 0 auto; padding: 40px 32px; }
