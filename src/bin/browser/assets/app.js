@@ -6,6 +6,7 @@ let connected = false;
 let revision = -1;
 let follow = true;
 let pending = null;
+let selectingModel = false;
 const nodes = [];
 const markdownJobs = new WeakMap();
 
@@ -33,6 +34,17 @@ new ResizeObserver(() => {
 }).observe($('composer'));
 function resizeInput() { $('prompt').style.height = 'auto'; $('prompt').style.height = `${$('prompt').scrollHeight}px`; }
 $('prompt').addEventListener('input', resizeInput);
+$('activity-toggle').onclick = () => {
+  $('activity').showModal();
+  $('activity-toggle').setAttribute('aria-expanded', 'true');
+};
+$('activity-close').onclick = () => $('activity').close();
+$('activity').addEventListener('close', () => $('activity-toggle').setAttribute('aria-expanded', 'false'));
+$('activity').addEventListener('click', (event) => {
+  if (event.target !== $('activity')) return;
+  const rect = $('activity').getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) $('activity').close();
+});
 
 function imageSource(source) {
   if (/^https?:\/\//.test(source) || /^data:image\/(png|jpeg|gif|webp);base64,/.test(source)) return source;
@@ -158,13 +170,20 @@ function snapshot(next) {
   metadata();
 }
 function metadata() {
-  $('model').textContent = state.model || '';
+  const model = $('model');
+  const keys = state.models || [];
+  if (keys.length !== model.options.length || keys.some((key, index) => model.options[index]?.value !== key)) {
+    model.replaceChildren(...keys.map((key) => { const option = element('option', '', key); option.value = key; return option; }));
+  }
+  model.value = state.model || '';
+  const disabled = !connected || state.busy || selectingModel;
+  model.disabled = disabled;
   activity();
-  $('send').disabled = !connected || state.busy;
+  $('send').disabled = disabled;
   $('cancel').hidden = !state.busy;
-  $('new-session').disabled = !connected || state.busy;
-  $('compact').disabled = !connected || state.busy || !state.blocks.length;
-  $('sessions').disabled = !connected || state.busy;
+  $('new-session').disabled = disabled;
+  $('compact').disabled = disabled || !state.blocks.length;
+  $('sessions').disabled = disabled;
   transcript.setAttribute('aria-busy', String(!!state.busy));
   document.title = `${state.title || 'myco'} · myco`;
   if (!state.busy) refreshSessions();
@@ -173,21 +192,31 @@ function activity() {
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
   const tasks = state.tasks || [];
   const count = calls.length + tasks.length;
-  $('activity').hidden = !count;
-  $('activity-title').textContent = `${connected ? 'Running' : 'Last known running'} · ${count}`;
+  $('activity-count').textContent = count;
+  $('activity-toggle').classList.toggle('has-activity', !!count);
+  $('activity-title').textContent = connected ? 'Activity' : 'Activity · reconnecting';
+  $('activity-empty').hidden = !!count;
+  $('active-calls').hidden = !calls.length;
+  $('background-tasks').hidden = !tasks.length;
+  $('activity-divider').hidden = !calls.length || !tasks.length;
+  const focusedCall = document.activeElement?.dataset.blockIndex;
   const list = $('activity-list'); list.replaceChildren();
   for (const { block, index } of calls) {
     const item = element('li');
     const button = element('button', 'active-call', `${block.tool.name} ${argumentPreview(block.tool.input)}`);
     button.type = 'button';
+    button.dataset.blockIndex = index;
     button.onclick = () => {
+      $('activity').close();
       nodes[index].open = true;
       follow = false;
       nodes[index].scrollIntoView({ block: 'center' });
     };
     item.append(button); list.append(item);
   }
-  for (const task of tasks) list.append(element('li', 'background-task', task));
+  const background = $('background-list'); background.replaceChildren();
+  for (const task of tasks) background.append(element('li', 'background-task', task));
+  if ($('activity').open && focusedCall !== undefined) (list.querySelector(`[data-block-index="${focusedCall}"]`) || $('activity-close')).focus({ preventScroll: true });
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
   $('connection').textContent = connected ? state.status === 'Cancelling' ? 'Cancelling' : current : 'Reconnecting…';
 }
@@ -223,7 +252,7 @@ async function sendAction(action, requestId = crypto.randomUUID()) {
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
-  if (!connected || state.busy) return;
+  if (!connected || state.busy || selectingModel) return;
   const text = $('prompt').value.trim(); if (!text) return;
   let action = { kind: 'submit', text };
   if (text.startsWith('/')) {
@@ -245,3 +274,11 @@ $('new-session').onclick = () => sendAction({ kind: 'new' }).catch((e) => error(
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
 $('sessions').onchange = () => sendAction({ kind: 'open', id: $('sessions').value }).catch((e) => error(e.message));
 $('cancel').onclick = () => api('/api/cancel', { session_id: state.session_id }).catch((e) => error(e.message));
+$('model').onchange = async () => {
+  const key = $('model').value;
+  if (!key || key === state.model) return;
+  selectingModel = true; metadata();
+  try { await sendAction({ kind: 'select_model', key }); }
+  catch (e) { error(e.message); }
+  finally { selectingModel = false; metadata(); }
+};

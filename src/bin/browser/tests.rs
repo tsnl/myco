@@ -16,6 +16,7 @@ fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
                 thread_id: "thread".into(),
                 title: "Test".into(),
                 model: "test".into(),
+                models: vec!["test".into(), "second".into()],
                 busy: false,
                 status: "Ready".into(),
                 tasks: vec![],
@@ -173,6 +174,41 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
         StatusCode::CONFLICT
     );
     assert!(work.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn model_selection_requires_an_idle_current_session() {
+    let (app, mut work) = app();
+    let mut request = action_request();
+    request.action = Action::SelectModel {
+        key: "second".into(),
+    };
+    app.live.lock().unwrap().snapshot.busy = true;
+    assert_eq!(
+        action(State(app.clone()), Json(request.clone()))
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::CONFLICT
+    );
+    app.live.lock().unwrap().snapshot.busy = false;
+    let mut stale = request.clone();
+    stale.session_id = "another-session".into();
+    assert_eq!(
+        action(State(app.clone()), Json(stale)).await.unwrap_err().0,
+        StatusCode::CONFLICT
+    );
+    assert!(work.try_recv().is_err());
+    for _ in 0..2 {
+        action(State(app.clone()), Json(request.clone()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(work.try_recv().unwrap().request.action, request.action);
+    assert!(work.try_recv().is_err());
+    let snapshot = app.snapshot().change;
+    assert_eq!(snapshot["snapshot"]["model"], "test");
+    assert_eq!(snapshot["snapshot"]["models"], json!(["test", "second"]));
 }
 
 #[tokio::test]

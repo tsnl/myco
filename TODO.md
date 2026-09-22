@@ -149,6 +149,10 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Control plane (default can stay open)
 
+- [ ] **Browser activity sections** — add triggers and cron activity alongside
+      tool calls and background sessions in the collapsed right-hand drawer.
+      Keep each activity type in its own section, separated by short inset
+      dividers; scheduled execution and its controls need a separate design.
 - [x] (REJECTED) **Permission modes** — e.g. ask / allowlist / autopilot; optional network/fs boundaries.
   - Wrong mechanism: better to use OS-level protection or bubblewrap sandboxing.
 - [ ] **Dangerous-command gates** — `rm -rf`, `git push --force`, `sudo`, curl|sh, etc.

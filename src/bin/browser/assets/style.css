@@ -65,20 +65,39 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .notice { padding: 10px 0; white-space: pre-wrap; }
 .composer { position: fixed; z-index: 3; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); width: min(932px, calc(100% - 32px)); padding: 13px 16px 11px; border: 1px solid #485563; border-radius: 12px; background: #191e25f5; box-shadow: 0 10px 40px #0009; backdrop-filter: blur(12px); }
 .composer:focus-within { border-color: #708b9a; }
-#activity { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 10px; }
-#activity-title { color: var(--cyan); font-weight: 700; }
-#activity-list { max-height: 18vh; overflow: auto; margin: 4px 0 0; padding-left: 1.5em; color: var(--cyan); }
-#activity-list li { overflow-wrap: anywhere; }
-.active-call { display: block; width: 100%; text-align: left; border: 0; background: none; color: inherit; padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#activity-toggle { white-space: nowrap; }
+#activity-toggle.has-activity { color: var(--cyan); border-color: var(--cyan); }
+#activity-count { display: inline-block; min-width: 1.5em; margin-left: 4px; border-radius: 4px; background: #27313a; }
+#activity { position: fixed; inset: 16px 16px 16px auto; margin: 0; width: 390px; max-width: calc(100% - 32px); height: calc(100dvh - 32px); max-height: none; padding: 20px; border: 1px solid #485563; border-radius: 12px; background: #161b22; color: inherit; box-shadow: 0 10px 40px #0009; }
+#activity::backdrop { background: #0005; }
+.activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
+#activity h2, #activity h3 { font: inherit; font-weight: 700; margin: 0; }
+#activity h3 { color: var(--cyan); }
+#activity-close { min-width: 36px; min-height: 36px; }
+#activity-empty { color: var(--dim); }
+.activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
+.activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
+#activity-divider { border: 0; border-top: 1px solid #485563; width: 48px; margin: 24px 0; }
+.active-call { display: block; width: 100%; text-align: left; border: 0; background: none; color: inherit; padding: 0; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { text-decoration: underline; }
 .composer-heading, .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .composer-heading label { color: var(--cyan); font-weight: 700; }
 #model, #input-hint { color: var(--dim); }
+#model { max-width: 70%; min-width: 0; text-overflow: ellipsis; }
 #prompt { display: block; width: 100%; resize: none; min-height: 3.3em; max-height: 32vh; padding: 8px 0; border: 0; background: transparent; outline: 0; }
 #prompt::placeholder { color: #77818e; }
 #send { color: var(--green); }
 #cancel { color: var(--red); margin-left: auto; }
 #error { color: var(--red); padding-top: 8px; white-space: pre-wrap; }
-#jump { position: fixed; right: 24px; bottom: calc(var(--composer-height) + 28px); z-index: 3; color: var(--cyan); box-shadow: 0 4px 20px #0008; }
+#jump { position: fixed; right: 24px; bottom: calc(var(--composer-height) + 28px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: #1b2930; box-shadow: 0 4px 20px #0008; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-@media (max-width: 650px) { .toolbar { padding: 10px 12px; gap: 7px; flex-wrap: wrap; } .session-picker { max-width: none; } #connection { width: 100%; text-align: right; } #transcript { padding-left: 16px; padding-right: 16px; } #input-hint { display: none; } .composer-footer { justify-content: flex-end; } #model { max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } }
+@media (max-width: 650px) {
+  .toolbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; padding: 10px 12px; gap: 7px; }
+  .session-picker { min-width: 0; max-width: none; }
+  #connection { grid-column: 1 / 3; margin-left: 0; }
+  #activity-toggle { grid-column: 3 / 5; justify-self: end; }
+  #transcript { padding-left: 16px; padding-right: 16px; }
+  #input-hint { display: none; }
+  .composer-footer { justify-content: flex-end; }
+  #model { overflow: hidden; white-space: nowrap; }
+}

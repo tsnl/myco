@@ -37,6 +37,7 @@ struct Snapshot {
     thread_id: String,
     title: String,
     model: String,
+    models: Vec<String>,
     busy: bool,
     status: String,
     tasks: Vec<String>,
@@ -237,6 +238,7 @@ enum Action {
     New,
     Open { id: String },
     Compact,
+    SelectModel { key: String },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -278,6 +280,12 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
                         .clone()
                         .unwrap_or_else(|| "New session".into()),
                     model: config.model.clone(),
+                    models: config
+                        .models
+                        .keys()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     busy: false,
                     status: "Ready".into(),
                     tasks: vec![],
@@ -343,7 +351,7 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
         .with_state(app.clone());
     println!("Browser UI: {}/auth?token={}", app.origin, app.token);
     println!("Press Ctrl-C here to stop the server. Browser refreshes keep the current run alive.");
-    let worker = tokio::spawn(worker(boot, app.clone(), receiver));
+    let worker = tokio::spawn(worker(boot, app.clone(), receiver, args));
     let shutdown = app.clone();
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -357,7 +365,7 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
     result
 }
 
-async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work>) {
+async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work>, args: Args) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -371,7 +379,7 @@ async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work
         };
         let result = {
             let runtime = boot.runner.runtime().clone();
-            let operation = execute(&mut boot, &app, work);
+            let operation = execute(&mut boot, &app, work, &args);
             tokio::pin!(operation);
             loop {
                 tokio::select! {
@@ -394,7 +402,7 @@ async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work
     }
 }
 
-async fn execute(boot: &mut Boot, app: &App, work: Work) -> Result<(), String> {
+async fn execute(boot: &mut Boot, app: &App, work: Work, args: &Args) -> Result<(), String> {
     match work.request.action {
         Action::Submit { text } => match super::expand_image_attachments(
             &text,
@@ -431,6 +439,20 @@ async fn execute(boot: &mut Boot, app: &App, work: Work) -> Result<(), String> {
             Ok(session) => switch(boot, session).await,
             Err(error) => Err(error),
         },
+        Action::SelectModel { key } => {
+            let catalog = boot.app_config.models.get(&key)?.clone();
+            super::select_runner_model(
+                &mut boot.runner,
+                &boot.harness,
+                &catalog,
+                args.effort,
+                args.debug_dump_api_requests,
+                boot.app_config.compaction_max_requests,
+            )
+            .await?;
+            boot.catalog_model = catalog;
+            Ok(())
+        }
     }
 }
 

@@ -16,7 +16,8 @@ frontend build step or CDN. Stop the server with Ctrl-C in the launching termina
 The browser uses the same model configuration, profile, session store, tools,
 and compaction runner as the CLI. `--model`, `--effort`, `--profile`, `--config`,
 and `--resume <id>` apply at startup. Bare `--resume` and print/host modes do
-not combine with `--web`. Model and effort changes require restarting the server.
+not combine with `--web`. Effort and configuration-file changes require
+restarting the server.
 
 ## Conversation controls
 
@@ -31,11 +32,14 @@ green, and failures red. Expand a block to inspect its complete recorded input,
 output, images, and outcome. All tools show their arguments as JSON, with
 colored keys. There is no browser verbose mode.
 
-The pinned input area lists active tool calls and local background tasks, such
-as bash sessions that continue between turns. Click an active call to open its
-block. Background-task summaries refresh every second without consuming tool
-output, and disappear when the task ends. As in the CLI, background summaries
-cover the local host; active calls include remote tools too.
+**Activity** opens a right-hand drawer with separate sections for active tool
+calls and local background tasks, such as bash sessions that continue between
+turns. The drawer starts closed; its button shows the current activity count.
+Click an active call to close the drawer and open its block. Close the drawer
+with its close button, Escape, or a click outside it. Background-task summaries
+refresh every second without consuming tool output, and disappear when the task
+ends. As in the CLI, background summaries cover the local host; active calls
+include remote tools too.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, and images. Text uses one font size;
@@ -48,6 +52,13 @@ images resolve through the profile's image store.
 USER and ASSISTANT headers have UTC timestamps on the next line. Recorded
 messages use the turn's saved acceptance time; older turns without one show
 `unknown`. The input box has no timestamp.
+
+The model selector in the input bar lists the active configuration's model keys.
+Choose a model between turns to use it for subsequent requests and compaction.
+Switching preserves conversation history and live tool sessions, and records
+the change in the session. An unavailable model leaves the current selection
+unchanged and shows an error. The selector does not change the configured
+startup default.
 
 The session picker opens a recent visible session. **New** starts a fresh session;
 **Compact** creates a successor thread in the current session. These controls
