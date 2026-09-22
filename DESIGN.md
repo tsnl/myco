@@ -86,8 +86,9 @@ It yields the request before dispatch, ordered progress, and one
 `Completed { message, finish, usage }` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
-The returned assistant message holds content and provider continuation, ready to
-append to the next request. Finish reason and usage describe the generation.
+The returned assistant message holds content and opaque continuation JSON, ready
+to append to the next request. Callers preserve continuation unchanged; private
+backends interpret and validate it. Finish reason and usage describe the generation.
 
 ## Workspaces and service APIs
 
@@ -312,8 +313,8 @@ an enclosing agent object.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
 The richer roles in `thread` are interpreted by each workflow, not mechanically
-converted into model roles. Provider-native continuation data stays in inference
-records alongside the portable thread entries.
+converted into model roles. Opaque continuation data stays in inference records
+alongside the portable thread entries; workflows need no provider-specific types.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
