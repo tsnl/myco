@@ -87,8 +87,9 @@ It yields the request before dispatch, raw progress, normalized deltas, and one
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
 Each request supplies the complete selected conversation history. Backends rebuild
-their request from those messages. The returned assistant message holds output,
-ready to append to that history. Reasoning content retains its signature or
+their request from those messages. `Message::Assistant` holds an ordered
+`content: Vec<ContentPart>` for both generated replies and request history.
+Parts include text, reasoning, and tool calls; reasoning retains its signature or
 encrypted data explicitly. Finish reason and usage describe the generation.
 
 ## Workspaces and service APIs
