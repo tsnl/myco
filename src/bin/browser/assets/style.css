@@ -6,6 +6,7 @@
   color: #e2e8f0; background: #090f1c;
   --dim: #c7d1e0; --cyan: #8bd5dc; --green: #a6da95; --amber: #e5c890; --red: #ed8796;
   --line: #d8e7ff26; --composer-height: 180px; --toolbar-height: 65px;
+  --composer-bottom: max(16px, env(safe-area-inset-bottom));
   --glass-tint: 12 20 35;
   --glass-well: rgb(var(--glass-tint) / .64);
   --glass-raised: rgb(var(--glass-tint) / .77);
@@ -111,7 +112,7 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .thinking summary { cursor: pointer; }
 .thinking .body { margin-top: 10px; }
 .notice { color: var(--red); padding: 10px 0; white-space: pre-wrap; }
-.composer { position: fixed; z-index: 3; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); width: min(932px, calc(100% - 32px)); padding: 16px 20px 14px; border: 1px solid var(--glass-border); border-radius: 0; background: var(--glass-composer); box-shadow: var(--glass-shadow), inset 0 1px #ffffff08; backdrop-filter: var(--glass-filter); }
+.composer { position: fixed; z-index: 3; bottom: var(--composer-bottom); left: 50%; transform: translateX(-50%); width: min(932px, calc(100% - 32px)); padding: 16px 20px 14px; border: 1px solid var(--glass-border); border-radius: 0; background: var(--glass-composer); box-shadow: var(--glass-shadow), inset 0 1px #ffffff08; backdrop-filter: var(--glass-filter); }
 .composer:focus-within { border-color: #708b9a; }
 #activity-toggle { white-space: nowrap; }
 #activity-toggle.has-activity { color: var(--cyan); }
@@ -141,7 +142,7 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 #queued-list li { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
 #cancel { color: var(--red); margin-left: auto; }
 #error { color: var(--red); padding-top: 8px; white-space: pre-wrap; }
-#jump { position: fixed; right: 24px; bottom: calc(var(--composer-height) + 28px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: var(--glass-raised); backdrop-filter: var(--glass-filter); box-shadow: 0 8px 32px #02061266; }
+#jump { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--composer-height) + var(--composer-bottom) + 12px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: var(--glass-raised); backdrop-filter: var(--glass-filter); box-shadow: 0 8px 32px #02061266; }
 @media (max-width: 760px) {
   :root { --toolbar-height: 89px; }
   .toolbar-inner { flex-wrap: wrap; gap: 8px 12px; min-height: 88px; padding: 10px 16px; }
