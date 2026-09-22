@@ -38,25 +38,34 @@ impl IntoResponse for Error {
 pub(super) struct Server {
     pub(super) token: String,
     pub(super) origin: String,
+    port: u16,
     pub(super) cookie: String,
     launch_path: String,
     pub(super) sessions: Sessions,
 }
 
 impl Server {
-    pub(super) fn new(
-        sessions: Sessions,
-        address: std::net::SocketAddr,
-        launch_path: String,
-    ) -> Self {
+    pub(super) fn new(sessions: Sessions, origin: String, port: u16, launch_path: String) -> Self {
         Self {
             token: Uuid::new_v4().as_simple().to_string(),
-            cookie: format!("myco_{}", address.port()),
-            origin: format!("http://{address}"),
+            cookie: format!("myco_{port}"),
+            origin,
+            port,
             launch_path,
             sessions,
         }
     }
+}
+
+/// The origin a request addressed, or `None` when its `Host` is not this server.
+///
+/// A non-loopback bind answers on every name that resolves here, so the served
+/// origin cannot be one fixed string; the port is what identifies this server.
+/// Authority rests on the launch cookie, which a browser only sends back to the
+/// host that set it, so a rebound name reaching this port arrives without one.
+fn addressed_origin(headers: &HeaderMap, port: u16) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    (host.rsplit_once(':')?.1.parse::<u16>().ok()? == port).then(|| format!("http://{host}"))
 }
 
 pub(super) fn router(server: Arc<Server>) -> Router {
@@ -120,10 +129,11 @@ pub(super) fn router(server: Arc<Server>) -> Router {
 }
 
 pub(super) fn allowed(headers: &HeaderMap, app: &Server, mutation: bool) -> bool {
-    headers.get(header::HOST).and_then(|v| v.to_str().ok()) == app.origin.strip_prefix("http://")
-        && (!mutation
-            || headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
-                == Some(app.origin.as_str()))
+    let Some(origin) = addressed_origin(headers, app.port) else {
+        return false;
+    };
+    (!mutation
+        || headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(origin.as_str()))
         && headers
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
@@ -173,9 +183,7 @@ async fn auth(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult<Response> {
-    if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != app.origin.strip_prefix("http://")
-        || query.get("token") != Some(&app.token)
-    {
+    if addressed_origin(&headers, app.port).is_none() || query.get("token") != Some(&app.token) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid launch URL.".into()));
     }
     let mut response = Redirect::to(&app.launch_path).into_response();

@@ -84,9 +84,19 @@ const SLASH_COMMANDS: &[&str] = &[
     disable_help_flag = true,
 )]
 struct Args {
-    /// Serve the browser UI on 127.0.0.1 (default port 8765; use 0 for a free port).
+    /// Serve the browser UI (default port 8765; use 0 for a free port).
     #[arg(long, num_args = 0..=1, default_missing_value = "8765", value_name = "PORT", conflicts_with = "print")]
     web: Option<u16>,
+    /// IP address `--web` listens on. Loopback by default; `0.0.0.0` also answers
+    /// every other machine that can route here, so the launch token is the only
+    /// thing keeping them out of these sessions.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        default_value = "127.0.0.1",
+        requires = "web"
+    )]
+    web_bind: std::net::IpAddr,
     /// Show CLI help, or print a manual article when ARTICLE is given
     /// (e.g. `myco --help overview`). Same articles startup exports to
     /// `~/.myco/profiles/default/manual/<version>/<commit>/` for agents to read.

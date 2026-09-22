@@ -1,17 +1,27 @@
 # Browser UI
 
-Start the local server, then open the URL it prints:
+Start the server, then open the URL it prints:
 
 ```bash
 myco --web
 myco --web 8766 --profile research
 myco --web 0 --config /path/to/config.toml --resume <session-id>
+myco --web --web-bind 0.0.0.0
 ```
 
 `--web` uses port 8765 by default; `--web 0` picks a free port. The server binds
-to `127.0.0.1`. Its launch URL signs this browser into this server; keep that
-URL private. Assets and Markdown rendering are bundled with myco, with no
-frontend build step or CDN. Stop the server with Ctrl-C in the launching terminal.
+to `127.0.0.1` unless `--web-bind` names another address. Its launch URL signs
+this browser into this server; keep that URL private. Assets and Markdown
+rendering are bundled with myco, with no frontend build step or CDN. Stop the
+server with Ctrl-C in the launching terminal.
+
+`--web-bind 0.0.0.0` listens on every interface, so the UI answers any machine
+that can route here, under whatever name they dial. The launch token is then the
+only thing between them and these sessions — and a session is a shell on your
+machine. There is no TLS and no user model: treat the URL as the credential,
+prefer an SSH tunnel or a trusted network, and pick a hostname over an address
+when handing the link out. Restarting the server mints a new token, which
+invalidates the previous launch URL.
 
 The home page lists your visible, unarchived sessions, with search, recent update
 times, and running status. **New session** creates a session and opens its own

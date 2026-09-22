@@ -90,7 +90,8 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         .map_or_else(|| broadcast::channel(4).0, |app| app.events.clone());
     Arc::new(Server::new(
         sessions,
-        "127.0.0.1:8765".parse().unwrap(),
+        "http://127.0.0.1:8765".into(),
+        8765,
         "/".into(),
     ))
 }
@@ -575,7 +576,29 @@ async fn browser_actions_require_the_launch_cookie_and_same_origin() {
     assert!(allowed(&headers, &app, true));
     headers.insert(header::ORIGIN, "https://other.example".parse().unwrap());
     assert!(!allowed(&headers, &app, true));
-    headers.insert(header::HOST, "other.example:8765".parse().unwrap());
+    headers.insert(header::HOST, "other.example:1".parse().unwrap());
+    assert!(!allowed(&headers, &app, false));
+}
+
+/// A non-loopback bind answers on every name that routes to it, so the served
+/// origin follows the request rather than one address fixed at startup.
+#[tokio::test]
+async fn any_name_reaching_the_bound_port_is_served_against_its_own_origin() {
+    let app = server(&[]);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, "dus-mj0kwbx5:8765".parse().unwrap());
+    headers.insert(
+        header::COOKIE,
+        format!("{}={}", app.cookie, app.token).parse().unwrap(),
+    );
+    assert!(allowed(&headers, &app, false));
+    // Cross-origin writes stay barred: the Origin must name the host asked for.
+    headers.insert(header::ORIGIN, "http://127.0.0.1:8765".parse().unwrap());
+    assert!(!allowed(&headers, &app, true));
+    headers.insert(header::ORIGIN, "http://dus-mj0kwbx5:8765".parse().unwrap());
+    assert!(allowed(&headers, &app, true));
+    // A request that never carried the launch cookie is still refused.
+    headers.remove(header::COOKIE);
     assert!(!allowed(&headers, &app, false));
 }
 
