@@ -2,8 +2,8 @@
 // drifting; only changes to the sky palette repaint the finished clouds.
 const LAYERS = [
   { name: 'high', altitude: '8+', count: 8, top: 9, spread: 25, width: 850, height: 220, resolution: 192, duration: 6800 },
-  { name: 'mid', altitude: '3–8', count: 8, top: 32, spread: 26, width: 900, height: 260, resolution: 224, duration: 5100 },
-  { name: 'low', altitude: '0–3', count: 8, top: 60, spread: 26, width: 1050, height: 320, resolution: 256, duration: 3700 },
+  { name: 'mid', altitude: '3–8', count: 8, top: 32, spread: 26, width: 900, height: 440, resolution: 256, duration: 5100 },
+  { name: 'low', altitude: '0–3', count: 8, top: 60, spread: 26, width: 1050, height: 580, resolution: 288, duration: 3700 },
 ];
 
 //

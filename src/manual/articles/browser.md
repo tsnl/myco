@@ -17,9 +17,10 @@ server with Ctrl-C in the launching terminal.
 
 The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
-floating controls use background blur. Translucent, feathered cloud strands drift
-slowly in three layers: fine high wisps near the top, middle veils below them, and
-broader low clouds near the horizon. Colors follow daylight, sunset, and night;
+floating controls use background blur. Translucent clouds drift slowly in three
+layers: fine high wisps near the top, soft middle billows below them, and broader
+low clouds near the horizon. Their feathered edges and overlapping layers let the
+sky show through. Colors follow daylight, sunset, and night;
 stars twinkle behind the clouds. An occasional distant airplane crosses the sky,
 with a faint contrail or navigation lights after dark. These are decorative
 flybys, with at most two visible at once. Wet weather adds fine rain streaks at

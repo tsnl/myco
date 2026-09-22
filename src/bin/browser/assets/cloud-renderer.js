@@ -30,10 +30,14 @@ function turbulence(sample, x, y) {
     + sample(x * 4.07 + 31, y * 4.07 + 21) * 0.14 + sample(x * 8.13, y * 8.13) * 0.07;
 }
 
-function strands(kind, roll) {
-  return Array.from({ length: kind === 'high' ? 11 : 9 }, () => ({
+//
+// Cirrus and billows
+//
+
+function strands(roll) {
+  return Array.from({ length: 11 }, () => ({
     x: (roll() - 0.5) * 0.5, y: (roll() - 0.5) * 0.3,
-    width: 0.4 + roll() * 0.5, thickness: (kind === 'high' ? 0.018 : 0.038) + roll() * 0.035,
+    width: 0.4 + roll() * 0.5, thickness: 0.018 + roll() * 0.035,
     bend: (roll() - 0.5) * 0.25, slope: (roll() - 0.5) * 0.22,
     phase: roll() * Math.PI * 2, strength: 0.35 + roll() * 0.45,
   }));
@@ -50,55 +54,87 @@ function envelope(x, y, shapes) {
   return density;
 }
 
+function billows(roll) {
+  return Array.from({ length: 7 }, (_, index) => ({
+    x: (index - 3) * 0.19 + (roll() - 0.5) * 0.16,
+    y: (roll() - 0.5) * 0.2,
+    width: 0.24 + roll() * 0.22,
+    height: 0.1 + roll() * 0.12,
+  }));
+}
+
+function cloudBody(x, y, shapes) {
+  let distance = Infinity;
+  for (const shape of shapes) {
+    const dx = (x - shape.x) / shape.width, dy = (y - shape.y) / shape.height;
+    distance = Math.min(distance, dx * dx + dy * dy);
+  }
+  return Math.exp(-distance * 1.6);
+}
+
+function cloudField(spec, sample) {
+  const high = spec.kind === 'high';
+  const shapes = high ? strands(random(spec.seed)) : billows(random(spec.seed));
+  return (x, y) => {
+    const warpX = (turbulence(sample, x * 3 + 8, y * 2.5 + 8) - 0.5) * 0.3;
+    const warpY = (turbulence(sample, x * 3 + 50, y * 2.5 + 50) - 0.5) * 0.2;
+    const detail = turbulence(sample, (x + warpX) * 9 + 20, (y + warpY) * (high ? 48 : 10) + 20);
+    if (high) return envelope(x + warpX, y + warpY, shapes) * Math.max(0, detail - 0.24);
+    const body = cloudBody(x + warpX, y + warpY, shapes);
+    // Erosion opens gaps through the body and feathers its outline at several scales.
+    return Math.max(0, body - 0.38 + (detail - 0.5) * 1.25);
+  };
+}
+
+//
+// Density and diffuse lighting
+//
+
 function density(spec) {
   const { width, height, kind, seed } = spec;
-  const sample = noise(seed), shapes = strands(kind, random(seed));
-  const surface = new Float32Array(width * height);
+  const field = cloudField(spec, noise(seed));
+  const volumes = new Float32Array(width * height);
   const samples = new Uint8Array(width * height * 2);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const px = x / width * 2 - 1, py = y / height - 0.5, i = y * width + x;
-      const warpX = (sample(px * 3 + 8, py * 8 + 8) - 0.5) * 0.12;
-      const warpY = (turbulence(sample, px * 2.2 + 50, py * 6 + 50) - 0.5) * 0.19;
-      const shape = envelope(px + warpX, py + warpY, shapes);
-      const fibers = turbulence(sample, px * 4 + 20, (py + warpY) * 48 + 20);
-      const detail = Math.max(0, (fibers - 0.22) / 0.78);
-      const volume = shape * (0.2 + detail * 1.5);
+      const volume = field(px, py);
       // The outer fade prevents a texture boundary even on stretched wisps.
       const edge = Math.max(0, 1 - Math.pow(px, 8)) * Math.max(0, 1 - Math.pow(py * 2, 6));
-      const thickness = kind === 'high' ? 0.9 : kind === 'mid' ? 1.3 : 1.7;
-      samples[i * 2] = (1 - Math.exp(-volume * thickness)) * edge * 220;
-      samples[i * 2 + 1] = (0.74 + detail * 0.18) * 255;
-      surface[i] = shape * 0.065 + detail * 0.012;
+      const thickness = kind === 'high' ? 1.4 : kind === 'mid' ? 2.4 : 3;
+      samples[i * 2] = (1 - Math.exp(-volume * thickness)) * edge * 200;
+      samples[i * 2 + 1] = 220;
+      volumes[i] = volume;
     }
   }
-  if (kind !== 'high') illuminate(samples, surface, width, height);
+  if (kind !== 'high') illuminate(samples, volumes, width, height);
   return samples;
 }
 
-//
-// Lighting and texture delivery
-//
+function transmittedLight(volumes, width, x, y) {
+  let shadow = 0;
+  // Broad extinction toward the light keeps the volume soft. Surface
+  // normals over the fine noise would turn every wisp into a hard ridge.
+  for (const step of [4, 9, 17, 29, 43]) {
+    if (x < step || y < step) break;
+    shadow += volumes[(y - step) * width + x - step] * 0.2;
+  }
+  return 0.62 + 0.32 * Math.exp(-shadow * 2.4);
+}
 
-function illuminate(samples, surface, width, height) {
-  for (let y = 3; y < height - 3; y++) {
-    for (let x = 3; x < width - 3; x++) {
+function illuminate(samples, volumes, width, height) {
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
       const i = y * width + x;
       if (!samples[i * 2]) continue;
-      const nx = (surface[i - 3] - surface[i + 3]) * width / 18;
-      const ny = (surface[i - width * 3] - surface[i + width * 3]) * height / 10;
-      const sunlight = Math.max(0, (-nx * 0.48 - ny * 0.64 + 0.60) / Math.hypot(nx, ny, 1));
-      let shadow = 0;
-      for (const step of [6, 14, 28, 44]) {
-        if (x < step || y < step) break;
-        shadow += Math.max(0, surface[i - step * (width + 1)] - surface[i] - step * 0.0014);
-      }
-      const ambient = 0.34 + (1 - y / height) * 0.18;
-      const light = ambient + sunlight * 0.54 * Math.exp(-shadow * 1.4);
-      samples[i * 2 + 1] = Math.min(1, light) * 255;
+      samples[i * 2 + 1] = transmittedLight(volumes, width, x, y) * 255;
     }
   }
 }
+
+//
+// Texture delivery
+//
 
 function paint(spec) {
   let samples = cache.get(spec.id);

@@ -1,4 +1,6 @@
-#sky-clouds { position: absolute; inset: 0; }
+/* Composite the whole cloud bank before fading it: overlapping sprites must
+   still let the sky through, even with full cover in every altitude layer. */
+#sky-clouds { position: absolute; inset: 0; opacity: .56; }
 #sky-aircraft { position: absolute; inset: 0; opacity: var(--sky-clarity, 1); transition: opacity 12s; }
 .sky-aircraft { position: absolute; left: 0; top: 0; animation: aircraft-pass var(--flight-duration) linear both; }
 .aircraft-bearing { width: 28px; height: 20px; position: absolute; left: -14px; top: -10px; transform: rotate(var(--flight-heading)) scale(var(--aircraft-scale)); }
