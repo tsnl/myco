@@ -1,4 +1,4 @@
-# myco-gen-ai-service
+# myco::model
 
 One inference attempt, independent of agent behavior, storage, and tool execution.
 `GenAiClient` is a concrete type; `Config` selects OpenAI Responses or Anthropic
@@ -7,7 +7,7 @@ limits are supplied by the caller. Backend drivers are private.
 
 ```no_run
 use futures_util::StreamExt;
-use myco_gen_ai_service::{Config, Event, GenAiClient, Message, Request};
+use myco::model::{Config, Event, GenAiClient, Message, Request};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = GenAiClient::new(Config::OpenAi {
@@ -38,17 +38,18 @@ by reference or through `Arc<GenAiClient>` for concurrent requests. Additional
 provider settings, such as `reasoning` or `thinking`, go in
 `Request::provider_options`; these cannot replace managed context, tool, or
 stream fields. No model catalog, environment loading, or policy defaults are
-embedded in the crate.
+embedded in the model module.
 
-The kernel's inference adapter translates thread context into a `Request` and
-translates stream events into the vocabulary of `myco-threads`. It records native
-provider continuation and call-ID mappings, then restores that evidence when
-assembling subsequent requests. Those higher layers are specified in DESIGN.md
-and are not implemented in this crate.
+Workflow code in `logic` translates selected thread history into a `Request`
+and translates stream events into conversation entries. It records native provider
+continuation and call-ID mappings, then restores that evidence when assembling
+subsequent requests. The `thread` module supplies history operations; each workflow
+chooses its context and publication policy. These higher modules are specified in
+[DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
 
 Operation, turn, and attempt IDs belong to the caller. `Completed(Response)`
-is a validated inference outcome, not a persisted turn. The threads layer decides
-whether to accept and commit it before exposing `TurnUpdate::Committed`.
+is a validated inference outcome, not a persisted turn. Workflow code decides
+whether to accept it and append it to history before reporting a committed turn.
 Concurrent calls can produce independent candidates from the same fixed history.
 
 ## Stream contract
@@ -93,7 +94,7 @@ call IDs are preserved. Continuation with another protocol is rejected.
 Applications can reconstruct recorded responses through `Response::from_provider`;
 public types have no prescribed storage encoding.
 
-Agent evaluations can inject scripted inference results without this crate.
+Workflow evaluations can inject scripted inference results without HTTP.
 Adapter tests can construct outcomes using `Response::new`. The application
 chooses how request events, raw progress, responses, and errors enter its records.
 

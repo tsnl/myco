@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use crate::driver::Decoded;
-use crate::types::{field, index};
-use crate::{Delta, DeltaKind, Error};
+use crate::model::driver::Decoded;
+use crate::model::types::{field, index};
+use crate::model::{Delta, DeltaKind, Error};
 
 pub(super) fn decode(event: &Value) -> Result<Decoded, Error> {
     match field(event, "type")? {

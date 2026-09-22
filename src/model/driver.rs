@@ -3,7 +3,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 use serde_json::Value;
 
-use crate::{Delta, Error, Event, Protocol, Request};
+use crate::model::{Delta, Error, Event, Protocol, Request};
 
 pub(crate) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
 

@@ -4,14 +4,14 @@ A programmable conversation server with shared services and a web GUI.
 
 The implementation is organized into separately reviewable steps in
 [DESIGN.md](DESIGN.md). The engine is one `myco` crate, organized into `model`,
-`thread`, `logic`, `service`, and `api` modules. The first implementation step is
-the `model` module. The server and remote workers are binary targets; the browser
-GUI is a separate application.
+`thread`, `logic`, `service`, and `api` modules. The server and remote workers are
+planned binary targets; the browser GUI is a separate application.
 
-The current implementation is the standalone
-[`myco-gen-ai-service`](crates/myco-gen-ai-service/README.md) crate. Start review at its
-[public client](crates/myco-gen-ai-service/src/client.rs) and
-[request/response types](crates/myco-gen-ai-service/src/types.rs).
+Implemented so far: [`myco::model`](src/model/README.md), with a concrete
+[`GenAiClient`](src/model/client.rs), private provider drivers, and a generation
+stream. Start review at its [public types](src/model/types.rs) and
+[stream implementation](src/model/generation.rs). Thread history, workflow logic,
+services, and the HTTP API are subsequent review steps in the design.
 
 ```sh
 cargo test --locked --offline --workspace

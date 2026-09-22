@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco_gen_ai_service::{
+use myco::model::{
     Config, Error, Event, GenAiClient, Generation, Message, Protocol, Request, Response,
 };
 use serde_json::Value;

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::{Error, Message, Output, Protocol, Request, Response, ToolCall};
+use crate::model::{Error, Message, Output, Protocol, Request, Response, ToolCall};
 
 pub(crate) fn validate(request: &Request, protocol: Protocol) -> Result<(), Error> {
     if request.model.is_empty() || request.messages.is_empty() || request.max_output_tokens == 0 {

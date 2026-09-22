@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::model::Error;
 
 /// Decode complete SSE data events without assuming HTTP chunk boundaries,
 /// UTF-8 boundaries, or a particular line ending. EOF never completes a frame.

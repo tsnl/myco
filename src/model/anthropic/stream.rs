@@ -1,8 +1,8 @@
 use serde_json::{Map, Value, json};
 
-use crate::driver::Decoded;
-use crate::types::{array, field, index};
-use crate::{Delta, DeltaKind, Error};
+use crate::model::driver::Decoded;
+use crate::model::types::{array, field, index};
+use crate::model::{Delta, DeltaKind, Error};
 
 #[derive(Default)]
 pub(super) struct Accumulator {

@@ -5,8 +5,8 @@ use std::{
 
 use futures_core::{Stream, stream::FusedStream};
 
-use crate::driver::EventStream;
-use crate::{Error, Event};
+use crate::model::driver::EventStream;
+use crate::model::{Error, Event};
 
 /// An owned attempt, borrowing its client. Polling drives I/O; no task is spawned.
 /// Completion or error terminates the stream and releases its request.

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
-use myco_gen_ai_service::{Config, Error, Event, GenAiClient, Message, Request};
+use myco::model::{Config, Error, Event, GenAiClient, Message, Request};
 use tokio::{net::TcpListener, time::timeout};
 
 fn request() -> Request {

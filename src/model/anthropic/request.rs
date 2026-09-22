@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
-use crate::types::array;
-use crate::{Error, Message, Output, Request, Response, Tool, ToolCall};
+use crate::model::types::array;
+use crate::model::{Error, Message, Output, Request, Response, Tool, ToolCall};
 
 pub(super) fn encode(request: &Request) -> Result<Value, Error> {
     let mut body = json!({"model": request.model, "messages": messages(&request.messages)?,

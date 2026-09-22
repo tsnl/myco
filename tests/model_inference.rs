@@ -1,11 +1,11 @@
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
-use myco_gen_ai_service::{Event, Message, Protocol, Request};
+use myco::model::{Event, Message, Protocol, Request};
 
 mod common;
 
 use common::*;
-use myco_gen_ai_service::{DeltaKind, Error, Finish, Output, Response, Tool};
+use myco::model::{DeltaKind, Error, Finish, Output, Response, Tool};
 use serde_json::{Value, json};
 
 #[tokio::test]

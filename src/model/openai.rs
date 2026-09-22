@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use crate::driver::{Driver, EventStream};
-use crate::http::Transport;
-use crate::{Error, Protocol, Request};
+use crate::model::driver::{Driver, EventStream};
+use crate::model::http::Transport;
+use crate::model::{Error, Protocol, Request};
 
 mod request;
 mod response;

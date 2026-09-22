@@ -9,8 +9,8 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use crate::driver::{Decoded, EventStream};
-use crate::{Error, Event, Protocol, Response, sse::Sse};
+use crate::model::driver::{Decoded, EventStream};
+use crate::model::{Error, Event, Protocol, Response, sse::Sse};
 
 pub(crate) struct Transport {
     client: Client,

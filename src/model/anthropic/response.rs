@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use crate::types::{array, field};
-use crate::{Error, Finish, Output, Response, ToolCall, Usage};
+use crate::model::types::{array, field};
+use crate::model::{Error, Finish, Output, Response, ToolCall, Usage};
 
 pub(crate) fn decode(body: &Value) -> Result<Response, Error> {
     if field(body, "type")? != "message" {

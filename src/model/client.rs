@@ -2,8 +2,8 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::driver::Driver;
-use crate::{Error, Generation, Request, anthropic, openai, request};
+use crate::model::driver::Driver;
+use crate::model::{Error, Generation, Request, anthropic, openai, request};
 
 /// Endpoints are complete URLs. An empty key omits authentication.
 /// Credentials are deliberately excluded from debug output.

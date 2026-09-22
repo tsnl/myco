@@ -138,8 +138,8 @@ impl Response {
 
     pub fn from_provider(protocol: Protocol, body: Value) -> Result<Self, Error> {
         let mut response = match protocol {
-            Protocol::OpenAiResponses => crate::openai::response(&body)?,
-            Protocol::AnthropicMessages => crate::anthropic::response(&body)?,
+            Protocol::OpenAiResponses => crate::model::openai::response(&body)?,
+            Protocol::AnthropicMessages => crate::model::anthropic::response(&body)?,
         };
         response.validate_call_ids()?;
         response.provider = Some(ProviderResponse { protocol, body });

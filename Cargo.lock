@@ -449,7 +449,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "myco-gen-ai-service"
+name = "myco"
 version = "0.1.0"
 dependencies = [
  "async-stream",
