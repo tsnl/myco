@@ -17,7 +17,9 @@ server with Ctrl-C in the launching terminal.
 
 The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
-floating controls use background blur. Translucent clouds drift slowly in three
+floating controls use background blur. The conversation well is the lightest
+surface; the input bar and top banner share darker translucent glass, with
+dialogs darkest in front. Translucent clouds drift slowly in three
 layers: fine high wisps near the top, soft middle billows below them, and broader
 low clouds near the horizon. Broken banks vary in shape and height; increasing
 cover adds thin, broad veils. Their feathered edges and overlapping layers let the
