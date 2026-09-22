@@ -100,12 +100,16 @@ chooses how request events, raw progress, responses, and errors enter its record
 
 ## Implementation
 
-`client` holds a private `Box<dyn Driver>`. `generation` owns the public stream
-and releases it at a terminal outcome. `request` validates shared input;
-`http` yields requests and ordered response events; `sse` handles framing.
-Each backend separates request encoding, incremental interpretation, and response
-normalization into small modules. `async-stream` expresses the yielding control
-flow without an extra task or channel.
+`mod.rs` contains the entire public interface. `GenAiClient` holds a private
+`Box<dyn Driver>`; `Generation` owns each attempt's stream.
+
+- `openai_responses_backend.rs` and `anthropic_backend.rs` each implement request
+  encoding, incremental interpretation, and response normalization for a provider.
+- `backend_helpers.rs` contains the driver interface, shared validation, and
+  stream lifecycle handling.
+- `http_helpers.rs` handles HTTP transport and SSE framing.
+
+`async-stream` expresses the yielding control flow without an extra task or channel.
 
 ## Scope and validation
 

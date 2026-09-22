@@ -8,9 +8,8 @@ The implementation is organized into separately reviewable steps in
 planned binary targets; the browser GUI is a separate application.
 
 Implemented so far: [`myco::model`](src/model/README.md), with a concrete
-[`GenAiClient`](src/model/client.rs), private provider drivers, and a generation
-stream. Start review at its [public types](src/model/types.rs) and
-[stream implementation](src/model/generation.rs). Thread history, workflow logic,
+`GenAiClient`, private provider drivers, and a generation stream. Its entire
+[public interface](src/model/mod.rs) is in `mod.rs`. Thread history, workflow logic,
 services, and the HTTP API are subsequent review steps in the design.
 
 ```sh
