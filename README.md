@@ -9,9 +9,9 @@ the `model` module. The server and remote workers are binary targets; the browse
 GUI is a separate application.
 
 The current implementation is the standalone
-[`myco-genai`](crates/myco-genai/README.md) crate. Start review at its
-[public client](crates/myco-genai/src/client.rs) and
-[request/response types](crates/myco-genai/src/types.rs).
+[`myco-gen-ai-service`](crates/myco-gen-ai-service/README.md) crate. Start review at its
+[public client](crates/myco-gen-ai-service/src/client.rs) and
+[request/response types](crates/myco-gen-ai-service/src/types.rs).
 
 ```sh
 cargo test --locked --offline --workspace

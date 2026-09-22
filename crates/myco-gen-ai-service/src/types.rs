@@ -199,10 +199,9 @@ pub enum Event {
     /// Provider event plus an optional projection suitable for live rendering.
     /// Partial tool arguments are observations, not executable calls.
     Progress { raw: Value, delta: Option<Delta> },
+    /// Validated inference outcome. This service does not persist a thread turn.
+    Completed(Response),
 }
-
-/// Application failures while recording or forwarding an observation.
-pub type ObserverError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -221,8 +220,6 @@ pub enum Error {
     Protocol(String),
     #[error("provider reported an inference failure: {0}")]
     Provider(Value),
-    #[error("inference observer failed: {0}")]
-    Observer(#[source] ObserverError),
 }
 
 pub(crate) fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str, Error> {

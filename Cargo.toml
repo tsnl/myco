@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/myco-genai"]
+members = ["crates/myco-gen-ai-service"]
 resolver = "3"
 
 [workspace.package]

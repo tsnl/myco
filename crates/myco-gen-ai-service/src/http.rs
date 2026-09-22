@@ -1,12 +1,15 @@
 use std::{collections::VecDeque, time::Duration};
 
+use async_stream::try_stream;
+use futures_core::Stream;
+use futures_util::StreamExt;
 use reqwest::{
     Client, Url,
     header::{HeaderMap, HeaderValue},
 };
 use serde_json::Value;
 
-use crate::driver::{Decoded, Observer};
+use crate::driver::{Decoded, EventStream};
 use crate::{Error, Event, Protocol, Response, sse::Sse};
 
 pub(crate) struct Transport {
@@ -26,21 +29,25 @@ impl Transport {
         Ok(Self { client, endpoint })
     }
 
-    pub async fn generate(
-        &self,
+    pub fn generate<'a>(
+        &'a self,
         protocol: Protocol,
         body: Value,
-        observer: &mut dyn Observer,
-        decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send,
-    ) -> Result<Response, Error> {
-        let request = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&body)
-            .build()?;
-        observer.observe(Event::Request { protocol, body }).await?;
-        let response = self.send(request).await?;
-        read_response(Events::new(response), protocol, observer, decode).await
+        decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send + 'a,
+    ) -> EventStream<'a> {
+        Box::pin(try_stream! {
+            let request = self.request(&body)?;
+            yield Event::Request { protocol, body };
+            let response = self.send(request).await?;
+            let mut events = std::pin::pin!(response_events(response, protocol, decode));
+            while let Some(event) = events.next().await {
+                yield event?;
+            }
+        })
+    }
+
+    fn request(&self, body: &Value) -> Result<reqwest::Request, Error> {
+        Ok(self.client.post(self.endpoint.clone()).json(body).build()?)
     }
 
     async fn send(&self, request: reqwest::Request) -> Result<reqwest::Response, Error> {
@@ -117,24 +124,25 @@ fn validate_content_type(headers: &HeaderMap) -> Result<(), Error> {
     Ok(())
 }
 
-async fn read_response(
-    mut events: Events,
+fn response_events(
+    response: reqwest::Response,
     protocol: Protocol,
-    observer: &mut dyn Observer,
     mut decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send,
-) -> Result<Response, Error> {
-    while let Some(raw) = events.next().await? {
-        let decoded = decode(&raw);
-        let delta = decoded.as_ref().ok().and_then(Decoded::delta);
-        // Record valid JSON even when decoding or final normalization fails.
-        observer.observe(Event::Progress { raw, delta }).await?;
-        if let Decoded::Completed(body) = decoded? {
-            return Response::from_provider(protocol, body);
+) -> impl Stream<Item = Result<Event, Error>> + Send {
+    try_stream! {
+        let mut events = Events::new(response);
+        while let Some(raw) = events.next().await? {
+            let decoded = decode(&raw);
+            let delta = decoded.as_ref().ok().and_then(Decoded::delta);
+            // Expose valid JSON before any decoding or normalization failure.
+            yield Event::Progress { raw, delta };
+            if let Decoded::Completed(body) = decoded? {
+                yield Event::Completed(Response::from_provider(protocol, body)?);
+                return;
+            }
         }
+        Err(Error::Protocol("stream ended before its terminal event".into()))?;
     }
-    Err(Error::Protocol(
-        "stream ended before its terminal event".into(),
-    ))
 }
 
 struct Events {

@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use myco_genai::{Client, Config, Error, Event, Message, Protocol, Request, Response};
+use futures_util::StreamExt;
+use myco_gen_ai_service::{
+    Config, Error, Event, GenAiClient, Generation, Message, Protocol, Request, Response,
+};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -81,6 +84,26 @@ pub async fn fixture(
     (url, receive)
 }
 
+pub async fn unfinished_body(body: String) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/inference", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        socket
+            .write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0, "client retained an unfinished response body");
+    });
+    (url, server)
+}
+
 pub fn request() -> Request {
     Request::new(
         "test-model",
@@ -89,10 +112,10 @@ pub fn request() -> Request {
     )
 }
 
-pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<Client, Error> {
+pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
     let endpoint = endpoint.into();
     let api_key = key.into();
-    Client::new(match protocol {
+    GenAiClient::new(match protocol {
         Protocol::OpenAiResponses => Config::OpenAi { endpoint, api_key },
         Protocol::AnthropicMessages => Config::Anthropic { endpoint, api_key },
     })
@@ -104,16 +127,34 @@ pub struct Trace {
     pub result: Result<Response, Error>,
 }
 
-pub async fn collect(client: &Client, request: Request) -> Trace {
+pub async fn collect(client: &GenAiClient, request: Request) -> Trace {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        collect_events(client.generate(request)),
+    )
+    .await
+    .unwrap()
+}
+
+async fn collect_events(mut generation: Generation<'_>) -> Trace {
     let mut events = Vec::new();
-    let generation = client.generate(request, |event| {
-        events.push(event);
-        std::future::ready(Ok(()))
-    });
-    let result = tokio::time::timeout(Duration::from_secs(5), generation)
-        .await
-        .unwrap();
-    Trace { events, result }
+    let mut result = None;
+    while let Some(item) = generation.next().await {
+        assert!(result.is_none(), "event after terminal outcome");
+        match item {
+            Ok(event) => {
+                if let Event::Completed(response) = &event {
+                    result = Some(Ok(response.clone()));
+                }
+                events.push(event);
+            }
+            Err(error) => result = Some(Err(error)),
+        }
+    }
+    Trace {
+        events,
+        result: result.expect("stream ended without a terminal outcome"),
+    }
 }
 
 pub async fn run(protocol: Protocol, body: &str) -> Trace {

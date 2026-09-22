@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use crate::driver::{BoxFuture, Driver, Observer};
+use crate::driver::{Driver, EventStream};
 use crate::http::Transport;
-use crate::{Error, Protocol, Request, Response};
+use crate::{Error, Protocol, Request};
 
 mod request;
 mod response;
@@ -31,18 +31,9 @@ impl Driver for Backend {
         request::encode(request)
     }
 
-    fn generate<'a>(
-        &'a self,
-        body: Value,
-        observer: &'a mut dyn Observer,
-    ) -> BoxFuture<'a, Result<Response, Error>> {
-        Box::pin(async move {
-            let mut accumulator = stream::Accumulator::default();
-            self.transport
-                .generate(self.protocol(), body, observer, |event| {
-                    accumulator.event(event)
-                })
-                .await
-        })
+    fn generate(&self, body: Value) -> EventStream<'_> {
+        let mut accumulator = stream::Accumulator::default();
+        self.transport
+            .generate(self.protocol(), body, move |event| accumulator.event(event))
     }
 }

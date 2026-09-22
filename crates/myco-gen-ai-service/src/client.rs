@@ -1,9 +1,9 @@
-use std::future::Future;
-
+use async_stream::try_stream;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::driver::Driver;
-use crate::{Error, Event, ObserverError, Request, Response, anthropic, openai, request};
+use crate::{Error, Generation, Request, anthropic, openai, request};
 
 /// Endpoints are complete URLs. An empty key omits authentication.
 /// Credentials are deliberately excluded from debug output.
@@ -12,12 +12,12 @@ pub enum Config {
     Anthropic { endpoint: String, api_key: String },
 }
 
-/// Reusable inference client. Share it by reference or through `Arc<Client>`.
-pub struct Client {
+/// Reusable inference client. Share it by reference or through `Arc<GenAiClient>`.
+pub struct GenAiClient {
     driver: Box<dyn Driver>,
 }
 
-impl Client {
+impl GenAiClient {
     pub fn new(config: Config) -> Result<Self, Error> {
         let driver: Box<dyn Driver> = match config {
             Config::OpenAi { endpoint, api_key } => {
@@ -38,17 +38,15 @@ impl Client {
         Ok(body)
     }
 
-    /// One attempt. Observations are awaited in order; only the return value is
-    /// final. Dropping this future releases the request without a background task.
-    pub async fn generate<F>(
-        &self,
-        request: Request,
-        mut observe: impl FnMut(Event) -> F + Send,
-    ) -> Result<Response, Error>
-    where
-        F: Future<Output = Result<(), ObserverError>> + Send,
-    {
-        let body = self.request_body(&request)?;
-        self.driver.generate(body, &mut observe).await
+    /// One attempt, advanced by polling. Only `Event::Completed` contains the
+    /// final response. Dropping the stream releases the request.
+    pub fn generate(&self, request: Request) -> Generation<'_> {
+        Generation::new(try_stream! {
+            let body = self.request_body(&request)?;
+            let mut events = self.driver.generate(body);
+            while let Some(event) = events.next().await {
+                yield event?;
+            }
+        })
     }
 }

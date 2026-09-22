@@ -1,9 +1,11 @@
-use myco_genai::{Event, Message, Protocol, Request};
+use futures_core::stream::FusedStream;
+use futures_util::StreamExt;
+use myco_gen_ai_service::{Event, Message, Protocol, Request};
 
 mod common;
 
 use common::*;
-use myco_genai::{DeltaKind, Error, Finish, Output, Response, Tool};
+use myco_gen_ai_service::{DeltaKind, Error, Finish, Output, Response, Tool};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -47,66 +49,28 @@ async fn request_capture_precedes_any_network_io() {
 }
 
 #[tokio::test]
-async fn async_observations_finish_in_order_before_the_response_returns() {
+async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion() {
     let progress = json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"});
     let terminal = json!({"type":"response.completed","response":text_response("hello")});
     let (url, _capture) = fixture(&events(&[progress.clone(), terminal.clone()]), 200, "").await;
     let client = client(Protocol::OpenAiResponses, &url, "").unwrap();
-    let observed = tokio::sync::Mutex::new(Vec::new());
-    let response = client
-        .generate(request(), |event| {
-            let observed = &observed;
-            async move {
-                tokio::task::yield_now().await;
-                observed.lock().await.push(event);
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(response.output(), &[Output::Text("hello".into())]);
-    let observed = observed.into_inner();
-    assert!(matches!(observed[0], Event::Request { .. }));
-    let raw: Vec<_> = observed
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Progress { raw, .. } => Some(raw),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(raw, [progress, terminal]);
-}
-
-#[tokio::test]
-async fn observer_failures_stop_progress_and_prevent_a_successful_response() {
-    for fail_on in ["response.output_text.delta", "response.completed"] {
-        let progress =
-            json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"});
-        let terminal = json!({"type":"response.completed","response":text_response("hello")});
-        let (url, _capture) = fixture(&events(&[progress, terminal]), 200, "").await;
-        let client = client(Protocol::OpenAiResponses, &url, "").unwrap();
-        let mut observed = Vec::new();
-        let result = client
-            .generate(request(), |event| {
-                let fail = matches!(&event, Event::Progress { raw, .. } if raw["type"] == fail_on);
-                observed.push(event);
-                async move {
-                    tokio::task::yield_now().await;
-                    if fail {
-                        Err("could not record progress".into())
-                    } else {
-                        Ok(())
-                    }
-                }
-            })
-            .await;
-        assert!(
-            matches!(result, Err(Error::Observer(error)) if error.to_string() == "could not record progress")
-        );
-        assert!(
-            matches!(observed.last(), Some(Event::Progress { raw, .. }) if raw["type"] == fail_on)
-        );
+    let mut generation = client.generate(request());
+    assert!(matches!(
+        generation.next().await,
+        Some(Ok(Event::Request { .. }))
+    ));
+    for expected in [progress, terminal] {
+        assert!(matches!(generation.next().await,
+            Some(Ok(Event::Progress { raw, .. })) if raw == expected));
+        assert!(!generation.is_terminated());
     }
+    let Some(Ok(Event::Completed(response))) = generation.next().await else {
+        panic!("missing final response");
+    };
+    assert_eq!(response.output(), &[Output::Text("hello".into())]);
+    assert!(generation.is_terminated());
+    assert!(generation.next().await.is_none());
+    assert!(generation.next().await.is_none());
 }
 
 #[tokio::test]
@@ -392,55 +356,54 @@ async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
 
 #[tokio::test]
 async fn dropping_an_incomplete_generation_closes_the_http_request() {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        read_request(&mut socket).await;
-        let progress = events(&[
-            json!({"type":"response.output_text.delta","output_index":0,"delta":"started"}),
-        ]);
-        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
-        socket
-            .write_all(format!("{:x}\r\n{progress}\r\n", progress.len()).as_bytes())
-            .await
-            .unwrap();
-        let read =
-            tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut [0; 1]))
-                .await
-                .unwrap();
-        assert_eq!(
-            read.unwrap(),
-            0,
-            "client kept the unfinished connection alive"
-        );
-    });
+    let body =
+        events(&[json!({"type":"response.output_text.delta","output_index":0,"delta":"started"})]);
+    let (endpoint, server) = unfinished_body(body).await;
     let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
-    let (started, observed) = tokio::sync::oneshot::channel();
-    let mut started = Some(started);
-    {
-        let generation = model.generate(request(), move |event| {
-            if matches!(event, Event::Progress { delta: Some(_), .. }) {
-                started.take().unwrap().send(()).unwrap();
-            }
-            std::future::ready(Ok(()))
-        });
-        tokio::pin!(generation);
+    let mut generation = model.generate(request());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        assert!(matches!(
+            generation.next().await,
+            Some(Ok(Event::Request { .. }))
+        ));
+        assert!(matches!(
+            generation.next().await,
+            Some(Ok(Event::Progress { delta: Some(_), .. }))
+        ));
+    })
+    .await
+    .unwrap();
+    drop(generation);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_releases_the_http_request_without_dropping_or_polling_again() {
+    for (protocol, body) in [
+        (Protocol::OpenAiResponses, OPENAI),
+        (Protocol::AnthropicMessages, ANTHROPIC),
+    ] {
+        let (endpoint, server) = unfinished_body(body.into()).await;
+        let model = client(protocol, &endpoint, "").unwrap();
+        let mut generation = model.generate(request());
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                result = &mut generation => panic!("generation ended early: {result:?}"),
-                result = observed => result.unwrap(),
+            loop {
+                let event = generation
+                    .next()
+                    .await
+                    .expect("missing completion")
+                    .unwrap();
+                if matches!(event, Event::Completed(_)) {
+                    break;
+                }
             }
         })
         .await
         .unwrap();
+        assert!(generation.is_terminated());
+        server.await.unwrap();
+        assert!(generation.next().await.is_none());
     }
-    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -585,4 +548,65 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
         model.request_body(&input),
         Err(Error::InvalidRequest(_))
     ));
+}
+
+#[tokio::test]
+async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() {
+    use std::time::Duration;
+    use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let (release, resume) = oneshot::channel();
+    let initial =
+        events(&[json!({"type":"response.output_text.delta","output_index":0,"delta":"first"})]);
+    let rest = events(&[
+        json!({"type":"response.output_text.delta","output_index":0,"delta":"雪"}),
+        json!({"type":"response.completed","response":text_response("first雪")}),
+    ]);
+    let split = rest.find('雪').unwrap() + 1;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+            initial.len() + rest.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(initial.as_bytes()).await.unwrap();
+        socket.write_all(&rest.as_bytes()[..split]).await.unwrap();
+        resume.await.unwrap();
+        socket.write_all(&rest.as_bytes()[split..]).await.unwrap();
+    });
+
+    let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
+    let mut generation = model.generate(request());
+    assert!(matches!(
+        generation.next().await,
+        Some(Ok(Event::Request { .. }))
+    ));
+    assert!(
+        matches!(timeout(Duration::from_secs(5), generation.next()).await.unwrap(),
+        Some(Ok(Event::Progress { delta: Some(delta), .. })) if delta.text == "first")
+    );
+    assert!(
+        timeout(Duration::from_millis(30), generation.next())
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert!(
+        matches!(timeout(Duration::from_secs(5), generation.next()).await.unwrap(),
+        Some(Ok(Event::Progress { delta: Some(delta), .. })) if delta.text == "雪")
+    );
+    assert!(matches!(
+        generation.next().await,
+        Some(Ok(Event::Progress { .. }))
+    ));
+    let Some(Ok(Event::Completed(response))) = generation.next().await else {
+        panic!("lost the resumed response");
+    };
+    assert_eq!(response.output(), &[Output::Text("first雪".into())]);
+    assert!(generation.next().await.is_none());
+    server.await.unwrap();
 }
