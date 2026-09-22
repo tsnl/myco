@@ -1,4 +1,4 @@
-import { $, api, element, error, newSession } from '/common.js';
+import { $, api, element, error, newSession, requestId } from '/common.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -314,9 +314,9 @@ function connect() {
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
 window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); });
 connect();
-async function sendAction(action, requestId = crypto.randomUUID()) {
+async function sendAction(action, id = requestId()) {
   error();
-  await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: requestId, session_id: state.session_id, action });
+  await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: id, session_id: state.session_id, action });
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
@@ -329,7 +329,7 @@ $('composer').onsubmit = async (event) => {
     else if (text.startsWith('/resume ')) { location.assign(`/sessions/${encodeURIComponent(text.slice(8).trim())}`); return; }
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }
   }
-  if (!pending || pending.text !== text || pending.session !== state.session_id) pending = { text, session: state.session_id, id: crypto.randomUUID() };
+  if (!pending || pending.text !== text || pending.session !== state.session_id) pending = { text, session: state.session_id, id: requestId() };
   sending = true; metadata();
   try {
     await sendAction(action, pending.id);
