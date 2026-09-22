@@ -45,17 +45,19 @@ semantic code search).
 ## Use
 
 ```bash
-myco                      # start the browser server on 127.0.0.1:8765
+myco                      # start HTTPS on 127.0.0.1:8765
 myco --port 8766 --profile research
 myco --resume SESSION_ID  # open a saved session from the launch URL
 ```
 
-Open the printed URL to sign in. The browser has collapsible tool blocks, a
+Trust the generated public certificate whose path Myco prints, or supply your
+own with `--tls-cert PATH --tls-key PATH`. Open the printed URL to sign in.
+The browser has collapsible tool blocks, a
 floating input bar, Markdown/images, and independent sessions in separate tabs.
 Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
 launching terminal stops the server and its sessions. See the
 [browser manual](src/manual/articles/browser.md), also `myco --help browser`,
-for controls and the authenticated HTTP API.
+for controls, authenticated workspace files, and the HTTPS API.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.

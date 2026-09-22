@@ -25,7 +25,9 @@ struct Server {
 impl Server {
     async fn start(home: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_myco"))
-            .args(["--web", "0", "--config"])
+            // This raw HTTP fixture also exercises the explicit loopback-only
+            // compatibility mode; server_workflows verifies trusted HTTPS.
+            .args(["--insecure-http", "--web", "0", "--config"])
             .arg(home.join("config.toml"))
             .env("MYCO_HOME", home)
             .env("MYCO_PROFILE", "default")

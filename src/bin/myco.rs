@@ -30,6 +30,18 @@ struct Args {
     /// Listen address. Non-loopback addresses expose the server to other hosts.
     #[arg(long, alias = "web-bind", default_value = "127.0.0.1")]
     bind: std::net::IpAddr,
+    /// PEM certificate chain for HTTPS (requires --tls-key).
+    #[arg(long, requires = "tls_key", conflicts_with = "insecure_http")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for HTTPS (requires --tls-cert).
+    #[arg(long, requires = "tls_cert", conflicts_with = "insecure_http")]
+    tls_key: Option<PathBuf>,
+    /// Additional DNS name or IP for the generated local certificate (repeatable).
+    #[arg(long, conflicts_with_all = ["tls_cert", "insecure_http"])]
+    tls_name: Vec<String>,
+    /// Explicitly use unencrypted HTTP on a loopback address only.
+    #[arg(long)]
+    insecure_http: bool,
     /// Print launcher help, or an embedded manual article.
     #[arg(long = "help", short = 'h', value_name = "ARTICLE", num_args = 0..=1, default_missing_value = "")]
     help_topic: Option<String>,

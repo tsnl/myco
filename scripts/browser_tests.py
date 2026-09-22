@@ -148,7 +148,7 @@ context_window = 100000
         self.process, launch = self.launch()
         parsed = urlsplit(launch)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
-        self.context = self.browser.new_context(viewport={"width": 1200, "height": 850})
+        self.context = self.browser.new_context(viewport={"width": 1200, "height": 850}, ignore_https_errors=True)
         self.addCleanup(self.context.close)
         self.context.on("page", lambda page: page.on("pageerror", lambda error: self.errors.append(str(error))))
         self.context.tracing.start(screenshots=True, snapshots=True)
@@ -177,7 +177,7 @@ context_window = 100000
             selector.register(process.stdout, selectors.EVENT_READ)
             self.assertTrue(selector.select(15), "Server did not print its launch URL")
         launch = process.stdout.readline().strip().removeprefix("Browser UI: ")
-        self.assertTrue(launch.startswith("http://"), f"Server failed to launch; see {log.name}")
+        self.assertTrue(launch.startswith("https://"), f"Server failed to launch; see {log.name}")
         return process, launch
 
     def stop(self, process):
@@ -206,6 +206,84 @@ context_window = 100000
         page.fill("#prompt", text)
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
+
+    def test_https_cookie_and_bearer_auth_cover_assets_files_and_api(self):
+        cookies = self.context.cookies()
+        cookie = next(cookie for cookie in cookies if cookie['name'].startswith('__Host-myco_'))
+        self.assertTrue(cookie['secure'] and cookie['httpOnly'])
+        self.assertEqual(cookie['sameSite'], 'Strict')
+        self.assertEqual(self.page.evaluate('document.cookie'), '')
+        anonymous = self.playwright.request.new_context(ignore_https_errors=True)
+        try:
+            for path in ['/', '/app.js', '/api/sessions', '/api/events', '/files/pixel.png', '/api/image?source=pixel.png']:
+                self.assertEqual(anonymous.get(self.origin + path).status, 401, path)
+            self.assertEqual(anonymous.head(self.origin + '/files/pixel.png').status, 401)
+            bearer = {'Authorization': 'Bearer ' + cookie['value']}
+            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png', headers=bearer).status, 200)
+            response = anonymous.post(self.origin + '/api/markdown', headers=bearer, data={'text': '**hello**'})
+            self.assertEqual(response.status, 200)
+            self.assertIn('<strong>hello</strong>', response.text())
+            self.assertEqual(anonymous.post(self.origin + '/api/markdown',
+                headers={**bearer, 'Origin': 'https://other.example'}, data={'text': 'no'}).status, 401)
+            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png?token=' + cookie['value']).status, 401)
+            self.assertEqual(self.context.request.get(self.origin + '/files/pixel.png',
+                headers={'Authorization': 'Bearer wrong'}).status, 401)
+        finally:
+            anonymous.dispose()
+
+    def test_workspace_links_and_svg_images_are_mapped_and_authenticated(self):
+        path = self.home / 'plot & space.svg'
+        path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8"><rect width="12" height="8" fill="cyan"/></svg>')
+        (self.home / 'notes.txt').write_text('workspace notes')
+        source = f'![relative](plot%20%26%20space.svg) ![absolute](<{path}>) ![file](<{path.as_uri()}>)\n\n[Notes](notes.txt)'
+        response = self.context.request.post(self.origin + '/api/markdown',
+            headers={'Origin': self.origin}, data={'text': source})
+        self.assertEqual(response.status, 200)
+        self.assertIn('href="/files/notes.txt"', response.text())
+        self.assertEqual(response.text().count('src="/files/'), 3)
+        self.page.evaluate('html => { const box = document.createElement("div"); box.id="file-preview"; box.innerHTML=html; document.body.append(box); }', response.text())
+        for image in self.page.locator('#file-preview img').all():
+            expect(image).to_have_js_property('naturalWidth', 12)
+        self.page.get_by_role('link', name='Notes', exact=True).click()
+        expect(self.page.locator('body')).to_contain_text('workspace notes')
+
+    def test_workspace_files_reject_escape_and_preserve_range_and_head_semantics(self):
+        (self.home / 'bytes.bin').write_bytes(b'0123456789')
+        with tempfile.TemporaryDirectory(prefix='myco-outside-') as outside:
+            secret = Path(outside) / 'secret.txt'
+            secret.write_text('outside workspace')
+            (self.home / 'escape').symlink_to(outside, target_is_directory=True)
+            paths = ['/files/escape/secret.txt', '/files/..%2F' + Path(outside).name + '/secret.txt', '/files/%2Fetc/passwd']
+            for path in paths:
+                self.assertIn(self.context.request.get(self.origin + path).status, [403, 404], path)
+        url = self.origin + '/files/bytes.bin'
+        response = self.context.request.get(url, headers={'Range': 'bytes=2-5'})
+        self.assertEqual((response.status, response.body()), (206, b'2345'))
+        self.assertEqual(response.headers['content-range'], 'bytes 2-5/10')
+        self.assertEqual(self.context.request.get(url, headers={'Range': 'bytes=-3'}).body(), b'789')
+        self.assertEqual(self.context.request.get(url, headers={'Range': 'bytes=20-'}).status, 416)
+        response = self.context.request.head(url)
+        self.assertEqual((response.status, response.body()), (200, b''))
+        self.assertEqual(response.headers['content-length'], '10')
+        self.assertEqual(self.context.request.post(url, headers={'Origin': self.origin}, data='replace').status, 405)
+        self.assertEqual((self.home / 'bytes.bin').read_bytes(), b'0123456789')
+        if hasattr(os, 'mkfifo'):
+            os.mkfifo(self.home / 'pipe')
+            self.assertEqual(self.context.request.get(self.origin + '/files/pipe', timeout=3000).status, 404)
+
+    def test_workspace_html_displays_relative_assets_without_executing_scripts(self):
+        folder = self.home / 'preview'
+        folder.mkdir()
+        (folder / 'style.css').write_text('h1 { color: rgb(12, 34, 56); }')
+        (folder / 'index.html').write_text('<link rel="stylesheet" href="style.css"><h1>Preview</h1><img src="../pixel.png"><script>document.documentElement.dataset.executed="yes"; fetch("/api/sessions")</script>')
+        page = self.context.new_page()
+        response = page.goto(self.origin + '/files/preview')
+        self.assertEqual(page.url, self.origin + '/files/preview/')
+        self.assertEqual(response.status, 200)
+        self.assertIn('sandbox allow-same-origin', response.headers['content-security-policy'])
+        expect(page.locator('h1')).to_have_css('color', 'rgb(12, 34, 56)')
+        expect(page.locator('img')).to_have_js_property('naturalWidth', 1)
+        self.assertIsNone(page.locator('html').get_attribute('data-executed'))
 
     def test_settings_contains_sky_and_restores_focus_on_home_and_session(self):
         page = self.page
@@ -326,7 +404,7 @@ context_window = 100000
         self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
 
     def test_sky_endpoints_require_authentication_and_validate_input(self):
-        anonymous = self.playwright.request.new_context()
+        anonymous = self.playwright.request.new_context(ignore_https_errors=True)
         try:
             for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
                          "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js", "/settings.js"]:

@@ -7,8 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use uuid::Uuid;
 
 mod test_utils;
@@ -46,8 +45,9 @@ impl Drop for ServerEnv {
 
 struct Server {
     process: tokio::process::Child,
-    authority: String,
-    cookie: String,
+    origin: String,
+    token: String,
+    client: reqwest::Client,
 }
 
 impl Server {
@@ -75,7 +75,19 @@ impl Server {
             let mut rest = String::new();
             let _ = stdout.read_to_string(&mut rest).await;
         });
-        let authority = format!("127.0.0.1:{}", url.port().unwrap());
+        assert_eq!(url.scheme(), "https");
+        let certificate = std::fs::read_dir(env.dir.join("profiles/default/tls"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "crt"))
+            .unwrap();
+        let certificate =
+            reqwest::Certificate::from_pem(&std::fs::read(certificate).unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(certificate)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
         let token = url
             .query_pairs()
             .find(|(key, _)| key == "token")
@@ -84,36 +96,24 @@ impl Server {
             .into_owned();
         Self {
             process,
-            authority,
-            cookie: format!("myco_{}={token}", url.port().unwrap()),
+            origin: url.origin().ascii_serialization(),
+            token,
+            client,
         }
     }
 
     async fn request(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        let text = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-            self.authority,
-            self.authority,
-            self.cookie,
-            text.len()
-        );
-        let response = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut stream = TcpStream::connect(&self.authority).await.unwrap();
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).await.unwrap();
-            String::from_utf8(bytes).unwrap()
-        })
-        .await
-        .expect("HTTP response timed out");
-        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let body = serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.into()));
+        let mut request = self
+            .client
+            .request(method.parse().unwrap(), format!("{}{path}", self.origin))
+            .bearer_auth(&self.token);
+        if !body.is_null() {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
         (status, body)
     }
 
@@ -176,6 +176,109 @@ impl Server {
             .unwrap()
             .unwrap();
         assert!(status.success(), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn https_identity_survives_restart_while_bearer_tokens_rotate() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = ServerEnv::new("https-identity");
+    let server = Server::start(&env, &[]).await;
+    let directory = env.dir.join("profiles/default/tls");
+    let identity = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pem"))
+        .unwrap();
+    let original = std::fs::read(&identity).unwrap();
+    assert_eq!(
+        std::fs::metadata(&identity).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert_eq!(
+        server.request("GET", "/api/sessions", Value::Null).await.0,
+        200
+    );
+    let untrusted = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    assert!(
+        untrusted
+            .get(format!("{}/", server.origin))
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        untrusted
+            .get(server.origin.replacen("https:", "http:", 1))
+            .send()
+            .await
+            .is_err()
+    );
+    let token = server.token.clone();
+    server.stop().await;
+    // A missing public copy is repaired without silently rotating the key.
+    std::fs::remove_file(identity.with_extension("crt")).unwrap();
+    let server = Server::start(&env, &[]).await;
+    assert_eq!(std::fs::read(&identity).unwrap(), original);
+    assert_ne!(server.token, token);
+    let response = server
+        .client
+        .get(format!("{}/api/sessions", server.origin))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    server.stop().await;
+    let certificate = identity.with_extension("crt");
+    let server = Server::start(
+        &env,
+        &[
+            "--tls-cert",
+            certificate.to_str().unwrap(),
+            "--tls-key",
+            identity.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        server.request("GET", "/api/sessions", Value::Null).await.0,
+        200
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_tls_configuration_never_falls_back_to_plain_http() {
+    let env = ServerEnv::new("https-invalid");
+    for (args, message) in [
+        (
+            vec!["--insecure-http", "--bind", "0.0.0.0"],
+            "requires a loopback",
+        ),
+        (
+            vec![
+                "--tls-cert",
+                "/missing/cert.pem",
+                "--tls-key",
+                "/missing/key.pem",
+            ],
+            "load HTTPS certificate",
+        ),
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+            .args(args)
+            .env("MYCO_HOME", &env.dir)
+            .env("MYCO_PROFILE", "default")
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert!(output.stdout.is_empty());
     }
 }
 

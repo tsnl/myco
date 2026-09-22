@@ -72,6 +72,12 @@ cd /path/to/your/project
 myco
 ```
 
+Myco serves HTTPS by default. Trust the public certificate whose path it prints,
+or launch with `--tls-cert PATH --tls-key PATH` for a certificate you already
+manage. For a LAN hostname or IP, include it with `--tls-name NAME` when using a
+generated certificate. See the [browser manual](../manual/browser.md) for trust,
+authentication, and workspace-file access.
+
 Open the URL printed by the server and choose **New session**. Ask for a bounded
 first task, such as “Explain the entry points in this repository.” Myco reads
 project guidance from `AGENTS.md` or `CLAUDE.md` at session start.

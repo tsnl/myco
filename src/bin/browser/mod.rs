@@ -1,13 +1,16 @@
-//! Loopback browser frontend. Tabs observe independently owned session workers.
+//! HTTPS browser frontend. Tabs observe independently owned session workers.
 
 use std::sync::Arc;
 
 use super::Args;
 
 mod assets;
+mod auth;
+mod files;
 mod http;
 mod markdown;
 mod runtime;
+mod tls;
 mod view;
 mod weather;
 
@@ -16,11 +19,12 @@ mod weather;
 /// A wildcard bind has no address to dial, so use this machine's hostname and
 /// let the reader's resolver find a route; the served origin is whatever `Host`
 /// they arrive with, not this string.
-fn launch_origin(address: std::net::SocketAddr) -> String {
+fn launch_origin(address: std::net::SocketAddr, secure: bool) -> String {
+    let scheme = if secure { "https" } else { "http" };
     if address.ip().is_unspecified() {
-        return format!("http://{}:{}", hostname(), address.port());
+        return format!("{scheme}://{}:{}", hostname(), address.port());
     }
-    format!("http://{address}")
+    format!("{scheme}://{address}")
 }
 
 fn hostname() -> String {
@@ -43,6 +47,8 @@ fn hostname() -> String {
 }
 
 pub(super) async fn run(args: Args) -> Result<(), String> {
+    let tls = tls::configure(&args, &hostname()).await?;
+    let files = files::Files::open(&std::env::current_dir().map_err(|e| e.to_string())?)?;
     let listener = tokio::net::TcpListener::bind((args.bind, args.port))
         .await
         .map_err(|e| format!("cannot listen for browser UI: {e}"))?;
@@ -58,9 +64,10 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
         .map_or_else(|| "/".into(), |s| format!("/sessions/{}", s.id));
     let server = Arc::new(http::Server::new(
         runtime::Sessions::new(args, config, preflight),
-        launch_origin(address),
+        launch_origin(address, tls.is_some()),
         address.port(),
         launch_path,
+        files,
     ));
     if let Some(session) = initial {
         server
@@ -69,21 +76,45 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    println!("Browser UI: {}/auth?token={}", server.origin, server.token);
+    println!(
+        "Browser UI: {}/auth?token={}",
+        server.auth.origin, server.auth.token
+    );
     if !address.ip().is_loopback() {
         println!(
             "Listening on {address} — anyone who can route here and holds that URL reaches these sessions."
         );
     }
     println!("Press Ctrl-C here to stop the server. Browser tabs keep independent sessions alive.");
-    let shutdown = server.clone();
-    let result = axum::serve(listener, http::router(server.clone()))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown.sessions.stop().await;
-        })
-        .await
-        .map_err(|e| e.to_string());
+    let handle = axum_server::Handle::new();
+    let listener = listener.into_std().map_err(|e| e.to_string())?;
+    let app = http::router(server.clone()).into_make_service();
+    let serving = async {
+        match tls {
+            Some(tls) => {
+                axum_server::from_tcp_rustls(listener, tls)?
+                    .handle(handle.clone())
+                    .serve(app)
+                    .await
+            }
+            None => {
+                axum_server::from_tcp(listener)?
+                    .handle(handle.clone())
+                    .serve(app)
+                    .await
+            }
+        }
+    };
+    tokio::pin!(serving);
+    let result = tokio::select! {
+        result = &mut serving => result,
+        _ = tokio::signal::ctrl_c() => {
+            server.sessions.stop().await;
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            serving.await
+        }
+    }
+    .map_err(|e| e.to_string());
     server.sessions.stop().await;
     server.sessions.join().await.map_err(|e| e.to_string())?;
     result
