@@ -19,6 +19,14 @@ times, and running status. **New session** creates a session and opens its own
 tab groups. Click the myco name to return home. `--resume <id>` opens that session
 directly from the launch URL.
 
+Click **Archive** beside a session to hide it from the active list. Choose
+**Archived sessions** above the list to find archived sessions and **Restore**
+them. Archiving preserves history, the session URL, and running tools; an open
+tab can continue its turn. It does not archive child sessions. A session held
+by another myco process must be archived from that process or after it closes.
+The list refreshes while the home page is visible; changes made outside this
+server can take up to ten seconds to appear.
+
 The browser uses the same model configuration, profile, session store, tools,
 and compaction runner as the CLI. `--model`, `--effort`, `--profile`, `--config`,
 and `--resume <id>` apply at startup. Bare `--resume` and print/host modes do

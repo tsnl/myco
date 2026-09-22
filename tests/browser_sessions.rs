@@ -86,7 +86,7 @@ impl Server {
 }
 
 #[tokio::test]
-async fn browser_session_urls_are_durable_and_retries_do_not_create_extra_sessions() {
+async fn browser_sessions_preserve_urls_archive_visibility_and_writer_isolation() {
     let home = TestHome(std::env::temp_dir().join(format!("myco-browser-{}", Uuid::new_v4())));
     std::fs::create_dir_all(&home.0).unwrap();
     let models = ["first", "second"]
@@ -180,10 +180,87 @@ context_window = 100000
         404
     );
     assert!(other.child.try_wait().unwrap().is_none());
-    other
+    let created_elsewhere = other
         .json("/api/sessions", Some(json!({"request_id":Uuid::new_v4()})))
         .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let listed = server.json("/api/sessions", None).await;
+            if listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == created_elsewhere["id"])
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("cached listings must pick up sessions created by another process");
+    let archive_path = format!("{first_path}/archive");
+    let archive = json!({"session_id":first_id, "archived":true});
+    assert_eq!(
+        other.request(&archive_path, Some(archive.clone())).await.0,
+        409
+    );
+    assert_eq!(
+        server
+            .request(
+                &archive_path,
+                Some(json!({"session_id":"wrong", "archived":true}))
+            )
+            .await
+            .0,
+        409
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            server.request(&archive_path, Some(archive.clone())).await.0,
+            204
+        );
+    }
+    assert!(
+        server
+            .json("/api/sessions", None)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != first_id)
+    );
+    assert_eq!(
+        server.json("/api/sessions?archived=true", None).await[0]["id"],
+        first_id
+    );
+    assert_eq!(server.json(&first_path, None).await["session_id"], first_id);
     server.stop().await;
+    // Restoring a saved session only edits metadata; it must not open a worker.
+    assert_eq!(
+        other
+            .request(
+                &archive_path,
+                Some(json!({"session_id":first_id, "archived":false}))
+            )
+            .await
+            .0,
+        204
+    );
+    let mut reopened = Server::start(&home.0).await;
+    assert_eq!(
+        reopened.json(&first_path, None).await["session_id"],
+        first_id
+    );
+    assert!(
+        reopened
+            .json("/api/sessions?archived=true", None)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    reopened.stop().await;
     assert_eq!(other.json(&first_path, None).await["session_id"], first_id);
     other.stop().await;
 }

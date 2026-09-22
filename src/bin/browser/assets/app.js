@@ -1,5 +1,4 @@
-'use strict';
-const $ = (id) => document.getElementById(id);
+import { $, api, element, error, newSession } from '/common.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -7,25 +6,11 @@ let revision = -1;
 let follow = true;
 let pending = null;
 let selectingModel = false;
-let createId = null;
-let creating = false;
 let eventPort = null;
 const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length));
 const nodes = [];
 const markdownJobs = new WeakMap();
 
-function element(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-function error(message = '') { $('error').textContent = message; $('error').hidden = !message; }
-async function api(path, body) {
-  const response = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!response.ok) throw new Error(await response.text());
-  return response;
-}
 function scrollLatest() { requestAnimationFrame(() => { if (follow) window.scrollTo({ top: document.documentElement.scrollHeight }); }); }
 window.addEventListener('scroll', () => {
   follow = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 100;
@@ -65,41 +50,44 @@ function addImages(parent, sources) {
 }
 function markdown(node, text) {
   let job = markdownJobs.get(node);
-  if (!job) { job = { text, version: 0, timer: null }; markdownJobs.set(node, job); }
+  if (!job) { job = { text: null, pending: false, failed: false }; markdownJobs.set(node, job); }
+  if (job.text === text && !job.failed) return;
   job.text = text;
-  job.version += 1;
   if (!node.hasChildNodes()) { node.textContent = text; node.classList.add('pending'); }
-  if (job.timer) return;
+  if (job.pending) return;
+  job.pending = true;
   const render = async () => {
-    job.timer = null;
-    const version = job.version;
+    if (!node.isConnected) { job.pending = false; return; }
+    const text = job.text;
+    job.failed = false;
     try {
-      const html = await (await api('/api/markdown', { text: job.text })).text();
-      if (!node.isConnected) return;
-      if (version !== job.version) { job.timer = setTimeout(render, 80); return; }
+      const html = await (await api('/api/markdown', { text })).text();
+      if (!node.isConnected || text !== job.text) return;
       node.innerHTML = html;
       node.classList.remove('pending');
       for (const link of node.querySelectorAll('a')) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
       for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
       scrollLatest();
-    } catch (e) { node.textContent = job.text; node.classList.add('pending'); }
+    } catch (e) { job.failed = true; node.textContent = job.text; node.classList.add('pending'); }
+    finally {
+      if (node.isConnected && text !== job.text) setTimeout(render, 80);
+      else job.pending = false;
+    }
   };
-  job.timer = setTimeout(render, 80);
+  setTimeout(render, 80);
 }
 function jsonArguments(input, preview = false) {
   const pre = element(preview ? 'span' : 'pre', preview ? 'tool-args' : 'arguments');
-  const text = JSON.stringify(input, null, preview ? 0 : 2);
-  const limit = preview ? Array.from(text).slice(0, 180).join('').length : text.length;
+  const text = preview ? argumentPreview(input) : JSON.stringify(input, null, 2);
   const strings = /"(?:[^"\\]|\\.)*"\s*:?/g;
   let start = 0;
   for (const match of text.matchAll(strings)) {
-    if (match.index >= limit) break;
     if (!match[0].endsWith(':')) continue;
     pre.append(document.createTextNode(text.slice(start, match.index)));
-    start = Math.min(limit, match.index + match[0].length);
+    start = match.index + match[0].length;
     pre.append(element('span', 'json-key', text.slice(match.index, start)));
   }
-  pre.append(document.createTextNode(text.slice(start, limit) + (limit < text.length ? '…' : '')));
+  pre.append(document.createTextNode(text.slice(start)));
   return pre;
 }
 function argumentPreview(input) {
@@ -142,7 +130,20 @@ function blockNode(block) {
   addImages(article, block.images);
   return article;
 }
-function replaceBlock(index, block) {
+function replaceBlock(index, block, previous) {
+  if (nodes[index] && previous) {
+    if (JSON.stringify(previous) === JSON.stringify(block)) {
+      if (block.kind === 'message' && block.role !== 'user') markdown(nodes[index].querySelector('.body'), block.text);
+      return;
+    }
+    if (block.kind === 'message' && previous.kind === 'message' && block.role === previous.role && block.time === previous.time && JSON.stringify(block.images) === JSON.stringify(previous.images)) {
+      const body = nodes[index].querySelector('.body');
+      if (block.role === 'user') body.textContent = block.text;
+      else markdown(body, block.text);
+      scrollLatest();
+      return;
+    }
+  }
   const node = blockNode(block);
   if (nodes[index]) {
     if (node.tagName === 'DETAILS' && nodes[index].tagName === 'DETAILS') node.open = nodes[index].open;
@@ -160,14 +161,16 @@ function snapshot(next) {
     const queue = open.get(node.dataset.key) || []; queue.push(node.open); open.set(node.dataset.key, queue);
   }
   const sameSession = state.session_id === next.session_id && state.thread_id === next.thread_id;
+  const previous = state;
   state = next;
   history.replaceState(null, '', `/sessions/${encodeURIComponent(state.session_id)}`);
-  nodes.length = 0; transcript.replaceChildren();
+  if (!sameSession) { nodes.length = 0; transcript.replaceChildren(); }
   for (const [index, block] of state.blocks.entries()) {
-    replaceBlock(index, block);
+    replaceBlock(index, block, sameSession ? previous.blocks[index] : undefined);
     if (sameSession && nodes[index].dataset.key) nodes[index].open = open.get(nodes[index].dataset.key)?.shift() || false;
   }
-  if (!nodes.length) {
+  for (const node of nodes.splice(state.blocks.length)) node.remove();
+  if (!nodes.length && !transcript.querySelector('.welcome')) {
     const welcome = element('section', 'welcome');
     welcome.append(element('h1', '', 'MYCO'), element('p', '', 'Write a prompt to begin. Tool inputs and output expand in place.'));
     transcript.append(welcome);
@@ -230,7 +233,7 @@ function updateSession(update) {
   const change = update.change;
   if (change.kind === 'snapshot') snapshot(change.snapshot);
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
-  else if (change.kind === 'block') { state.blocks[change.index] = change.block; replaceBlock(change.index, change.block); activity(); }
+  else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; activity(); }
   else if (change.kind === 'tasks') { state.tasks = change.tasks; activity(); }
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
@@ -251,20 +254,11 @@ function connect() {
   eventPort.postMessage({ kind: 'subscribe', session_id: sessionId });
 }
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
-window.addEventListener('pageshow', (event) => { if (event.persisted) { creating = false; createId = null; $('new-session').disabled = false; connect(); } });
+window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); });
 connect();
 async function sendAction(action, requestId = crypto.randomUUID()) {
   error();
   await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: requestId, session_id: state.session_id, action });
-}
-async function newSession() {
-  if (creating) return;
-  creating = true; $('new-session').disabled = true;
-  createId ||= crypto.randomUUID();
-  try {
-    const session = await (await api('/api/sessions', { request_id: createId })).json();
-    location.assign(`/sessions/${encodeURIComponent(session.id)}`);
-  } catch (e) { creating = false; $('new-session').disabled = false; error(e.message); }
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
@@ -286,7 +280,6 @@ $('composer').onsubmit = async (event) => {
   } catch (e) { error(`${e.message} Your draft is still here.`); metadata(); }
 };
 $('prompt').onkeydown = (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing) { event.preventDefault(); $('composer').requestSubmit(); } };
-$('new-session').onclick = newSession;
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
 $('cancel').onclick = () => api(`/api/sessions/${encodeURIComponent(state.session_id)}/cancel`, { session_id: state.session_id }).catch((e) => error(e.message));
 $('model').onchange = async () => {
