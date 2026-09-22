@@ -27,6 +27,7 @@ pub trait Compactor: Send + Sync {
 
 pub struct ModelCompactor {
     pub model: CatalogModel,
+    pub max_requests: usize,
 }
 
 impl Compactor for ModelCompactor {
@@ -35,7 +36,9 @@ impl Compactor for ModelCompactor {
         predecessor: Session,
         cancel: CancelToken,
     ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
-        Box::pin(async move { run_compact_worker(&predecessor, &self.model, cancel).await })
+        Box::pin(async move {
+            run_compact_worker(&predecessor, &self.model, self.max_requests, cancel).await
+        })
     }
 }
 

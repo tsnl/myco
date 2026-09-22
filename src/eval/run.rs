@@ -570,6 +570,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
 
 struct EvalCompactor {
     model: CatalogModel,
+    max_requests: usize,
     recorder: Arc<Recorder>,
 }
 impl Compactor for EvalCompactor {
@@ -579,9 +580,13 @@ impl Compactor for EvalCompactor {
         cancel: CancelToken,
     ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
         Box::pin(async move {
-            crate::chat::run_compact_worker_with_model(&predecessor, &self.model, cancel, |model| {
-                self.recorder.wrap(model, true)
-            })
+            crate::chat::run_compact_worker_with_model(
+                &predecessor,
+                &self.model,
+                self.max_requests,
+                cancel,
+                |model| self.recorder.wrap(model, true),
+            )
             .await
         })
     }
@@ -673,6 +678,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     runner.set_compactor(
         Arc::new(EvalCompactor {
             model: catalog.clone(),
+            max_requests: config.compaction_max_requests,
             recorder: recorder.clone(),
         }),
         catalog.spec.auto_compact_at_tokens,

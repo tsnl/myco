@@ -225,8 +225,10 @@ summary through `session_history` or the summary path shown in the banner.
 
 The compaction worker can only read its assigned thread and write one summary
 (at most 8,000 characters). It has no shell, editor, prelude, or host access.
-Compaction stops after 12 model requests (including retries) or 120 seconds;
-the CLI reports elapsed time every 10 seconds. Ctrl-C cancels it. A failed or
+Compaction stops after `compaction_max_requests` model requests (including retries;
+default 64). Set this positive integer at the top level of `config.toml` to change
+the budget for manual and automatic compaction. There is no compaction duration
+limit; the CLI reports elapsed time every 10 seconds. Ctrl-C cancels it. A failed or
 cancelled compaction leaves the current thread intact.
 
 Each live USER header is `USER <used>/<max> (<pct>%)` — context tokens used / model window,

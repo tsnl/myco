@@ -139,6 +139,8 @@ attach_timeout_secs = 10
 # Hard cap on the rendered prelude in every agent system prompt (default 262144):
 # oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144
+# Model requests per compaction, including retries (positive; no duration limit).
+compaction_max_requests = 64
 
 [gateways.xai]
 protocol = "openai-responses"

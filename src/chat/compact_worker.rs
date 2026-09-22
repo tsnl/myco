@@ -4,7 +4,6 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use crate::core::{Async, AsyncStream, CancelToken, uuid_simple_hex};
 use crate::generative_model::{
@@ -16,8 +15,6 @@ use crate::tool_services::{HostDispatchContext, SessionHistoryTool, ToolService}
 
 use crate::agent::{Agent, AgentInteractionError, NullEventSink, ToolExecutor, TraceContext};
 
-const MAX_REQUESTS: usize = 12;
-const MAX_DURATION: Duration = Duration::from_secs(120);
 const MAX_SUMMARY_CHARS: usize = 8_000;
 
 struct CompactTools {
@@ -112,7 +109,7 @@ impl GenerativeModel for CompactModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
         if self.requests.fetch_add(1, Ordering::SeqCst) >= self.limit {
             let failure = GenerationFailure::terminal(GenerateError::ExecutionError(format!(
-                "compaction reached its {}-request limit; session unchanged",
+                "compaction reached its {}-request limit; increase compaction_max_requests in config.toml; session unchanged",
                 self.limit
             )));
             return Box::pin(futures::stream::once(async {
@@ -123,32 +120,12 @@ impl GenerativeModel for CompactModel {
     }
 }
 
-async fn run_with_deadline(
+async fn run_worker(
     worker: &mut Agent,
     prompt: String,
     cancel: CancelToken,
-    duration: Duration,
 ) -> Result<(), CompactWorkerError> {
-    let work_cancel = cancel.child_token();
-    let mut work = std::pin::pin!(crate::chat::interact(
-        worker,
-        vec![Content::Text { text: prompt }],
-        work_cancel.clone()
-    ));
-    let result = tokio::select! {
-        biased;
-        result = &mut work => result,
-        _ = tokio::time::sleep(duration) => {
-            work_cancel.cancel();
-            let result = work.await;
-            if let Err(error @ AgentInteractionError::Checkpoint(_)) = result {
-                return Err(CompactWorkerError::Failed(error.to_string()));
-            }
-            return Err(CompactWorkerError::Failed(format!(
-                "compaction exceeded {} seconds; session unchanged", duration.as_secs()
-            )));
-        }
-    };
+    let result = crate::chat::interact(worker, vec![Content::Text { text: prompt }], cancel).await;
     match result {
         Ok(_) => Ok(()),
         Err(AgentInteractionError::Cancelled) => Err(CompactWorkerError::Cancelled),
@@ -200,15 +177,20 @@ pub enum CompactWorkerError {
 pub async fn run_compact_worker(
     predecessor: &Session,
     catalog_model: &CatalogModel,
+    max_requests: usize,
     cancel: CancelToken,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
-    run_compact_worker_with_model(predecessor, catalog_model, cancel, |model| model).await
+    run_compact_worker_with_model(predecessor, catalog_model, max_requests, cancel, |model| {
+        model
+    })
+    .await
 }
 
 /// Instrument compaction requests with the same telemetry/budget as a headless run.
 pub async fn run_compact_worker_with_model(
     predecessor: &Session,
     catalog_model: &CatalogModel,
+    max_requests: usize,
     cancel: CancelToken,
     wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
@@ -258,7 +240,7 @@ pub async fn run_compact_worker_with_model(
                     .map_err(CompactWorkerError::Failed)?,
             ),
             requests: AtomicUsize::new(0),
-            limit: MAX_REQUESTS,
+            limit: max_requests,
         }),
         tools,
         sink,
@@ -275,7 +257,7 @@ pub async fn run_compact_worker_with_model(
     super::wire_checkpoint(&mut worker, &session);
 
     let prompt = compact_subagent_prompt(&predecessor.id, &predecessor.active_thread().id);
-    let result = run_with_deadline(&mut worker, prompt, cancel, MAX_DURATION).await;
+    let result = run_worker(&mut worker, prompt, cancel).await;
 
     super::persist_session(&worker, &session, true).map_err(|error| {
         CompactWorkerError::Failed(format!("could not save compact worker state: {error}"))
@@ -377,13 +359,7 @@ mod tests {
             CompactTools::new(&Session::new("test")),
             Arc::new(NullEventSink),
         );
-        let result = run_with_deadline(
-            &mut worker,
-            "summarize".into(),
-            CancelToken::new(),
-            MAX_DURATION,
-        )
-        .await;
+        let result = run_worker(&mut worker, "summarize".into(), CancelToken::new()).await;
         assert!(
             matches!(result, Err(CompactWorkerError::Failed(text)) if text.contains("2-request limit"))
         );
@@ -419,41 +395,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_and_user_cancel_settle_pending_generation_without_cancelling_the_parent() {
-        struct Pending;
+    async fn user_cancel_settles_pending_generation() {
+        struct Pending(Arc<tokio::sync::Notify>);
         impl GenerativeModel for Pending {
             fn generate(&self, _: &[Message]) -> AsyncStream<GenerationEvent> {
+                self.0.notify_one();
                 Box::pin(futures::stream::pending())
             }
         }
-        for timed_out in [true, false] {
-            let mut worker = Agent::new(
-                Arc::new(Pending),
-                CompactTools::new(&Session::new("test")),
-                Arc::new(NullEventSink),
-            );
-            let cancel = CancelToken::new();
-            if !timed_out {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut worker = Agent::new(
+            Arc::new(Pending(started.clone())),
+            CompactTools::new(&Session::new("test")),
+            Arc::new(NullEventSink),
+        );
+        let cancel = CancelToken::new();
+        let (result, ()) = tokio::join!(
+            run_worker(&mut worker, "summarize".into(), cancel.clone()),
+            async {
+                started.notified().await;
                 cancel.cancel();
             }
-            let result = run_with_deadline(
-                &mut worker,
-                "summarize".into(),
-                cancel.clone(),
-                Duration::from_millis(10),
-            )
-            .await;
-            if timed_out {
-                assert!(
-                    matches!(result, Err(CompactWorkerError::Failed(text)) if text.contains("exceeded"))
-                );
-                assert!(!cancel.is_cancelled());
-            } else {
-                assert!(matches!(result, Err(CompactWorkerError::Cancelled)));
+        );
+        assert!(matches!(result, Err(CompactWorkerError::Cancelled)));
+        assert!(worker.state().pending_operation().is_none());
+        crate::agent::validate_context(worker.history()).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_generation_can_finish_after_two_minutes() {
+        struct Slow;
+        impl GenerativeModel for Slow {
+            fn generate(&self, _: &[Message]) -> AsyncStream<GenerationEvent> {
+                Box::pin(
+                    futures::stream::once(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(121)).await;
+                        ScriptedModel::new(vec![GenerateOutput {
+                            content: vec![Content::Text {
+                                text: "summary ready".into(),
+                            }],
+                            tool_uses: vec![],
+                            turn_end_reason: TurnEndReason::EndTurn,
+                            usage: None,
+                        }])
+                        .generate(&[])
+                    })
+                    .flatten(),
+                )
             }
-            assert!(worker.state().pending_operation().is_none());
-            crate::agent::validate_context(worker.history()).unwrap();
         }
+        let mut worker = Agent::new(
+            Arc::new(Slow),
+            CompactTools::new(&Session::new("test")),
+            Arc::new(NullEventSink),
+        );
+        run_worker(&mut worker, "summarize".into(), CancelToken::new())
+            .await
+            .unwrap();
+        assert!(worker.state().pending_operation().is_none());
+        crate::agent::validate_context(worker.history()).unwrap();
     }
 
     /// A summary file left behind by an earlier compaction must not be mistaken
