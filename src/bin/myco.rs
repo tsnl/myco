@@ -63,6 +63,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/model",
     "/title",
     "/compact",
+    "/verbose",
     "/archive",
     "/restore",
 ];
@@ -350,7 +351,7 @@ async fn run_print(args: Args) {
     let accepted_at = chrono::Utc::now();
     eprintln!(
         "{}",
-        myco::tui::transcript::acceptance_line(Some(accepted_at))
+        myco::tui::transcript::turn_header("USER", Some(accepted_at))
     );
     let outcome = runner.submit(content, accepted_at, cancel).await;
     sigint_task.abort();
@@ -763,10 +764,7 @@ async fn run_interactive(args: Args) {
             automatic,
         } => {
             workflow_ui.flush_output();
-            workflow_ui.note(&format!(
-                "{}compacting session={session_id} thread={thread_id} …",
-                if automatic { "auto-" } else { "" }
-            ));
+            workflow_ui.compacting_banner(&session_id, &thread_id, automatic);
         }
         WorkflowEvent::CompactionProgress { elapsed } => workflow_ui.note(&format!(
             "compacting: {}s elapsed (Ctrl-C to cancel)",
@@ -1169,8 +1167,7 @@ impl ReplSession {
         }
         let cancel = self.turn_cancel.arm();
         let accepted_at = chrono::Utc::now();
-        self.ui
-            .note(&myco::tui::transcript::acceptance_line(Some(accepted_at)));
+        self.ui.accepted_turn(accepted_at);
 
         let outcome = self.runner.submit(content, accepted_at, cancel).await;
         self.show_turn_outcome(outcome);
@@ -1231,6 +1228,7 @@ impl ReplSession {
 
 enum MetaCommand<'a> {
     Help,
+    Verbose,
     New,
     Session,
     Sessions(bool),
@@ -1268,6 +1266,7 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     let cmd = head.strip_prefix('/').or_else(|| head.strip_prefix(':'));
     match (cmd, rest) {
         (Some("help"), _) => Some(MetaCommand::Help),
+        (Some("verbose"), None) => Some(MetaCommand::Verbose),
         (None, _) if head == "help" => Some(MetaCommand::Help),
         (Some("new"), _) => Some(MetaCommand::New),
         (Some("session"), _) => Some(MetaCommand::Session),
@@ -1331,6 +1330,15 @@ impl ReplSession {
     async fn handle_meta(&mut self, cmd: MetaCommand<'_>) {
         match cmd {
             MetaCommand::Help => print_help(&self.ui),
+            MetaCommand::Verbose => {
+                let verbose = self.ui.toggle_verbose();
+                clear_and_reprint(&self.session, &self.ui);
+                self.ui.myco_section(if verbose {
+                    "verbose: on"
+                } else {
+                    "verbose: off"
+                });
+            }
             MetaCommand::Unknown(head) => self
                 .ui
                 .error_section(&format!("Unknown command: {head}  (try /help)")),
@@ -1703,6 +1711,9 @@ fn format_session_list(list: &[SessionListEntry]) -> String {
 /// conversation ([`clear_and_reprint`]) or a fresh banner (`/compact`).
 /// Terminal-only: cursor codes never reach the console mirror.
 fn clear_screen() {
+    if !std::io::stdout().is_terminal() || std::env::var("TERM").as_deref() == Ok("dumb") {
+        return;
+    }
     print!("\x1B[3J\x1B[2J\x1B[1;1H");
     let _ = std::io::stdout().flush();
 }
@@ -1949,6 +1960,7 @@ mod tests {
     #[test]
     fn parse_meta_reports_unknown_commands_instead_of_printing() {
         assert!(matches!(parse_meta("/help"), Some(MetaCommand::Help)));
+        assert!(matches!(parse_meta("/verbose"), Some(MetaCommand::Verbose)));
         assert!(matches!(parse_meta("help"), Some(MetaCommand::Help)));
         assert!(matches!(
             parse_meta(":sessions"),

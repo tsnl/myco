@@ -23,17 +23,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use unicode_width::UnicodeWidthChar;
-
 pub mod markdown;
+mod tool_box;
 pub mod transcript;
 
 pub use markdown::{MarkdownRenderer, render_block, render_block_with_base};
 pub use transcript::{
-    Palette, SECTION_RULE, TOOL_DISPLAY_STRING_MAX, attachment_note, banner_open_events,
-    banner_rule, compacted_banner_events, format_tokens, history_events, section_rule,
-    truncate_json_strings, usage_line, user_header_line, user_rule, write_error_section,
-    write_warning_section,
+    Palette, SECTION_RULE, attachment_note, banner_open_events, banner_rule,
+    compacted_banner_events, format_tokens, history_events, section_rule, usage_line,
+    user_header_line, user_rule, write_error_section, write_warning_section,
 };
 
 use crate::agent::{AgentEvent, EventSink, TraceContext};
@@ -335,110 +333,6 @@ pub(crate) fn section_open_events(
     events.push(TuiEvent::Text("\n".into()));
 }
 
-/// Tool arguments shared by live output and replay. Bash commands and stdin
-/// appear in full below their options; other strings use bounded JSON previews.
-pub(crate) fn tool_invocation_events(
-    events: &mut Vec<TuiEvent>,
-    name: &str,
-    input: &serde_json::Value,
-    wrap: Option<usize>,
-) {
-    events.push(TuiEvent::Style(Style::WARNING));
-    events.push(TuiEvent::Text(name.to_string()));
-    events.push(TuiEvent::Style(Style::RESET));
-    let command = (name == "bash")
-        .then(|| input.get("command")?.as_str())
-        .flatten();
-    let stdin = (name == "bash")
-        .then(|| input.get("stdin")?.as_str())
-        .flatten();
-    let mut display = truncate_json_strings(input, TOOL_DISPLAY_STRING_MAX);
-    if command.is_some() {
-        display.as_object_mut().unwrap().remove("command");
-    }
-    if stdin.is_some() {
-        display.as_object_mut().unwrap().remove("stdin");
-    }
-    let body = match &display {
-        serde_json::Value::Object(fields)
-            if (command.is_some() || stdin.is_some()) && fields.is_empty() =>
-        {
-            String::new()
-        }
-        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-            serde_json::to_string_pretty(&display).unwrap_or_else(|_| display.to_string())
-        }
-        other => other.to_string(),
-    };
-    events.push(TuiEvent::Text(format!("({body})\n")));
-    if let Some(command) = command {
-        events.push(TuiEvent::Text(tool_text(command, "$ ", wrap)));
-    }
-    if let Some(stdin) = stdin {
-        events.push(TuiEvent::Text("stdin:\n".into()));
-        events.push(TuiEvent::Text(tool_text(stdin, "> ", wrap)));
-    }
-}
-
-/// Wrap without parsing shell syntax or dropping whitespace. The arrow marks
-/// display continuations, so they cannot be mistaken for source line breaks.
-fn tool_text(text: &str, prefix: &str, wrap: Option<usize>) -> String {
-    let mut visible = String::new();
-    for ch in text.chars() {
-        if ch.is_control() && ch != '\n' && ch != '\t' {
-            visible.extend(ch.escape_default());
-        } else {
-            visible.push(ch);
-        }
-    }
-    let Some(width) = wrap else {
-        let newline = if visible.ends_with('\n') { "" } else { "\n" };
-        return format!("{prefix}{visible}{newline}");
-    };
-    let mut out = String::new();
-    for (index, line) in visible
-        .strip_suffix('\n')
-        .unwrap_or(&visible)
-        .split('\n')
-        .enumerate()
-    {
-        let mut prefix = if index == 0 { prefix } else { "  " };
-        let mut remaining = line;
-        loop {
-            let mut end = 0;
-            let mut boundary = 0;
-            let mut column = 2;
-            for (offset, ch) in remaining.char_indices() {
-                let char_width = if ch == '\t' {
-                    8 - column % 8
-                } else {
-                    ch.width().unwrap_or(0)
-                };
-                if column + char_width > width && end > 0 {
-                    break;
-                }
-                column += char_width;
-                end = offset + ch.len_utf8();
-                if ch == ' ' || ch == '\t' {
-                    boundary = end;
-                }
-            }
-            if end < remaining.len() && boundary > 0 {
-                end = boundary;
-            }
-            out.push_str(prefix);
-            out.push_str(&remaining[..end]);
-            out.push('\n');
-            remaining = &remaining[end..];
-            if remaining.is_empty() {
-                break;
-            }
-            prefix = "↪ ";
-        }
-    }
-    out
-}
-
 /// Section/paragraph layout state shared by the live producer and history
 /// replay: ASSISTANT opens once per agent turn, paragraphs (text, thinking,
 /// tools) are blank-line separated inside it.
@@ -450,6 +344,8 @@ pub(crate) struct SectionState {
     pub assistant_open: bool,
     /// A finished paragraph wants a blank line before the next one.
     pub need_blank: bool,
+    tool_box: Option<tool_box::ToolBox>,
+    pub turn_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl SectionState {
@@ -458,6 +354,8 @@ impl SectionState {
             at_line_start: true,
             assistant_open: false,
             need_blank: false,
+            tool_box: None,
+            turn_time: None,
         }
     }
 
@@ -476,7 +374,8 @@ impl SectionState {
             return;
         }
         self.ensure_line_start(events);
-        section_open_events(events, Style::ASSISTANT, "ASSISTANT", wrap);
+        let header = transcript::turn_header("ASSISTANT", self.turn_time);
+        section_open_events(events, Style::ASSISTANT, &header, wrap);
         self.at_line_start = true;
         self.assistant_open = true;
         self.need_blank = false;
@@ -484,10 +383,79 @@ impl SectionState {
 
     /// Blank line before a subsequent paragraph inside ASSISTANT.
     pub fn separate_paragraph_if_needed(&mut self, events: &mut Vec<TuiEvent>) {
+        self.finish_tools(events);
         if self.need_blank {
             self.ensure_line_start(events);
             events.push(TuiEvent::Text("\n".into()));
             self.at_line_start = true;
+        }
+    }
+
+    pub fn start_tool(
+        &mut self,
+        events: &mut Vec<TuiEvent>,
+        name: &str,
+        input: &serde_json::Value,
+        palette: Palette,
+    ) {
+        self.ensure_assistant(events, palette.wrap);
+        let mut frame = match self.tool_box {
+            Some(frame) => {
+                frame.next(events, name);
+                frame
+            }
+            None => {
+                self.separate_paragraph_if_needed(events);
+                tool_box::ToolBox::open(events, name, palette)
+            }
+        };
+        frame.input(events, input);
+        self.tool_box = Some(frame);
+        self.at_line_start = true;
+        self.need_blank = true;
+    }
+
+    pub fn tool_result(
+        &mut self,
+        events: &mut Vec<TuiEvent>,
+        tool: &ToolUse,
+        result: &ToolResult,
+        palette: Palette,
+    ) {
+        let line = tool_outcome_line(tool, result)
+            .unwrap_or_else(|| format!("↳ {}: output", tool.name.escape_debug()));
+        if self.tool_box.is_none() {
+            self.start_tool(events, &tool.name, &tool.input, palette);
+        }
+        let status = result.status.as_deref().unwrap_or("");
+        let process_failed = status.starts_with("signal ")
+            || status
+                .strip_prefix("exit ")
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| code != 0);
+        let style = if result.is_error || process_failed {
+            Style::ERROR
+        } else if status.contains("cancel") {
+            Style::WARNING
+        } else {
+            Style::ASSISTANT
+        };
+        let frame = self.tool_box.as_mut().unwrap();
+        frame.status(events, &line, style);
+        for content in &result.content {
+            match content {
+                Content::Text { text } if !text.is_empty() => {
+                    frame.text(events, text, Style::RESET)
+                }
+                Content::Image { .. } => frame.text(events, "[image output]", Style::THINKING),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn finish_tools(&mut self, events: &mut Vec<TuiEvent>) {
+        if let Some(frame) = self.tool_box.take() {
+            frame.close(events);
         }
     }
 }
@@ -500,6 +468,7 @@ impl SectionState {
 /// the sinks after it is released (no sink IO while holding producer state).
 struct ProducerState {
     wrap: Option<usize>,
+    verbose: bool,
     section: SectionState,
     /// True while streaming answer text (no blank lines between text deltas).
     in_text_stream: bool,
@@ -550,6 +519,7 @@ impl TuiProducer {
             colors,
             state: Mutex::new(ProducerState {
                 wrap,
+                verbose: false,
                 section: SectionState::new(),
                 in_text_stream: false,
                 text_md: None,
@@ -565,13 +535,23 @@ impl TuiProducer {
         self.with_state(|st| st.wrap = wrap);
     }
 
+    /// Toggle tool detail at the idle prompt; the caller redraws saved history.
+    pub fn toggle_verbose(&self) -> bool {
+        self.with_state(|st| {
+            st.verbose = !st.verbose;
+            st.verbose
+        })
+    }
+
     fn with_state<R>(&self, f: impl FnOnce(&mut ProducerState) -> R) -> R {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut state)
     }
 
-    fn palette(&self, wrap: Option<usize>) -> Palette {
-        Palette::colored(self.colors).with_wrap(wrap)
+    fn palette(&self, st: &ProducerState) -> Palette {
+        Palette::colored(self.colors)
+            .with_wrap(st.wrap)
+            .with_verbose(st.verbose)
     }
 
     fn broadcast(&self, events: Vec<TuiEvent>) {
@@ -597,7 +577,11 @@ impl TuiProducer {
         let events = self.with_state(|st| {
             let mut events = Vec::new();
             styled_line(&mut events, Style::USER, &user_rule(st.wrap));
-            styled_line(&mut events, Style::USER, &user_header_line(used, max));
+            styled_line(
+                &mut events,
+                Style::USER,
+                &transcript::turn_header(&user_header_line(used, max), Some(chrono::Utc::now())),
+            );
             if let Some(u) = usage {
                 styled_line(&mut events, Style::USER, &usage_line(u));
             }
@@ -625,25 +609,33 @@ impl TuiProducer {
             .emit(&[TuiEvent::Text(rendered), TuiEvent::Text("\n".into())]);
     }
 
+    /// Label the assistant turn with the same acceptance time saved in history.
+    pub fn accepted_turn(&self, time: chrono::DateTime<chrono::Utc>) {
+        let events = self.with_state(|st| {
+            st.section.turn_time = Some(time);
+            let mut events = Vec::new();
+            st.section.ensure_assistant(&mut events, st.wrap);
+            events
+        });
+        self.broadcast(events);
+    }
+
     /// Replay saved history — **terminal only**: the mirror already holds this
     /// content from the run(s) that streamed it (`{id}.console` is opened for
     /// append). Used for `--resume`/`/resume` replay and the Ctrl-L / resize
     /// reprint.
     pub fn replay_history(&self, messages: &[Message]) {
-        let wrap = self.with_state(|st| st.wrap);
-        let events = history_events(messages, self.palette(wrap));
+        let palette = self.with_state(|st| self.palette(st));
+        let events = history_events(messages, palette);
         if !events.is_empty() {
             self.terminal.emit(&events);
         }
     }
 
     pub fn replay_thread(&self, thread: &crate::session::Thread) {
-        let wrap = self.with_state(|st| st.wrap);
-        let events = transcript::history_events_at(
-            &thread.messages,
-            self.palette(wrap),
-            &thread.user_turn_timestamps,
-        );
+        let palette = self.with_state(|st| self.palette(st));
+        let events =
+            transcript::history_events_at(&thread.messages, palette, &thread.user_turn_timestamps);
         self.terminal.emit(&events);
     }
 
@@ -670,11 +662,24 @@ impl TuiProducer {
     pub fn compacted_banner(&self, outcome: &crate::session::CompactOutcome) {
         let events = self.with_state(|st| {
             let events = compacted_banner_events(outcome, st.wrap);
+            let turn_time = st.section.turn_time;
             st.section = SectionState::new();
+            st.section.turn_time = turn_time;
             st.section.at_line_start = true;
             events
         });
         self.broadcast(events);
+    }
+
+    pub fn compacting_banner(&self, session: &str, thread: &str, automatic: bool) {
+        self.headed_section(
+            Style::BANNER,
+            "COMPACTING",
+            &format!(
+                "Mode: {}\nSession: {session}\nThread: {thread}\nCtrl-C to cancel",
+                if automatic { "automatic" } else { "manual" }
+            ),
+        );
     }
 
     /// Headed MYCO section (live-only): myco's own response to a meta-command
@@ -698,6 +703,10 @@ impl TuiProducer {
     fn headed_section(&self, style: Style, header: &str, body: &str) {
         let events = self.with_state(|st| {
             let mut events = Vec::new();
+            finish_thinking_line(st, &mut events);
+            end_text_stream(st, &mut events, self.colors);
+            st.section.finish_tools(&mut events);
+            st.section.assistant_open = false;
             section_open_events(&mut events, style, header, st.wrap);
             let body = if body.ends_with('\n') {
                 body.to_string()
@@ -758,9 +767,10 @@ impl TuiProducer {
                 st.section.ensure_line_start(&mut events);
                 st.thinking_line_open = true;
                 // Dim base stays open across deltas; finish_thinking_line resets.
+                let palette = self.palette(st);
                 let md = st
                     .thinking_md
-                    .insert(MarkdownRenderer::with_base(self.palette(st.wrap), "2"));
+                    .insert(MarkdownRenderer::with_base(palette, "2"));
                 events.extend(md.feed_events("Thinking: "));
                 events.extend(md.feed_events(text));
             } else if let Some(md) = st.thinking_md.as_mut() {
@@ -790,7 +800,7 @@ impl TuiProducer {
             }
             st.in_text_stream = true;
             st.section.need_blank = false;
-            let palette = self.palette(st.wrap);
+            let palette = self.palette(st);
             let md = st
                 .text_md
                 .get_or_insert_with(|| MarkdownRenderer::new(palette));
@@ -807,9 +817,8 @@ impl TuiProducer {
             // End any open text/thinking stream so the tool is its own paragraph.
             finish_thinking_line(st, &mut events);
             end_text_stream(st, &mut events, self.colors);
-            st.section.ensure_assistant(&mut events, st.wrap);
-            st.section.separate_paragraph_if_needed(&mut events);
-            tool_invocation_events(&mut events, name, input, st.wrap);
+            let palette = self.palette(st);
+            st.section.start_tool(&mut events, name, input, palette);
             st.section.at_line_start = true;
             st.in_text_stream = false;
             st.section.need_blank = true;
@@ -819,15 +828,12 @@ impl TuiProducer {
     }
 
     fn tool_finished(&self, tool: &ToolUse, result: &ToolResult) {
-        let Some(line) = tool_outcome_line(tool, result) else {
-            return;
-        };
         let events = self.with_state(|st| {
             let mut events = Vec::new();
             finish_thinking_line(st, &mut events);
             end_text_stream(st, &mut events, self.colors);
-            st.section.ensure_assistant(&mut events, st.wrap);
-            styled_line(&mut events, Style::WARNING, &line);
+            let palette = self.palette(st);
+            st.section.tool_result(&mut events, tool, result, palette);
             st.section.at_line_start = true;
             st.section.need_blank = true;
             events
@@ -858,6 +864,7 @@ impl TuiProducer {
             let mut events = Vec::new();
             finish_thinking_line(st, &mut events);
             end_text_stream(st, &mut events, self.colors);
+            st.section.finish_tools(&mut events);
             st.section.ensure_line_start(&mut events);
             // Close ASSISTANT for the next user turn (REPL prints USER next).
             st.section.assistant_open = false;
@@ -980,7 +987,139 @@ mod tests {
     }
 
     #[test]
-    fn factual_outcomes_are_bounded_mirrored_and_replayed_without_tool_stdout() {
+    fn compact_tool_boxes_show_the_first_five_lines_and_keep_the_outcome() {
+        let (p, terminal, _) = producer(Some(48));
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"content": (1..=10).map(|i| format!("input-{i}")).collect::<Vec<_>>()}),
+        };
+        p.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: ctx(0),
+        });
+        p.emit(AgentEvent::ToolFinished {
+            tool_use: tool,
+            result: ToolResult::text("output-1\noutput-2\noutput-3\noutput-4\noutput-5\noutput-6")
+                .with_status("exit 7"),
+            context: ctx(0),
+        });
+        finish(&p);
+        let output = encode_plain(&terminal.events());
+        assert!(output.contains("\"input-3\""), "{output}");
+        assert!(!output.contains("\"input-4\""), "{output}");
+        assert!(!output.contains("output-6"), "{output}");
+        assert!(output.contains("… /verbose"), "{output}");
+        assert!(output.contains("exit 7"), "{output}");
+    }
+
+    #[test]
+    fn tool_input_and_outcome_share_a_rounded_box() {
+        let (p, terminal, mirror) = producer(Some(48));
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"command":"exit 7"}),
+        };
+        p.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: ctx(0),
+        });
+        assert!(encode_plain(&terminal.events()).contains("\"command\": \"exit 7\""));
+        p.emit(AgentEvent::ToolFinished {
+            tool_use: tool,
+            result: ToolResult::text("hidden stdout").with_status("exit 7"),
+            context: ctx(0),
+        });
+        finish(&p);
+        let output = encode_plain(&terminal.events());
+        assert_eq!(output, encode_plain(&mirror.events()));
+        assert_eq!(output.matches('╭').count(), 1, "{output}");
+        assert_eq!(output.matches('╰').count(), 1, "{output}");
+        assert!(!output.contains("bash("), "{output}");
+        let start = output.find('╭').unwrap();
+        let end = output.find('╰').unwrap();
+        assert!(output[start..end].contains("\"command\": \"exit 7\""));
+        assert!(output[start..end].contains("exit 7: exit 7"));
+        for line in output[start..].lines() {
+            assert_eq!(unicode_width::UnicodeWidthStr::width(line), 48, "{line}");
+        }
+    }
+
+    #[test]
+    fn concurrent_tool_outcomes_and_cancellation_stay_inside_the_frame() {
+        let (p, terminal, mirror) = producer(Some(40));
+        let tools = ["sleep 30", "exit 7"].map(|command| ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"command":command}),
+        });
+        for tool in &tools {
+            p.emit(AgentEvent::ToolStarted {
+                tool_use: tool.clone(),
+                context: ctx(0),
+            });
+        }
+        for (tool, status) in [
+            (&tools[1], "exit 7"),
+            (&tools[0], "cancel requested; effects unknown"),
+        ] {
+            p.emit(AgentEvent::ToolFinished {
+                tool_use: tool.clone(),
+                result: ToolResult::text("").with_status(status),
+                context: ctx(0),
+            });
+        }
+        finish(&p);
+        let events = terminal.events();
+        let output = encode_plain(&events);
+        assert_eq!(events, mirror.events());
+        assert_eq!(output.matches('╭').count(), 1);
+        assert_eq!(output.matches('├').count(), 1);
+        assert_eq!(output.matches('╰').count(), 1);
+        assert!(output.find("exit 7: exit 7").unwrap() < output.find('╰').unwrap());
+        assert!(output.find("effects unknown").unwrap() < output.find('╰').unwrap());
+        assert!(encode_ansi(&events, true).contains("\x1b[0;1;31m↳ bash exit 7: exit 7"));
+        assert!(!output.contains('\x1b'));
+    }
+
+    #[test]
+    fn turn_banners_use_the_saved_acceptance_time_in_live_output_and_replay() {
+        let (p, terminal, mirror) = producer(None);
+        let time = "2026-09-21T22:00:00Z".parse().unwrap();
+        p.user_header(Some(0), 100, None, &[]);
+        p.accepted_turn(time);
+        text(&p, "answer");
+        finish(&p);
+        let live = encode_plain(&terminal.events());
+        assert_eq!(live, encode_plain(&mirror.events()));
+        let replay = encode_plain(&transcript::history_events_at(
+            &[
+                crate::test_support::user("question"),
+                crate::test_support::assistant("answer"),
+            ],
+            Palette::plain(),
+            &[(0, time)].into(),
+        ));
+        for output in [live, replay] {
+            assert!(
+                output.contains("ASSISTANT\n2026-09-21T22:00:00Z\n"),
+                "{output}"
+            );
+            assert!(!output.contains("Accepted:"));
+        }
+    }
+
+    #[test]
+    fn compaction_progress_has_its_own_system_section() {
+        let (p, terminal, mirror) = producer(None);
+        p.user_header(Some(90), 100, None, &[]);
+        p.compacting_banner("session-id", "thread-id", true);
+        p.note("compacting: 10s elapsed (Ctrl-C to cancel)");
+        let output = encode_plain(&terminal.events());
+        assert!(output.contains(&format!("{SECTION_RULE}\nCOMPACTING\n\nMode: automatic\nSession: session-id\nThread: thread-id\nCtrl-C to cancel\ncompacting: 10s")), "{output}");
+        assert_eq!(terminal.events(), mirror.events());
+    }
+
+    #[test]
+    fn factual_outcomes_remain_visible_with_truncated_content_and_replay() {
         let (p, terminal, mirror) = producer(None);
         let tool = ToolUse {
             name: "bash".into(),
@@ -1182,9 +1321,12 @@ mod tests {
         let events = terminal.events();
 
         let rule = "═".repeat(24);
+        let plain = encode_plain(&events);
+        let timestamp = plain.lines().nth(2).unwrap();
+        chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
         let expected = format!(
             "\x1b[0;1;36m{rule}\x1b[0m\n\
-             \x1b[0;1;36mUSER 10/200 (5%)\x1b[0m\n\
+             \x1b[0;1;36mUSER 10/200 (5%)\n{timestamp}\x1b[0m\n\
              \x1b[0;1;36m⚙ last turn: input 10 (8 cached) · output 3\x1b[0m\n\
              \x1b[0;1;36m● bash: sleep 99 (up 3s)\x1b[0m\n\n"
         );
@@ -1265,14 +1407,14 @@ mod tests {
         text(&producer, " two");
         finish(&producer);
         let plain = encode_plain(&terminal.events());
-        assert_eq!(plain.matches("ASSISTANT\n").count(), 1);
+        assert_eq!(plain.matches("ASSISTANT\nunknown\n").count(), 1);
         assert!(plain.contains("one two\n"));
         // Next user turn reopens the section.
         producer.user_header(Some(0), 1, None, &[]);
         text(&producer, "three");
         finish(&producer);
         let plain = encode_plain(&terminal.events());
-        assert_eq!(plain.matches("ASSISTANT\n").count(), 2);
+        assert_eq!(plain.matches("ASSISTANT\nunknown\n").count(), 2);
     }
 
     #[test]
@@ -1286,7 +1428,7 @@ mod tests {
         let plain = encode_plain(&terminal.events());
         // One ASSISTANT section: thinking line, blank line, answer text.
         assert!(
-            plain.contains("ASSISTANT\n\nThinking: plan it\n\ndone\n"),
+            plain.contains("ASSISTANT\nunknown\n\nThinking: plan it\n\ndone\n"),
             "{plain:?}"
         );
         // The thinking line is dim on the terminal and closed before the answer.
@@ -1304,12 +1446,13 @@ mod tests {
         finish(&producer);
         let plain = encode_plain(&terminal.events());
         assert!(
-            plain.contains("running now\n\nbash()\n$ echo hi\n\nand after\n"),
+            plain.contains("running now\n\n╭─ bash ")
+                && plain.contains("\"command\": \"echo hi\"")
+                && plain.contains("╯\n\nand after\n"),
             "{plain:?}"
         );
-        // Only the tool name is styled (bold yellow).
         let ansi = encode_ansi(&terminal.events(), true);
-        assert!(ansi.contains("\x1b[0;1;33mbash\x1b[0m()"), "{ansi:?}");
+        assert!(ansi.contains("\x1b[0;1;33m╭─ bash "), "{ansi:?}");
     }
 
     #[test]
@@ -1320,26 +1463,85 @@ mod tests {
             "command": "bash --noprofile --norc",
             "stdin": "cargo test --locked --workspace --lib -- --nocapture\nprintf '%s\\n' '**done**'\n",
         });
-        for wrap in [None, Some(20), Some(40)] {
-            let (producer, terminal, mirror) = producer(wrap);
-            tool(&producer, "bash", input.clone());
-            let replay = history_events(
-                &[Message::AssistantMessage {
-                    content: vec![],
-                    tool_uses: vec![ToolUse {
-                        name: "bash".into(),
-                        input: input.clone(),
+        for verbose in [false, true] {
+            for wrap in [None, Some(20), Some(40)] {
+                let (producer, terminal, mirror) = producer(wrap);
+                if verbose {
+                    producer.toggle_verbose();
+                }
+                tool(&producer, "bash", input.clone());
+                finish(&producer);
+                let replay = history_events(
+                    &[Message::AssistantMessage {
+                        content: vec![],
+                        tool_uses: vec![ToolUse {
+                            name: "bash".into(),
+                            input: input.clone(),
+                        }],
+                        turn_end_reason: None,
                     }],
-                    turn_end_reason: None,
-                }],
-                Palette::colored(true).with_wrap(wrap),
-            );
-            assert_eq!(terminal.events(), mirror.events());
-            assert_eq!(terminal.events(), replay);
-            let plain = encode_plain(&replay);
-            assert_eq!(plain.contains("↪ "), wrap.is_some());
-            assert_eq!(plain, strip_sgr(&encode_ansi(&replay, true)));
+                    Palette::colored(true).with_wrap(wrap).with_verbose(verbose),
+                );
+                assert_eq!(terminal.events(), mirror.events());
+                assert_eq!(terminal.events(), replay);
+                let plain = encode_plain(&replay);
+                if verbose {
+                    assert!(plain.contains("↪ "));
+                }
+                assert_eq!(plain, strip_sgr(&encode_ansi(&replay, true)));
+            }
         }
+    }
+
+    #[test]
+    fn verbose_toggle_replays_full_recorded_output_and_applies_to_future_tools() {
+        let (p, terminal, mirror) = producer(Some(48));
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"command":"echo hi"}),
+        };
+        let result =
+            ToolResult::text("output-1\noutput-2\noutput-3\noutput-4\noutput-5\noutput-6\n\x1b[2J")
+                .with_status("exit 0");
+        let messages = vec![
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![tool.clone()],
+                turn_end_reason: None,
+            },
+            Message::ToolResults {
+                tool_use_results: vec![result.clone()],
+            },
+        ];
+        p.replay_history(&messages);
+        let compact = terminal.events();
+        assert!(encode_plain(&compact).contains("output-2"));
+        assert!(!encode_plain(&compact).contains("output-3"));
+        assert!(p.toggle_verbose());
+        p.replay_history(&messages);
+        let full_events = terminal.events();
+        let full = &full_events[compact.len()..];
+        let output = encode_plain(full);
+        assert!(output.contains("output-6"));
+        assert!(output.contains("\\u{1b}[2J"));
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains("… /verbose"));
+        assert!(!p.toggle_verbose());
+        p.replay_history(&messages);
+        assert_eq!(&terminal.events()[full_events.len()..], compact);
+        assert!(mirror.events().is_empty());
+        assert!(p.toggle_verbose());
+        p.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: ctx(0),
+        });
+        p.emit(AgentEvent::ToolFinished {
+            tool_use: tool,
+            result,
+            context: ctx(0),
+        });
+        finish(&p);
+        assert_eq!(mirror.events(), full);
     }
 
     #[test]
@@ -1378,7 +1580,7 @@ mod tests {
         }]);
         assert!(mirror.events().is_empty());
         let plain = encode_plain(&terminal.events());
-        assert!(plain.contains("USER\n\nhello\n"), "{plain:?}");
+        assert!(plain.contains("USER\nunknown\n\nhello\n"), "{plain:?}");
     }
 
     #[test]

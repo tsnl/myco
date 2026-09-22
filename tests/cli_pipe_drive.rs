@@ -139,7 +139,8 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
             .unwrap(),
     )
     .unwrap();
-    let line = myco::tui::transcript::acceptance_line(Some(time.with_timezone(&chrono::Utc)));
+    let line =
+        myco::tui::transcript::turn_header("ASSISTANT", Some(time.with_timezone(&chrono::Utc)));
     assert!(stdout.contains(&line), "{stdout}");
     let replay = run_myco(
         &env,
@@ -147,7 +148,12 @@ async fn turn_times_replay_after_restart_and_archive_restore_are_explicit() {
         b"/quit\n",
     )
     .await;
-    assert!(replay.contains(&line), "{replay}");
+    assert!(
+        replay.contains(&line.replace("ASSISTANT", "USER")),
+        "{replay}"
+    );
+    assert!(!stdout.contains("Accepted:"));
+    assert!(!replay.contains("Accepted:"));
     assert!(!replay.contains("# Session"), "{replay}");
     assert!(!replay.contains("Launch directory:"), "{replay}");
 }
@@ -569,6 +575,46 @@ async fn automatic_compaction_resumes_once_without_inventing_user_input() {
     assert!(replay.contains("continued task"), "{replay}");
     assert!(!replay.contains("# Resumption"), "{replay}");
     assert!(!replay.contains("# Compaction resume"), "{replay}");
+}
+
+#[tokio::test]
+async fn verbose_redraws_saved_tool_output_without_reexecuting_tools_or_model_requests() {
+    let env = pipe_env("verbose");
+    let counter = env.dir.join("executions");
+    let command = format!(
+        "printf x >> '{}'; for n in {{1..12}}; do printf 'output-%s\\n' \"$n\"; done",
+        counter.display()
+    );
+    let server = test_utils::StubHttpServer::sequence(vec![
+        model_tool("bash", serde_json::json!({"command":command}), 100),
+        model_answer("Done.", 100),
+    ])
+    .await;
+    configure_compact(&env, &server, false);
+    let stdout = run_myco(
+        &env,
+        &["--color", "never"],
+        b"run task\n/verbose\n/verbose\n/quit\n",
+    )
+    .await;
+    assert!(stdout.contains("verbose: on"), "{stdout}");
+    assert!(stdout.contains("verbose: off"), "{stdout}");
+    assert_eq!(stdout.matches("output-12").count(), 1, "{stdout}");
+    assert_eq!(stdout.matches("ASSISTANT\n").count(), 3, "{stdout}");
+    assert_eq!(stdout.matches("… /verbose").count(), 2, "{stdout}");
+    assert!(!stdout.contains('\x1b'), "{stdout}");
+    assert_eq!(server.connections(), 2);
+    assert_eq!(std::fs::read_to_string(counter).unwrap(), "x");
+    let id = announced_session_id(&stdout);
+    let saved = session_json(&env.dir, &id);
+    assert_eq!(
+        saved["threads"][0]["user_turn_timestamps"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(saved.to_string().contains("output-12"));
 }
 
 #[tokio::test]
