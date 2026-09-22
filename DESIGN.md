@@ -82,13 +82,14 @@ instances and observations.
 `GenAiClient::generate` validates and encodes the request synchronously, returning
 `Result<Generation<'_>, Error>`. A valid request produces a concrete stream
 implementing `Stream<Item = Result<Event, Error>>`; network I/O waits for polling.
-It yields the request before dispatch, ordered progress, and one
+It yields the request before dispatch, raw progress, normalized deltas, and one
 `Completed { message, finish, usage }` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
-The returned assistant message holds content and opaque continuation JSON, ready
-to append to the next request. Callers preserve continuation unchanged; private
-backends interpret and validate it. Finish reason and usage describe the generation.
+Each request supplies the complete selected conversation history. Backends rebuild
+their request from those messages. The returned assistant message holds output,
+ready to append to that history. Reasoning content retains its signature or
+encrypted data explicitly. Finish reason and usage describe the generation.
 
 ## Workspaces and service APIs
 
@@ -313,8 +314,10 @@ an enclosing agent object.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
 The richer roles in `thread` are interpreted by each workflow, not mechanically
-converted into model roles. Opaque continuation data stays in inference records
-alongside the portable thread entries; workflows need no provider-specific types.
+converted into model roles. Raw provider events stay in inference records alongside
+the portable thread entries; workflows need no provider-specific response types.
+Selected reasoning retains its original text, signature/encrypted data, and order
+when rebuilding model history.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
@@ -328,8 +331,9 @@ pub enum TurnUpdate {
 
 `TurnUpdate` belongs to `logic`, not the history API. Deltas carry generation/
 attempt identity and content-block coordinates, including incomplete tool arguments.
-`model::Event::Completed { message, finish, usage }` supplies a validated inference
-outcome. Workflow code records its evidence, checks conversation structure and correlation, and
+`model::Event::Completed { message, finish, usage }` supplies the assembled message
+and validated inference outcome, including fields absent from provisional deltas.
+Workflow code records its evidence, checks conversation structure and correlation, and
 appends it with the expected revision and operation receipt before yielding
 `Committed`. A refusal or output limit can be recorded as such; incomplete
 arguments never authorize tool execution.
@@ -431,11 +435,9 @@ Workflow adapters pin model configuration and capabilities, record the exact
 request before polling the inference stream into dispatch, and translate progress
 and its final outcome into thread values.
 
-Native continuation, raw provider metadata, and provider-call/invocation-ID
-mappings remain in interpreter records. Evidence is durable before a thread or
-operation can reference it. Retained history keeps evidence reachable.
-Continuation is reusable only when it represents the selected context; otherwise
-the adapter reconstructs the request or reports an incompatibility.
+Raw provider metadata and provider-call/invocation-ID mappings remain in
+interpreter records. Evidence is durable before a thread or operation can
+reference it. Retained history keeps evidence reachable.
 
 Tool adapters validate against pinned schemas, invoke a service or internal kernel
 operation, and record a translated outcome. GUI controls use those same service
@@ -490,8 +492,8 @@ Review steps are module-sized changes within the engine crate.
 1. **Interfaces:** module boundaries, history operations, workflow composition,
    stream completion, persistence, cancellation, and recovery.
 2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
-   Check request-before-dispatch, ordered progress, explicit completion, native
-   continuation, consumer backpressure, concurrent requests, and stream drop.
+   Check request-before-dispatch, ordered progress, explicit completion, history
+   reconstruction, consumer backpressure, concurrent requests, and stream drop.
 3. **Thread:** owned vector histories, rich entries, fixed references, injected
    storage, and atomic append/fork. Check stale writes, independent forks,
    ambiguous commits, and cancellation/publication races.
