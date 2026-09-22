@@ -15,42 +15,41 @@ mod openai_responses_backend;
 
 use backend_helpers::{Driver, EventStream};
 
-/// Complete endpoint URLs; empty keys omit authentication.
-pub enum Config {
-    OpenAi { endpoint: String, api_key: String },
-    Anthropic { endpoint: String, api_key: String },
-}
+//
+// GenAiClient
+//
 
 pub struct GenAiClient {
     driver: Box<dyn Driver>,
 }
-
+pub enum Config {
+    OpenAi { endpoint: String, api_key: String },
+    Anthropic { endpoint: String, api_key: String },
+}
 impl GenAiClient {
     pub fn new(config: Config) -> Result<Self, Error> {
         Ok(Self {
             driver: backend_helpers::driver(config)?,
         })
     }
-
-    /// Validates and encodes immediately; network I/O waits for polling.
     pub fn generate(&self, request: Request) -> Result<Generation<'_>, Error> {
         backend_helpers::generate(self.driver.as_ref(), request)
     }
 }
 
-/// Completion, error, or drop releases the attempt's HTTP request.
+//
+// Generation
+//
+
 pub struct Generation<'a> {
     inner: Option<EventStream<'a>>,
 }
-
 impl Stream for Generation<'_> {
     type Item = Result<Event, Error>;
-
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         backend_helpers::poll_generation(self.get_mut(), cx)
     }
 }
-
 impl FusedStream for Generation<'_> {
     fn is_terminated(&self) -> bool {
         self.inner.is_none()
