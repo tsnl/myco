@@ -55,6 +55,7 @@ only on the local worker. Model credentials stay with the application process.
 | Area | Entry point |
 | --- | --- |
 | Startup and CLI controls | `src/bin/myco.rs` |
+| Browser frontend, HTTP actions, and transcript projection | `src/bin/browser/` |
 | Profiles, models, authentication | `src/config/`, `src/core/fs.rs` |
 | Agent execution | `crates/myco-agent/src/lib.rs`, `generation.rs` |
 | Provider translation and streaming | `crates/myco-model/src/` |

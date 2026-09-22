@@ -42,6 +42,9 @@ use rustyline::{
 };
 use unicode_width::UnicodeWidthStr;
 
+#[path = "browser/mod.rs"]
+mod browser;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -81,6 +84,9 @@ const SLASH_COMMANDS: &[&str] = &[
     disable_help_flag = true,
 )]
 struct Args {
+    /// Serve the browser UI on 127.0.0.1 (default port 8765; use 0 for a free port).
+    #[arg(long, num_args = 0..=1, default_missing_value = "8765", value_name = "PORT", conflicts_with = "print")]
+    web: Option<u16>,
     /// Show CLI help, or print a manual article when ARTICLE is given
     /// (e.g. `myco --help overview`). Same articles startup exports to
     /// `~/.myco/profiles/default/manual/<version>/<commit>/` for agents to read.
@@ -228,12 +234,24 @@ fn main() {
         eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
         std::process::exit(2);
     }
+    if args.web.is_some() && (args.mode != Mode::Interactive || args.resume == Some(None)) {
+        eprintln!(
+            "myco: --web requires interactive mode; --resume needs a session id in the browser"
+        );
+        std::process::exit(2);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("create async runtime")
         .block_on(async {
             match args.mode {
+                Mode::Interactive if args.web.is_some() => {
+                    if let Err(error) = browser::run(args).await {
+                        eprintln!("myco: {error}");
+                        std::process::exit(1);
+                    }
+                }
                 Mode::Interactive if args.print.is_some() => run_print(args).await,
                 Mode::Interactive => run_interactive(args).await,
                 Mode::Host => run_host(args).await,

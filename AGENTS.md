@@ -90,6 +90,7 @@ gateway access, session store) stay on the user's machine; remotes stay hands.
 | Area | Role |
 |------|------|
 | `src/bin/myco.rs` | CLI: interactive REPL + `--mode host` worker |
+| `src/bin/browser/` | `--web` loopback frontend over the shared session runner; embedded assets, transcript projection, and authenticated browser actions |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults, color decision |
 | `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |

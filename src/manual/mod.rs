@@ -37,6 +37,12 @@ pub const ARTICLES: &[Article] = &[
         body: include_str!("articles/cli.md"),
     },
     Article {
+        id: "browser",
+        title: "Browser UI",
+        summary: "Launch the local browser UI, inspect tool output, render Markdown and images",
+        body: include_str!("articles/browser.md"),
+    },
+    Article {
         id: "harness-ops",
         title: "Harness ops",
         summary: "Find hosts, install from releases or git source, diagnosis checklist",
@@ -144,7 +150,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), ARTICLES.len(), "duplicate article ids");
-        assert_eq!(ids, ["cli", "evals", "harness-ops", "overview"]); // sorted unique
+        assert_eq!(ids, ["browser", "cli", "evals", "harness-ops", "overview"]);
         for a in ARTICLES {
             assert!(!a.body.trim().is_empty(), "empty body: {}", a.id);
             assert!(!a.title.is_empty());
