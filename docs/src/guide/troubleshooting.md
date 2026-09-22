@@ -14,7 +14,7 @@ contract; this website tracks `main`.
 | Session missing | Check the profile and archived-session filter. Nested and compaction worker sessions are hidden in ordinary listings. |
 | Session is locked | Another running process owns the session. Continue there or use a different session. |
 | Shell missing after resume | Conversation history persists; live tools do not survive process exit. |
-| Unexpected submission | Most terminals send Shift-Enter as Enter. Use Alt-Enter or Ctrl-J. |
+| Unexpected submission | Enter sends; use Shift-Enter or Alt-Enter for newlines. |
 
 ## Oversized input
 
@@ -28,16 +28,16 @@ does not undo tool side effects.
 ## Repeated failures or interruption
 
 Only transient failures before response parts arrive are retried automatically.
-An error after partial output is surfaced rather than replayed. Ctrl-C cancels
+An error after partial output is surfaced rather than replayed. The Cancel button cancels
 the turn, including retry waits; tools have their own cancellation cleanup.
 Inspect current files and processes before resubmitting work with side effects.
 
 ## Recover useful evidence
 
-`/session` shows the session's data and console paths. In an interactive TTY
-run, the `.console` file records startup warnings and live errors as well as
-the conversation. Print mode sends diagnostics to stderr and has no console
-mirror. Read saved threads through `session_history` for structured history.
+Use `session_meta` to inspect session metadata and paths. The browser shows
+startup warnings, running errors, and tool outcomes; server diagnostics go to the
+launching terminal. Read saved threads through `session_history` for structured
+history. Legacy `.console` files remain available but are not extended by the server.
 
 When reporting a bug, include the version, relevant config shape with credentials
 removed, host and protocol involved, and the smallest reproduction. The

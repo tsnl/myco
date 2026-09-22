@@ -13,10 +13,9 @@ cargo install myco --locked
 myco --version
 ```
 
-Have `bash` and `uv` available for shell work and Python tooling. Install `tmux`
-and `fzf` for the session picker, and OpenSSH for remote hosts. `git`, `gh`,
-`rg`, and `curl` are useful programs for the agent to use through bash. Startup
-reports missing expected executables; `/resume <id>` works without the picker.
+Have `bash` and `uv` available for shell work and Python tooling, and OpenSSH
+for remote hosts. `git`, `gh`, `rg`, and `curl` are useful programs for the agent
+to use through bash. Startup reports missing expected executables.
 
 This book tracks `main`. To run the same source from a checkout:
 
@@ -73,11 +72,11 @@ cd /path/to/your/project
 myco
 ```
 
-Ask for a bounded first task, such as “Explain the entry points in this
-repository.” Myco reads project guidance from `AGENTS.md` or `CLAUDE.md` at
-startup. Use `/hosts` to inspect available execution hosts, `/session` to see
-the current session, and `/help` for controls.
+Open the URL printed by the server and choose **New session**. Ask for a bounded
+first task, such as “Explain the entry points in this repository.” Myco reads
+project guidance from `AGENTS.md` or `CLAUDE.md` at session start.
 
-Enter submits a message. **Alt-Enter** or **Ctrl-J** inserts a newline.
-**Ctrl-C** cancels the current turn; **Ctrl-D** or `/exit` saves and quits.
+Enter submits a message; Shift-Enter or Alt-Enter inserts a newline. The **Cancel**
+button stops a running turn. Closing a tab leaves it running; Ctrl-C in the
+launching terminal stops the server and all its sessions.
 Next, read [everyday use](everyday-use.md) and [sessions](sessions.md).

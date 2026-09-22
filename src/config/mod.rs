@@ -6,7 +6,7 @@
 //! produces fully resolved settings — the **model catalog**, the host pool
 //! (remote hosts from `~/.ssh/config` `Host` aliases), the default model key
 //! (`--model` → config file `model` → sole catalog entry), the prelude size cap
-//! (`max_prelude_bytes`), and the color decision for stdout rendering. Downstream
+//! (`max_prelude_bytes`). Downstream
 //! code reads the resolved fields; nothing else reads these environment
 //! variables or files.
 //!
@@ -33,7 +33,6 @@
 //! tool-call time on whichever host runs the tool).
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
@@ -103,123 +102,6 @@ pub fn read_auth_file(path: &Path) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Colors
-// ---------------------------------------------------------------------------
-
-/// Color choice for stdout rendering (CLI `--color`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ColorMode {
-    /// Colors when stdout is a TTY; `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb` respected.
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-impl std::fmt::Display for ColorMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ColorMode::Auto => "auto",
-            ColorMode::Always => "always",
-            ColorMode::Never => "never",
-        })
-    }
-}
-
-impl std::str::FromStr for ColorMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(ColorMode::Auto),
-            "always" | "on" => Ok(ColorMode::Always),
-            "never" | "off" => Ok(ColorMode::Never),
-            other => Err(format!(
-                "unknown color mode {other:?}; expected auto|always|never"
-            )),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Word wrap
-// ---------------------------------------------------------------------------
-
-/// Wrap cap for `--wrap auto` (narrower terminals win).
-pub const DEFAULT_WRAP_WIDTH: usize = 80;
-
-/// Word-wrap choice for stdout rendering (CLI `--wrap`). Every mode is a
-/// *cap*: the effective width is `min(cap, measured terminal width)`,
-/// re-measured at render time so resizes reflow.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WrapMode {
-    /// Cap at [`DEFAULT_WRAP_WIDTH`].
-    #[default]
-    Auto,
-    Off,
-    /// Cap at a custom column count.
-    Columns(usize),
-}
-
-impl std::fmt::Display for WrapMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WrapMode::Auto => f.write_str("auto"),
-            WrapMode::Off => f.write_str("off"),
-            WrapMode::Columns(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-impl std::str::FromStr for WrapMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim().to_ascii_lowercase();
-        match s.as_str() {
-            "auto" => Ok(WrapMode::Auto),
-            "off" | "never" | "none" => Ok(WrapMode::Off),
-            _ => match s.parse::<usize>() {
-                Ok(n) if n >= 20 => Ok(WrapMode::Columns(n)),
-                Ok(n) => Err(format!("wrap width {n} is too narrow (minimum 20)")),
-                Err(_) => Err(format!(
-                    "unknown wrap mode {s:?}; expected auto|off|<columns>"
-                )),
-            },
-        }
-    }
-}
-
-/// The configured wrap cap. Wrap is TTY-only, like colors — piped output is
-/// never wrapped. Terminal-width measurement happens at render time, not here.
-fn resolve_wrap(mode: WrapMode, stdout_is_tty: bool) -> Option<usize> {
-    match mode {
-        WrapMode::Off => None,
-        WrapMode::Columns(n) => stdout_is_tty.then_some(n),
-        WrapMode::Auto => stdout_is_tty.then_some(DEFAULT_WRAP_WIDTH),
-    }
-}
-
-/// Terminal (columns, rows) of stdout, when stdout is a terminal.
-#[cfg(unix)]
-pub fn detect_terminal_size() -> Option<(usize, usize)> {
-    let mut ws = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCGWINSZ only writes the winsize out-param on success.
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
-    (ok && ws.ws_col > 0).then_some((ws.ws_col as usize, ws.ws_row as usize))
-}
-
-#[cfg(not(unix))]
-pub fn detect_terminal_size() -> Option<(usize, usize)> {
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Config resolution
 // ---------------------------------------------------------------------------
 
@@ -227,10 +109,6 @@ pub fn detect_terminal_size() -> Option<(usize, usize)> {
 /// tests). Any field set here wins over file/environment resolution.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigUserSettings {
-    pub color: ColorMode,
-    pub wrap: WrapMode,
-    /// Override TTY detection (tests / embedders). `None` → detect from stdout.
-    pub stdout_is_tty: Option<bool>,
     /// Config file override (CLI `--config`).
     /// `None` → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`.
     pub config_path: Option<PathBuf>,
@@ -244,18 +122,6 @@ pub struct ConfigUserSettings {
 /// the environment or config files.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Whether stdout is a terminal (or the [`ConfigUserSettings`] override).
-    pub stdout_is_tty: bool,
-    /// Final color decision for stdout rendering ([`ColorMode`] + env overrides + TTY).
-    pub colors_enabled: bool,
-    /// Wrap cap ([`WrapMode`] + TTY), `None` = off. The effective width is
-    /// `min(cap, terminal width)`, measured by the renderer per prompt so
-    /// terminal resizes reflow.
-    pub wrap_max: Option<usize>,
-    /// Automatic cursor repaints allowed (input re-echo, resize reflow):
-    /// stdout is a TTY and `TERM` is not `dumb`. Wrapping itself stays on for
-    /// dumb terminals — it only inserts newlines.
-    pub repaint_enabled: bool,
     /// Path the config file was loaded from
     /// (override → `$MYCO_CONFIG` → `~/.myco/profiles/default/config.toml`).
     pub config_path: PathBuf,
@@ -278,15 +144,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolve from the real process environment, stdout TTY state, the
+    /// Resolve from the real process environment, the
     /// config file, auth files, and `~/.ssh/config` host aliases. Errors
     /// carry the offending path / entry name.
     pub fn resolve(settings: ConfigUserSettings) -> Result<Self, String> {
-        let stdout_is_tty = std::io::stdout().is_terminal();
         Self::resolve_with(
             settings,
             |k| std::env::var(k).ok(),
-            stdout_is_tty,
             load_file_config,
             load_ssh_host_aliases,
             read_auth_file,
@@ -298,21 +162,16 @@ impl Config {
     pub fn resolve_with(
         settings: ConfigUserSettings,
         env: impl Fn(&str) -> Option<String>,
-        stdout_is_tty: bool,
         load_file: impl FnOnce(&Path, bool) -> Result<FileConfig, String>,
         ssh_aliases: impl FnOnce() -> Result<Vec<String>, String>,
         read_auth_file: impl Fn(&Path) -> Result<String, String>,
     ) -> Result<Self, String> {
         let env = |key: &str| env(key).filter(|v| !v.is_empty());
         let ConfigUserSettings {
-            color,
-            wrap,
-            stdout_is_tty: tty_override,
             config_path,
             model: model_override,
         } = settings;
 
-        let stdout_is_tty = tty_override.unwrap_or(stdout_is_tty);
         let (config_path, named_by_user) = resolve_config_path(config_path, &env)?;
         // Every failure from here on is about this file, and the first question
         // a config error raises is which file it means. Errors that already
@@ -361,15 +220,7 @@ impl Config {
                 .map(|s| s.max_image_base64_bytes)
                 .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
         );
-        let colors_enabled = resolve_colors(color, &env, stdout_is_tty);
-        let wrap_max = resolve_wrap(wrap, stdout_is_tty);
-        let repaint_enabled = stdout_is_tty && env("TERM").as_deref() != Some("dumb");
-
         Ok(Self {
-            stdout_is_tty,
-            colors_enabled,
-            wrap_max,
-            repaint_enabled,
             config_path,
             harness,
             models,
@@ -500,7 +351,7 @@ fn resolve_catalog(
         };
 
         // A fraction of *this* model's window, turned into a token count once
-        // here so the REPL compares plain numbers and a bad value is caught at
+        // here so the runner compares plain numbers and a bad value is caught at
         // startup rather than hours into an unattended run.
         let auto_compact_at_tokens = match entry.auto_compact_at {
             None => None,
@@ -620,31 +471,6 @@ fn resolve_default_model(
     }
 }
 
-/// `Never`/`Always` win; `Auto` consults `NO_COLOR` (non-empty disables),
-/// `CLICOLOR_FORCE` (non-empty, non-`"0"` forces), `TERM=dumb`, then the TTY.
-fn resolve_colors(
-    mode: ColorMode,
-    env: &impl Fn(&str) -> Option<String>,
-    stdout_is_tty: bool,
-) -> bool {
-    match mode {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => {
-            if env("NO_COLOR").is_some() {
-                return false;
-            }
-            if env("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
-                return true;
-            }
-            if env("TERM").as_deref() == Some("dumb") {
-                return false;
-            }
-            stdout_is_tty
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -714,7 +540,6 @@ context_window = 200_000
         Config::resolve_with(
             settings,
             env,
-            false,
             move |_, _| parse_file_config_str(&toml_text),
             || Ok(Vec::new()),
             read_auth_file,
@@ -1227,7 +1052,7 @@ max_attempts = 0
     }
 
     /// The fraction is resolved against *this* model's window, once, so the
-    /// REPL compares plain token counts.
+    /// runner compares plain token counts.
     #[test]
     fn auto_compact_fraction_becomes_a_token_threshold() {
         let toml_text = r#"
@@ -1273,95 +1098,6 @@ context_window = 200_000
     }
 
     #[test]
-    fn color_mode_always_and_never_override_everything() {
-        let env = env_of(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]);
-        assert!(resolve_colors(ColorMode::Always, &env, false));
-        assert!(!resolve_colors(ColorMode::Never, &env, true));
-    }
-
-    #[test]
-    fn auto_colors_follow_tty_and_env_overrides() {
-        let auto = |env_pairs: &[(&str, &str)], tty: bool| {
-            let env = env_of(env_pairs);
-            let env = |k: &str| env(k).filter(|v| !v.is_empty());
-            resolve_colors(ColorMode::Auto, &env, tty)
-        };
-        assert!(auto(&[], true));
-        assert!(!auto(&[], false));
-        // NO_COLOR (non-empty) disables, even on a TTY, and beats CLICOLOR_FORCE.
-        assert!(!auto(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")], true));
-        // Empty NO_COLOR is unset.
-        assert!(auto(&[("NO_COLOR", "")], true));
-        // CLICOLOR_FORCE forces colors without a TTY; "0" does not.
-        assert!(auto(&[("CLICOLOR_FORCE", "1")], false));
-        assert!(!auto(&[("CLICOLOR_FORCE", "0")], false));
-        // Dumb terminals stay plain.
-        assert!(!auto(&[("TERM", "dumb")], true));
-    }
-
-    #[test]
-    fn wrap_resolves_to_a_tty_only_cap() {
-        assert_eq!(resolve_wrap(WrapMode::Auto, true), Some(80));
-        assert_eq!(resolve_wrap(WrapMode::Auto, false), None);
-        assert_eq!(resolve_wrap(WrapMode::Columns(100), true), Some(100));
-        // Wrap is TTY-only, like colors — a custom cap does not force it on pipes.
-        assert_eq!(resolve_wrap(WrapMode::Columns(100), false), None);
-        assert_eq!(resolve_wrap(WrapMode::Off, true), None);
-    }
-
-    #[test]
-    fn repaint_needs_a_tty_and_a_capable_term() {
-        let resolve = |tty: bool, env_pairs: &[(&str, &str)]| {
-            resolve_toml(
-                model_toml("m", &[]),
-                ConfigUserSettings {
-                    stdout_is_tty: Some(tty),
-                    ..Default::default()
-                },
-                env_of(env_pairs),
-            )
-            .unwrap()
-            .repaint_enabled
-        };
-        assert!(resolve(true, &[]));
-        // Dumb terminals can't interpret cursor addressing; wrap itself stays.
-        assert!(!resolve(true, &[("TERM", "dumb")]));
-    }
-
-    #[test]
-    fn wrap_resolution_flows_into_config() {
-        // The two direct cases (TTY cap, piped off) are
-        // `wrap_resolves_to_a_tty_only_cap`'s claim; this pins the wiring.
-        let cfg = resolve_toml(
-            model_toml("m", &[]),
-            ConfigUserSettings {
-                stdout_is_tty: Some(true),
-                ..Default::default()
-            },
-            env_of(&[]),
-        )
-        .unwrap();
-        assert_eq!(cfg.wrap_max, Some(80));
-    }
-
-    #[test]
-    fn wrap_mode_parses() {
-        assert_eq!("auto".parse::<WrapMode>().unwrap(), WrapMode::Auto);
-        assert_eq!("OFF".parse::<WrapMode>().unwrap(), WrapMode::Off);
-        assert_eq!("100".parse::<WrapMode>().unwrap(), WrapMode::Columns(100));
-        assert!("10".parse::<WrapMode>().is_err());
-        assert!("wide".parse::<WrapMode>().is_err());
-    }
-
-    #[test]
-    fn color_mode_parses() {
-        assert_eq!("auto".parse::<ColorMode>().unwrap(), ColorMode::Auto);
-        assert_eq!("ALWAYS".parse::<ColorMode>().unwrap(), ColorMode::Always);
-        assert_eq!("off".parse::<ColorMode>().unwrap(), ColorMode::Never);
-        assert!("rainbow".parse::<ColorMode>().is_err());
-    }
-
-    #[test]
     fn config_path_override_beats_env_beats_home_default() {
         let path_for = |override_path: Option<PathBuf>, env_pairs: &[(&str, &str)]| {
             let env = env_of(env_pairs);
@@ -1390,7 +1126,6 @@ context_window = 200_000
                 ..Default::default()
             },
             env_of(&[]),
-            false,
             |p, _| {
                 assert_eq!(p, Path::new("/tmp/h.toml"));
                 let mut file = parse_file_config_str(&model_toml("m", &[]))?;

@@ -103,7 +103,6 @@ fn config(path: &Path, model: &str) -> Result<(Config, CatalogModel), String> {
     let config = Config::resolve(ConfigUserSettings {
         config_path: Some(path.to_path_buf()),
         model: Some(model.into()),
-        ..Default::default()
     })?;
     let model = config.models.get(model)?.clone();
     Ok((config, model))

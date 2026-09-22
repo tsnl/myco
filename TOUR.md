@@ -1,6 +1,6 @@
 # A guided tour of myco
 
-Myco is a Rust workspace and CLI for running a coding agent across local and
+Myco is a Rust workspace and server for running a coding agent across local and
 remote hosts. Start with one concrete interaction: **a user asks the agent to
 inspect a file, the model calls a tool, and the model explains the result**.
 This tour follows that interaction through the code, then visits persistence
@@ -26,19 +26,17 @@ myco → myco-agent → myco-model
 |---|---|---|
 | `myco-model` | Message types, generation streams, and provider drivers | [model library](crates/myco-model/src/lib.rs) |
 | `myco-agent` | Context execution over supplied models, tools, and event sinks | [agent library](crates/myco-agent/src/lib.rs) |
-| `myco` | Sessions, live tool resources, hosts, configuration, and frontends | [application library](src/lib.rs) and [CLI](src/bin/myco.rs) |
+| `myco` | Sessions, live tool resources, hosts, configuration, and frontends | [application library](src/lib.rs) and [server launcher](src/bin/myco.rs) |
 
 The lower crates cannot import application code, even in their tests. The
 application reexports them as `myco::generative_model` and `myco::agent`.
 Tokio runs the asynchronous work.
-There is no service daemon between the CLI and its agent: the interactive
-process constructs the runtime directly.
-
-These are the main calls and output paths:
+The server owns independent session runners; browser tabs observe them over
+HTTP and server-sent events. Closing a tab does not stop its runner.
 
 ```mermaid
 flowchart TD
-    CLI[CLI] --> Chat[chat::run_session_turn]
+    Server[HTTP session worker] --> Chat[chat::run_session_turn]
     Chat --> Input[chat::interact]
     Input --> Agent[Agent::run]
     Agent --> Generation[Generation attempts and retries]
@@ -50,8 +48,8 @@ flowchart TD
     Harness --> Local[In-process local worker]
     Harness --> Remote[SSH / remote host worker]
     Agent --> Events[AgentEvent / EventSink]
-    Events --> UI[TuiProducer / terminal and console mirror]
-    CLI --> Session[ActiveSession / saved session document]
+    Events --> UI[Browser projection / event stream]
+    Server --> Session[ActiveSession / saved session document]
     Chat --> Session
     Session --> Threads[Ordered threads / latest active]
 ```
@@ -74,23 +72,17 @@ Compaction replaces the active context without replacing the session or its runt
 
 ## 2. Follow startup to the assembled application
 
-In [src/bin/myco.rs](src/bin/myco.rs), find `main`, then `boot`.
+In [src/bin/myco.rs](src/bin/myco.rs), find `main`, then `boot_session`.
 
-`main` loads `.env`, parses arguments, and selects a mode: interactive, print
-(`-p`), host worker, or session browser. Both interactive and print mode use
-`boot` to assemble the application:
+`main` loads `.env`, parses server options, and starts the browser server or the
+internal SSH host worker. The server resolves configuration and startup preflight
+once. Each opened session acquires its writer lock, constructs the event sink and
+harness with local session tools, then builds its model, runtime, and agent.
 
-1. Resolve settings and select a model.
-2. Check required programs and SSH setup.
-3. Open the active session and acquire its writer lock.
-4. Construct the event sink and harness, including local session tools.
-5. Build the model and session runtime, create the agent, bind the active thread,
-   and wire checkpoints.
-
-The resulting `Boot` bundles these objects. `ReplSession` adds line editing,
-slash-command handling, display state, and the cancellation control used by the
-interactive CLI. `run_print` uses a simpler sink that streams answer text to
-stdout.
+`Boot` bundles those resources for the worker. In
+[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs), `Sessions` owns workers
+and `App` publishes snapshots and changes. The worker retains its runner and
+live tools independently of browser connections.
 
 For configuration, read `Config::resolve` in
 [src/config/mod.rs](src/config/mod.rs), then the file shapes in
@@ -112,7 +104,7 @@ Read `SessionRunner` in [src/chat/runner.rs](src/chat/runner.rs), then its
 [submission adapter](src/chat/session_turn.rs) and the pure
 [AgentState](crates/myco-agent/src/state.rs).
 
-Interactive and print mode resolve attachments, then call `SessionRunner::submit`.
+The server resolves attachments, then calls `SessionRunner::submit`.
 The runner holds the session writer across submission, model/tool execution, and
 compaction. It binds the latest context, stamps real input, persists observations,
 and recovers size-rejected input into a successor thread. An injected `Compactor`
@@ -200,7 +192,7 @@ Read `Harness::dispatch_tool_use` in
 [src/harness/mod.rs](src/harness/mod.rs). The harness advertises tools to the
 model, injects the optional `host` routing field into host-tool schemas, and
 routes each call. Omitted `host` means `local`. Local-only services, including
-session metadata and prelude editing, are installed by CLI startup.
+session metadata and prelude editing, are installed by server startup.
 
 A [HostController](src/host/host_controller.rs) represents one execution host.
 For `local`, it dispatches directly to an in-process worker. A remote controller
@@ -246,32 +238,25 @@ across the agent, controller, worker, and actual process, read
 
 Return to `AgentEvent` and `EventSink` in
 [crates/myco-agent/src/lib.rs](crates/myco-agent/src/lib.rs), then open
-[src/tui/mod.rs](src/tui/mod.rs).
+[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs).
 
-The runtime emits text/thinking deltas, tool starts, failures, and turn completion.
-`TuiProducer` consumes those events and also exposes methods for CLI notices and
-slash-command output. It produces `TuiEvent`s: text, style changes, and links.
-The terminal sink encodes these for display; the console sink writes their
-plain-text representation when mirroring is enabled for an interactive TTY.
+The runtime emits text/thinking deltas, tool starts, failures, and completion.
+`App` projects these into transcript blocks and publishes updates to clients.
+[src/bin/browser/view.rs](src/bin/browser/view.rs) reconstructs blocks from saved
+history, preserving observed outcomes and hiding runtime-only context.
 
-Two other files explain most display bugs:
-
-- [src/tui/markdown/mod.rs](src/tui/markdown/mod.rs) incrementally renders
-  markdown while chunks arrive.
-- [src/tui/transcript.rs](src/tui/transcript.rs) contains section layout and
-  history replay helpers shared with live rendering.
-
-The `.console` mirror includes notices that never enter model history. It is a
-record of displayed output, with cursor repaints excluded. It is not a complete
-machine-readable execution trace; an eval recorder would need its own contract.
+[src/bin/browser/assets/app.js](src/bin/browser/assets/app.js) updates the page
+incrementally. Markdown rendering lives in
+[src/bin/browser/markdown.rs](src/bin/browser/markdown.rs). Authentication and
+HTTP endpoints live in [http.rs](src/bin/browser/http.rs); tabs share their event
+connection through a browser SharedWorker.
 
 ## 7. Follow state onto disk, through resume and compaction
 
 Open `Session` and `ActiveSession` in
 [src/session/mod.rs](src/session/mod.rs), then `Thread` in
 [src/session/thread.rs](src/session/thread.rs). `Session` is the serializable
-document; `ActiveSession` shares it between the CLI, metadata tools, and console
-mirror. `active_thread()` returns the latest thread. Older threads are exposed
+document; `ActiveSession` shares it between the server and metadata tools. `active_thread()` returns the latest thread. Older threads are exposed
 only as immutable references. Deserialization checks that IDs are unique and
 predecessors refer to earlier threads in the same session.
 
@@ -284,18 +269,18 @@ Reading alone does not rewrite an existing file.
 
 The chat adapter's `wire_checkpoint` binds a checkpoint to a particular thread.
 Stale callbacks cannot overwrite a successor. `run_session_turn` force-saves
-after a turn, including a failed or cancelled one; quit and session switching
-also use `persist_session`. The [session-turn tests](src/chat/session_turn.rs)
+after a turn, including a failed or cancelled one; server shutdown
+also uses `persist_session`. The [session-turn tests](src/chat/session_turn.rs)
 verify recovery, queued turns selecting the successor, and cancellation before
 queued input is accepted.
 
 Two locks have different jobs. `ActiveSession::writer` serializes chat turns and
 compaction inside a process. [SessionWriteLock](src/session/lock.rs) prevents a
-second CLI process from writing the same session. Metadata edits use the shared
+second server process from writing the same session. Metadata edits use the shared
 document mutex and can continue while a compaction worker runs. Search and
 picking live in [src/session/search.rs](src/session/search.rs) and
-[src/session_browser.rs](src/session_browser.rs); the picker composes with fzf
-and, when available, a tmux popup.
+[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs). The browser lists visible
+sessions; `session_meta` also searches saved excerpts and legacy console tails.
 
 Compaction crosses three boundaries while holding the session writer:
 
@@ -308,7 +293,7 @@ Compaction crosses three boundaries while holding the session writer:
    the latest session metadata, and saves atomically before switching the live
    document. The runner binds the agent to that thread and rewires checkpoints.
 
-The session ID, writer lock, readline history, console mirror, and runtime stay
+The session ID, writer lock, metadata, and runtime stay
 in place. [SessionHistoryTool](src/tool_services/session_history_service.rs)
 provides a `threads` listing and a `thread_id` selector for reading original
 messages and tool output. Omitting the selector reads the active thread.
@@ -322,15 +307,15 @@ old output, rejects access from another session, and checks final cleanup.
 
 Auto-compaction belongs to `SessionRunner`. It checks reported prompt usage at
 settled boundaries, including between tool rounds, and uses the same compaction
-path in interactive, print, and scripted workflows. Nested agents
-are separate local `myco` processes launched through bash, linked with
-`--parent-session`; `--fork` seeds their context from a saved checkpoint.
+path in server and scripted workflows. Nested agents are independent session
+workers created through the authenticated API with `parent_session`; `fork: true`
+seeds their context from a saved checkpoint.
 
 ## 8. Pick your next reading path
 
 | What you want to change | Start here |
 |---|---|
-| CLI arguments, slash commands, attachments | `Args` and `ReplSession` in [the CLI](src/bin/myco.rs) |
+| Server options and startup | `Args` and `boot_session` in [the launcher](src/bin/myco.rs) |
 | Model settings or authentication | [config resolution](src/config/mod.rs) and [file shapes](src/config/file.rs) |
 | Provider payloads or stream handling | [myco-model](crates/myco-model/src/lib.rs), then the relevant driver |
 | Message assembly and validation | [message accumulator](crates/myco-model/src/accumulator.rs) |
@@ -341,7 +326,7 @@ are separate local `myco` processes launched through bash, linked with
 | Tool behavior | [tool_services](src/tool_services/mod.rs) and its implementation tests |
 | Saved threads or compaction | [session](src/session/mod.rs) and [chat](src/chat/mod.rs) |
 | Live tool lifetime across agents | [session runtime](src/session_runtime.rs) |
-| Terminal layout | [TUI producer](src/tui/mod.rs), then markdown or transcript helpers |
+| Browser rendering | [Browser assets](src/bin/browser/assets/), projection, and Markdown renderer |
 | Headless execution / an eval entry point | [agent crate](crates/myco-agent/src/lib.rs), its [in-memory fixtures](crates/myco-agent/src/test_support.rs), and the [application example](tests/headless_agent.rs) |
 | Package versions or releasing | [workspace manifest](Cargo.toml), [Publish workflow](.github/workflows/publish.yml), and [release script](scripts/release.py) |
 

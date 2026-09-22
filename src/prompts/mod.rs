@@ -82,7 +82,7 @@ Quick map (details in the manual):
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
   guidance lives in `AGENTS.md`/`CLAUDE.md` and skill packs (`.claude/skills`, `SKILL.md`
   folders) — read them with the editor or `rg` when the task touches how this project works.
-- You cannot run slash-commands (`/hosts`, `/session`, …); tell the user which to run.
+- Use `session_meta` for session metadata. Browser controls are described in `browser.md`.
 - Updating `myco` on **remote** hosts: compile **on the target** (see `harness-ops.md`).
   If developing myco, archive the local git tree; else download a source snapshot from
   https://github.com/tsnl/myco/releases (match `session_meta` `executable_path` +
@@ -94,29 +94,24 @@ Quick map (details in the manual):
 
 # Nested Agents
 
-Context is precious. For ephemeral, task-specific context — and for complex, multi-step tasks —
-delegate to a nested agent: `myco` drives itself as an ordinary command. A live `bash` session
-(`myco --parent-session <your-session-id>`, your id being on the newest `# Session` block in this
-conversation) gives real back-and-forth; `myco -p "<task>" --parent-session <id>` is a one-shot
-turn that answers on stdout and exits. `--fork` seeds the child with your conversation instead of
-a blank context, and `--model <key>` (the key stamped at the end of this prompt) keeps a fork on
-your model, where its first request re-reads your cached prompt prefix cheaply.
+For independent work, an authenticated client can create hidden child sessions
+through `POST /api/sessions` with `parent_session` set to your session ID. Optional
+`fork: true` seeds the child with your conversation. Select the model key stamped
+at the end of this prompt before submitting when prompt-cache reuse matters.
 
-Nest **on the local host only**. The brain stays on this machine — model access, config, keys, and
-the session store are shared by construction — and a nested agent reaches remote machines through
-its own host pool exactly as you do. Remote hosts stay hands, not brains: they need only `myco` on
-PATH plus SSH, never config or keys.
+Use the server on the **local host only**. The server owns model access, config,
+keys, and the session store; children have independent tools and can reach remotes
+through their host pools. Remote hosts stay tool workers without model credentials.
 
-**Read `overview.md` § Nested agents before your first nest in a session** (`myco --help overview`
-prints the embedded copy if the exported file is unavailable) — driving a child over a pipe fails
-in ways you cannot see from outside, and one bites immediately:
-each prompt is a single self-contained line; only the trailing newline submits it, so a `write`
-without `"\n"` leaves the child waiting for the rest of the line while you wait on `read`, forever.
+Read `browser.md` § Server API and automation and `overview.md` § Nested agents
+before delegating. An operator must configure the client's launch credential;
+do not put it in model context. Poll snapshots or consume server events for
+completion and cancel through the child's API when needed.
 
-Give each child a bounded task, constraints, expected result, and whether it may delegate further.
-Ask for completion evidence or a specific blocker; keep bulk output in files and return paths.
-For one-shot runs, check the exit status and stderr, then verify the answer and artifacts against
-the task. A completed turn alone does not prove the task is complete.
+Give each child a bounded task, constraints, expected result, and whether it may
+delegate further. Ask for completion evidence or a specific blocker; keep bulk
+output in files and return paths. Verify the answer and artifacts against the task.
+A completed turn alone does not prove the task is complete.
 
 ---
 "#,
@@ -141,15 +136,15 @@ the task. A completed turn alone does not prove the task is complete.
 /// bytes per agent and break fork prompt-cache reuse from the first byte.
 pub fn model_stamp(model_key: &str) -> String {
     format!(
-        "---\n\n# Current Model\n\nCatalog key: `{model_key}` — pass `--model {model_key}` when \
-         spawning nested or forked myco agents to keep them on this model.\n"
+        "---\n\n# Current Model\n\nCatalog key: `{model_key}` — use `select_model` with key `{model_key}` when \
+         creating nested or forked sessions to keep them on this model.\n"
     )
 }
 
 const SESSION_STAMP_HEADING: &str = "# Session";
 
 /// Where this agent is running, as a block for the **first user message** of a
-/// conversation: the session id `--resume` / `--parent-session` take, when the
+/// conversation: the session ID used by the browser and child-creation API, when the
 /// session began, and the directory myco was launched in — the facts an agent
 /// would otherwise spend a `session_meta` round trip and a `pwd` to learn.
 ///
@@ -186,7 +181,7 @@ fn stamp_with(session_id: &str, started_at: DateTime<Utc>, cwd: Option<&Path>) -
         .to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut block = format!(
         "{SESSION_STAMP_HEADING}\n\n- Session id: `{session_id}` — this conversation from here \
-         on. Spawn nested myco agents with `--parent-session {session_id}`; `session_meta` \
+         on. Create nested sessions with API `parent_session: {session_id}`; `session_meta` \
          action=get has the rest of this session's metadata.\n- Started: {started} — when this \
          session began, not the current time; run `date` for that.\n"
     );
@@ -603,13 +598,10 @@ mod tests {
             "User authority & privileged operations",
             "force-merge",
             "manual",
-            // The nested-agent recipe lives in the manual; the prompt keeps
-            // the pointer and the hang that would otherwise cost a turn to
-            // diagnose — prompts are single-line, submitted by a trailing
-            // newline alone.
+            // Keep the API entry point and the detailed recipe discoverable.
             "`overview.md` § Nested agents",
-            "single self-contained line",
-            "only the trailing newline submits it",
+            "POST /api/sessions",
+            "parent_session",
             // Remote work goes through the `host` field, not local `ssh`.
             "do not run `ssh <alias> …` from",
             "persistent SSH connection",
@@ -734,13 +726,10 @@ mod tests {
 
     #[test]
     fn fork_recipe_and_model_stamp_are_documented() {
-        // The epilogue points at the stamp; the stamp names the key and flag.
-        // Why to fork (and the checkpoint semantics) moved to the manual; what
-        // survives here is the flag and the cache-alignment reason to pair it
-        // with the stamped model key.
+        // The API recipe uses the stamped key for a cache-aligned fork.
         for needle in [
             "seeds the child with your conversation",
-            "--fork",
+            "fork: true",
             "at the end of this prompt",
         ] {
             assert!(
@@ -751,7 +740,7 @@ mod tests {
         let stamp = model_stamp("grok-4");
         assert!(stamp.contains("# Current Model"), "{stamp}");
         assert!(stamp.contains("`grok-4`"), "{stamp}");
-        assert!(stamp.contains("--model grok-4"), "{stamp}");
+        assert!(stamp.contains("select_model"), "{stamp}");
     }
 
     /// Where the agent is running reaches it through the conversation, never
@@ -766,7 +755,7 @@ mod tests {
         let stamp = stamp_with(id, started_at, Some(Path::new("/home/user/myco")));
 
         assert!(stamp.contains(&format!("`{id}`")), "{stamp}");
-        assert!(stamp.contains(&format!("--parent-session {id}")), "{stamp}");
+        assert!(stamp.contains(&format!("parent_session: {id}")), "{stamp}");
         assert!(stamp.contains("`/home/user/myco`"), "{stamp}");
         assert!(stamp.starts_with(SESSION_STAMP_HEADING), "{stamp}");
 

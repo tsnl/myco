@@ -44,12 +44,11 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
 
 fn server(apps: &[Arc<App>]) -> Arc<Server> {
     let config = Config::resolve_with(
-        crate::ConfigUserSettings {
+        myco::ConfigUserSettings {
             config_path: Some("/unused/config.toml".into()),
             ..Default::default()
         },
         |_| None,
-        false,
         |_, _| {
             Ok(toml::from_str(
                 r#"

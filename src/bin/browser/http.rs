@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{
     markdown,
-    runtime::{ActionRequest, Error, Sessions, Update},
+    runtime::{ActionRequest, CreateSession, Error, Sessions, Update},
     weather::{Coordinates, Weather},
 };
 
@@ -250,19 +250,11 @@ pub(super) async fn session_cancel(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateSession {
-    request_id: Uuid,
-}
-
 async fn create_session(
     State(server): State<Arc<Server>>,
     Json(request): Json<CreateSession>,
 ) -> Result<Json<Value>, Error> {
-    Ok(Json(
-        json!({"id": server.sessions.create(request.request_id).await?}),
-    ))
+    Ok(Json(json!({"id": server.sessions.create(request).await?})))
 }
 
 #[derive(Deserialize)]

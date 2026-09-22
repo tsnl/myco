@@ -1,7 +1,7 @@
 # Evaluations
 
 `myco-eval` freezes task cases from existing sessions or new prompts, then runs
-them through the same `SessionRunner` as the CLI. Each attempt uses a fresh
+them through the same `SessionRunner` as the server. Each attempt uses a fresh
 workspace and profile. An independent grader checks the resulting artifacts.
 
 ```bash

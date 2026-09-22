@@ -1,11 +1,11 @@
-//! Startup work before the first prompt + the combined preflight WARNING.
+//! Server startup checks and a combined preflight report.
 //!
 //! Startup exports the manual for this build ([`crate::manual::export`]) and
 //! verifies that the external programs myco spawns (declared in
 //! [`crate::external_command`]) actually resolve on the agent machine. Results
-//! fold into one WARNING block with the ssh-agent preflight
+//! combine with the ssh-agent preflight
 //! ([`SshAgentPreflightReport`]) and the prelude read check
-//! ([`crate::prelude::read_failure`]) — one section after the banner, silent
+//! ([`crate::prelude::read_failure`]) — one browser notice, silent
 //! when everything resolves. Remote hosts are not probed here; they report
 //! missing programs as tool errors at call time.
 //!
@@ -14,8 +14,7 @@
 //! lets this type mean exactly one thing: problems a session can run through.
 //!
 //! Reporting stops at plain text ([`StartupPreflight::warning_body`]); the
-//! caller owns the WARNING block around it, because the interactive REPL and
-//! `--print` put it in different places (the Ui's event stream vs. stderr).
+//! caller presents it in the browser and server diagnostics.
 
 use std::io::Write;
 
@@ -231,7 +230,7 @@ mod tests {
     fn rendered(pf: &StartupPreflight) -> String {
         let body = pf.warning_body();
         // Plain problem lines. The block's rule and header come from the caller
-        // (`tui::write_warning_section`), which is what keeps several unrelated
+        // in the frontend, which keeps several unrelated
         // problems inside one WARNING block.
         assert!(!body.contains("WARNING"), "{body}");
         body
@@ -243,16 +242,13 @@ mod tests {
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, ["bash", "tmux", "fzf"]);
+        assert_eq!(names, ["bash"]);
 
         let names: Vec<_> = missing_executables(true, |_| false)
             .iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(
-            names,
-            ["bash", "tmux", "fzf", "ssh", "ssh-add", "ssh-keygen"]
-        );
+        assert_eq!(names, ["bash", "ssh", "ssh-add", "ssh-keygen"]);
     }
 
     #[test]
@@ -266,14 +262,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_tmux_reports_the_purpose_and_an_install_hint() {
+    fn missing_bash_reports_the_purpose_and_an_install_hint() {
         let pf = preflight(
-            missing_executables(false, |e| e.name != "tmux"),
+            missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport::default(),
         );
         let out = rendered(&pf);
         assert!(
-            out.contains("missing executable tmux: bare /resume cannot open the session browser"),
+            out.contains("missing executable bash: the bash tool cannot run commands"),
             "{out}"
         );
         assert!(
@@ -306,14 +302,14 @@ mod tests {
         // A clean-but-noted ssh report (e.g. "no SSH-backed hosts") must not
         // leak into a WARNING block opened for missing executables.
         let pf = preflight(
-            missing_executables(false, |e| e.name != "tmux"),
+            missing_executables(false, |e| e.name != "bash"),
             SshAgentPreflightReport {
                 notes: vec!["no SSH-backed hosts in config; skipping agent preflight".into()],
                 ..Default::default()
             },
         );
         let out = rendered(&pf);
-        assert!(out.contains("missing executable tmux"), "{out}");
+        assert!(out.contains("missing executable bash"), "{out}");
         assert!(!out.contains("note:"), "{out}");
     }
 
@@ -371,7 +367,7 @@ mod tests {
         let pf = StartupPreflight {
             manual: Some("/home/u/.myco/manual/9.9.9/abc: permission denied".into()),
             executables: ExecutableCheckReport {
-                missing: missing_executables(false, |e| e.name != "tmux"),
+                missing: missing_executables(false, |e| e.name != "bash"),
             },
             ..Default::default()
         };
@@ -383,16 +379,16 @@ mod tests {
         );
         assert!(out.contains("`myco --help <id>` still works"), "{out}");
         let manual_at = out.find("manual export failed").unwrap();
-        let exec_at = out.find("missing executable tmux").unwrap();
+        let exec_at = out.find("missing executable bash").unwrap();
         assert!(manual_at < exec_at, "{out}");
     }
 
     #[test]
     fn ssh_tools_missing_matches_only_openssh_tools() {
-        let only_tmux = ExecutableCheckReport {
-            missing: missing_executables(true, |e| e.name != "tmux"),
+        let only_bash = ExecutableCheckReport {
+            missing: missing_executables(true, |e| e.name != "bash"),
         };
-        assert!(!only_tmux.ssh_tools_missing());
+        assert!(!only_bash.ssh_tools_missing());
         let no_ssh_add = ExecutableCheckReport {
             missing: missing_executables(true, |e| e.name != "ssh-add"),
         };

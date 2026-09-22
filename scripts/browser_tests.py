@@ -165,7 +165,7 @@ context_window = 100000
     def launch(self, port=0, resume=None):
         log = (self.artifacts / f"server-{len(self.processes)}.log").open("w")
         self.addCleanup(log.close)
-        args = [str(OPTIONS.binary), "--web", str(port), "--config", str(self.home / "config.toml")]
+        args = [str(OPTIONS.binary), "--port", str(port), "--config", str(self.home / "config.toml")]
         if resume:
             args += ["--resume", resume]
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=log, text=True,

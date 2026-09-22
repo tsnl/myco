@@ -45,13 +45,13 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
       ControlPath ~/.ssh/cm-%r@%h:%p
       ControlPersist 10m
   ```
-- Tell the user to run **`/hosts`** for live attach status (local ok/in-process; remotes idle / ok / DOWN); you cannot run slash-commands.
+- Inspect tool errors and use the SSH checks below to diagnose remote attachment.
 - Host tool field `host` must match a configured name (`local` or a remote `name`). Omitted → `local`.
 
 ## Updating / installing `myco`
 
 **Local** uses the agent process binary / in-process worker — rebuild/reinstall the interactive
-`myco` on this machine and **restart the CLI**.
+`myco` on this machine and **restart the server**.
 
 For **remotes**, prefer a **same-platform binary** (release asset or build on the target)
 when you are not actively developing myco; only **build from a local git tree** when you are
@@ -148,8 +148,8 @@ ssh -o BatchMode=yes "$HOST" 'set -euo pipefail
   `~/.local/bin` or `~/.cargo/bin` are common — verify with
   `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'`. An interactive
   login can resolve a different binary; check the non-interactive command used by the worker.
-- After replacing binaries, the **interactive CLI must be restarted** to load a new agent binary;
-  remote **host** workers respawn on next tool use (or after `/hosts` shows DOWN and reconnect).
+- After replacing binaries, the **server must be restarted** to load a new agent binary;
+  remote **host** workers respawn on next tool use.
 - Ask before destructive remote installs; prefer installing into user prefixes (`~/.local`,
   `~/.cargo`) over system paths.
 
@@ -179,7 +179,7 @@ When tools fail or the user asks why something is broken, investigate with tools
      USER block).
      Unlock with `ssh-add` / `ssh-add --apple-use-keychain <key>` (myco cannot prompt on the
      NDJSON pipe). Restart myco after loading keys.
-   - Suggest user run `/hosts` after fixes (requires CLI restart to re-attach remotes).
+   - Retry the tool after fixes; restart the server if its configuration changed.
 
 2. **Wrong machine / wrong files**
    - Check whether `host` was set; default is always `local`.
@@ -187,7 +187,7 @@ When tools fail or the user asks why something is broken, investigate with tools
 
 3. **Session / state confusion**
    - Conversation resume ≠ restored bash sessions or editor state.
-   - Bash sessions die when the host process exits (CLI exit, host crash, SSH drop). Local
+   - Bash sessions die when the host process exits (server exit, host crash, SSH drop). Local
      in-process sessions die with the agent process.
 
 4. **Explain product limits honestly**

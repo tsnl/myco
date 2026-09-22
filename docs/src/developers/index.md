@@ -6,7 +6,7 @@ behavior you need:
 | You want to… | Use | Bring yourself |
 | --- | --- | --- |
 | Call a model and consume streamed responses | [`myco-model`](inference.md) | Endpoint, credentials, model settings, messages, retry policy |
-| Run a model/tool loop without the CLI | [`myco-agent`](agents.md) | A `GenerativeModel`, `ToolExecutor`, event sink, input, persistence |
+| Run a model/tool loop without the server | [`myco-agent`](agents.md) | A `GenerativeModel`, `ToolExecutor`, event sink, input, persistence |
 | Reuse Myco's hosts, sessions, and tool services | [`myco`](architecture.md) | Application startup and resource ownership |
 
 Dependencies flow from the application to `myco-agent`, then to `myco-model`.

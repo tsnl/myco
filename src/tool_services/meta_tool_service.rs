@@ -53,7 +53,7 @@ Actions (`action` is required):
 
 Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
 the real task is clear (usually first turn), set_title a short scannable label — replace a
-weak CLI auto-title from the first user line. When the session focus shifts, update the
+default auto-title from the first user line. When the session focus shifts, update the
 title; do not leave a stale first-line title for long work. When you create a worktree or
 open/receive a PR, add_link it (absolute path + host for worktrees).
 "#;

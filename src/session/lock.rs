@@ -3,7 +3,7 @@
 //! Two myco processes resuming the same session id both rewrite the whole
 //! document every turn, so the loser's turns disappear — and both append to one
 //! `.console`. That is easy to hit by accident in the tool's own habitat: a
-//! second tmux pane, or `--resume` in a script while the REPL is open.
+//! second server opening a session that another server already owns.
 //!
 //! The guard is an advisory `flock(2)` on `session/{shard}/{id}.lock`, held for as
 //! long as the session is live. The lock file is a separate inode on purpose:
@@ -11,7 +11,7 @@
 //! would leave a lock on the old inode. Archiving leaves this path in place.
 //!
 //! Reading is never blocked — `session_history`, `list_recent`, the session
-//! browser and `/sessions` all take no lock. Only a process that intends to
+//! browser all take no lock. Only a process that intends to
 //! *write* a session acquires one, and the kernel releases it if that process
 //! dies, so there is no stale-lock recovery to get wrong.
 

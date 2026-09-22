@@ -43,13 +43,16 @@ fn hostname() -> String {
 }
 
 pub(super) async fn run(args: Args) -> Result<(), String> {
-    let listener = tokio::net::TcpListener::bind((args.web_bind, args.web.unwrap()))
+    let listener = tokio::net::TcpListener::bind((args.bind, args.port))
         .await
         .map_err(|e| format!("cannot listen for browser UI: {e}"))?;
     let address = listener.local_addr().map_err(|e| e.to_string())?;
-    let (config, catalog, preflight) = super::prepare_boot(&args);
-    let initial = (args.resume.is_some() || args.parent_session.is_some())
-        .then(|| super::initial_session_or_exit(&args, &catalog.spec.key));
+    let (config, _, preflight) = super::prepare_boot(&args);
+    let initial = args
+        .resume
+        .as_deref()
+        .map(myco::Session::load_by_id_or_prefix)
+        .transpose()?;
     let launch_path = initial
         .as_ref()
         .map_or_else(|| "/".into(), |s| format!("/sessions/{}", s.id));

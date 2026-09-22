@@ -315,6 +315,46 @@ struct Listing {
     generation: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateSession {
+    request_id: Uuid,
+    parent_session: Option<String>,
+    #[serde(default)]
+    fork: bool,
+}
+
+impl CreateSession {
+    fn session(&self, model: &str) -> Result<Session> {
+        if self.fork && self.parent_session.is_none() {
+            return Err(Error::Invalid(
+                "A context fork requires parent_session.".into(),
+            ));
+        }
+        let id = self.request_id.as_simple().to_string();
+        let mut session = Session::new_with_id(model, &id);
+        // A retried creation uses the original durable identity and context.
+        if session.json_path().exists() {
+            return Session::load(&session.json_path()).map_err(Error::Internal);
+        }
+        if let Some(parent) = &self.parent_session {
+            if parent.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "parent_session must name a saved session.".into(),
+                ));
+            }
+            let parent = Session::load_by_id_or_prefix(parent).map_err(Error::NotFound)?;
+            session = if self.fork {
+                parent.fork_child(model)
+            } else {
+                Session::new_hidden(model, &id, myco::SessionKind::Subagent, Some(parent.id))
+            };
+            session.id = id;
+        }
+        Ok(session)
+    }
+}
+
 pub(super) struct Sessions {
     args: Arc<Args>,
     config: Config,
@@ -340,11 +380,18 @@ impl Sessions {
         }
     }
 
-    pub(super) async fn create(&self, id: Uuid) -> Result<String> {
+    pub(super) async fn create(&self, request: CreateSession) -> Result<String> {
         // The request id is also the session id, so retries cannot create extra sessions.
-        let session = Session::new_with_id(&self.config.model, id.as_simple().to_string());
-        let id = session.id.clone();
-        self.start(session).await?;
+        let id = request.request_id.as_simple().to_string();
+        let mut sessions = self.running.lock().await;
+        if sessions.contains_key(&id) {
+            return Ok(id);
+        }
+        let model = self.config.model.clone();
+        let session = tokio::task::spawn_blocking(move || request.session(&model))
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))??;
+        self.start_locked(&mut sessions, session).await?;
         Ok(id)
     }
 

@@ -33,7 +33,7 @@ need your model catalog or API credentials.
 
 ## Direct work to a host
 
-Start Myco and inspect `/hosts`. An idle remote is normal: it attaches on its
+Start Myco and issue a tool call on the named host. An idle remote is normal: it attaches on its
 first tool call. Ask, for example, “On `devbox`, inspect the build logs under
 `/srv/project`.” Host tools accept a `host` field; omitting it selects `local`.
 
@@ -45,7 +45,7 @@ owning session runtime.
 
 ## Operate and diagnose
 
-`/hosts` reports live, idle, and failed connections. A remote attach failure
+The tool block reports connection failures. A remote attach failure
 is reported as a tool error; it does not make the local host unavailable.
 Remote workers connect lazily with `ssh … myco --mode host` and exchange
 newline-delimited JSON. Keep non-interactive startup output from interfering

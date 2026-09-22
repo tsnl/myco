@@ -1,4 +1,4 @@
-//! Private, repeatable task evaluations over the same session runner as the CLI.
+//! Private, repeatable task evaluations over the same session runner as the server.
 //! Case inputs and graders are frozen separately from each fresh run workspace.
 
 mod case;
