@@ -42,6 +42,9 @@ use rustyline::{
 };
 use unicode_width::UnicodeWidthStr;
 
+#[path = "browser/mod.rs"]
+mod browser;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -81,6 +84,9 @@ const SLASH_COMMANDS: &[&str] = &[
     disable_help_flag = true,
 )]
 struct Args {
+    /// Serve the browser UI on 127.0.0.1 (default port 8765; use 0 for a free port).
+    #[arg(long, num_args = 0..=1, default_missing_value = "8765", value_name = "PORT", conflicts_with = "print")]
+    web: Option<u16>,
     /// Show CLI help, or print a manual article when ARTICLE is given
     /// (e.g. `myco --help overview`). Same articles startup exports to
     /// `~/.myco/profiles/default/manual/<version>/<commit>/` for agents to read.
@@ -228,12 +234,24 @@ fn main() {
         eprintln!("myco: -p/--print does not combine with --mode host/session-browser");
         std::process::exit(2);
     }
+    if args.web.is_some() && (args.mode != Mode::Interactive || args.resume == Some(None)) {
+        eprintln!(
+            "myco: --web requires interactive mode; --resume needs a session id in the browser"
+        );
+        std::process::exit(2);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("create async runtime")
         .block_on(async {
             match args.mode {
+                Mode::Interactive if args.web.is_some() => {
+                    if let Err(error) = browser::run(args).await {
+                        eprintln!("myco: {error}");
+                        std::process::exit(1);
+                    }
+                }
                 Mode::Interactive if args.print.is_some() => run_print(args).await,
                 Mode::Interactive => run_interactive(args).await,
                 Mode::Host => run_host(args).await,
@@ -1285,43 +1303,58 @@ fn parse_meta(input: &str) -> Option<MetaCommand<'_>> {
     }
 }
 
+async fn select_runner_model(
+    runner: &mut SessionRunner,
+    harness: &Harness,
+    catalog: &CatalogModel,
+    effort: Effort,
+    debug_dump_api_requests: bool,
+    compaction_max_requests: usize,
+) -> Result<(), String> {
+    let (model, prelude) = build_model(catalog, harness, debug_dump_api_requests, effort)?;
+    runner
+        .set_model(
+            model,
+            myco::ModelInfo::from_spec(&catalog.spec, Some(effort)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    runner
+        .agent_mut()
+        .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
+    runner
+        .agent_mut()
+        .set_retry_policy(catalog.backend.retry_policy());
+    runner
+        .agent_mut()
+        .set_context_window_tokens(catalog.spec.context_window_tokens);
+    runner
+        .agent_mut()
+        .set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
+    runner.set_compactor(
+        Arc::new(ModelCompactor {
+            model: catalog.clone(),
+            max_requests: compaction_max_requests,
+        }),
+        catalog.spec.auto_compact_at_tokens,
+    );
+    runner
+        .runtime()
+        .set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
+    Ok(())
+}
+
 impl ReplSession {
     async fn select_model(&mut self, catalog: CatalogModel, effort: Effort) -> Result<(), String> {
-        let (model, prelude) = build_model(
-            &catalog,
+        select_runner_model(
+            &mut self.runner,
             &self.harness,
-            self.debug_dump_api_requests,
+            &catalog,
             effort,
-        )?;
-        self.runner
-            .set_model(
-                model,
-                myco::ModelInfo::from_spec(&catalog.spec, Some(effort)),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        self.runner.agent_mut().set_before_generation_notice(Some(
-            myco::session_runtime::prelude_change_notices(prelude),
-        ));
-        self.runner
-            .agent_mut()
-            .set_retry_policy(catalog.backend.retry_policy());
-        self.runner
-            .agent_mut()
-            .set_context_window_tokens(catalog.spec.context_window_tokens);
-        self.runner
-            .agent_mut()
-            .set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
-        self.runner.set_compactor(
-            Arc::new(ModelCompactor {
-                model: catalog.clone(),
-                max_requests: self.compaction_max_requests,
-            }),
-            catalog.spec.auto_compact_at_tokens,
-        );
-        self.runner
-            .runtime()
-            .set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
+            self.debug_dump_api_requests,
+            self.compaction_max_requests,
+        )
+        .await?;
         self.catalog_model = catalog;
         self.effort = effort;
         Ok(())

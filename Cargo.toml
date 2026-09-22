@@ -36,6 +36,7 @@ license.workspace = true
 myco-model.workspace = true
 myco-agent.workspace = true
 atomic-write-file = "0.3.0"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 ring = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
@@ -44,6 +45,7 @@ dirs = "6"
 dotenvy = "0.15.7"
 futures.workspace = true
 libc = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rustyline = "15"
 schemars.workspace = true
 serde.workspace = true

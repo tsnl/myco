@@ -46,6 +46,7 @@ semantic code search).
 
 ```bash
 myco    # runs the default model from your config.toml; --model <key> to switch
+myco --web    # open the printed URL for the local browser UI
 myco -p "explain src/host/protocol.rs"   # print mode: one turn, answer on stdout, exit
 git diff | myco -p "review this"  # piped stdin becomes context for the prompt
 ```
@@ -54,6 +55,11 @@ git diff | myco -p "review this"  # piped stdin becomes context for the prompt
 (raw, pipe-friendly), everything else prints to stderr, and the session is
 saved like any other (`session=<id>` on stderr) — continue it with
 `--resume <id>`. Bare `-p` takes the prompt from piped stdin.
+
+`--web` serves a terminal-style browser UI with individually collapsible tool
+blocks, a floating input bar, and Markdown/image rendering. It shares the CLI's
+sessions and tools; refreshing the page keeps the current turn running. See the
+[browser manual](src/manual/articles/browser.md), also `myco --help browser`.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.

@@ -15,6 +15,7 @@
 
 - [Myco overview](manual/overview.md)
 - [CLI reference](manual/cli.md)
+- [Browser UI](manual/browser.md)
 - [Harness operations](manual/harness-ops.md)
 - [Task evals](manual/evals.md)
 

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <title>myco</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="toolbar">
+    <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
+    <label class="session-picker"><span class="sr-only">Session</span><select id="sessions"><option>New session</option></select></label>
+    <button id="new-session" type="button">New</button>
+    <button id="compact" type="button">Compact</button>
+    <span id="connection" role="status">Connecting…</span>
+    <button id="activity-toggle" type="button" aria-haspopup="dialog" aria-controls="activity" aria-expanded="false">Activity <span id="activity-count">0</span></button>
+  </header>
+  <main id="transcript" aria-label="Conversation" aria-busy="false">
+    <section class="welcome"><h1>MYCO</h1><p>Write a prompt to begin.<br>Tool inputs and output expand in place.</p></section>
+  </main>
+  <button id="jump" type="button" hidden>↓ Latest output</button>
+  <dialog id="activity" aria-labelledby="activity-title">
+    <header class="activity-heading"><h2 id="activity-title">Activity</h2><button id="activity-close" type="button" aria-label="Close activity" autofocus>×</button></header>
+    <p id="activity-empty">No running activities.</p>
+    <section id="active-calls" class="activity-section" hidden>
+      <h3>Tool calls</h3><ul id="activity-list"></ul>
+    </section>
+    <hr id="activity-divider" hidden>
+    <section id="background-tasks" class="activity-section" hidden>
+      <h3>Background sessions</h3><ul id="background-list"></ul>
+    </section>
+  </dialog>
+  <form id="composer" class="composer">
+    <div class="composer-heading"><label for="prompt">USER</label><select id="model" aria-label="Model" disabled></select></div>
+    <textarea id="prompt" rows="2" autofocus placeholder="What are we working on?" aria-describedby="input-hint" spellcheck="false"></textarea>
+    <div class="composer-footer"><span id="input-hint">Enter to send · Shift+Enter for a new line</span><button id="cancel" type="button" hidden>Cancel run</button><button id="send" type="submit" disabled>Send ↵</button></div>
+    <div id="error" role="alert" hidden></div>
+  </form>
+</body>
+</html>
