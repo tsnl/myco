@@ -297,6 +297,21 @@ impl HostController {
         }
     }
 
+    /// Reap local resources before returning; schedule remote notification when
+    /// possible. A short-lived caller may tear down Tokio immediately afterward.
+    pub(crate) fn notify_agent_finished(self: &Arc<Self>, agent_id: uuid::Uuid) {
+        if let Backend::InProcess { worker } = &self.backend {
+            worker.notify_agent_finished(agent_id);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = self.clone();
+            handle.spawn(async move {
+                if let Err(error) = client.agent_finished(agent_id).await {
+                    eprintln!("warning: agent_finished on host {:?}: {error}", client.name);
+                }
+            });
+        }
+    }
+
     /// Notify the worker that an agent session ended (reap sessions, …).
     ///
     /// In-process: runs immediately. Subprocess: fire-and-forget — the worker

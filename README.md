@@ -64,6 +64,9 @@ semantic code search).
 myco                      # start HTTP on 127.0.0.1:8765
 myco --port 8766 --profile research
 myco --resume SESSION_ID  # open a saved session from the launch URL
+myco -p "Review the changes in this repository"
+git diff | myco -p "Summarize this diff"
+myco --mode cli          # scrolling terminal chat
 ```
 
 Myco listens only on loopback. Open the printed URL to sign in. For remote access,
@@ -83,6 +86,13 @@ Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
 launching terminal stops the server and its sessions. See the
 [browser manual](src/manual/articles/browser.md), also `myco --help browser`,
 for controls, authenticated workspace files, and the HTTP API.
+
+For scripts, `myco -p "prompt"` streams answer text to stdout, with diagnostics
+and the saved session ID on stderr. Bare `-p` reads the prompt from stdin;
+piped input precedes an explicit prompt as context. Add `--resume SESSION_ID`
+to continue a saved conversation. `myco --mode cli` provides terminal chat with
+line editing, tool activity, `/compact`, and Ctrl-C cancellation. Both use the
+same sessions and automatic compaction as the browser; see `myco --help cli`.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
@@ -128,7 +138,7 @@ Screenshots, server logs, and Playwright traces go to `target/browser-test-resul
 
 `myco-model` provides backend drivers and message types. `myco-agent` drives
 headless execution using supplied tools and event sinks. The `myco` package
-assembles sessions, host tools, and the browser server. Workspace packages share a version and lockfile.
+assembles sessions, host tools, the browser server, and terminal adapters. Workspace packages share a version and lockfile.
 Run `cargo test --locked --workspace` to test all packages.
 
 For scripted sessions and evals, `SessionRunner` supplies submission, durable

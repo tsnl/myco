@@ -74,8 +74,10 @@ Compaction replaces the active context without replacing the session or its runt
 
 In [src/bin/myco.rs](src/bin/myco.rs), find `main`, then `boot_session`.
 
-`main` loads `.env`, parses server options, and starts the browser server or the
-internal SSH host worker. The server resolves configuration and startup preflight
+`main` loads `.env`, parses options, and starts the browser server, a terminal
+adapter (`-p` or `--mode cli`), or the internal SSH host worker. Terminal adapters
+live in `src/bin/cli/` and reuse `boot_session` and `SessionRunner`.
+The server resolves configuration and startup preflight
 once. Each opened session acquires its writer lock, constructs the event sink and
 harness with local session tools, then builds its model, runtime, and agent.
 

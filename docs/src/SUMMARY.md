@@ -14,7 +14,7 @@
 # Bundled manual
 
 - [Myco overview](manual/overview.md)
-- [Server launcher](manual/cli.md)
+- [Command line](manual/cli.md)
 - [Browser UI](manual/browser.md)
 - [Harness operations](manual/harness-ops.md)
 - [Task evals](manual/evals.md)

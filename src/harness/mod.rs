@@ -370,22 +370,12 @@ impl Harness {
 
     /// Notify all hosts that `agent_id`'s session ended.
     ///
-    /// Safe to call from [`Drop`]: schedules work on the current tokio runtime when
-    /// available. Host process exit (via HostController drop) is the hard guarantee
-    /// for remotes; in-process local reaps via the worker directly.
+    /// Safe to call from [`Drop`]: local cleanup is synchronous, including when
+    /// the runtime is shutting down. Remote notification is best-effort; dropping
+    /// the host connection also causes its worker to reap retained resources.
     pub fn notify_agent_finished(&self, agent_id: uuid::Uuid) {
-        let clients: Vec<_> = self.hosts.values().cloned().collect();
-        if clients.is_empty() {
-            return;
-        }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                for c in clients {
-                    if let Err(e) = c.agent_finished(agent_id).await {
-                        eprintln!("warning: agent_finished on host {:?}: {e}", c.name);
-                    }
-                }
-            });
+        for client in self.hosts.values() {
+            client.notify_agent_finished(agent_id);
         }
     }
 }

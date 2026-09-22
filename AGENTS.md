@@ -69,7 +69,7 @@ hosts, or lies about resume.
 ## Architecture (current)
 
 ```
-myco server / chat adapter
+myco browser / terminal adapters
   └── SessionRunner (submission, lifecycle, checkpoints, compaction)
       ├── Agent / AgentState (myco-agent) → GenerativeModel (myco-model)
       └── SessionRuntime (session binding + ToolExecutor)
@@ -86,8 +86,9 @@ hidden from normal browsing. Remotes stay tool workers without model keys.
 
 | Area | Role |
 |------|------|
-| `src/bin/myco.rs` | Server launcher, session composition, and `--mode host` worker |
+| `src/bin/myco.rs` | Server/CLI launcher, session composition, and `--mode host` worker |
 | `src/bin/browser/` | HTTP server and browser frontend over the shared session runner; embedded assets, transcript projection, and authenticated browser actions |
+| `src/bin/cli/` | One-shot `-p` prompts and scrolling terminal chat over the shared session runner |
 | `src/config/` | Config file shape (`~/.myco/config.toml` catalog/knobs) + startup resolution: model catalog (`[gateways]`/`[models]` + auth sources), knob defaults |
 | `src/core/` | Shared application primitives: reexports of `Async`/`AsyncStream` and `CancelToken`, image decoding, `myco_home()`, and `atomically_write()` |
 | `src/external_command.rs` | Registry of external programs myco spawns (resolution, spawn helpers, startup-check expectations) |
