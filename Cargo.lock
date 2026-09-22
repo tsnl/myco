@@ -976,6 +976,7 @@ dependencies = [
  "myco-agent",
  "myco-model",
  "pulldown-cmark",
+ "reqwest",
  "ring",
  "rustyline",
  "schemars",

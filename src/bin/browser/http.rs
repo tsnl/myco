@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::{
     markdown,
     runtime::{ActionRequest, Error, Sessions, Update},
+    weather::{Coordinates, Weather},
 };
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -42,6 +43,7 @@ pub(super) struct Server {
     pub(super) cookie: String,
     launch_path: String,
     pub(super) sessions: Sessions,
+    weather: Weather,
 }
 
 impl Server {
@@ -53,6 +55,7 @@ impl Server {
             port,
             launch_path,
             sessions,
+            weather: Weather::new(),
         }
     }
 }
@@ -116,6 +119,21 @@ pub(super) fn router(server: Arc<Server>) -> Router {
             "text/javascript; charset=utf-8",
             include_str!("assets/horizon.js"),
         ),
+        (
+            "/clouds.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/clouds.js"),
+        ),
+        (
+            "/sky-settings.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/sky-settings.js"),
+        ),
+        (
+            "/sky.css",
+            "text/css; charset=utf-8",
+            include_str!("assets/sky.css"),
+        ),
     ] {
         router = router.route(
             path,
@@ -123,6 +141,8 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         );
     }
     router
+        .route("/api/sky/weather", get(sky_weather))
+        .route("/api/sky/locations", get(sky_locations))
         .route("/api/events", get(events))
         .route("/api/sessions", get(sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_snapshot))
@@ -136,6 +156,24 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(headers))
         .with_state(server)
+}
+
+async fn sky_weather(
+    State(server): State<Arc<Server>>,
+    Query(coordinates): Query<Coordinates>,
+) -> Result<Json<super::weather::Forecast>, Error> {
+    server.weather.forecast(coordinates).await.map(Json)
+}
+
+async fn sky_locations(
+    State(server): State<Arc<Server>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<super::weather::Locations>, Error> {
+    server
+        .weather
+        .locations(query.get("query").map_or("", String::as_str))
+        .await
+        .map(Json)
 }
 
 pub(super) fn allowed(headers: &HeaderMap, app: &Server, mutation: bool) -> bool {

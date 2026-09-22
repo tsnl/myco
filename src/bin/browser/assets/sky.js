@@ -1,9 +1,11 @@
 import renderGradient from '/horizon.js';
+import { createClouds, colorClouds } from '/clouds.js';
+import { skySettings } from '/sky-settings.js';
 
-// A local-time day/night cycle; no location permission or external service.
 const sky = document.createElement('div');
 sky.id = 'sky';
 sky.setAttribute('aria-hidden', 'true');
+sky.classList.toggle('paused', document.hidden);
 const atmosphere = document.createElement('div');
 atmosphere.className = 'sky-atmosphere';
 sky.append(atmosphere);
@@ -27,11 +29,15 @@ for (let index = 0; index < 90; index++) {
 }
 sky.append(stars);
 document.body.prepend(sky);
+const updateClouds = createClouds(sky);
+const illustrated = { cloud_cover_high: 32, cloud_cover_mid: 38, cloud_cover_low: 42, wind_speed_10m: 3, wind_direction_10m: 260 };
+let forecast = null;
 
 function updateSky() {
   if (document.hidden) return;
   const now = new Date();
-  const hour = now.getHours() + now.getMinutes() / 60;
+  const local = forecast ? new Date(now.getTime() + forecast.utc_offset_seconds * 1000) : now;
+  const hour = forecast ? local.getUTCHours() + local.getUTCMinutes() / 60 : now.getHours() + now.getMinutes() / 60;
   const altitude = Math.cos((hour - 12) * Math.PI / 12) * Math.PI / 3;
   const night = Math.max(0, Math.min(1, (-altitude * 180 / Math.PI - 3) / 9));
   const [gradient] = renderGradient(altitude);
@@ -39,6 +45,7 @@ function updateSky() {
   atmosphere.style.opacity = String(1 - night * 0.92);
   stars.style.opacity = String(night);
   sky.dataset.phase = night > 0.5 ? 'night' : altitude < 0.15 ? 'twilight' : 'day';
+  colorClouds(sky, altitude, night);
 }
 document.addEventListener('visibilitychange', () => {
   sky.classList.toggle('paused', document.hidden);
@@ -46,3 +53,8 @@ document.addEventListener('visibilitychange', () => {
 });
 updateSky();
 setInterval(updateSky, 60000);
+skySettings(next => {
+  forecast = next;
+  updateClouds(forecast?.current || illustrated);
+  updateSky();
+});

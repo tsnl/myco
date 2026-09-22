@@ -8,6 +8,7 @@ mod http;
 mod markdown;
 mod runtime;
 mod view;
+mod weather;
 
 /// A URL a browser can open for a listener bound to `address`.
 ///

@@ -207,6 +207,122 @@ context_window = 100000
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
 
+    def test_sky_city_drives_altitude_layers_and_persists_across_navigation(self):
+        page = self.page
+        calls = []
+        def weather(route):
+            calls.append(route.request.url)
+            route.fulfill(json={"utc_offset_seconds": 0, "current": {
+                "time": int(time.time()), "cloud_cover_low": 0, "cloud_cover_mid": 65,
+                "cloud_cover_high": 90, "wind_speed_10m": 6, "wind_direction_10m": 250}})
+        self.context.route("**/api/sky/weather?*", weather)
+        self.context.route("**/api/sky/locations?*", lambda route: route.fulfill(json={"results": [
+            {"name": "London", "admin1": "England", "country": "United Kingdom", "latitude": 51.5085, "longitude": -0.1257}]}))
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
+        self.assertEqual(calls, [], "Illustrated skies must not request a location or weather")
+        page.emulate_media(reduced_motion="reduce")
+        page.click("#sky-toggle")
+        page.fill("#sky-city", "London")
+        page.press("#sky-city", "Enter")
+        page.get_by_role("button", name="London, England, United Kingdom", exact=True).click()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
+        expect(page.locator("#sky-low")).to_have_text("0%")
+        self.assertIn("latitude=51.51&longitude=-0.13", calls[-1])
+        for layer, cover in [("high", "90"), ("mid", "65"), ("low", "0")]:
+            expect(page.locator(f".cloud-{layer}")).to_have_attribute("data-cover", cover)
+        self.assertTrue(page.locator(".cloud-low .pixel-cloud").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).opacity === '0')"))
+        self.assertTrue(page.locator(".cloud-high .pixel-cloud").evaluate_all("nodes => nodes.some(n => getComputedStyle(n).opacity === '1')"))
+        page.press("#sky-city", "Escape")
+        self.session(page)
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
+        page.click("#sky-toggle")
+        expect(page.locator("#sky-status")).to_contain_text("London")
+        page.click("#sky-reset")
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
+        self.assertIsNone(page.evaluate("localStorage.getItem('myco.sky.location.v1')"))
+
+    def test_sky_weather_outages_mark_old_conditions_and_eventually_use_illustration(self):
+        page = self.page
+        page.clock.install()
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json={
+            "utc_offset_seconds": 0, "current": {"time": int(time.time()), "cloud_cover_low": 100,
+            "cloud_cover_mid": 100, "cloud_cover_high": 0, "wind_speed_10m": 12, "wind_direction_10m": 45}}))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
+        self.context.unroute("**/api/sky/weather?*")
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(status=503, body="Weather upstream unavailable"))
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "stale")
+        page.click("#sky-toggle")
+        expect(page.locator("#sky-status")).to_contain_text("last available")
+        expect(page.locator("#sky-error")).to_contain_text("Weather unavailable")
+        page.clock.fast_forward(2 * 60 * 60 * 1000)
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
+        expect(page.locator("#sky-coverage")).to_be_hidden()
+        page.click("#sky-close")
+        self.session(page)
+        self.submit(page, "Alpha markdown")
+        expect(page.locator("#model")).to_be_enabled()
+
+    def test_sky_motion_preferences_mobile_settings_and_location_denial(self):
+        page = self.page
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.emulate_media(reduced_motion="reduce")
+        self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationName"), "none")
+        page.emulate_media(reduced_motion="no-preference")
+        self.assertGreater(float(page.locator(".cloud-track").first.evaluate("n => parseFloat(getComputedStyle(n).animationDuration)")), 1000)
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationPlayState"), "paused")
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        page.click("#sky-toggle")
+        page.evaluate("() => { navigator.geolocation.getCurrentPosition = (_ok, fail) => fail({code: 1}); }")
+        page.click("#sky-locate")
+        expect(page.locator("#sky-error")).to_contain_text("Location unavailable")
+        self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
+        rect = page.locator("#sky-settings").bounding_box()
+        self.assertGreaterEqual(rect["x"], 0)
+        self.assertLessEqual(rect["x"] + rect["width"], 390)
+        page.screenshot(path=str(self.artifacts / "sky-settings-mobile.png"))
+        page.click("#sky-close")
+        self.session(page)
+        self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
+
+    def test_sky_endpoints_require_authentication_and_validate_input(self):
+        anonymous = self.playwright.request.new_context()
+        try:
+            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js"]:
+                self.assertEqual(anonymous.get(self.origin + path).status, 401)
+        finally:
+            anonymous.dispose()
+        for path in ["/api/sky/weather?latitude=91&longitude=0", "/api/sky/weather?latitude=nan&longitude=0", "/api/sky/locations?query=a"]:
+            self.assertEqual(self.context.request.get(self.origin + path).status, 400)
+
+    def test_sky_wind_changes_preserve_cloud_positions(self):
+        page = self.page
+        page.clock.install()
+        report = {"utc_offset_seconds": 0, "current": {"time": int(time.time()),
+            "cloud_cover_low": 80, "cloud_cover_mid": 50, "cloud_cover_high": 70,
+            "wind_speed_10m": 4, "wind_direction_10m": 250}}
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json=report))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
+        tracks = page.locator(".cloud-track")
+        tracks.evaluate_all("nodes => nodes.forEach(n => { n.getAnimations()[0].currentTime = 1200000; })")
+        before = tracks.evaluate_all("nodes => nodes.map(n => n.getBoundingClientRect().x)")
+        report["current"]["wind_direction_10m"] = 90
+        report["current"]["wind_speed_10m"] = 15
+        report["current"]["cloud_cover_low"] = 85
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(page.locator(".cloud-low")).to_have_attribute("data-cover", "85")
+        after = tracks.evaluate_all("nodes => nodes.map(n => n.getBoundingClientRect().x)")
+        for start, end in zip(before, after):
+            self.assertLess(abs(end - start), 2, "Weather updates must not jump drifting clouds")
+
     def test_refresh_keeps_transcript_nodes_and_expanded_tools(self):
         page = self.session(self.page)
         self.submit(page, "Alpha shell")
