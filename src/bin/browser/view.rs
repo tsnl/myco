@@ -71,6 +71,8 @@ impl Block {
                 .unwrap_or_else(|| if result.is_error { "failed" } else { "done" }.into());
             *error = result.is_error
                 || status.starts_with("signal ")
+                || status.starts_with("timed out")
+                || status.starts_with("cancel requested")
                 || status
                     .strip_prefix("exit ")
                     .and_then(|n| n.parse::<i32>().ok())

@@ -18,6 +18,7 @@ fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
                 model: "test".into(),
                 busy: false,
                 status: "Ready".into(),
+                tasks: vec![],
                 blocks: vec![],
             },
             cancel: None,
@@ -37,6 +38,82 @@ fn action_request() -> ActionRequest {
         action: Action::Submit {
             text: "task".into(),
         },
+    }
+}
+
+#[test]
+fn tool_calls_appear_before_results_and_finish_independently() {
+    let (app, _) = app();
+    let first = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"sleep 10"}),
+    };
+    let second = ToolUse {
+        name: "editor".into(),
+        input: json!({"text":"write this"}),
+    };
+    for tool in [&first, &second] {
+        app.emit(AgentEvent::ToolStarted {
+            tool_use: tool.clone(),
+            context: Default::default(),
+        });
+    }
+    let started = app.snapshot().change;
+    let blocks = started["snapshot"]["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.iter().all(|block| block["running"] == true));
+    assert_eq!(blocks[0]["tool"]["input"], first.input);
+    app.emit(AgentEvent::ToolFinished {
+        tool_use: second,
+        result: ToolResult::text("saved"),
+        context: Default::default(),
+    });
+    let finished = app.snapshot().change;
+    let blocks = finished["snapshot"]["blocks"].as_array().unwrap();
+    assert_eq!(blocks[0]["running"], true);
+    assert_eq!(blocks[1]["running"], false);
+    assert_eq!(blocks[1]["status"], "done");
+    assert_eq!(blocks[1]["text"], "saved");
+}
+
+#[tokio::test]
+async fn background_tasks_update_idle_clients_and_survive_reconnect() {
+    let (app, _) = app();
+    let response = events(State(app.clone())).await.into_response();
+    let mut stream = response.into_body().into_data_stream();
+    let _ = stream.next().await.unwrap().unwrap();
+    let tasks = vec!["bash session build: cargo build (up 1s, idle 1s)".into()];
+    app.tasks(tasks.clone());
+    let updated = event_data(&stream.next().await.unwrap().unwrap());
+    assert_eq!(updated["change"], json!({"kind":"tasks", "tasks":tasks}));
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], false);
+    app.tasks(tasks.clone());
+    assert_eq!(app.snapshot().revision, updated["revision"]);
+    let response = events(State(app.clone())).await.into_response();
+    let mut reconnect = response.into_body().into_data_stream();
+    let snapshot = event_data(&reconnect.next().await.unwrap().unwrap());
+    assert_eq!(snapshot["change"]["snapshot"]["tasks"], json!(tasks));
+    app.tasks(vec![]);
+    let cleared = event_data(&stream.next().await.unwrap().unwrap());
+    assert_eq!(cleared["change"], json!({"kind":"tasks", "tasks":[]}));
+}
+
+#[test]
+fn cancelled_and_timed_out_calls_are_not_successful_outcomes() {
+    for status in [
+        "cancel requested; partial result recorded",
+        "timed out after 10ms; process group killed",
+        "exit 7",
+        "signal 9",
+    ] {
+        let mut block = Block::tool(ToolUse {
+            name: "any-tool".into(),
+            input: Value::Null,
+        });
+        block.finish(&ToolResult::text("partial output").with_status(status));
+        let block = serde_json::to_value(block).unwrap();
+        assert_eq!(block["error"], true, "{status}");
+        assert_eq!(block["running"], false);
     }
 }
 

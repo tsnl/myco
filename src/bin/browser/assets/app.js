@@ -1,13 +1,11 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const transcript = $('transcript');
-let state = { blocks: [], busy: false };
+let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
 let revision = -1;
 let follow = true;
 let pending = null;
-let promptSession = null;
-let wasBusy = true;
 const nodes = [];
 const markdownJobs = new WeakMap();
 
@@ -72,26 +70,39 @@ function markdown(node, text) {
   };
   job.timer = setTimeout(render, 80);
 }
-function jsonArguments(input) {
-  const pre = element('pre', 'arguments');
-  const text = JSON.stringify(input, null, 2);
-  const keys = /^(\s*)("(?:[^"\\]|\\.)*":)/gm;
+function jsonArguments(input, preview = false) {
+  const pre = element(preview ? 'span' : 'pre', preview ? 'tool-args' : 'arguments');
+  const text = JSON.stringify(input, null, preview ? 0 : 2);
+  const limit = preview ? Array.from(text).slice(0, 180).join('').length : text.length;
+  const strings = /"(?:[^"\\]|\\.)*"\s*:?/g;
   let start = 0;
-  for (const match of text.matchAll(keys)) {
-    pre.append(document.createTextNode(text.slice(start, match.index) + match[1]));
-    pre.append(element('span', 'json-key', match[2]));
-    start = match.index + match[0].length;
+  for (const match of text.matchAll(strings)) {
+    if (match.index >= limit) break;
+    if (!match[0].endsWith(':')) continue;
+    pre.append(document.createTextNode(text.slice(start, match.index)));
+    start = Math.min(limit, match.index + match[0].length);
+    pre.append(element('span', 'json-key', text.slice(match.index, start)));
   }
-  pre.append(document.createTextNode(text.slice(start)));
+  pre.append(document.createTextNode(text.slice(start, limit) + (limit < text.length ? '…' : '')));
   return pre;
+}
+function argumentPreview(input) {
+  const chars = Array.from(JSON.stringify(input));
+  return chars.length > 180 ? `${chars.slice(0, 180).join('')}…` : chars.join('');
+}
+function toolState(block) {
+  if (block.running) return 'running';
+  if (block.error) return 'failed';
+  return block.status === 'outcome not recorded' ? 'unknown' : 'done';
 }
 function blockNode(block) {
   if (block.kind === 'notice') return element('div', 'notice', block.text);
   if (block.kind === 'tool') {
-    const details = element('details', 'tool');
+    const outcome = toolState(block);
+    const details = element('details', `tool ${outcome}`);
     details.dataset.key = JSON.stringify(block.tool);
     const summary = element('summary');
-    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status${block.error ? ' failed' : ''}${block.running ? ' running' : ''}`, block.status));
+    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), jsonArguments(block.tool.input, true));
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), jsonArguments(block.tool.input));
     if (block.text || block.images?.length) body.append(element('span', 'tool-label', 'Output'));
@@ -147,14 +158,8 @@ function snapshot(next) {
   metadata();
 }
 function metadata() {
-  if (state.session_id && !state.busy && (wasBusy || promptSession !== state.session_id)) {
-    $('prompt-time').dateTime = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-    $('prompt-time').textContent = $('prompt-time').dateTime;
-    promptSession = state.session_id;
-  }
-  wasBusy = state.busy;
   $('model').textContent = state.model || '';
-  $('connection').textContent = connected ? state.status || 'Ready' : 'Reconnecting…';
+  activity();
   $('send').disabled = !connected || state.busy;
   $('cancel').hidden = !state.busy;
   $('new-session').disabled = !connected || state.busy;
@@ -163,6 +168,28 @@ function metadata() {
   transcript.setAttribute('aria-busy', String(!!state.busy));
   document.title = `${state.title || 'myco'} · myco`;
   if (!state.busy) refreshSessions();
+}
+function activity() {
+  const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
+  const tasks = state.tasks || [];
+  const count = calls.length + tasks.length;
+  $('activity').hidden = !count;
+  $('activity-title').textContent = `${connected ? 'Running' : 'Last known running'} · ${count}`;
+  const list = $('activity-list'); list.replaceChildren();
+  for (const { block, index } of calls) {
+    const item = element('li');
+    const button = element('button', 'active-call', `${block.tool.name} ${argumentPreview(block.tool.input)}`);
+    button.type = 'button';
+    button.onclick = () => {
+      nodes[index].open = true;
+      follow = false;
+      nodes[index].scrollIntoView({ block: 'center' });
+    };
+    item.append(button); list.append(item);
+  }
+  for (const task of tasks) list.append(element('li', 'background-task', task));
+  const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
+  $('connection').textContent = connected ? state.status === 'Cancelling' ? 'Cancelling' : current : 'Reconnecting…';
 }
 async function refreshSessions() {
   try {
@@ -183,7 +210,8 @@ stream.onmessage = ({ data }) => {
   const change = update.change;
   if (change.kind === 'snapshot') snapshot(change.snapshot);
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
-  else if (change.kind === 'block') { state.blocks[change.index] = change.block; replaceBlock(change.index, change.block); }
+  else if (change.kind === 'block') { state.blocks[change.index] = change.block; replaceBlock(change.index, change.block); activity(); }
+  else if (change.kind === 'tasks') { state.tasks = change.tasks; activity(); }
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
     markdown(nodes[change.index].querySelector('.body'), block.text);

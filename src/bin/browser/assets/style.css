@@ -13,7 +13,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .brand span { color: var(--dim); }
 .session-picker { flex: 1; min-width: 80px; max-width: 430px; }
 #sessions { width: 100%; text-overflow: ellipsis; }
-#connection { margin-left: auto; color: var(--dim); white-space: nowrap; }
+#connection { margin-left: auto; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #transcript { max-width: 980px; margin: 0 auto; padding: 32px 24px calc(var(--composer-height) + 55px); overflow-wrap: anywhere; }
 .welcome { color: var(--dim); padding: 25px 0; }
 .welcome h1 { color: var(--green); font: inherit; font-weight: 700; }
@@ -44,12 +44,16 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 1.5em 0; }
 .markdown.pending { white-space: pre-wrap; }
 img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fit: contain; object-position: left center; margin: 14px 0; border-radius: 5px; }
-.tool { border: 1px solid #665739; border-radius: 9px; background: #161a20; margin: 15px 0 22px; }
-.tool summary { padding: 11px 15px; cursor: pointer; color: var(--amber); overflow-wrap: anywhere; }
+.tool { --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 9px; background: #161a20; margin: 15px 0 22px; }
+.tool.running { --tool-color: var(--cyan); }
+.tool.done { --tool-color: var(--green); }
+.tool.failed { --tool-color: var(--red); }
+.tool.unknown { --tool-color: var(--amber); }
+.tool summary { padding: 11px 15px; cursor: pointer; color: var(--tool-color); overflow-wrap: anywhere; }
 .tool-name { font-weight: 700; }
-.tool-status { color: var(--dim); margin-left: 12px; }
-.tool-status.failed, .notice { color: var(--red); }
-.tool-status.running { color: var(--cyan); }
+.tool-status { margin-left: 12px; }
+.tool-args { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 4px; color: var(--dim); }
+.notice { color: var(--red); }
 .tool-content { padding: 0 15px 10px; border-top: 1px solid #34302a; }
 .tool-label { display: block; margin-top: 12px; color: var(--dim); font-weight: 600; }
 .json-key { color: var(--cyan); }
@@ -61,6 +65,12 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .notice { padding: 10px 0; white-space: pre-wrap; }
 .composer { position: fixed; z-index: 3; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); width: min(932px, calc(100% - 32px)); padding: 13px 16px 11px; border: 1px solid #485563; border-radius: 12px; background: #191e25f5; box-shadow: 0 10px 40px #0009; backdrop-filter: blur(12px); }
 .composer:focus-within { border-color: #708b9a; }
+#activity { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 10px; }
+#activity-title { color: var(--cyan); font-weight: 700; }
+#activity-list { max-height: 18vh; overflow: auto; margin: 4px 0 0; padding-left: 1.5em; color: var(--cyan); }
+#activity-list li { overflow-wrap: anywhere; }
+.active-call { display: block; width: 100%; text-align: left; border: 0; background: none; color: inherit; padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.active-call:hover { text-decoration: underline; }
 .composer-heading, .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .composer-heading label { color: var(--cyan); font-weight: 700; }
 #model, #input-hint { color: var(--dim); }

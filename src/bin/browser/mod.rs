@@ -39,6 +39,7 @@ struct Snapshot {
     model: String,
     busy: bool,
     status: String,
+    tasks: Vec<String>,
     blocks: Vec<Block>,
 }
 
@@ -107,6 +108,7 @@ impl App {
 
     fn sync(&self, boot: &Boot, status: &str, idle: bool) {
         let session = boot.session.snapshot();
+        let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
         let snapshot = &mut live.snapshot;
         snapshot.session_id = session.id.clone();
@@ -119,10 +121,20 @@ impl App {
         snapshot.blocks = view::history(session.active_thread());
         snapshot.status = status.into();
         snapshot.busy = !idle;
+        snapshot.tasks = tasks;
         let change = json!({"kind":"snapshot", "snapshot":snapshot});
         self.publish(snapshot, change);
         if idle {
             live.cancel = None;
+        }
+    }
+
+    fn tasks(&self, tasks: Vec<String>) {
+        let mut live = self.live.lock().unwrap();
+        if live.snapshot.tasks != tasks {
+            live.snapshot.tasks = tasks;
+            let change = json!({"kind":"tasks", "tasks":live.snapshot.tasks});
+            self.publish(&mut live.snapshot, change);
         }
     }
 
@@ -268,6 +280,7 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
                     model: config.model.clone(),
                     busy: false,
                     status: "Ready".into(),
+                    tasks: vec![],
                     blocks: view::history(session.active_thread()),
                 },
                 cancel: None,
@@ -345,47 +358,27 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
 }
 
 async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let work = tokio::select! {
             _ = app.shutdown.cancelled() => break,
+            _ = tick.tick() => {
+                app.tasks(boot.runner.runtime().running_tool_summaries());
+                continue;
+            }
             work = receiver.recv() => match work { Some(work) => work, None => break },
         };
-        let result: Result<(), String> = match work.request.action {
-            Action::Submit { text } => match super::expand_image_attachments(
-                &text,
-                boot.catalog_model.spec.max_image_base64_bytes,
-            ) {
-                Err(error) => Err(error),
-                Ok(content) => {
-                    let time = Utc::now();
-                    {
-                        let mut live = app.live.lock().unwrap();
-                        let block = Block::message("user", &content, Some(view::timestamp(&time)));
-                        let index = live.snapshot.blocks.len();
-                        live.snapshot.blocks.push(block.clone());
-                        app.publish(
-                            &mut live.snapshot,
-                            json!({"kind":"block", "index":index, "block":block}),
-                        );
-                    }
-                    let outcome = boot.runner.submit(content, time, work.cancel).await;
-                    outcome.result.map(|_| ()).map_err(|e| e.to_string())
+        let result = {
+            let runtime = boot.runner.runtime().clone();
+            let operation = execute(&mut boot, &app, work);
+            tokio::pin!(operation);
+            loop {
+                tokio::select! {
+                    result = &mut operation => break result,
+                    _ = tick.tick() => app.tasks(runtime.running_tool_summaries()),
                 }
-            },
-            Action::Compact => boot
-                .runner
-                .compact(work.cancel)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            Action::New => {
-                let session = Session::new(boot.catalog_model.spec.key.clone());
-                switch(&mut boot, session).await
             }
-            Action::Open { id } => match Session::load_by_id_or_prefix(&id) {
-                Ok(session) => switch(&mut boot, session).await,
-                Err(error) => Err(error),
-            },
         };
         app.sync(
             &boot,
@@ -398,6 +391,46 @@ async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work
     }
     if let Err(error) = persist_session(boot.runner.agent(), &boot.session, false) {
         eprintln!("browser: {error}");
+    }
+}
+
+async fn execute(boot: &mut Boot, app: &App, work: Work) -> Result<(), String> {
+    match work.request.action {
+        Action::Submit { text } => match super::expand_image_attachments(
+            &text,
+            boot.catalog_model.spec.max_image_base64_bytes,
+        ) {
+            Err(error) => Err(error),
+            Ok(content) => {
+                let time = Utc::now();
+                {
+                    let mut live = app.live.lock().unwrap();
+                    let block = Block::message("user", &content, Some(view::timestamp(&time)));
+                    let index = live.snapshot.blocks.len();
+                    live.snapshot.blocks.push(block.clone());
+                    app.publish(
+                        &mut live.snapshot,
+                        json!({"kind":"block", "index":index, "block":block}),
+                    );
+                }
+                let outcome = boot.runner.submit(content, time, work.cancel).await;
+                outcome.result.map(|_| ()).map_err(|e| e.to_string())
+            }
+        },
+        Action::Compact => boot
+            .runner
+            .compact(work.cancel)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Action::New => {
+            let session = Session::new(boot.catalog_model.spec.key.clone());
+            switch(boot, session).await
+        }
+        Action::Open { id } => match Session::load_by_id_or_prefix(&id) {
+            Ok(session) => switch(boot, session).await,
+            Err(error) => Err(error),
+        },
     }
 }
 

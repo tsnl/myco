@@ -25,9 +25,17 @@ Shift-Enter or Alt-Enter inserts a newline. Mention `@path/to/image.png` to atta
 an image using the CLI's attachment rules and limits. Image paths with spaces
 are not supported as attachments.
 
-Each tool has its own collapsed block. Expand it to inspect the complete
-recorded input, output, images, and outcome. All tools show their arguments as
-JSON, with colored keys. There is no browser verbose mode.
+Each tool appears as soon as execution starts, with a truncated JSON argument
+preview in its collapsed header. Running calls are cyan; completed calls turn
+green, and failures red. Expand a block to inspect its complete recorded input,
+output, images, and outcome. All tools show their arguments as JSON, with
+colored keys. There is no browser verbose mode.
+
+The pinned input area lists active tool calls and local background tasks, such
+as bash sessions that continue between turns. Click an active call to open its
+block. Background-task summaries refresh every second without consuming tool
+output, and disappear when the task ends. As in the CLI, background summaries
+cover the local host; active calls include remote tools too.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, and images. Text uses one font size;
@@ -39,7 +47,7 @@ images resolve through the profile's image store.
 
 USER and ASSISTANT headers have UTC timestamps on the next line. Recorded
 messages use the turn's saved acceptance time; older turns without one show
-`unknown`. The input bar shows when that prompt opened.
+`unknown`. The input box has no timestamp.
 
 The session picker opens a recent visible session. **New** starts a fresh session;
 **Compact** creates a successor thread in the current session. These controls
