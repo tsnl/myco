@@ -8,21 +8,19 @@ use common::*;
 use myco::model::{DeltaKind, Error, Finish, Output, Response, Tool};
 use serde_json::{Value, json};
 
-#[tokio::test]
-async fn an_invalid_request_finishes_without_contacting_the_endpoint() {
+#[test]
+fn invalid_input_is_rejected_before_a_stream_is_returned() {
     let model = client(
         Protocol::OpenAiResponses,
         "http://127.0.0.1:1/responses",
         "test",
     )
     .unwrap();
-    let mut request = Request::new("test-model", vec![Message::User("hello".into())], 64);
-    request
-        .provider_options
-        .insert("stream".into(), false.into());
-    let trace = collect(&model, request).await;
-    assert!(matches!(trace.result, Err(Error::InvalidRequest(_))));
-    assert!(trace.events.is_empty());
+    let request = Request::new("", vec![Message::User("hello".into())], 64);
+    assert!(matches!(
+        model.generate(request),
+        Err(Error::InvalidRequest(_))
+    ));
 }
 
 #[tokio::test]
@@ -54,7 +52,7 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
     let terminal = json!({"type":"response.completed","response":text_response("hello")});
     let (url, _capture) = fixture(&events(&[progress.clone(), terminal.clone()]), 200, "").await;
     let client = client(Protocol::OpenAiResponses, &url, "").unwrap();
-    let mut generation = client.generate(request());
+    let mut generation = client.generate(request()).unwrap();
     assert!(matches!(
         generation.next().await,
         Some(Ok(Event::Request { .. }))
@@ -139,7 +137,7 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
                 is_error: false,
             },
         ]);
-        let body = model.request_body(&next).unwrap();
+        let body = encoded_request(&model, next).await;
         match protocol {
             Protocol::OpenAiResponses => {
                 assert!(captured.headers.contains("authorization: Bearer test-key"));
@@ -340,7 +338,7 @@ async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
     let mut input = request();
     input.messages.push(Message::Assistant(response));
     assert!(matches!(
-        model.request_body(&input),
+        model.generate(input.clone()),
         Err(Error::InvalidRequest(_))
     ));
     input.messages = vec![Message::ToolResult {
@@ -349,7 +347,7 @@ async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
         is_error: false,
     }];
     assert!(matches!(
-        model.request_body(&input),
+        model.generate(input),
         Err(Error::InvalidRequest(_))
     ));
 }
@@ -360,7 +358,7 @@ async fn dropping_an_incomplete_generation_closes_the_http_request() {
         events(&[json!({"type":"response.output_text.delta","output_index":0,"delta":"started"})]);
     let (endpoint, server) = unfinished_body(body).await;
     let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
-    let mut generation = model.generate(request());
+    let mut generation = model.generate(request()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         assert!(matches!(
             generation.next().await,
@@ -385,7 +383,7 @@ async fn completion_releases_the_http_request_without_dropping_or_polling_again(
     ] {
         let (endpoint, server) = unfinished_body(body.into()).await;
         let model = client(protocol, &endpoint, "").unwrap();
-        let mut generation = model.generate(request());
+        let mut generation = model.generate(request()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let event = generation
@@ -492,13 +490,12 @@ async fn provider_settings_are_per_request_and_cannot_replace_context() {
         .provider_options
         .insert("reasoning".into(), json!({"effort":"high"}));
     assert_eq!(
-        model.request_body(&input).unwrap()["reasoning"],
+        encoded_request(&model, input).await["reasoning"],
         json!({"effort":"high"})
     );
     assert!(
-        model
-            .request_body(&request())
-            .unwrap()
+        encoded_request(&model, request())
+            .await
             .get("reasoning")
             .is_none()
     );
@@ -518,7 +515,7 @@ async fn provider_settings_are_per_request_and_cannot_replace_context() {
         let mut input = request();
         input.provider_options.insert(key.into(), Value::Null);
         assert!(
-            matches!(model.request_body(&input), Err(Error::InvalidRequest(_))),
+            matches!(model.generate(input), Err(Error::InvalidRequest(_))),
             "{key}"
         );
     }
@@ -545,7 +542,7 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
     let mut input = request();
     input.messages.push(Message::Assistant(reply));
     assert!(matches!(
-        model.request_body(&input),
+        model.generate(input),
         Err(Error::InvalidRequest(_))
     ));
 }
@@ -580,7 +577,7 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
     });
 
     let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
-    let mut generation = model.generate(request());
+    let mut generation = model.generate(request()).unwrap();
     assert!(matches!(
         generation.next().await,
         Some(Ok(Event::Request { .. }))

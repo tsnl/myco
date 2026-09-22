@@ -130,10 +130,18 @@ pub struct Trace {
 pub async fn collect(client: &GenAiClient, request: Request) -> Trace {
     tokio::time::timeout(
         Duration::from_secs(5),
-        collect_events(client.generate(request)),
+        collect_events(client.generate(request).unwrap()),
     )
     .await
     .unwrap()
+}
+
+pub async fn encoded_request(client: &GenAiClient, request: Request) -> Value {
+    let mut generation = client.generate(request).unwrap();
+    let Some(Ok(Event::Request { body, .. })) = generation.next().await else {
+        panic!("request must be first");
+    };
+    body
 }
 
 async fn collect_events(mut generation: Generation<'_>) -> Trace {

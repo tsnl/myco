@@ -34,14 +34,9 @@ impl GenAiClient {
         })
     }
 
-    /// Inspect the provider payload without opening a connection.
-    pub fn request_body(&self, request: &Request) -> Result<Value, Error> {
-        backend_helpers::request_body(self.driver.as_ref(), request)
-    }
-
-    /// One attempt, advanced by polling. Only `Event::Completed` contains the
-    /// final response. Dropping the stream releases the request.
-    pub fn generate(&self, request: Request) -> Generation<'_> {
+    /// Validate and encode one attempt without network I/O. Polling yields the
+    /// request before dispatch; transport and provider failures arrive in the stream.
+    pub fn generate(&self, request: Request) -> Result<Generation<'_>, Error> {
         backend_helpers::generate(self.driver.as_ref(), request)
     }
 }

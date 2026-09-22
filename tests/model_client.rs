@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
 use myco::model::{Config, Error, Event, GenAiClient, Message, Request};
 use tokio::{net::TcpListener, time::timeout};
@@ -24,7 +23,7 @@ async fn an_unpolled_generation_never_contacts_the_endpoint() {
         "http://{}/responses",
         listener.local_addr().unwrap()
     ));
-    let generation = client.generate(request());
+    let generation = client.generate(request()).unwrap();
     assert!(
         timeout(Duration::from_millis(30), listener.accept())
             .await
@@ -45,7 +44,7 @@ async fn consuming_only_the_request_never_dispatches_it() {
         "http://{}/responses",
         listener.local_addr().unwrap()
     ));
-    let mut generation = client.generate(request());
+    let mut generation = client.generate(request()).unwrap();
     let Event::Request { body, .. } = generation.next().await.unwrap().unwrap() else {
         panic!("request must be first");
     };
@@ -64,20 +63,15 @@ async fn consuming_only_the_request_never_dispatches_it() {
     );
 }
 
-#[tokio::test]
-async fn validation_failure_is_one_error_then_permanent_exhaustion() {
+#[test]
+fn invalid_options_fail_before_a_stream_is_returned_without_a_runtime() {
     let client = client("http://127.0.0.1:1/responses".into());
     let mut request = request();
     request
         .provider_options
         .insert("stream".into(), false.into());
-    let mut generation = client.generate(request);
-    assert!(!generation.is_terminated());
     assert!(matches!(
-        generation.next().await,
-        Some(Err(Error::InvalidRequest(_)))
+        client.generate(request),
+        Err(Error::InvalidRequest(_))
     ));
-    assert!(generation.is_terminated());
-    assert!(generation.next().await.is_none());
-    assert!(generation.next().await.is_none());
 }

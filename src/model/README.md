@@ -19,7 +19,7 @@ let request = Request::new(
     vec![Message::User("Explain this repository.".into())],
     1024,
 );
-let mut generation = client.generate(request);
+let mut generation = client.generate(request)?;
 while let Some(event) = generation.next().await {
     match event? {
         Event::Progress { delta: Some(delta), .. } => print!("{}", delta.text),
@@ -54,15 +54,16 @@ Concurrent calls can produce independent candidates from the same fixed history.
 
 ## Stream contract
 
-- `generate` returns a concrete `Generation<'_>` implementing
+- `generate` validates and encodes the request synchronously, returning
+  `Result<Generation<'_>, Error>`. Invalid input returns an error immediately,
+  without a stream or network dispatch. The concrete `Generation` implements
   `Stream<Item = Result<Event, Error>>`, `Send`, `Unpin`, and `FusedStream`.
-  It borrows its client and owns its attempt. Creating it performs no work.
-- The first poll validates and encodes the request. A valid request first yields
-  `Event::Request` with its exact JSON body, excluding authentication headers.
-  The HTTP request is sent only when polling continues. The caller can persist
-  the request before polling again, or drop the stream if recording fails.
-  Invalid input yields one error without a request event or network dispatch.
-  `GenAiClient::request_body` inspects the payload independently.
+  It borrows its client and owns its attempt. Creating it performs no network I/O.
+- The first stream item is `Event::Request` with the exact JSON body, excluding
+  authentication headers. The HTTP request is sent only when polling continues.
+  The caller can inspect and persist the request before polling again, or drop
+  the stream if recording fails. Transport and provider failures arrive as stream
+  errors.
 - `Progress` carries provider JSON and an optional text/reasoning/tool-argument
   delta. Valid JSON is yielded before decoding or final normalization errors,
   including provider failure events. Tool arguments remain provisional.

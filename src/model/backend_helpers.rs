@@ -4,9 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_stream::try_stream;
 use futures_core::Stream;
-use futures_util::StreamExt;
 use serde_json::Value;
 
 use super::{
@@ -47,29 +45,13 @@ pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
     })
 }
 
-pub(super) fn request_body(driver: &dyn Driver, request: &Request) -> Result<Value, Error> {
-    validate(request, driver.protocol())?;
-    let mut body = driver.encode(request)?;
-    apply_options(&mut body, request)?;
-    Ok(body)
-}
-
-pub(super) fn generate(driver: &dyn Driver, request: Request) -> Generation<'_> {
-    Generation::new(try_stream! {
-        let body = request_body(driver, &request)?;
-        let mut events = driver.generate(body);
-        while let Some(event) = events.next().await {
-            yield event?;
-        }
+pub(super) fn generate(driver: &dyn Driver, request: Request) -> Result<Generation<'_>, Error> {
+    validate(&request, driver.protocol())?;
+    let mut body = driver.encode(&request)?;
+    apply_options(&mut body, &request)?;
+    Ok(Generation {
+        inner: Some(driver.generate(body)),
     })
-}
-
-impl<'a> Generation<'a> {
-    fn new(stream: impl Stream<Item = Result<Event, Error>> + Send + 'a) -> Self {
-        Self {
-            inner: Some(Box::pin(stream)),
-        }
-    }
 }
 
 pub(super) fn poll_generation(
