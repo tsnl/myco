@@ -187,8 +187,7 @@ fn decode_frame(frame: &str) -> Result<Value, Error> {
     serde_json::from_str(frame).map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))
 }
 
-/// Decode complete SSE data events without assuming HTTP chunk boundaries,
-/// UTF-8 boundaries, or a particular line ending. EOF never completes a frame.
+// EOF does not complete an unterminated SSE event.
 #[derive(Default)]
 struct Sse {
     bytes: Vec<u8>,

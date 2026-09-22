@@ -36,7 +36,7 @@ For Anthropic, use `Config::Anthropic` and the complete endpoint
 local compatible endpoint. The caller supplies a Tokio runtime. Share a client
 by reference or through `Arc<GenAiClient>` for concurrent requests. Additional
 provider settings, such as `reasoning` or `thinking`, go in
-`Request::provider_options`; these cannot replace managed context, tool, or
+`Request::driver_options`; these cannot replace managed context, tool, or
 stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the model module.
 
@@ -74,8 +74,9 @@ Concurrent calls can produce independent candidates from the same fixed history.
 - The raw provider terminal event is yielded as `Progress` before `Completed`.
   Only `Completed` supplies the authoritative response. `Finish::Length`,
   `Refusal`, and `Other` remain distinct from a normal reply. EOF and `[DONE]`
-  without a provider terminal event are errors. Malformed tool JSON fails
-  explicitly; in Anthropic this can precede a later output-limit indication.
+  without a provider terminal event are errors. Malformed arguments in a completed
+  response fail validation; in Anthropic malformed tool JSON can fail before a
+  later output-limit indication.
 - Polling drives request execution and decoding. Pausing consumption applies
   backpressure; no producer task runs in the background. Dropping a pending
   `next()` future leaves the stream and attempt intact. Dropping the stream itself
@@ -88,6 +89,11 @@ Concurrent calls can produce independent candidates from the same fixed history.
 - A response exposes ordered output, optional usage counters, and native provider
   data. Input-token totals include cache reads and writes. Additional usage
   fields and stop details remain in the provider body.
+
+`ToolCall::arguments` is `Result<Value, String>`: parsed JSON or a parse error.
+Truncated Responses calls can retain an error while the raw arguments remain in
+provider data. Valid tool arguments must be JSON objects. Streaming argument
+deltas remain text until the response is decoded.
 
 Put a response in `Message::Assistant`, followed by linked `ToolResult` messages,
 to continue. Opaque reasoning, thinking signatures, content ordering, and provider

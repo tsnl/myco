@@ -73,7 +73,7 @@ fn output(output: &Output) -> Result<Value, Error> {
             Ok(json!({"role": "assistant", "content": text}))
         }
         Output::ToolCall(call) => Ok(
-            json!({"type": "function_call", "call_id": call.id, "name": call.name, "arguments": call.arguments}),
+            json!({"type": "function_call", "call_id": call.id, "name": call.name, "arguments": call.arguments()?.to_string()}),
         ),
         Output::Reasoning(_) => Err(Error::InvalidRequest(
             "reasoning continuation requires the original provider response".into(),
@@ -151,7 +151,8 @@ fn tool_call(item: &Value, complete: bool) -> Result<ToolCall, Error> {
     let call = ToolCall {
         id: field(item, "call_id")?.into(),
         name: field(item, "name")?.into(),
-        arguments: field(item, "arguments")?.into(),
+        arguments: serde_json::from_str(field(item, "arguments")?)
+            .map_err(|error| error.to_string()),
     };
     if complete {
         call.validate()?;

@@ -103,20 +103,22 @@ impl ToolCall {
         if self.id.is_empty() || self.name.is_empty() {
             return Err(Error::Protocol("tool call has an empty ID or name".into()));
         }
-        self.validate_arguments()
-    }
-
-    fn validate_arguments(&self) -> Result<(), Error> {
-        let arguments: Value = serde_json::from_str(&self.arguments).map_err(|e| {
-            Error::Protocol(format!("invalid arguments for tool call {}: {e}", self.id))
-        })?;
-        if !arguments.is_object() {
+        if !self.arguments()?.is_object() {
             return Err(Error::Protocol(format!(
                 "arguments for tool call {} must be an object",
                 self.id
             )));
         }
         Ok(())
+    }
+
+    pub(super) fn arguments(&self) -> Result<&Value, Error> {
+        self.arguments.as_ref().map_err(|error| {
+            Error::Protocol(format!(
+                "invalid arguments for tool call {}: {error}",
+                self.id
+            ))
+        })
     }
 }
 
@@ -207,10 +209,10 @@ impl<'a> History<'a> {
 }
 
 fn apply_options(body: &mut Value, request: &Request) -> Result<(), Error> {
-    for (name, value) in &request.provider_options {
+    for (name, value) in &request.driver_options {
         if managed_field(name) {
             return Err(Error::InvalidRequest(format!(
-                "provider option {name} overrides a managed request field"
+                "driver option {name} overrides a managed request field"
             )));
         }
         body[name] = value.clone();

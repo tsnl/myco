@@ -5,7 +5,7 @@ use myco::model::{Event, Message, Protocol, Request};
 mod common;
 
 use common::*;
-use myco::model::{DeltaKind, Error, Finish, Output, Response, Tool};
+use myco::model::{DeltaKind, Error, Finish, Output, Response, Tool, ToolCall};
 use serde_json::{Value, json};
 
 #[test]
@@ -99,10 +99,7 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
             panic!()
         };
         assert_eq!(call.id, "call_fixture");
-        assert_eq!(
-            serde_json::from_str::<Value>(&call.arguments).unwrap(),
-            json!({"path":"note.txt"})
-        );
+        assert_eq!(call.arguments, Ok(json!({"path":"note.txt"})));
         let arguments: String = trace
             .events
             .iter()
@@ -113,7 +110,10 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
                 _ => None,
             })
             .collect();
-        assert_eq!(arguments, call.arguments);
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            *call.arguments.as_ref().unwrap()
+        );
         let captured = capture.await.unwrap();
         let Event::Request { body, .. } = &trace.events[0] else {
             panic!()
@@ -478,7 +478,7 @@ async fn duplicate_calls_cannot_be_mistaken_for_distinct_operations() {
 }
 
 #[tokio::test]
-async fn provider_settings_are_per_request_and_cannot_replace_context() {
+async fn driver_options_are_per_request_and_cannot_replace_context() {
     let model = client(
         Protocol::OpenAiResponses,
         "http://127.0.0.1:1/responses",
@@ -487,7 +487,7 @@ async fn provider_settings_are_per_request_and_cannot_replace_context() {
     .unwrap();
     let mut input = request();
     input
-        .provider_options
+        .driver_options
         .insert("reasoning".into(), json!({"effort":"high"}));
     assert_eq!(
         encoded_request(&model, input).await["reasoning"],
@@ -513,7 +513,7 @@ async fn provider_settings_are_per_request_and_cannot_replace_context() {
         "background",
     ] {
         let mut input = request();
-        input.provider_options.insert(key.into(), Value::Null);
+        input.driver_options.insert(key.into(), Value::Null);
         assert!(
             matches!(model.generate(input), Err(Error::InvalidRequest(_))),
             "{key}"
@@ -533,6 +533,18 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
         reply.output()[0],
         Output::Reasoning("visible reasoning".into())
     );
+    let Output::ToolCall(call) = &reply.output()[1] else {
+        panic!("missing truncated call");
+    };
+    assert!(
+        call.arguments
+            .as_ref()
+            .is_err_and(|error| !error.is_empty())
+    );
+    assert_eq!(
+        reply.provider().unwrap().body["output"][1]["arguments"],
+        "{"
+    );
     let model = client(
         Protocol::OpenAiResponses,
         "http://127.0.0.1:1/responses",
@@ -545,6 +557,58 @@ fn visible_reasoning_and_truncated_arguments_remain_observations() {
         model.generate(input),
         Err(Error::InvalidRequest(_))
     ));
+}
+
+#[tokio::test]
+async fn parsed_tool_arguments_encode_in_each_providers_wire_format() {
+    let arguments = json!({"path":"note.txt", "lines":[1, 2]});
+    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+        let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
+        let body = encoded_request(&model, tool_history(Ok(arguments.clone()))).await;
+        match protocol {
+            Protocol::OpenAiResponses => {
+                let encoded = body["input"][1]["arguments"].as_str().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), arguments);
+            }
+            Protocol::AnthropicMessages => {
+                assert_eq!(body["messages"][1]["content"][0]["input"], arguments);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_tool_arguments_cannot_be_used_in_continuation() {
+    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+        let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
+        for arguments in [Err("incomplete JSON".into()), Ok(json!([1, 2]))] {
+            assert!(matches!(
+                model.generate(tool_history(arguments)),
+                Err(Error::InvalidRequest(_))
+            ));
+        }
+    }
+}
+
+fn tool_history(arguments: Result<Value, String>) -> Request {
+    let mut input = request();
+    input.messages.extend([
+        Message::Assistant(Response::new(
+            vec![Output::ToolCall(ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments,
+            })],
+            Finish::ToolCalls,
+            Default::default(),
+        )),
+        Message::ToolResult {
+            call_id: "call".into(),
+            output: "note contents".into(),
+            is_error: false,
+        },
+    ]);
+    input
 }
 
 #[tokio::test]

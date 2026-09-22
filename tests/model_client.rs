@@ -67,9 +67,7 @@ async fn consuming_only_the_request_never_dispatches_it() {
 fn invalid_options_fail_before_a_stream_is_returned_without_a_runtime() {
     let client = client("http://127.0.0.1:1/responses".into());
     let mut request = request();
-    request
-        .provider_options
-        .insert("stream".into(), false.into());
+    request.driver_options.insert("stream".into(), false.into());
     assert!(matches!(
         client.generate(request),
         Err(Error::InvalidRequest(_))

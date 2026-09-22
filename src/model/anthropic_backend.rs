@@ -126,8 +126,7 @@ fn output(output: &Output) -> Result<Value, Error> {
 }
 
 fn encode_tool_call(call: &ToolCall) -> Result<Value, Error> {
-    let input: Value = serde_json::from_str(&call.arguments)
-        .map_err(|e| Error::InvalidRequest(format!("invalid tool arguments: {e}")))?;
+    let input = call.arguments()?;
     Ok(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}))
 }
 
@@ -176,7 +175,7 @@ fn decode_tool_call(block: &Value) -> Result<ToolCall, Error> {
     let call = ToolCall {
         id: field(block, "id")?.into(),
         name: field(block, "name")?.into(),
-        arguments: input.to_string(),
+        arguments: Ok(input.clone()),
     };
     call.validate()?;
     Ok(call)

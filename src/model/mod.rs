@@ -15,14 +15,12 @@ mod openai_responses_backend;
 
 use backend_helpers::{Driver, EventStream};
 
-/// Endpoints are complete URLs. An empty key omits authentication.
-/// Credentials are deliberately excluded from debug output.
+/// Complete endpoint URLs; empty keys omit authentication.
 pub enum Config {
     OpenAi { endpoint: String, api_key: String },
     Anthropic { endpoint: String, api_key: String },
 }
 
-/// Reusable inference client. Share it by reference or through `Arc<GenAiClient>`.
 pub struct GenAiClient {
     driver: Box<dyn Driver>,
 }
@@ -34,15 +32,13 @@ impl GenAiClient {
         })
     }
 
-    /// Validate and encode one attempt without network I/O. Polling yields the
-    /// request before dispatch; transport and provider failures arrive in the stream.
+    /// Validates and encodes immediately; network I/O waits for polling.
     pub fn generate(&self, request: Request) -> Result<Generation<'_>, Error> {
         backend_helpers::generate(self.driver.as_ref(), request)
     }
 }
 
-/// An owned attempt, borrowing its client. Polling drives I/O; no task is spawned.
-/// Completion or error terminates the stream and releases its request.
+/// Completion, error, or drop releases the attempt's HTTP request.
 pub struct Generation<'a> {
     inner: Option<EventStream<'a>>,
 }
@@ -74,9 +70,7 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
     pub max_output_tokens: u32,
-    /// Additional provider settings, such as `reasoning` or `thinking`.
-    /// Core request fields cannot be overridden.
-    pub provider_options: Map<String, Value>,
+    pub driver_options: Map<String, Value>,
 }
 
 impl Request {
@@ -87,7 +81,7 @@ impl Request {
             messages,
             tools: vec![],
             max_output_tokens,
-            provider_options: Map::new(),
+            driver_options: Map::new(),
         }
     }
 }
@@ -114,9 +108,7 @@ pub struct Tool {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// JSON text. A truncated response may contain incomplete arguments.
-    /// The caller must check the finish reason and validate before execution.
-    pub arguments: String,
+    pub arguments: Result<Value, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +125,6 @@ pub enum Finish {
     ToolCalls,
     Length,
     Refusal,
-    /// An unrecognized stop or incomplete reason, retained for caller policy.
     Other(String),
 }
 
@@ -146,8 +137,6 @@ pub struct Usage {
     pub cache_write_tokens: Option<u64>,
 }
 
-/// Immutable output and its provider continuation. Applications own storage
-/// encodings and can reconstruct a response with [`Response::from_provider`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Response {
     output: Vec<Output>,
@@ -159,13 +148,11 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderResponse {
     pub protocol: Protocol,
-    /// The terminal Responses object, or the Messages object assembled from
-    /// streaming blocks and metadata. Raw stream events are delivered separately.
+    /// Native Responses object or assembled Messages object.
     pub body: Value,
 }
 
 impl Response {
-    /// Construct a response without provider state, for example in an evaluation.
     pub fn new(output: Vec<Output>, finish: Finish, usage: Usage) -> Self {
         Self {
             output,
@@ -203,8 +190,7 @@ pub enum DeltaKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delta {
-    /// Responses output-item index or Messages content-block index.
-    /// Further provider coordinates remain available in the raw event.
+    /// Provider output-item or content-block index.
     pub index: usize,
     pub kind: DeltaKind,
     pub text: String,
@@ -212,12 +198,8 @@ pub struct Delta {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Exact JSON request body, without authentication headers.
     Request { protocol: Protocol, body: Value },
-    /// Provider event plus an optional projection suitable for live rendering.
-    /// Partial tool arguments are observations, not executable calls.
     Progress { raw: Value, delta: Option<Delta> },
-    /// Validated inference outcome. This service does not persist a thread turn.
     Completed(Response),
 }
 
