@@ -1,10 +1,14 @@
 // Density and lighting textures are generated once in a worker. CSS handles
 // drifting; only changes to the sky palette repaint the finished clouds.
 const LAYERS = [
-  { name: 'high', altitude: '8+', count: 8, top: 9, spread: 22, width: 680, height: 135, resolution: 128, duration: 6800 },
-  { name: 'mid', altitude: '3–8', count: 8, top: 33, spread: 24, width: 650, height: 220, resolution: 192, duration: 5100 },
-  { name: 'low', altitude: '0–3', count: 8, top: 62, spread: 23, width: 740, height: 350, resolution: 288, duration: 3700 },
+  { name: 'high', altitude: '8+', count: 8, top: 9, spread: 25, width: 850, height: 220, resolution: 192, duration: 6800 },
+  { name: 'mid', altitude: '3–8', count: 8, top: 32, spread: 26, width: 900, height: 260, resolution: 224, duration: 5100 },
+  { name: 'low', altitude: '0–3', count: 8, top: 60, spread: 26, width: 1050, height: 320, resolution: 256, duration: 3700 },
 ];
+
+//
+// Textures and fallback
+//
 
 function random(seed) {
   return () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
@@ -16,17 +20,19 @@ let worker, currentPalette, generation = 0;
 function fallback(canvas, seed) {
   const context = canvas.getContext('2d'), roll = random(seed);
   context.clearRect(0, 0, canvas.width, canvas.height);
+  context.save(); context.scale(1, 0.4);
   for (let i = 0; i < 9; i++) {
-    const x = canvas.width * (0.12 + i * 0.095), y = canvas.height * (0.45 + roll() * 0.18);
+    const x = canvas.width * (0.12 + i * 0.095), y = canvas.height * (0.9 + roll() * 0.65);
     const radius = canvas.height * (0.23 + roll() * 0.12);
     const glow = context.createRadialGradient(x, y, radius * 0.12, x, y, radius);
     const color = currentPalette[3 + i % 3].join(' ');
-    glow.addColorStop(0, `rgb(${color} / .75)`);
-    glow.addColorStop(0.55, `rgb(${color} / .5)`);
+    glow.addColorStop(0, `rgb(${color} / .35)`);
+    glow.addColorStop(0.55, `rgb(${color} / .12)`);
     glow.addColorStop(1, `rgb(${color} / 0)`);
     context.fillStyle = glow;
     context.fillRect(x - radius, y - radius, radius * 2, radius * 2);
   }
+  context.restore();
 }
 
 function renderTextures(sky) {
@@ -75,6 +81,10 @@ function repaint(sky) {
   }
 }
 
+//
+// Altitude layers and wind
+//
+
 function makeLayer(spec, index) {
   const layer = document.createElement('div');
   layer.className = `cloud-layer cloud-${spec.name}`;
@@ -91,6 +101,7 @@ function makeLayer(spec, index) {
     cloud.style.width = `${spec.width * scale}px`;
     cloud.style.height = `${spec.height * scale}px`;
     cloud.style.top = `${spec.top + roll() * spec.spread}%`;
+    cloud.style.setProperty('--cloud-tilt', `${(roll() - 0.5) * (24 - index * 8)}deg`);
     const id = `${spec.name}-${i}`;
     const texture = { spec: { id, kind: spec.name, seed: 781 + index * 100 + i * 7, width: 512, height: spec.resolution }, canvases: [] };
     textures.set(id, texture);
@@ -141,24 +152,28 @@ export function createClouds(sky) {
         cloud.style.opacity = String(Math.max(0, Math.min(1, (cover - threshold) / 16)));
       }
     });
-    const overcast = Math.max(conditions.cloud_cover_low, conditions.cloud_cover_mid) / 100;
-    sky.style.setProperty('--overcast', String(overcast * 0.28));
   };
 }
+
+//
+// Daylight and overcast lighting
+//
 
 const DAY = ['#587491', '#718baa', '#9db2c5', '#cad7e1', '#e9eff1', '#fffcf3'];
 const DUSK = ['#655d91', '#8b709e', '#b98ba8', '#e1aaa9', '#f4c6ad', '#ffdfb9'];
 const NIGHT = ['#172238', '#263850', '#3a4f6a', '#5b7490', '#849bb0', '#b4c6d5'];
+const OVERCAST = ['#34475b', '#50657a', '#728597', '#98a7b4', '#b5c3cc', '#d9e1e6'];
 
 const channels = hex => [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
 const blend = (a, b, weight) => a.map((value, index) => value * (1 - weight) + b[index] * weight);
 currentPalette = DAY.map(channels);
 
-export function colorClouds(sky, altitude, night) {
+export function colorClouds(sky, altitude, night, gloom = 0) {
   const twilight = Math.max(0, 1 - Math.abs(altitude) / 0.35);
   const next = DAY.map((color, index) => {
     const warm = blend(channels(color), channels(DUSK[index]), twilight);
-    const tones = blend(warm, channels(NIGHT[index]), night).map(Math.round);
+    const shaded = blend(warm, channels(OVERCAST[index]), gloom * (1 - night));
+    const tones = blend(shaded, channels(NIGHT[index]), night).map(Math.round);
     return tones;
   });
   if (JSON.stringify(next) === JSON.stringify(currentPalette)) return;

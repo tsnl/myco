@@ -17,21 +17,28 @@ server with Ctrl-C in the launching terminal.
 
 The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
-floating controls use background blur. Soft, naturally shaded clouds drift slowly in three
-layers: high wisps near the top, middle clouds below them, and larger low clouds
-near the horizon. Colors follow the sky through daylight, sunset, and night;
+floating controls use background blur. Translucent, feathered cloud strands drift
+slowly in three layers: fine high wisps near the top, middle veils below them, and
+broader low clouds near the horizon. Colors follow daylight, sunset, and night;
 stars twinkle behind the clouds. An occasional distant airplane crosses the sky,
 with a faint contrail or navigation lights after dark. These are decorative
-flybys, with at most two visible at once. Reduced-motion settings keep clouds and
-stars still and disable airplanes. Hidden tabs pause both animation and arrivals.
+flybys, with at most two visible at once. Wet weather adds fine rain streaks at
+several depths; wind influences their slant, and heavier precipitation increases
+their density. Overcast skies darken the clouds and obscure stars and airplanes.
+Reduced-motion settings keep clouds and stars still and disable airplanes and
+falling rain. Hidden tabs pause animation and airplane arrivals.
 The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
 with its MIT license retained in the served source.
 
 **Sky** opens the weather settings. Choose a city or explicitly select **Use my
-location** to reflect its current low, middle, and high cloud cover from
-[Open-Meteo](https://open-meteo.com/). The layers roughly represent below 3 km,
+location** to reflect its current cloud cover, rain, showers, and wind from
+[Open-Meteo](https://open-meteo.com/en/docs). The panel names the reported weather
+condition. The layers roughly represent below 3 km,
 3–8 km, and above 8 km. Surface wind influences the deliberately slow drift;
-the art is an impression of conditions, not a view of individual real clouds.
+the art is an impression of modelled current conditions, not a view of individual
+real clouds. Rain intensity accounts for the feed's accumulation interval; a
+drizzle or rain code can still produce light streaks when its amount rounds to
+zero. Snow-only reports do not produce rain.
 The approximate day/night cycle follows that location's clock and updates once
 a minute; it does not calculate seasonal sunrise or sunset.
 

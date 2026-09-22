@@ -16,6 +16,10 @@ const FRESH: Duration = Duration::from_secs(15 * 60);
 const RETRY: Duration = Duration::from_secs(60);
 const CAPACITY: usize = 32;
 
+//
+// Coordinates and current conditions
+//
+
 #[derive(Clone, Copy, Deserialize)]
 pub(super) struct Coordinates {
     latitude: f64,
@@ -45,6 +49,10 @@ pub(super) struct Forecast {
 #[derive(Clone, Deserialize, Serialize)]
 struct Conditions {
     time: i64,
+    interval: u32,
+    weather_code: u8,
+    rain: f64,
+    showers: f64,
     cloud_cover_low: f64,
     cloud_cover_mid: f64,
     cloud_cover_high: f64,
@@ -60,10 +68,19 @@ impl Forecast {
             .all(|v| (0.0..=100.0).contains(v))
             && (0.0..=360.0).contains(&c.wind_direction_10m)
             && (0.0..=200.0).contains(&c.wind_speed_10m)
+            && (1..=3600).contains(&c.interval)
+            && c.weather_code <= 99
+            && [c.rain, c.showers]
+                .iter()
+                .all(|v| (0.0..=1000.0).contains(v))
             && (-86400..=86400).contains(&self.utc_offset_seconds)
             && chrono::Utc::now().timestamp().abs_diff(c.time) < 2 * 60 * 60
     }
 }
+
+//
+// Location search
+//
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Locations {
@@ -81,6 +98,10 @@ struct Location {
     #[serde(default)]
     country: String,
 }
+
+//
+// Weather client and bounded caches
+//
 
 struct Entry<T> {
     key: String,
@@ -121,8 +142,9 @@ impl Weather {
         let mut url = Url::parse(FORECAST).unwrap();
         coordinates.query(&mut url);
         url.query_pairs_mut()
-            .append_pair("current", "cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,wind_direction_10m")
+            .append_pair("current", "cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,wind_direction_10m,rain,showers,weather_code")
             .append_pair("wind_speed_unit", "ms")
+            .append_pair("precipitation_unit", "mm")
             .append_pair("timeformat", "unixtime")
             .append_pair("timezone", "auto")
             .append_pair("forecast_days", "1");
@@ -212,6 +234,10 @@ impl Weather {
     }
 }
 
+//
+// Contract tests
+//
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -228,7 +254,8 @@ mod tests {
         json!({"utc_offset_seconds": -25200, "current": {
             "time": chrono::Utc::now().timestamp(), "cloud_cover_low": 70,
             "cloud_cover_mid": 20, "cloud_cover_high": 40,
-            "wind_speed_10m": 5, "wind_direction_10m": 250
+            "wind_speed_10m": 5, "wind_direction_10m": 250,
+            "interval": 900, "weather_code": 63, "rain": 0.4, "showers": 0.2
         }})
     }
 
@@ -264,7 +291,13 @@ mod tests {
             weather.cached(url.clone(), &weather.forecasts, Forecast::valid),
             weather.cached(url.clone(), &weather.forecasts, Forecast::valid),
         );
-        assert_eq!(first.unwrap().current.cloud_cover_low, 70.0);
+        let current = first.unwrap().current;
+        assert_eq!(current.cloud_cover_low, 70.0);
+        assert_eq!(
+            (current.rain, current.showers, current.interval),
+            (0.4, 0.2, 900)
+        );
+        assert_eq!(current.weather_code, 63);
         assert_eq!(second.unwrap().current.cloud_cover_high, 40.0);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         weather.forecasts.lock().await[0].expires = Instant::now();
@@ -274,6 +307,30 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_precipitation_is_unavailable_instead_of_inventing_dry_weather() {
+        for (field, value) in [
+            ("rain", json!(-0.1)),
+            ("showers", json!(1001)),
+            ("rain", Value::Null),
+            ("interval", json!(0)),
+            ("interval", json!(86400)),
+            ("weather_code", json!(100)),
+        ] {
+            let weather = Weather::new();
+            let mut body = forecast();
+            body["current"][field] = value;
+            let (url, _, task) = upstream(StatusCode::OK, body.to_string()).await;
+            assert!(matches!(
+                weather
+                    .cached(url, &weather.forecasts, Forecast::valid)
+                    .await,
+                Err(Error::Unavailable(_))
+            ));
+            task.abort();
+        }
     }
 
     #[tokio::test]

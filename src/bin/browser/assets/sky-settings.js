@@ -1,3 +1,9 @@
+import { weatherDescription } from '/rain.js';
+
+//
+// Saved location and weather requests
+//
+
 const KEY = 'myco.sky.location.v1';
 const REFRESH = 15 * 60 * 1000;
 
@@ -20,6 +26,10 @@ async function request(path, signal) {
   return response.json();
 }
 
+//
+// Weather controls
+//
+
 function controls() {
   const button = document.createElement('button');
   button.id = 'sky-toggle'; button.type = 'button'; button.textContent = 'Sky';
@@ -32,6 +42,7 @@ function controls() {
   dialog.innerHTML = `
     <div class="sky-heading"><h2 id="sky-heading">Your sky</h2><button id="sky-close" aria-label="Close sky settings">×</button></div>
     <p id="sky-status" role="status"></p>
+    <p id="sky-conditions" hidden></p>
     <dl id="sky-coverage" hidden><div><dt>High clouds</dt><dd id="sky-high"></dd></div><div><dt>Middle clouds</dt><dd id="sky-mid"></dd></div><div><dt>Low clouds</dt><dd id="sky-low"></dd></div></dl>
     <form id="sky-search"><label for="sky-city">Follow the weather in a city</label><div class="sky-search-row"><input id="sky-city" type="search" placeholder="City or postal code" minlength="2" maxlength="80" required autocomplete="off"><button>Search</button></div></form>
     <ul id="sky-results" aria-label="Matching cities"></ul>
@@ -65,6 +76,8 @@ export function skySettings(onChange) {
     $('status').textContent = active ? `${location.name} · ${state === 'stale' ? 'last available' : 'updated'} ${time}`
       : location ? `${location.name} · illustrated sky until weather is available` : 'An illustrated sky, following your clock.';
     $('coverage').hidden = !active;
+    $('conditions').hidden = !active;
+    $('conditions').textContent = active ? weatherDescription(forecast.current) : '';
     if (active) for (const layer of ['high', 'mid', 'low']) $(layer).textContent = `${Math.round(forecast.current[`cloud_cover_${layer}`])}%`;
     document.querySelector('#sky').dataset.weather = state;
     document.querySelector('#sky-toggle').title = active ? `Sky over ${location.name}` : 'Choose your sky';

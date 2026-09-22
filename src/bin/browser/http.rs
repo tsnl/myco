@@ -120,6 +120,11 @@ pub(super) fn router(server: Arc<Server>) -> Router {
             include_str!("assets/aircraft.js"),
         ),
         (
+            "/rain.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/rain.js"),
+        ),
+        (
             "/horizon.js",
             "text/javascript; charset=utf-8",
             include_str!("assets/horizon.js"),

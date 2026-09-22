@@ -3,6 +3,10 @@
 const cache = new Map();
 let pending = [], palette, generation = 0, paused = false, scheduled = false;
 
+//
+// Seeded cloud fields
+//
+
 function random(seed) {
   return () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
 }
@@ -26,69 +30,55 @@ function turbulence(sample, x, y) {
     + sample(x * 4.07 + 31, y * 4.07 + 21) * 0.14 + sample(x * 8.13, y * 8.13) * 0.07;
 }
 
-function billows(kind, roll) {
-  const shapes = [{ x: 0, y: 0.21, rx: 0.83, ry: 0.16, depth: 0.38 }];
-  for (let i = 0; i < 7; i++) {
-    const crown = Math.sin((i + 1) / 8 * Math.PI);
-    const x = -0.77 + i * 0.245 + roll() * 0.08;
-    const y = 0.16 - crown * (kind === 'low' ? 0.33 : 0.14) + roll() * 0.13;
-    shapes.push({ x, y, rx: Math.min(0.96 - Math.abs(x), 0.18 + roll() * 0.16),
-      ry: Math.min(0.46 - Math.abs(y), 0.12 + crown * 0.18 + roll() * 0.07), depth: 0.55 + crown * 0.45 });
-  }
-  return shapes;
+function strands(kind, roll) {
+  return Array.from({ length: kind === 'high' ? 11 : 9 }, () => ({
+    x: (roll() - 0.5) * 0.5, y: (roll() - 0.5) * 0.3,
+    width: 0.4 + roll() * 0.5, thickness: (kind === 'high' ? 0.018 : 0.038) + roll() * 0.035,
+    bend: (roll() - 0.5) * 0.25, slope: (roll() - 0.5) * 0.22,
+    phase: roll() * Math.PI * 2, strength: 0.35 + roll() * 0.45,
+  }));
 }
 
 function envelope(x, y, shapes) {
-  let value = -1, depth = 0;
-  for (const shape of shapes) {
-    const dx = (x - shape.x) / shape.rx, dy = (y - shape.y) / shape.ry;
-    const next = 1 - dx * dx - dy * dy;
-    const join = Math.max(0, 0.22 - Math.abs(value - next));
-    value = Math.max(value, next) + join * join / 0.88;
-    if (next > 0) {
-      const surface = Math.sqrt(next) * shape.depth;
-      const merge = Math.max(0, 0.12 - Math.abs(depth - surface));
-      depth = Math.max(depth, surface) + merge * merge / 0.48;
-    }
+  let density = 0;
+  for (const s of shapes) {
+    const along = (x - s.x) / s.width, taper = Math.exp(-Math.pow(along, 4) * 2);
+    const center = s.y + x * s.slope + x * x * s.bend + Math.sin(x * 3 + s.phase) * 0.035;
+    const across = (y - center) / (s.thickness * (0.35 + taper * 0.65));
+    density += Math.exp(-across * across) * taper * s.strength;
   }
-  return [value, depth];
-}
-
-function cirrus(x, y, sample, seed) {
-  const bend = 0.11 * Math.sin(x * 2.6 + seed) - x * 0.16;
-  const wisps = turbulence(sample, x * 3 + 40, y * 27 + 40);
-  const distance = Math.abs(y - bend + (sample(x * 5 + 9, y * 3 + 7) - 0.5) * 0.15);
-  const taper = Math.max(0, 1 - x * x);
-  const density = Math.max(0, (0.15 * taper - distance) * 6 + (wisps - 0.5) * 0.8);
-  return [(1 - Math.exp(-density * 2.8)) * Math.min(1, taper * 8), 0.66 + wisps * 0.22];
+  return density;
 }
 
 function density(spec) {
   const { width, height, kind, seed } = spec;
-  const sample = noise(seed), shapes = billows(kind, random(seed));
+  const sample = noise(seed), shapes = strands(kind, random(seed));
   const surface = new Float32Array(width * height);
   const samples = new Uint8Array(width * height * 2);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const px = x / width * 2 - 1, py = y / height - 0.5, i = y * width + x;
-      if (kind === 'high') {
-        const [alpha, light] = cirrus(px, py, sample, seed);
-        samples[i * 2] = alpha * 255; samples[i * 2 + 1] = light * 255;
-        continue;
-      }
-      const warpX = (sample(px * 5 + 8, py * 9 + 8) - 0.5) * 0.075;
-      const warpY = (sample(px * 7 + 50, py * 8 + 50) - 0.5) * 0.075;
-      const [shape, depth] = envelope(px + warpX, py + warpY, shapes);
-      const detail = turbulence(sample, px * 12 + 20, py * 15 + 20);
-      const volume = Math.max(0, shape - 0.15 + (detail - 0.5) * 0.55);
-      samples[i * 2] = (1 - Math.exp(-volume * 6)) * 255;
-      const billow = turbulence(sample, px * 5 + 20, py * 6 + 20);
-      surface[i] = depth * 0.30 + billow * 0.035 + detail * 0.008;
+      const warpX = (sample(px * 3 + 8, py * 8 + 8) - 0.5) * 0.12;
+      const warpY = (turbulence(sample, px * 2.2 + 50, py * 6 + 50) - 0.5) * 0.19;
+      const shape = envelope(px + warpX, py + warpY, shapes);
+      const fibers = turbulence(sample, px * 4 + 20, (py + warpY) * 48 + 20);
+      const detail = Math.max(0, (fibers - 0.22) / 0.78);
+      const volume = shape * (0.2 + detail * 1.5);
+      // The outer fade prevents a texture boundary even on stretched wisps.
+      const edge = Math.max(0, 1 - Math.pow(px, 8)) * Math.max(0, 1 - Math.pow(py * 2, 6));
+      const thickness = kind === 'high' ? 0.9 : kind === 'mid' ? 1.3 : 1.7;
+      samples[i * 2] = (1 - Math.exp(-volume * thickness)) * edge * 220;
+      samples[i * 2 + 1] = (0.74 + detail * 0.18) * 255;
+      surface[i] = shape * 0.065 + detail * 0.012;
     }
   }
   if (kind !== 'high') illuminate(samples, surface, width, height);
   return samples;
 }
+
+//
+// Lighting and texture delivery
+//
 
 function illuminate(samples, surface, width, height) {
   for (let y = 3; y < height - 3; y++) {

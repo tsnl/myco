@@ -2,6 +2,11 @@ import renderGradient from '/horizon.js';
 import { createClouds, colorClouds } from '/clouds.js';
 import { skySettings } from '/sky-settings.js';
 import { createAircraft } from '/aircraft.js';
+import { createRain, rainfall } from '/rain.js';
+
+//
+// Sky layers
+//
 
 const sky = document.createElement('div');
 sky.id = 'sky';
@@ -32,8 +37,13 @@ sky.append(stars);
 document.body.prepend(sky);
 createAircraft(sky);
 const updateClouds = createClouds(sky);
+const updateRain = createRain(sky);
 const illustrated = { cloud_cover_high: 32, cloud_cover_mid: 38, cloud_cover_low: 42, wind_speed_10m: 3, wind_direction_10m: 260 };
 let forecast = null;
+
+//
+// Time and weather lighting
+//
 
 function updateSky() {
   if (document.hidden) return;
@@ -45,9 +55,16 @@ function updateSky() {
   const [gradient] = renderGradient(altitude);
   atmosphere.style.backgroundImage = gradient;
   atmosphere.style.opacity = String(1 - night * 0.92);
-  stars.style.opacity = String(night);
+  const conditions = forecast?.current || illustrated;
+  const cover = Math.max(conditions.cloud_cover_low, conditions.cloud_cover_mid) / 100;
+  const wet = Math.min(1, rainfall(conditions) / 6);
+  const gloom = Math.pow(cover, 2) * (0.55 + wet * 0.45);
+  const clarity = 1 - Math.pow(cover, 2) * 0.96;
+  sky.style.setProperty('--overcast', String(gloom * 0.65));
+  sky.style.setProperty('--sky-clarity', String(clarity));
+  stars.style.opacity = String(night * clarity);
   sky.dataset.phase = night > 0.5 ? 'night' : altitude < 0.15 ? 'twilight' : 'day';
-  colorClouds(sky, altitude, night);
+  colorClouds(sky, altitude, night, gloom);
 }
 document.addEventListener('visibilitychange', () => {
   sky.classList.toggle('paused', document.hidden);
@@ -58,5 +75,6 @@ setInterval(updateSky, 60000);
 skySettings(next => {
   forecast = next;
   updateClouds(forecast?.current || illustrated);
+  updateRain(forecast?.current);
   updateSky();
 });

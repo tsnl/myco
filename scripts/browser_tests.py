@@ -250,7 +250,8 @@ context_window = 100000
         page.clock.install()
         self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json={
             "utc_offset_seconds": 0, "current": {"time": int(time.time()), "cloud_cover_low": 100,
-            "cloud_cover_mid": 100, "cloud_cover_high": 0, "wind_speed_10m": 12, "wind_direction_10m": 45}}))
+            "cloud_cover_mid": 100, "cloud_cover_high": 0, "wind_speed_10m": 12, "wind_direction_10m": 45,
+            "interval": 900, "rain": 1, "showers": 0, "weather_code": 63}}))
         page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
         page.reload()
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
@@ -258,12 +259,14 @@ context_window = 100000
         self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(status=503, body="Weather upstream unavailable"))
         page.clock.fast_forward(15 * 60 * 1000)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "stale")
+        expect(page.locator("#sky-rain")).to_be_visible()
         page.click("#sky-toggle")
         expect(page.locator("#sky-status")).to_contain_text("last available")
         expect(page.locator("#sky-error")).to_contain_text("Weather unavailable")
         page.clock.fast_forward(2 * 60 * 60 * 1000)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
         expect(page.locator("#sky-coverage")).to_be_hidden()
+        expect(page.locator("#sky-rain")).to_be_hidden()
         page.click("#sky-close")
         self.session(page)
         self.submit(page, "Alpha markdown")
@@ -295,12 +298,75 @@ context_window = 100000
     def test_sky_endpoints_require_authentication_and_validate_input(self):
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js"]:
+            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401)
         finally:
             anonymous.dispose()
         for path in ["/api/sky/weather?latitude=91&longitude=0", "/api/sky/weather?latitude=nan&longitude=0", "/api/sky/locations?query=a"]:
             self.assertEqual(self.context.request.get(self.origin + path).status, 400)
+
+    def test_sky_rain_tracks_weather_intensity_and_clears_for_snow_and_illustration(self):
+        page = self.page
+        page.clock.install()
+        report = {"utc_offset_seconds": 0, "current": {"time": int(time.time()), "interval": 900,
+            "cloud_cover_low": 95, "cloud_cover_mid": 90, "cloud_cover_high": 40,
+            "wind_speed_10m": 6, "wind_direction_10m": 270, "rain": 0.5, "showers": 0.25, "weather_code": 63}}
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json=report))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        rain = page.locator("#sky-rain")
+        expect(rain).to_be_visible()
+        page.click("#sky-toggle")
+        expect(page.locator("#sky-conditions")).to_have_text("Rain")
+        sheet = rain.locator(".rain-sheet").first
+        opacity = sheet.evaluate("n => getComputedStyle(n).opacity")
+        self.assertIn("data:image/png", sheet.evaluate("n => getComputedStyle(n).backgroundImage"))
+        report["current"]["interval"] = 3600
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(sheet).not_to_have_css("opacity", opacity)
+        self.assertLess(float(sheet.evaluate("n => getComputedStyle(n).opacity")), float(opacity))
+        report["current"].update(rain=5, weather_code=65, interval=900)
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(page.locator("#sky-conditions")).to_have_text("Heavy rain")
+        self.assertGreater(float(sheet.evaluate("n => getComputedStyle(n).opacity")), float(opacity))
+        report["current"].update(rain=0, showers=0, weather_code=73)
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(page.locator("#sky-conditions")).to_have_text("Snow")
+        expect(rain).to_be_hidden()
+        report["current"]["weather_code"] = 51
+        page.clock.fast_forward(15 * 60 * 1000)
+        expect(page.locator("#sky-conditions")).to_have_text("Light drizzle")
+        expect(rain).to_be_visible()
+        page.click("#sky-reset")
+        expect(rain).to_be_hidden()
+        expect(page.locator("#sky-conditions")).to_be_hidden()
+
+    def test_sky_rain_respects_reduced_motion_and_pauses_in_hidden_tabs(self):
+        page = self.page
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json={
+            "utc_offset_seconds": 0, "current": {"time": int(time.time()), "interval": 900,
+            "cloud_cover_low": 100, "cloud_cover_mid": 100, "cloud_cover_high": 20,
+            "wind_speed_10m": 8, "wind_direction_10m": 250, "rain": 2, "showers": 0, "weather_code": 65}}))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        rain = page.locator("#sky-rain")
+        expect(rain).to_be_visible()
+        self.assertEqual(rain.evaluate("n => getComputedStyle(n).pointerEvents"), "none")
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertTrue(rain.locator(".rain-sheet").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).animationPlayState === 'paused')"))
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertTrue(rain.locator(".rain-sheet").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).animationPlayState === 'running')"))
+        page.emulate_media(reduced_motion="reduce")
+        expect(rain).to_be_hidden()
+        expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
+        page.click("#sky-toggle")
+        expect(page.locator("#sky-conditions")).to_have_text("Heavy rain")
+        page.click("#sky-close")
+        page.emulate_media(reduced_motion="no-preference")
+        expect(rain).to_be_visible()
+        self.session(page)
+        self.submit(page, "Alpha markdown")
+        expect(page.locator(".assistant .markdown table")).to_be_visible()
 
     def test_sky_wind_changes_preserve_cloud_positions(self):
         page = self.page
