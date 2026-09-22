@@ -15,6 +15,54 @@ this browser into this server; keep that URL private. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
 
+The browser uses square-edged translucent panels over a locally rendered sky.
+The conversation stays in a central well, with the sky visible on both sides;
+floating controls use background blur. The conversation well is the lightest
+surface; the input bar and top banner share darker translucent glass, with
+dialogs darkest in front. Translucent clouds drift slowly in three
+layers: fine high wisps near the top, soft middle billows below them, and broader
+low clouds near the horizon. Broken banks vary in shape and height; increasing
+cover adds thin, broad veils. Their feathered edges and overlapping layers let the
+sky show through. Gentle directional light travels across the clouds through the
+day, softening in overcast weather. Colors follow daylight, sunset, and night;
+stars twinkle behind the clouds. An occasional distant airplane crosses the sky,
+with a faint contrail or navigation lights after dark. These are decorative
+flybys, with at most two visible at once. Wet weather adds fine rain streaks at
+several depths; wind influences their slant, and heavier precipitation increases
+their density. Overcast skies darken the clouds and obscure stars and airplanes.
+Reduced-motion settings keep clouds and stars still and disable airplanes and
+falling rain. Hidden tabs pause animation and airplane arrivals.
+The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
+with its MIT license retained in the served source.
+
+The **Settings** icon in the top bar opens a centered modal. Its **Sky** section
+contains the weather controls. Choose a city or explicitly select **Use my
+location** to reflect its current cloud cover, rain, showers, and wind from
+[Open-Meteo](https://open-meteo.com/en/docs). The panel names the reported weather
+condition. The layers roughly represent below 3 km,
+3–8 km, and above 8 km. Surface wind influences the deliberately slow drift;
+the art is an impression of modelled current conditions, not a view of individual
+real clouds. Rain intensity accounts for the feed's accumulation interval; a
+drizzle or rain code can still produce light streaks when its amount rounds to
+zero. Snow-only reports do not produce rain.
+The approximate day/night cycle and direction of light follow that location's
+clock and update once a minute; they do not calculate seasonal sunrise, sunset,
+or the position of the moon.
+
+The location is saved in this browser and shared across its tabs. Coordinates
+are rounded to two decimal places before Myco forwards them to Open-Meteo.
+City searches also pass through Myco, with location data from GeoNames. The
+browser contacts only Myco. Weather refreshes every 15 minutes while visible;
+the server coalesces requests and keeps bounded caches. The free weather service
+is for [non-commercial use](https://open-meteo.com/en/terms).
+
+With no selected location, **Illustrated sky** uses decorative clouds and the
+browser's clock without weather requests or location permission. This is also
+the fallback when weather is unavailable; settings label any retained conditions
+as last available, and discard them after two hours. Device location requires
+browser permission and HTTPS or localhost; city search works over remote HTTP.
+Weather failures do not affect conversations.
+
 `--web-bind 0.0.0.0` listens on every interface, so the UI answers any machine
 that can route here, under whatever name they dial. The launch token is then the
 only thing between them and these sessions — and a session is a shell on your
@@ -61,7 +109,10 @@ Queues live in the running server and are not restored after a server restart.
 A rejected submission keeps its draft.
 
 The page heading and browser tab title follow the session title, including the
-first-message title and agent renames during a running turn.
+first-message title and agent renames during a running turn. Hover over a truncated
+heading to read its full title. The top bar aligns with the conversation and keeps
+its controls on a separate row on narrow screens. Activity counts appear only
+while tools or background sessions are running.
 
 Each tool appears as soon as execution starts, with a truncated argument
 preview in its collapsed header. Running calls are cyan; completed calls turn
