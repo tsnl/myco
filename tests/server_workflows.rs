@@ -75,16 +75,9 @@ impl Server {
             let mut rest = String::new();
             let _ = stdout.read_to_string(&mut rest).await;
         });
-        assert_eq!(url.scheme(), "https");
-        let certificate = std::fs::read_dir(env.dir.join("profiles/default/tls"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "crt"))
-            .unwrap();
-        let certificate =
-            reqwest::Certificate::from_pem(&std::fs::read(certificate).unwrap()).unwrap();
+        assert_eq!(url.scheme(), "http");
         let client = reqwest::Client::builder()
-            .add_root_certificate(certificate)
+            .no_proxy()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
@@ -180,49 +173,18 @@ impl Server {
 }
 
 #[tokio::test]
-async fn https_identity_survives_restart_while_bearer_tokens_rotate() {
-    use std::os::unix::fs::PermissionsExt;
-    let env = ServerEnv::new("https-identity");
+async fn loopback_server_rotates_credentials_without_creating_tls_files() {
+    let env = ServerEnv::new("loopback-identity");
     let server = Server::start(&env, &[]).await;
-    let directory = env.dir.join("profiles/default/tls");
-    let identity = std::fs::read_dir(&directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "pem"))
-        .unwrap();
-    let original = std::fs::read(&identity).unwrap();
-    assert_eq!(
-        std::fs::metadata(&identity).unwrap().permissions().mode() & 0o077,
-        0
-    );
+    assert!(server.origin.starts_with("http://127.0.0.1:"));
+    assert!(!env.dir.join("profiles/default/tls").exists());
     assert_eq!(
         server.request("GET", "/api/sessions", Value::Null).await.0,
         200
     );
-    let untrusted = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    assert!(
-        untrusted
-            .get(format!("{}/", server.origin))
-            .send()
-            .await
-            .is_err()
-    );
-    assert!(
-        untrusted
-            .get(server.origin.replacen("https:", "http:", 1))
-            .send()
-            .await
-            .is_err()
-    );
     let token = server.token.clone();
     server.stop().await;
-    // A missing public copy is repaired without silently rotating the key.
-    std::fs::remove_file(identity.with_extension("crt")).unwrap();
     let server = Server::start(&env, &[]).await;
-    assert_eq!(std::fs::read(&identity).unwrap(), original);
     assert_ne!(server.token, token);
     let response = server
         .client
@@ -233,53 +195,35 @@ async fn https_identity_survives_restart_while_bearer_tokens_rotate() {
         .unwrap();
     assert_eq!(response.status(), 401);
     server.stop().await;
-    let certificate = identity.with_extension("crt");
-    let server = Server::start(
-        &env,
-        &[
-            "--tls-cert",
-            certificate.to_str().unwrap(),
-            "--tls-key",
-            identity.to_str().unwrap(),
-        ],
-    )
-    .await;
-    assert_eq!(
-        server.request("GET", "/api/sessions", Value::Null).await.0,
-        200
-    );
-    server.stop().await;
 }
 
 #[tokio::test]
-async fn invalid_tls_configuration_never_falls_back_to_plain_http() {
-    let env = ServerEnv::new("https-invalid");
-    for (args, message) in [
-        (
-            vec!["--insecure-http", "--bind", "0.0.0.0"],
-            "requires a loopback",
-        ),
-        (
-            vec![
-                "--tls-cert",
-                "/missing/cert.pem",
-                "--tls-key",
-                "/missing/key.pem",
-            ],
-            "load HTTPS certificate",
-        ),
-    ] {
+async fn non_loopback_bind_addresses_fail_before_listening() {
+    let env = ServerEnv::new("loopback-invalid");
+    for address in ["0.0.0.0", "::", "192.168.1.10", "2001:db8::1"] {
         let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
-            .args(args)
+            .args(["--bind", address, "--port", "0"])
             .env("MYCO_HOME", &env.dir)
             .env("MYCO_PROFILE", "default")
             .output()
             .await
             .unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("use an SSH tunnel"));
         assert!(output.stdout.is_empty());
     }
+}
+
+#[tokio::test]
+async fn ipv6_loopback_serves_authenticated_http() {
+    let env = ServerEnv::new("loopback-ipv6");
+    let server = Server::start(&env, &["--bind", "::1"]).await;
+    assert!(server.origin.starts_with("http://[::1]:"));
+    assert_eq!(
+        server.request("GET", "/api/sessions", Value::Null).await.0,
+        200
+    );
+    server.stop().await;
 }
 
 fn session_json(dir: &Path, id: &str) -> Value {

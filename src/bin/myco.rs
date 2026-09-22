@@ -27,21 +27,9 @@ struct Args {
     /// Server port (0 chooses a free port).
     #[arg(long, alias = "web", default_value = "8765", num_args = 0..=1, default_missing_value = "8765")]
     port: u16,
-    /// Listen address. Non-loopback addresses expose the server to other hosts.
-    #[arg(long, alias = "web-bind", default_value = "127.0.0.1")]
+    /// Loopback listen address. Use an SSH tunnel for remote access.
+    #[arg(long, alias = "web-bind", default_value = "127.0.0.1", value_parser = parse_loopback_arg)]
     bind: std::net::IpAddr,
-    /// PEM certificate chain for HTTPS (requires --tls-key).
-    #[arg(long, requires = "tls_key", conflicts_with = "insecure_http")]
-    tls_cert: Option<PathBuf>,
-    /// PEM private key for HTTPS (requires --tls-cert).
-    #[arg(long, requires = "tls_cert", conflicts_with = "insecure_http")]
-    tls_key: Option<PathBuf>,
-    /// Additional DNS name or IP for the generated local certificate (repeatable).
-    #[arg(long, conflicts_with_all = ["tls_cert", "insecure_http"])]
-    tls_name: Vec<String>,
-    /// Explicitly use unencrypted HTTP on a loopback address only.
-    #[arg(long)]
-    insecure_http: bool,
     /// Print launcher help, or an embedded manual article.
     #[arg(long = "help", short = 'h', value_name = "ARTICLE", num_args = 0..=1, default_missing_value = "")]
     help_topic: Option<String>,
@@ -76,6 +64,21 @@ struct Args {
 
 fn parse_effort_arg(s: &str) -> Result<Effort, String> {
     s.parse()
+}
+
+fn parse_loopback_arg(value: &str) -> Result<std::net::IpAddr, String> {
+    let address = if value == "localhost" {
+        "127.0.0.1"
+    } else {
+        value
+    };
+    address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .filter(std::net::IpAddr::is_loopback)
+        .ok_or_else(|| {
+            "--bind requires a loopback address; use an SSH tunnel for remote access".into()
+        })
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -475,9 +478,30 @@ mod tests {
 
     #[test]
     fn existing_web_launch_options_remain_aliases() {
-        let args = Args::parse_from(["myco", "--web", "0", "--web-bind", "0.0.0.0"]);
+        let args = Args::parse_from(["myco", "--web", "0", "--web-bind", "::1"]);
         assert_eq!(args.port, 0);
-        assert!(args.bind.is_unspecified());
+        assert!(args.bind.is_loopback());
+    }
+
+    #[test]
+    fn server_listen_addresses_are_loopback_only() {
+        for address in ["localhost", "127.0.0.1", "127.0.0.2", "::1"] {
+            let args = Args::try_parse_from(["myco", "--bind", address]).unwrap();
+            assert!(args.bind.is_loopback());
+        }
+        for flag in ["--bind", "--web-bind"] {
+            for address in [
+                "0.0.0.0",
+                "::",
+                "192.168.1.10",
+                "2001:db8::1",
+                "example.com",
+                "::ffff:127.0.0.1",
+            ] {
+                let error = Args::try_parse_from(["myco", flag, address]).unwrap_err();
+                assert!(error.to_string().contains("use an SSH tunnel"));
+            }
+        }
     }
 
     #[test]

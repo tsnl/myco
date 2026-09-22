@@ -37,7 +37,6 @@ myco-model.workspace = true
 myco-agent.workspace = true
 atomic-write-file = "0.3.0"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
-axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 cap-std = "4"
 ring = "0.17"
@@ -49,9 +48,7 @@ futures.workspace = true
 libc = "0.2"
 mime_guess = "2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

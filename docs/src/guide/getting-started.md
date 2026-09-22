@@ -72,10 +72,16 @@ cd /path/to/your/project
 myco
 ```
 
-Myco serves HTTPS by default. Trust the public certificate whose path it prints,
-or launch with `--tls-cert PATH --tls-key PATH` for a certificate you already
-manage. For a LAN hostname or IP, include it with `--tls-name NAME` when using a
-generated certificate. See the [browser manual](../manual/browser.md) for trust,
+Myco serves HTTP on loopback only (`127.0.0.1` by default, or `--bind ::1` for
+IPv6). For a remote server, use an SSH tunnel from your computer:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-host
+```
+
+Change the remote launch URL's address to `http://127.0.0.1:8766`, keeping its
+path and token. The tunnel encrypts traffic between your computer and the remote
+host. See the [browser manual](../manual/browser.md) for tunneling,
 authentication, and workspace-file access.
 
 Open the URL printed by the server and choose **New session**. Ask for a bounded

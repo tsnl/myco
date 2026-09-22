@@ -11,29 +11,16 @@ use subtle::ConstantTimeEq;
 pub(super) struct Auth {
     pub(super) token: String,
     pub(super) origin: String,
-    pub(super) cookie: String,
-    port: u16,
     launch_path: String,
 }
 
 impl Auth {
-    pub(super) fn new(origin: String, port: u16, launch_path: String) -> Self {
-        let prefix = if origin.starts_with("https://") {
-            "__Host-"
-        } else {
-            ""
-        };
+    pub(super) fn new(origin: String, launch_path: String) -> Self {
         Self {
             token: uuid::Uuid::new_v4().as_simple().to_string(),
-            cookie: format!("{prefix}myco_{port}"),
             origin,
-            port,
             launch_path,
         }
-    }
-
-    fn secure(&self) -> bool {
-        self.origin.starts_with("https://")
     }
 }
 
@@ -41,25 +28,35 @@ impl Auth {
 // Credential and origin checks
 //
 
-fn addressed_origin(headers: &HeaderMap, app: &Auth) -> Option<String> {
+fn addressed_origin(headers: &HeaderMap) -> Option<url::Url> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
-    let scheme = if app.secure() { "https" } else { "http" };
-    let origin = url::Url::parse(&format!("{scheme}://{host}")).ok()?;
-    (origin.port_or_known_default()? == app.port
+    let origin = url::Url::parse(&format!("http://{host}")).ok()?;
+    let loopback = match origin.host()? {
+        url::Host::Domain(name) => name == "localhost",
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    };
+    (loopback
         && origin.username().is_empty()
         && origin.password().is_none()
         && origin.path() == "/"
         && origin.query().is_none()
         && origin.fragment().is_none())
-    .then(|| origin.origin().ascii_serialization())
+    .then_some(origin)
+}
+
+// SSH can forward a different local port. Cookies use that browser-facing port
+// so separate tunnels to servers using the same remote port do not overwrite them.
+fn cookie_name(origin: &url::Url) -> String {
+    format!("myco_{}", origin.port_or_known_default().unwrap())
 }
 
 fn matches_token(candidate: &str, token: &str) -> bool {
     bool::from(candidate.as_bytes().ct_eq(token.as_bytes()))
 }
 
-// HTTP/2 carries :authority in the URI, rather than a Host header. Refuse
-// contradictory authorities before applying the same origin policy to either.
+// Absolute-form requests also carry an authority in the URI. Refuse a
+// contradictory Host header before applying the origin policy.
 fn normalize_host(headers: &mut HeaderMap, uri: &Uri) -> bool {
     if let Some(authority) = uri.authority() {
         if headers
@@ -74,11 +71,13 @@ fn normalize_host(headers: &mut HeaderMap, uri: &Uri) -> bool {
 }
 
 pub(super) fn allowed(headers: &HeaderMap, app: &Auth, mutation: bool) -> bool {
-    let Some(origin) = addressed_origin(headers, app) else {
+    let Some(origin) = addressed_origin(headers) else {
         return false;
     };
     let supplied_origin = headers.get(header::ORIGIN);
-    if supplied_origin.is_some_and(|value| value.to_str().ok() != Some(&origin)) {
+    if supplied_origin
+        .is_some_and(|value| value.to_str().ok() != Some(&origin.origin().ascii_serialization()))
+    {
         return false;
     }
     if let Some(value) = headers.get(header::AUTHORIZATION) {
@@ -91,6 +90,7 @@ pub(super) fn allowed(headers: &HeaderMap, app: &Auth, mutation: bool) -> bool {
                 .is_some_and(|token| matches_token(token, &app.token))
             && words.next().is_none();
     }
+    let cookie_name = cookie_name(&origin);
     (!mutation || supplied_origin.is_some())
         && headers
             .get_all(header::COOKIE)
@@ -99,7 +99,7 @@ pub(super) fn allowed(headers: &HeaderMap, app: &Auth, mutation: bool) -> bool {
             .flat_map(|cookies| cookies.split(';'))
             .any(|cookie| {
                 cookie.trim().split_once('=').is_some_and(|(name, token)| {
-                    name == app.cookie && matches_token(token, &app.token)
+                    name == cookie_name && matches_token(token, &app.token)
                 })
             })
 }
@@ -137,19 +137,20 @@ pub(super) async fn login(
     uri: Uri,
     Query(query): Query<Login>,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    if !normalize_host(&mut headers, &uri)
-        || addressed_origin(&headers, &app).is_none()
-        || !matches_token(&query.token, &app.token)
-    {
+    if !normalize_host(&mut headers, &uri) || !matches_token(&query.token, &app.token) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid launch URL."));
     }
+    let origin = addressed_origin(&headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "Launch URL must use localhost or a loopback IP.",
+    ))?;
     let mut response = Redirect::to(&app.launch_path).into_response();
-    let secure = if app.secure() { "; Secure" } else { "" };
     response.headers_mut().insert(
         header::SET_COOKIE,
         format!(
-            "{}={}; HttpOnly; SameSite=Strict; Path=/{secure}",
-            app.cookie, app.token
+            "{}={}; HttpOnly; SameSite=Strict; Path=/",
+            cookie_name(&origin),
+            app.token
         )
         .parse()
         .unwrap(),

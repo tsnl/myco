@@ -90,7 +90,6 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
     Arc::new(Server::new(
         sessions,
         "http://127.0.0.1:8765".into(),
-        8765,
         "/".into(),
         super::super::files::Files::open(&std::env::current_dir().unwrap()).unwrap(),
     ))
@@ -577,7 +576,7 @@ async fn browser_actions_require_the_launch_cookie_and_same_origin() {
     assert!(!allowed(&headers, &app.auth, false));
     headers.insert(
         header::COOKIE,
-        format!("other=value; {}={}", app.auth.cookie, app.auth.token)
+        format!("other=value; myco_8765={}", app.auth.token)
             .parse()
             .unwrap(),
     );
@@ -585,13 +584,11 @@ async fn browser_actions_require_the_launch_cookie_and_same_origin() {
     headers.insert(header::COOKIE, "other=value".parse().unwrap());
     headers.append(
         header::COOKIE,
-        format!("{}={}", app.auth.cookie, app.auth.token)
-            .parse()
-            .unwrap(),
+        format!("myco_8765={}", app.auth.token).parse().unwrap(),
     );
     assert!(
         allowed(&headers, &app.auth, false),
-        "HTTP/2 can split cookies across header fields"
+        "multiple cookie headers are accepted"
     );
     assert!(!allowed(&headers, &app.auth, true));
     headers.insert(header::ORIGIN, app.auth.origin.parse().unwrap());
@@ -602,28 +599,55 @@ async fn browser_actions_require_the_launch_cookie_and_same_origin() {
     assert!(!allowed(&headers, &app.auth, false));
 }
 
-/// A non-loopback bind answers on every name that routes to it, so the served
-/// origin follows the request rather than one address fixed at startup.
 #[tokio::test]
-async fn any_name_reaching_the_bound_port_is_served_against_its_own_origin() {
+async fn loopback_origins_support_different_forwarded_ports() {
     let app = server(&[]);
-    let mut headers = HeaderMap::new();
-    headers.insert(header::HOST, "dus-mj0kwbx5:8765".parse().unwrap());
-    headers.insert(
-        header::COOKIE,
-        format!("{}={}", app.auth.cookie, app.auth.token)
-            .parse()
-            .unwrap(),
-    );
-    assert!(allowed(&headers, &app.auth, false));
-    // Cross-origin writes stay barred: the Origin must name the host asked for.
-    headers.insert(header::ORIGIN, "http://127.0.0.1:8765".parse().unwrap());
-    assert!(!allowed(&headers, &app.auth, true));
-    headers.insert(header::ORIGIN, "http://dus-mj0kwbx5:8765".parse().unwrap());
-    assert!(allowed(&headers, &app.auth, true));
-    // A request that never carried the launch cookie is still refused.
-    headers.remove(header::COOKIE);
-    assert!(!allowed(&headers, &app.auth, false));
+    for host in ["localhost:9876", "127.0.0.1:9876", "[::1]:9876"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("myco_9876={}", app.auth.token).parse().unwrap(),
+        );
+        assert!(allowed(&headers, &app.auth, false), "{host}");
+        assert!(!allowed(&headers, &app.auth, true));
+        headers.insert(header::ORIGIN, app.auth.origin.parse().unwrap());
+        assert!(!allowed(&headers, &app.auth, true));
+        headers.insert(header::ORIGIN, format!("http://{host}").parse().unwrap());
+        assert!(allowed(&headers, &app.auth, true));
+        headers.insert(
+            header::COOKIE,
+            format!("myco_8765={}", app.auth.token).parse().unwrap(),
+        );
+        assert!(!allowed(&headers, &app.auth, false));
+    }
+}
+
+#[tokio::test]
+async fn non_loopback_hosts_are_refused_even_with_a_valid_credential() {
+    let app = server(&[]);
+    for host in [
+        "other.example:8765",
+        "localhost.evil:8765",
+        "192.168.1.10:8765",
+        "[2001:db8::1]:8765",
+        "0.0.0.0:8765",
+        "[::]:8765",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers.insert(header::ORIGIN, format!("http://{host}").parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("myco_8765={}", app.auth.token).parse().unwrap(),
+        );
+        assert!(!allowed(&headers, &app.auth, false), "{host}");
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", app.auth.token).parse().unwrap(),
+        );
+        assert!(!allowed(&headers, &app.auth, true), "{host}");
+    }
 }
 
 #[tokio::test]
@@ -650,9 +674,7 @@ async fn bearer_authentication_rejects_malformed_tokens_and_cross_origin_request
     }
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.auth.cookie, app.auth.token)
-            .parse()
-            .unwrap(),
+        format!("myco_8765={}", app.auth.token).parse().unwrap(),
     );
     assert!(
         !allowed(&headers, &app.auth, false),

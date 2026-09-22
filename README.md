@@ -9,6 +9,10 @@
 
 A minimalist coding agent that works across your machines over SSH.
 
+> [!WARNING]
+> Myco is pre-1.0 software under active development. Things are changing quickly;
+> expect bugs and breaking changes as features, APIs, and configuration evolve.
+
 Run `myco` on your laptop and open its browser UI. It edits files, runs shells, and searches code on
 the local machine **and** on every concrete `Host` alias in your
 `~/.ssh/config` — one session, many hosts, no setup beyond SSH itself.
@@ -16,7 +20,7 @@ the local machine **and** on every concrete `Host` alias in your
 ![Myco reviewing its own code in a frosted browser UI against a rainy dusk sky](https://raw.githubusercontent.com/tsnl/myco/dddcfef1712641da1823240af9569e192f366730/docs/media/pr251/myco-review.png)
 
 **Myco reviewing Myco.** A scripted review in the real browser UI, with simulated
-rain. Captured from the [HTTPS and workspace-files preview](https://github.com/tsnl/myco/pull/251).
+rain. Captured from the [workspace-files preview](https://github.com/tsnl/myco/pull/251).
 
 <details>
 <summary>Watch the rain · 8-second loop</summary>
@@ -57,19 +61,28 @@ semantic code search).
 ## Use
 
 ```bash
-myco                      # start HTTPS on 127.0.0.1:8765
+myco                      # start HTTP on 127.0.0.1:8765
 myco --port 8766 --profile research
 myco --resume SESSION_ID  # open a saved session from the launch URL
 ```
 
-Trust the generated public certificate whose path Myco prints, or supply your
-own with `--tls-cert PATH --tls-key PATH`. Open the printed URL to sign in.
+Myco listens only on loopback. Open the printed URL to sign in. For remote access,
+run Myco on the remote host and forward its port through SSH from your computer:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-host
+```
+
+Open the remote launch URL with its address changed to `http://127.0.0.1:8766`,
+keeping `/auth?token=...` intact. SSH encrypts traffic between the computers;
+Myco does not serve HTTPS or accept non-loopback bind addresses.
+
 The browser has collapsible tool blocks, a
 floating input bar, Markdown/images, and independent sessions in separate tabs.
 Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
 launching terminal stops the server and its sessions. See the
 [browser manual](src/manual/articles/browser.md), also `myco --help browser`,
-for controls, authenticated workspace files, and the HTTPS API.
+for controls, authenticated workspace files, and the HTTP API.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.

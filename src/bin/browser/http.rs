@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response, Sse, sse};
 use axum::routing::{get, post};
@@ -51,12 +51,11 @@ impl Server {
     pub(super) fn new(
         sessions: Sessions,
         origin: String,
-        port: u16,
         launch_path: String,
         files: Files,
     ) -> Self {
         Self {
-            auth: Arc::new(auth::Auth::new(origin, port, launch_path)),
+            auth: Arc::new(auth::Auth::new(origin, launch_path)),
             sessions,
             weather: Weather::new(),
             files,
@@ -259,13 +258,18 @@ async fn render_markdown(
 async fn workspace_file(
     State(server): State<Arc<Server>>,
     Path(path): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
-    server.files.serve(path, headers).await
+    server.files.serve(path, method, headers).await
 }
 
-async fn workspace_index(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
-    server.files.serve(String::new(), headers).await
+async fn workspace_index(
+    State(server): State<Arc<Server>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    server.files.serve(String::new(), method, headers).await
 }
 
 async fn image(Query(query): Query<HashMap<String, String>>) -> ApiResult<Response> {

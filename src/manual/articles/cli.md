@@ -7,12 +7,8 @@ mode. `myco-eval` remains a separate evaluation utility.
 
 | Option | Meaning |
 | --- | --- |
-| `--port PORT` | HTTPS port, default 8765; `0` chooses a free port |
-| `--bind ADDR` | Listen address, default `127.0.0.1` |
-| `--tls-cert PATH` | PEM certificate chain; requires `--tls-key` |
-| `--tls-key PATH` | PEM private key; requires `--tls-cert` |
-| `--tls-name NAME` | Additional name/IP for the generated local certificate; repeatable |
-| `--insecure-http` | Explicit unencrypted HTTP; requires a loopback bind |
+| `--port PORT` | Loopback HTTP port, default 8765; `0` chooses a free port |
+| `--bind ADDR` | Loopback IP or `localhost`, default `127.0.0.1`; `::1` selects IPv6 |
 | `--profile NAME` | Select profile, overriding `MYCO_PROFILE` (default `default`) |
 | `--config PATH` | Config path, overriding `MYCO_CONFIG` and the profile default |
 | `--model KEY` | Default model from the config catalog |
@@ -24,9 +20,9 @@ mode. `myco-eval` remains a separate evaluation utility.
 | `--mode host` | Internal SSH worker speaking NDJSON on stdin/stdout |
 
 `--web [PORT]` and `--web-bind ADDR` remain aliases for `--port` and `--bind`.
-Without certificate paths, Myco generates a persistent local identity and prints
-the public certificate path for browser trust setup. Certificates, authentication,
-and the read-only `/files/` workspace routes are described in `browser`.
+Non-loopback addresses, including wildcard binds, are rejected. Use an SSH tunnel
+for remote access; Myco has no HTTPS listener or certificate options. Tunneling,
+authentication, and the read-only `/files/` workspace routes are described in `browser`.
 Host workers accept `--name` and `--max-image-base64-bytes`, supplied by the
 server when it attaches a remote. The local host is always in-process.
 

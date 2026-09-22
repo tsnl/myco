@@ -9,6 +9,8 @@ import re
 import selectors
 import shlex
 import signal
+import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -148,7 +150,7 @@ context_window = 100000
         self.process, launch = self.launch()
         parsed = urlsplit(launch)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
-        self.context = self.browser.new_context(viewport={"width": 1200, "height": 850}, ignore_https_errors=True)
+        self.context = self.browser.new_context(viewport={"width": 1200, "height": 850})
         self.addCleanup(self.context.close)
         self.context.on("page", lambda page: page.on("pageerror", lambda error: self.errors.append(str(error))))
         self.context.tracing.start(screenshots=True, snapshots=True)
@@ -177,7 +179,7 @@ context_window = 100000
             selector.register(process.stdout, selectors.EVENT_READ)
             self.assertTrue(selector.select(15), "Server did not print its launch URL")
         launch = process.stdout.readline().strip().removeprefix("Browser UI: ")
-        self.assertTrue(launch.startswith("https://"), f"Server failed to launch; see {log.name}")
+        self.assertTrue(launch.startswith("http://127.0.0.1:"), f"Server failed to launch; see {log.name}")
         return process, launch
 
     def stop(self, process):
@@ -207,13 +209,14 @@ context_window = 100000
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
 
-    def test_https_cookie_and_bearer_auth_cover_assets_files_and_api(self):
+    def test_loopback_cookie_and_bearer_auth_cover_assets_files_and_api(self):
         cookies = self.context.cookies()
-        cookie = next(cookie for cookie in cookies if cookie['name'].startswith('__Host-myco_'))
-        self.assertTrue(cookie['secure'] and cookie['httpOnly'])
+        cookie = next(cookie for cookie in cookies if cookie['name'].startswith('myco_'))
+        self.assertTrue(cookie['httpOnly'])
+        self.assertFalse(cookie['secure'])
         self.assertEqual(cookie['sameSite'], 'Strict')
         self.assertEqual(self.page.evaluate('document.cookie'), '')
-        anonymous = self.playwright.request.new_context(ignore_https_errors=True)
+        anonymous = self.playwright.request.new_context()
         try:
             for path in ['/', '/app.js', '/api/sessions', '/api/events', '/files/pixel.png', '/api/image?source=pixel.png']:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401, path)
@@ -228,8 +231,53 @@ context_window = 100000
             self.assertEqual(anonymous.get(self.origin + '/files/pixel.png?token=' + cookie['value']).status, 401)
             self.assertEqual(self.context.request.get(self.origin + '/files/pixel.png',
                 headers={'Authorization': 'Bearer wrong'}).status, 401)
+            self.assertEqual(self.context.request.post(self.origin + '/api/markdown',
+                data={'text': 'no origin'}).status, 401)
+            for host in ['other.example:8765', '192.168.1.10:8765', 'localhost.evil:8765']:
+                self.assertEqual(anonymous.get(self.origin + '/api/sessions',
+                    headers={**bearer, 'Host': host}).status, 401)
+                self.assertEqual(anonymous.get(self.origin + '/auth?token=' + cookie['value'],
+                    headers={'Host': host}).status, 401)
         finally:
             anonymous.dispose()
+
+    def test_forwarded_port_supports_login_actions_events_and_images(self):
+        destination = ('127.0.0.1', urlsplit(self.origin).port)
+
+        class Forward(socketserver.BaseRequestHandler):
+            def handle(self):
+                # Relay TCP bytes like ssh -L; preserve Host, Origin, and cookies.
+                with socket.create_connection(destination) as upstream:
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(self.request, selectors.EVENT_READ, upstream)
+                        selector.register(upstream, selectors.EVENT_READ, self.request)
+                        while True:
+                            for key, _ in selector.select():
+                                data = key.fileobj.recv(65536)
+                                if not data:
+                                    return
+                                key.data.sendall(data)
+
+        forwarder = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Forward)
+        forwarder.daemon_threads = True
+        self.addCleanup(forwarder.server_close)
+        self.addCleanup(forwarder.shutdown)
+        threading.Thread(target=forwarder.serve_forever, daemon=True).start()
+        port = forwarder.server_address[1]
+        origin = f'http://127.0.0.1:{port}'
+        token = next(cookie['value'] for cookie in self.context.cookies()
+                     if cookie['name'].startswith('myco_'))
+        self.page.goto(origin + '/auth?token=' + token)
+        self.assertTrue(self.page.url.startswith(origin + '/'))
+        cookies = {cookie['name']: cookie for cookie in self.context.cookies()}
+        self.assertIn(f'myco_{port}', cookies)
+        self.assertIn(f'myco_{destination[1]}', cookies)
+        self.session(self.page)
+        self.submit(self.page, 'Alpha markdown')
+        expect(self.page.locator('.assistant .markdown')).to_contain_text('Paragraph 23')
+        expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
+        self.page.reload()
+        expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
 
     def test_workspace_links_and_svg_images_are_mapped_and_authenticated(self):
         path = self.home / 'plot & space.svg'
@@ -265,6 +313,15 @@ context_window = 100000
         response = self.context.request.head(url)
         self.assertEqual((response.status, response.body()), (200, b''))
         self.assertEqual(response.headers['content-length'], '10')
+        for validator in ['"different-version"', 'Wed, 21 Oct 2015 07:28:00 GMT']:
+            response = self.context.request.get(url, headers={'Range': 'bytes=2-5', 'If-Range': validator})
+            self.assertEqual((response.status, response.body()), (200, b'0123456789'))
+            self.assertNotIn('content-range', response.headers)
+        for requested_range in ['bytes=2-5', 'bytes=20-', 'not a range']:
+            response = self.context.request.head(url, headers={'Range': requested_range})
+            self.assertEqual((response.status, response.body()), (200, b''))
+            self.assertEqual(response.headers['content-length'], '10')
+            self.assertNotIn('content-range', response.headers)
         self.assertEqual(self.context.request.post(url, headers={'Origin': self.origin}, data='replace').status, 405)
         self.assertEqual((self.home / 'bytes.bin').read_bytes(), b'0123456789')
         if hasattr(os, 'mkfifo'):
@@ -404,7 +461,7 @@ context_window = 100000
         self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
 
     def test_sky_endpoints_require_authentication_and_validate_input(self):
-        anonymous = self.playwright.request.new_context(ignore_https_errors=True)
+        anonymous = self.playwright.request.new_context()
         try:
             for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
                          "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js", "/settings.js"]:

@@ -64,8 +64,8 @@ only on the local worker. Model credentials stay with the application process.
 | Host transport and routing | `src/host/`, `src/harness/` |
 | Host tools | `src/tool_services/` |
 
-The browser server defaults to HTTPS. `tls.rs` owns certificate configuration and
-persistent local identities; `auth.rs` applies one credential and origin policy
+The browser server accepts HTTP only on loopback; remote access uses SSH port
+forwarding. `auth.rs` applies one credential and a loopback origin policy
 to UI assets, event streams, images, files, and actions. `files.rs` holds a
 directory capability for read-only workspace access and streams regular files.
 Markdown rendering maps local links to those routes on the server. Workspace

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use cap_std::fs::{Dir, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -61,7 +61,17 @@ impl Files {
         ))
     }
 
-    pub(super) async fn serve(&self, path: String, headers: HeaderMap) -> Response {
+    pub(super) async fn serve(
+        &self,
+        path: String,
+        method: Method,
+        mut headers: HeaderMap,
+    ) -> Response {
+        // Range applies only to GET. Without representation validators, an
+        // If-Range condition cannot match and must fall back to the full file.
+        if method != Method::GET || headers.contains_key(header::IF_RANGE) {
+            headers.remove(header::RANGE);
+        }
         let directory = self.directory.clone();
         let requested = path.clone();
         let opened = tokio::task::spawn_blocking(move || open_file(&directory, &path)).await;
