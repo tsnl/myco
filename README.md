@@ -13,6 +13,18 @@ Run `myco` on your laptop and open its browser UI. It edits files, runs shells, 
 the local machine **and** on every concrete `Host` alias in your
 `~/.ssh/config` — one session, many hosts, no setup beyond SSH itself.
 
+![Myco reviewing its own code in a frosted browser UI against a rainy dusk sky](https://raw.githubusercontent.com/tsnl/myco/dddcfef1712641da1823240af9569e192f366730/docs/media/pr251/myco-review.png)
+
+**Myco reviewing Myco.** A scripted review in the real browser UI, with simulated
+rain. Captured from the [HTTPS and workspace-files preview](https://github.com/tsnl/myco/pull/251).
+
+<details>
+<summary>Watch the rain · 8-second loop</summary>
+
+![Rain falling behind Myco's translucent code-review interface](https://raw.githubusercontent.com/tsnl/myco/dddcfef1712641da1823240af9569e192f366730/docs/media/pr251/myco-review-rain.gif)
+
+</details>
+
 ## Why use it?
 
 - **One agent, many machines.** Point tools at `local` or any `Host` alias from
