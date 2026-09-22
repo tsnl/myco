@@ -103,11 +103,12 @@ the raw progress events. Valid tool arguments must be JSON objects. Streaming ar
 deltas remain text until the response is decoded.
 
 Append the returned message directly to the next request, followed by linked
-`ToolResult` messages when needed. `Message::Assistant` holds ordered output;
+`ToolResult` messages when needed. `Message::Assistant` holds an ordered
+`content: Vec<ContentPart>` for both generated replies and request history;
 finish reason and usage belong to the completion event. Every request is rebuilt
 from the supplied history. No whole native response is attached to it.
 
-Reasoning metadata is explicit in the completed message: `Output::Reasoning`
+Reasoning metadata is explicit in the completed message: `ContentPart::Reasoning`
 has an optional `signature`; `EncryptedReasoning` carries its ID, summaries, and
 opaque data; `RedactedReasoning` carries a separate opaque block. Preserve these
 fields and their ordering when replaying reasoning. Only the provider can verify

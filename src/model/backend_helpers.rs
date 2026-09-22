@@ -8,8 +8,8 @@ use futures_core::Stream;
 use serde_json::Value;
 
 use super::{
-    Config, Delta, Error, Event, Finish, Generation, Message, Output, Request, ToolCall, Usage,
-    anthropic_backend, openai_responses_backend,
+    Config, ContentPart, Delta, Error, Event, Finish, Generation, Message, Request, ToolCall,
+    Usage, anthropic_backend, openai_responses_backend,
 };
 
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
@@ -31,7 +31,7 @@ pub(super) enum Decoded {
 }
 
 pub(super) struct Completion {
-    pub(super) output: Vec<Output>,
+    pub(super) output: Vec<ContentPart>,
     pub(super) finish: Finish,
     pub(super) usage: Usage,
 }
@@ -81,17 +81,17 @@ pub(super) fn completed(protocol: Protocol, body: &Value) -> Result<Event, Error
     validate_call_ids(&completion.output)?;
     Ok(Event::Completed {
         message: Message::Assistant {
-            output: completion.output,
+            content: completion.output,
         },
         finish: completion.finish,
         usage: completion.usage,
     })
 }
 
-fn validate_call_ids(output: &[Output]) -> Result<(), Error> {
+fn validate_call_ids(output: &[ContentPart]) -> Result<(), Error> {
     let mut calls = HashSet::new();
     for output in output {
-        if let Output::ToolCall(call) = output
+        if let ContentPart::ToolCall(call) = output
             && !calls.insert(&call.id)
         {
             return Err(Error::Protocol(format!(
@@ -171,15 +171,15 @@ struct History<'a> {
 impl<'a> History<'a> {
     fn message(&mut self, message: &'a Message) -> Result<(), Error> {
         match message {
-            Message::Assistant { output } => self.assistant(output),
+            Message::Assistant { content } => self.assistant(content),
             Message::ToolResult { call_id, .. } => self.result(call_id),
             Message::User(_) => Ok(()),
         }
     }
 
-    fn assistant(&mut self, output: &'a [Output]) -> Result<(), Error> {
-        for output in output {
-            if let Output::ToolCall(call) = output {
+    fn assistant(&mut self, content: &'a [ContentPart]) -> Result<(), Error> {
+        for part in content {
+            if let ContentPart::ToolCall(call) = part {
                 self.call(call)?;
             }
         }

@@ -4,7 +4,9 @@ use super::backend_helpers::{
     Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
 };
 use super::http_helpers::Transport;
-use super::{Delta, DeltaKind, Error, Finish, Message, Output, Request, Tool, ToolCall, Usage};
+use super::{
+    ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
+};
 
 pub(super) struct Backend {
     transport: Transport,
@@ -72,7 +74,7 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
 fn content(message: &Message) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
         Message::User(text) => ("user", vec![json!({"type": "text", "text": text})], false),
-        Message::Assistant { output } => ("assistant", assistant(output)?, false),
+        Message::Assistant { content } => ("assistant", assistant(content)?, false),
         Message::ToolResult {
             call_id,
             output,
@@ -108,26 +110,30 @@ fn merge(message: &mut Value, content: Content) {
     }
 }
 
-fn assistant(outputs: &[Output]) -> Result<Vec<Value>, Error> {
-    outputs
+fn assistant(content: &[ContentPart]) -> Result<Vec<Value>, Error> {
+    content
         .iter()
-        .filter_map(|part| output(part).transpose())
+        .filter_map(|part| encode_part(part).transpose())
         .collect()
 }
 
-fn output(output: &Output) -> Result<Option<Value>, Error> {
-    Ok(match output {
-        Output::Text(text) | Output::Refusal(text) => Some(json!({"type":"text", "text":text})),
-        Output::ToolCall(call) => Some(encode_tool_call(call)?),
-        Output::Reasoning {
+fn encode_part(part: &ContentPart) -> Result<Option<Value>, Error> {
+    Ok(match part {
+        ContentPart::Text(text) | ContentPart::Refusal(text) => {
+            Some(json!({"type":"text", "text":text}))
+        }
+        ContentPart::ToolCall(call) => Some(encode_tool_call(call)?),
+        ContentPart::Reasoning {
             text,
             signature: Some(signature),
         } => Some(json!({"type":"thinking", "thinking":text, "signature":signature})),
-        Output::Reasoning {
+        ContentPart::Reasoning {
             signature: None, ..
         } => None,
-        Output::RedactedReasoning(data) => Some(json!({"type":"redacted_thinking", "data":data})),
-        Output::EncryptedReasoning { .. } => {
+        ContentPart::RedactedReasoning(data) => {
+            Some(json!({"type":"redacted_thinking", "data":data}))
+        }
+        ContentPart::EncryptedReasoning { .. } => {
             return Err(Error::InvalidRequest(
                 "encrypted reasoning belongs to another backend".into(),
             ));
@@ -169,15 +175,15 @@ fn finish(body: &Value) -> Result<Finish, Error> {
     })
 }
 
-fn block(block: &Value) -> Result<Option<Output>, Error> {
+fn block(block: &Value) -> Result<Option<ContentPart>, Error> {
     Ok(match field(block, "type")? {
-        "text" => Some(Output::Text(field(block, "text")?.into())),
-        "thinking" => Some(Output::Reasoning {
+        "text" => Some(ContentPart::Text(field(block, "text")?.into())),
+        "thinking" => Some(ContentPart::Reasoning {
             text: field(block, "thinking")?.into(),
             signature: Some(field(block, "signature")?.into()),
         }),
-        "redacted_thinking" => Some(Output::RedactedReasoning(field(block, "data")?.into())),
-        "tool_use" => Some(Output::ToolCall(decode_tool_call(block)?)),
+        "redacted_thinking" => Some(ContentPart::RedactedReasoning(field(block, "data")?.into())),
+        "tool_use" => Some(ContentPart::ToolCall(decode_tool_call(block)?)),
         _ => None,
     })
 }

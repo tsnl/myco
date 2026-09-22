@@ -5,7 +5,7 @@ use myco::model::{Event, Message, Request};
 mod common;
 
 use common::*;
-use myco::model::{DeltaKind, Error, Finish, Output, Tool, ToolCall};
+use myco::model::{ContentPart, DeltaKind, Error, Finish, Tool, ToolCall};
 use serde_json::{Value, json};
 
 #[test]
@@ -84,7 +84,7 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
     assert_eq!(
         message,
         Message::Assistant {
-            output: vec![Output::Text("hello".into())]
+            content: vec![ContentPart::Text("hello".into())]
         }
     );
     assert_eq!(finish, Finish::Stop);
@@ -111,16 +111,16 @@ async fn completed_messages_rebuild_full_history_including_reasoning_for_each_ba
         });
         let trace = collect(&model, initial).await;
         let reply = completed(&trace);
-        let Message::Assistant { output } = &reply.message else {
+        let Message::Assistant { content: output } = &reply.message else {
             panic!("missing assistant message");
         };
         assert_eq!(reply.finish, Finish::ToolCalls);
         assert_eq!(reply.usage.output_tokens, Some(9));
-        assert!(output.contains(&Output::Text("Ready 雪".into())));
+        assert!(output.contains(&ContentPart::Text("Ready 雪".into())));
         let call = output
             .iter()
             .find_map(|part| match part {
-                Output::ToolCall(call) => Some(call),
+                ContentPart::ToolCall(call) => Some(call),
                 _ => None,
             })
             .unwrap();
@@ -219,10 +219,10 @@ async fn unknown_output_stays_in_raw_events_without_entering_history() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant { output } = &reply.message else {
+    let Message::Assistant { content: output } = &reply.message else {
         panic!("missing assistant message");
     };
-    assert_eq!(output, &[Output::Text("full response".into())]);
+    assert_eq!(output, &[ContentPart::Text("full response".into())]);
     assert_eq!(reply.usage.input_tokens, None);
     assert!(
         trace
@@ -405,14 +405,17 @@ async fn edited_text_history_is_rebuilt_from_the_callers_content() {
     ] {
         let trace = run(protocol, fixture_body).await;
         let mut message = completed(&trace).message.clone();
-        let Message::Assistant { output, .. } = &mut message else {
+        let Message::Assistant {
+            content: output, ..
+        } = &mut message
+        else {
             panic!("missing assistant message");
         };
         let text = output
             .iter_mut()
-            .find(|part| matches!(part, Output::Text(_)))
+            .find(|part| matches!(part, ContentPart::Text(_)))
             .unwrap();
-        *text = Output::Text("edited text".into());
+        *text = ContentPart::Text("edited text".into());
         let mut input = request();
         input.messages.extend([
             message,
@@ -525,9 +528,9 @@ async fn concurrent_requests(protocol: Backend) {
     };
     let (a, b) = tokio::join!(collect(&model, a), collect(&model, b));
     assert!(matches!(&completed(&a).message,
-        Message::Assistant { output, .. } if output == &[Output::Text("a".into())]));
+        Message::Assistant { content: output, .. } if output == &[ContentPart::Text("a".into())]));
     assert!(matches!(&completed(&b).message,
-        Message::Assistant { output, .. } if output == &[Output::Text("b".into())]));
+        Message::Assistant { content: output, .. } if output == &[ContentPart::Text("b".into())]));
     server.await.unwrap();
 }
 
@@ -614,18 +617,18 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant { output } = &reply.message else {
+    let Message::Assistant { content: output } = &reply.message else {
         panic!("missing assistant message");
     };
     assert_eq!(reply.finish, Finish::Length);
     assert_eq!(
         output[0],
-        Output::Reasoning {
+        ContentPart::Reasoning {
             text: "visible reasoning".into(),
             signature: None
         }
     );
-    let Output::ToolCall(call) = &output[1] else {
+    let ContentPart::ToolCall(call) = &output[1] else {
         panic!("missing truncated call");
     };
     assert!(
@@ -680,7 +683,7 @@ fn tool_history(arguments: Result<Value, String>) -> Request {
     let mut input = request();
     input.messages.extend([
         Message::Assistant {
-            output: vec![Output::ToolCall(ToolCall {
+            content: vec![ContentPart::ToolCall(ToolCall {
                 id: "call".into(),
                 name: "read".into(),
                 arguments,
@@ -762,7 +765,7 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
     assert_eq!(
         message,
         Message::Assistant {
-            output: vec![Output::Text("first雪".into())]
+            content: vec![ContentPart::Text("first雪".into())]
         }
     );
     assert!(generation.next().await.is_none());
@@ -782,7 +785,10 @@ async fn interleaved_deltas_keep_part_coordinates_and_completion_supplies_the_wh
     assert_eq!(
         completed(&trace).message,
         Message::Assistant {
-            output: vec![Output::Text("a雪".into()), Output::Text("b".into())],
+            content: vec![
+                ContentPart::Text("a雪".into()),
+                ContentPart::Text("b".into())
+            ],
         }
     );
     let text: Vec<_> = trace
@@ -803,19 +809,19 @@ async fn initial_thinking_and_signature_fragments_are_assembled_once() {
         "\"thinking\":\"Plan. \",\"signature\":\"prefix-\"",
     );
     let trace = run(Backend::AnthropicMessages, &body).await;
-    let Message::Assistant { output } = &completed(&trace).message else {
+    let Message::Assistant { content: output } = &completed(&trace).message else {
         panic!()
     };
     assert_eq!(
         output[0],
-        Output::Reasoning {
+        ContentPart::Reasoning {
             text: "Plan. Checking the note.".into(),
             signature: Some("prefix-signed-reasoning".into()),
         }
     );
     assert_eq!(
         output[1],
-        Output::RedactedReasoning("opaque-reasoning".into())
+        ContentPart::RedactedReasoning("opaque-reasoning".into())
     );
 }
 
@@ -833,7 +839,7 @@ async fn encrypted_reasoning_survives_without_a_visible_summary() {
     assert_eq!(
         completed(&trace).message,
         Message::Assistant {
-            output: vec![Output::EncryptedReasoning {
+            content: vec![ContentPart::EncryptedReasoning {
                 id: "rs_secret".into(),
                 summary: vec![],
                 data: "opaque".into(),
@@ -869,7 +875,7 @@ async fn unsigned_reasoning_is_observation_only_in_history() {
         let mut input = request();
         input.messages.extend([
             Message::Assistant {
-                output: vec![Output::Reasoning {
+                content: vec![ContentPart::Reasoning {
                     text: "private observation".into(),
                     signature: None,
                 }],
@@ -890,18 +896,18 @@ fn incompatible_reasoning_formats_fail_before_network_io() {
     for (backend, output) in [
         (
             Backend::OpenAiResponses,
-            Output::Reasoning {
+            ContentPart::Reasoning {
                 text: "summary".into(),
                 signature: Some("signed".into()),
             },
         ),
         (
             Backend::OpenAiResponses,
-            Output::RedactedReasoning("opaque".into()),
+            ContentPart::RedactedReasoning("opaque".into()),
         ),
         (
             Backend::AnthropicMessages,
-            Output::EncryptedReasoning {
+            ContentPart::EncryptedReasoning {
                 id: "rs".into(),
                 summary: vec![],
                 data: "opaque".into(),
@@ -911,7 +917,7 @@ fn incompatible_reasoning_formats_fail_before_network_io() {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
         let mut input = request();
         input.messages.push(Message::Assistant {
-            output: vec![output],
+            content: vec![output],
         });
         assert!(
             matches!(model.generate(input), Err(Error::InvalidRequest(error))

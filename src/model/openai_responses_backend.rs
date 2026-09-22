@@ -4,7 +4,9 @@ use super::backend_helpers::{
     Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
 };
 use super::http_helpers::Transport;
-use super::{Delta, DeltaKind, Error, Finish, Message, Output, Request, Tool, ToolCall, Usage};
+use super::{
+    ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
+};
 
 pub(super) struct Backend {
     transport: Transport,
@@ -47,7 +49,7 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
 fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     match message {
         Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant { output } => assistant(output),
+        Message::Assistant { content } => assistant(content),
         Message::ToolResult {
             call_id,
             output,
@@ -56,25 +58,25 @@ fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     }
 }
 
-fn assistant(outputs: &[Output]) -> Result<Vec<Value>, Error> {
-    outputs
+fn assistant(content: &[ContentPart]) -> Result<Vec<Value>, Error> {
+    content
         .iter()
-        .filter_map(|part| output(part).transpose())
+        .filter_map(|part| encode_part(part).transpose())
         .collect()
 }
 
-fn output(output: &Output) -> Result<Option<Value>, Error> {
-    Ok(match output {
-        Output::Text(text) | Output::Refusal(text) => {
+fn encode_part(part: &ContentPart) -> Result<Option<Value>, Error> {
+    Ok(match part {
+        ContentPart::Text(text) | ContentPart::Refusal(text) => {
             Some(json!({"role":"assistant", "content":text}))
         }
-        Output::ToolCall(call) => Some(json!({"type":"function_call", "call_id":call.id,
+        ContentPart::ToolCall(call) => Some(json!({"type":"function_call", "call_id":call.id,
             "name":call.name, "arguments":call.arguments()?.to_string()})),
-        Output::EncryptedReasoning { id, summary, data } => Some(json!({
+        ContentPart::EncryptedReasoning { id, summary, data } => Some(json!({
             "type":"reasoning", "id":id, "encrypted_content":data,
             "summary":summary.iter().map(|text| json!({"type":"summary_text", "text":text})).collect::<Vec<_>>(),
         })),
-        Output::Reasoning {
+        ContentPart::Reasoning {
             signature: None, ..
         } => None,
         _ => {
@@ -114,46 +116,46 @@ pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
     })
 }
 
-fn outputs(body: &Value, complete: bool) -> Result<Vec<Output>, Error> {
+fn outputs(body: &Value, complete: bool) -> Result<Vec<ContentPart>, Error> {
     let mut output = vec![];
     for item in array(body, "output")? {
         match field(item, "type")? {
             "message" => output.extend(decode_message(item)?),
             "reasoning" => output.extend(reasoning(item)?),
-            "function_call" => output.push(Output::ToolCall(tool_call(item, complete)?)),
+            "function_call" => output.push(ContentPart::ToolCall(tool_call(item, complete)?)),
             _ => {} // Unsupported items remain available in raw events.
         }
     }
     Ok(output)
 }
 
-fn decode_message(item: &Value) -> Result<Vec<Output>, Error> {
+fn decode_message(item: &Value) -> Result<Vec<ContentPart>, Error> {
     let mut output = vec![];
     for part in array(item, "content")? {
         match field(part, "type")? {
-            "output_text" => output.push(Output::Text(field(part, "text")?.into())),
-            "refusal" => output.push(Output::Refusal(field(part, "refusal")?.into())),
+            "output_text" => output.push(ContentPart::Text(field(part, "text")?.into())),
+            "refusal" => output.push(ContentPart::Refusal(field(part, "refusal")?.into())),
             _ => {}
         }
     }
     Ok(output)
 }
 
-fn reasoning(item: &Value) -> Result<Vec<Output>, Error> {
+fn reasoning(item: &Value) -> Result<Vec<ContentPart>, Error> {
     if item.get("encrypted_content").is_some_and(|v| !v.is_null()) {
         return Ok(vec![encrypted_reasoning(item)?]);
     }
     Ok(reasoning_text(item)?
         .into_iter()
-        .map(|text| Output::Reasoning {
+        .map(|text| ContentPart::Reasoning {
             text,
             signature: None,
         })
         .collect())
 }
 
-fn encrypted_reasoning(item: &Value) -> Result<Output, Error> {
-    Ok(Output::EncryptedReasoning {
+fn encrypted_reasoning(item: &Value) -> Result<ContentPart, Error> {
+    Ok(ContentPart::EncryptedReasoning {
         id: field(item, "id")?.into(),
         summary: array(item, "summary")?
             .iter()
@@ -187,17 +189,19 @@ fn tool_call(item: &Value, complete: bool) -> Result<ToolCall, Error> {
     Ok(call)
 }
 
-fn finish(body: &Value, output: &[Output]) -> Result<Finish, Error> {
+fn finish(body: &Value, output: &[ContentPart]) -> Result<Finish, Error> {
     if body["status"] == "incomplete" {
         return incomplete(&body["incomplete_details"]);
     }
-    Ok(if output.iter().any(|o| matches!(o, Output::Refusal(_))) {
-        Finish::Refusal
-    } else if output.iter().any(|o| matches!(o, Output::ToolCall(_))) {
-        Finish::ToolCalls
-    } else {
-        Finish::Stop
-    })
+    Ok(
+        if output.iter().any(|o| matches!(o, ContentPart::Refusal(_))) {
+            Finish::Refusal
+        } else if output.iter().any(|o| matches!(o, ContentPart::ToolCall(_))) {
+            Finish::ToolCalls
+        } else {
+            Finish::Stop
+        },
+    )
 }
 
 fn incomplete(details: &Value) -> Result<Finish, Error> {

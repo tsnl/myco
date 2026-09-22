@@ -70,7 +70,7 @@ pub struct Request {
 pub enum Message {
     User(String),
     Assistant {
-        output: Vec<Output>,
+        content: Vec<ContentPart>,
     },
     ToolResult {
         call_id: String,
@@ -94,7 +94,7 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Output {
+pub enum ContentPart {
     Text(String),
     Reasoning {
         text: String,
