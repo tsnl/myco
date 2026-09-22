@@ -49,8 +49,8 @@ Workflow code in `logic` translates selected thread history into a `Request`
 and translates stream events into conversation entries. Every request supplies
 the complete history it wants the model to see; the backend rebuilds the provider
 request from that history. The `thread` module supplies history operations;
-each workflow chooses its context and publication policy. These modules are specified in
-[DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
+each workflow chooses its context and publication policy. Workflow logic is a
+subsequent implementation step in [DESIGN.md](../../DESIGN.md).
 
 Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
 assistant message, finish reason, and usage. Workflow code decides whether to

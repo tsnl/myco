@@ -7,10 +7,15 @@ The implementation is organized into separately reviewable steps in
 `thread`, `logic`, `service`, and `api` modules. The server and remote workers are
 planned binary targets; the browser GUI is a separate application.
 
-Implemented so far: [`myco::model`](src/model/README.md), with a concrete
-`GenAiClient`, private provider drivers, and a generation stream. Its entire
-[public interface](src/model/mod.rs) is in `mod.rs`. Thread history, workflow logic,
-services, and the HTTP API are subsequent review steps in the design.
+Implemented so far:
+
+- [`myco::model`](src/model/README.md): a concrete `GenAiClient`, private provider
+  drivers, and a generation stream.
+- [`myco::thread`](src/thread/README.md): owned history snapshots, fixed references,
+  forks, and an injected store with an in-memory implementation.
+
+Each module's public interface lives in its `mod.rs`. Workflow logic, durable
+storage, services, and the HTTP API are subsequent review steps in the design.
 
 ```sh
 cargo test --locked --offline --workspace

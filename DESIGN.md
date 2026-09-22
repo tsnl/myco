@@ -262,12 +262,19 @@ impl Thread {
 Owned values use dense vectors. Cloning copies that value's entries and provenance,
 preserving identity and revision; it grants no writer and does not recursively
 copy referenced threads. The kernel chooses the storage format.
+`Thread::from_parts` restores a snapshot for storage implementations without
+publishing it.
 
 `thread` owns the canonical conversation entries: user and assistant messages,
 tool results, system information, warnings, errors, and notifications. Its content
 types are independent of inference types. A stored entry need not appear in a
 model prompt. Workflow code chooses how to render it or retain it only for humans.
 Thread data has no agent policy, foreground selection, or live operation state.
+Assistant entries can carry an `EvidenceId` referencing an immutable inference
+record. The workflow persists and retains the complete model message there,
+including signed/encrypted reasoning, before publishing the reference. It resolves
+that evidence when constructing model context. Thread storage preserves the
+reference without depending on model types or owning evidence storage.
 
 `thread::Threads` exposes history operations through an injected store:
 
@@ -275,18 +282,29 @@ Thread data has no agent policy, foreground selection, or live operation state.
 impl Threads {
     pub fn new(store: Arc<dyn ThreadStore>) -> Self;
 
-    pub async fn create(&self, request: CreateThread) -> Result<ThreadVersion, ThreadError>;
-    pub async fn read(&self, version: ThreadVersion) -> Result<Thread, ThreadError>;
-    pub async fn append(&self, request: AppendEntries) -> Result<ThreadVersion, ThreadError>;
-    pub async fn fork(&self, request: ForkThread) -> Result<ThreadVersion, ThreadError>;
+    pub async fn create(&self, request: CreateThread) -> Result<ThreadVersion, Error>;
+    pub async fn read(&self, version: ThreadVersion) -> Result<Thread, Error>;
+    pub async fn append(&self, request: AppendEntries) -> Result<ThreadVersion, Error>;
+    pub async fn fork(&self, request: ForkThread) -> Result<ThreadVersion, Error>;
+    pub async fn operation(&self, id: OperationId) -> Result<Option<OperationStatus>, Error>;
+    pub async fn cancel(&self, id: OperationId) -> Result<OperationStatus, Error>;
 }
 ```
 
-Mutation requests carry an operation ID and the expected revisions of existing
-threads. `ThreadStore` is a narrow, dyn-compatible storage interface defined by
+Callers assign thread and operation IDs. Create carries entries and fixed source
+references; fork carries a fixed source version and prefix length. Append carries
+entries and an expected version. `ThreadStore` is a dyn-compatible interface defined by
 `thread`. It loads history and atomically publishes mutations with their receipts.
-The kernel supplies its implementation. Create and fork return new identities;
-append preserves identity and advances the revision.
+`MemoryStore` implements this contract in-process; the kernel supplies durable
+storage. Create and fork publish revision zero under new IDs; each nonempty append
+preserves identity and advances the revision once.
+
+Receipts retain committed, cancelled, or rejected outcomes. Retrying the same
+operation returns its original outcome; reusing its ID for a different mutation
+fails. Cancellation recorded first prevents publication; cancellation after a
+terminal outcome reports that outcome. A missing receipt or store error can leave
+work unresolved. These operations govern history publication; workflow code
+separately supervises inference and tools.
 
 Publication is serialized per thread. Reading and forking published history do
 not wait for inference. Workflow code decides whether to queue competing input
