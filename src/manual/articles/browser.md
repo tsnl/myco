@@ -35,7 +35,8 @@ falling rain. Hidden tabs pause animation and airplane arrivals.
 The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
 with its MIT license retained in the served source.
 
-**Sky** opens the weather settings. Choose a city or explicitly select **Use my
+The **Settings** icon in the top bar opens a centered modal. Its **Sky** section
+contains the weather controls. Choose a city or explicitly select **Use my
 location** to reflect its current cloud cover, rain, showers, and wind from
 [Open-Meteo](https://open-meteo.com/en/docs). The panel names the reported weather
 condition. The layers roughly represent below 3 km,

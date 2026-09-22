@@ -6,7 +6,8 @@ never participates in session state or conversation requests.
 
 | Module | Responsibility |
 | --- | --- |
-| `sky-settings.js` | Location selection, persistence, refresh, and stale-weather fallback |
+| `settings.js` | Shared Settings modal, keyboard dismissal, and focus restoration |
+| `sky-settings.js` | Sky section controls, location persistence, refresh, and stale-weather fallback |
 | `sky-weather.js` | Weather descriptions, precipitation units, and illustrated defaults |
 | `sky-light.js` | Pure sampling of clock and weather into colors, light direction, and visibility |
 | `sky-atmosphere.js` | Gradient, diffuse glow, and stars |

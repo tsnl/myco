@@ -207,6 +207,36 @@ context_window = 100000
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
 
+    def test_settings_contains_sky_and_restores_focus_on_home_and_session(self):
+        page = self.page
+        for view in ["home", "session"]:
+            if view == "session":
+                self.session(page)
+            with self.subTest(view=view):
+                toggle = page.get_by_role("button", name="Settings", exact=True)
+                dialog = page.get_by_role("dialog", name="Settings", exact=True)
+                expect(toggle).to_be_visible()
+                expect(page.locator(".toolbar").get_by_role("button", name="Sky", exact=True)).to_have_count(0)
+                expect(page.locator("#sky-city")).to_be_hidden()
+                for dismiss in ["close", "escape", "outside"]:
+                    toggle.click()
+                    expect(dialog).to_be_visible()
+                    expect(toggle).to_have_attribute("aria-expanded", "true")
+                    expect(dialog.get_by_role("heading", name="Sky", exact=True)).to_be_visible()
+                    expect(page.get_by_role("button", name="Close settings")).to_be_focused()
+                    page.keyboard.press("Tab")
+                    expect(page.locator("#sky-city")).to_be_focused()
+                    if dismiss == "close":
+                        page.get_by_role("button", name="Close settings").click()
+                    elif dismiss == "escape":
+                        page.fill("#sky-city", "London")
+                        page.keyboard.press("Escape")
+                    else:
+                        page.mouse.click(4, 4)
+                    expect(dialog).to_be_hidden()
+                    expect(toggle).to_have_attribute("aria-expanded", "false")
+                    expect(toggle).to_be_focused()
+
     def test_sky_city_drives_altitude_layers_and_persists_across_navigation(self):
         page = self.page
         calls = []
@@ -223,7 +253,7 @@ context_window = 100000
         expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
         self.assertEqual(calls, [], "Illustrated skies must not request a location or weather")
         page.emulate_media(reduced_motion="reduce")
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         page.fill("#sky-city", "London")
         page.press("#sky-city", "Enter")
         page.get_by_role("button", name="London, England, United Kingdom", exact=True).click()
@@ -237,7 +267,7 @@ context_window = 100000
         page.press("#sky-city", "Escape")
         self.session(page)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         expect(page.locator("#sky-status")).to_contain_text("London")
         page.click("#sky-reset")
         expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
@@ -260,14 +290,14 @@ context_window = 100000
         page.clock.fast_forward(15 * 60 * 1000)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "stale")
         expect(page.locator("#sky-rain")).to_be_visible()
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         expect(page.locator("#sky-status")).to_contain_text("last available")
         expect(page.locator("#sky-error")).to_contain_text("Weather unavailable")
         page.clock.fast_forward(2 * 60 * 60 * 1000)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
         expect(page.locator("#sky-coverage")).to_be_hidden()
         expect(page.locator("#sky-rain")).to_be_hidden()
-        page.click("#sky-close")
+        page.click("#settings-close")
         self.session(page)
         self.submit(page, "Alpha markdown")
         expect(page.locator("#model")).to_be_enabled()
@@ -282,16 +312,16 @@ context_window = 100000
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
         self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationPlayState"), "paused")
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         page.evaluate("() => { navigator.geolocation.getCurrentPosition = (_ok, fail) => fail({code: 1}); }")
         page.click("#sky-locate")
         expect(page.locator("#sky-error")).to_contain_text("Location unavailable")
         self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
-        rect = page.locator("#sky-settings").bounding_box()
+        rect = page.locator("#settings").bounding_box()
         self.assertGreaterEqual(rect["x"], 0)
         self.assertLessEqual(rect["x"] + rect["width"], 390)
         page.screenshot(path=str(self.artifacts / "sky-settings-mobile.png"))
-        page.click("#sky-close")
+        page.click("#settings-close")
         self.session(page)
         self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
 
@@ -299,7 +329,7 @@ context_window = 100000
         anonymous = self.playwright.request.new_context()
         try:
             for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
-                         "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js"]:
+                         "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js", "/settings.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401)
         finally:
             anonymous.dispose()
@@ -317,7 +347,7 @@ context_window = 100000
         page.reload()
         rain = page.locator("#sky-rain")
         expect(rain).to_be_visible()
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         expect(page.locator("#sky-conditions")).to_have_text("Rain")
         sheet = rain.locator(".rain-sheet").first
         opacity = sheet.evaluate("n => getComputedStyle(n).opacity")
@@ -360,9 +390,9 @@ context_window = 100000
         page.emulate_media(reduced_motion="reduce")
         expect(rain).to_be_hidden()
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
-        page.click("#sky-toggle")
+        page.click("#settings-toggle")
         expect(page.locator("#sky-conditions")).to_have_text("Heavy rain")
-        page.click("#sky-close")
+        page.click("#settings-close")
         page.emulate_media(reduced_motion="no-preference")
         expect(rain).to_be_visible()
         self.session(page)

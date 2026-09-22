@@ -4,6 +4,7 @@ import { createRain } from '/rain.js';
 import { createAircraft } from '/aircraft.js';
 import { sampleSky } from '/sky-light.js';
 import { skySettings } from '/sky-settings.js';
+import { createSettings } from '/settings.js';
 
 // One scene per document. Weather changes coverage and wind; the minute clock
 // only updates lighting. Hidden tabs defer painting until they become visible.
@@ -36,4 +37,4 @@ function visibility() {
 document.addEventListener('visibilitychange', visibility);
 visibility();
 setInterval(updateSky, 60000);
-skySettings(next => { forecast = next; updateSky(true); });
+skySettings(createSettings(), next => { forecast = next; updateSky(true); });

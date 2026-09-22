@@ -30,17 +30,11 @@ async function request(path, signal) {
 // Weather controls
 //
 
-function controls() {
-  const button = document.createElement('button');
-  button.id = 'sky-toggle'; button.type = 'button'; button.textContent = 'Sky';
-  button.setAttribute('aria-haspopup', 'dialog');
-  button.setAttribute('aria-controls', 'sky-settings');
-  button.setAttribute('aria-expanded', 'false');
-  document.querySelector('.toolbar-tools').append(button);
-  const dialog = document.createElement('dialog');
-  dialog.id = 'sky-settings'; dialog.setAttribute('aria-labelledby', 'sky-heading');
-  dialog.innerHTML = `
-    <div class="sky-heading"><h2 id="sky-heading">Your sky</h2><button id="sky-close" aria-label="Close sky settings">×</button></div>
+function controls(container) {
+  const section = document.createElement('section');
+  section.id = 'sky-settings'; section.setAttribute('aria-labelledby', 'sky-heading');
+  section.innerHTML = `
+    <h3 id="sky-heading">Sky</h3>
     <p id="sky-status" role="status"></p>
     <p id="sky-conditions" hidden></p>
     <dl id="sky-coverage" hidden><div><dt>High clouds</dt><dd id="sky-high"></dd></div><div><dt>Middle clouds</dt><dd id="sky-mid"></dd></div><div><dt>Low clouds</dt><dd id="sky-low"></dd></div></dl>
@@ -49,24 +43,12 @@ function controls() {
     <div class="sky-actions"><button id="sky-locate">Use my location</button><button id="sky-reset">Illustrated sky</button></div>
     <p id="sky-error" role="status"></p>
     <div class="sky-attribution">Weather from <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a> · Locations from <a href="https://www.geonames.org/" target="_blank" rel="noopener noreferrer">GeoNames</a>.<p>City searches and approximate coordinates go to Open-Meteo. Your choice is saved in this browser.</p></div>`;
-  document.body.append(dialog);
-  button.onclick = () => { dialog.showModal(); button.setAttribute('aria-expanded', 'true'); };
-  dialog.addEventListener('close', () => button.setAttribute('aria-expanded', 'false'));
-  dialog.querySelector('#sky-close').onclick = () => dialog.close();
-  dialog.addEventListener('keydown', event => {
-    if (event.key === 'Escape') { event.preventDefault(); dialog.close(); }
-  });
-  dialog.addEventListener('click', event => { if (event.target === dialog && !inside(dialog, event)) dialog.close(); });
-  return id => dialog.querySelector(`#sky-${id}`);
+  container.append(section);
+  return id => section.querySelector(`#sky-${id}`);
 }
 
-function inside(dialog, event) {
-  const rect = dialog.getBoundingClientRect();
-  return event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
-}
-
-export function skySettings(onChange) {
-  const $ = controls();
+export function skySettings(container, onChange) {
+  const $ = controls(container);
   let location = savedLocation(), forecast = null, controller, searchController;
   let refreshed = 0, selection = 0;
 
@@ -80,7 +62,6 @@ export function skySettings(onChange) {
     $('conditions').textContent = active ? weatherDescription(forecast.current) : '';
     if (active) for (const layer of ['high', 'mid', 'low']) $(layer).textContent = `${Math.round(forecast.current[`cloud_cover_${layer}`])}%`;
     document.querySelector('#sky').dataset.weather = state;
-    document.querySelector('#sky-toggle').title = active ? `Sky over ${location.name}` : 'Choose your sky';
     onChange(active ? forecast : null);
   }
 
