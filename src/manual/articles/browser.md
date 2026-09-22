@@ -15,6 +15,15 @@ this browser into this server; keep that URL private. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
 
+The browser uses square-edged translucent panels over a locally rendered sky.
+The conversation stays in a central well, with the sky visible on both sides;
+floating controls use background blur. The sky follows the browser's local clock,
+updates once a minute, and adds subtle twinkling stars at night. This is an
+approximate day/night cycle, not location or weather data. Reduced-motion settings
+keep the stars still. No location permission or external request is needed.
+The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
+with its MIT license retained in the served source.
+
 `--web-bind 0.0.0.0` listens on every interface, so the UI answers any machine
 that can route here, under whatever name they dial. The launch token is then the
 only thing between them and these sessions — and a session is a shell on your

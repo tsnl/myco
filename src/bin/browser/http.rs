@@ -106,6 +106,16 @@ pub(super) fn router(server: Arc<Server>) -> Router {
             "text/css; charset=utf-8",
             include_str!("assets/style.css"),
         ),
+        (
+            "/sky.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/sky.js"),
+        ),
+        (
+            "/horizon.js",
+            "text/javascript; charset=utf-8",
+            include_str!("assets/horizon.js"),
+        ),
     ] {
         router = router.route(
             path,
