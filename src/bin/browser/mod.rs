@@ -1,11 +1,11 @@
-//! Loopback browser frontend. The worker owns the runner and session lock;
+//! Loopback browser frontend. Each session worker owns its runner and writer lock;
 //! browser connections only observe it and never own the lifetime of a turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response, Sse, sse};
@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use super::{Args, Boot, Session, WorkflowEvent, boot, persist_session};
+use super::{
+    Args, Boot, Config, Session, StartupPreflight, WorkflowEvent, boot_session, persist_session,
+};
 
 mod markdown;
 #[cfg(test)]
@@ -58,14 +60,12 @@ struct Live {
 
 #[derive(Clone, Serialize)]
 struct Update {
+    session_id: String,
     revision: u64,
     change: Value,
 }
 
 struct App {
-    token: String,
-    origin: String,
-    cookie: String,
     live: Mutex<Live>,
     events: broadcast::Sender<Arc<Update>>,
     work: mpsc::Sender<Work>,
@@ -83,6 +83,7 @@ impl App {
     fn publish(&self, snapshot: &mut Snapshot, change: Value) {
         snapshot.revision += 1;
         let _ = self.events.send(Arc::new(Update {
+            session_id: snapshot.session_id.clone(),
             revision: snapshot.revision,
             change,
         }));
@@ -91,6 +92,7 @@ impl App {
     fn snapshot(&self) -> Update {
         let live = self.live.lock().unwrap();
         Update {
+            session_id: live.snapshot.session_id.clone(),
             revision: live.snapshot.revision,
             change: json!({"kind":"snapshot", "snapshot":live.snapshot}),
         }
@@ -235,8 +237,6 @@ fn same_tool(a: &ToolUse, b: &ToolUse) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     Submit { text: String },
-    New,
-    Open { id: String },
     Compact,
     SelectModel { key: String },
 }
@@ -254,70 +254,191 @@ struct Work {
     cancel: CancelToken,
 }
 
+struct RunningSession {
+    app: Arc<App>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+struct Server {
+    token: String,
+    origin: String,
+    cookie: String,
+    launch_path: String,
+    args: Arc<Args>,
+    config: Config,
+    preflight: StartupPreflight,
+    sessions: tokio::sync::Mutex<HashMap<String, RunningSession>>,
+    events: broadcast::Sender<Arc<Update>>,
+    shutdown: CancelToken,
+}
+
+impl Server {
+    async fn open(&self, id: &str) -> ApiResult<Arc<App>> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(id) {
+            return Ok(session.app.clone());
+        }
+        let id = id.to_owned();
+        let session = tokio::task::spawn_blocking(move || Session::load_by_id_or_prefix(&id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+        self.start(&mut sessions, session).await
+    }
+
+    async fn start(
+        &self,
+        sessions: &mut HashMap<String, RunningSession>,
+        session: Session,
+    ) -> ApiResult<Arc<App>> {
+        if self.shutdown.is_cancelled() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The server is stopping.".into(),
+            ));
+        }
+        if let Some(running) = sessions.get(&session.id) {
+            return Ok(running.app.clone());
+        }
+        let catalog = self
+            .config
+            .models
+            .get(&self.config.model)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .clone();
+        let (work, receiver) = mpsc::channel(1);
+        let (mut boot, app) = boot_session(
+            &self.args,
+            self.config.clone(),
+            catalog,
+            self.preflight.clone(),
+            session,
+            |config, _, session| {
+                let session = session.snapshot();
+                Arc::new(App {
+                    live: Mutex::new(Live {
+                        snapshot: Snapshot {
+                            revision: 0,
+                            session_id: session.id.clone(),
+                            thread_id: session.active_thread().id.clone(),
+                            title: session
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| "New session".into()),
+                            model: config.model.clone(),
+                            models: config
+                                .models
+                                .keys()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect(),
+                            busy: false,
+                            status: "Ready".into(),
+                            tasks: vec![],
+                            blocks: view::history(session.active_thread()),
+                        },
+                        cancel: None,
+                        accepted: HashMap::new(),
+                    }),
+                    events: self.events.clone(),
+                    work,
+                    shutdown: CancelToken::new(),
+                })
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+        // New browser sessions need a durable URL before their first message.
+        let session = boot.session.snapshot();
+        boot.session
+            .persist_agent_state(
+                &session.active_thread().id,
+                boot.runner.agent().state(),
+                !session.json_path().exists(),
+                None,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        app.sync(&boot, "Ready", true);
+        if boot.preflight.has_problems() {
+            app.notice(boot.preflight.warning_body());
+        }
+        let observer = app.clone();
+        boot.runner.set_observer(Arc::new(move |event| match event {
+            WorkflowEvent::Compacting { automatic, .. } => observer.notice(if automatic {
+                "Compacting automatically…"
+            } else {
+                "Compacting…"
+            }),
+            WorkflowEvent::Compacted(_) => observer.notice("Compaction complete."),
+            WorkflowEvent::Warning(text) => observer.notice(text),
+            WorkflowEvent::CompactionProgress { .. } => {}
+        }));
+        let id = boot.session.id();
+        let worker = tokio::spawn(worker(boot, app.clone(), receiver, self.args.clone()));
+        sessions.insert(
+            id,
+            RunningSession {
+                app: app.clone(),
+                worker,
+            },
+        );
+        Ok(app)
+    }
+
+    async fn snapshots(&self) -> VecDeque<Update> {
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .map(|session| session.app.snapshot())
+            .collect()
+    }
+
+    async fn stop(&self) {
+        self.shutdown.cancel();
+        for session in self.sessions.lock().await.values() {
+            session.app.stop();
+        }
+    }
+}
+
 pub(super) async fn run(args: Args) -> Result<(), String> {
     let listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.web.unwrap()))
             .await
             .map_err(|e| format!("cannot listen for browser UI: {e}"))?;
-    let origin = format!(
-        "http://{}",
-        listener.local_addr().map_err(|e| e.to_string())?
-    );
-    let (work, receiver) = mpsc::channel(1);
-    let (mut boot, app) = boot(&args, |config, _, session| {
-        let session = session.snapshot();
-        Arc::new(App {
-            token: Uuid::new_v4().as_simple().to_string(),
-            cookie: format!("myco_{}", listener.local_addr().unwrap().port()),
-            origin,
-            live: Mutex::new(Live {
-                snapshot: Snapshot {
-                    revision: 0,
-                    session_id: session.id.clone(),
-                    thread_id: session.active_thread().id.clone(),
-                    title: session
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "New session".into()),
-                    model: config.model.clone(),
-                    models: config
-                        .models
-                        .keys()
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect(),
-                    busy: false,
-                    status: "Ready".into(),
-                    tasks: vec![],
-                    blocks: view::history(session.active_thread()),
-                },
-                cancel: None,
-                accepted: HashMap::new(),
-            }),
-            events: broadcast::channel(256).0,
-            work,
-            shutdown: CancelToken::new(),
-        })
-    })
-    .await;
-    app.sync(&boot, "Ready", true);
-    if boot.preflight.has_problems() {
-        app.notice(boot.preflight.warning_body());
+    let address = listener.local_addr().map_err(|e| e.to_string())?;
+    let (config, catalog, preflight) = super::prepare_boot(&args);
+    let initial = (args.resume.is_some() || args.parent_session.is_some())
+        .then(|| super::initial_session_or_exit(&args, &catalog.spec.key));
+    let launch_path = initial
+        .as_ref()
+        .map_or_else(|| "/".into(), |s| format!("/sessions/{}", s.id));
+    let server = Arc::new(Server {
+        token: Uuid::new_v4().as_simple().to_string(),
+        cookie: format!("myco_{}", address.port()),
+        origin: format!("http://{address}"),
+        launch_path,
+        args: Arc::new(args),
+        config,
+        preflight,
+        sessions: tokio::sync::Mutex::new(HashMap::new()),
+        events: broadcast::channel(256).0,
+        shutdown: CancelToken::new(),
+    });
+    if let Some(session) = initial {
+        server
+            .start(&mut *server.sessions.lock().await, session)
+            .await
+            .map_err(|(_, e)| e)?;
     }
-    let observer = app.clone();
-    boot.runner.set_observer(Arc::new(move |event| match event {
-        WorkflowEvent::Compacting { automatic, .. } => observer.notice(if automatic {
-            "Compacting automatically…"
-        } else {
-            "Compacting…"
-        }),
-        WorkflowEvent::Compacted(_) => observer.notice("Compaction complete."),
-        WorkflowEvent::Warning(text) => observer.notice(text),
-        WorkflowEvent::CompactionProgress { .. } => {}
-    }));
     let router = Router::new()
         .route(
             "/",
+            get(|| async { Html(include_str!("assets/home.html")) }),
+        )
+        .route(
+            "/sessions/{id}",
             get(|| async { Html(include_str!("assets/index.html")) }),
         )
         .route(
@@ -326,6 +447,24 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("assets/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/home.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("assets/home.js"),
+                )
+            }),
+        )
+        .route(
+            "/events.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("assets/events.js"),
                 )
             }),
         )
@@ -339,33 +478,44 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
             }),
         )
         .route("/api/events", get(events))
-        .route("/api/action", post(action))
-        .route("/api/cancel", post(cancel))
-        .route("/api/sessions", get(sessions))
+        .route("/api/sessions", get(sessions).post(create_session))
+        .route("/api/sessions/{id}", get(session_snapshot))
+        .route("/api/sessions/{id}/action", post(session_action))
+        .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
-        .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
+        .route_layer(middleware::from_fn_with_state(server.clone(), authorize))
         .route("/auth", get(auth))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(headers))
-        .with_state(app.clone());
-    println!("Browser UI: {}/auth?token={}", app.origin, app.token);
-    println!("Press Ctrl-C here to stop the server. Browser refreshes keep the current run alive.");
-    let worker = tokio::spawn(worker(boot, app.clone(), receiver, args));
-    let shutdown = app.clone();
+        .with_state(server.clone());
+    println!("Browser UI: {}/auth?token={}", server.origin, server.token);
+    println!("Press Ctrl-C here to stop the server. Browser tabs keep independent sessions alive.");
+    let shutdown = server.clone();
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
-            shutdown.stop();
+            shutdown.stop().await;
         })
         .await
         .map_err(|e| e.to_string());
-    app.stop();
-    worker.await.map_err(|e| format!("browser worker: {e}"))?;
+    server.stop().await;
+    let workers = std::mem::take(&mut *server.sessions.lock().await);
+    for session in workers.into_values() {
+        session
+            .worker
+            .await
+            .map_err(|e| format!("browser worker: {e}"))?;
+    }
     result
 }
 
-async fn worker(mut boot: Boot, app: Arc<App>, mut receiver: mpsc::Receiver<Work>, args: Args) {
+async fn worker(
+    mut boot: Boot,
+    app: Arc<App>,
+    mut receiver: mpsc::Receiver<Work>,
+    args: Arc<Args>,
+) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -431,14 +581,6 @@ async fn execute(boot: &mut Boot, app: &App, work: Work, args: &Args) -> Result<
             .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
-        Action::New => {
-            let session = Session::new(boot.catalog_model.spec.key.clone());
-            switch(boot, session).await
-        }
-        Action::Open { id } => match Session::load_by_id_or_prefix(&id) {
-            Ok(session) => switch(boot, session).await,
-            Err(error) => Err(error),
-        },
         Action::SelectModel { key } => {
             let catalog = boot.app_config.models.get(&key)?.clone();
             super::select_runner_model(
@@ -456,38 +598,7 @@ async fn execute(boot: &mut Boot, app: &App, work: Work, args: &Args) -> Result<
     }
 }
 
-async fn switch(boot: &mut Boot, loaded: Session) -> Result<(), String> {
-    if loaded.id == boot.session.id() {
-        return Ok(());
-    }
-    myco::agent::validate_checkpoint(
-        &loaded.active_thread().messages,
-        loaded.active_thread().pending_operation,
-    )
-    .map_err(|e| e.to_string())?;
-    if !boot.runner.agent().state().is_idle() {
-        return Err("The current session has an outstanding operation.".into());
-    }
-    persist_session(boot.runner.agent(), &boot.session, false)?;
-    let lock = super::lock_session_or_report(&loaded.id)?;
-    let previous = boot.session.snapshot();
-    let previous_runtime = boot.runner.runtime().clone();
-    boot.session.replace(loaded);
-    let runtime = myco::SessionRuntime::new(boot.harness.clone(), boot.session.clone());
-    runtime.set_max_image_base64_bytes(boot.catalog_model.spec.max_image_base64_bytes);
-    if let Err(error) = boot.runner.bind_runtime(runtime).await {
-        boot.session.replace(previous);
-        boot.runner
-            .bind_runtime(previous_runtime)
-            .await
-            .map_err(|e| format!("Session switch failed: {error}; restore failed: {e}"))?;
-        return Err(error.to_string());
-    }
-    boot.session_lock = lock;
-    Ok(())
-}
-
-fn allowed(headers: &HeaderMap, app: &App, mutation: bool) -> bool {
+fn allowed(headers: &HeaderMap, app: &Server, mutation: bool) -> bool {
     headers.get(header::HOST).and_then(|v| v.to_str().ok()) == app.origin.strip_prefix("http://")
         && (!mutation
             || headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
@@ -502,7 +613,7 @@ fn allowed(headers: &HeaderMap, app: &App, mutation: bool) -> bool {
             })
 }
 
-async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+async fn authorize(State(app): State<Arc<Server>>, request: Request, next: Next) -> Response {
     if !allowed(
         request.headers(),
         &app,
@@ -537,7 +648,7 @@ async fn headers(request: Request, next: Next) -> Response {
 }
 
 async fn auth(
-    State(app): State<Arc<App>>,
+    State(app): State<Arc<Server>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult<Response> {
@@ -546,7 +657,7 @@ async fn auth(
     {
         return Err((StatusCode::UNAUTHORIZED, "Invalid launch URL.".into()));
     }
-    let mut response = Redirect::to("/").into_response();
+    let mut response = Redirect::to(&app.launch_path).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         format!(
@@ -560,37 +671,92 @@ async fn auth(
 }
 
 async fn events(
-    State(app): State<Arc<App>>,
+    State(server): State<Arc<Server>>,
 ) -> Sse<impl futures::Stream<Item = Result<sse::Event, Infallible>>> {
-    let receiver = app.events.subscribe();
-    let initial = app.snapshot();
+    let receiver = server.events.subscribe();
+    let initial = server.snapshots().await;
     let stream = futures::stream::unfold(
-        (app, receiver, Some(initial), 0),
-        |(app, mut receiver, mut initial, mut cursor)| async move {
+        (server, receiver, initial),
+        |(server, mut receiver, mut initial)| async move {
             loop {
-                let update = if let Some(initial) = initial.take() {
+                let update = if let Some(initial) = initial.pop_front() {
                     initial
                 } else {
                     tokio::select! {
-                        _ = app.shutdown.cancelled() => return None,
+                        _ = server.shutdown.cancelled() => return None,
                         next = receiver.recv() => match next {
-                            Ok(update) if update.revision > cursor => (*update).clone(),
-                            Ok(_) => continue,
-                            Err(broadcast::error::RecvError::Lagged(_)) => app.snapshot(),
+                            Ok(update) => (*update).clone(),
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                initial = server.snapshots().await;
+                                continue;
+                            }
                             Err(broadcast::error::RecvError::Closed) => return None,
                         },
                     }
                 };
-                cursor = update.revision;
-                let event = sse::Event::default()
-                    .id(cursor.to_string())
-                    .json_data(update)
-                    .unwrap();
-                return Some((Ok(event), (app, receiver, initial, cursor)));
+                let event = sse::Event::default().json_data(update).unwrap();
+                return Some((Ok(event), (server, receiver, initial)));
             }
         },
     );
     Sse::new(stream).keep_alive(sse::KeepAlive::default())
+}
+
+async fn session_snapshot(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Update>> {
+    Ok(Json(server.open(&id).await?.snapshot()))
+}
+
+async fn session_action(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<ActionRequest>,
+) -> ApiResult<StatusCode> {
+    if request.session_id != id {
+        return Err((
+            StatusCode::CONFLICT,
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    action(State(server.open(&id).await?), Json(request)).await
+}
+
+async fn session_cancel(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<SessionRequest>,
+) -> ApiResult<StatusCode> {
+    if request.session_id != id {
+        return Err((
+            StatusCode::CONFLICT,
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    cancel(State(server.open(&id).await?), Json(request)).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSession {
+    request_id: Uuid,
+}
+
+async fn create_session(
+    State(server): State<Arc<Server>>,
+    Json(request): Json<CreateSession>,
+) -> ApiResult<Json<Value>> {
+    // The request id is also the session id, so a retry cannot create a second session.
+    let session = Session::new_with_id(
+        &server.config.model,
+        request.request_id.as_simple().to_string(),
+    );
+    let id = session.id.clone();
+    server
+        .start(&mut *server.sessions.lock().await, session)
+        .await?;
+    Ok(Json(json!({"id": id})))
 }
 
 async fn action(
@@ -617,7 +783,7 @@ async fn action(
     if request.session_id != live.snapshot.session_id {
         return Err((
             StatusCode::CONFLICT,
-            "The active session changed. Reconnect before sending.".into(),
+            "The request belongs to a different session.".into(),
         ));
     }
     if live.snapshot.busy {
@@ -661,7 +827,10 @@ async fn cancel(
 ) -> ApiResult<StatusCode> {
     let mut live = app.live.lock().unwrap();
     if request.session_id != live.snapshot.session_id {
-        return Err((StatusCode::CONFLICT, "The active session changed.".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "The request belongs to a different session.".into(),
+        ));
     }
     if let Some(cancel) = &live.cancel {
         cancel.cancel();
@@ -672,17 +841,21 @@ async fn cancel(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn sessions() -> ApiResult<Json<Value>> {
-    let sessions = tokio::task::spawn_blocking(|| myco::session::list_sessions(50))
+async fn sessions(State(server): State<Arc<Server>>) -> ApiResult<Json<Value>> {
+    let sessions = tokio::task::spawn_blocking(|| myco::session::list_sessions(0))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!(
-        sessions
-            .into_iter()
-            .map(|s| json!({"id":s.id, "title":s.title.unwrap_or(s.snippet), "model":s.model}))
-            .collect::<Vec<_>>()
-    )))
+    let running = server.sessions.lock().await;
+    Ok(Json(json!(sessions.into_iter().map(|s| {
+        let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
+        json!({
+            "id": s.id, "title": s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet }),
+            "model": live.as_ref().map_or(s.model.as_str(), |live| &live.snapshot.model),
+            "updated_at": s.updated_at, "message_count": s.message_count,
+            "status": live.as_ref().map_or("Saved", |live| if live.snapshot.busy { "Running" } else if !live.snapshot.tasks.is_empty() { "Background tasks" } else { "Ready" }),
+        })
+    }).collect::<Vec<_>>())))
 }
 
 #[derive(Deserialize)]

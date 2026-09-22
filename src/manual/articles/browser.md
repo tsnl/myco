@@ -13,6 +13,12 @@ to `127.0.0.1`. Its launch URL signs this browser into this server; keep that
 URL private. Assets and Markdown rendering are bundled with myco, with no
 frontend build step or CDN. Stop the server with Ctrl-C in the launching terminal.
 
+The home page lists your visible, unarchived sessions, with search, recent update
+times, and running status. **New session** creates a session and opens its own
+`/sessions/<id>` URL. Session links work with bookmarks, middle-click, and browser
+tab groups. Click the myco name to return home. `--resume <id>` opens that session
+directly from the launch URL.
+
 The browser uses the same model configuration, profile, session store, tools,
 and compaction runner as the CLI. `--model`, `--effort`, `--profile`, `--config`,
 and `--resume <id>` apply at startup. Bare `--resume` and print/host modes do
@@ -60,24 +66,32 @@ the change in the session. An unavailable model leaves the current selection
 unchanged and shows an error. The selector does not change the configured
 startup default.
 
-The session picker opens a recent visible session. **New** starts a fresh session;
-**Compact** creates a successor thread in the current session. These controls
-also accept `/new`, `/compact`, and `/resume <id>` in the input. Other CLI slash
-commands are not available in this frontend.
+**New** opens a fresh session in the current tab; the previous session continues
+running on the server. **Compact** creates a successor thread without changing
+the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
+in the input; `/resume` navigates only the current tab. Other CLI slash commands
+are not available in this frontend.
 
 ## Running and resuming
 
-One server owns one active session at a time. Multiple tabs observe that same
-session, and session controls are disabled during a turn. Another CLI or browser
-server cannot write a session while this server holds its writer lock.
+One server can run several sessions concurrently. Each has its own runner, model
+selection, cancellation, tool state, and writer lock. Tabs on different session
+URLs work independently; tabs on the same URL observe the same run. Changing a
+model or compacting is disabled during that session's turn. Another CLI or browser
+server cannot write an opened session while this server holds its writer lock.
+An unavailable or locked session shows an error without interrupting other tabs.
 
-Refreshing or closing the browser does not cancel an active turn. Reopening the
-launch URL reconnects to the running server and its current output. **Cancel run**
-or Ctrl-C in the server terminal cancels the turn. Request retries do not submit
-the same action twice. If submission fails, the input draft remains available.
+Refreshing, navigating away, or closing a tab does not cancel its active turn.
+Reopening its session URL reconnects to its output and live tools. **Cancel run**
+affects only that session; Ctrl-C in the server terminal cancels all active turns.
+Opened sessions and their locks stay alive until the server stops. Request retries
+do not submit the same action or create the same session twice. If submission
+fails, the input draft remains available. Tabs share a live-output connection
+through a browser SharedWorker so a tab group does not exhaust HTTP connections.
 
 Restarting the server and resuming a saved session restores conversation history,
 not old bash processes or editor state. Uncertain tool outcomes from an
 interrupted process are recorded without rerunning their effects. Compaction
-within a running session preserves live tools; switching sessions gives the
-new session its own runtime.
+within a running session preserves live tools. After a server restart, open the
+new launch URL once to sign in again, then reopen your saved session URLs. Keep
+the same port to reuse bookmarks (`--web 0` chooses a new port each time).
