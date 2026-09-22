@@ -82,10 +82,12 @@ instances and observations.
 `GenAiClient::generate` validates and encodes the request synchronously, returning
 `Result<Generation<'_>, Error>`. A valid request produces a concrete stream
 implementing `Stream<Item = Result<Event, Error>>`; network I/O waits for polling.
-It yields the request before dispatch,
-ordered progress, and one `Completed(Response)` after validation. The caller can
+It yields the request before dispatch, ordered progress, and one
+`Completed { message, finish, usage }` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
+The returned assistant message holds content and provider continuation, ready to
+append to the next request. Finish reason and usage describe the generation.
 
 ## Workspaces and service APIs
 
@@ -325,8 +327,8 @@ pub enum TurnUpdate {
 
 `TurnUpdate` belongs to `logic`, not the history API. Deltas carry generation/
 attempt identity and content-block coordinates, including incomplete tool arguments.
-`model::Event::Completed(Response)` supplies a validated inference outcome. Workflow
-code records its evidence, checks conversation structure and correlation, and
+`model::Event::Completed { message, finish, usage }` supplies a validated inference
+outcome. Workflow code records its evidence, checks conversation structure and correlation, and
 appends it with the expected revision and operation receipt before yielding
 `Committed`. A refusal or output limit can be recorded as such; incomplete
 arguments never authorize tool execution.
