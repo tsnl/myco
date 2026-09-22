@@ -67,6 +67,7 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .tool summary { padding: 11px 15px; cursor: pointer; color: var(--tool-color); overflow-wrap: anywhere; }
 .tool-name { font-weight: 700; }
 .tool-status { margin-left: 12px; }
+.tool-duration { margin-left: 12px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tool-args { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 4px; color: var(--dim); }
 .tool-content { padding: 0 15px 10px; border-top: 1px solid #34302a; }
 .tool-label { display: block; margin-top: 12px; color: var(--dim); font-weight: 600; }

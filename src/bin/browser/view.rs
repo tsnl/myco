@@ -1,6 +1,9 @@
 //! Browser projection of recorded history and live events. Internal runtime
 //! content stays hidden; tool inputs and results remain individually inspectable.
 
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use myco::generative_model::{Content, Message, ToolResult, ToolUse};
 use myco::session::Thread;
@@ -8,6 +11,26 @@ use serde::Serialize;
 
 pub(super) fn timestamp(time: &DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Observed by this server process; historical calls have no measured duration.
+#[derive(Clone)]
+pub(super) struct ToolTimer {
+    started: Instant,
+    finished: Option<Duration>,
+}
+
+impl ToolTimer {
+    fn finish(&mut self) {
+        self.finished.get_or_insert_with(|| self.started.elapsed());
+    }
+}
+
+impl Serialize for ToolTimer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let elapsed = self.finished.unwrap_or_else(|| self.started.elapsed());
+        serializer.serialize_u64(elapsed.as_millis().try_into().unwrap_or(u64::MAX))
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -26,6 +49,8 @@ pub(super) enum Block {
         status: String,
         error: bool,
         running: bool,
+        #[serde(rename = "elapsed_ms", skip_serializing_if = "Option::is_none")]
+        timer: Option<ToolTimer>,
     },
     Notice {
         text: String,
@@ -43,7 +68,7 @@ impl Block {
         }
     }
 
-    pub fn tool(tool: ToolUse) -> Self {
+    pub fn tool(tool: ToolUse, started: Option<Instant>) -> Self {
         Self::Tool {
             tool,
             text: String::new(),
@@ -51,6 +76,10 @@ impl Block {
             status: "running".into(),
             error: false,
             running: true,
+            timer: started.map(|started| ToolTimer {
+                started,
+                finished: None,
+            }),
         }
     }
 
@@ -61,6 +90,7 @@ impl Block {
             status,
             error,
             running,
+            timer,
             ..
         } = self
         {
@@ -78,6 +108,31 @@ impl Block {
                     .and_then(|n| n.parse::<i32>().ok())
                     .is_some_and(|n| n != 0);
             *running = false;
+            if let Some(timer) = timer {
+                timer.finish();
+            }
+        }
+    }
+}
+
+/// Keep observations when rebuilding the same thread, matching repeated calls
+/// by occurrence. Calls loaded from disk must not acquire invented durations.
+pub(super) fn retain_tool_timers(blocks: &mut [Block], previous: &[Block]) {
+    let mut timers: HashMap<_, VecDeque<_>> = HashMap::new();
+    for block in previous {
+        if let Block::Tool { tool, timer, .. } = block {
+            timers
+                .entry((&tool.name, tool.input.to_string()))
+                .or_default()
+                .push_back(timer.clone().filter(|timer| timer.finished.is_some()));
+        }
+    }
+    for block in blocks {
+        if let Block::Tool { tool, timer, .. } = block {
+            *timer = timers
+                .get_mut(&(&tool.name, tool.input.to_string()))
+                .and_then(VecDeque::pop_front)
+                .flatten();
         }
     }
 }
@@ -134,7 +189,7 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
                 pending.clear();
                 for tool in tool_uses {
                     pending.push(blocks.len());
-                    blocks.push(Block::tool(tool.clone()));
+                    blocks.push(Block::tool(tool.clone(), None));
                 }
             }
             Message::ToolResults { tool_use_results } => {

@@ -11,6 +11,32 @@ let eventPort = null;
 const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length));
 const nodes = [];
 const markdownJobs = new WeakMap();
+const toolClocks = new WeakMap();
+
+function updateToolDuration(node, now = performance.now()) {
+  const elapsed = Number(node.dataset.elapsed) + (node.dataset.running === 'true' ? now - Number(node.dataset.observed) : 0);
+  const text = `${(Math.floor(Math.max(0, elapsed) / 100) / 10).toFixed(1)}s`;
+  if (node.textContent !== text) node.textContent = text;
+}
+function toolDuration(block) {
+  const node = element('span', 'tool-duration');
+  node.hidden = !Number.isFinite(block.elapsed_ms);
+  if (node.hidden) return node;
+  let clock = toolClocks.get(block);
+  if (!clock) { clock = { elapsed: block.elapsed_ms, observed: performance.now() }; toolClocks.set(block, clock); }
+  node.dataset.elapsed = clock.elapsed;
+  node.dataset.observed = clock.observed;
+  node.dataset.running = String(block.running);
+  node.title = block.running ? 'Tool execution time' : 'Total tool execution time';
+  updateToolDuration(node);
+  return node;
+}
+function updateToolDurations() {
+  const now = performance.now();
+  for (const node of document.querySelectorAll('.tool-duration[data-running="true"]')) updateToolDuration(node, now);
+}
+setInterval(updateToolDurations, 100);
+document.addEventListener('visibilitychange', updateToolDurations);
 
 function scrollLatest() { requestAnimationFrame(() => { if (follow) window.scrollTo({ top: document.documentElement.scrollHeight }); }); }
 window.addEventListener('scroll', () => {
@@ -108,7 +134,7 @@ function blockNode(block) {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
     const summary = element('summary');
-    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), element('span', 'tool-args', argumentPreview(block.tool.input)));
+    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block), element('span', 'tool-args', argumentPreview(block.tool.input)));
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
     if (block.text || block.images?.length) body.append(element('span', 'tool-label', 'Output'));
@@ -137,6 +163,14 @@ function replaceBlock(index, block, previous) {
     if (JSON.stringify(previous) === JSON.stringify(block)) {
       if (block.kind === 'message' && block.role !== 'user') markdown(nodes[index].querySelector('.body'), block.text);
       return;
+    }
+    if (block.kind === 'tool' && previous.kind === 'tool') {
+      const { elapsed_ms: elapsed, ...content } = block;
+      const { elapsed_ms: previousElapsed, ...previousContent } = previous;
+      if (JSON.stringify(content) === JSON.stringify(previousContent)) {
+        nodes[index].querySelector('.tool-duration').replaceWith(toolDuration(block));
+        return;
+      }
     }
     if (block.kind === 'message' && previous.kind === 'message' && block.role === previous.role && block.time === previous.time && JSON.stringify(block.images) === JSON.stringify(previous.images)) {
       const body = nodes[index].querySelector('.body');
@@ -233,7 +267,8 @@ function activity() {
   const list = $('activity-list'); list.replaceChildren();
   for (const { block, index } of calls) {
     const item = element('li');
-    const button = element('button', 'active-call', `${block.tool.name} ${argumentPreview(block.tool.input)}`);
+    const button = element('button', 'active-call');
+    button.append(element('span', '', block.tool.name), toolDuration(block), document.createTextNode(` ${argumentPreview(block.tool.input)}`));
     button.type = 'button';
     button.dataset.blockIndex = index;
     button.onclick = () => {
