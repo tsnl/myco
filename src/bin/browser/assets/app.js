@@ -7,6 +7,10 @@ let revision = -1;
 let follow = true;
 let pending = null;
 let selectingModel = false;
+let createId = null;
+let creating = false;
+let eventPort = null;
+const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length));
 const nodes = [];
 const markdownJobs = new WeakMap();
 
@@ -157,6 +161,7 @@ function snapshot(next) {
   }
   const sameSession = state.session_id === next.session_id && state.thread_id === next.thread_id;
   state = next;
+  history.replaceState(null, '', `/sessions/${encodeURIComponent(state.session_id)}`);
   nodes.length = 0; transcript.replaceChildren();
   for (const [index, block] of state.blocks.entries()) {
     replaceBlock(index, block);
@@ -176,17 +181,16 @@ function metadata() {
     model.replaceChildren(...keys.map((key) => { const option = element('option', '', key); option.value = key; return option; }));
   }
   model.value = state.model || '';
-  const disabled = !connected || state.busy || selectingModel;
+  const disabled = !connected || !state.session_id || state.busy || selectingModel;
   model.disabled = disabled;
   activity();
   $('send').disabled = disabled;
   $('cancel').hidden = !state.busy;
-  $('new-session').disabled = disabled;
   $('compact').disabled = disabled || !state.blocks.length;
-  $('sessions').disabled = disabled;
+  $('session-title').textContent = state.title || 'Session';
+  $('session-title').title = state.session_id || '';
   transcript.setAttribute('aria-busy', String(!!state.busy));
   document.title = `${state.title || 'myco'} · myco`;
-  if (!state.busy) refreshSessions();
 }
 function activity() {
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
@@ -220,20 +224,7 @@ function activity() {
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
   $('connection').textContent = connected ? state.status === 'Cancelling' ? 'Cancelling' : current : 'Reconnecting…';
 }
-async function refreshSessions() {
-  try {
-    const sessions = await (await api('/api/sessions')).json();
-    const select = $('sessions'); select.replaceChildren();
-    if (!sessions.some((s) => s.id === state.session_id)) sessions.unshift({ id: state.session_id, title: state.title || 'New session' });
-    for (const session of sessions) { const option = element('option', '', session.title || session.id); option.value = session.id; select.append(option); }
-    select.value = state.session_id;
-  } catch (e) { error(e.message); }
-}
-const stream = new EventSource('/api/events');
-stream.onopen = () => { connected = true; metadata(); };
-stream.onerror = () => { connected = false; metadata(); };
-stream.onmessage = ({ data }) => {
-  const update = JSON.parse(data);
+function updateSession(update) {
   if (update.revision <= revision) return;
   revision = update.revision;
   const change = update.change;
@@ -245,20 +236,45 @@ stream.onmessage = ({ data }) => {
     const block = state.blocks[change.index]; block.text += change.text;
     markdown(nodes[change.index].querySelector('.body'), block.text);
   }
-};
+}
+function connect() {
+  connected = false; metadata();
+  const worker = new SharedWorker('/events.js', { name: 'myco-events' });
+  eventPort = worker.port;
+  worker.onerror = () => { connected = false; metadata(); error('Could not connect to live output. Reload this page to reconnect.'); };
+  eventPort.onmessage = ({ data }) => {
+    if (data.kind === 'snapshot') { revision = -1; error(); updateSession(data.update); }
+    else if (data.kind === 'update') updateSession(data.update);
+    else if (data.kind === 'connection') { connected = data.connected; metadata(); }
+    else if (data.kind === 'error') { connected = false; metadata(); error(data.message); }
+  };
+  eventPort.postMessage({ kind: 'subscribe', session_id: sessionId });
+}
+window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
+window.addEventListener('pageshow', (event) => { if (event.persisted) { creating = false; createId = null; $('new-session').disabled = false; connect(); } });
+connect();
 async function sendAction(action, requestId = crypto.randomUUID()) {
   error();
-  await api('/api/action', { request_id: requestId, session_id: state.session_id, action });
+  await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: requestId, session_id: state.session_id, action });
+}
+async function newSession() {
+  if (creating) return;
+  creating = true; $('new-session').disabled = true;
+  createId ||= crypto.randomUUID();
+  try {
+    const session = await (await api('/api/sessions', { request_id: createId })).json();
+    location.assign(`/sessions/${encodeURIComponent(session.id)}`);
+  } catch (e) { creating = false; $('new-session').disabled = false; error(e.message); }
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
-  if (!connected || state.busy || selectingModel) return;
+  if (!connected || !state.session_id || state.busy || selectingModel) return;
   const text = $('prompt').value.trim(); if (!text) return;
   let action = { kind: 'submit', text };
   if (text.startsWith('/')) {
-    if (text === '/new') action = { kind: 'new' };
+    if (text === '/new') { await newSession(); return; }
     else if (text === '/compact') action = { kind: 'compact' };
-    else if (text.startsWith('/resume ')) action = { kind: 'open', id: text.slice(8).trim() };
+    else if (text.startsWith('/resume ')) { location.assign(`/sessions/${encodeURIComponent(text.slice(8).trim())}`); return; }
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }
   }
   if (!pending || pending.text !== text || pending.session !== state.session_id) pending = { text, session: state.session_id, id: crypto.randomUUID() };
@@ -270,10 +286,9 @@ $('composer').onsubmit = async (event) => {
   } catch (e) { error(`${e.message} Your draft is still here.`); metadata(); }
 };
 $('prompt').onkeydown = (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing) { event.preventDefault(); $('composer').requestSubmit(); } };
-$('new-session').onclick = () => sendAction({ kind: 'new' }).catch((e) => error(e.message));
+$('new-session').onclick = newSession;
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
-$('sessions').onchange = () => sendAction({ kind: 'open', id: $('sessions').value }).catch((e) => error(e.message));
-$('cancel').onclick = () => api('/api/cancel', { session_id: state.session_id }).catch((e) => error(e.message));
+$('cancel').onclick = () => api(`/api/sessions/${encodeURIComponent(state.session_id)}/cancel`, { session_id: state.session_id }).catch((e) => error(e.message));
 $('model').onchange = async () => {
   const key = $('model').value;
   if (!key || key === state.model) return;

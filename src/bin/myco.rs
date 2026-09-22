@@ -529,18 +529,15 @@ fn initial_session_or_exit(args: &Args, model_key: &str) -> Session {
     }
 }
 
-async fn attach_harness_or_exit(
+async fn attach_harness(
     app_config: &Config,
     preflight: &StartupPreflight,
     root_services: Vec<Arc<dyn myco::ToolService>>,
-) -> Arc<Harness> {
+) -> Result<Arc<Harness>, String> {
     Harness::attach_with_root_services(app_config.harness.clone(), root_services)
         .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to attach harness: {e}");
-            eprintln!(
-                "hint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn"
-            );
+        .map_err(|e| {
+            let mut message = format!("Failed to attach harness: {e}\nhint: remote hosts come from ~/.ssh/config Host aliases; local needs no binary spawn");
             if !preflight.executables.is_clean() {
                 let names: Vec<&str> = preflight
                     .executables
@@ -548,16 +545,16 @@ async fn attach_harness_or_exit(
                     .iter()
                     .map(|m| m.name)
                     .collect();
-                eprintln!("hint: missing executables: {}", names.join(", "));
+                message.push_str(&format!("\nhint: missing executables: {}", names.join(", ")));
             }
             if preflight.ssh.has_problems() {
-                eprintln!(
-                    "hint: ssh-agent preflight reported missing keys or an unreachable agent; \
+                message.push_str(
+                    "\nhint: ssh-agent preflight reported missing keys or an unreachable agent; \
                      try `ssh-add -l` and `ssh-add --apple-use-keychain <key>`"
                 );
             }
-            eprintln!("config: {}", app_config.config_path.display());
-            std::process::exit(1);
+            message.push_str(&format!("\nconfig: {}", app_config.config_path.display()));
+            message
         })
 }
 
@@ -611,6 +608,24 @@ async fn boot<S: EventSink + 'static>(
     args: &Args,
     make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
 ) -> (Boot, Arc<S>) {
+    let (app_config, catalog_model, preflight) = prepare_boot(args);
+    let session = initial_session_or_exit(args, &catalog_model.spec.key);
+    boot_session(
+        args,
+        app_config,
+        catalog_model,
+        preflight,
+        session,
+        make_sink,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        eprintln!("myco: {error}");
+        std::process::exit(1);
+    })
+}
+
+fn prepare_boot(args: &Args) -> (Config, CatalogModel, StartupPreflight) {
     let (app_config, catalog_model) = resolve_app_config_or_exit(args);
 
     // Startup preflight: verify expected executables resolve (bash, tmux, fzf;
@@ -627,17 +642,24 @@ async fn boot<S: EventSink + 'static>(
         std::process::exit(1);
     }
     let preflight = StartupPreflight::run(&app_config.harness.remote_hosts);
+    (app_config, catalog_model, preflight)
+}
 
+async fn boot_session<S: EventSink + 'static>(
+    args: &Args,
+    app_config: Config,
+    catalog_model: CatalogModel,
+    preflight: StartupPreflight,
+    mut loaded: Session,
+    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
+) -> Result<(Boot, Arc<S>), String> {
+    let session_lock = lock_session_or_report(&loaded.id)?;
+    // A previous writer may have finished between discovery and acquiring the lock.
+    if loaded.json_path().exists() {
+        loaded = Session::load(&loaded.json_path())?;
+    }
     // Session handle first so `session_meta` can share it with the agent harness.
-    let session = ActiveSession::new(initial_session_or_exit(args, &catalog_model.spec.key));
-    // Before the sink, whose console mirror already writes to this session.
-    let session_lock = match lock_session_or_report(&session.id()) {
-        Ok(lock) => lock,
-        Err(msg) => {
-            eprintln!("myco: {msg}");
-            std::process::exit(1);
-        }
-    };
+    let session = ActiveSession::new(loaded);
     let sink = make_sink(&app_config, &preflight, &session);
 
     let session_tool =
@@ -646,23 +668,19 @@ async fn boot<S: EventSink + 'static>(
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
     let prelude_tool =
         Arc::new(PreludeTool::new(app_config.max_prelude_bytes)) as Arc<dyn myco::ToolService>;
-    let harness = attach_harness_or_exit(
+    let harness = attach_harness(
         &app_config,
         &preflight,
         vec![session_tool, history_tool, list_recent_tool, prelude_tool],
     )
-    .await;
+    .await?;
 
     let (model, prelude) = build_model(
         &catalog_model,
         &harness,
         args.debug_dump_api_requests,
         args.effort,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("myco: {error}");
-        std::process::exit(1);
-    });
+    )?;
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
     runtime.set_max_image_base64_bytes(catalog_model.spec.max_image_base64_bytes);
     let mut agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
@@ -673,20 +691,14 @@ async fn boot<S: EventSink + 'static>(
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let mut runner = SessionRunner::new(agent, runtime)
         .await
-        .unwrap_or_else(|error| {
-            eprintln!("myco: cannot bind session: {error}");
-            std::process::exit(1);
-        });
+        .map_err(|error| format!("cannot bind session: {error}"))?;
     runner
         .set_model(
             model,
             myco::ModelInfo::from_spec(&catalog_model.spec, Some(args.effort)),
         )
         .await
-        .unwrap_or_else(|error| {
-            eprintln!("myco: cannot record runtime: {error}");
-            std::process::exit(1);
-        });
+        .map_err(|error| format!("cannot record runtime: {error}"))?;
     runner.set_forked(args.fork);
     runner.set_compactor(
         Arc::new(ModelCompactor {
@@ -701,7 +713,7 @@ async fn boot<S: EventSink + 'static>(
         }
     }));
 
-    (
+    Ok((
         Boot {
             app_config,
             catalog_model,
@@ -712,7 +724,7 @@ async fn boot<S: EventSink + 'static>(
             runner,
         },
         sink,
-    )
+    ))
 }
 
 async fn run_interactive(args: Args) {

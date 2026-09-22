@@ -1,7 +1,7 @@
 :root { color-scheme: dark; font: 14px/1.65 "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: #d4d9e0; background: #101317; --dim: #8993a1; --cyan: #8bd5dc; --green: #a6da95; --amber: #e5c890; --red: #ed8796; --line: #30363e; --composer-height: 180px; }
 * { box-sizing: border-box; }
 body { margin: 0; }
-button, textarea, select { font: inherit; color: inherit; }
+button, textarea, select, input { font: inherit; color: inherit; }
 button, select { border: 1px solid var(--line); border-radius: 6px; background: #181d24; padding: 5px 11px; }
 button { cursor: pointer; }
 button:hover { border-color: var(--dim); }
@@ -11,8 +11,20 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .toolbar { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px; padding: 12px 24px; min-height: 62px; border-bottom: 1px solid var(--line); background: #101317f5; }
 .brand { color: var(--green); text-decoration: none; font-weight: 800; margin-right: 10px; }
 .brand span { color: var(--dim); }
-.session-picker { flex: 1; min-width: 80px; max-width: 430px; }
-#sessions { width: 100%; text-overflow: ellipsis; }
+#session-title { flex: 1; min-width: 0; max-width: 430px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-toolbar #session-title { max-width: none; }
+#session-browser { max-width: 980px; margin: 0 auto; padding: 32px 24px; }
+#session-browser label { display: block; font-weight: 700; color: var(--cyan); margin-bottom: 8px; }
+#search { width: 100%; border: 1px solid var(--line); border-radius: 6px; background: #181d24; padding: 10px 12px; }
+#search:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+#session-count, .session-meta, .session-id { color: var(--dim); }
+#session-list { list-style: none; padding: 0; margin: 24px 0; }
+#session-list a { display: block; padding: 18px 0; border-top: 1px solid var(--line); color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+#session-list a:hover .session-name { text-decoration: underline; text-underline-offset: 4px; }
+#session-list a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 4px; }
+.session-name, .session-meta, .session-id { display: block; }
+.session-name { color: var(--green); font-weight: 700; margin-bottom: 5px; }
+.session-active { color: var(--cyan); }
 #connection { margin-left: auto; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #transcript { max-width: 980px; margin: 0 auto; padding: 32px 24px calc(var(--composer-height) + 55px); overflow-wrap: anywhere; }
 .welcome { color: var(--dim); padding: 25px 0; }
@@ -93,7 +105,7 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (max-width: 650px) {
   .toolbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; padding: 10px 12px; gap: 7px; }
-  .session-picker { min-width: 0; max-width: none; }
+  .home-toolbar { grid-template-columns: auto minmax(0, 1fr) auto; }
   #connection { grid-column: 1 / 3; margin-left: 0; }
   #activity-toggle { grid-column: 3 / 5; justify-self: end; }
   #transcript { padding-left: 16px; padding-right: 16px; }
