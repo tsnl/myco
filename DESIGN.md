@@ -79,8 +79,10 @@ Model-facing tools live under `logic::kernel`: definitions, argument schemas,
 and adapters that call service APIs or internal kernel operations and translate results. GUI
 controls also use service APIs through the kernel and server, sharing the same
 instances and observations.
-`GenAiClient::generate` returns a concrete `Generation` implementing
-`Stream<Item = Result<Event, Error>>`. It yields the request before dispatch,
+`GenAiClient::generate` validates and encodes the request synchronously, returning
+`Result<Generation<'_>, Error>`. A valid request produces a concrete stream
+implementing `Stream<Item = Result<Event, Error>>`; network I/O waits for polling.
+It yields the request before dispatch,
 ordered progress, and one `Completed(Response)` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
