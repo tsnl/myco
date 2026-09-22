@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use myco::generative_model::ToolUse;
 use myco::session::{ActiveSession, ArchiveFilter, SessionListEntry, SessionWriteLock};
 use myco::{AgentEvent, CancelToken, EventSink};
@@ -45,6 +45,15 @@ impl std::fmt::Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+const MAX_QUEUED_MESSAGES: usize = 20;
+
+#[derive(Clone, Serialize)]
+struct QueuedMessage {
+    request_id: Uuid,
+    text: String,
+    accepted_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Serialize)]
 struct Snapshot {
     #[serde(skip)]
@@ -57,12 +66,13 @@ struct Snapshot {
     busy: bool,
     status: String,
     tasks: Vec<String>,
+    queued: VecDeque<QueuedMessage>,
     blocks: Vec<Block>,
 }
 
 impl Snapshot {
     fn metadata(&self) -> Value {
-        json!({"session_id":self.session_id, "thread_id":self.thread_id, "title":self.title, "model":self.model, "busy":self.busy, "status":self.status})
+        json!({"session_id":self.session_id, "thread_id":self.thread_id, "title":self.title, "model":self.model, "busy":self.busy, "status":self.status, "queued":self.queued})
     }
 }
 
@@ -138,12 +148,32 @@ impl App {
         snapshot.model = boot.catalog_model.spec.key.clone();
         snapshot.blocks = view::history(session.active_thread());
         snapshot.status = status.into();
-        snapshot.busy = false;
         snapshot.tasks = tasks;
-        let change = json!({"kind":"snapshot", "snapshot":snapshot});
-        self.publish(snapshot, change);
-        live.cancel = None;
+        if let Err(error) = self.start_next(&mut live) {
+            live.snapshot.blocks.push(Block::Notice {
+                text: error.to_string(),
+            });
+        }
+        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
+        self.publish(&mut live.snapshot, change);
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn refresh(&self, session: &ActiveSession, tasks: Vec<String>) {
+        self.tasks(tasks);
+        let title = session.with(|session| {
+            session
+                .title
+                .clone()
+                .unwrap_or_else(|| "New session".into())
+        });
+        let mut live = self.live.lock().unwrap();
+        if live.snapshot.title != title {
+            live.snapshot.title = title;
+            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
+            self.publish(&mut live.snapshot, change);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn tasks(&self, tasks: Vec<String>) {
@@ -266,6 +296,7 @@ pub(super) struct ActionRequest {
 struct Work {
     request: ActionRequest,
     cancel: CancelToken,
+    accepted_at: DateTime<Utc>,
 }
 
 struct RunningSession {
@@ -288,7 +319,7 @@ pub(super) struct Sessions {
     pub(super) events: broadcast::Sender<Arc<Update>>,
     pub(super) shutdown: CancelToken,
     generation: Arc<AtomicU64>,
-    listing: tokio::sync::Mutex<Option<Listing>>,
+    listing: tokio::sync::Mutex<[Option<Listing>; 2]>,
 }
 
 impl Sessions {
@@ -301,7 +332,7 @@ impl Sessions {
             events: broadcast::channel(256).0,
             shutdown: CancelToken::new(),
             generation: Arc::new(AtomicU64::new(0)),
-            listing: tokio::sync::Mutex::new(None),
+            listing: tokio::sync::Mutex::new([None, None]),
         }
     }
 
@@ -377,6 +408,7 @@ impl Sessions {
                             busy: false,
                             status: "Ready".into(),
                             tasks: vec![],
+                            queued: VecDeque::new(),
                             blocks: view::history(session.active_thread()),
                         },
                         cancel: None,
@@ -481,14 +513,20 @@ impl Sessions {
 
     pub(super) async fn list(&self, archived: bool) -> Result<Value> {
         let entries = {
-            let mut cache = self.listing.lock().await;
+            let mut listings = self.listing.lock().await;
+            let cache = &mut listings[usize::from(archived)];
             let generation = self.generation.load(Ordering::Relaxed);
             // Changes from other processes remain visible on the next polling interval.
             if cache.as_ref().is_none_or(|c| {
                 c.generation != generation || c.loaded_at.elapsed() >= Duration::from_secs(5)
             }) {
-                let entries = tokio::task::spawn_blocking(|| {
-                    myco::session::list_sessions_with_filter(0, false, ArchiveFilter::All)
+                let entries = tokio::task::spawn_blocking(move || {
+                    let filter = if archived {
+                        ArchiveFilter::Archived
+                    } else {
+                        ArchiveFilter::Active
+                    };
+                    myco::session::list_sessions_with_filter(0, false, filter)
                 })
                 .await
                 .map_err(|e| Error::Internal(e.to_string()))?
@@ -531,7 +569,7 @@ async fn worker(
         let work = tokio::select! {
             _ = app.shutdown.cancelled() => break,
             _ = tick.tick() => {
-                app.tasks(boot.runner.runtime().running_tool_summaries());
+                app.refresh(&boot.session, boot.runner.runtime().running_tool_summaries());
                 continue;
             }
             work = receiver.recv() => match work { Some(work) => work, None => break },
@@ -543,7 +581,7 @@ async fn worker(
             loop {
                 tokio::select! {
                     result = &mut operation => break result,
-                    _ = tick.tick() => app.tasks(runtime.running_tool_summaries()),
+                    _ = tick.tick() => app.refresh(runtime.session(), runtime.running_tool_summaries()),
                 }
             }
         };
@@ -570,7 +608,7 @@ async fn execute(
         ) {
             Err(error) => Err(error),
             Ok(content) => {
-                let time = Utc::now();
+                let time = work.accepted_at;
                 {
                     let mut live = app.live.lock().unwrap();
                     let block = Block::message("user", &content, Some(view::timestamp(&time)));
@@ -628,7 +666,7 @@ impl App {
                 "The request belongs to a different session.".into(),
             ));
         }
-        if live.snapshot.busy {
+        if live.snapshot.busy && !matches!(request.action, Action::Submit { .. }) {
             return Err(Error::Conflict(
                 "Wait for the current run or cancel it first.".into(),
             ));
@@ -636,19 +674,71 @@ impl App {
         if matches!(&request.action, Action::Submit { text } if text.trim().is_empty()) {
             return Err(Error::Invalid("Enter a message.".into()));
         }
+        if live.snapshot.status == "Cancelling" {
+            return Err(Error::Conflict("Wait for cancellation to finish.".into()));
+        }
+        let accepted_at = Utc::now();
+        if live.snapshot.busy {
+            if self.work.is_closed() {
+                return Err(Error::Unavailable(
+                    "The session worker is unavailable.".into(),
+                ));
+            }
+            if live.snapshot.queued.len() >= MAX_QUEUED_MESSAGES {
+                return Err(Error::Conflict(
+                    "The message queue is full (20 messages).".into(),
+                ));
+            }
+            let Action::Submit { text } = &request.action else {
+                unreachable!()
+            };
+            live.snapshot.queued.push_back(QueuedMessage {
+                request_id: request.request_id,
+                text: text.clone(),
+                accepted_at,
+            });
+        } else {
+            self.start_work(&mut live, request.clone(), accepted_at)?;
+        }
+        live.accepted.insert(request.request_id, request);
+        let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
+        self.publish(&mut live.snapshot, change);
+        Ok(())
+    }
+
+    fn start_work(
+        &self,
+        live: &mut Live,
+        request: ActionRequest,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<()> {
         let cancel = CancelToken::new();
         self.work
             .try_send(Work {
-                request: request.clone(),
+                request,
                 cancel: cancel.clone(),
+                accepted_at,
             })
             .map_err(|_| Error::Unavailable("The session worker is unavailable.".into()))?;
-        live.accepted.insert(request.request_id, request);
         live.cancel = Some(cancel);
         live.snapshot.busy = true;
         live.snapshot.status = "Running".into();
-        let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-        self.publish(&mut live.snapshot, change);
+        Ok(())
+    }
+
+    fn start_next(&self, live: &mut Live) -> Result<()> {
+        live.cancel = None;
+        live.snapshot.busy = false;
+        if self.shutdown.is_cancelled() {
+            return Ok(());
+        }
+        if let Some(next) = live.snapshot.queued.pop_front() {
+            let request = live.accepted[&next.request_id].clone();
+            if let Err(error) = self.start_work(live, request, next.accepted_at) {
+                live.snapshot.queued.push_front(next);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -662,9 +752,10 @@ impl App {
         if let Some(cancel) = &live.cancel {
             cancel.cancel();
             live.snapshot.status = "Cancelling".into();
-            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-            self.publish(&mut live.snapshot, change);
         }
+        live.snapshot.queued.clear();
+        let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
+        self.publish(&mut live.snapshot, change);
         Ok(())
     }
 }

@@ -1,7 +1,8 @@
 //! Conversation session persistence and metadata.
 //!
-//! Sessions live under the selected profile's `session/{shard}/{id}.json` (plus a sibling
-//! `.history` for readline). Each document owns ordered threads and shared
+//! Sessions live under the selected profile's `session/{shard}/{id}.json`, or
+//! `session/archived/{shard}/{id}.json`, with sibling histories and transcripts.
+//! Each document owns ordered threads and shared
 //! metadata. Version 2 loads as one thread; saves use [`SESSION_FILE_VERSION`].
 //!
 //! Persistence only: how a conversation is stored, not how one is produced.
@@ -9,6 +10,7 @@
 //! ([`compact_thread`], [`select_tail`]) is here, and the
 //! agent run that writes the summary is [`crate::chat::run_compact_worker`].
 
+mod archive;
 mod attach;
 mod compact;
 mod console_log;
@@ -18,6 +20,7 @@ mod thread;
 
 pub use thread::Thread;
 
+pub use archive::migrate_archived_sessions;
 pub use attach::{MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
 pub use compact::{CompactOutcome, compact_thread, select_tail};
 pub use console_log::ConsoleLog;
@@ -261,13 +264,24 @@ impl ActiveSession {
     /// Archive only this session, preserving threads, lineage and live tools.
     pub fn set_archived(&self, archived: bool) -> Result<(), String> {
         let mut current = self.lock();
+        let relocation = archive::Relocation::prepare(&current.id, archived)?;
         let mut updated = current.clone();
         updated.archived = archived;
         updated.touch();
         updated.externalize_images()?;
+        // Keep the archived flag until restore reaches the active directory.
+        // A failed or interrupted move must remain visible in archived listings.
+        if !archived {
+            relocation.apply()?;
+            updated.save()?;
+            *current = updated;
+            return Ok(());
+        }
         updated.save()?;
         *current = updated;
-        Ok(())
+        relocation.apply().map_err(|error| {
+            format!("Archive status saved, but files could not all be moved; retry /archive {}: {error}", current.id)
+        })
     }
 
     pub fn set_session_archived(&self, id: Option<&str>, archived: bool) -> Result<String, String> {
@@ -593,7 +607,13 @@ impl Session {
 
     pub fn load_by_id_or_prefix(id_or_prefix: &str) -> Result<Self, String> {
         let id = resolve_session_id(id_or_prefix)?;
-        Self::load(&session_file_path(&id, "json"))
+        let path = session_file_path(&id, "json");
+        match Self::load(&path) {
+            // Readers do not hold the writer lock; archive/restore may rename
+            // the file between resolving its location and opening it.
+            Err(_) if !path.exists() => Self::load(&session_file_path(&id, "json")),
+            result => result,
+        }
     }
 
     pub fn set_title(&mut self, title: Option<String>) -> Result<(), String> {
@@ -707,10 +727,19 @@ pub fn session_root() -> Result<PathBuf, String> {
 }
 
 pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
-    let shard = &id[..2.min(id.len())];
-    match session_root() {
-        Ok(root) => root.join(shard).join(format!("{id}.{ext}")),
-        Err(_) => PathBuf::from(format!(".myco/session/{shard}/{id}.{ext}")),
+    // Locks never move: a second process must see the same inode throughout
+    // archive/restore, including while the session is still running.
+    if ext == "lock" {
+        return archive::file_path(id, ext, false);
+    }
+    let archived = !archive::file_path(id, "json", false).exists()
+        && archive::file_path(id, "json", true).exists();
+    let path = archive::file_path(id, ext, archived);
+    let other = archive::file_path(id, ext, !archived);
+    if !path.exists() && other.exists() {
+        other
+    } else {
+        path
     }
 }
 
@@ -766,7 +795,12 @@ fn collect_session_entries(
 ) -> Result<SessionScan, String> {
     let mut metas = Vec::new();
     let mut skipped = Vec::new();
-    for path in iter_session_json_files(root)? {
+    let paths = if archive == ArchiveFilter::Active {
+        iter_sharded_session_files(root)?
+    } else {
+        iter_session_json_files(root)?
+    };
+    for path in paths {
         match session_list_entry_from_path(&path) {
             Ok(entry) => {
                 if (include_hidden || entry.kind.is_user()) && archive.includes(entry.archived) {
@@ -857,7 +891,7 @@ fn load_most_recent_session() -> Result<Session, String> {
     let root = session_root()?;
     let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     if root.exists() {
-        for path in iter_session_json_files(&root)? {
+        for path in iter_sharded_session_files(&root)? {
             let mtime = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -922,10 +956,22 @@ pub fn resolve_session_id(id_or_prefix: &str) -> Result<String, String> {
 }
 
 pub fn iter_session_json_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = iter_sharded_session_files(root)?;
+    let archived = root.join("archived");
+    if archived.exists() {
+        paths.extend(iter_sharded_session_files(&archived)?);
+    }
+    Ok(paths)
+}
+
+fn iter_sharded_session_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     let shards = fs::read_dir(root).map_err(|e| e.to_string())?;
     for shard_ent in shards {
         let shard_ent = shard_ent.map_err(|e| e.to_string())?;
+        if shard_ent.file_name() == "archived" {
+            continue;
+        }
         let shard_path = shard_ent.path();
         if !shard_path.is_dir() {
             continue;
@@ -1817,6 +1863,224 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn archive_moves_session_files_and_restores_them_without_releasing_the_writer_lock() {
+        let home = temp_home("archive-files");
+        let session = Session::new("test");
+        session.save().unwrap();
+        let original = session.json_path();
+        let id = session.id.clone();
+        let summary = session.thread_summary_path(&session.active_thread().id);
+        fs::write(session.history_path(), "previous input\n").unwrap();
+        fs::write(&summary, "thread summary").unwrap();
+        let active = ActiveSession::new(session);
+        let lock = SessionWriteLock::acquire(&id).unwrap();
+        let log = ConsoleLog::new(active.clone(), true);
+        log.append("before archive\n");
+
+        active.set_archived(true).unwrap();
+        let saved = Session::load_by_id_or_prefix(&id[..12]).unwrap();
+        let archive = home.path().join("session/archived").join(&id[..2]);
+        assert_eq!(saved.json_path(), archive.join(format!("{id}.json")));
+        assert!(!original.exists());
+        assert!(!summary.exists());
+        assert!(lock.path().exists());
+        assert!(matches!(
+            SessionWriteLock::acquire(&id),
+            Err(SessionLockError::Busy { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(saved.history_path()).unwrap(),
+            "previous input\n"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.thread_summary_path(&saved.active_thread().id)).unwrap(),
+            "thread summary"
+        );
+        log.append("archived console needle\n");
+        active
+            .persist_messages(&[user("continued while archived")], None, true)
+            .unwrap();
+        assert!(!original.exists());
+        let listed = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        assert_eq!(
+            search_sessions(&listed, "needle", 10).unwrap().entries[0].id,
+            id
+        );
+
+        active.set_archived(false).unwrap();
+        log.append("after restore\n");
+        assert!(original.exists());
+        assert!(!archive.join(format!("{id}.json")).exists());
+        assert_eq!(
+            fs::read_to_string(original.with_extension("console")).unwrap(),
+            "before archive\narchived console needle\nafter restore\n"
+        );
+        assert!(matches!(
+            SessionWriteLock::acquire(&id),
+            Err(SessionLockError::Busy { .. })
+        ));
+        assert_eq!(
+            Session::load_by_id_or_prefix(&id)
+                .unwrap()
+                .active_thread()
+                .messages,
+            vec![user("continued while archived")]
+        );
+    }
+
+    #[test]
+    fn legacy_archives_can_be_listed_and_moved_by_archiving_again() {
+        let _home = temp_home("legacy-archive-files");
+        let mut session = Session::new("test");
+        session.archived = true;
+        session.save().unwrap();
+        let old_path = session.json_path();
+        let listed = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        assert_eq!(listed[0].id, session.id);
+        let active = ActiveSession::new(Session::load_by_id_or_prefix(&session.id).unwrap());
+        active.set_archived(true).unwrap();
+        assert!(!old_path.exists());
+        assert!(active.snapshot().json_path().exists());
+        assert!(list_sessions(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_moves_legacy_archives_but_skips_live_writers_and_active_sessions() {
+        let _home = temp_home("archive-startup");
+        let active = Session::new("test");
+        active.save().unwrap();
+        let mut archived = Session::new("test");
+        archived.archived = true;
+        archived.save().unwrap();
+        let original = archived.json_path();
+        let bytes = fs::read(&original).unwrap();
+        fs::write(archived.history_path(), "preserve history").unwrap();
+        let lock = SessionWriteLock::acquire(&archived.id).unwrap();
+        migrate_archived_sessions().unwrap();
+        assert!(original.exists());
+        drop(lock);
+        migrate_archived_sessions().unwrap();
+        migrate_archived_sessions().unwrap();
+        assert!(!original.exists());
+        assert_eq!(fs::read(archived.json_path()).unwrap(), bytes);
+        assert_eq!(
+            fs::read_to_string(archived.history_path()).unwrap(),
+            "preserve history"
+        );
+        assert!(active.json_path().exists());
+        assert_eq!(list_sessions(0).unwrap()[0].id, active.id);
+    }
+
+    #[test]
+    fn interrupted_archive_moves_are_readable_and_completed_at_startup() {
+        let _home = temp_home("archive-interrupted");
+        let mut session = Session::new("test");
+        session.archived = true;
+        session.save().unwrap();
+        let original = session.json_path();
+        fs::write(session.console_path(), "preserved console").unwrap();
+        fs::write(session.history_path(), "preserved history").unwrap();
+        let moved = archive::file_path(&session.id, "console", true);
+        fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        fs::rename(session.console_path(), &moved).unwrap();
+        assert_eq!(
+            fs::read_to_string(session.console_path()).unwrap(),
+            "preserved console"
+        );
+        migrate_archived_sessions().unwrap();
+        assert!(!original.exists());
+        assert_eq!(
+            fs::read_to_string(session.console_path()).unwrap(),
+            "preserved console"
+        );
+        assert_eq!(
+            fs::read_to_string(session.history_path()).unwrap(),
+            "preserved history"
+        );
+        let active = ActiveSession::new(session);
+        active.set_archived(false).unwrap();
+        assert!(original.exists());
+        assert!(!moved.exists());
+    }
+
+    #[test]
+    fn archive_conflicts_preserve_both_copies_and_active_listings_skip_archive_files() {
+        let _home = temp_home("archive-conflict");
+        let session = Session::new("test");
+        session.save().unwrap();
+        let original = session.json_path();
+        let bytes = fs::read(&original).unwrap();
+        let target = archive::file_path(&session.id, "json", true);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "an existing, unreadable archive").unwrap();
+        let active = ActiveSession::new(session);
+        assert!(
+            active
+                .set_archived(true)
+                .unwrap_err()
+                .contains("refusing to overwrite")
+        );
+        assert!(!active.snapshot().archived);
+        assert_eq!(fs::read(&original).unwrap(), bytes);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "an existing, unreadable archive"
+        );
+        let (entries, skipped) =
+            collect_session_entries(&session_root().unwrap(), false, ArchiveFilter::Active)
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            skipped.is_empty(),
+            "ordinary listings must not parse archived files"
+        );
+    }
+
+    #[test]
+    fn interrupted_restore_stays_archived_and_retries_reunite_sidecars() {
+        let _home = temp_home("restore-interrupted");
+        let session = Session::new("test");
+        session.save().unwrap();
+        let original = session.json_path();
+        fs::write(session.history_path(), "preserve this").unwrap();
+        let active = ActiveSession::new(session);
+        active.set_archived(true).unwrap();
+        // A restore interrupted between its sidecar and JSON renames.
+        fs::rename(
+            active.snapshot().history_path(),
+            original.with_extension("history"),
+        )
+        .unwrap();
+        assert_eq!(
+            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+                .unwrap()
+                .len(),
+            1
+        );
+        active.set_archived(true).unwrap();
+        assert!(!original.with_extension("history").exists());
+        assert_eq!(
+            fs::read_to_string(active.snapshot().history_path()).unwrap(),
+            "preserve this"
+        );
+        // A restore interrupted after the JSON move but before clearing the flag.
+        archive::Relocation::prepare(&active.id(), false)
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert!(original.exists());
+        assert!(list_sessions(0).unwrap().is_empty());
+        assert_eq!(
+            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+                .unwrap()
+                .len(),
+            1
+        );
+        active.set_archived(false).unwrap();
+        assert_eq!(list_sessions(0).unwrap().len(), 1);
     }
 
     #[test]

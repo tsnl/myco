@@ -131,10 +131,16 @@ fn pick_with_fzf(entries: &[SessionListEntry]) -> Result<Option<String>, String>
 /// `id \t console-path \t display` — fzf shows and matches only the display
 /// field (`--with-nth 3..`); the preview tails the console path.
 fn fzf_line(entry: &SessionListEntry) -> String {
+    let console = entry.path.with_extension("console");
+    let console = if console.exists() {
+        console
+    } else {
+        crate::session::session_file_path(&entry.id, "console")
+    };
     format!(
         "{}\t{}\t{}",
         entry.id,
-        entry.path.with_extension("console").display(),
+        console.display(),
         sanitize_field(&display_line(entry)),
     )
 }

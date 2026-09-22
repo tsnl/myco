@@ -5,10 +5,10 @@
 //! `.console`. That is easy to hit by accident in the tool's own habitat: a
 //! second tmux pane, or `--resume` in a script while the REPL is open.
 //!
-//! The guard is an advisory `flock(2)` on a sibling `{id}.lock`, held for as
+//! The guard is an advisory `flock(2)` on `session/{shard}/{id}.lock`, held for as
 //! long as the session is live. The lock file is a separate inode on purpose:
 //! [`crate::core::atomically_write`] replaces `{id}.json` by rename, which
-//! would leave a lock on the old inode.
+//! would leave a lock on the old inode. Archiving leaves this path in place.
 //!
 //! Reading is never blocked — `session_history`, `list_recent`, the session
 //! browser and `/sessions` all take no lock. Only a process that intends to

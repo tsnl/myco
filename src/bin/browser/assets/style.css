@@ -70,7 +70,10 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 .tool-args { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 4px; color: var(--dim); }
 .tool-content { padding: 0 15px 10px; border-top: 1px solid #34302a; }
 .tool-label { display: block; margin-top: 12px; color: var(--dim); font-weight: 600; }
-.json-key { color: var(--cyan); }
+.arguments { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.arguments dt { color: var(--cyan); margin-top: 12px; }
+.arguments dd { margin: 0; }
+.tool .arguments pre { padding: 0; border: 0; background: transparent; }
 .tool pre { color: #aeb7c4; }
 .tool .output { color: #d4d9e0; max-height: 65vh; overflow: auto; }
 .thinking { color: var(--dim); margin-bottom: 20px; }
@@ -101,6 +104,10 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 #prompt { display: block; width: 100%; resize: none; min-height: 3.3em; max-height: 32vh; padding: 8px 0; border: 0; background: transparent; outline: 0; }
 #prompt::placeholder { color: #77818e; }
 #send { color: var(--green); }
+#queued { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+#queued-count { color: var(--cyan); }
+#queued-list { margin: 6px 0 0; padding-left: 1.5em; max-height: 18vh; overflow: auto; }
+#queued-list li { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
 #cancel { color: var(--red); margin-left: auto; }
 #error { color: var(--red); padding-top: 8px; white-space: pre-wrap; }
 #jump { position: fixed; right: 24px; bottom: calc(var(--composer-height) + 28px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: #1b2930; box-shadow: 0 4px 20px #0008; }

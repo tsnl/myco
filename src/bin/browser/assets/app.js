@@ -6,6 +6,7 @@ let revision = -1;
 let follow = true;
 let pending = null;
 let selectingModel = false;
+let sending = false;
 let eventPort = null;
 const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length));
 const nodes = [];
@@ -76,22 +77,24 @@ function markdown(node, text) {
   };
   setTimeout(render, 80);
 }
-function jsonArguments(input, preview = false) {
-  const pre = element(preview ? 'span' : 'pre', preview ? 'tool-args' : 'arguments');
-  const text = preview ? argumentPreview(input) : JSON.stringify(input, null, 2);
-  const strings = /"(?:[^"\\]|\\.)*"\s*:?/g;
-  let start = 0;
-  for (const match of text.matchAll(strings)) {
-    if (!match[0].endsWith(':')) continue;
-    pre.append(document.createTextNode(text.slice(start, match.index)));
-    start = match.index + match[0].length;
-    pre.append(element('span', 'json-key', text.slice(match.index, start)));
+function argumentValue(value) {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+function argumentEntries(input) {
+  return input !== null && typeof input === 'object' && !Array.isArray(input) ? Object.entries(input) : [['value', input]];
+}
+function toolArguments(input) {
+  const fields = element('dl', 'arguments');
+  for (const [key, value] of argumentEntries(input)) {
+    const label = element('dt'); label.append(element('strong', '', key));
+    const body = element('dd'); body.append(element('pre', '', argumentValue(value)));
+    fields.append(label, body);
   }
-  pre.append(document.createTextNode(text.slice(start)));
-  return pre;
+  return fields;
 }
 function argumentPreview(input) {
-  const chars = Array.from(JSON.stringify(input));
+  const text = argumentEntries(input).map(([key, value]) => `${key}: ${argumentValue(value)}`).join(' · ').replace(/\s+/g, ' ');
+  const chars = Array.from(text);
   return chars.length > 180 ? `${chars.slice(0, 180).join('')}…` : chars.join('');
 }
 function toolState(block) {
@@ -105,9 +108,9 @@ function blockNode(block) {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
     const summary = element('summary');
-    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), jsonArguments(block.tool.input, true));
+    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), element('span', 'tool-args', argumentPreview(block.tool.input)));
     const body = element('div', 'tool-content');
-    body.append(element('span', 'tool-label', 'Input'), jsonArguments(block.tool.input));
+    body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
     if (block.text || block.images?.length) body.append(element('span', 'tool-label', 'Output'));
     if (block.text) body.append(element('pre', 'output', block.text));
     addImages(body, block.images);
@@ -195,8 +198,20 @@ function metadata() {
   const disabled = !connected || !state.session_id || state.busy || selectingModel;
   model.disabled = disabled;
   activity();
-  $('send').disabled = disabled;
+  $('send').disabled = !connected || !state.session_id || selectingModel || sending || state.status === 'Cancelling';
+  $('send').textContent = state.busy ? 'Queue ↵' : 'Send ↵';
+  $('input-hint').textContent = state.busy ? 'Enter to queue · Runs after the current turn' : 'Enter to send · Shift+Enter for a new line';
   $('cancel').hidden = !state.busy;
+  const queued = state.queued || [];
+  $('cancel').textContent = queued.length ? 'Cancel run & queue' : 'Cancel run';
+  $('queued').hidden = !queued.length;
+  $('queued-count').textContent = `${queued.length} queued`;
+  const list = $('queued-list');
+  const signature = JSON.stringify(queued);
+  if (list.dataset.messages !== signature) {
+    list.dataset.messages = signature;
+    list.replaceChildren(...queued.map((message) => element('li', '', message.text)));
+  }
   $('compact').disabled = disabled || !state.blocks.length;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.session_id || '';
@@ -270,7 +285,7 @@ async function sendAction(action, requestId = crypto.randomUUID()) {
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
-  if (!connected || !state.session_id || state.busy || selectingModel) return;
+  if (!connected || !state.session_id || selectingModel || sending || state.status === 'Cancelling') return;
   const text = $('prompt').value.trim(); if (!text) return;
   let action = { kind: 'submit', text };
   if (text.startsWith('/')) {
@@ -280,12 +295,13 @@ $('composer').onsubmit = async (event) => {
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }
   }
   if (!pending || pending.text !== text || pending.session !== state.session_id) pending = { text, session: state.session_id, id: crypto.randomUUID() };
-  $('send').disabled = true;
+  sending = true; metadata();
   try {
     await sendAction(action, pending.id);
     if ($('prompt').value.trim() === text) { $('prompt').value = ''; resizeInput(); }
     pending = null;
-  } catch (e) { error(`${e.message} Your draft is still here.`); metadata(); }
+  } catch (e) { error(`${e.message} Your draft is still here.`); }
+  finally { sending = false; metadata(); }
 };
 $('prompt').onkeydown = (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing) { event.preventDefault(); $('composer').requestSubmit(); } };
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));

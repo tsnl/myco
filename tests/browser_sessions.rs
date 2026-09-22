@@ -221,6 +221,16 @@ context_window = 100000
             204
         );
     }
+    let active_file = home.0.join(format!(
+        "profiles/default/session/{}/{first_id}.json",
+        &first_id[..2]
+    ));
+    let archived_file = home.0.join(format!(
+        "profiles/default/session/archived/{}/{first_id}.json",
+        &first_id[..2]
+    ));
+    assert!(!active_file.exists());
+    assert!(archived_file.exists());
     assert!(
         server
             .json("/api/sessions", None)
@@ -248,6 +258,8 @@ context_window = 100000
         204
     );
     let mut reopened = Server::start(&home.0).await;
+    assert!(active_file.exists());
+    assert!(!archived_file.exists());
     assert_eq!(
         reopened.json(&first_path, None).await["session_id"],
         first_id
