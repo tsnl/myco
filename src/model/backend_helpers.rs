@@ -5,11 +5,11 @@ use std::{
 };
 
 use futures_core::Stream;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
-    Config, Delta, Error, Event, Finish, Generation, Message, Output, Protocol, ProviderResponse,
-    Request, ToolCall, Usage, anthropic_backend, openai_responses_backend,
+    Config, Delta, Error, Event, Finish, Generation, Message, Output, Request, ToolCall, Usage,
+    anthropic_backend, openai_responses_backend,
 };
 
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
@@ -18,6 +18,31 @@ pub(super) trait Driver: Send + Sync {
     fn protocol(&self) -> Protocol;
     fn encode(&self, request: &Request) -> Result<Value, Error>;
     fn generate(&self, body: Value) -> EventStream<'_>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Protocol {
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+impl Protocol {
+    fn key(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+        }
+    }
+
+    pub(super) fn body(self, continuation: &Value) -> Result<&Value, Error> {
+        continuation
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get(self.key()))
+            .ok_or_else(|| {
+                Error::InvalidRequest("invalid or incompatible assistant continuation".into())
+            })
+    }
 }
 
 pub(super) enum Decoded {
@@ -86,7 +111,7 @@ pub(super) fn completed(protocol: Protocol, body: Value) -> Result<Event, Error>
     Ok(Event::Completed {
         message: Message::Assistant {
             output,
-            provider: Some(ProviderResponse { protocol, body }),
+            continuation: Some(json!({protocol.key(): body})),
         },
         finish,
         usage,
@@ -185,9 +210,10 @@ struct History<'a> {
 impl<'a> History<'a> {
     fn message(&mut self, message: &'a Message, protocol: Protocol) -> Result<(), Error> {
         match message {
-            Message::Assistant { output, provider } => {
-                self.assistant(output, provider.as_ref(), protocol)
-            }
+            Message::Assistant {
+                output,
+                continuation,
+            } => self.assistant(output, continuation.as_ref(), protocol),
             Message::ToolResult { call_id, .. } => self.result(call_id),
             Message::User(_) => Ok(()),
         }
@@ -196,11 +222,11 @@ impl<'a> History<'a> {
     fn assistant(
         &mut self,
         output: &'a [Output],
-        provider: Option<&ProviderResponse>,
+        continuation: Option<&Value>,
         protocol: Protocol,
     ) -> Result<(), Error> {
-        if let Some(provider) = provider {
-            validate_provider(output, provider, protocol)?;
+        if let Some(continuation) = continuation {
+            validate_continuation(output, continuation, protocol)?;
         }
         for output in output {
             if let Output::ToolCall(call) = output {
@@ -232,21 +258,16 @@ impl<'a> History<'a> {
     }
 }
 
-fn validate_provider(
+fn validate_continuation(
     output: &[Output],
-    provider: &ProviderResponse,
+    continuation: &Value,
     protocol: Protocol,
 ) -> Result<(), Error> {
-    if provider.protocol != protocol {
-        return Err(Error::InvalidRequest(
-            "assistant continuation belongs to another provider protocol".into(),
-        ));
-    }
-    let native = decode(protocol, &provider.body)
+    let native = decode(protocol, protocol.body(continuation)?)
         .map_err(|error| Error::InvalidRequest(error.to_string()))?;
     if native.output != output {
         return Err(Error::InvalidRequest(
-            "assistant output does not match its provider data; clear provider data when editing output".into(),
+            "assistant output does not match its continuation; clear continuation when editing output".into(),
         ));
     }
     Ok(())

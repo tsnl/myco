@@ -56,12 +56,6 @@ impl FusedStream for Generation<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    OpenAiResponses,
-    AnthropicMessages,
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Request {
     pub model: String,
@@ -77,7 +71,7 @@ pub enum Message {
     User(String),
     Assistant {
         output: Vec<Output>,
-        provider: Option<ProviderResponse>,
+        continuation: Option<Value>,
     },
     ToolResult {
         call_id: String,
@@ -126,13 +120,6 @@ pub struct Usage {
     pub cache_write_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderResponse {
-    pub protocol: Protocol,
-    /// Native Responses object or assembled Messages object.
-    pub body: Value,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaKind {
     Text,
@@ -152,7 +139,6 @@ pub struct Delta {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Request {
-        protocol: Protocol,
         body: Value,
     },
     Progress {

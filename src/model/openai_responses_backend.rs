@@ -1,11 +1,10 @@
 use serde_json::{Value, json};
 
-use super::backend_helpers::{Completion, Decoded, Driver, EventStream, array, field, index};
-use super::http_helpers::Transport;
-use super::{
-    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, ProviderResponse, Request, Tool,
-    ToolCall, Usage,
+use super::backend_helpers::{
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
 };
+use super::http_helpers::Transport;
+use super::{Delta, DeltaKind, Error, Finish, Message, Output, Request, Tool, ToolCall, Usage};
 
 pub(super) struct Backend {
     transport: Transport,
@@ -51,7 +50,10 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
 fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     match message {
         Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant { output, provider } => assistant(output, provider.as_ref()),
+        Message::Assistant {
+            output,
+            continuation,
+        } => assistant(output, continuation.as_ref()),
         Message::ToolResult {
             call_id,
             output,
@@ -60,9 +62,10 @@ fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
     }
 }
 
-fn assistant(outputs: &[Output], provider: Option<&ProviderResponse>) -> Result<Vec<Value>, Error> {
-    if let Some(native) = provider {
-        return Ok(array(&native.body, "output")?.clone());
+fn assistant(outputs: &[Output], continuation: Option<&Value>) -> Result<Vec<Value>, Error> {
+    if let Some(continuation) = continuation {
+        let body = Protocol::OpenAiResponses.body(continuation)?;
+        return Ok(array(body, "output")?.clone());
     }
     outputs.iter().map(output).collect()
 }

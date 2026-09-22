@@ -9,8 +9,8 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use super::backend_helpers::{Decoded, EventStream, completed};
-use super::{Error, Event, Protocol};
+use super::backend_helpers::{Decoded, EventStream, Protocol, completed};
+use super::{Error, Event};
 
 pub(super) struct Transport {
     client: Client,
@@ -37,7 +37,7 @@ impl Transport {
     ) -> EventStream<'a> {
         Box::pin(try_stream! {
             let request = self.request(&body)?;
-            yield Event::Request { protocol, body };
+            yield Event::Request { body };
             let response = self.send(request).await?;
             let mut events = std::pin::pin!(response_events(response, protocol, decode));
             while let Some(event) = events.next().await {

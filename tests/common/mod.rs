@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{
-    Config, Error, Event, Finish, GenAiClient, Generation, Message, Protocol, Request, Usage,
-};
+use myco::model::{Config, Error, Event, Finish, GenAiClient, Generation, Message, Request, Usage};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -13,6 +11,12 @@ use tokio::{
 
 pub const OPENAI: &str = include_str!("../fixtures/openai.sse");
 pub const ANTHROPIC: &str = include_str!("../fixtures/anthropic.sse");
+
+#[derive(Clone, Copy)]
+pub enum Backend {
+    OpenAiResponses,
+    AnthropicMessages,
+}
 
 pub struct Captured {
     pub headers: String,
@@ -113,12 +117,12 @@ pub fn request() -> Request {
     }
 }
 
-pub fn client(protocol: Protocol, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
+pub fn client(protocol: Backend, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
     let endpoint = endpoint.into();
     let api_key = key.into();
     GenAiClient::new(match protocol {
-        Protocol::OpenAiResponses => Config::OpenAi { endpoint, api_key },
-        Protocol::AnthropicMessages => Config::Anthropic { endpoint, api_key },
+        Backend::OpenAiResponses => Config::OpenAi { endpoint, api_key },
+        Backend::AnthropicMessages => Config::Anthropic { endpoint, api_key },
     })
 }
 
@@ -182,7 +186,7 @@ async fn collect_events(mut generation: Generation<'_>) -> Trace {
     }
 }
 
-pub async fn run(protocol: Protocol, body: &str) -> Trace {
+pub async fn run(protocol: Backend, body: &str) -> Trace {
     let (url, _capture) = fixture(body, 200, "").await;
     let client = client(protocol, &url, "test-key").unwrap();
     collect(&client, request()).await

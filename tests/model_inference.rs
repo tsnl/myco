@@ -1,6 +1,6 @@
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
-use myco::model::{Event, Message, Protocol, Request};
+use myco::model::{Event, Message, Request};
 
 mod common;
 
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 #[test]
 fn invalid_input_is_rejected_before_a_stream_is_returned() {
     let model = client(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         "http://127.0.0.1:1/responses",
         "test",
     )
@@ -33,7 +33,7 @@ fn invalid_input_is_rejected_before_a_stream_is_returned() {
 #[tokio::test]
 async fn request_capture_precedes_any_network_io() {
     let model = client(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         "http://127.0.0.1:1/responses",
         "test",
     )
@@ -46,10 +46,9 @@ async fn request_capture_precedes_any_network_io() {
         },
     )
     .await;
-    let Event::Request { protocol, body } = &trace.events[0] else {
+    let Event::Request { body } = &trace.events[0] else {
         panic!("expected request")
     };
-    assert_eq!(*protocol, Protocol::OpenAiResponses);
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
     assert_eq!(body["input"][0]["content"], "hello");
@@ -61,7 +60,7 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
     let progress = json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"});
     let terminal = json!({"type":"response.completed","response":text_response("hello")});
     let (url, _capture) = fixture(&events(&[progress.clone(), terminal.clone()]), 200, "").await;
-    let client = client(Protocol::OpenAiResponses, &url, "").unwrap();
+    let client = client(Backend::OpenAiResponses, &url, "").unwrap();
     let mut generation = client.generate(request()).unwrap();
     assert!(matches!(
         generation.next().await,
@@ -92,10 +91,10 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
 }
 
 #[tokio::test]
-async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() {
+async fn both_backends_restore_opaque_continuations_without_client_state() {
     for (protocol, fixture_body) in [
-        (Protocol::OpenAiResponses, OPENAI),
-        (Protocol::AnthropicMessages, ANTHROPIC),
+        (Backend::OpenAiResponses, OPENAI),
+        (Backend::AnthropicMessages, ANTHROPIC),
     ] {
         let (url, capture) = fixture(fixture_body, 200, "").await;
         let model = client(protocol, &url, "test-key").unwrap();
@@ -110,7 +109,7 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
         let reply = completed(&trace);
         let Message::Assistant {
             output,
-            provider: Some(native),
+            continuation: Some(continuation),
         } = &reply.message
         else {
             panic!("missing assistant continuation");
@@ -148,7 +147,10 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
 
         let mut next = request();
         next.messages.extend([
-            reply.message.clone(),
+            Message::Assistant {
+                output: output.clone(),
+                continuation: Some(serde_json::from_str(&continuation.to_string()).unwrap()),
+            },
             Message::User("Continue.".into()),
             Message::ToolResult {
                 call_id: call.id.clone(),
@@ -156,21 +158,21 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
                 is_error: false,
             },
         ]);
-        let body = encoded_request(&model, next).await;
+        assert_eq!(next.messages[1], reply.message);
+        let restored = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
+        let body = encoded_request(&restored, next).await;
         match protocol {
-            Protocol::OpenAiResponses => {
+            Backend::OpenAiResponses => {
                 assert!(captured.headers.contains("authorization: Bearer test-key"));
                 assert_eq!(reply.usage.input_tokens, Some(12));
-                assert_eq!(body["input"][1], native.body["output"][0]);
                 assert_eq!(body["input"][1]["encrypted_content"], "opaque-reasoning");
                 assert_eq!(body["input"][3]["call_id"], "call_fixture");
                 assert_eq!(body["input"][5]["call_id"], "call_fixture");
             }
-            Protocol::AnthropicMessages => {
+            Backend::AnthropicMessages => {
                 assert!(captured.headers.contains("x-api-key: test-key"));
                 assert!(captured.headers.contains("anthropic-version: 2023-06-01"));
                 assert_eq!(reply.usage.input_tokens, Some(11));
-                assert_eq!(body["messages"][1]["content"], native.body["content"]);
                 assert_eq!(
                     body["messages"][1]["content"][0]["signature"],
                     "signed-reasoning"
@@ -190,11 +192,15 @@ async fn both_protocols_stream_text_and_tools_and_retain_native_continuations() 
 }
 
 #[tokio::test]
-async fn terminal_response_is_authoritative_even_without_text_deltas() {
+async fn terminal_output_retains_opaque_items_even_without_text_deltas() {
     let mut raw = text_response("full response");
     raw["extra_provider_field"] = json!({"evidence":"retained"});
+    raw["output"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"future_output","payload":"retained"}));
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(&[
             json!({"type":"future_event","payload":"retained"}),
             json!({"type":"response.completed","response":raw}),
@@ -204,17 +210,31 @@ async fn terminal_response_is_authoritative_even_without_text_deltas() {
     let reply = completed(&trace);
     let Message::Assistant {
         output,
-        provider: Some(native),
+        continuation: Some(continuation),
     } = &reply.message
     else {
         panic!("missing assistant continuation");
     };
     assert_eq!(output, &[Output::Text("full response".into())]);
     assert_eq!(reply.usage.input_tokens, None);
-    assert_eq!(native.body, raw);
+    assert!(!continuation.is_null());
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Progress { raw: event, .. } if event["response"] == raw))
+    );
     assert!(trace.events.iter().any(
         |e| matches!(e, Event::Progress { raw, delta: None } if raw["type"] == "future_event")
     ));
+    let model = client(Backend::OpenAiResponses, "http://127.0.0.1:1/inference", "").unwrap();
+    let mut next = request();
+    next.messages.push(reply.message.clone());
+    let body = encoded_request(&model, next).await;
+    assert_eq!(
+        &body["input"].as_array().unwrap()[1..],
+        raw["output"].as_array().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -223,13 +243,13 @@ async fn output_limits_and_refusals_are_not_normal_completion() {
     raw["status"] = "incomplete".into();
     raw["incomplete_details"] = json!({"reason":"max_output_tokens"});
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(&[json!({"type":"response.incomplete","response":raw})]),
     )
     .await;
     assert_eq!(completed(&trace).finish, Finish::Length);
     let trace = run(
-        Protocol::AnthropicMessages,
+        Backend::AnthropicMessages,
         &ANTHROPIC.replace(
             "\"tool_use\",\"stop_sequence\"",
             "\"max_tokens\",\"stop_sequence\"",
@@ -239,7 +259,7 @@ async fn output_limits_and_refusals_are_not_normal_completion() {
     assert_eq!(completed(&trace).finish, Finish::Length);
     let raw = json!({"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"Cannot comply"}]}]});
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(&[json!({"type":"response.completed","response":raw})]),
     )
     .await;
@@ -250,11 +270,11 @@ async fn output_limits_and_refusals_are_not_normal_completion() {
 async fn a_closed_connection_or_done_marker_does_not_imply_completion() {
     for (protocol, body) in [
         (
-            Protocol::OpenAiResponses,
+            Backend::OpenAiResponses,
             "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
         ),
-        (Protocol::OpenAiResponses, "data: [DONE]\n\n"),
-        (Protocol::AnthropicMessages, "data: {\"type\":\"ping\"}\n\n"),
+        (Backend::OpenAiResponses, "data: [DONE]\n\n"),
+        (Backend::AnthropicMessages, "data: {\"type\":\"ping\"}\n\n"),
     ] {
         let trace = run(protocol, body).await;
         assert!(
@@ -272,7 +292,7 @@ async fn http_failures_keep_status_request_id_and_retry_advice() {
         "x-request-id: req_fixture\r\nRetry-After: 3\r\n",
     )
     .await;
-    let model = client(Protocol::OpenAiResponses, &url, "test-key").unwrap();
+    let model = client(Backend::OpenAiResponses, &url, "test-key").unwrap();
     let trace = collect(&model, request()).await;
     assert_eq!(trace.events.len(), 1);
     let Err(Error::Http {
@@ -293,7 +313,7 @@ async fn http_failures_keep_status_request_id_and_retry_advice() {
 
 #[tokio::test]
 async fn provider_failures_preserve_the_last_event_and_never_complete() {
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let error = json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}});
         let trace = run(protocol, &events(std::slice::from_ref(&error))).await;
         assert!(matches!(&trace.result, Err(Error::Provider(raw)) if raw == &error));
@@ -310,7 +330,7 @@ async fn provider_failures_preserve_the_last_event_and_never_complete() {
 async fn malformed_terminal_output_still_has_a_trace_record() {
     let event = json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c","name":"read","arguments":"{"}]}});
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(std::slice::from_ref(&event)),
     )
     .await;
@@ -343,7 +363,7 @@ async fn malformed_anthropic_sequences_fail_without_a_completed_message() {
             json!({"type":"message_stop"}),
         ],
     ] {
-        let trace = run(Protocol::AnthropicMessages, &events(&sequence)).await;
+        let trace = run(Backend::AnthropicMessages, &events(&sequence)).await;
         assert!(
             matches!(&trace.result, Err(Error::Protocol(_))),
             "{trace:?}"
@@ -352,37 +372,66 @@ async fn malformed_anthropic_sequences_fail_without_a_completed_message() {
 }
 
 #[tokio::test]
-async fn continuation_protocol_and_tool_links_are_checked_before_dispatch() {
-    let trace = run(Protocol::AnthropicMessages, ANTHROPIC).await;
-    let message = completed(&trace).message.clone();
-    let model = client(
-        Protocol::OpenAiResponses,
-        "http://127.0.0.1:1/responses",
-        "",
-    )
-    .unwrap();
-    let mut input = request();
-    input.messages.push(message);
-    assert!(matches!(
-        model.generate(input.clone()),
-        Err(Error::InvalidRequest(_))
-    ));
-    input.messages = vec![Message::ToolResult {
-        call_id: "missing".into(),
-        output: "orphan".into(),
-        is_error: false,
-    }];
-    assert!(matches!(
-        model.generate(input),
-        Err(Error::InvalidRequest(_))
-    ));
+async fn incompatible_continuations_and_tool_links_are_rejected_before_dispatch() {
+    for (source, target, body) in [
+        (
+            Backend::AnthropicMessages,
+            Backend::OpenAiResponses,
+            ANTHROPIC,
+        ),
+        (Backend::OpenAiResponses, Backend::AnthropicMessages, OPENAI),
+    ] {
+        let trace = run(source, body).await;
+        let model = client(target, "http://127.0.0.1:1/inference", "").unwrap();
+        let mut input = request();
+        input.messages.extend([
+            completed(&trace).message.clone(),
+            Message::ToolResult {
+                call_id: "call_fixture".into(),
+                output: "note contents".into(),
+                is_error: false,
+            },
+        ]);
+        assert!(matches!(model.generate(input.clone()),
+            Err(Error::InvalidRequest(error)) if error.contains("incompatible")));
+        input.messages = vec![Message::ToolResult {
+            call_id: "missing".into(),
+            output: "orphan".into(),
+            is_error: false,
+        }];
+        assert!(matches!(model.generate(input),
+            Err(Error::InvalidRequest(error)) if error.contains("unmatched")));
+    }
+}
+
+#[test]
+fn malformed_continuations_fail_before_a_stream_is_returned() {
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        for continuation in [
+            Value::Null,
+            json!(42),
+            json!("invalid"),
+            json!([]),
+            json!({}),
+            json!({"unknown":{}}),
+        ] {
+            let mut input = request();
+            input.messages.push(Message::Assistant {
+                output: vec![Output::Text("previous reply".into())],
+                continuation: Some(continuation),
+            });
+            assert!(matches!(model.generate(input),
+                Err(Error::InvalidRequest(error)) if error.contains("continuation")));
+        }
+    }
 }
 
 #[tokio::test]
-async fn edited_assistant_output_cannot_silently_reuse_stale_provider_data() {
+async fn edited_assistant_output_cannot_silently_reuse_stale_continuation() {
     for (protocol, fixture_body) in [
-        (Protocol::OpenAiResponses, OPENAI),
-        (Protocol::AnthropicMessages, ANTHROPIC),
+        (Backend::OpenAiResponses, OPENAI),
+        (Backend::AnthropicMessages, ANTHROPIC),
     ] {
         let trace = run(protocol, fixture_body).await;
         let mut message = completed(&trace).message.clone();
@@ -410,7 +459,7 @@ async fn dropping_an_incomplete_generation_closes_the_http_request() {
     let body =
         events(&[json!({"type":"response.output_text.delta","output_index":0,"delta":"started"})]);
     let (endpoint, server) = unfinished_body(body).await;
-    let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
+    let model = client(Backend::OpenAiResponses, &endpoint, "").unwrap();
     let mut generation = model.generate(request()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         assert!(matches!(
@@ -431,8 +480,8 @@ async fn dropping_an_incomplete_generation_closes_the_http_request() {
 #[tokio::test]
 async fn completion_releases_the_http_request_without_dropping_or_polling_again() {
     for (protocol, body) in [
-        (Protocol::OpenAiResponses, OPENAI),
-        (Protocol::AnthropicMessages, ANTHROPIC),
+        (Backend::OpenAiResponses, OPENAI),
+        (Backend::AnthropicMessages, ANTHROPIC),
     ] {
         let (endpoint, server) = unfinished_body(body.into()).await;
         let model = client(protocol, &endpoint, "").unwrap();
@@ -459,12 +508,12 @@ async fn completion_releases_the_http_request_without_dropping_or_polling_again(
 
 #[tokio::test]
 async fn two_requests_share_a_client_without_serializing_or_mixing_outputs() {
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         concurrent_requests(protocol).await;
     }
 }
 
-async fn concurrent_requests(protocol: Protocol) {
+async fn concurrent_requests(protocol: Backend) {
     use std::sync::Arc;
     use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Barrier};
 
@@ -506,13 +555,13 @@ async fn concurrent_requests(protocol: Protocol) {
     server.await.unwrap();
 }
 
-fn echo(protocol: Protocol, request: &Value) -> String {
+fn echo(protocol: Backend, request: &Value) -> String {
     match protocol {
-        Protocol::OpenAiResponses => {
+        Backend::OpenAiResponses => {
             let text = request["input"][0]["content"].as_str().unwrap();
             events(&[json!({"type":"response.completed","response":text_response(text)})])
         }
-        Protocol::AnthropicMessages => {
+        Backend::AnthropicMessages => {
             let text = &request["messages"][0]["content"][0]["text"];
             events(&[
                 json!({"type":"message_start","message":{"type":"message","role":"assistant","content":[]}}),
@@ -531,7 +580,7 @@ async fn duplicate_calls_cannot_be_mistaken_for_distinct_operations() {
     let call = json!({"type":"function_call","call_id":"same","name":"read","arguments":"{}"});
     let raw = json!({"status":"completed","output":[call.clone(),call]});
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(&[json!({"type":"response.completed","response":raw})]),
     )
     .await;
@@ -540,12 +589,7 @@ async fn duplicate_calls_cannot_be_mistaken_for_distinct_operations() {
 
 #[tokio::test]
 async fn driver_options_are_per_request_and_cannot_replace_context() {
-    let model = client(
-        Protocol::OpenAiResponses,
-        "http://127.0.0.1:1/responses",
-        "",
-    )
-    .unwrap();
+    let model = client(Backend::OpenAiResponses, "http://127.0.0.1:1/responses", "").unwrap();
     let mut input = request();
     input
         .driver_options
@@ -589,14 +633,14 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
         {"type":"function_call","call_id":"c","name":"read","arguments":"{"}
     ]});
     let trace = run(
-        Protocol::OpenAiResponses,
+        Backend::OpenAiResponses,
         &events(&[json!({"type":"response.incomplete", "response":raw})]),
     )
     .await;
     let reply = completed(&trace);
     let Message::Assistant {
         output,
-        provider: Some(native),
+        continuation: Some(continuation),
     } = &reply.message
     else {
         panic!("missing assistant continuation");
@@ -611,13 +655,11 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
             .as_ref()
             .is_err_and(|error| !error.is_empty())
     );
-    assert_eq!(native.body["output"][1]["arguments"], "{");
-    let model = client(
-        Protocol::OpenAiResponses,
-        "http://127.0.0.1:1/responses",
-        "",
-    )
-    .unwrap();
+    assert!(!continuation.is_null());
+    assert!(trace.events.iter().any(
+        |e| matches!(e, Event::Progress { raw, .. } if raw["response"]["output"][1]["arguments"] == "{")
+    ));
+    let model = client(Backend::OpenAiResponses, "http://127.0.0.1:1/responses", "").unwrap();
     let mut input = request();
     input.messages.push(reply.message.clone());
     assert!(matches!(
@@ -629,15 +671,15 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
 #[tokio::test]
 async fn parsed_tool_arguments_encode_in_each_providers_wire_format() {
     let arguments = json!({"path":"note.txt", "lines":[1, 2]});
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
         let body = encoded_request(&model, tool_history(Ok(arguments.clone()))).await;
         match protocol {
-            Protocol::OpenAiResponses => {
+            Backend::OpenAiResponses => {
                 let encoded = body["input"][1]["arguments"].as_str().unwrap();
                 assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), arguments);
             }
-            Protocol::AnthropicMessages => {
+            Backend::AnthropicMessages => {
                 assert_eq!(body["messages"][1]["content"][0]["input"], arguments);
             }
         }
@@ -646,7 +688,7 @@ async fn parsed_tool_arguments_encode_in_each_providers_wire_format() {
 
 #[test]
 fn invalid_tool_arguments_cannot_be_used_in_continuation() {
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
         for arguments in [Err("incomplete JSON".into()), Ok(json!([1, 2]))] {
             assert!(matches!(
@@ -666,7 +708,7 @@ fn tool_history(arguments: Result<Value, String>) -> Request {
                 name: "read".into(),
                 arguments,
             })],
-            provider: None,
+            continuation: None,
         },
         Message::ToolResult {
             call_id: "call".into(),
@@ -706,7 +748,7 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
         socket.write_all(&rest.as_bytes()[split..]).await.unwrap();
     });
 
-    let model = client(Protocol::OpenAiResponses, &endpoint, "").unwrap();
+    let model = client(Backend::OpenAiResponses, &endpoint, "").unwrap();
     let mut generation = model.generate(request()).unwrap();
     assert!(matches!(
         generation.next().await,

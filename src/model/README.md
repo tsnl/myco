@@ -46,10 +46,10 @@ stream fields. No model catalog, environment loading, or policy defaults are
 embedded in the model module.
 
 Workflow code in `logic` translates selected thread history into a `Request`
-and translates stream events into conversation entries. It records native provider
-continuation and call-ID mappings, then restores that evidence when assembling
-subsequent requests. The `thread` module supplies history operations; each workflow
-chooses its context and publication policy. These higher modules are specified in
+and translates stream events into conversation entries. It records opaque
+continuation JSON and call-ID mappings, passing the continuation back unchanged
+when assembling subsequent requests. The `thread` module supplies history
+operations; each workflow chooses its context and publication policy. These higher modules are specified in
 [DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
 
 Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
@@ -64,8 +64,8 @@ Concurrent calls can produce independent candidates from the same fixed history.
   without a stream or network dispatch. The concrete `Generation` implements
   `Stream<Item = Result<Event, Error>>`, `Send`, `Unpin`, and `FusedStream`.
   It borrows its client and owns its attempt. Creating it performs no network I/O.
-- The first stream item is `Event::Request` with the exact JSON body, excluding
-  authentication headers. The HTTP request is sent only when polling continues.
+- The first stream item is `Event::Request { body }` with the exact JSON body,
+  excluding authentication headers. The HTTP request is sent only when polling continues.
   The caller can inspect and persist the request before polling again, or drop
   the stream if recording fails. Transport and provider failures arrive as stream
   errors.
@@ -91,22 +91,26 @@ Concurrent calls can produce independent candidates from the same fixed history.
   shared conversation state, or application event buffers. The caller owns retry
   policy and overall/idle deadlines; the connection timeout is 30 seconds.
   A retried attempt must remain distinguishable from earlier partial output.
-- A response exposes ordered output, optional usage counters, and native provider
-  data. Input-token totals include cache reads and writes. Additional usage
-  fields and stop details remain in the provider body.
+- A response exposes ordered output and optional usage counters. Input-token
+  totals include cache reads and writes. Raw progress retains provider metadata
+  for diagnostics; workflows need not interpret it.
 
 `ToolCall::arguments` is `Result<Value, String>`: parsed JSON or a parse error.
 Truncated Responses calls can retain an error while the raw arguments remain in
-provider data. Valid tool arguments must be JSON objects. Streaming argument
+the continuation. Valid tool arguments must be JSON objects. Streaming argument
 deltas remain text until the response is decoded.
 
 Append the returned message directly to the next request, followed by linked
-`ToolResult` messages when needed. `Message::Assistant` holds output and optional
-provider data; finish reason and usage belong to the completion event. Opaque
-reasoning, thinking signatures, content ordering, and provider call IDs are
-preserved. Continuation with another protocol is rejected. Edited output must
-clear its provider data; mismatched content is rejected before dispatch.
-Applications store and reconstruct messages in their chosen format.
+`ToolResult` messages when needed. `Message::Assistant` holds output and
+`continuation: Option<Value>`; finish reason and usage belong to the completion
+event. Continuation is opaque JSON: store it and pass it back unchanged, without
+depending on its structure. Private backends preserve and validate reasoning,
+thinking signatures, content ordering, and call IDs. Malformed or incompatible
+continuation is rejected before dispatch, as is edited output that no longer
+matches it. Synthesized messages use `None`; editing output requires clearing
+continuation, and reasoning cannot be reconstructed without it. Applications
+store and reconstruct messages in their chosen format, without provider-specific
+response or protocol types.
 
 Workflow evaluations can inject scripted inference results without HTTP.
 Adapter tests can construct messages and completion events directly. The application
@@ -134,7 +138,8 @@ this step. Unknown top-level events and opaque output items are retained;
 unsupported Anthropic content deltas fail explicitly.
 
 Tests use local HTTP fixtures and need no credentials. They cover fragmented SSE,
-Unicode, both providers, continuation, cumulative usage, truncation, errors,
+Unicode, both providers, opaque continuation round trips through fresh clients,
+invalid continuation, cumulative usage, truncation, errors,
 request-before-dispatch, ordered completion, stream termination, concurrent calls,
 stream drop, and retaining a partial frame across a dropped `next()` wait.
 Live provider/account compatibility has not been exercised.

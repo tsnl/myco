@@ -1,11 +1,10 @@
 use serde_json::{Map, Value, json};
 
-use super::backend_helpers::{Completion, Decoded, Driver, EventStream, array, field, index};
-use super::http_helpers::Transport;
-use super::{
-    Delta, DeltaKind, Error, Finish, Message, Output, Protocol, ProviderResponse, Request, Tool,
-    ToolCall, Usage,
+use super::backend_helpers::{
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
 };
+use super::http_helpers::Transport;
+use super::{Delta, DeltaKind, Error, Finish, Message, Output, Request, Tool, ToolCall, Usage};
 
 pub(super) struct Backend {
     transport: Transport,
@@ -72,9 +71,14 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
 fn content(message: &Message) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
         Message::User(text) => ("user", vec![json!({"type": "text", "text": text})], false),
-        Message::Assistant { output, provider } => {
-            ("assistant", assistant(output, provider.as_ref())?, false)
-        }
+        Message::Assistant {
+            output,
+            continuation,
+        } => (
+            "assistant",
+            assistant(output, continuation.as_ref())?,
+            false,
+        ),
         Message::ToolResult {
             call_id,
             output,
@@ -110,9 +114,10 @@ fn merge(message: &mut Value, content: Content) {
     }
 }
 
-fn assistant(outputs: &[Output], provider: Option<&ProviderResponse>) -> Result<Vec<Value>, Error> {
-    if let Some(native) = provider {
-        return Ok(array(&native.body, "content")?.clone());
+fn assistant(outputs: &[Output], continuation: Option<&Value>) -> Result<Vec<Value>, Error> {
+    if let Some(continuation) = continuation {
+        let body = Protocol::AnthropicMessages.body(continuation)?;
+        return Ok(array(body, "content")?.clone());
     }
     outputs.iter().map(output).collect()
 }
