@@ -1,4 +1,29 @@
 #sky-clouds { position: absolute; inset: 0; }
+#sky-aircraft { position: absolute; inset: 0; }
+.sky-aircraft { position: absolute; left: 0; top: 0; animation: aircraft-pass var(--flight-duration) linear both; }
+.aircraft-bearing { width: 28px; height: 20px; position: absolute; left: -14px; top: -10px; transform: rotate(var(--flight-heading)) scale(var(--aircraft-scale)); }
+.aircraft-bearing svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.aircraft-silhouette { fill: #e2ebf1; stroke: #536a8270; stroke-width: .5px; opacity: .8; }
+.aircraft-contrail { display: none; position: absolute; right: 90%; top: calc(50% - 2px); width: var(--contrail-length); height: 4px; opacity: .32; filter: blur(.6px); }
+.has-contrail .aircraft-contrail { display: block; }
+.aircraft-contrail::before, .aircraft-contrail::after { content: ''; position: absolute; inset: 0 0 auto; height: 1px; background: linear-gradient(90deg, transparent, #e8f2fc40 25%, #f4f7fd); }
+.aircraft-contrail::after { top: auto; bottom: 0; }
+.aircraft-lights { opacity: .15; }
+.aircraft-port { fill: #ff918b; }
+.aircraft-starboard { fill: #a4e9c9; }
+.aircraft-beacon { fill: #fff9db; animation: aircraft-beacon 4s ease-in-out var(--beacon-delay) infinite; }
+#sky[data-phase="twilight"] .aircraft-contrail { opacity: .26; }
+#sky[data-phase="twilight"] .aircraft-contrail::before, #sky[data-phase="twilight"] .aircraft-contrail::after { background: linear-gradient(90deg, transparent, #f1c4ac40 25%, #ffe0be); }
+#sky[data-phase="night"] .aircraft-contrail { opacity: .045; }
+#sky[data-phase="night"] .aircraft-silhouette { fill: #8296b0; stroke: none; opacity: .2; }
+#sky[data-phase="night"] .aircraft-lights, #sky[data-phase="twilight"] .aircraft-lights { opacity: .9; filter: drop-shadow(0 0 1.5px #ffeac860); }
+#sky.paused .sky-aircraft, #sky.paused .aircraft-beacon { animation-play-state: paused; }
+@keyframes aircraft-pass {
+  from { transform: translate(var(--flight-from-x), var(--flight-from-y)); opacity: 0; }
+  8%, 92% { opacity: 1; }
+  to { transform: translate(var(--flight-to-x), var(--flight-to-y)); opacity: 0; }
+}
+@keyframes aircraft-beacon { 0%, 55%, 100% { opacity: .25; } 70%, 78% { opacity: 1; } }
 #sky::after { content: ''; position: absolute; inset: 0; background: #34435c; opacity: var(--overcast, 0); transition: opacity 12s; }
 .cloud-layer { position: absolute; inset: 0 auto 0 50%; width: max(100vw, 1440px); transform: translateX(-50%); }
 .cloud-track { position: absolute; inset: 0; animation: cloud-drift var(--drift-duration, 4800s) linear infinite; animation-direction: var(--drift-direction, normal); }
@@ -39,6 +64,8 @@
   #sky-settings { right: 16px; top: 100px; max-height: calc(100dvh - 120px); padding: 20px; }
 }
 @media (prefers-reduced-motion: reduce) {
+  #sky-aircraft { display: none; }
+  .sky-aircraft, .aircraft-beacon { animation: none; }
   .cloud-track { animation: none; }
   .cloud-sprite, #sky::after { transition: none; }
 }

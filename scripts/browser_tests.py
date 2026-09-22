@@ -295,7 +295,7 @@ context_window = 100000
     def test_sky_endpoints_require_authentication_and_validate_input(self):
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js"]:
+            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 401)
         finally:
             anonymous.dispose()
@@ -333,6 +333,47 @@ context_window = 100000
         self.submit(page, "Alpha markdown")
         expect(page.locator(".assistant .markdown table")).to_be_visible()
         expect(page.locator("#model")).to_be_enabled()
+
+    def test_sky_airplanes_arrive_occasionally_stay_bounded_and_leave(self):
+        page = self.page
+        page.clock.install()
+        page.reload()
+        planes = page.locator(".sky-aircraft")
+        page.clock.fast_forward(30000)
+        expect(planes).to_have_count(0)
+        page.clock.fast_forward(81000)
+        expect(planes.first).to_be_attached()
+        for _ in range(6):
+            page.clock.fast_forward(361000)
+            self.assertLessEqual(planes.count(), 2)
+        self.assertEqual(page.locator("#sky-aircraft").evaluate("n => getComputedStyle(n).pointerEvents"), "none")
+        planes.evaluate_all("nodes => nodes.forEach(n => n.getAnimations().forEach(a => a.finish()))")
+        expect(planes).to_have_count(0)
+
+    def test_sky_airplanes_pause_when_hidden_and_stop_for_reduced_motion(self):
+        page = self.page
+        page.clock.install()
+        page.emulate_media(reduced_motion="reduce")
+        page.reload()
+        planes = page.locator(".sky-aircraft")
+        page.clock.fast_forward(3600000)
+        expect(planes).to_have_count(0)
+        page.emulate_media(reduced_motion="no-preference")
+        page.clock.fast_forward(111000)
+        expect(planes.first).to_be_attached()
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertEqual(planes.first.evaluate("n => getComputedStyle(n).animationPlayState"), "paused")
+        count = planes.count()
+        elapsed = planes.first.evaluate("n => n.getAnimations()[0].currentTime")
+        page.clock.fast_forward(3600000)
+        expect(planes).to_have_count(count)
+        self.assertAlmostEqual(planes.first.evaluate("n => n.getAnimations()[0].currentTime"), elapsed, delta=1)
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertEqual(planes.first.evaluate("n => getComputedStyle(n).animationPlayState"), "running")
+        page.emulate_media(reduced_motion="reduce")
+        expect(planes).to_have_count(0)
+        page.clock.fast_forward(3600000)
+        expect(planes).to_have_count(0)
 
     def test_refresh_keeps_transcript_nodes_and_expanded_tools(self):
         page = self.session(self.page)

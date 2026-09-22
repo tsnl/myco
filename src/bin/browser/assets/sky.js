@@ -1,6 +1,7 @@
 import renderGradient from '/horizon.js';
 import { createClouds, colorClouds } from '/clouds.js';
 import { skySettings } from '/sky-settings.js';
+import { createAircraft } from '/aircraft.js';
 
 const sky = document.createElement('div');
 sky.id = 'sky';
@@ -29,6 +30,7 @@ for (let index = 0; index < 90; index++) {
 }
 sky.append(stars);
 document.body.prepend(sky);
+createAircraft(sky);
 const updateClouds = createClouds(sky);
 const illustrated = { cloud_cover_high: 32, cloud_cover_mid: 38, cloud_cover_low: 42, wind_speed_10m: 3, wind_direction_10m: 260 };
 let forecast = null;

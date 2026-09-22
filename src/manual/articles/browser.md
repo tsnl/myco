@@ -20,8 +20,10 @@ The conversation stays in a central well, with the sky visible on both sides;
 floating controls use background blur. Soft, naturally shaded clouds drift slowly in three
 layers: high wisps near the top, middle clouds below them, and larger low clouds
 near the horizon. Colors follow the sky through daylight, sunset, and night;
-stars twinkle behind the clouds. Reduced-motion settings keep clouds and stars
-still, and hidden tabs pause their animation.
+stars twinkle behind the clouds. An occasional distant airplane crosses the sky,
+with a faint contrail or navigation lights after dark. These are decorative
+flybys, with at most two visible at once. Reduced-motion settings keep clouds and
+stars still and disable airplanes. Hidden tabs pause both animation and arrivals.
 The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
 with its MIT license retained in the served source.
 
