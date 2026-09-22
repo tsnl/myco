@@ -57,6 +57,12 @@ output, images, and outcome. Input shows each top-level key as a bold label abov
 its value. Strings retain their newlines without JSON quoting; nested objects and
 arrays retain JSON structure. There is no browser verbose mode.
 
+Tool calls show elapsed execution time to tenths of a second in their headers
+and in the Activity drawer. Running timers update every 0.1 seconds and survive
+page refreshes; completion, failure, or cancellation freezes the final duration.
+Durations are observed by the running browser server and retained while viewing
+the same thread. Saved history opened after a server restart has no timing data.
+
 **Activity** opens a right-hand drawer with separate sections for active tool
 calls and local background tasks, such as bash sessions that continue between
 turns. The drawer starts closed; its button shows the current activity count.

@@ -25,12 +25,12 @@ def reply(text):
              "content_index": 0, "delta": text}]
 
 
-def tool(arguments, name="bash"):
+def tool(arguments, name="bash", index=0):
     return [
-        {"type": "response.output_item.added", "output_index": 0,
+        {"type": "response.output_item.added", "output_index": index,
          "item": {"type": "function_call", "name": name,
                   "call_id": str(uuid.uuid4()), "arguments": ""}},
-        {"type": "response.function_call_arguments.done", "output_index": 0,
+        {"type": "response.function_call_arguments.done", "output_index": index,
          "arguments": json.dumps(arguments)},
     ]
 
@@ -50,7 +50,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1]
@@ -65,6 +65,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = reply(f"{name} finished.")
         elif "rename" in prompt:
             events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
+        elif "parallel" in prompt:
+            events = []
+            for index in range(2):
+                release = shlex.quote(str(root / f"{name}-release-{index}"))
+                events += tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done", "timeout_ms": 60000}, index=index)
         elif "shell" in prompt:
             events = tool({"action": "start", "session_id": "kept",
                            "command": f"MYCO_TEST_MARKER={name} bash --noprofile --norc",
@@ -239,6 +244,54 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         expect(page.locator("#queued")).to_be_hidden()
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
+
+    def test_tool_timers_tick_every_tenth_and_keep_independent_durations_across_refresh(self):
+        page = self.page
+        page.clock.install(time="2000-01-01T00:00:00Z")
+        self.session(page)
+        self.submit(page, "Alpha parallel")
+        expect(page.locator(".tool.running")).to_have_count(2)
+        expect(page.locator(".tool.running .tool-duration")).to_have_text([re.compile(r"^[1-9]\d*\.\ds$"), re.compile(r"^[1-9]\d*\.\ds$")])
+        before = [float(text[:-1]) for text in page.locator(".tool-duration").all_text_contents()[:2]]
+        self.assertTrue(all(1 <= duration < 30 for duration in before), "Browser clock skew must not affect elapsed time")
+        page.click("#activity-toggle")
+        page.clock.pause_at(page.evaluate("Date.now() / 1000 + 1"))
+        page.clock.run_for(100)
+        timers = page.locator(".tool-duration[data-running=true]")
+        previous = [float(text[:-1]) for text in timers.all_text_contents()]
+        self.assertEqual(len(previous), 4, "Both the tool headers and activity drawer show timers")
+        for _ in range(3):
+            page.clock.run_for(100)
+            current = [float(text[:-1]) for text in timers.all_text_contents()]
+            self.assertEqual(current[:2], current[2:], "Header and activity timers agree")
+            for old, new in zip(previous, current):
+                self.assertAlmostEqual(new - old, 0.1)
+            previous = current
+        page.clock.resume()
+        page.reload()
+        expect(page.locator(".tool.running")).to_have_count(2)
+        after = [float(text[:-1]) for text in page.locator(".tool .tool-duration").all_text_contents()]
+        self.assertTrue(all(new >= old for old, new in zip(before, after)), "Refreshing must not reset a running timer")
+        (self.home / "Alpha-release-0").touch()
+        expect(page.locator(".tool.done")).to_have_count(1)
+        finished = page.locator(".tool.done .tool-duration").inner_text()
+        running_timer = page.locator(".tool.running .tool-duration")
+        running = float(running_timer.inner_text()[:-1])
+        for _ in range(3):
+            expect(running_timer).not_to_have_text(running_timer.inner_text())
+        self.assertGreaterEqual(float(running_timer.inner_text()[:-1]) - running, 0.29)
+        expect(page.locator(".tool.done .tool-duration")).to_have_text(finished)
+        page.screenshot(path=str(self.artifacts / "independent-tool-timers.png"))
+        page.click("#cancel")
+        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator(".tool.failed")).to_have_count(1)
+        expect(page.locator(".tool.done .tool-duration")).to_have_text(finished)
+        stopped = page.locator(".tool .tool-duration").all_text_contents()
+        self.submit(page, "Alpha markdown")
+        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator(".tool .tool-duration")).to_have_text(stopped)
+        page.reload()
+        expect(page.locator(".tool .tool-duration")).to_have_text(stopped)
 
     def test_cancel_clears_queued_messages_without_submitting_them(self):
         page = self.session(self.page)

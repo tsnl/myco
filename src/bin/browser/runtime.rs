@@ -139,6 +139,10 @@ impl App {
         let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
         let snapshot = &mut live.snapshot;
+        let mut blocks = view::history(session.active_thread());
+        if snapshot.thread_id == session.active_thread().id {
+            view::retain_tool_timers(&mut blocks, &snapshot.blocks);
+        }
         snapshot.session_id = session.id.clone();
         snapshot.thread_id = session.active_thread().id.clone();
         snapshot.title = session
@@ -146,7 +150,7 @@ impl App {
             .clone()
             .unwrap_or_else(|| "New session".into());
         snapshot.model = boot.catalog_model.spec.key.clone();
-        snapshot.blocks = view::history(session.active_thread());
+        snapshot.blocks = blocks;
         snapshot.status = status.into();
         snapshot.tasks = tasks;
         if let Err(error) = self.start_next(&mut live) {
@@ -234,7 +238,7 @@ impl EventSink for App {
             AgentEvent::ToolStarted { tool_use, context } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
                 let index = live.snapshot.blocks.len();
-                let block = Block::tool(tool_use);
+                let block = Block::tool(tool_use, Some(Instant::now()));
                 live.snapshot.blocks.push(block.clone());
                 self.publish(
                     &mut live.snapshot,

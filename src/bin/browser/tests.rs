@@ -221,6 +221,7 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     let blocks = started["snapshot"]["blocks"].as_array().unwrap();
     assert_eq!(blocks.len(), 2);
     assert!(blocks.iter().all(|block| block["running"] == true));
+    assert!(blocks.iter().all(|block| block["elapsed_ms"].is_u64()));
     assert_eq!(blocks[0]["tool"]["input"], first.input);
     app.emit(AgentEvent::ToolFinished {
         tool_use: second,
@@ -233,6 +234,70 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     assert_eq!(blocks[1]["running"], false);
     assert_eq!(blocks[1]["status"], "done");
     assert_eq!(blocks[1]["text"], "saved");
+    assert!(blocks[1]["elapsed_ms"].is_u64());
+}
+
+#[test]
+fn snapshots_keep_measured_durations_for_repeated_calls_without_inventing_history_timings() {
+    let tool = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"same command"}),
+    };
+    let mut observed = Vec::new();
+    for age in [None, Some(3), Some(1)] {
+        let started = age.map(|seconds| Instant::now() - Duration::from_secs(seconds));
+        let mut block = Block::tool(tool.clone(), started);
+        block.finish(&ToolResult::text("done"));
+        observed.push(block);
+    }
+    let mut rebuilt = (0..4)
+        .map(|_| {
+            let mut block = Block::tool(tool.clone(), None);
+            block.finish(&ToolResult::text("done"));
+            block
+        })
+        .collect::<Vec<_>>();
+    view::retain_tool_timers(&mut rebuilt, &observed);
+    let expected = serde_json::to_value(observed).unwrap();
+    let actual = serde_json::to_value(rebuilt).unwrap();
+    assert!(actual[0].get("elapsed_ms").is_none());
+    assert!(actual[3].get("elapsed_ms").is_none());
+    assert!(expected[1]["elapsed_ms"].as_u64().unwrap() >= 3000);
+    assert!(expected[2]["elapsed_ms"].as_u64().unwrap() >= 1000);
+    assert_eq!(actual[1]["elapsed_ms"], expected[1]["elapsed_ms"]);
+    assert_eq!(actual[2]["elapsed_ms"], expected[2]["elapsed_ms"]);
+}
+
+#[test]
+fn running_snapshots_measure_time_since_dispatch_instead_of_time_since_reconnect() {
+    let (app, _) = app();
+    let tool = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"waiting"}),
+    };
+    app.live.lock().unwrap().snapshot.blocks.push(Block::tool(
+        tool.clone(),
+        Some(Instant::now() - Duration::from_secs(5)),
+    ));
+    let running = app.snapshot();
+    assert!(
+        running.change["snapshot"]["blocks"][0]["elapsed_ms"]
+            .as_u64()
+            .unwrap()
+            >= 5000
+    );
+    app.emit(AgentEvent::ToolFinished {
+        tool_use: tool,
+        result: ToolResult::err("cancelled"),
+        context: Default::default(),
+    });
+    let finished = app.snapshot().change["snapshot"]["blocks"][0].clone();
+    assert_eq!(finished["running"], false);
+    assert!(finished["elapsed_ms"].as_u64().unwrap() >= 5000);
+    assert_eq!(
+        app.snapshot().change["snapshot"]["blocks"][0]["elapsed_ms"],
+        finished["elapsed_ms"]
+    );
 }
 
 #[tokio::test]
@@ -266,10 +331,13 @@ fn cancelled_and_timed_out_calls_are_not_successful_outcomes() {
         "exit 7",
         "signal 9",
     ] {
-        let mut block = Block::tool(ToolUse {
-            name: "any-tool".into(),
-            input: Value::Null,
-        });
+        let mut block = Block::tool(
+            ToolUse {
+                name: "any-tool".into(),
+                input: Value::Null,
+            },
+            None,
+        );
         block.finish(&ToolResult::text("partial output").with_status(status));
         let block = serde_json::to_value(block).unwrap();
         assert_eq!(block["error"], true, "{status}");
@@ -563,5 +631,6 @@ fn recorded_history_hides_runtime_context_and_preserves_outcomes_and_turn_times(
     assert_eq!(blocks[2]["status"], "exit 7");
     assert_eq!(blocks[2]["error"], true);
     assert_eq!(blocks[2]["running"], false);
+    assert!(blocks[2].get("elapsed_ms").is_none());
     assert!(blocks[3]["time"].is_null());
 }
