@@ -2,6 +2,7 @@ import { $, api, element, error, newSession, requestId } from '/common.js';
 import { showActivity } from '/activity.js';
 import { imageAttachments } from '/attachments.js';
 import { linkify, setLinkedText } from '/links.js';
+import { markdownContent } from '/markdown-content.js';
 import { messageTimestamp } from '/timestamps.js';
 import { showUsage } from '/usage.js';
 const transcript = $('transcript');
@@ -83,7 +84,7 @@ function addImages(parent, sources) {
 }
 function markdown(node, text) {
   let job = markdownJobs.get(node);
-  if (!job) { job = { text: null, pending: false, failed: false }; markdownJobs.set(node, job); }
+  if (!job) { job = { text: null, pending: false, failed: false, scope: requestId() }; markdownJobs.set(node, job); }
   if (job.text === text && !job.failed) return;
   job.text = text;
   if (!node.hasChildNodes()) { node.textContent = text; node.classList.add('pending'); }
@@ -96,10 +97,9 @@ function markdown(node, text) {
     try {
       const html = await (await api('/api/markdown', { text })).text();
       if (!node.isConnected || text !== job.text) return;
-      node.innerHTML = html;
+      node.replaceChildren(markdownContent(html, job.scope));
       linkify(node);
       node.classList.remove('pending');
-      for (const link of node.querySelectorAll('a')) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
       for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
       scrollLatest();
     } catch (e) { job.failed = true; node.textContent = job.text; node.classList.add('pending'); }

@@ -182,13 +182,28 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
             Message::AssistantMessage {
                 content, tool_uses, ..
             } => {
+                // Providers can split Markdown syntax across adjacent text parts.
+                // Replay must concatenate them exactly as the live stream does.
+                let mut text_block: Option<usize> = None;
                 for part in content {
+                    if !matches!(part, Content::Text { .. }) {
+                        text_block = None;
+                    }
                     match part {
-                        Content::Text { text } if !text.is_empty() => blocks.push(Block::message(
-                            "assistant",
-                            std::slice::from_ref(part),
-                            time.clone(),
-                        )),
+                        Content::Text { text } if !text.is_empty() => {
+                            if let Some(Block::Message { text: previous, .. }) =
+                                text_block.and_then(|index| blocks.get_mut(index))
+                            {
+                                previous.push_str(text);
+                            } else {
+                                text_block = Some(blocks.len());
+                                blocks.push(Block::message(
+                                    "assistant",
+                                    std::slice::from_ref(part),
+                                    time.clone(),
+                                ));
+                            }
+                        }
                         Content::Thinking { text, .. } if !text.is_empty() => {
                             blocks.push(Block::Message {
                                 role: "thinking".into(),

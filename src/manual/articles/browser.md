@@ -180,7 +180,10 @@ remain visible during compaction, including after refreshing the page.
 Warnings and failures retain their error styling.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
-blockquote text, code blocks, links, and images. Text uses one font size;
+blockquote text, code blocks, links, footnotes, and images. Adjacent text parts
+in an assistant response are rendered together, keeping Markdown intact after
+streaming and page reloads. Footnotes stay within their message and open in the
+current tab. Text uses one font size;
 headings use weight and underlines. Tables size to their contents, wrap long
 descriptions, and keep Markdown's column alignment. Wide tables scroll within
 the conversation; focus a table to scroll it with the keyboard. Plain HTTP(S)
