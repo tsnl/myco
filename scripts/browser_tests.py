@@ -63,12 +63,14 @@ class Provider(http.server.BaseHTTPRequestHandler):
         fixture = self.server.fixture
         fixture.requests.append(body)
         prompts = []
+        resuming = False
         for item in body["input"]:
             if item.get("role") != "user":
                 continue
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
+            resuming |= '# Resumption\n\n' in content
             match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links)\b", content)
             if match:
                 prompts.append(match.group(0))
@@ -131,6 +133,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
         try:
             if compact is not None:
                 fixture.compaction_release.wait(30)
+            elif resuming:
+                fixture.continuation_release.wait(30)
             if "generate" in prompt:
                 fixture.generation_releases[name].wait(30)
             for index, event in enumerate(events):
@@ -177,6 +181,9 @@ class BrowserTests(unittest.TestCase):
         self.compaction_release = threading.Event()
         self.compaction_release.set()
         self.addCleanup(self.compaction_release.set)
+        self.continuation_release = threading.Event()
+        self.continuation_release.set()
+        self.addCleanup(self.continuation_release.set)
         threading.Thread(target=provider.serve_forever, daemon=True).start()
         (self.home / "config.toml").write_text('model = "first"\n' + "".join(f'''
 [models.{name}]
@@ -320,7 +327,7 @@ context_window = 100000
         expect(page.locator('#input-tokens')).to_have_text('Input 0')
         expect(page.locator('#output-tokens')).to_have_text('Output 0')
 
-    def test_manual_and_automatic_compaction_have_a_system_banner_after_refresh(self):
+    def test_compaction_updates_one_system_card_and_keeps_the_continuation_boundary_after_restart(self):
         for automatic in [False, True]:
             with self.subTest(automatic=automatic):
                 if automatic:
@@ -330,29 +337,73 @@ context_window = 100000
                                       'context_window = 100000\nauto_compact_at = 0.8'))
                     self.process, _ = self.launch(port=urlsplit(self.origin).port)
                 self.compaction_release.clear()
+                self.continuation_release.clear()
                 self.usage = {'input_tokens': 80000, 'output_tokens': 20}
+                self.turns['Alpha images'] = 1
                 page = self.session(self.page)
                 self.submit(page, 'Alpha images')
                 if not automatic:
                     expect(page.locator('#model')).to_be_enabled()
                     page.click('#compact')
-                label = 'Compacting automatically…' if automatic else 'Compacting…'
-                banner = page.get_by_role('status').filter(has_text=label)
+                banner = page.locator('.compaction')
+                expect(banner).to_have_count(1)
                 expect(banner.locator('.role')).to_have_text('SYSTEM')
-                expect(banner.locator('.body')).to_have_text(label)
+                expect(banner.locator('.compaction-title')).to_have_text('Compacting context…')
                 expect(banner.locator('time')).to_have_attribute('datetime', re.compile(r'^\d{4}-'))
-                self.assertEqual(page.locator('.notice').filter(has_text=label).count(), 0)
+                expect(page.locator('#connection')).to_have_text('Compacting')
                 page.reload()
                 expect(banner.locator('.role')).to_have_text('SYSTEM')
-                expect(banner.locator('.body')).to_have_text(label)
+                expect(banner.locator('.compaction-title')).to_have_text('Compacting context…')
                 if automatic:
                     page.set_viewport_size({'width': 390, 'height': 844})
                 banner.scroll_into_view_if_needed()
                 page.screenshot(path=str(self.artifacts / ('automatic-mobile.png' if automatic else 'manual-desktop.png')))
                 self.usage = {'input_tokens': 512, 'output_tokens': 6}
                 self.compaction_release.set()
+                expect(banner.locator('.compaction-title')).to_have_text('Context compacted')
+                if automatic:
+                    expect(banner).to_contain_text('Continuing the previous task automatically.')
+                    expect(page.locator('#connection')).to_have_text('Running')
+                    expect(page.locator('.assistant')).to_have_count(1)
+                else:
+                    expect(banner).to_contain_text('Ready for your next message.')
+                self.continuation_release.set()
                 expect(page.locator('#model')).to_be_enabled()
-                expect(page.locator('.system')).to_have_count(0)
+                expect(banner).to_have_count(1)
+                banner.scroll_into_view_if_needed()
+                page.screenshot(path=str(self.artifacts / ('continued-mobile.png' if automatic else 'completed-desktop.png')))
+                requests = len(self.requests)
+                self.stop(self.process)
+                self.process, _ = self.launch(port=urlsplit(self.origin).port)
+                page.reload()
+                expect(banner).to_have_count(1)
+                expect(banner.locator('.compaction-title')).to_have_text('Context compacted')
+                if automatic:
+                    expect(page.locator('.compaction + .assistant .body')).to_have_text('Alpha finished.')
+                self.assertEqual(len(self.requests), requests, 'Reloading must not generate another continuation')
+
+    def test_cancelled_compaction_keeps_the_source_and_delivers_queued_input_without_a_success_card(self):
+        self.turns.update({'Alpha images': 1, 'Beta images': 1})
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#model')).to_be_enabled()
+        state_url = self.origin + '/api/sessions/' + page.url.rsplit('/', 1)[1]
+        thread = self.context.request.get(state_url).json()['change']['snapshot']['thread_id']
+        self.compaction_release.clear()
+        page.click('#compact')
+        expect(page.locator('.compaction-title')).to_have_text('Compacting context…')
+        page.fill('#prompt', 'Beta images')
+        page.press('#prompt', 'Enter')
+        expect(page.locator('#queued-list li')).to_have_text(['Beta images'])
+        page.click('#cancel')
+        expect(page.locator('.assistant .body').last).to_have_text('Beta finished.')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.compaction')).to_have_count(0)
+        expect(page.locator('#queued-list li')).to_have_count(0)
+        self.assertEqual(self.context.request.get(state_url).json()['change']['snapshot']['thread_id'], thread)
+        page.reload()
+        expect(page.locator('.compaction')).to_have_count(0)
+        expect(page.locator('.assistant .body').last).to_have_text('Beta finished.')
 
     def test_compaction_clears_context_measurement_until_the_next_model_request(self):
         page = self.session(self.page)

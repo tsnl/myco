@@ -174,10 +174,14 @@ refresh every second without consuming tool output, and disappear when the task
 ends. Background summaries cover the local host; active calls
 include remote tools too.
 
-Manual and automatic compaction updates appear in their own timestamped
-**SYSTEM** message sections with neutral styling. These live status messages
-remain visible during compaction, including after refreshing the page.
-Warnings and failures retain their error styling.
+Manual and automatic compaction use one timestamped **SYSTEM** card with
+neutral styling. It updates from **Compacting context…** to **Context compacted**.
+The completed card separates retained messages from new output and remains
+visible after refreshing the page or restarting the server. Automatic compaction
+labels the continuation; manual compaction says **Ready for your next message**.
+Summaries and internal resumption instructions are not displayed as conversation
+messages. Older saved sessions without a recorded boundary show a context notice
+above their retained messages. Warnings and failures retain their error styling.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, footnotes, and images. Adjacent text parts

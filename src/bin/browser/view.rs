@@ -58,6 +58,11 @@ pub(super) enum Block {
     Notice {
         text: String,
     },
+    Compaction {
+        automatic: Option<bool>,
+        running: bool,
+        time: String,
+    },
 }
 
 impl Block {
@@ -159,6 +164,11 @@ pub(super) fn assistant_heading(blocks: &[Block]) -> Option<Block> {
     for block in blocks.iter().rev() {
         match block {
             Block::AssistantHeading { .. } => return None,
+            Block::Compaction { time, .. } => {
+                return Some(Block::AssistantHeading {
+                    time: Some(time.clone()),
+                });
+            }
             Block::Message { role, .. } if role == "assistant" => return None,
             Block::Message { role, time, .. } if role == "user" => {
                 return Some(Block::AssistantHeading { time: time.clone() });
@@ -173,7 +183,12 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut time = None;
     let mut pending = Vec::new();
+    let mut boundary = compaction_boundary(thread);
     for (index, message) in thread.messages.iter().enumerate() {
+        if boundary.as_ref().is_some_and(|(at, _)| *at == index) {
+            time = Some(timestamp(&thread.created_at));
+            blocks.extend(boundary.take().map(|(_, block)| block));
+        }
         match message {
             Message::UserMessage { content } if message.is_user_turn() => {
                 time = thread.user_turn_timestamps.get(&index).map(timestamp);
@@ -239,6 +254,7 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
             _ => {}
         }
     }
+    blocks.extend(boundary.map(|(_, block)| block));
     for block in &mut blocks {
         if let Block::Tool {
             status, running, ..
@@ -250,4 +266,35 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
         }
     }
     blocks
+}
+
+// The successor begins with a summary and copied recent context. Its boundary
+// belongs after that context, not before the user's retained messages.
+fn compaction_boundary(thread: &Thread) -> Option<(usize, Block)> {
+    let Message::UserMessage { content } = thread.messages.first()? else {
+        return None;
+    };
+    let data = content.iter().find_map(|part| match part {
+        Content::System { kind, data, .. } if kind == "compaction" => Some(data),
+        _ => None,
+    })?;
+    let boundary = data["tail_messages"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok()?.checked_add(1))
+        .filter(|&index| index <= thread.messages.len());
+    let automatic = boundary.map(|index| {
+        matches!(thread.messages.get(index), Some(Message::UserMessage { content })
+            if content.iter().any(|part| matches!(part, Content::System { kind, data, .. }
+                if kind == "continuation" && data["reason"] == "auto_compaction")))
+    });
+    // Older sessions lack the boundary count. Label the retained context without
+    // guessing where a continuation began or whether it was automatic.
+    Some((
+        boundary.unwrap_or(0),
+        Block::Compaction {
+            automatic,
+            running: false,
+            time: timestamp(&thread.created_at),
+        },
+    ))
 }

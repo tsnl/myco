@@ -43,6 +43,8 @@ pub fn compact_thread(
         TAIL_USER_TURNS,
         TAIL_TOOL_BODY_MAX_CHARS,
     );
+    let runtime = crate::core::latest_runtime_part(&predecessor.messages);
+    let tail_messages = tail.len() + usize::from(runtime.is_some());
     let mut successor = super::Thread::new();
     successor.predecessor_id = Some(predecessor.id.clone());
     let resume = format!(
@@ -62,7 +64,7 @@ pub fn compact_thread(
             Content::System {
                 kind: "compaction".into(),
                 text: resume,
-                data: serde_json::json!({"predecessor_id":predecessor.id, "summary_path":session.summary_path()}),
+                data: serde_json::json!({"predecessor_id":predecessor.id, "summary_path":session.summary_path(), "tail_messages":tail_messages}),
             },
         ],
     }];
@@ -75,7 +77,7 @@ pub fn compact_thread(
     }
     // Runtime state is independent of the human tail. Keep only the latest
     // observation, after the tail, so an older notice cannot override it.
-    if let Some(part) = crate::core::latest_runtime_part(&predecessor.messages) {
+    if let Some(part) = runtime {
         successor.messages.push(Message::UserMessage {
             content: vec![part.clone()],
         });
@@ -85,7 +87,7 @@ pub fn compact_thread(
         predecessor_id: predecessor.id.clone(),
         successor_id: successor.id.clone(),
         summary_path: session.summary_path(),
-        tail_messages: successor.messages.len() - 1,
+        tail_messages,
     };
     Ok((successor, outcome))
 }
@@ -260,7 +262,13 @@ mod tests {
         assert!(saved.active_thread().last_usage.is_none());
         assert!(
             matches!(&saved.active_thread().messages[0], Message::UserMessage { content }
-            if matches!(&content[1], Content::System { text, kind, .. } if kind == "compaction" && text.contains("Continue work")))
+            if matches!(&content[1], Content::System { text, kind, data }
+                if kind == "compaction" && text.contains("Continue work")
+                    && data["tail_messages"] == outcome.tail_messages))
+        );
+        assert_eq!(
+            saved.active_thread().messages.len(),
+            outcome.tail_messages + 1
         );
     }
 
