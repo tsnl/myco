@@ -75,7 +75,8 @@ and automation so their meaning does not depend on the next launch's `--profile`
 The browser uses translucent panels in neutral charcoal with square corners
 over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
-floating controls use background blur. The conversation well is the lightest
+its glass background continues below the viewport during native scroll bounce.
+Floating controls use background blur. The conversation well is the lightest
 surface; the input bar and top banner share darker translucent glass, with
 dialogs darkest in front. Translucent clouds drift slowly in three
 layers: fine high wisps near the top, soft middle billows below them, and broader
