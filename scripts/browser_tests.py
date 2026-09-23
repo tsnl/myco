@@ -1815,6 +1815,37 @@ context_window = 100000
         page.set_viewport_size({'width': 390, 'height': 844})
         page.locator('.assistant').screenshot(path=str(self.artifacts / 'table-mobile.png'))
 
+    def test_table_line_breaks_survive_streaming_and_reload_without_rendering_other_html(self):
+        self.turns['Alpha links'] = 1
+        self.link_reply = ['| Case | Value |\n| --- | --- |\n| Break | First<br',
+                           '/>Second |\n| Escaped pipe | a\\|b |\n| Path | src/browser/markdown.rs |\n',
+                           '| Code | `<br/>` |\n| HTML | <br onclick="alert(1)"> |\n']
+        self.event_gates = {index: threading.Event() for index in [1, 2, 3]}
+        self.addCleanup(lambda: [gate.set() for gate in self.event_gates.values()])
+        page = self.session(self.page)
+        self.submit(page, 'Alpha links')
+        table = page.locator('.assistant table')
+        expect(table.locator('td').last).to_have_text('First<br')
+        self.event_gates[1].set()
+        expect(table.locator('br')).to_have_count(1)
+        self.event_gates[2].set()
+        expect(table.locator('tr')).to_have_count(6)
+        self.event_gates[3].set()
+        expect(page.locator('#model')).to_be_enabled()
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            expect(table.locator('br')).to_have_count(1)
+            self.assertEqual(table.locator('td').nth(1).inner_text(), 'First\nSecond')
+            expect(table.locator('td').nth(3)).to_have_text('a|b')
+            expect(table.locator('td').nth(5)).to_have_text('src/browser/markdown.rs')
+            expect(table.locator('code')).to_have_text('<br/>')
+            expect(table.locator('td').last).to_have_text('<br onclick="alert(1)">')
+            expect(table.locator('[onclick]')).to_have_count(0)
+        page.locator('.assistant').screenshot(path=str(self.artifacts / 'table-desktop.png'))
+        page.set_viewport_size({'width': 390, 'height': 844})
+        page.locator('.assistant').screenshot(path=str(self.artifacts / 'table-mobile.png'))
+
     def test_footnotes_stay_with_their_message_and_cannot_replace_composer_ids(self):
         page = self.session(self.page)
         for name in ['Alpha', 'Beta']:

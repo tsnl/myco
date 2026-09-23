@@ -56,6 +56,14 @@ pub(super) fn render(text: &str, files: &Files) -> String {
         | Options::ENABLE_FOOTNOTES;
     let mut tables = Tables::default();
     let events = Parser::new_ext(text, options).map(|event| match event {
+        // Models use bare HTML breaks for multiple lines within a table cell.
+        Event::InlineHtml(text)
+            if ["<br>", "<br/>", "<br />"]
+                .iter()
+                .any(|tag| text.eq_ignore_ascii_case(tag)) =>
+        {
+            Event::HardBreak
+        }
         Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
         Event::Start(Tag::Image {
             link_type,
@@ -91,7 +99,7 @@ pub(super) fn render(text: &str, files: &Files) -> String {
 //
 
 // The default renderer uses inline alignment styles, which our CSP blocks.
-// Only parser table events produce trusted markup; user HTML remains escaped.
+// Only parser table events produce trusted table markup.
 #[derive(Default)]
 struct Tables {
     alignments: Vec<Alignment>,
@@ -202,6 +210,30 @@ mod tests {
         assert!(!html.contains("<script>"));
         assert!(!html.contains("href=\"javascript:"));
         assert!(!render("![x](data:text/html,bad)", &files).contains("src=\"data:"));
+    }
+
+    #[test]
+    fn bare_line_breaks_render_in_cells_without_reinterpreting_slashes_code_or_other_html() {
+        let files = Files::open(&std::env::current_dir().unwrap()).unwrap();
+        for line_break in ["<br>", "<br/>", "<br />", "<BR/>"] {
+            let html = render(
+                &format!("| Value |\n| --- |\n| First{line_break}Second |"),
+                &files,
+            );
+            assert!(html.contains("First<br />\nSecond"), "{html}");
+            assert_eq!(html.matches("<td ").count(), 1);
+        }
+        let html = render(
+            "| Value |\n| --- |\n| src/browser/markdown.rs |\n| a\\|b |\n| `<br/>` |\n| <br onclick=\"alert(1)\"> |\n| <img src=x onerror=\"alert(1)\"> |\n\n```html\n<br/>\n```",
+            &files,
+        );
+        assert!(html.contains("src/browser/markdown.rs"));
+        assert!(html.contains("a|b"));
+        assert!(html.contains("<code>&lt;br/&gt;</code>"));
+        assert!(html.contains("&lt;br onclick="));
+        assert!(html.contains("&lt;img src=x"));
+        assert!(!html.contains("<br"));
+        assert!(!html.contains("<img"));
     }
 
     #[test]
