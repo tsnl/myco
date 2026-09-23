@@ -90,7 +90,15 @@ model. The server retains Host and browser-origin checks to reject requests from
 other websites. Restarting does not require signing in again.
 
 The home page lists your visible, unarchived sessions, with search, recent update
-times, and running status. **New session** opens a separate tab, creates a session,
+times, and live activity indicators. A pulsing square beside **Running** in the
+session header and browser list means a run is in progress, including time waiting
+for model output and executing tools. **Background tasks** has a steady indicator
+when tools remain open after the run. **Ready**, **Stopped**, and **Saved** are idle;
+**Reconnecting…** means the current state is unknown. Reduced-motion preferences
+disable the pulse. Status changes arrive through the shared event stream; the
+browser also polls for changes made by other server processes.
+
+**New session** opens a separate tab, creates a session,
 and navigates that tab to its `/sessions/<id>` URL. Session links work with
 bookmarks, middle-click, and browser tab groups. Click the myco name to return
 home. `--resume <id>` opens that session
@@ -247,7 +255,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | Request | Body / result |
 | --- | --- |
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
-| `GET /api/sessions` | Visible sessions; add `?archived=true` for archives |
+| `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
 | `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, and `queued` |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |

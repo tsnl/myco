@@ -8,6 +8,7 @@ const ASSETS: &[(&str, &str)] = &[
     ("/new.js", include_str!("assets/new.js")),
     ("/sessions/{id}", include_str!("assets/index.html")),
     ("/app.js", include_str!("assets/app.js")),
+    ("/activity.js", include_str!("assets/activity.js")),
     ("/home.js", include_str!("assets/home.js")),
     ("/common.js", include_str!("assets/common.js")),
     ("/events.js", include_str!("assets/events.js")),

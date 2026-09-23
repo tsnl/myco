@@ -1,4 +1,5 @@
 import { $, api, element, error, newSession, requestId } from '/common.js';
+import { showActivity } from '/activity.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -263,9 +264,10 @@ function activity() {
   const count = calls.length + tasks.length;
   $('activity-count').textContent = count;
   $('activity-count').hidden = !count;
-  $('activity-toggle').classList.toggle('has-activity', !!count);
+  $('activity-toggle').classList.toggle('has-activity', connected && (state.busy || !!count));
   $('activity-title').textContent = connected ? 'Activity' : 'Activity · reconnecting';
   $('activity-empty').hidden = !!count;
+  $('activity-empty').textContent = !connected ? 'Reconnecting to confirm activity.' : state.busy ? 'Run in progress. No active tool calls.' : 'No running activities.';
   $('active-calls').hidden = !calls.length;
   $('background-tasks').hidden = !tasks.length;
   $('activity-divider').hidden = !calls.length || !tasks.length;
@@ -290,9 +292,8 @@ function activity() {
   if ($('activity').open && focusedCall !== undefined) (list.querySelector(`[data-block-index="${focusedCall}"]`) || $('activity-close')).focus({ preventScroll: true });
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
   const status = $('connection');
-  status.textContent = connected ? state.busy ? state.status : count ? 'Active' : state.status || 'Ready' : 'Reconnecting…';
-  status.title = connected ? current : 'Reconnecting to session';
-  status.dataset.state = !connected || ['Stopped', 'Cancelling'].includes(state.status) ? 'attention' : state.busy || count ? 'busy' : 'ready';
+  showActivity(status, state.busy ? state.status : count ? 'Background tasks' : state.status || 'Ready', state.busy, connected);
+  if (connected) status.title = current;
 }
 function updateSession(update) {
   if (update.revision <= revision) return;

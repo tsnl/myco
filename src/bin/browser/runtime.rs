@@ -602,15 +602,15 @@ impl Sessions {
         Ok(Value::Array(entries.into_iter().filter(|s| s.archived == archived).map(|s| {
             let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
             let status = live.as_ref().map_or("Saved", |live| {
-                if live.snapshot.busy { "Running" }
-                else if !live.snapshot.tasks.is_empty() { "Background tasks" }
-                else { "Ready" }
+                if !live.snapshot.busy && !live.snapshot.tasks.is_empty() { "Background tasks" }
+                else { live.snapshot.status.as_str() }
             });
             let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
             json!({
                 "id": s.id, "title": title,
                 "model": live.as_ref().map_or(s.model.as_str(), |live| &live.snapshot.model),
                 "updated_at": s.updated_at, "archived": s.archived, "status": status,
+                "busy": live.as_ref().is_some_and(|live| live.snapshot.busy),
             })
         }).collect()))
     }
