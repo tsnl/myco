@@ -43,7 +43,8 @@ pub fn prelude_change_notices(initial: Vec<PreludeEntry>) -> BeforeGenerationNot
                     _ => None,
                 };
                 observed.thread_id == context.thread_id
-                    && matches!(last, Some(Content::Text { text }) if text == notice)
+                    && matches!(last, Some(Content::System { kind, text, .. })
+                        if kind == "generation_notice" && text == notice)
             });
             (observed.entries.clone(), !retained)
         };
@@ -388,7 +389,7 @@ mod tests {
             assert!(outcome.result.is_err());
             let rewound = serde_json::to_string(&outcome.rewound.unwrap()).unwrap();
             assert!(rewound.contains("user task"), "{rewound}");
-            assert!(rewound.contains("Prelude changes"), "{rewound}");
+            assert!(!rewound.contains("Prelude changes"), "{rewound}");
             assert!(!agent.history().iter().any(Message::is_user_turn));
             assert!(
                 !serde_json::to_string(agent.history())

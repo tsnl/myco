@@ -138,41 +138,23 @@ impl App {
         self.append_block(Block::Notice { text: text.into() });
     }
 
-    fn compacting(&self, automatic: bool) {
-        self.append_block(Block::Compaction {
-            automatic: Some(automatic),
-            running: true,
-            time: view::timestamp(&Utc::now()),
-        });
+    fn compacting(&self) {
         self.status("Compacting");
     }
 
-    fn finish_compaction(&self, failure: Option<&str>) -> bool {
-        let mut live = self.live.lock().unwrap();
-        let snapshot = &mut live.snapshot;
-        let Some(index) = snapshot
-            .blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Compaction { running: true, .. }))
-        else {
-            return false;
-        };
-        if let Some(text) = failure {
-            snapshot.blocks[index] = Block::Notice { text: text.into() };
-        } else if let Block::Compaction { running, .. } = &mut snapshot.blocks[index] {
-            *running = false;
-        }
-        let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
-        self.publish(snapshot, change);
-        drop(live);
+    fn finish_compaction(&self) {
+        self.append_block(Block::Boundary {
+            time: view::timestamp(&Utc::now()),
+        });
         self.status("Running");
-        true
     }
 
     fn warning(&self, text: String) {
-        if !self.finish_compaction(Some(&text)) {
-            self.notice(text);
+        let compacting = self.live.lock().unwrap().snapshot.status == "Compacting";
+        if compacting {
+            self.status("Running");
         }
+        self.notice(text);
     }
 
     fn status(&self, status: &str) {
@@ -279,7 +261,7 @@ impl App {
         } else {
             let time = snapshot.blocks.iter().rev().find_map(|block| match block {
                 Block::Message { role, time, .. } if role == "user" => time.clone(),
-                Block::Compaction { time, .. } => Some(time.clone()),
+                Block::Boundary { time } => Some(time.clone()),
                 _ => None,
             });
             let block = Block::Message {
@@ -582,9 +564,9 @@ impl Sessions {
         }
         let observer = app.clone();
         boot.runner.set_observer(Arc::new(move |event| match event {
-            WorkflowEvent::Compacting { automatic, .. } => observer.compacting(automatic),
+            WorkflowEvent::Compacting { .. } => observer.compacting(),
             WorkflowEvent::Compacted(_) => {
-                observer.finish_compaction(None);
+                observer.finish_compaction();
             }
             WorkflowEvent::Warning(text) => observer.warning(text),
             WorkflowEvent::CompactionProgress { .. } => {}
