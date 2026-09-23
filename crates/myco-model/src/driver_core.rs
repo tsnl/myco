@@ -87,13 +87,19 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     acc: A,
     provider: &'static str,
     debug_dump_api_requests: bool,
+    max_request_bytes: usize,
 ) -> AsyncStream<GenerationEvent> {
     let (tx, rx) = tokio::sync::mpsc::channel::<GenerationEvent>(32);
 
     tokio::spawn(async move {
         let generate = async {
-            let (client, request) = prepare_request(request, provider, debug_dump_api_requests)
-                .map_err(GenerationFailure::terminal)?;
+            let (client, request) = prepare_request(
+                request,
+                provider,
+                debug_dump_api_requests,
+                max_request_bytes,
+            )
+            .map_err(GenerationFailure::terminal)?;
             let response = attempt_send(&client, request, provider).await?;
             drive_sse_stream(response, &tx, acc, provider)
                 .await
@@ -118,14 +124,15 @@ fn prepare_request(
     builder: reqwest::RequestBuilder,
     provider: &str,
     debug: bool,
+    max_request_bytes: usize,
 ) -> Result<(reqwest::Client, reqwest::Request), GenerateError> {
     let (client, request) = builder.build_split();
     let request = request.map_err(|e| GenerateError::ExecutionError(format!("{e:?}")))?;
     if let Some(body) = request.body().and_then(|body| body.as_bytes()) {
+        check_request_size(body.len(), max_request_bytes, provider)?;
         if debug {
             eprintln!("{}", String::from_utf8_lossy(body));
         }
-        check_request_size(body.len(), provider)?;
     }
     Ok((client, request))
 }

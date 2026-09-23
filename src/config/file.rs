@@ -8,6 +8,7 @@
 //! ([`crate::harness`]).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::generative_model::{Protocol, ThinkingMode};
@@ -60,6 +61,9 @@ pub struct GatewayEntry {
     /// Credential (see [`AuthEntry`]). Absent → no auth header.
     #[serde(default)]
     pub auth: Option<AuthEntry>,
+    /// Maximum serialized request body in bytes. Absent → 30,000,000 bytes.
+    #[serde(default)]
+    pub max_request_bytes: Option<NonZeroUsize>,
     /// `[gateways.NAME.retry]`: transient-failure retry for this endpoint.
     /// Absent → [`crate::generative_model::RetryPolicy::default`].
     #[serde(default)]
@@ -108,6 +112,9 @@ pub struct ModelEntry {
     /// Credential override (see [`AuthEntry`]). Absent → the gateway's.
     #[serde(default)]
     pub auth: Option<AuthEntry>,
+    /// Request-size override, also usable without a gateway. Absent → the gateway's.
+    #[serde(default)]
+    pub max_request_bytes: Option<NonZeroUsize>,
     /// Wire id sent to the provider (request `model` field). Defaults to the
     /// catalog key, so it is only needed when they differ
     /// (e.g. key `kimi-k3` → `api_id = "moonshotai/kimi-k3"`).

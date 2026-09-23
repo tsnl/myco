@@ -18,6 +18,9 @@ pub struct AnthropicBackendConfig {
     pub anthropic_auth_token: String,
     pub max_tokens_per_generate: usize,
     pub debug_dump_api_requests: bool,
+    /// Maximum serialized request body, including history, images, tools, and prompts.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
     /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
     #[serde(default)]
     pub retry: RetryPolicy,
@@ -40,6 +43,7 @@ impl Default for AnthropicBackendConfig {
             anthropic_auth_token: String::new(),
             max_tokens_per_generate: 8192,
             debug_dump_api_requests: false,
+            max_request_bytes: MAX_REQUEST_BYTES,
             retry: RetryPolicy::default(),
             effort: Some(Effort::DEFAULT),
         }
@@ -147,6 +151,7 @@ impl GenerativeModel for AnthropicGenerativeModel {
             StreamAccumulator::default(),
             "Anthropic",
             self.backend.debug_dump_api_requests,
+            self.backend.max_request_bytes,
         )
     }
 }
