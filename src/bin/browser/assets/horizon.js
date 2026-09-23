@@ -2,6 +2,8 @@
 Horizon, vendored from https://github.com/dnlzro/horizon
 Revision: d963c1bfadc72754d092b39c5a6c76199b68594e
 Adaptation: TypeScript annotations removed; vector helpers bundled for local serving.
+Myco display mapping adds twilight grading, shared-channel highlight compression,
+and the sRGB transfer function.
 
 MIT License
 
@@ -90,7 +92,6 @@ const FOV_DEG = 75;
 
 // Post-processing
 const EXPOSURE = 25.0;
-const GAMMA = 2.2;
 const SUNSET_BIAS_STRENGTH = 0.1;
 
 // ACES tonemapper (Knarkowicz)
@@ -103,16 +104,33 @@ function aces(color) {
 }
 
 // Enhance sunset hues (i.e., make warmer)
-function applySunsetBias([r, g, b]) {
-  // Relative luminance (sRGB)
+function applySunsetBias([r, g, b], twilight) {
+  // Relative luminance in linear sRGB.
   const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
   // Weight is higher for darker sky (near horizon/twilight), lower midday
   const w = 1.0 / (1.0 + 2.0 * lum);
   const k = SUNSET_BIAS_STRENGTH; // overall strength
-  const rb = 1.0 + 0.5 * k * w; // boost red
-  const gb = 1.0 - 0.5 * k * w; // suppress green
-  const bb = 1.0 + 1.0 * k * w; // boost blue
+  // Grade low-sun light toward coral and rose before display encoding.
+  const rb = (1.0 + 0.5 * k * w) * (1 + 0.12 * twilight);
+  const gb = (1.0 - 0.5 * k * w) * (1 - 0.30 * twilight);
+  const bb = (1.0 + 1.0 * k * w) * (1 + 0.20 * twilight);
   return [Math.max(0, r * rb), Math.max(0, g * gb), Math.max(0, b * bb)];
+}
+
+function linearToSrgb(value) {
+  // CSS rgb() expects encoded sRGB, not linear light or a simple 2.2 power.
+  // https://www.w3.org/TR/css-color-4/#color-conversion-code
+  return value <= 0.0031308 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
+}
+
+function displayColor(color, twilight) {
+  const mapped = aces(color), peak = Math.max(...color);
+  const gain = peak > 0 ? Math.max(...mapped) / peak : 0;
+  // Independent channel curves pull orange highlights toward yellow. A shared
+  // gain preserves their linear RGB ratios; blend it in only around twilight.
+  return color.map((value, index) => linearToSrgb(
+    mapped[index] * (1 - twilight) + value * gain * twilight,
+  ));
 }
 
 function rayleighPhase(angle) {
@@ -207,6 +225,7 @@ function computeTransmittance(height, angle) {
 export default function renderGradient(altitude) {
   const cameraPosition = [0, GROUND_RADIUS, 0];
   const sunDirection = norm([Math.cos(altitude), Math.sin(altitude), 0]);
+  const twilight = clamp(1 - Math.abs(altitude) / 0.35, 0, 1);
 
   // Projection constant (used to tilt rays upward)
   const focalZ = 1.0 / Math.tan((FOV_DEG * 0.5 * PI) / 180.0);
@@ -311,12 +330,10 @@ export default function renderGradient(altitude) {
       for (let k = 0; k < 3; k++) inscattered[k] *= SUN_INTENSITY;
     }
 
-    // Post-process: exposure → gentle sunset bias → ACES tonemap → gamma → 8-bit RGB
-    let color = inscattered.slice();
-    color = color.map((c) => c * EXPOSURE);
-    color = applySunsetBias(color);
-    color = aces(color);
-    color = color.map((c) => Math.pow(c, 1.0 / GAMMA));
+    // Keep grading and tone mapping in linear light; encode for CSS once.
+    let color = inscattered.map((c) => c * EXPOSURE);
+    color = applySunsetBias(color, twilight);
+    color = displayColor(color, twilight);
     const rgb = color.map((c) => Math.round(clamp(c, 0, 1) * 255));
 
     // 0% at zenith (top), 100% at horizon (bottom)
