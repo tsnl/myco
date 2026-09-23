@@ -73,6 +73,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .role { display: block; color: var(--green); font-weight: 700; }
 .user .role { color: var(--cyan); }
 .timestamp { display: block; color: var(--dim); }
+.timestamp-age { white-space: nowrap; }
 .user .body { white-space: pre-wrap; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }

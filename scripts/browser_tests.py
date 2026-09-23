@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from datetime import datetime, timedelta
 import http.server
 import json
 import os
@@ -19,6 +20,7 @@ import time
 import unittest
 from urllib.parse import urlsplit
 import uuid
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -226,6 +228,64 @@ context_window = 100000
     def image_urls(self, request):
         return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
                 for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
+
+    def test_message_timestamps_use_local_time_and_update_without_a_new_turn(self):
+        context = self.browser.new_context(locale='en-US', timezone_id='America/Los_Angeles')
+        self.addCleanup(context.close)
+        page = self.session(context.new_page())
+        page.on('pageerror', lambda error: self.errors.append(str(error)))
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        timestamps = page.locator('.message-header time')
+        expect(timestamps).to_have_count(2)
+        stamp = timestamps.first.get_attribute('datetime')
+        instant = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+        local = instant.astimezone(ZoneInfo('America/Los_Angeles'))
+        label = f'{local:%b} {local.day}, {local.year}, {local.hour % 12 or 12}:{local:%M:%S %p}'
+        page.clock.set_fixed_time(instant + timedelta(seconds=59))
+        expect(timestamps).to_have_text([f'{label} (0 minutes ago)'] * 2)
+        page.clock.set_fixed_time(instant + timedelta(minutes=1))
+        expect(timestamps).to_have_text([f'{label} (1 minute ago)'] * 2)
+        page.clock.set_fixed_time(instant + timedelta(minutes=3))
+        expect(timestamps).to_have_text([f'{label} (3 minutes ago)'] * 2)
+        page.reload()
+        expect(timestamps).to_have_text([f'{label} (3 minutes ago)'] * 2)
+        expect(timestamps.first).to_have_attribute('datetime', stamp)
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true})")
+        page.clock.set_fixed_time(instant + timedelta(minutes=7))
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        expect(timestamps).to_have_text([f'{label} (7 minutes ago)'] * 2)
+        page.click('#cancel')
+        expect(page.locator('#model')).to_be_enabled()
+
+    def test_timestamp_timezones_daylight_saving_and_missing_dates(self):
+        for zone, spring, fall in [
+            ('America/Los_Angeles', 'Mar 8, 2026, 1:58:00 AM', 'Nov 1, 2026, 1:58:00 AM'),
+            ('Asia/Tokyo', 'Mar 8, 2026, 6:58:00 PM', 'Nov 1, 2026, 5:58:00 PM'),
+        ]:
+            context = self.browser.new_context(locale='en-US', timezone_id=zone)
+            self.addCleanup(context.close)
+            page = context.new_page()
+            page.on('pageerror', lambda error: self.errors.append(str(error)))
+            page.clock.set_fixed_time('2026-03-08T10:02:00Z')
+            page.goto(self.origin)
+            page.evaluate("""async () => {
+                const {messageTimestamp} = await import('/timestamps.js');
+                const box = document.createElement('section'); box.id = 'timestamp-test';
+                box.append(...['2026-03-08T09:58:00Z', '2026-11-01T08:58:00Z', null, 'invalid',
+                    '2026-03-08T10:03:00Z'].map(messageTimestamp));
+                document.body.append(box);
+            }""")
+            timestamps = page.locator('#timestamp-test time')
+            expect(timestamps.nth(0)).to_have_text(spring + ' (4 minutes ago)')
+            expect(timestamps.nth(2)).to_have_text('unknown')
+            expect(timestamps.nth(3)).to_have_text('unknown')
+            self.assertIsNone(timestamps.nth(2).get_attribute('datetime'))
+            expect(timestamps.nth(4)).to_contain_text('(0 minutes ago)')
+            self.assertTrue(timestamps.nth(0).get_attribute('title'))
+            page.clock.set_fixed_time('2026-11-01T09:02:00Z')
+            expect(timestamps.nth(1)).to_have_text(fall + ' (4 minutes ago)')
+            context.close()
 
     def test_urls_are_clickable_in_messages_and_tool_output_after_reload(self):
         page = self.session(self.page)

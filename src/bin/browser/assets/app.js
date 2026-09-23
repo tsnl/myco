@@ -2,6 +2,7 @@ import { $, api, element, error, newSession, requestId } from '/common.js';
 import { showActivity } from '/activity.js';
 import { imageAttachments } from '/attachments.js';
 import { linkify, setLinkedText } from '/links.js';
+import { messageTimestamp } from '/timestamps.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -135,7 +136,7 @@ function toolState(block) {
 }
 function messageHeading(role, time) {
   const heading = element('header', 'message-header');
-  heading.append(element('span', 'role', role.toUpperCase()), element('time', 'timestamp', time || 'unknown'));
+  heading.append(element('span', 'role', role.toUpperCase()), messageTimestamp(time));
   return heading;
 }
 function blockNode(block) {

@@ -203,7 +203,11 @@ disabled. This keeps generated or checked-out content from executing with the
 conversation UI's access to the local API. Interactive applications need a
 separate preview origin instead of weakening this policy on the Myco origin.
 
-USER and ASSISTANT headers have UTC timestamps on the next line. A reply that
+USER and ASSISTANT headers show the browser's local date and time on the next
+line, followed by elapsed whole minutes in parentheses, such as `(2 minutes ago)`.
+The age updates while the page is open and when returning to a hidden tab;
+hover over the timestamp to see the full local date, time, and time zone.
+Saved timestamps remain UTC. A reply that
 starts with tools gets its ASSISTANT header before those calls, live and on replay.
 Recorded messages use the turn's saved acceptance time; older turns without one show
 `unknown`. The input box has no timestamp.
