@@ -135,8 +135,20 @@ impl App {
     }
 
     fn notice(&self, text: impl Into<String>) {
+        self.append_block(Block::Notice { text: text.into() });
+    }
+
+    fn system_message(&self, text: &str) {
+        self.append_block(Block::Message {
+            role: "system".into(),
+            text: text.into(),
+            images: vec![],
+            time: Some(view::timestamp(&Utc::now())),
+        });
+    }
+
+    fn append_block(&self, block: Block) {
         let mut live = self.live.lock().unwrap();
-        let block = Block::Notice { text: text.into() };
         let index = live.snapshot.blocks.len();
         live.snapshot.blocks.push(block.clone());
         self.publish(
@@ -532,12 +544,12 @@ impl Sessions {
         }
         let observer = app.clone();
         boot.runner.set_observer(Arc::new(move |event| match event {
-            WorkflowEvent::Compacting { automatic, .. } => observer.notice(if automatic {
+            WorkflowEvent::Compacting { automatic, .. } => observer.system_message(if automatic {
                 "Compacting automatically…"
             } else {
                 "Compacting…"
             }),
-            WorkflowEvent::Compacted(_) => observer.notice("Compaction complete."),
+            WorkflowEvent::Compacted(_) => observer.system_message("Compaction complete."),
             WorkflowEvent::Warning(text) => observer.notice(text),
             WorkflowEvent::CompactionProgress { .. } => {}
         }));
