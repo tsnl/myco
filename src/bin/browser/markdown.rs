@@ -1,5 +1,5 @@
 use super::files::Files;
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use pulldown_cmark::{Alignment, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 pub(super) fn image_url(source: &str, files: &Files) -> String {
     if source.starts_with("/api/image?") {
@@ -48,6 +48,7 @@ pub(super) fn render(text: &str, files: &Files) -> String {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
+    let mut tables = Tables::default();
     let events = Parser::new_ext(text, options).map(|event| match event {
         Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
         Event::Start(Tag::Image {
@@ -75,8 +76,71 @@ pub(super) fn render(text: &str, files: &Files) -> String {
         event => event,
     });
     let mut output = String::new();
-    html::push_html(&mut output, events);
+    html::push_html(&mut output, events.map(|event| tables.render(event)));
     output
+}
+
+//
+// Tables
+//
+
+// The default renderer uses inline alignment styles, which our CSP blocks.
+// Only parser table events produce trusted markup; user HTML remains escaped.
+#[derive(Default)]
+struct Tables {
+    alignments: Vec<Alignment>,
+    column: usize,
+    header: bool,
+}
+
+impl Tables {
+    fn render<'a>(&mut self, event: Event<'a>) -> Event<'a> {
+        let markup: CowStr<'a> = match event {
+            Event::Start(Tag::Table(alignments)) => {
+                self.alignments = alignments;
+                "<div class=\"table-scroll\" role=\"region\" aria-label=\"Markdown table\" tabindex=\"0\"><table>".into()
+            }
+            Event::Start(Tag::TableHead) => {
+                self.header = true;
+                self.column = 0;
+                "<thead><tr>".into()
+            }
+            Event::End(TagEnd::TableHead) => {
+                self.header = false;
+                "</tr></thead><tbody>".into()
+            }
+            Event::Start(Tag::TableRow) => {
+                self.column = 0;
+                "<tr>".into()
+            }
+            Event::End(TagEnd::TableRow) => "</tr>".into(),
+            Event::Start(Tag::TableCell) => self.cell().into(),
+            Event::End(TagEnd::TableCell) => if self.header {
+                "</div></th>"
+            } else {
+                "</div></td>"
+            }
+            .into(),
+            Event::End(TagEnd::Table) => "</tbody></table></div>\n".into(),
+            event => return event,
+        };
+        Event::Html(markup)
+    }
+
+    fn cell(&mut self) -> String {
+        let alignment = match self.alignments.get(self.column) {
+            Some(Alignment::Center) => "center",
+            Some(Alignment::Right) => "right",
+            _ => "left",
+        };
+        self.column += 1;
+        let tag = if self.header {
+            "th scope=\"col\""
+        } else {
+            "td"
+        };
+        format!("<{tag} class=\"align-{alignment}\"><div class=\"table-cell\">")
+    }
 }
 
 #[cfg(test)]
@@ -97,5 +161,37 @@ mod tests {
         assert!(!html.contains("<script>"));
         assert!(!html.contains("href=\"javascript:"));
         assert!(!render("![x](data:text/html,bad)", &files).contains("src=\"data:"));
+    }
+
+    #[test]
+    fn tables_preserve_alignment_and_inline_content_without_allowing_html_or_inline_styles() {
+        let files = Files::open(&std::env::current_dir().unwrap()).unwrap();
+        let html = render(
+            "| Name | State | Count | Default |\n| :--- | :---: | ---: | --- |\n| **Tools** | Ready | 12 | `<table>` |\n| Browser | Pass | 7 | [docs](https://example.com) |\n\n> | Next |\n> | --- |\n> | Plain |\n\n<table><tr><td>untrusted</td></tr></table>",
+            &files,
+        );
+        assert_eq!(html.matches("class=\"table-scroll\"").count(), 2);
+        assert!(html.contains(
+            "<th scope=\"col\" class=\"align-center\"><div class=\"table-cell\">State</div></th>"
+        ));
+        assert!(html.contains(
+            "<th scope=\"col\" class=\"align-right\"><div class=\"table-cell\">Count</div></th>"
+        ));
+        assert!(html.contains(
+            "<td class=\"align-left\"><div class=\"table-cell\"><strong>Tools</strong></div></td>"
+        ));
+        assert!(
+            html.contains("<td class=\"align-center\"><div class=\"table-cell\">Pass</div></td>")
+        );
+        assert!(html.contains("<td class=\"align-right\"><div class=\"table-cell\">7</div></td>"));
+        assert!(
+            html.contains("<td class=\"align-left\"><div class=\"table-cell\">Plain</div></td>")
+        );
+        assert!(html.contains("<code>&lt;table&gt;</code>"));
+        assert!(html.contains("<a href=\"https://example.com\">docs</a>"));
+        assert!(html.contains("&lt;table&gt;&lt;tr&gt;&lt;td&gt;untrusted"));
+        assert!(!html.contains("style="));
+        assert_eq!(html.matches("<table>").count(), 2);
+        assert_eq!(html.matches("</table></div>").count(), 2);
     }
 }

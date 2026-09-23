@@ -1540,6 +1540,39 @@ context_window = 100000
         self.assertTrue(node.evaluate("node => node.isConnected"))
         self.assertEqual(len(self.requests), requests)
 
+    def test_markdown_tables_keep_alignment_and_allow_keyboard_scrolling_without_widening_the_page(self):
+        self.link_reply = (
+            '| Check | State | Count |\n| :--- | :---: | ---: |\n'
+            '| Browser | **Ready** | 128 |\n| Runtime | Ready | 7 |\n\n'
+            '| Component | Revision | Artifact |\n| --- | --- | --- |\n'
+            '| Browser | `0123456789abcdef0123456789abcdef01234567` | browser-desktop-preview.png |\n')
+        page = self.session(self.page)
+        violations = []
+        page.on('console', lambda message: violations.append(message.text)
+                if message.type == 'error' and 'Content Security Policy' in message.text else None)
+        self.submit(page, 'Alpha links')
+        tables = page.locator('.markdown table')
+        expect(tables).to_have_count(2)
+        self.assertEqual(tables.first.locator('th').evaluate_all('nodes => nodes.map(n => getComputedStyle(n).textAlign)'),
+                         ['left', 'center', 'right'])
+        expect(tables.first.locator('tbody tr').first.locator('td').nth(2)).to_have_css('text-align', 'right')
+        expect(tables.first.locator('strong')).to_have_text('Ready')
+        expect(tables.first.locator('th[scope="col"]')).to_have_count(3)
+        self.assertLess(tables.first.bounding_box()['width'], page.locator('.assistant .body').last.bounding_box()['width'] / 2)
+        page.set_viewport_size({'width': 390, 'height': 844})
+        wide = page.get_by_role('region', name='Markdown table').last
+        self.assertGreater(wide.evaluate('n => n.scrollWidth'), wide.evaluate('n => n.clientWidth'))
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+        wide.focus()
+        page.keyboard.press('ArrowRight')
+        page.wait_for_function("() => document.querySelectorAll('.table-scroll')[1].scrollLeft > 0")
+        expect(tables.last.locator('code')).to_have_text('0123456789abcdef0123456789abcdef01234567')
+        self.assertTrue(tables.locator('.table-cell').evaluate_all('nodes => nodes.every(n => n.scrollWidth <= n.clientWidth + 1)'))
+        page.reload()
+        expect(page.get_by_role('region', name='Markdown table')).to_have_count(2)
+        expect(tables.first.locator('th').nth(1)).to_have_css('text-align', 'center')
+        self.assertEqual(violations, [])
+
     def test_markdown_images_and_floating_controls(self):
         page = self.session(self.page)
         self.submit(page, "Alpha markdown")

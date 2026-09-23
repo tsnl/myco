@@ -91,9 +91,14 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown pre { overflow: auto; white-space: pre; }
 .markdown code { font: inherit; color: #e8cfaa; }
 .markdown :not(pre) > code { background: #e5e5e50a; padding: 1px 4px; border-radius: 0; }
-.markdown table { display: block; overflow-x: auto; border-collapse: collapse; margin: 1em 0; }
-.markdown th, .markdown td { text-align: left; border: 1px solid var(--line); padding: 7px 12px; }
-.markdown th { font-weight: 700; }
+.markdown .table-scroll { width: fit-content; max-width: 100%; overflow-x: auto; margin: 1em 0; }
+.markdown .table-scroll:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.markdown table { width: max-content; border-collapse: collapse; overflow-wrap: normal; }
+.markdown th, .markdown td { text-align: left; vertical-align: top; border: 1px solid var(--line); padding: 8px 12px; }
+.markdown .table-cell { max-width: min(48ch, calc(100vw - 80px)); overflow-wrap: break-word; }
+.markdown th { font-weight: 700; background: #e5e5e508; }
+.markdown .align-center { text-align: center; }
+.markdown .align-right { text-align: right; font-variant-numeric: tabular-nums; }
 .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 1.5em 0; }
 .markdown.pending { white-space: pre-wrap; }
 img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fit: contain; object-position: left center; margin: 14px 0; border-radius: 0; }
