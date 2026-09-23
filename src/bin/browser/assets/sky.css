@@ -63,7 +63,7 @@
 #sky-search label { display: block; margin-bottom: 8px; }
 #sky-coverage:not([hidden]) + #sky-search { margin-top: 20px; }
 .sky-search-row { display: flex; gap: 8px; }
-#sky-city { width: 100%; min-width: 0; border: 1px solid var(--line); padding: 7px 10px; background: #0d172a66; border-radius: 0; }
+#sky-city { width: 100%; min-width: 0; border: 1px solid var(--line); padding: 7px 10px; background: var(--glass-control); border-radius: 0; }
 #sky-city:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 #sky-results { padding: 0; margin: 12px 0; list-style: none; }
 #sky-results button { display: block; width: 100%; text-align: left; padding: 10px; border-top: 0; }
