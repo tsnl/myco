@@ -1,5 +1,8 @@
-import { $, api, element, error } from '/common.js';
-import { showActivity } from '/activity.js';
+import { $, api, element, error } from './common.js';
+import { showActivity } from './activity.js';
+import { profileName, profilePath, eventsWorker } from './scope.js';
+
+document.title = `Sessions · ${profileName} · myco`;
 
 let sessions = [];
 let refreshing = null;
@@ -20,7 +23,7 @@ function render() {
     let row = rows.get(session.id);
     if (!row) {
       row = element('li');
-      const link = element('a'); link.href = `/sessions/${encodeURIComponent(session.id)}`;
+      const link = element('a'); link.href = profilePath(`/sessions/${encodeURIComponent(session.id)}`);
       link.append(element('span', 'session-name'), element('span', 'session-meta'), element('span', 'session-id', session.id));
       const archive = element('button'); archive.type = 'button';
       archive.onclick = async () => {
@@ -78,14 +81,14 @@ function connection(value) {
 }
 function connect() {
   connection(false);
-  const worker = new SharedWorker('/events.js', { name: 'myco-events' });
+  const worker = eventsWorker();
   eventPort = worker.port;
   worker.onerror = () => { connection(false); error('Could not connect to live activity. Reload this page to reconnect.'); };
   eventPort.onmessage = ({ data }) => {
     if (data.kind === 'sessions_changed') refresh();
     else if (data.kind === 'connection') connection(data.connected);
   };
-  eventPort.postMessage({ kind: 'subscribe_list' });
+  eventPort.postMessage({ kind: 'subscribe_list', profile: profileName });
 }
 $('search').oninput = render;
 $('archive-filter').onchange = refresh;

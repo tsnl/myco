@@ -1,4 +1,4 @@
-import { element } from '/common.js';
+import { element } from './common.js';
 
 const localTime = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const fullTime = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'long' });

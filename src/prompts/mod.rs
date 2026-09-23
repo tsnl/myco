@@ -170,6 +170,11 @@ pub fn session_stamp(session_id: &str, started_at: DateTime<Utc>) -> String {
             root.display()
         ));
     }
+    if std::env::var_os("MYCO_SERVER_URL").is_some() {
+        stamp.push_str(
+            "- Read `MYCO_SERVER_URL` from the current tool environment for this profile's API base. Use `$MYCO_SERVER_URL/api/...` for nested sessions; the address can change after a server restart.\n"
+        );
+    }
     stamp
 }
 

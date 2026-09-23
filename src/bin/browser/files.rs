@@ -22,6 +22,7 @@ const FILE_POLICY: &str = "sandbox allow-same-origin; default-src 'none'; img-sr
 pub(super) struct Files {
     root: PathBuf,
     directory: Arc<Dir>,
+    base_path: String,
 }
 
 impl Files {
@@ -34,7 +35,17 @@ impl Files {
         Ok(Self {
             root,
             directory: Arc::new(directory),
+            base_path: String::new(),
         })
+    }
+
+    pub(super) fn with_base_path(mut self, base_path: String) -> Self {
+        self.base_path = base_path;
+        self
+    }
+
+    pub(super) fn route(&self, path: &str) -> String {
+        format!("{}{path}", self.base_path)
     }
 
     pub(super) fn url(&self, source: &str) -> Option<String> {
@@ -42,6 +53,9 @@ impl Files {
             return None;
         }
         if source.starts_with("/files/") {
+            return Some(self.route(source));
+        }
+        if !self.base_path.is_empty() && source.starts_with(&self.route("/files/")) {
             return Some(source.into());
         }
         let base = url::Url::from_directory_path(&self.root).ok()?;
@@ -54,7 +68,7 @@ impl Files {
         let relative = path.strip_prefix(&self.root).ok()?;
         Some(format!(
             "{}{}",
-            path_url(relative),
+            self.route(&path_url(relative)),
             source
                 .fragment()
                 .map_or(String::new(), |value| format!("#{value}"))
@@ -81,7 +95,7 @@ impl Files {
                     && !requested.ends_with('/')
                     && path != Path::new(&requested) =>
             {
-                Redirect::permanent(&format!("{}/", path_url(Path::new(&requested))))
+                Redirect::permanent(&self.route(&format!("{}/", path_url(Path::new(&requested)))))
                     .into_response()
             }
             Ok(Ok((file, path))) => stream(file, &path, &headers).await,

@@ -1,10 +1,11 @@
-import { $, api, element, error, newSession, requestId } from '/common.js';
-import { showActivity } from '/activity.js';
-import { imageAttachments } from '/attachments.js';
-import { linkify, setLinkedText } from '/links.js';
-import { markdownContent } from '/markdown-content.js';
-import { messageTimestamp } from '/timestamps.js';
-import { showUsage } from '/usage.js';
+import { $, api, element, error, newSession, requestId } from './common.js';
+import { showActivity } from './activity.js';
+import { imageAttachments } from './attachments.js';
+import { linkify, setLinkedText } from './links.js';
+import { markdownContent } from './markdown-content.js';
+import { messageTimestamp } from './timestamps.js';
+import { showUsage } from './usage.js';
+import { profileName, profilePath, eventsWorker } from './scope.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -14,7 +15,7 @@ let pending = null;
 let selectingModel = false;
 let sending = false;
 let eventPort = null;
-const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length));
+const sessionId = decodeURIComponent(location.pathname.slice(profilePath('/sessions/').length));
 const nodes = [];
 const markdownJobs = new WeakMap();
 const toolClocks = new WeakMap();
@@ -72,7 +73,7 @@ $('activity').addEventListener('click', (event) => {
 function imageSource(source) {
   if (/^https?:\/\//.test(source) || /^data:image\/(png|jpeg|gif|webp);base64,/.test(source)) return source;
   if (!source.startsWith('myco-image:') && /^[A-Za-z0-9+/]+=*$/.test(source)) return `data:image/png;base64,${source}`;
-  return `/api/image?source=${encodeURIComponent(source)}`;
+  return profilePath(`/api/image?source=${encodeURIComponent(source)}`);
 }
 function addImages(parent, sources) {
   for (const source of sources || []) {
@@ -235,7 +236,7 @@ function snapshot(next) {
     queue.push({ block, node: nodes[index] }); reusable.set(key, queue);
   }
   state = next;
-  history.replaceState(null, '', `/sessions/${encodeURIComponent(state.session_id)}`);
+  history.replaceState(null, '', profilePath(`/sessions/${encodeURIComponent(state.session_id)}`));
   nodes.length = 0;
   for (const [index, block] of state.blocks.entries()) {
     const previous = reusable.get(blockKey(block))?.shift();
@@ -287,7 +288,7 @@ function metadata() {
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';
   transcript.setAttribute('aria-busy', String(!!state.busy));
-  document.title = `${state.title || 'myco'} · myco`;
+  document.title = `${state.title || 'myco'} · ${profileName} · myco`;
 }
 function activity() {
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
@@ -341,7 +342,7 @@ function updateSession(update) {
 }
 function connect() {
   connected = false; metadata();
-  const worker = new SharedWorker('/events.js', { name: 'myco-events' });
+  const worker = eventsWorker();
   eventPort = worker.port;
   worker.onerror = () => { connected = false; metadata(); error('Could not connect to live output. Reload this page to reconnect.'); };
   eventPort.onmessage = ({ data }) => {
@@ -350,7 +351,7 @@ function connect() {
     else if (data.kind === 'connection') { connected = data.connected; metadata(); }
     else if (data.kind === 'error') { connected = false; metadata(); error(data.message); }
   };
-  eventPort.postMessage({ kind: 'subscribe', session_id: sessionId });
+  eventPort.postMessage({ kind: 'subscribe', profile: profileName, session_id: sessionId });
 }
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
 window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); });
@@ -369,7 +370,7 @@ $('composer').onsubmit = async (event) => {
     if (imageIds.length) { error('Send or remove your attached images before using a slash command.'); return; }
     if (text === '/new') { newSession(); $('prompt').value = ''; resizeInput(); return; }
     else if (text === '/compact') action = { kind: 'compact' };
-    else if (text.startsWith('/resume ')) { location.assign(`/sessions/${encodeURIComponent(text.slice(8).trim())}`); return; }
+    else if (text.startsWith('/resume ')) { location.assign(profilePath(`/sessions/${encodeURIComponent(text.slice(8).trim())}`)); return; }
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }
   }
   const signature = JSON.stringify([state.session_id, text, imageIds]);

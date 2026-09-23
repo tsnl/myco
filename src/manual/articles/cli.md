@@ -12,7 +12,7 @@ the internal SSH host worker. `myco-eval` remains a separate evaluation utility.
 | `--mode cli` | Scrolling terminal chat (`--mode interactive` is an alias) |
 | `--port PORT` | Loopback HTTP port, default 8765; `0` chooses a free port |
 | `--bind ADDR` | Loopback IP or `localhost`, default `127.0.0.1`; `::1` selects IPv6 |
-| `--profile NAME` | Select profile, overriding `MYCO_PROFILE` (default `default`) |
+| `--profile NAME` | Select profile, overriding `MYCO_PROFILE` (default `default`); server mode opens it first |
 | `--config PATH` | Config path, overriding `MYCO_CONFIG` and the profile default |
 | `--model KEY` | Default model from the config catalog |
 | `--effort LEVEL` | Reasoning effort: `low`, `medium`, `high`, `max`; default `high` |
@@ -32,8 +32,12 @@ server when it attaches a remote. The local host is always in-process.
 Profiles put config, sessions, images, workspace, and manual under
 `$MYCO_HOME/profiles/NAME/`; `MYCO_HOME` defaults to `~/.myco`. Local tool
 processes inherit absolute `MYCO_HOME` and the selected `MYCO_PROFILE` even
-when they change directories. Child sessions created by the server API share
-that server's profile. Remote workers need no model credentials.
+when they change directories. In server mode, every existing profile has an
+independent instance under `/profiles/NAME/`, sharing one loopback port. Launch
+overrides apply only to the selected profile; other instances use their own config.
+Local tools also receive `MYCO_SERVER_URL` for their instance's API. Child
+sessions created at that URL share its profile. Remote workers need no model
+credentials. CLI modes continue to run only the selected profile.
 
 `.env` in the launch directory is loaded at startup. Configure at least one
 model before starting; the overview describes the catalog. Browser controls,

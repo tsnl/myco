@@ -1,4 +1,4 @@
-import { random } from '/sky-noise.js';
+import { random } from './sky-noise.js';
 
 //
 // Distant stars

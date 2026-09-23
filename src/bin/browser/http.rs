@@ -40,6 +40,7 @@ pub(super) struct Server {
     pub(super) sessions: Sessions,
     weather: Weather,
     files: Files,
+    base_path: String,
 }
 
 impl Server {
@@ -48,12 +49,20 @@ impl Server {
             sessions,
             weather: Weather::new(),
             files,
+            base_path: String::new(),
         }
+    }
+
+    pub(super) fn with_profile(mut self, profile: &str) -> Self {
+        self.base_path = format!("/profiles/{profile}");
+        self.files = self.files.with_base_path(self.base_path.clone());
+        self
     }
 }
 
 pub(super) fn router(server: Arc<Server>) -> Router {
-    super::assets::routes()
+    let base = server.base_path.clone();
+    let routes = super::assets::routes(&base)
         .route("/api/sky/weather", get(sky_weather))
         .route("/api/sky/locations", get(sky_locations))
         .route("/api/events", get(events))
@@ -73,7 +82,12 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route_layer(middleware::from_fn(origin::guard))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(headers))
-        .with_state(server)
+        .with_state(server);
+    if base.is_empty() {
+        routes
+    } else {
+        Router::new().nest(&format!("{base}/"), routes)
+    }
 }
 
 async fn sky_weather(
@@ -94,7 +108,7 @@ async fn sky_locations(
         .map(Json)
 }
 
-async fn headers(request: Request, next: Next) -> Response {
+pub(super) async fn headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     for (name, value) in [
         ("cache-control", "no-store"),

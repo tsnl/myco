@@ -1,5 +1,5 @@
-import renderGradient from '/horizon.js';
-import { illustrated, rainfall } from '/sky-weather.js';
+import renderGradient from './horizon.js';
+import { illustrated, rainfall } from './sky-weather.js';
 
 //
 // Clock and atmospheric conditions

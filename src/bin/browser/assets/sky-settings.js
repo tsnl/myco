@@ -1,15 +1,17 @@
-import { weatherDescription } from '/sky-weather.js';
+import { weatherDescription } from './sky-weather.js';
+import { basePath, profileName, profilePath } from './scope.js';
 
 //
 // Saved location and weather requests
 //
 
-const KEY = 'myco.sky.location.v1';
+const LEGACY_KEY = 'myco.sky.location.v1';
+const KEY = `${LEGACY_KEY}:${basePath}`;
 const REFRESH = 15 * 60 * 1000;
 
 function savedLocation() {
   try {
-    const value = JSON.parse(localStorage.getItem(KEY));
+    const value = JSON.parse(localStorage.getItem(KEY) ?? (profileName === 'default' ? localStorage.getItem(LEGACY_KEY) : null));
     return validLocation(value) ? value : null;
   } catch { return null; }
 }
@@ -21,7 +23,7 @@ function validLocation(value) {
 }
 
 async function request(path, signal) {
-  const response = await fetch(path, { signal });
+  const response = await fetch(profilePath(path), { signal });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -91,7 +93,7 @@ export function skySettings(container, onChange) {
     location = next; forecast = null; refreshed = 0;
     $('results').replaceChildren(); $('error').textContent = '';
     if (save) {
-      try { next ? localStorage.setItem(KEY, JSON.stringify(next)) : localStorage.removeItem(KEY); }
+      try { localStorage.setItem(KEY, JSON.stringify(next)); }
       catch { $('error').textContent = 'This browser cannot save your sky preference.'; }
     }
     display('illustrated');

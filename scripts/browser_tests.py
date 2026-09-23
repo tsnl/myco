@@ -71,7 +71,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -115,6 +115,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "links" in prompt:
             output = f'Preview: {fixture.origin}/files/linked.txt?from=tool&mode=full#details.'
             events = tool({'command': f"printf '%s\\n' {shlex.quote(output)}", 'timeout_ms': 1000})
+        elif "profile" in prompt:
+            marker = shlex.quote(str(root / (name + '-profile')))
+            events = tool({'command': f'printf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
         elif "stream" in prompt:
             events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
         elif "generate" in prompt:
@@ -211,14 +214,15 @@ context_window = 100000
         (self.artifacts / "requests.json").write_text(json.dumps(self.requests, indent=2))
         self.assertEqual(self.errors, [])
 
-    def launch(self, port=0, resume=None):
+    def launch(self, port=0, resume=None, profile='default'):
         log = (self.artifacts / f"server-{len(self.processes)}.log").open("w")
         self.addCleanup(log.close)
-        args = [str(OPTIONS.binary), "--port", str(port), "--config", str(self.home / "config.toml")]
+        args = [str(OPTIONS.binary), "--port", str(port), "--profile", profile, "--config", str(self.home / "config.toml")]
         if resume:
             args += ["--resume", resume]
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=log, text=True,
-                                   cwd=self.home, env=dict(os.environ, MYCO_HOME=str(self.home), MYCO_PROFILE="default"))
+                                   cwd=self.home, env=dict(os.environ, MYCO_HOME=str(self.home), MYCO_PROFILE="default",
+                                                          MYCO_CONFIG=str(self.home / 'config.toml')))
         self.processes.append(process)
         self.addCleanup(process.stdout.close)
         self.addCleanup(self.stop, process)
@@ -241,13 +245,177 @@ context_window = 100000
             self.fail("Browser server did not shut down")
         self.assertEqual(process.returncode, 0)
 
-    def session(self, page=None):
+    def add_profile(self, name='research'):
+        profile = self.home / 'profiles' / name
+        (profile / 'workspace/prelude').mkdir(parents=True)
+        (profile / 'config.toml').write_text((self.home / 'config.toml').read_text()
+                                           .replace('first', name).replace('second', 'spare'))
+        return profile
+
+    def profile_pid(self, name):
+        for line in subprocess.check_output(['ps', '-eo', 'pid=,ppid=,args='], text=True).splitlines():
+            pid, parent, command = line.strip().split(None, 2)
+            if int(parent) == self.process.pid and f'--profile {name} --profile-worker ' in command:
+                return int(pid)
+        return None
+
+    def test_profile_urls_isolate_catalogs_tools_and_identical_session_ids_with_one_browser_stream(self):
+        self.add_profile()
+        names = [item['name'] for item in self.context.request.get(self.origin + '/api/profiles').json()]
+        self.assertEqual(names, ['default', 'research'])
+        default = self.session(self.page)
+        session_id = default.url.rsplit('/', 1)[1]
+        prefix = self.origin + '/profiles/research'
+        response = self.context.request.post(prefix + '/api/sessions', data={'request_id': str(uuid.UUID(session_id))})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json()['id'], session_id)
+        other = self.context.new_page()
+        renderers = []
+        other.on('worker', lambda worker: renderers.append(worker.url))
+        other.goto(prefix + '/sessions/' + session_id)
+        expect(other.locator('#model')).to_be_enabled()
+        expect(other.locator('#sky')).to_have_attribute('data-clouds', 'ready', timeout=30000)
+        self.assertIn(prefix + '/cloud-renderer.js', renderers)
+        expect(default.locator('#profile-switcher')).to_have_value('default')
+        expect(other.locator('#profile-switcher')).to_have_value('research')
+        expect(default.locator('#model option')).to_have_text(['first', 'second'])
+        expect(other.locator('#model option')).to_have_text(['research', 'spare'])
+        self.submit(default, 'Alpha profile')
+        expect(default.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(other.locator('.user')).to_have_count(0)
+        self.submit(other, 'Beta profile')
+        expect(other.locator('.assistant .body').last).to_have_text('Beta finished.')
+        expect(default.locator('.user .body')).to_have_text('Alpha profile')
+        expect(other.locator('.user .body')).to_have_text('Beta profile')
+        for label, profile in [('Alpha', 'default'), ('Beta', 'research')]:
+            self.assertEqual((self.home / (label + '-profile')).read_text().splitlines(),
+                             [profile, str(self.home), str(self.home), self.origin + f'/profiles/{profile}'])
+        self.assertEqual([item['title'] for item in self.context.request.get(self.origin + '/profiles/default/api/sessions').json()], ['Alpha profile'])
+        self.assertEqual([item['title'] for item in self.context.request.get(prefix + '/api/sessions').json()], ['Beta profile'])
+        targets = self.context.new_cdp_session(default).send('Target.getTargets')['targetInfos']
+        self.assertEqual(len([target for target in targets if target['type'] == 'shared_worker' and target['url'].startswith(self.origin)]), 1)
+        other.reload()
+        expect(other.locator('.assistant .body').last).to_have_text('Beta finished.')
+        expect(other).to_have_title('Beta profile · research · myco')
+        other.select_option('#profile-switcher', 'default')
+        expect(other).to_have_url(self.origin + '/profiles/default/')
+        expect(other.locator('.session-name')).to_have_text('Alpha profile')
+        other.screenshot(path=str(self.artifacts / 'profiles-desktop.png'))
+        other.set_viewport_size({'width': 390, 'height': 844})
+        other.screenshot(path=str(self.artifacts / 'profiles-mobile.png'))
+
+    def test_profile_images_and_weather_preferences_stay_in_their_profile(self):
+        self.add_profile()
+        default = self.session(self.page)
+        self.choose_image(default)
+        self.submit(default, 'Alpha images')
+        expect(default.locator('#model')).to_be_enabled()
+        source = default.locator('.user img').get_attribute('src')
+        self.assertTrue(source.startswith('/profiles/default/api/image?'), source)
+        self.assertEqual(self.context.request.get(self.origin + source).status, 200)
+        self.assertEqual(self.context.request.get(self.origin + source.replace('/default/', '/research/')).status, 404)
+        other = self.session(profile='research')
+        self.choose_image(other)
+        self.submit(other, 'Beta images')
+        expect(other.locator('#model')).to_be_enabled()
+        expect(other.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        self.assertTrue(other.locator('.user img').get_attribute('src').startswith('/profiles/research/api/image?'))
+        other.reload()
+        expect(other.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        self.context.route('**/api/sky/weather?*', lambda route: route.fulfill(json={
+            'utc_offset_seconds': 0, 'current': {'time': int(time.time()), 'cloud_cover_low': 0,
+            'cloud_cover_mid': 65, 'cloud_cover_high': 90, 'wind_speed_10m': 6, 'wind_direction_10m': 250}}))
+        default.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Legacy city', latitude: 50, longitude: 0}))")
+        default.reload()
+        expect(default.locator('#sky')).to_have_attribute('data-weather', 'live')
+        expect(other.locator('#sky')).to_have_attribute('data-weather', 'illustrated')
+        default.click('#settings-toggle')
+        expect(default.locator('#sky-status')).to_contain_text('Legacy city')
+        default.click('#sky-reset')
+        default.reload()
+        expect(default.locator('#sky')).to_have_attribute('data-weather', 'illustrated')
+        other.evaluate("localStorage.setItem('myco.sky.location.v1:/profiles/research', JSON.stringify({name: 'Research city', latitude: 51, longitude: 1}))")
+        other.reload()
+        expect(other.locator('#sky')).to_have_attribute('data-weather', 'live')
+        other.click('#settings-toggle')
+        expect(other.locator('#sky-status')).to_contain_text('Research city')
+        expect(default.locator('#sky')).to_have_attribute('data-weather', 'illustrated')
+
+    def test_selected_profile_owns_launch_overrides_legacy_urls_new_tabs_and_resume(self):
+        self.add_profile()
+        (self.home / 'profiles/default/config.toml').write_text((self.home / 'config.toml').read_text().replace('first', 'default'))
+        self.stop(self.process)
+        self.process, launch = self.launch(profile='research')
+        self.origin = launch.split('/profiles/')[0]
+        self.page.goto(self.origin + '/')
+        expect(self.page).to_have_url(launch)
+        expect(self.page.locator('#profile-switcher')).to_have_value('research')
+        with self.page.expect_popup() as popup:
+            self.page.click('#new-session')
+        session = popup.value
+        session.wait_for_url(re.compile(re.escape(self.origin) + r'/profiles/research/sessions/[a-f0-9]{32}$'))
+        expect(session.locator('#model')).to_be_enabled()
+        expect(session.locator('#model option')).to_have_text(['first', 'second'])
+        default = self.session(profile='default')
+        expect(default.locator('#model option')).to_have_text(['default', 'second'])
+        session_id = session.url.rsplit('/', 1)[1]
+        self.assertEqual([s['id'] for s in self.context.request.get(self.origin + '/api/sessions').json()], [session_id])
+        self.page.goto(self.origin + '/sessions/' + session_id)
+        expect(self.page).to_have_url(session.url)
+        self.stop(self.process)
+        self.process, launch = self.launch(resume=session_id, profile='research')
+        self.assertTrue(launch.endswith('/profiles/research/sessions/' + session_id), launch)
+        self.page.goto(launch)
+        expect(self.page.locator('#model')).to_be_enabled()
+
+    def test_profile_failure_recovers_without_interrupting_another_profiles_tool(self):
+        research = self.add_profile()
+        config = research / 'config.toml'
+        valid = config.read_text()
+        config.write_text('not a valid configuration')
+        other = self.context.new_page()
+        response = other.goto(self.origin + '/profiles/research/')
+        self.assertEqual(response.status, 503)
+        expect(other.get_by_role('heading', name='Profile unavailable')).to_be_visible()
+        other.get_by_role('link', name='Choose a profile').click()
+        expect(other.get_by_role('link', name='research Open profile')).to_be_visible()
+        self.assertEqual(self.context.request.get(self.origin + '/profiles/absent/api/sessions').status, 404)
+        self.assertFalse((self.home / 'profiles/absent').exists())
+        default = self.session(self.page)
+        self.submit(default, 'Alpha wait')
+        expect(default.locator('.tool.running')).to_have_count(1)
+        config.write_text(valid)
+        self.session(other, profile='research')
+        self.submit(other, 'Beta images')
+        expect(other.locator('#model')).to_be_enabled()
+        pid = self.profile_pid('research')
+        self.assertIsNotNone(pid)
+        os.kill(pid, signal.SIGKILL)
+        for _ in range(100):
+            replacement = self.profile_pid('research')
+            if replacement is not None and replacement != pid:
+                break
+            other.wait_for_timeout(100)
+        self.assertIsNotNone(replacement, 'Profile did not restart from its disconnected tab')
+        self.assertNotEqual(replacement, pid)
+        expect(other.locator('#model')).to_be_enabled()
+        expect(other.locator('.user .body')).to_have_text('Beta images')
+        expect(default.locator('.tool.running')).to_have_count(1)
+        (self.home / 'Alpha-release').touch()
+        expect(default.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        self.assertEqual(self.turns['Beta images'], 1, 'Restart must not replay a completed generation')
+        self.stop(self.process)
+        self.assertIsNone(self.profile_pid('default'))
+        self.assertIsNone(self.profile_pid('research'))
+
+    def session(self, page=None, profile=None):
         if page is None:
             page = self.context.new_page()
             page.goto(self.origin)
-        response = self.context.request.post(self.origin + '/api/sessions', data={'request_id': str(uuid.uuid4())})
+        prefix = self.origin + (f'/profiles/{profile}' if profile else '')
+        response = self.context.request.post(prefix + '/api/sessions', data={'request_id': str(uuid.uuid4())})
         self.assertEqual(response.status, 200)
-        page.goto(self.origin + '/sessions/' + response.json()['id'])
+        page.goto(prefix + '/sessions/' + response.json()['id'])
         expect(page.locator("#model")).to_be_enabled()
         return page
 
@@ -508,7 +676,7 @@ context_window = 100000
         with self.context.expect_page() as opened:
             page.locator('.user .body a').click()
         expect(opened.value.locator('body')).to_have_text('Opened the link target.')
-        self.assertTrue(page.url.startswith(self.origin + '/sessions/'))
+        self.assertTrue(page.url.startswith(self.origin + '/profiles/default/sessions/'))
 
     def test_url_boundaries_punctuation_and_queued_links_preserve_text(self):
         page = self.session(self.page)
@@ -844,7 +1012,7 @@ context_window = 100000
         page = opened.value
         page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
         expect(page.locator('#model')).to_be_enabled()
-        self.assertEqual(self.page.url, self.origin + '/')
+        self.assertEqual(self.page.url, self.origin + '/profiles/default/')
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(1)
         page.fill('#prompt', 'Keep this draft')
@@ -886,7 +1054,7 @@ context_window = 100000
             self.page.click('#new-session')
         page = opened.value
         expect(page.locator('#retry')).to_be_visible()
-        self.assertEqual(self.page.url, self.origin + '/')
+        self.assertEqual(self.page.url, self.origin + '/profiles/default/')
         page.reload()
         page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
         expect(page.locator('#model')).to_be_enabled()
@@ -965,12 +1133,12 @@ context_window = 100000
         port = forwarder.server_address[1]
         origin = f'http://127.0.0.1:{port}'
         self.page.goto(origin)
-        self.assertEqual(self.page.url, origin + '/')
+        self.assertEqual(self.page.url, origin + '/profiles/default/')
         self.assertEqual(self.context.cookies(), [])
         with self.context.expect_page() as opened:
             self.page.click('#new-session')
         self.page = opened.value
-        self.page.wait_for_url(re.compile(re.escape(origin) + r'/sessions/[a-f0-9]{32}$'))
+        self.page.wait_for_url(re.compile(re.escape(origin) + r'/profiles/default/sessions/[a-f0-9]{32}$'))
         expect(self.page.locator('#model')).to_be_enabled()
         self.submit(self.page, 'Alpha markdown')
         expect(self.page.locator('.assistant .markdown')).to_contain_text('Paragraph 23')
@@ -986,8 +1154,8 @@ context_window = 100000
         response = self.context.request.post(self.origin + '/api/markdown',
             headers={'Origin': self.origin}, data={'text': source})
         self.assertEqual(response.status, 200)
-        self.assertIn('href="/files/notes.txt"', response.text())
-        self.assertEqual(response.text().count('src="/files/'), 3)
+        self.assertIn('href="/profiles/default/files/notes.txt"', response.text())
+        self.assertEqual(response.text().count('src="/profiles/default/files/'), 3)
         self.page.evaluate('html => { const box = document.createElement("div"); box.id="file-preview"; box.innerHTML=html; document.body.append(box); }', response.text())
         for image in self.page.locator('#file-preview img').all():
             expect(image).to_have_js_property('naturalWidth', 12)
@@ -1034,7 +1202,7 @@ context_window = 100000
         (folder / 'index.html').write_text('<link rel="stylesheet" href="style.css"><h1>Preview</h1><img src="../pixel.png"><script>document.documentElement.dataset.executed="yes"; fetch("/api/sessions")</script>')
         page = self.context.new_page()
         response = page.goto(self.origin + '/files/preview')
-        self.assertEqual(page.url, self.origin + '/files/preview/')
+        self.assertEqual(page.url, self.origin + '/profiles/default/files/preview/')
         self.assertEqual(response.status, 200)
         self.assertIn('sandbox allow-same-origin', response.headers['content-security-policy'])
         expect(page.locator('h1')).to_have_css('color', 'rgb(12, 34, 56)')
@@ -1493,7 +1661,7 @@ context_window = 100000
         self.submit(page, "Alpha wait")
         expect(page.locator(".tool.running")).to_have_count(1)
         expect(page.locator("#session-title")).to_have_text("Alpha wait")
-        expect(page).to_have_title("Alpha wait · myco")
+        expect(page).to_have_title("Alpha wait · default · myco")
         page.locator(".tool summary").click()
         fields = page.locator(".tool .arguments")
         expect(fields.locator("dt strong")).to_have_text(["command", "host", "timeout_ms"])
@@ -1506,12 +1674,12 @@ context_window = 100000
         self.submit(page, "Alpha rename")
         expect(page.locator(".tool.running")).to_have_count(1)
         expect(page.locator("#session-title")).to_have_text("Renamed Alpha")
-        expect(page).to_have_title("Renamed Alpha · myco")
+        expect(page).to_have_title("Renamed Alpha · default · myco")
         home = self.context.new_page()
         home.goto(self.origin)
         expect(home.locator(".session-name")).to_have_text("Renamed Alpha")
         page.reload()
-        expect(page).to_have_title("Renamed Alpha · myco")
+        expect(page).to_have_title("Renamed Alpha · default · myco")
         expect(page.locator(".tool.running")).to_have_count(1)
         (self.home / "Alpha-rename-release").touch()
         expect(page.locator("#model")).to_be_enabled()

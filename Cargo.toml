@@ -48,7 +48,7 @@ futures.workspace = true
 libc = "0.2"
 mime_guess = "2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustyline = { version = "15", default-features = false, features = ["custom-bindings"] }
 schemars.workspace = true
 serde.workspace = true

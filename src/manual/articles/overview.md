@@ -27,7 +27,7 @@ myco server / chat adapter
   `view_image`) over NDJSON via SSH.
 - **Nested agents:** clients create a hidden child through
   `POST /api/sessions` with `parent_session` and optional `fork: true`. The
-  child shares the server's profile and model catalog, with its own runner and
+  child shares the addressed profile and model catalog, with its own runner and
   tools. Forks inherit saved context; unresolved parent tool calls receive unknown
   outcomes, never replay. The child's first submission stamps its own identity,
   including when it was created before a server restart. Remotes stay tool workers.
@@ -97,9 +97,12 @@ and exported manual under `~/.myco/profiles/NAME/`. `MYCO_HOME` changes the pare
 installation directory, so test runs can use `MYCO_HOME=/tmp/myco-test`.
 Profile names contain letters, digits, hyphens, or underscores.
 
-All sessions hosted by a server share its profile. Local tool processes inherit
-`MYCO_PROFILE` and absolute `MYCO_HOME` across working-directory changes. Remote
-hosts remain tool workers; config and credentials stay with the server.
+The browser server exposes an independent instance at `/profiles/NAME/` for each
+existing profile, all on one port. `--profile` chooses the initial instance and
+the target of launch overrides. Local tool processes inherit `MYCO_PROFILE`,
+absolute `MYCO_HOME`, and their current instance's `MYCO_SERVER_URL` across
+working-directory changes. Use `$MYCO_SERVER_URL/api/...` for nested sessions.
+Remote hosts remain tool workers; config and credentials stay with the server.
 
 For an existing installation, stop myco and move its `config.toml`, `session/`,
 and `workspace/` into `~/.myco/profiles/default/` before restarting. Files are
@@ -384,7 +387,7 @@ alone does not prove that the task is complete.
 Forks copy checkpointed observations, including pending operations. Unfinished
 tool calls get unknown outcomes before the child generates; they are never
 replayed. Forks have their own tool ownership and cannot inherit live parent shells.
-All child sessions share the server's profile and reach remotes through SSH;
+Child sessions share the profile addressed by their API URL and reach remotes through SSH;
 remote workers need no model keys or session store.
 
 ## Agent workspace

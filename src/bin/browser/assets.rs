@@ -1,6 +1,6 @@
 //! Embedded browser resources. Origin checks and response policy belong to HTTP.
 
-use axum::{Router, http::header, routing::get};
+use axum::{Router, body::Bytes, http::header, routing::get};
 
 const ASSETS: &[(&str, &str)] = &[
     ("/", include_str!("assets/home.html")),
@@ -19,6 +19,8 @@ const ASSETS: &[(&str, &str)] = &[
     ("/usage.js", include_str!("assets/usage.js")),
     ("/home.js", include_str!("assets/home.js")),
     ("/common.js", include_str!("assets/common.js")),
+    ("/scope.js", include_str!("assets/scope.js")),
+    ("/profiles.js", include_str!("assets/profiles.js")),
     ("/events.js", include_str!("assets/events.js")),
     ("/style.css", include_str!("assets/style.css")),
     ("/settings.js", include_str!("assets/settings.js")),
@@ -47,7 +49,7 @@ const ASSETS: &[(&str, &str)] = &[
     ),
 ];
 
-pub(super) fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+pub(super) fn routes<S: Clone + Send + Sync + 'static>(base: &str) -> Router<S> {
     let mut router = Router::new();
     for &(path, body) in ASSETS {
         let content_type = match path.rsplit_once('.') {
@@ -55,9 +57,27 @@ pub(super) fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
             Some((_, "css")) => "text/css; charset=utf-8",
             _ => "text/html; charset=utf-8",
         };
+        let body = if content_type.starts_with("text/html") {
+            Bytes::from(
+                body.replace("href=\"/", &format!("href=\"{base}/"))
+                    .replace("src=\"/", &format!("src=\"{base}/"))
+                    .replace(
+                        "__MYCO_PROFILE__",
+                        base.rsplit('/')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("default"),
+                    ),
+            )
+        } else {
+            Bytes::from_static(body.as_bytes())
+        };
         router = router.route(
             path,
-            get(move || async move { ([(header::CONTENT_TYPE, content_type)], body) }),
+            get(move || {
+                let body = body.clone();
+                async move { ([(header::CONTENT_TYPE, content_type)], body) }
+            }),
         );
     }
     router

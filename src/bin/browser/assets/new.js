@@ -1,4 +1,7 @@
-import { $, api, error, requestId } from '/common.js';
+import { $, api, error, requestId } from './common.js';
+import { profileName, profilePath } from './scope.js';
+
+document.title = `New session · ${profileName} · myco`;
 
 // Reloads and retries must keep the same durable identity after a lost response.
 const createId = history.state?.createId || requestId();
@@ -9,7 +12,7 @@ async function create() {
   error();
   try {
     const session = await (await api('/api/sessions', { request_id: createId })).json();
-    location.replace(`/sessions/${encodeURIComponent(session.id)}`);
+    location.replace(profilePath(`/sessions/${encodeURIComponent(session.id)}`));
   } catch (e) {
     $('creation-status').textContent = 'Could not create the session.';
     error(e.message);

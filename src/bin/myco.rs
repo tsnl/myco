@@ -44,9 +44,12 @@ struct Args {
     /// Start the browser server, scrolling terminal chat, or internal SSH host worker.
     #[arg(long, value_enum, default_value_t = Mode::Server)]
     mode: Mode,
-    /// Data profile: overrides MYCO_PROFILE (default: default).
+    /// Initial server profile / CLI profile: overrides MYCO_PROFILE (default: default).
     #[arg(long, value_name = "NAME", value_parser = myco::core::validate_profile)]
     profile: Option<String>,
+    /// Private profile-worker socket, owned by the browser supervisor.
+    #[arg(long, hide = true, conflicts_with = "print")]
+    profile_worker: Option<PathBuf>,
     /// Host worker name (only used with --mode host).
     #[arg(long, default_value = "local")]
     name: String,
@@ -98,8 +101,10 @@ enum Mode {
 }
 
 fn main() {
-    let _ = dotenvy::dotenv();
     let args = Args::parse();
+    if args.profile_worker.is_none() {
+        let _ = dotenvy::dotenv();
+    }
     if let Some(topic) = args.help_topic.as_deref() {
         print_launcher_help(topic);
         return;
@@ -108,7 +113,7 @@ fn main() {
         eprintln!("myco: {error}");
         std::process::exit(2);
     }
-    if args.mode != Mode::Host
+    if (args.mode == Mode::Cli || args.print.is_some() || args.profile_worker.is_some())
         && let Err(error) = myco::session::migrate_archived_sessions()
     {
         eprintln!("warning: could not organize archived sessions: {error}");
@@ -155,6 +160,9 @@ fn configure_profile(profile: Option<&str>) -> Result<(), String> {
     // Startup is single-threaded, before Tokio or tools can read the environment.
     // Local bash children inherit both selectors, including across cwd changes.
     unsafe {
+        if inherited.as_deref().unwrap_or("default") != profile {
+            std::env::remove_var("MYCO_SERVER_URL");
+        }
         std::env::set_var("MYCO_PROFILE", profile);
         std::env::set_var("MYCO_HOME", root);
     }
