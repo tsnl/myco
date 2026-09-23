@@ -1,6 +1,7 @@
 import { $, api, element, error, newSession, requestId } from '/common.js';
 import { showActivity } from '/activity.js';
 import { imageAttachments } from '/attachments.js';
+import { linkify, setLinkedText } from '/links.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -94,6 +95,7 @@ function markdown(node, text) {
       const html = await (await api('/api/markdown', { text })).text();
       if (!node.isConnected || text !== job.text) return;
       node.innerHTML = html;
+      linkify(node);
       node.classList.remove('pending');
       for (const link of node.querySelectorAll('a')) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
       for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
@@ -147,7 +149,10 @@ function blockNode(block) {
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
     if (block.text || block.images?.length) body.append(element('span', 'tool-label', 'Output'));
-    if (block.text) body.append(element('pre', 'output', block.text));
+    if (block.text) {
+      const output = element('pre', 'output');
+      setLinkedText(output, block.text); body.append(output);
+    }
     addImages(body, block.images);
     details.append(summary, body);
     return details;
@@ -159,7 +164,7 @@ function blockNode(block) {
     article.append(messageHeading(block.role, block.time));
   }
   const body = element('div', `body${block.role === 'user' ? '' : ' markdown'}`);
-  if (block.role === 'user') body.textContent = block.text;
+  if (block.role === 'user') setLinkedText(body, block.text);
   else markdown(body, block.text);
   article.append(body);
   addImages(article, block.images);
@@ -181,7 +186,7 @@ function replaceBlock(index, block, previous) {
     }
     if (block.kind === 'message' && previous.kind === 'message' && block.role === previous.role && block.time === previous.time && JSON.stringify(block.images) === JSON.stringify(previous.images)) {
       const body = nodes[index].querySelector('.body');
-      if (block.role === 'user') body.textContent = block.text;
+      if (block.role === 'user') setLinkedText(body, block.text);
       else markdown(body, block.text);
       scrollLatest();
       return;
@@ -254,7 +259,8 @@ function metadata() {
   if (list.dataset.messages !== signature) {
     list.dataset.messages = signature;
     list.replaceChildren(...queued.map((message) => {
-      const item = element('li', '', message.text);
+      const item = element('li');
+      setLinkedText(item, message.text);
       addImages(item, message.images);
       return item;
     }));

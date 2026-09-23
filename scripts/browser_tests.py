@@ -53,7 +53,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -64,7 +64,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
         if "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
-        if count == 1 and "rename" in prompt:
+        if count and "links" in prompt:
+            events = reply(fixture.link_reply)
+        elif count == 1 and "rename" in prompt:
             release = shlex.quote(str(root / (name + "-rename-release")))
             events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done", "timeout_ms": 60000})
         elif count:
@@ -89,6 +91,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
             done = shlex.quote(str(root / (name + "-done")))
             events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done\nprintf done > {done}", "host": "local",
                            "timeout_ms": 60000})
+        elif "links" in prompt:
+            output = f'Preview: {fixture.origin}/files/linked.txt?from=tool&mode=full#details.'
+            events = tool({'command': f"printf '%s\\n' {shlex.quote(output)}", 'timeout_ms': 1000})
         elif "stream" in prompt:
             events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
         elif "generate" in prompt:
@@ -221,6 +226,59 @@ context_window = 100000
     def image_urls(self, request):
         return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
                 for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
+
+    def test_urls_are_clickable_in_messages_and_tool_output_after_reload(self):
+        page = self.session(self.page)
+        (self.home / 'linked.txt').write_text('Opened the link target.')
+        url = self.origin + '/files/linked.txt?from=review&mode=full#details'
+        self.link_reply = (f'Review {url}.\n\n[Named preview]({url})\n\n`{url}`\n\n```text\n{url}\n```\n\n'
+                           'Also https://example.com/a_(b), www.example.com/docs.')
+        prompt = f'Alpha links: {url}.\n<b>literal user text</b>'
+        self.submit(page, prompt)
+        expect(page.locator('#model')).to_be_enabled()
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            expect(page.locator('.user .body')).to_have_text(prompt)
+            expect(page.locator('.user .body b')).to_have_count(0)
+            expect(page.locator('.user .body a')).to_have_attribute('href', url)
+            expect(page.locator('.assistant .body a')).to_have_count(4)
+            expect(page.locator('.assistant .body a').nth(2)).to_have_attribute('href', 'https://example.com/a_(b)')
+            expect(page.locator('.assistant .body a').nth(3)).to_have_attribute('href', 'https://www.example.com/docs')
+            expect(page.locator('.assistant code a')).to_have_count(0)
+            expect(page.locator('.assistant a a')).to_have_count(0)
+            expect(page.locator('.tool .output a')).to_have_attribute('href', self.origin + '/files/linked.txt?from=tool&mode=full#details')
+            for link in page.locator('.user .body a, .assistant .body a, .tool .output a').all():
+                expect(link).to_have_attribute('target', '_blank')
+                expect(link).to_have_attribute('rel', 'noopener noreferrer')
+        with self.context.expect_page() as opened:
+            page.locator('.user .body a').click()
+        expect(opened.value.locator('body')).to_have_text('Opened the link target.')
+        self.assertTrue(page.url.startswith(self.origin + '/sessions/'))
+
+    def test_url_boundaries_punctuation_and_queued_links_preserve_text(self):
+        page = self.session(self.page)
+        text = ('See (https://example.com/a_(b)), www.example.com/docs.\n'
+                'HTTP://localhost:3000/path?q=one&other=two#section!\n'
+                '[http://[::1]:8080/test] and https://example.com/雪.\n'
+                'Skip https:// and javascript:alert(1), me@www.example.com, /www.example.com, prefixhttps://example.com.')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        page.fill('#prompt', text)
+        page.click('#send')
+        queued = page.locator('#queued-list li')
+        expect(queued).to_have_text(text)
+        expected = ['https://example.com/a_(b)', 'https://www.example.com/docs',
+                    'http://localhost:3000/path?q=one&other=two#section',
+                    'http://[::1]:8080/test', 'https://example.com/%E9%9B%AA']
+        self.assertEqual(queued.locator('a').evaluate_all('nodes => nodes.map(n => n.href)'), expected)
+        page.reload()
+        expect(queued.locator('a')).to_have_count(5)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#model')).to_be_enabled()
+        user = page.locator('.user .body').last
+        expect(user).to_have_text(text)
+        self.assertEqual(user.locator('a').evaluate_all('nodes => nodes.map(n => n.href)'), expected)
 
     def choose_image(self, page, name='local image.png', buffer=None):
         page.set_input_files('#attachment-picker', {'name': name, 'mimeType': 'image/png',
