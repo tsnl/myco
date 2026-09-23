@@ -9,6 +9,8 @@ import re
 import selectors
 import shlex
 import signal
+import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -177,7 +179,7 @@ context_window = 100000
             selector.register(process.stdout, selectors.EVENT_READ)
             self.assertTrue(selector.select(15), "Server did not print its launch URL")
         launch = process.stdout.readline().strip().removeprefix("Browser UI: ")
-        self.assertTrue(launch.startswith("http://"), f"Server failed to launch; see {log.name}")
+        self.assertTrue(launch.startswith("http://127.0.0.1:"), f"Server failed to launch; see {log.name}")
         return process, launch
 
     def stop(self, process):
@@ -206,6 +208,139 @@ context_window = 100000
         page.fill("#prompt", text)
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
+
+    def test_loopback_cookie_and_bearer_auth_cover_assets_files_and_api(self):
+        cookies = self.context.cookies()
+        cookie = next(cookie for cookie in cookies if cookie['name'].startswith('myco_'))
+        self.assertTrue(cookie['httpOnly'])
+        self.assertFalse(cookie['secure'])
+        self.assertEqual(cookie['sameSite'], 'Strict')
+        self.assertEqual(self.page.evaluate('document.cookie'), '')
+        anonymous = self.playwright.request.new_context()
+        try:
+            for path in ['/', '/app.js', '/api/sessions', '/api/events', '/files/pixel.png', '/api/image?source=pixel.png']:
+                self.assertEqual(anonymous.get(self.origin + path).status, 401, path)
+            self.assertEqual(anonymous.head(self.origin + '/files/pixel.png').status, 401)
+            bearer = {'Authorization': 'Bearer ' + cookie['value']}
+            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png', headers=bearer).status, 200)
+            response = anonymous.post(self.origin + '/api/markdown', headers=bearer, data={'text': '**hello**'})
+            self.assertEqual(response.status, 200)
+            self.assertIn('<strong>hello</strong>', response.text())
+            self.assertEqual(anonymous.post(self.origin + '/api/markdown',
+                headers={**bearer, 'Origin': 'https://other.example'}, data={'text': 'no'}).status, 401)
+            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png?token=' + cookie['value']).status, 401)
+            self.assertEqual(self.context.request.get(self.origin + '/files/pixel.png',
+                headers={'Authorization': 'Bearer wrong'}).status, 401)
+            self.assertEqual(self.context.request.post(self.origin + '/api/markdown',
+                data={'text': 'no origin'}).status, 401)
+            for host in ['other.example:8765', '192.168.1.10:8765', 'localhost.evil:8765']:
+                self.assertEqual(anonymous.get(self.origin + '/api/sessions',
+                    headers={**bearer, 'Host': host}).status, 401)
+                self.assertEqual(anonymous.get(self.origin + '/auth?token=' + cookie['value'],
+                    headers={'Host': host}).status, 401)
+        finally:
+            anonymous.dispose()
+
+    def test_forwarded_port_supports_login_actions_events_and_images(self):
+        destination = ('127.0.0.1', urlsplit(self.origin).port)
+
+        class Forward(socketserver.BaseRequestHandler):
+            def handle(self):
+                # Relay TCP bytes like ssh -L; preserve Host, Origin, and cookies.
+                with socket.create_connection(destination) as upstream:
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(self.request, selectors.EVENT_READ, upstream)
+                        selector.register(upstream, selectors.EVENT_READ, self.request)
+                        while True:
+                            for key, _ in selector.select():
+                                data = key.fileobj.recv(65536)
+                                if not data:
+                                    return
+                                key.data.sendall(data)
+
+        forwarder = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Forward)
+        forwarder.daemon_threads = True
+        self.addCleanup(forwarder.server_close)
+        self.addCleanup(forwarder.shutdown)
+        threading.Thread(target=forwarder.serve_forever, daemon=True).start()
+        port = forwarder.server_address[1]
+        origin = f'http://127.0.0.1:{port}'
+        token = next(cookie['value'] for cookie in self.context.cookies()
+                     if cookie['name'].startswith('myco_'))
+        self.page.goto(origin + '/auth?token=' + token)
+        self.assertTrue(self.page.url.startswith(origin + '/'))
+        cookies = {cookie['name']: cookie for cookie in self.context.cookies()}
+        self.assertIn(f'myco_{port}', cookies)
+        self.assertIn(f'myco_{destination[1]}', cookies)
+        self.session(self.page)
+        self.submit(self.page, 'Alpha markdown')
+        expect(self.page.locator('.assistant .markdown')).to_contain_text('Paragraph 23')
+        expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
+        self.page.reload()
+        expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
+
+    def test_workspace_links_and_svg_images_are_mapped_and_authenticated(self):
+        path = self.home / 'plot & space.svg'
+        path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8"><rect width="12" height="8" fill="cyan"/></svg>')
+        (self.home / 'notes.txt').write_text('workspace notes')
+        source = f'![relative](plot%20%26%20space.svg) ![absolute](<{path}>) ![file](<{path.as_uri()}>)\n\n[Notes](notes.txt)'
+        response = self.context.request.post(self.origin + '/api/markdown',
+            headers={'Origin': self.origin}, data={'text': source})
+        self.assertEqual(response.status, 200)
+        self.assertIn('href="/files/notes.txt"', response.text())
+        self.assertEqual(response.text().count('src="/files/'), 3)
+        self.page.evaluate('html => { const box = document.createElement("div"); box.id="file-preview"; box.innerHTML=html; document.body.append(box); }', response.text())
+        for image in self.page.locator('#file-preview img').all():
+            expect(image).to_have_js_property('naturalWidth', 12)
+        self.page.get_by_role('link', name='Notes', exact=True).click()
+        expect(self.page.locator('body')).to_contain_text('workspace notes')
+
+    def test_workspace_files_reject_escape_and_preserve_range_and_head_semantics(self):
+        (self.home / 'bytes.bin').write_bytes(b'0123456789')
+        with tempfile.TemporaryDirectory(prefix='myco-outside-') as outside:
+            secret = Path(outside) / 'secret.txt'
+            secret.write_text('outside workspace')
+            (self.home / 'escape').symlink_to(outside, target_is_directory=True)
+            paths = ['/files/escape/secret.txt', '/files/..%2F' + Path(outside).name + '/secret.txt', '/files/%2Fetc/passwd']
+            for path in paths:
+                self.assertIn(self.context.request.get(self.origin + path).status, [403, 404], path)
+        url = self.origin + '/files/bytes.bin'
+        response = self.context.request.get(url, headers={'Range': 'bytes=2-5'})
+        self.assertEqual((response.status, response.body()), (206, b'2345'))
+        self.assertEqual(response.headers['content-range'], 'bytes 2-5/10')
+        self.assertEqual(self.context.request.get(url, headers={'Range': 'bytes=-3'}).body(), b'789')
+        self.assertEqual(self.context.request.get(url, headers={'Range': 'bytes=20-'}).status, 416)
+        response = self.context.request.head(url)
+        self.assertEqual((response.status, response.body()), (200, b''))
+        self.assertEqual(response.headers['content-length'], '10')
+        for validator in ['"different-version"', 'Wed, 21 Oct 2015 07:28:00 GMT']:
+            response = self.context.request.get(url, headers={'Range': 'bytes=2-5', 'If-Range': validator})
+            self.assertEqual((response.status, response.body()), (200, b'0123456789'))
+            self.assertNotIn('content-range', response.headers)
+        for requested_range in ['bytes=2-5', 'bytes=20-', 'not a range']:
+            response = self.context.request.head(url, headers={'Range': requested_range})
+            self.assertEqual((response.status, response.body()), (200, b''))
+            self.assertEqual(response.headers['content-length'], '10')
+            self.assertNotIn('content-range', response.headers)
+        self.assertEqual(self.context.request.post(url, headers={'Origin': self.origin}, data='replace').status, 405)
+        self.assertEqual((self.home / 'bytes.bin').read_bytes(), b'0123456789')
+        if hasattr(os, 'mkfifo'):
+            os.mkfifo(self.home / 'pipe')
+            self.assertEqual(self.context.request.get(self.origin + '/files/pipe', timeout=3000).status, 404)
+
+    def test_workspace_html_displays_relative_assets_without_executing_scripts(self):
+        folder = self.home / 'preview'
+        folder.mkdir()
+        (folder / 'style.css').write_text('h1 { color: rgb(12, 34, 56); }')
+        (folder / 'index.html').write_text('<link rel="stylesheet" href="style.css"><h1>Preview</h1><img src="../pixel.png"><script>document.documentElement.dataset.executed="yes"; fetch("/api/sessions")</script>')
+        page = self.context.new_page()
+        response = page.goto(self.origin + '/files/preview')
+        self.assertEqual(page.url, self.origin + '/files/preview/')
+        self.assertEqual(response.status, 200)
+        self.assertIn('sandbox allow-same-origin', response.headers['content-security-policy'])
+        expect(page.locator('h1')).to_have_css('color', 'rgb(12, 34, 56)')
+        expect(page.locator('img')).to_have_js_property('naturalWidth', 1)
+        self.assertIsNone(page.locator('html').get_attribute('data-executed'))
 
     def test_settings_contains_sky_and_restores_focus_on_home_and_session(self):
         page = self.page

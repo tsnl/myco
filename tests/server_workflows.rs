@@ -7,8 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use uuid::Uuid;
 
 mod test_utils;
@@ -46,8 +45,9 @@ impl Drop for ServerEnv {
 
 struct Server {
     process: tokio::process::Child,
-    authority: String,
-    cookie: String,
+    origin: String,
+    token: String,
+    client: reqwest::Client,
 }
 
 impl Server {
@@ -75,7 +75,12 @@ impl Server {
             let mut rest = String::new();
             let _ = stdout.read_to_string(&mut rest).await;
         });
-        let authority = format!("127.0.0.1:{}", url.port().unwrap());
+        assert_eq!(url.scheme(), "http");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
         let token = url
             .query_pairs()
             .find(|(key, _)| key == "token")
@@ -84,36 +89,24 @@ impl Server {
             .into_owned();
         Self {
             process,
-            authority,
-            cookie: format!("myco_{}={token}", url.port().unwrap()),
+            origin: url.origin().ascii_serialization(),
+            token,
+            client,
         }
     }
 
     async fn request(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        let text = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-            self.authority,
-            self.authority,
-            self.cookie,
-            text.len()
-        );
-        let response = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut stream = TcpStream::connect(&self.authority).await.unwrap();
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).await.unwrap();
-            String::from_utf8(bytes).unwrap()
-        })
-        .await
-        .expect("HTTP response timed out");
-        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let body = serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.into()));
+        let mut request = self
+            .client
+            .request(method.parse().unwrap(), format!("{}{path}", self.origin))
+            .bearer_auth(&self.token);
+        if !body.is_null() {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
         (status, body)
     }
 
@@ -177,6 +170,60 @@ impl Server {
             .unwrap();
         assert!(status.success(), "{status}");
     }
+}
+
+#[tokio::test]
+async fn loopback_server_rotates_credentials_without_creating_tls_files() {
+    let env = ServerEnv::new("loopback-identity");
+    let server = Server::start(&env, &[]).await;
+    assert!(server.origin.starts_with("http://127.0.0.1:"));
+    assert!(!env.dir.join("profiles/default/tls").exists());
+    assert_eq!(
+        server.request("GET", "/api/sessions", Value::Null).await.0,
+        200
+    );
+    let token = server.token.clone();
+    server.stop().await;
+    let server = Server::start(&env, &[]).await;
+    assert_ne!(server.token, token);
+    let response = server
+        .client
+        .get(format!("{}/api/sessions", server.origin))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn non_loopback_bind_addresses_fail_before_listening() {
+    let env = ServerEnv::new("loopback-invalid");
+    for address in ["0.0.0.0", "::", "192.168.1.10", "2001:db8::1"] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_myco"))
+            .args(["--bind", address, "--port", "0"])
+            .env("MYCO_HOME", &env.dir)
+            .env("MYCO_PROFILE", "default")
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("use an SSH tunnel"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ipv6_loopback_serves_authenticated_http() {
+    let env = ServerEnv::new("loopback-ipv6");
+    let server = Server::start(&env, &["--bind", "::1"]).await;
+    assert!(server.origin.starts_with("http://[::1]:"));
+    assert_eq!(
+        server.request("GET", "/api/sessions", Value::Null).await.0,
+        200
+    );
+    server.stop().await;
 }
 
 fn session_json(dir: &Path, id: &str) -> Value {

@@ -1,27 +1,31 @@
-//! Authenticated loopback routes and browser assets over the session runtime.
+//! Authenticated routes and browser assets over the session runtime.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response, Sse, sse};
+use axum::response::{Html, IntoResponse, Response, Sse, sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use super::{
+    auth,
+    files::Files,
     markdown,
     runtime::{ActionRequest, CreateSession, Error, Sessions, Update},
     weather::{Coordinates, Weather},
 };
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
+
+#[cfg(test)]
+pub(super) use super::auth::allowed;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -37,38 +41,26 @@ impl IntoResponse for Error {
 }
 
 pub(super) struct Server {
-    pub(super) token: String,
-    pub(super) origin: String,
-    port: u16,
-    pub(super) cookie: String,
-    launch_path: String,
+    pub(super) auth: Arc<auth::Auth>,
     pub(super) sessions: Sessions,
     weather: Weather,
+    files: Files,
 }
 
 impl Server {
-    pub(super) fn new(sessions: Sessions, origin: String, port: u16, launch_path: String) -> Self {
+    pub(super) fn new(
+        sessions: Sessions,
+        origin: String,
+        launch_path: String,
+        files: Files,
+    ) -> Self {
         Self {
-            token: Uuid::new_v4().as_simple().to_string(),
-            cookie: format!("myco_{port}"),
-            origin,
-            port,
-            launch_path,
+            auth: Arc::new(auth::Auth::new(origin, launch_path)),
             sessions,
             weather: Weather::new(),
+            files,
         }
     }
-}
-
-/// The origin a request addressed, or `None` when its `Host` is not this server.
-///
-/// A non-loopback bind answers on every name that resolves here, so the served
-/// origin cannot be one fixed string; the port is what identifies this server.
-/// Authority rests on the launch cookie, which a browser only sends back to the
-/// host that set it, so a rebound name reaching this port arrives without one.
-fn addressed_origin(headers: &HeaderMap, port: u16) -> Option<String> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    (host.rsplit_once(':')?.1.parse::<u16>().ok()? == port).then(|| format!("http://{host}"))
 }
 
 pub(super) fn router(server: Arc<Server>) -> Router {
@@ -83,8 +75,13 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
-        .route_layer(middleware::from_fn_with_state(server.clone(), authorize))
-        .route("/auth", get(auth))
+        .route("/files/{*path}", get(workspace_file))
+        .route("/files/", get(workspace_index))
+        .route_layer(middleware::from_fn_with_state(
+            server.auth.clone(),
+            auth::authorize,
+        ))
+        .route("/auth", get(auth::login).with_state(server.auth.clone()))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(headers))
         .with_state(server)
@@ -108,75 +105,25 @@ async fn sky_locations(
         .map(Json)
 }
 
-pub(super) fn allowed(headers: &HeaderMap, app: &Server, mutation: bool) -> bool {
-    let Some(origin) = addressed_origin(headers, app.port) else {
-        return false;
-    };
-    (!mutation
-        || headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(origin.as_str()))
-        && headers
-            .get(header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|cookies| {
-                cookies
-                    .split(';')
-                    .any(|cookie| cookie.trim() == format!("{}={}", app.cookie, app.token))
-            })
-}
-
-async fn authorize(State(app): State<Arc<Server>>, request: Request, next: Next) -> Response {
-    if !allowed(
-        request.headers(),
-        &app,
-        request.method() != axum::http::Method::GET,
-    ) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Open the browser URL printed by myco in your terminal.",
-        )
-            .into_response();
-    }
-    next.run(request).await
-}
-
 async fn headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     for (name, value) in [
         ("cache-control", "no-store"),
         ("referrer-policy", "no-referrer"),
         ("x-content-type-options", "nosniff"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("cross-origin-opener-policy", "same-origin"),
         (
             "content-security-policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     ] {
-        response.headers_mut().insert(
-            header::HeaderName::from_static(name),
-            value.parse().unwrap(),
-        );
+        response
+            .headers_mut()
+            .entry(header::HeaderName::from_static(name))
+            .or_insert_with(|| value.parse().unwrap());
     }
     response
-}
-
-async fn auth(
-    State(app): State<Arc<Server>>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> ApiResult<Response> {
-    if addressed_origin(&headers, app.port).is_none() || query.get("token") != Some(&app.token) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid launch URL.".into()));
-    }
-    let mut response = Redirect::to(&app.launch_path).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        format!(
-            "{}={}; HttpOnly; SameSite=Strict; Path=/",
-            app.cookie, app.token
-        )
-        .parse()
-        .unwrap(),
-    );
-    Ok(response)
 }
 
 pub(super) async fn events(
@@ -301,8 +248,28 @@ struct MarkdownRequest {
     text: String,
 }
 
-async fn render_markdown(Json(request): Json<MarkdownRequest>) -> Html<String> {
-    Html(markdown::render(&request.text))
+async fn render_markdown(
+    State(server): State<Arc<Server>>,
+    Json(request): Json<MarkdownRequest>,
+) -> Html<String> {
+    Html(markdown::render(&request.text, &server.files))
+}
+
+async fn workspace_file(
+    State(server): State<Arc<Server>>,
+    Path(path): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    server.files.serve(path, method, headers).await
+}
+
+async fn workspace_index(
+    State(server): State<Arc<Server>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    server.files.serve(String::new(), method, headers).await
 }
 
 async fn image(Query(query): Query<HashMap<String, String>>) -> ApiResult<Response> {

@@ -72,6 +72,18 @@ cd /path/to/your/project
 myco
 ```
 
+Myco serves HTTP on loopback only (`127.0.0.1` by default, or `--bind ::1` for
+IPv6). For a remote server, use an SSH tunnel from your computer:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-host
+```
+
+Change the remote launch URL's address to `http://127.0.0.1:8766`, keeping its
+path and token. The tunnel encrypts traffic between your computer and the remote
+host. See the [browser manual](../manual/browser.md) for tunneling,
+authentication, and workspace-file access.
+
 Open the URL printed by the server and choose **New session**. Ask for a bounded
 first task, such as “Explain the entry points in this repository.” Myco reads
 project guidance from `AGENTS.md` or `CLAUDE.md` at session start.

@@ -1,8 +1,7 @@
 export const $ = (id) => document.getElementById(id);
 
 // Request ids deduplicate retries, so they must be unique, not unguessable.
-// `crypto.randomUUID` exists only in a secure context, which plain HTTP to
-// anything but localhost is not — and that is how `--web-bind` is reached.
+// Keep the fallback for browsers where the local certificate is not yet trusted.
 export const requestId = () =>
   crypto.randomUUID?.() ??
   '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (c) =>
