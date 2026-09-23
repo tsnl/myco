@@ -234,7 +234,8 @@ descriptions, and keep Markdown's column alignment. Wide tables scroll within
 the conversation; focus a table to scroll it with the keyboard. Plain HTTP(S)
 and `www.` URLs become clickable
 in messages, queued messages, and tool output, and open in a new tab. Inline and
-fenced Markdown code stays literal. Raw HTML is displayed as text. Markdown
+fenced Markdown code stays literal. Bare `<br>`, `<br/>`, and `<br />` tags create
+line breaks, including inside table cells. Other raw HTML is displayed as text. Markdown
 images can reference HTTP(S) URLs, supported image data URLs, or local files.
 The server rewrites workspace image and file links to `/files/`
 URLs, including browser formats such as SVG and AVIF. Relative paths resolve
