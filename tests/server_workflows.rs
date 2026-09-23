@@ -1,4 +1,4 @@
-//! Exercise the actual server launcher, authenticated actions, persistence, and
+//! Exercise the actual server launcher, loopback actions, persistence, and
 //! compaction without provider credentials or an external browser.
 #![cfg(unix)]
 
@@ -46,7 +46,6 @@ impl Drop for ServerEnv {
 struct Server {
     process: tokio::process::Child,
     origin: String,
-    token: String,
     client: reqwest::Client,
 }
 
@@ -81,16 +80,10 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        let token = url
-            .query_pairs()
-            .find(|(key, _)| key == "token")
-            .unwrap()
-            .1
-            .into_owned();
+        assert!(url.query().is_none(), "launch URLs need no credentials");
         Self {
             process,
             origin: url.origin().ascii_serialization(),
-            token,
             client,
         }
     }
@@ -98,8 +91,7 @@ impl Server {
     async fn request(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
         let mut request = self
             .client
-            .request(method.parse().unwrap(), format!("{}{path}", self.origin))
-            .bearer_auth(&self.token);
+            .request(method.parse().unwrap(), format!("{}{path}", self.origin));
         if !body.is_null() {
             request = request.json(&body);
         }
@@ -173,28 +165,34 @@ impl Server {
 }
 
 #[tokio::test]
-async fn loopback_server_rotates_credentials_without_creating_tls_files() {
-    let env = ServerEnv::new("loopback-identity");
-    let server = Server::start(&env, &[]).await;
-    assert!(server.origin.starts_with("http://127.0.0.1:"));
-    assert!(!env.dir.join("profiles/default/tls").exists());
-    assert_eq!(
-        server.request("GET", "/api/sessions", Value::Null).await.0,
-        200
-    );
-    let token = server.token.clone();
-    server.stop().await;
-    let server = Server::start(&env, &[]).await;
-    assert_ne!(server.token, token);
-    let response = server
-        .client
-        .get(format!("{}/api/sessions", server.origin))
-        .bearer_auth(token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 401);
-    server.stop().await;
+async fn loopback_server_needs_no_login_before_or_after_restart() {
+    let env = ServerEnv::new("loopback-access");
+    for _ in 0..2 {
+        let server = Server::start(&env, &[]).await;
+        assert!(server.origin.starts_with("http://127.0.0.1:"));
+        assert!(!env.dir.join("profiles/default/tls").exists());
+        assert_eq!(
+            server.request("GET", "/api/sessions", Value::Null).await.0,
+            200
+        );
+        let response = server
+            .client
+            .get(format!("{}/", server.origin))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(!response.headers().contains_key("www-authenticate"));
+        assert_eq!(
+            server
+                .request("GET", "/auth?token=old", Value::Null)
+                .await
+                .0,
+            404
+        );
+        server.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -215,7 +213,7 @@ async fn non_loopback_bind_addresses_fail_before_listening() {
 }
 
 #[tokio::test]
-async fn ipv6_loopback_serves_authenticated_http() {
+async fn ipv6_loopback_serves_http_without_credentials() {
     let env = ServerEnv::new("loopback-ipv6");
     let server = Server::start(&env, &["--bind", "::1"]).await;
     assert!(server.origin.starts_with("http://[::1]:"));

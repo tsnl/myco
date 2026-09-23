@@ -80,9 +80,9 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-
 ```
 
 Change the remote launch URL's address to `http://127.0.0.1:8766`, keeping its
-path and token. The tunnel encrypts traffic between your computer and the remote
-host. See the [browser manual](../manual/browser.md) for tunneling,
-authentication, and workspace-file access.
+session path. No browser login is needed. The tunnel encrypts traffic between
+your computer and the remote host. See the [browser manual](../manual/browser.md) for tunneling,
+request-origin checks, and workspace-file access.
 
 Open the URL printed by the server and choose **New session**. Ask for a bounded
 first task, such as “Explain the entry points in this repository.” Myco reads

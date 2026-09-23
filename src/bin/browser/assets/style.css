@@ -20,9 +20,11 @@
 body { margin: 0; min-height: 100dvh; isolation: isolate; }
 #session-browser, #transcript { min-height: calc(100dvh - var(--toolbar-height)); border-inline: 1px solid #d8e7ff1c; background: var(--glass-well); backdrop-filter: blur(18px) saturate(1.25); }
 button, textarea, select, input { font: inherit; color: inherit; }
-button, select { border: 1px solid var(--line); border-radius: 0; background: #0d172a66; padding: 5px 11px; }
-button { cursor: pointer; }
-button:hover { border-color: var(--dim); }
+button, select, .button { border: 1px solid var(--line); border-radius: 0; background: #0d172a66; padding: 5px 11px; }
+button, .button { cursor: pointer; }
+.button { display: inline-block; color: inherit; text-decoration: none; }
+button:hover, .button:hover { border-color: var(--dim); }
+.button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 button:disabled { opacity: .45; cursor: default; }
 button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, .brand:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 [hidden] { display: none !important; }

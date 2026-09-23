@@ -237,6 +237,14 @@ impl EventSink for App {
             }
             AgentEvent::ToolStarted { tool_use, context } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
+                if let Some(heading) = view::assistant_heading(&live.snapshot.blocks) {
+                    let index = live.snapshot.blocks.len();
+                    live.snapshot.blocks.push(heading.clone());
+                    self.publish(
+                        &mut live.snapshot,
+                        json!({"kind":"block", "index":index, "block":heading}),
+                    );
+                }
                 let index = live.snapshot.blocks.len();
                 let block = Block::tool(tool_use, Some(Instant::now()));
                 live.snapshot.blocks.push(block.clone());

@@ -1049,7 +1049,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "subtle",
  "thiserror",
  "tokio",
  "tokio-util",

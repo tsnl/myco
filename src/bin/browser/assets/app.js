@@ -128,8 +128,14 @@ function toolState(block) {
   if (block.error) return 'failed';
   return block.status === 'outcome not recorded' ? 'unknown' : 'done';
 }
+function messageHeading(role, time) {
+  const heading = element('header', 'message-header');
+  heading.append(element('span', 'role', role.toUpperCase()), element('time', 'timestamp', time || 'unknown'));
+  return heading;
+}
 function blockNode(block) {
   if (block.kind === 'notice') return element('div', 'notice', block.text);
+  if (block.kind === 'assistant_heading') return messageHeading('assistant', block.time);
   if (block.kind === 'tool') {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
@@ -147,9 +153,7 @@ function blockNode(block) {
   const article = element(thinking ? 'details' : 'article', `message ${block.role}${thinking ? ' thinking' : ''}`);
   if (thinking) article.append(element('summary', '', 'Thinking'));
   else {
-    const heading = element('header', 'message-header');
-    heading.append(element('span', 'role', block.role.toUpperCase()), element('time', 'timestamp', block.time || 'unknown'));
-    article.append(heading);
+    article.append(messageHeading(block.role, block.time));
   }
   const body = element('div', `body${block.role === 'user' ? '' : ' markdown'}`);
   if (block.role === 'user') body.textContent = block.text;
@@ -194,6 +198,7 @@ function replaceBlock(index, block, previous) {
 function blockKey(block) {
   if (block.kind === 'tool') return JSON.stringify(['tool', block.tool]);
   if (block.kind === 'message') return JSON.stringify(['message', block.role, block.time, block.images]);
+  if (block.kind === 'assistant_heading') return JSON.stringify(['assistant_heading', block.time]);
   return JSON.stringify(['notice', block.text]);
 }
 function snapshot(next) {
@@ -328,7 +333,7 @@ $('composer').onsubmit = async (event) => {
   const text = $('prompt').value.trim(); if (!text) return;
   let action = { kind: 'submit', text };
   if (text.startsWith('/')) {
-    if (text === '/new') { await newSession(); return; }
+    if (text === '/new') { newSession(); $('prompt').value = ''; resizeInput(); return; }
     else if (text === '/compact') action = { kind: 'compact' };
     else if (text.startsWith('/resume ')) { location.assign(`/sessions/${encodeURIComponent(text.slice(8).trim())}`); return; }
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }

@@ -11,8 +11,8 @@ myco --bind ::1
 
 The HTTP server uses port 8765 by default; `--port 0` picks a free port. The server binds
 to `127.0.0.1` unless `--bind` names another loopback IP (`localhost` selects IPv4).
-Non-loopback addresses, including `0.0.0.0` and `::`, are rejected. Its launch URL signs
-this browser into this server; keep that URL private. Assets and Markdown
+Non-loopback addresses, including `0.0.0.0` and `::`, are rejected. Open the printed
+URL directly; there is no login, token, or browser cookie. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
 
@@ -24,17 +24,17 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-
 ```
 
 This forwards local port 8766 to the remote server's default port 8765. Change
-the printed launch URL's address to `http://127.0.0.1:8766`, retaining its
-`/auth?token=...` path and query. Keep SSH running while using Myco. If either
+the printed launch URL's address to `http://127.0.0.1:8766`, keeping its session
+path when resuming. Keep SSH running while using Myco. If either
 port differs, adjust the command and browser URL to match. For a remote server
 bound to `::1`, use `[::1]:8765` as the forwarding destination.
 
 Myco does not serve HTTPS or manage certificates. SSH provides encryption and
 host authentication between the two computers; HTTP stays on each loopback
-connection. Keep the forwarding listener on `127.0.0.1` or `::1`. Login, files,
+connection. Keep the forwarding listener on `127.0.0.1` or `::1`. Files,
 actions, and live event streams work through the tunnel, including when its
 local and remote ports differ. Requests must address `localhost` or a loopback
-IP; LAN names and other hostnames are refused even with a valid credential.
+IP; LAN names and other hostnames are refused.
 
 The browser uses square-edged translucent panels over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
@@ -84,15 +84,16 @@ as last available, and discard them after two hours. Device location requires
 browser permission and a loopback browser URL; city search does not need device permission.
 Weather failures do not affect conversations.
 
-The launch token grants access to these sessions and their tools, including a
-shell on the server's machine. Treat the launch URL as an owner credential;
-there is no multi-user permission model. Restarting the server mints a new
-token, invalidating the previous launch URL.
+SSH controls remote access. Any process or user able to reach the loopback port
+can use the sessions, tools, and workspace files; there is no per-user permission
+model. The server retains Host and browser-origin checks to reject requests from
+other websites. Restarting does not require signing in again.
 
 The home page lists your visible, unarchived sessions, with search, recent update
-times, and running status. **New session** creates a session and opens its own
-`/sessions/<id>` URL. Session links work with bookmarks, middle-click, and browser
-tab groups. Click the myco name to return home. `--resume <id>` opens that session
+times, and running status. **New session** opens a separate tab, creates a session,
+and navigates that tab to its `/sessions/<id>` URL. Session links work with
+bookmarks, middle-click, and browser tab groups. Click the myco name to return
+home. `--resume <id>` opens that session
 directly from the launch URL.
 
 Click **Archive** beside a session to hide it from the active list. Choose
@@ -159,16 +160,16 @@ Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, and images. Text uses one font size;
 headings use weight and underlines. Raw HTML is displayed as text. Markdown
 images can reference HTTP(S) URLs, supported image data URLs, or local files.
-The server rewrites workspace image and file links to authenticated `/files/`
+The server rewrites workspace image and file links to `/files/`
 URLs, including browser formats such as SVG and AVIF. Relative paths resolve
 from the server's launch directory; absolute paths, `~/`, and `file://` URLs
 inside that directory also map to `/files/`. URL-encode spaces and special
 characters, or use Markdown's angle-bracket syntax for paths with spaces.
 Saved images use the profile's image store. Explicit PNG, JPEG, GIF, and WebP
-paths outside the workspace retain the authenticated `/api/image` endpoint.
+paths outside the workspace use the `/api/image` endpoint.
 
 `GET /files/path/to/file` and `HEAD` expose regular files below the launch
-directory, including dotfiles. Anyone with the launch credential can read them.
+directory, including dotfiles. Anyone able to reach the loopback port can read them.
 Traversal and symlinks that escape that directory are refused. Files stream
 without loading the whole document into memory; a single byte range supports
 media seeking on GET requests. HEAD always describes the complete file. With
@@ -179,11 +180,12 @@ without an index are not listed. There is no file upload or write route.
 Workspace HTML and SVG have their own restrictive content policy. Static HTML,
 relative images, and styles render; scripts, forms, and embedded frames are
 disabled. This keeps generated or checked-out content from executing with the
-conversation UI's credentials. Interactive applications need a separate preview
-origin instead of weakening this policy on the Myco origin.
+conversation UI's access to the local API. Interactive applications need a
+separate preview origin instead of weakening this policy on the Myco origin.
 
-USER and ASSISTANT headers have UTC timestamps on the next line. Recorded
-messages use the turn's saved acceptance time; older turns without one show
+USER and ASSISTANT headers have UTC timestamps on the next line. A reply that
+starts with tools gets its ASSISTANT header before those calls, live and on replay.
+Recorded messages use the turn's saved acceptance time; older turns without one show
 `unknown`. The input box has no timestamp.
 
 The model selector in the input bar lists the active configuration's model keys.
@@ -193,8 +195,8 @@ the change in the session. An unavailable model leaves the current selection
 unchanged and shows an error. The selector does not change the configured
 startup default.
 
-**New** opens a fresh session in the current tab; the previous session continues
-running on the server. **Compact** creates a successor thread without changing
+**New** opens a fresh session in a new tab; the current tab, draft, and running
+turn stay in place. **Compact** creates a successor thread without changing
 the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
 in the input; `/resume` navigates only the current tab. Other slash commands are not available.
 
@@ -227,26 +229,20 @@ through a browser SharedWorker so a tab group does not exhaust HTTP connections.
 Restarting the server and resuming a saved session restores conversation history,
 not old bash processes or editor state. Uncertain tool outcomes from an
 interrupted process are recorded without rerunning their effects. Compaction
-within a running session preserves live tools. After a server restart, open the
-new launch URL once to sign in again, then reopen your saved session URLs. Keep
-the same port to reuse bookmarks (`--port 0` chooses a new port each time).
+within a running session preserves live tools. After a server restart, reopen
+your saved session URLs directly. Keep the same port to reuse bookmarks
+(`--port 0` chooses a new port each time).
 
 ## Server API and automation
 
-Automated clients use the same authenticated HTTP API as the browser. Sign in
-by requesting the printed `/auth?token=...` URL and retaining its cookie, or by
-setting `Authorization: Bearer <launch-token>` on requests. Both authenticate
-the API, event streams, images, assets, and workspace files. The browser uses a
-host-only `HttpOnly`, `SameSite=Strict` cookie automatically; image and
-event-stream URLs do not carry the token. The cookie is named for the
-browser-facing port so multiple tunnels can coexist. It has no `Secure` flag
-because the browser connects over loopback HTTP.
+Automated clients use the same loopback HTTP API as the browser. No credential
+or login request is needed. Use the local forwarding address when connecting over
+SSH. POST bodies use `Content-Type: application/json`.
 
-Cookie-authenticated writes require an `Origin` equal to the loopback HTTP
-origin the browser addresses. Bearer clients can omit `Origin`; a supplied mismatched origin is
-rejected for both authentication modes. No CORS access is granted. Restarting
-changes the credential. Access to this API also grants session tools and shell
-execution: the token is an owner credential, not a read-only file-share token.
+Browser requests must come from the same origin. A supplied `Origin` must match
+the loopback address and port in `Host`; cross-site and cross-port browser requests
+are rejected, and no CORS access is granted. Native clients can omit `Origin` and
+Fetch Metadata. Access to this API includes session tools and shell execution.
 
 | Request | Body / result |
 | --- | --- |
@@ -258,7 +254,7 @@ execution: the token is an owner credential, not a read-only file-share token.
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
 | `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
-| `GET /files/PATH`, `HEAD /files/PATH` | Authenticated launch-directory files; GET supports a single `Range: bytes=START-END` |
+| `GET /files/PATH`, `HEAD /files/PATH` | Launch-directory files; GET supports a single `Range: bytes=START-END` |
 
 Use a fresh UUID per operation and reuse it when retrying that operation.
 Creation uses the UUID as the session ID and survives restart without creating
@@ -274,7 +270,7 @@ runners and tool state, remain hidden from both normal and archived listings,
 and can be opened directly by ID. Retrying creation keeps its original context.
 Model selection is a separate action before submission.
 
-For example, a Python client can authenticate and create a session using only
+For example, a Python client can create a session using only
 the standard library. Supply the launch URL through `MYCO_LAUNCH_URL`; when
 using a tunnel, first change its address to the local forwarding address:
 
@@ -284,13 +280,12 @@ import json, os, urllib.parse, urllib.request, uuid
 launch = os.environ["MYCO_LAUNCH_URL"]
 url = urllib.parse.urlsplit(launch)
 origin = f"{url.scheme}://{url.netloc}"
-token = dict(urllib.parse.parse_qsl(url.query))["token"]
 client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def post(path, payload):
     request = urllib.request.Request(origin + path,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        headers={"Content-Type": "application/json"})
     with client.open(request) as response:
         return response.read()
 
@@ -300,6 +295,5 @@ post(f"/api/sessions/{session}/action", {
     "action": {"kind": "submit", "text": "Explain this repository"}})
 ```
 
-Clients must be given the launch credential by their operator. The server does
-not inject it into model context. API-created sessions use the server's launch
-directory and profile; no new process or model configuration is needed per child.
+API-created sessions use the server's launch directory and profile; no new
+process or model configuration is needed per child.

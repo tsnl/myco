@@ -51,10 +51,11 @@ Use `--resume ID` to continue later. `myco --mode cli` provides a scrolling chat
 with line editing, tool activity, and `/compact`. The
 [command-line manual](../manual/cli.md) describes input, cancellation, and exit codes.
 
-Use the authenticated server API to create sessions, submit work, observe output,
-compact, and cancel. Clients retain the launch cookie and send an `Origin` header
-on writes. A successful submission means accepted; wait for an idle snapshot and
-inspect the result. The [browser manual](../manual/browser.md#server-api-and-automation)
+Use the loopback server API to create sessions, submit work, observe output,
+compact, and cancel. Connect directly on localhost or through SSH forwarding;
+no login or token is needed. A successful submission means accepted; wait for an
+idle snapshot and inspect the result. The
+[browser manual](../manual/browser.md#server-api-and-automation)
 contains the request formats and a Python example.
 
 Include `parent_session` to create a hidden child; add `fork: true` to seed it

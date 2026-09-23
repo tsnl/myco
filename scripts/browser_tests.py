@@ -198,9 +198,9 @@ context_window = 100000
         if page is None:
             page = self.context.new_page()
             page.goto(self.origin)
-        previous = page.url
-        page.click("#new-session")
-        page.wait_for_url(lambda url: str(url) != previous and re.fullmatch(r".*/sessions/[a-f0-9]{32}", str(url)))
+        response = self.context.request.post(self.origin + '/api/sessions', data={'request_id': str(uuid.uuid4())})
+        self.assertEqual(response.status, 200)
+        page.goto(self.origin + '/sessions/' + response.json()['id'])
         expect(page.locator("#model")).to_be_enabled()
         return page
 
@@ -209,44 +209,114 @@ context_window = 100000
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
 
-    def test_loopback_cookie_and_bearer_auth_cover_assets_files_and_api(self):
-        cookies = self.context.cookies()
-        cookie = next(cookie for cookie in cookies if cookie['name'].startswith('myco_'))
-        self.assertTrue(cookie['httpOnly'])
-        self.assertFalse(cookie['secure'])
-        self.assertEqual(cookie['sameSite'], 'Strict')
-        self.assertEqual(self.page.evaluate('document.cookie'), '')
+    def test_new_opens_an_independent_tab_and_preserves_the_running_session_and_draft(self):
+        with self.context.expect_page() as opened:
+            self.page.click('#new-session')
+        page = opened.value
+        page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(self.page.url, self.origin + '/')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        page.fill('#prompt', 'Keep this draft')
+        previous = page.url
+        with self.context.expect_page() as opened:
+            page.click('#new-session')
+        fresh = opened.value
+        fresh.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+        expect(fresh.locator('#model')).to_be_enabled()
+        self.assertNotEqual(fresh.url, previous)
+        self.assertEqual(page.url, previous)
+        expect(page.locator('#prompt')).to_have_value('Keep this draft')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        expect(fresh.locator('.user')).to_have_count(0)
+        self.assertIsNone(fresh.evaluate('window.opener'))
+        page.click('#cancel')
+        expect(page.locator('#model')).to_be_enabled()
+        with self.context.expect_page() as opened:
+            page.fill('#prompt', '/new')
+            page.press('#prompt', 'Enter')
+        opened.value.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+        expect(page.locator('#prompt')).to_have_value('')
+        self.assertEqual(page.url, previous)
+
+    def test_new_tab_retries_a_lost_creation_response_without_duplicate_sessions(self):
+        attempts = []
+        def lose_once(route):
+            if route.request.method != 'POST':
+                route.continue_()
+                return
+            attempts.append(route.request.post_data_json['request_id'])
+            response = route.fetch()
+            if len(attempts) == 1:
+                route.abort()
+            else:
+                route.fulfill(response=response)
+        self.context.route('**/api/sessions', lose_once)
+        with self.context.expect_page() as opened:
+            self.page.click('#new-session')
+        page = opened.value
+        expect(page.locator('#retry')).to_be_visible()
+        self.assertEqual(self.page.url, self.origin + '/')
+        page.reload()
+        page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        sessions = self.context.request.get(self.origin + '/api/sessions').json()
+        self.assertEqual(len(sessions), 1)
+
+    def test_assistant_heading_precedes_tool_first_output_live_after_reload_and_restart(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        heading = page.locator('#transcript > .message-header')
+        expect(heading.locator('.role')).to_have_text('ASSISTANT')
+        self.assertTrue(page.locator('.tool').evaluate("tool => tool.previousElementSibling.querySelector('.role').textContent === 'ASSISTANT'"))
+        expect(heading.locator('time')).to_have_text(page.locator('.user time').inner_text())
+        page.reload()
+        expect(heading.locator('.role')).to_have_text('ASSISTANT')
+        page.click('#cancel')
+        expect(page.locator('#model')).to_be_enabled()
+        session_url = page.url
+        port = urlsplit(self.origin).port
+        self.stop(self.process)
+        self.process, launch = self.launch(port=port)
+        page.goto(session_url)
+        expect(heading.locator('.role')).to_have_text('ASSISTANT')
+        expect(page.locator('.tool')).to_have_count(1)
+
+    def test_loopback_has_no_login_and_rejects_foreign_web_origins(self):
+        self.assertEqual(self.context.cookies(), [])
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ['/', '/app.js', '/api/sessions', '/api/events', '/files/pixel.png', '/api/image?source=pixel.png']:
-                self.assertEqual(anonymous.get(self.origin + path).status, 401, path)
-            self.assertEqual(anonymous.head(self.origin + '/files/pixel.png').status, 401)
-            bearer = {'Authorization': 'Bearer ' + cookie['value']}
-            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png', headers=bearer).status, 200)
-            response = anonymous.post(self.origin + '/api/markdown', headers=bearer, data={'text': '**hello**'})
-            self.assertEqual(response.status, 200)
-            self.assertIn('<strong>hello</strong>', response.text())
-            self.assertEqual(anonymous.post(self.origin + '/api/markdown',
-                headers={**bearer, 'Origin': 'https://other.example'}, data={'text': 'no'}).status, 401)
-            self.assertEqual(anonymous.get(self.origin + '/files/pixel.png?token=' + cookie['value']).status, 401)
-            self.assertEqual(self.context.request.get(self.origin + '/files/pixel.png',
-                headers={'Authorization': 'Bearer wrong'}).status, 401)
-            self.assertEqual(self.context.request.post(self.origin + '/api/markdown',
-                data={'text': 'no origin'}).status, 401)
+            for path in ['/', '/app.js', '/api/sessions', '/files/pixel.png', '/api/image?source=pixel.png']:
+                response = anonymous.get(self.origin + path)
+                self.assertEqual(response.status, 200, path)
+                self.assertNotIn('set-cookie', response.headers)
+                self.assertNotIn('www-authenticate', response.headers)
+            self.assertEqual(anonymous.head(self.origin + '/files/pixel.png').status, 200)
+            self.assertEqual(anonymous.get(self.origin + '/auth?token=old').status, 404)
+            self.assertEqual(anonymous.post(self.origin + '/api/markdown', data={'text': '**local**'}).status, 200)
+            for origin in ['https://other.example', 'null', 'http://localhost:1']:
+                self.assertEqual(anonymous.post(self.origin + '/api/markdown',
+                    headers={'Origin': origin}, data={'text': 'no'}).status, 403)
+            for site in ['cross-site', 'same-site']:
+                self.assertEqual(anonymous.get(self.origin + '/files/pixel.png',
+                    headers={'Sec-Fetch-Site': site}).status, 403)
             for host in ['other.example:8765', '192.168.1.10:8765', 'localhost.evil:8765']:
-                self.assertEqual(anonymous.get(self.origin + '/api/sessions',
-                    headers={**bearer, 'Host': host}).status, 401)
-                self.assertEqual(anonymous.get(self.origin + '/auth?token=' + cookie['value'],
-                    headers={'Host': host}).status, 401)
+                self.assertEqual(anonymous.get(self.origin + '/api/sessions', headers={'Host': host}).status, 403)
+            self.assertEqual(anonymous.get(self.origin + '/api/sessions',
+                headers={'Cookie': 'myco_8765=old', 'Authorization': 'Bearer old'}).status, 200)
         finally:
             anonymous.dispose()
 
-    def test_forwarded_port_supports_login_actions_events_and_images(self):
+    def test_forwarded_port_supports_actions_events_and_images_without_login(self):
         destination = ('127.0.0.1', urlsplit(self.origin).port)
 
         class Forward(socketserver.BaseRequestHandler):
             def handle(self):
-                # Relay TCP bytes like ssh -L; preserve Host, Origin, and cookies.
+                # Relay TCP bytes like ssh -L; preserve Host and Origin.
                 with socket.create_connection(destination) as upstream:
                     with selectors.DefaultSelector() as selector:
                         selector.register(self.request, selectors.EVENT_READ, upstream)
@@ -265,21 +335,21 @@ context_window = 100000
         threading.Thread(target=forwarder.serve_forever, daemon=True).start()
         port = forwarder.server_address[1]
         origin = f'http://127.0.0.1:{port}'
-        token = next(cookie['value'] for cookie in self.context.cookies()
-                     if cookie['name'].startswith('myco_'))
-        self.page.goto(origin + '/auth?token=' + token)
-        self.assertTrue(self.page.url.startswith(origin + '/'))
-        cookies = {cookie['name']: cookie for cookie in self.context.cookies()}
-        self.assertIn(f'myco_{port}', cookies)
-        self.assertIn(f'myco_{destination[1]}', cookies)
-        self.session(self.page)
+        self.page.goto(origin)
+        self.assertEqual(self.page.url, origin + '/')
+        self.assertEqual(self.context.cookies(), [])
+        with self.context.expect_page() as opened:
+            self.page.click('#new-session')
+        self.page = opened.value
+        self.page.wait_for_url(re.compile(re.escape(origin) + r'/sessions/[a-f0-9]{32}$'))
+        expect(self.page.locator('#model')).to_be_enabled()
         self.submit(self.page, 'Alpha markdown')
         expect(self.page.locator('.assistant .markdown')).to_contain_text('Paragraph 23')
         expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
         self.page.reload()
         expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
 
-    def test_workspace_links_and_svg_images_are_mapped_and_authenticated(self):
+    def test_workspace_links_and_svg_images_are_mapped_without_login(self):
         path = self.home / 'plot & space.svg'
         path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8"><rect width="12" height="8" fill="cyan"/></svg>')
         (self.home / 'notes.txt').write_text('workspace notes')
@@ -460,16 +530,16 @@ context_window = 100000
         self.session(page)
         self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
 
-    def test_sky_endpoints_require_authentication_and_validate_input(self):
+    def test_sky_assets_need_no_login_and_endpoints_validate_input(self):
         anonymous = self.playwright.request.new_context()
         try:
-            for path in ["/api/sky/weather?latitude=0&longitude=0", "/api/sky/locations?query=London", "/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
+            for path in ["/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
                          "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js", "/settings.js"]:
-                self.assertEqual(anonymous.get(self.origin + path).status, 401)
+                self.assertEqual(anonymous.get(self.origin + path).status, 200)
+            for path in ["/api/sky/weather?latitude=91&longitude=0", "/api/sky/weather?latitude=nan&longitude=0", "/api/sky/locations?query=a"]:
+                self.assertEqual(anonymous.get(self.origin + path).status, 400)
         finally:
             anonymous.dispose()
-        for path in ["/api/sky/weather?latitude=91&longitude=0", "/api/sky/weather?latitude=nan&longitude=0", "/api/sky/locations?query=a"]:
-            self.assertEqual(self.context.request.get(self.origin + path).status, 400)
 
     def test_sky_rain_tracks_weather_intensity_and_clears_for_snow_and_illustration(self):
         page = self.page

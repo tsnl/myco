@@ -19,7 +19,6 @@ struct Server {
     child: Child,
     _output: BufReader<tokio::process::ChildStdout>,
     address: String,
-    cookie: String,
 }
 
 impl Server {
@@ -42,17 +41,11 @@ impl Server {
             .expect("browser startup must finish")
             .unwrap();
         let url = url::Url::parse(line.trim().strip_prefix("Browser UI: ").unwrap()).unwrap();
-        let token = url
-            .query_pairs()
-            .find(|(key, _)| key == "token")
-            .unwrap()
-            .1
-            .into_owned();
+        assert!(url.query().is_none());
         Self {
             child,
             _output: output,
             address: format!("127.0.0.1:{}", url.port().unwrap()),
-            cookie: format!("myco_{}={token}", url.port().unwrap()),
         }
     }
 
@@ -62,8 +55,8 @@ impl Server {
             let method = if body.is_some() { "POST" } else { "GET" };
             let body = body.map_or_else(String::new, |body| body.to_string());
             let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                self.address, self.address, self.cookie, body.len()
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                self.address, self.address, body.len()
             );
             socket.write_all(request.as_bytes()).await.unwrap();
             let mut response = String::new();

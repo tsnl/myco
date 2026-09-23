@@ -1,7 +1,7 @@
 # Myco overview
 
 **myco** is a coding agent server: one conversation can drive tools on your laptop and on remote
-machines over SSH. Tools run on **hosts** (local or remote); nested sessions use the authenticated server API (see below).
+machines over SSH. Tools run on **hosts** (local or remote); nested sessions use the server API (see below).
 
 ## Architecture (one sentence)
 
@@ -25,7 +25,7 @@ myco server / chat adapter
   **local** host worker (standard tools plus root-only services such as `session_meta`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor,
   `view_image`) over NDJSON via SSH.
-- **Nested agents:** authenticated clients create a hidden child through
+- **Nested agents:** clients create a hidden child through
   `POST /api/sessions` with `parent_session` and optional `fork: true`. The
   child shares the server's profile and model catalog, with its own runner and
   tools. Forks inherit saved context; unresolved parent tool calls receive unknown
@@ -342,10 +342,9 @@ also loads the config file (`--config` → `$MYCO_CONFIG` →
 
 ## Nested agents (the recipe)
 
-Use the authenticated server API on the **local host**. Read `browser.md` for
-cookie authentication, request envelopes, and polling or streaming results.
-An operator must supply the server launch credential to the client; never put
-it in model messages or commit it to the repository.
+Use the server API on the **local host**. Read `browser.md` for
+loopback access, request envelopes, and polling or streaming results.
+Remote clients connect through an SSH tunnel; no browser login is required.
 
 1. Create a session with a fresh `request_id` and `parent_session` set to your
    session ID, available in the newest `# Session` block or `session_meta` get.

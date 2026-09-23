@@ -25,7 +25,7 @@ the internal SSH host worker. `myco-eval` remains a separate evaluation utility.
 `--web [PORT]` and `--web-bind ADDR` remain aliases for `--port` and `--bind`.
 Non-loopback addresses, including wildcard binds, are rejected. Use an SSH tunnel
 for remote access; Myco has no HTTPS listener or certificate options. Tunneling,
-authentication, and the read-only `/files/` workspace routes are described in `browser`.
+request-origin checks, and the read-only `/files/` workspace routes are described in `browser`.
 Host workers accept `--name` and `--max-image-base64-bytes`, supplied by the
 server when it attaches a remote. The local host is always in-process.
 
@@ -40,8 +40,8 @@ model before starting; the overview describes the catalog. Browser controls,
 attachments, archived sessions, and automation are documented in `browser`.
 
 Ctrl-C stops the server, cancels active turns, and saves their recorded outcomes.
-Closing a browser tab leaves its session running. Restarting requires opening
-the new launch URL to authenticate again. Saved session URLs keep the same port;
+Closing a browser tab leaves its session running. Reopen session URLs directly
+after restarting; no login is needed. Saved session URLs keep the same port;
 use a fixed port for bookmarks.
 
 ## One-shot prompts
