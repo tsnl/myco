@@ -81,9 +81,11 @@ impl Profiles {
             return Ok(worker.clone());
         }
         *cached = None;
+        let workspace = self.directory.join(name).join("workspace");
         let start = Worker::start(
             &self.args,
             name,
+            &workspace,
             &self.selected,
             &self.origin,
             self.events.clone(),
