@@ -650,6 +650,126 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
 }
 
 #[test]
+fn compaction_updates_one_card_and_separates_tool_first_continuation_from_prior_output() {
+    let (app, _) = app();
+    app.delta("assistant", "Prior answer".into());
+    app.compacting(true);
+    let pending = app.snapshot().change["snapshot"].clone();
+    assert_eq!(pending["status"], "Compacting");
+    assert_eq!(pending["blocks"][1]["running"], true);
+    app.finish_compaction(None);
+    let completed = app.snapshot().change["snapshot"].clone();
+    assert_eq!(completed["status"], "Running");
+    assert_eq!(completed["blocks"].as_array().unwrap().len(), 2);
+    assert_eq!(completed["blocks"][1]["running"], false);
+    app.emit(AgentEvent::ToolStarted {
+        tool_use: ToolUse {
+            name: "bash".into(),
+            input: json!({"command":"pwd"}),
+        },
+        context: Default::default(),
+    });
+    let blocks = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(blocks[0]["text"], "Prior answer");
+    assert_eq!(blocks[2]["kind"], "assistant_heading");
+    assert_eq!(blocks[2]["time"], blocks[1]["time"]);
+    assert_eq!(blocks[3]["kind"], "tool");
+    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.finish_compaction(None);
+    assert_eq!(app.snapshot().change["snapshot"]["status"], "Cancelling");
+}
+
+#[test]
+fn failed_compaction_replaces_progress_with_the_warning_and_restores_running_status() {
+    let (app, _) = app();
+    app.compacting(true);
+    app.warning("Summary failed; continuing with the existing context".into());
+    let snapshot = app.snapshot().change["snapshot"].clone();
+    assert_eq!(snapshot["status"], "Running");
+    assert_eq!(snapshot["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["blocks"][0]["kind"], "notice");
+    assert!(
+        snapshot["blocks"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Summary failed")
+    );
+}
+
+#[test]
+fn completed_compaction_boundary_follows_retained_context_and_precedes_new_output() {
+    let user = Message::UserMessage {
+        content: vec![Content::Text {
+            text: "task".into(),
+        }],
+    };
+    let assistant = |text: &str| Message::AssistantMessage {
+        content: vec![Content::Text { text: text.into() }],
+        tool_uses: vec![],
+        turn_end_reason: None,
+    };
+    let continuation = Message::UserMessage {
+        content: vec![Content::System {
+            kind: "continuation".into(),
+            text: "internal resumption instructions".into(),
+            data: json!({"reason":"auto_compaction"}),
+        }],
+    };
+    let mut session = Session::new("test");
+    // An older automatic continuation may itself be retained by a later manual
+    // compaction; only the marker at the current boundary determines its mode.
+    session.replace_context(
+        vec![
+            user,
+            assistant("old output"),
+            continuation.clone(),
+            assistant("recent output"),
+        ],
+        None,
+    );
+    for automatic in [false, true] {
+        let (mut thread, _) = myco::session::compact_thread(&session, "internal summary").unwrap();
+        if automatic {
+            thread.messages.push(continuation.clone());
+        }
+        thread.messages.push(assistant("new output"));
+        let blocks = serde_json::to_value(view::history(&thread)).unwrap();
+        assert_eq!(blocks[2]["text"], "recent output");
+        assert_eq!(blocks[3]["kind"], "compaction");
+        assert_eq!(blocks[3]["automatic"], automatic);
+        assert_eq!(blocks[3]["running"], false);
+        assert_eq!(blocks[4]["text"], "new output");
+        assert_eq!(blocks[4]["time"], view::timestamp(&thread.created_at));
+        assert!(!blocks.to_string().contains("internal"));
+    }
+}
+
+#[test]
+fn legacy_compaction_is_labeled_without_guessing_its_boundary_or_mode() {
+    let mut session = Session::new("test");
+    session.replace_context(
+        vec![Message::UserMessage {
+            content: vec![Content::Text {
+                text: "retained task".into(),
+            }],
+        }],
+        None,
+    );
+    for metadata in [json!({}), json!({"tail_messages":u64::MAX})] {
+        let (mut thread, _) = myco::session::compact_thread(&session, "summary").unwrap();
+        if let Message::UserMessage { content } = &mut thread.messages[0]
+            && let Content::System { data, .. } = &mut content[1]
+        {
+            *data = metadata;
+        }
+        let blocks = serde_json::to_value(view::history(&thread)).unwrap();
+        assert_eq!(blocks[0]["kind"], "compaction");
+        assert!(blocks[0]["automatic"].is_null());
+        assert_eq!(blocks[1]["text"], "retained task");
+    }
+}
+
+#[test]
 fn markdown_text_parts_join_without_crossing_images_thinking_or_message_boundaries() {
     let text = |value: &str| Content::Text { text: value.into() };
     let assistant = |content| Message::AssistantMessage {

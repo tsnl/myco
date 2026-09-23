@@ -74,6 +74,10 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .role { display: block; color: var(--green); font-weight: 700; }
 .user .role { color: var(--cyan); }
 .system .role { color: var(--dim); }
+.compaction { border: 1px solid var(--line); padding: 14px 16px; background: rgb(var(--glass-tint) / .28); }
+.compaction .message-header { border: 0; padding: 0; margin-bottom: 8px; }
+.compaction-title { font-weight: 700; }
+.compaction-description { color: var(--dim); margin: 4px 0 0; }
 .timestamp { display: block; color: var(--dim); }
 .timestamp-age { white-space: nowrap; }
 .user .body { white-space: pre-wrap; }
