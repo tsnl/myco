@@ -1,4 +1,4 @@
-//! Read-only access relative to the directory captured when the server starts.
+//! Read-only access relative to the profile workspace captured at worker startup.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,9 +10,9 @@ use cap_std::fs::{Dir, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-// Workspace documents may display HTML/SVG, but never execute with the app's
-// credentials. Keeping same-origin permits authenticated relative images/CSS;
-// omitting allow-scripts, forms, and navigation prevents active app privileges.
+// Workspace documents may display HTML/SVG and load relative images/CSS.
+// Keeping same-origin permits those assets; omitting allow-scripts, forms, and
+// navigation prevents documents from exercising the app's API privileges.
 const FILE_POLICY: &str = "sandbox allow-same-origin; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 //
