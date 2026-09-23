@@ -176,7 +176,15 @@ function blockNode(block) {
   const thinking = block.role === 'thinking';
   const article = element(thinking ? 'details' : 'article', `message ${block.role}${thinking ? ' thinking' : ''}`);
   if (block.role === 'system') article.setAttribute('role', 'status');
-  if (thinking) article.append(element('summary', '', 'Thinking'));
+  if (thinking) {
+    const summary = element('summary', '', 'Thinking');
+    article.append(summary);
+    article.onclick = event => {
+      if (event.target.closest('summary')) return;
+      article.open = !article.open;
+      summary.focus({ preventScroll: true });
+    };
+  }
   else {
     article.append(messageHeading(block.role, block.time));
   }
