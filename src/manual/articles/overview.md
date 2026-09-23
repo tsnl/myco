@@ -243,6 +243,23 @@ clear message naming both sizes instead of a provider 400. Remote hosts are
 spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
 which keeps every host in a session on the same limit.
 
+`max_request_bytes` on `[gateways.NAME]` caps the **entire serialized JSON
+request body**, including the system prompt, tool schemas, conversation history,
+and base64 image data from attachments and `view_image`. It defaults to
+**30,000,000 bytes (30 MB)** for every protocol and must be a positive integer.
+For example, put `max_request_bytes = 20_000_000` in a gateway table for a
+20 MB endpoint. A `[models.KEY]` value overrides its gateway's cap and also
+works for models configured without a gateway.
+
+The exact body size is checked before upload. A request over the cap fails
+locally without transient retries and follows the normal rejected-turn rewind;
+earlier completed turns remain active, and the predecessor thread preserves
+the rejected turn's observations. Errors name the actual and configured
+byte counts. Reduce attachments or compact the session before retrying, or
+raise the configured cap if the endpoint supports it. This cap does not resize
+images or replace `max_image_base64_bytes`: several individually acceptable
+images can still exceed the request cap as they accumulate in history.
+
 `max_truncated_resumes` (default 3, `0` to opt out) caps how many consecutive
 `max_tokens` stops one turn resumes through before handing control back.
 Truncation is not a dead end: a turn cut off mid-tool-call already ends on the

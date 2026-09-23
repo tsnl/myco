@@ -193,6 +193,62 @@ async fn invalid_input_fails_before_a_model_call_and_provider_errors_are_nonzero
 }
 
 #[tokio::test]
+async fn gateway_cap_rejects_accumulated_tool_images_before_upload_and_allows_resume() {
+    let provider = StubHttpServer::sequence(vec![
+        answer("Earlier answer.", 100),
+        tool("view_image", json!({"path":"first.png"})),
+        tool("view_image", json!({"path":"second.png"})),
+        answer("Recovered.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    std::fs::write(&env.config, format!(
+        "model = \"pipetest\"\n[gateways.test]\nprotocol = \"openai-responses\"\nbase_url = {:?}\nmax_request_bytes = 200_000\n[models.pipetest]\ngateway = \"test\"\ncontext_window = 100000\n",
+        provider.base_url(),
+    )).unwrap();
+    // Each image fits separately; retaining both exceeds the whole-request cap.
+    let mut image = vec![0; 90_000];
+    image[..4].copy_from_slice(b"\x89PNG");
+    for name in ["first.png", "second.png"] {
+        std::fs::write(env.dir.join(name), &image).unwrap();
+    }
+    let first = env.run(&["-p", "remember this"], b"").await;
+    assert_eq!(success(&first), "Earlier answer.\n");
+    let id = session_id(&first);
+    let rejected = env
+        .run(&["-p", "inspect the images", "--resume", &id], b"")
+        .await;
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("200000 bytes"),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        provider.connections(),
+        3,
+        "the oversized request must never reach the gateway"
+    );
+    let saved = env.saved(&id);
+    let active = serde_json::to_string(&saved.active_thread().messages).unwrap();
+    assert!(active.contains("Earlier answer."));
+    assert!(
+        !active.contains("inspect the images"),
+        "the rejected turn must rewind"
+    );
+    assert!(
+        serde_json::to_string(&saved.threads()[0])
+            .unwrap()
+            .contains("inspect the images"),
+        "the predecessor must preserve tool observations"
+    );
+    let resumed = env
+        .run(&["-p", "continue without images", "--resume", &id], b"")
+        .await;
+    assert_eq!(success(&resumed), "Recovered.\n");
+    assert_eq!(provider.connections(), 4);
+}
+
+#[tokio::test]
 async fn print_runs_tools_once_and_resumes_the_saved_session_by_prefix() {
     let provider = StubHttpServer::sequence(vec![
         tool(

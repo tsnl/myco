@@ -37,6 +37,7 @@ attach_timeout_secs = 10
 protocol = "openai-responses"
 base_url = "https://YOUR_GATEWAY/v1"
 auth = { source = "env", var_name = "MY_MODEL_API_KEY" }
+max_request_bytes = 30_000_000
 
 [models.coding]
 gateway = "provider"
@@ -62,6 +63,14 @@ selected model is used; unknown config fields are rejected during startup.
 Model fields override gateway fields. A model can inline `protocol`, `base_url`,
 and `auth` and omit `gateway`. A model's `auth` or retry table replaces the
 gateway's corresponding value rather than merging individual fields.
+
+`max_request_bytes` sets a gateway's maximum serialized JSON request body
+(default **30,000,000 bytes / 30 MB**; positive integers only). A model can
+override it, including when configured without a gateway. The limit counts
+the complete history, base64 images, system prompt, tool schemas, and JSON
+overhead. Oversized requests are rejected locally before upload and rewind
+the rejected turn. This is separate from the per-image limit below; images
+are never silently resized or removed to fit a request.
 
 ## Control long runs
 

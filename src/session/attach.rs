@@ -14,7 +14,7 @@
 //! (`max_image_base64_bytes`); the per-message budget below is myco's own and does
 //! not vary by model. Per-message budgets alone cannot keep a session under
 //! the request cap — images accumulate in history — so the drivers also
-//! preflight the composed request (`generative_model::MAX_REQUEST_BYTES`).
+//! preflight the composed request against the gateway's `max_request_bytes`.
 //! myco does not re-encode images; a file over the limit is rejected with the
 //! sizes named so the user can downscale it and resubmit.
 
@@ -24,8 +24,8 @@ use crate::core::image::{looks_like_image_path, mib, read_image_data_url};
 use crate::generative_model::Content;
 
 /// Limit on the combined upload payload of one message's attachments. Well
-/// under the request cap so a single message still leaves room for the
-/// conversation it is appended to.
+/// under the default request cap so a single message still leaves room for the
+/// conversation it is appended to. Gateways can set a smaller request cap.
 ///
 /// Deliberately not per-model: it bounds a *message*, not an image. A model
 /// configured above this still gets its full `max_image_base64_bytes` through

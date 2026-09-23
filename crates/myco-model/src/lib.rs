@@ -1138,15 +1138,41 @@ mod tests {
     /// top level can act on.
     #[test]
     fn oversized_request_is_refused_before_upload() {
-        assert!(check_request_size(MAX_REQUEST_BYTES, "Anthropic").is_ok());
+        for limit in [1024, MAX_REQUEST_BYTES, 60_000_000] {
+            assert!(check_request_size(limit, limit, "Anthropic").is_ok());
+            let err = check_request_size(limit + 1, limit, "Anthropic").unwrap_err();
+            assert!(
+                matches!(err, GenerateError::RequestTooLargeError(_)),
+                "{err:?}"
+            );
+            assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+            assert!(
+                err.to_string().contains(&format!("limit is {limit} bytes")),
+                "{err}"
+            );
+        }
+    }
 
-        let err = check_request_size(MAX_REQUEST_BYTES + 1, "Anthropic").unwrap_err();
-        assert!(
-            matches!(err, GenerateError::RequestTooLargeError(_)),
-            "{err:?}"
+    #[test]
+    fn older_backend_configs_default_to_a_thirty_megabyte_request_cap() {
+        let mut anthropic = serde_json::to_value(AnthropicBackendConfig::default()).unwrap();
+        let mut openai = serde_json::to_value(OpenAIBackendConfig::default()).unwrap();
+        for config in [&mut anthropic, &mut openai] {
+            assert_eq!(config["max_request_bytes"], 30_000_000);
+            config.as_object_mut().unwrap().remove("max_request_bytes");
+        }
+        assert_eq!(
+            serde_json::from_value::<AnthropicBackendConfig>(anthropic)
+                .unwrap()
+                .max_request_bytes,
+            30_000_000
         );
-        assert_eq!(err.recovery(), Recovery::OmitLastMessage);
-        assert!(err.to_string().contains("the limit is 30 MiB"), "{err}");
+        assert_eq!(
+            serde_json::from_value::<OpenAIBackendConfig>(openai)
+                .unwrap()
+                .max_request_bytes,
+            30_000_000
+        );
     }
 
     /// A provider that rejects the size itself lands on the same variant, so
@@ -1268,14 +1294,16 @@ pub enum Recovery {
     Stop,
 }
 
-/// Ceiling on one serialized API request body, checked before upload.
+/// Default ceiling on one serialized API request body: 30 MB (decimal).
 ///
-/// Providers cap the whole request (Anthropic: 32 MB), not just each image, and
-/// attachments accumulate in history — so a session that was fine for several
-/// turns can cross the cap and then fail on *every* subsequent turn. Checking
-/// locally, with headroom under the provider's number, turns a confusing 413
-/// after a multi-megabyte upload into an immediate [`Recovery::OmitLastMessage`].
-pub const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
+/// Each backend can override this with `max_request_bytes`. The check includes
+/// images accumulated in history and JSON overhead, and refuses oversized bodies
+/// before upload with [`Recovery::OmitLastMessage`].
+pub const MAX_REQUEST_BYTES: usize = 30_000_000;
+
+fn default_max_request_bytes() -> usize {
+    MAX_REQUEST_BYTES
+}
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {
@@ -1305,18 +1333,21 @@ impl GenerateError {
     }
 }
 
-/// Refuse a composed request body over [`MAX_REQUEST_BYTES`].
+/// Refuse a composed request body over the configured endpoint limit.
 ///
 /// Takes the already-serialized length so the checked size is exactly the size
 /// uploaded — no second serialization pass over a multi-megabyte body.
-pub(crate) fn check_request_size(len: usize, provider: &str) -> Result<(), GenerateError> {
-    if len > MAX_REQUEST_BYTES {
+pub(crate) fn check_request_size(
+    len: usize,
+    limit: usize,
+    provider: &str,
+) -> Result<(), GenerateError> {
+    if len > limit {
         return Err(GenerateError::RequestTooLargeError(format!(
-            "the {provider} request is {:.1} MiB; the limit is {} MiB. \
-             Attached images stay in the conversation and add up — drop the last \
-             message (or start a new session) to get back under it",
-            len as f64 / (1024.0 * 1024.0),
-            MAX_REQUEST_BYTES / (1024 * 1024),
+            "the {provider} request is {len} bytes; the configured limit is {limit} bytes \
+             (max_request_bytes). Images accumulate in the conversation; reduce \
+             attachments or compact the session before retrying. Raise the gateway's \
+             max_request_bytes only if it supports larger requests",
         )));
     }
     Ok(())

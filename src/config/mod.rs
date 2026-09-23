@@ -381,12 +381,19 @@ fn resolve_catalog(
             auto_compact_at_tokens,
         };
         let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let max_request_bytes = entry
+            .max_request_bytes
+            .or_else(|| gateway.and_then(|g| g.max_request_bytes))
+            .map_or(crate::generative_model::MAX_REQUEST_BYTES, |limit| {
+                limit.get()
+            });
         let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)));
         let backend = match protocol {
             Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
                 anthropic_base_url: base_url,
                 anthropic_auth_token: token,
                 max_tokens_per_generate: max_output,
+                max_request_bytes,
                 retry,
                 ..Default::default()
             }),
@@ -397,6 +404,7 @@ fn resolve_catalog(
                     base_url,
                     auth_token: token,
                     max_output_tokens: Some(max_output),
+                    max_request_bytes,
                     retry,
                     ..Default::default()
                 };
@@ -594,6 +602,81 @@ context_window = 200_000
         let err = cfg.models.get("kimi-k3").unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
         assert!(err.contains("kimi-k3"), "{err}");
+    }
+
+    #[test]
+    fn request_caps_inherit_per_gateway_allow_model_overrides_and_default_to_thirty_mb() {
+        for protocol in [
+            "anthropic-messages",
+            "openai-responses",
+            "openai-completions",
+        ] {
+            let cfg = resolve_toml(
+                format!(
+                    r#"
+model = "inherited"
+[gateways.small]
+protocol = "{protocol}"
+base_url = "http://localhost:8080"
+max_request_bytes = 12_000_000
+[gateways.large]
+protocol = "{protocol}"
+base_url = "http://localhost:8081"
+max_request_bytes = 60_000_000
+[models.inherited]
+gateway = "small"
+context_window = 1000
+[models.other]
+gateway = "large"
+context_window = 1000
+[models.overridden]
+gateway = "small"
+context_window = 1000
+max_request_bytes = 8_000_000
+[models.inline]
+protocol = "{protocol}"
+base_url = "http://localhost:8082"
+context_window = 1000
+max_request_bytes = 2_000_000
+[models.default]
+protocol = "{protocol}"
+base_url = "http://localhost:8083"
+context_window = 1000
+"#
+                ),
+                ConfigUserSettings::default(),
+                env_of(&[]),
+            )
+            .unwrap();
+            for (key, expected) in [
+                ("inherited", 12_000_000),
+                ("other", 60_000_000),
+                ("overridden", 8_000_000),
+                ("inline", 2_000_000),
+                ("default", 30_000_000),
+            ] {
+                let limit = match &cfg.models.get(key).unwrap().backend {
+                    BackendConfig::Anthropic(b) => b.max_request_bytes,
+                    BackendConfig::OpenAIResponses(b) | BackendConfig::OpenAICompletions(b) => {
+                        b.max_request_bytes
+                    }
+                };
+                assert_eq!(limit, expected, "{protocol}/{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_caps_must_be_positive_in_both_gateways_and_models() {
+        for table in ["gateways.g", "models.m"] {
+            for invalid in ["0", "-1", "1.5", "\"30000000\""] {
+                let config = format!(
+                    "[{table}]\nprotocol = \"openai-responses\"\nbase_url = \"http://localhost\"\nmax_request_bytes = {invalid}\n"
+                );
+                let error = parse_file_config_str(&config).unwrap_err();
+                assert!(error.contains("max_request_bytes"), "{error}");
+            }
+        }
     }
 
     /// `max_image_base64_bytes` is per model and defaults to the shared cap. The
