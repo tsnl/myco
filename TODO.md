@@ -19,6 +19,11 @@ additional surfaces outrank server trust + long-session viability.
   list/get any session (breaking vs old v1 files — WIP, no migration)
 - Browser session navigation, archive/restore, and metadata search. `session_meta`
   also searches stored first messages, scratchpads, and legacy console tails.
+- Profile URLs and switcher; each browser profile owns its config, sessions,
+  runtime, and workspace for local tools and served files.
+- Browser queued follow-ups at tool boundaries; Cancel delivers queued input.
+- Live generation/tool activity, token/context readouts, local timestamps,
+  Markdown tables and links, image attachments, and collapsible thinking traces.
 - Anthropic system-block prompt caching (`cache_control` on system text)
 - Per-session browser cancellation; synthetic cancelled tool results when tools already started
 - `dyn GenerativeModel`; harness routing with injected `host` field
@@ -82,10 +87,10 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
       Retry progress is visible and cancellable. Only pre-stream failures
       (connection, 408, 429, 5xx) retry; deterministic statuses and mid-stream
       failures still surface immediately.
-- [ ] **Token + cost tracking**
-  - Plumb provider `usage` (input/output; Anthropic cache read/write) into `AgentEvent`
-    and session totals.
-  - Turn footer / `/session` (or similar): tokens this turn, session cumulative, rough cost.
+- [x] **Current token/context tracking** — browser footer shows input/output/cache
+      usage and context consumption, including after reload.
+- [ ] **Cumulative usage and cost** — session totals and estimated cost; current
+      request usage is available, but model pricing is not configured.
 - [x] (REJECT) **Caching strategy beyond system block**
   - History breakpoints / strategic `cache_control` so the growing prefix is not fully uncached.
   - Surface cache hit metrics so prompts can be tuned.
@@ -140,8 +145,10 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 ### Control plane (default can stay open)
 
+- [ ] **Config reload** — refresh each profile's config without restarting the
+      server. Define how running sessions retain their model and tool settings.
 - [ ] **Browser activity sections** — add triggers and cron activity alongside
-      tool calls and background sessions in the collapsed right-hand drawer.
+      tool calls and background sessions in the Activity dialog.
       Keep each activity type in its own section, separated by short inset
       dividers; scheduled execution and its controls need a separate design.
 - [x] (REJECTED) **Permission modes** — e.g. ask / allowlist / autopilot; optional network/fs boundaries.
@@ -156,9 +163,12 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 ### Invocation surface
 
 - [x] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
-- [x] **User multimodal (images)** — `@path` mentions in the browser attach
-      png/jpg/jpeg/gif/webp as `Content::Image` (data URL, ≤5 MiB); OpenAI
-      Responses sends `input_image` parts. Non-image files: see **Rich attach**.
+- [ ] **Terminal styling follow-up (deferred)** — scrolling chat is available;
+      further visual parity with the browser was set aside to focus on the server.
+- [x] **User multimodal (images)** — browser picker, paste, drag/drop, and `@path`
+      references attach PNG/JPEG/GIF/WebP within the configured image and gateway
+      request limits. Profile sidecars preserve images across reload and resume.
+      Non-image files: see **Rich attach**.
 - [x] **Agent multimodal (images)** — `view_image` tool returns an image file as
       `Content::Image` on any host. Media type is sniffed from the magic number
       (`infer`), shared with `@path` attachments, so a mislabeled extension can't
@@ -184,22 +194,17 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 - [x] (REJECTED) **Todo / task-list tool** — durable checklist for long jobs (Claude TodoWrite-shaped).
   - Adds complexity. Can be achieved with a `TODO.md` file.
-- [x] **Subagents: multi-turn + background** — resolved by **dropping the
-      subagent toolset**: nested agents are `myco` itself driven over a bash
-      session (piped stdin/stdout; wrap/color auto-off; one prompt per line;
-      the `USER n/m` header marks each turn boundary). Bash sessions already
-      run in the background and support multi-turn `write`/`read`, so both
-      halves come free. Nesting is **local-only by doctrine** (brains — config,
-      keys, gateway network, session store — stay on the user's machine;
-      remotes stay hands); children pass `--parent-session <id>` so their
-      sessions are hidden and linked in the shared store.
-- [x] **Context forking** — `--parent-session <id> --fork` seeds the child with
-      the supervisor's saved conversation under a fresh hidden session id.
-      Sessions checkpoint mid-turn at replayable boundaries (after the user
-      message and each completed tool round), the current model key is stamped
-      into the system prompt (identity-free otherwise) so supervisors launch
-      same-model forks, and a same-model fork's first request re-reads the
-      supervisor's cached prompt prefix instead of rebuilding context.
+- [x] **Subagents: multi-turn + background** — create independent child sessions
+      through `$MYCO_SERVER_URL/api/sessions` with `parent_session`, then submit,
+      inspect, and cancel through the session API. Children share the profile's
+      config and workspace, own their runners and tools, and remain hidden from
+      normal and archived browsing. Remote hosts remain tool workers.
+- [x] **Context forking** — `fork: true` with `parent_session` copies the saved
+      conversation into a fresh hidden child session and stamps its own identity.
+      Checkpoints preserve replayable boundaries and the parent's observations.
+- [ ] **Dedicated subagent tool** — optional wrapper around the existing child
+      session API; creating, following, and cancelling children already works
+      through that API.
 - [ ] **Remote nesting / gateway proxy** — running a whole agent *on* a remote
       (vs local brain + remote hands) would need config, keys, and gateway
       network there. If it is ever really needed, the principled fix is

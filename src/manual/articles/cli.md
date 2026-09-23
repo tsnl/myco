@@ -1,7 +1,8 @@
 # Command line
 
-Run `myco` in your project directory and open its printed launch URL. The server
-owns sessions and tools; the browser supplies conversation controls. Use `-p`
+Run `myco` and open its printed launch URL. Each browser profile uses its own
+`workspace/` for local tools and served files. The server owns sessions and tools;
+the browser supplies conversation controls. Use `-p`
 for a one-shot prompt or `--mode cli` for scrolling terminal chat. Both run a
 local session runner without starting an HTTP server. The launcher also provides
 the internal SSH host worker. `myco-eval` remains a separate evaluation utility.
@@ -37,7 +38,8 @@ independent instance under `/profiles/NAME/`, sharing one loopback port. Launch
 overrides apply only to the selected profile; other instances use their own config.
 Local tools also receive `MYCO_SERVER_URL` for their instance's API. Child
 sessions created at that URL share its profile. Remote workers need no model
-credentials. CLI modes continue to run only the selected profile.
+credentials. CLI modes continue to run only the selected profile and inherit the
+directory where you launched the command.
 
 `.env` in the launch directory is loaded at startup. Configure at least one
 model before starting; the overview describes the catalog. Browser controls,
