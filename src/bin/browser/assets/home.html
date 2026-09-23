@@ -6,6 +6,7 @@
   <title>Sessions · myco</title>
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/sky.css">
+  <script src="/profiles.js" type="module"></script>
   <script src="/sky.js" type="module"></script>
   <script src="/home.js" type="module"></script>
 </head>
@@ -14,6 +15,7 @@
     <div class="toolbar-inner">
       <div class="toolbar-heading">
         <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
+        <select id="profile-switcher" aria-label="Profile"><option>__MYCO_PROFILE__</option></select>
         <h1 id="session-title">Sessions</h1>
       </div>
       <span id="connection" class="activity-indicator" role="status" data-state="attention">Connecting…</span>

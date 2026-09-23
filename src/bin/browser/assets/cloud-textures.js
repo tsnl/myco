@@ -1,4 +1,4 @@
-import { random } from '/sky-noise.js';
+import { random } from './sky-noise.js';
 
 //
 // Lightweight fallback
@@ -37,7 +37,7 @@ export class CloudTextures {
   start() {
     this.renderFallback();
     try {
-      this.worker = new Worker('/cloud-renderer.js', { type: 'module' });
+      this.worker = new Worker(new URL('./cloud-renderer.js', import.meta.url), { type: 'module' });
       this.worker.onmessage = ({ data }) => this.accept(data);
       this.worker.onerror = event => { event.preventDefault(); this.fail(); };
       const pause = () => this.worker?.postMessage({ paused: document.hidden });

@@ -62,7 +62,7 @@ semantic code search).
 
 ```bash
 myco                      # start HTTP on 127.0.0.1:8765
-myco --port 8766 --profile research
+myco --profile research  # open research first; all profiles share this port
 myco --resume SESSION_ID  # open a saved session from the launch URL
 myco -p "Review the changes in this repository"
 git diff | myco -p "Summarize this diff"
@@ -77,7 +77,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8766:127.0.0.1:8765 user@remote-
 ```
 
 Open the remote launch URL with its address changed to `http://127.0.0.1:8766`,
-keeping the session path if resuming. SSH provides authentication and encryption
+keeping the profile and session path. SSH provides authentication and encryption
 between the computers; Myco needs no browser login, token, or cookie.
 Myco does not serve HTTPS or accept non-loopback bind addresses.
 
@@ -87,6 +87,13 @@ Refreshing or closing a tab keeps its current turn running. Ctrl-C in the
 launching terminal stops the server and its sessions. See the
 [browser manual](src/manual/articles/browser.md), also `myco --help browser`,
 for controls, workspace files, and the HTTP API.
+
+Each profile has its own URL, such as `/profiles/default/` or
+`/profiles/research/`, with separate config, sessions, images, and tool runtimes.
+The profile selector switches between existing profiles; `/profiles/` lists them.
+Instances start when opened and share the server's launch directory for tools
+and served files. `--profile` chooses the initial profile, and launch overrides
+such as `--config` and `--model` apply only to that profile.
 
 For scripts, `myco -p "prompt"` streams answer text to stdout, with diagnostics
 and the saved session ID on stderr. Bare `-p` reads the prompt from stdin;

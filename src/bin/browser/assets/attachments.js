@@ -1,4 +1,4 @@
-import { $, element, error, requestId } from '/common.js';
+import { $, element, error, requestId } from './common.js';
 
 const supported = file => /^image\/(png|jpeg|gif|webp)$/.test(file.type) || /\.(png|jpe?g|gif|webp)$/i.test(file.name);
 const encodedSize = file => Math.ceil(file.size / 3) * 4;

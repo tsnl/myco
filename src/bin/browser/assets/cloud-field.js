@@ -1,4 +1,4 @@
-import { random, noise, turbulence } from '/sky-noise.js';
+import { random, noise, turbulence } from './sky-noise.js';
 
 //
 // Cirrus, broken banks, and veils

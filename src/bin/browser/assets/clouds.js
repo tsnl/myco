@@ -1,5 +1,5 @@
-import { random } from '/sky-noise.js';
-import { CloudTextures } from '/cloud-textures.js';
+import { random } from './sky-noise.js';
+import { CloudTextures } from './cloud-textures.js';
 
 const LAYERS = [
   { name: 'high', altitude: '8+', count: 8, top: 9, spread: 25, width: 850, height: 220, resolution: 192, duration: 6800 },

@@ -1,5 +1,5 @@
 // Counts follow the runner's saved usage: latest input/cache, output across a run.
-import { $ } from '/common.js';
+import { $ } from './common.js';
 
 const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
 const exact = new Intl.NumberFormat();

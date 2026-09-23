@@ -1,5 +1,5 @@
-import { random } from '/sky-noise.js';
-import { rainfall } from '/sky-weather.js';
+import { random } from './sky-noise.js';
+import { rainfall } from './sky-weather.js';
 
 //
 // Rain textures and wind

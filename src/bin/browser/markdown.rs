@@ -3,6 +3,9 @@ use pulldown_cmark::{Alignment, CowStr, Event, Options, Parser, Tag, TagEnd, htm
 
 pub(super) fn image_url(source: &str, files: &Files) -> String {
     if source.starts_with("/api/image?") {
+        return files.route(source);
+    }
+    if source.starts_with(&files.route("/api/image?")) {
         return source.into();
     }
     if source.starts_with("https://")
@@ -30,12 +33,15 @@ pub(super) fn image_url(source: &str, files: &Files) -> String {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("source", source)
         .finish();
-    format!("/api/image?{query}")
+    files.route(&format!("/api/image?{query}"))
 }
 
 fn link_url(link: &str, files: &Files) -> String {
-    if link.starts_with('#') || link.starts_with("/sessions/") || link.starts_with("/api/") {
+    if link.starts_with('#') || link.starts_with("/profiles/") {
         return link.into();
+    }
+    if link.starts_with("/sessions/") || link.starts_with("/api/") {
+        return files.route(link);
     }
     match url::Url::parse(link) {
         Ok(url) if matches!(url.scheme(), "http" | "https" | "mailto") => link.into(),
@@ -146,6 +152,41 @@ impl Tables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_links_and_images_preserve_their_profile_prefix() {
+        let files = Files::open(&std::env::current_dir().unwrap())
+            .unwrap()
+            .with_base_path("/profiles/research".into());
+        for source in [
+            "./plot.png",
+            "/files/plot.png",
+            "/profiles/research/files/plot.png",
+        ] {
+            assert_eq!(
+                image_url(source, &files),
+                "/profiles/research/files/plot.png"
+            );
+        }
+        let stored = image_url("myco-image:sha256:123", &files);
+        assert_eq!(
+            stored,
+            "/profiles/research/api/image?source=myco-image%3Asha256%3A123"
+        );
+        assert_eq!(image_url(&stored, &files), stored);
+        assert_eq!(
+            image_url("/api/image?source=123", &files),
+            "/profiles/research/api/image?source=123"
+        );
+        let html = render(
+            "[session](/sessions/123) [api](/api/models) [file](/files/notes.txt) [other](/profiles/work/)",
+            &files,
+        );
+        for target in ["sessions/123", "api/models", "files/notes.txt"] {
+            assert!(html.contains(&format!("href=\"/profiles/research/{target}\"")));
+        }
+        assert!(html.contains("href=\"/profiles/work/\""));
+    }
 
     #[test]
     fn markdown_renders_tables_tasks_and_local_images_without_active_html() {

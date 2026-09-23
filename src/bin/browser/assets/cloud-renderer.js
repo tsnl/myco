@@ -1,4 +1,4 @@
-import { density, paint } from '/cloud-field.js';
+import { density, paint } from './cloud-field.js';
 
 // The scene sends a fixed, bounded set of specs. Cache their density in this
 // worker; only lighting changes repaint them, and CSS handles all motion.

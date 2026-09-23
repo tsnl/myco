@@ -66,8 +66,16 @@ only on the local worker. Model credentials stay with the application process.
 | Host tools | `src/tool_services/` |
 
 The browser server accepts HTTP only on loopback; remote access uses SSH port
-forwarding. `auth.rs` applies one credential and a loopback origin policy
-to UI assets, event streams, images, files, and actions. `files.rs` holds a
+forwarding. `profiles.rs` discovers profiles and routes `/profiles/NAME/` to
+lazy worker processes managed by `profile_worker.rs`. Each worker inherits its
+profile environment once and owns its config, stores, sessions, and tools.
+Private Unix sockets keep all public traffic on one port. The supervisor merges
+profile events into one browser stream; the SharedWorker scopes subscriptions by
+profile and session ID. A profile crash can be recovered without restarting its
+neighbors. Parent shutdown closes worker stdin pipes and stops their sessions.
+
+`origin.rs` applies loopback Host and browser-origin checks to UI assets, event
+streams, images, files, and actions. `files.rs` holds a
 directory capability for read-only workspace access and streams regular files.
 Markdown rendering maps local links to those routes on the server. Workspace
 documents have a stricter content policy than the application: their scripts

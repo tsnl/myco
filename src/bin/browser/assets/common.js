@@ -1,3 +1,5 @@
+import { profilePath } from './scope.js';
+
 export const $ = (id) => document.getElementById(id);
 
 // Request ids deduplicate retries, so they must be unique, not unguessable.
@@ -16,11 +18,11 @@ export function element(tag, className, text) {
 }
 export function error(message = '') { $('error').textContent = message; $('error').hidden = !message; }
 export async function api(path, body) {
-  const response = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const response = await fetch(profilePath(path), body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(await response.text());
   return response;
 }
 
 export function newSession() {
-  window.open('/new', '_blank', 'noopener');
+  window.open(profilePath('/new'), '_blank', 'noopener');
 }
