@@ -161,6 +161,7 @@ function blockNode(block) {
   }
   const thinking = block.role === 'thinking';
   const article = element(thinking ? 'details' : 'article', `message ${block.role}${thinking ? ' thinking' : ''}`);
+  if (block.role === 'system') article.setAttribute('role', 'status');
   if (thinking) article.append(element('summary', '', 'Thinking'));
   else {
     article.append(messageHeading(block.role, block.time));

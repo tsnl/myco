@@ -174,6 +174,11 @@ refresh every second without consuming tool output, and disappear when the task
 ends. Background summaries cover the local host; active calls
 include remote tools too.
 
+Manual and automatic compaction updates appear in their own timestamped
+**SYSTEM** message sections with neutral styling. These live status messages
+remain visible during compaction, including after refreshing the page.
+Warnings and failures retain their error styling.
+
 Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, and images. Text uses one font size;
 headings use weight and underlines. Tables size to their contents, wrap long

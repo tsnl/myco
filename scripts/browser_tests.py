@@ -128,6 +128,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
+            if compact is not None:
+                fixture.compaction_release.wait(30)
             if "generate" in prompt:
                 fixture.generation_releases[name].wait(30)
             for event in events:
@@ -169,6 +171,9 @@ class BrowserTests(unittest.TestCase):
         self.addCleanup(provider.shutdown)
         self.generation_releases = {name: threading.Event() for name in ['Alpha', 'Beta']}
         self.addCleanup(lambda: [gate.set() for gate in self.generation_releases.values()])
+        self.compaction_release = threading.Event()
+        self.compaction_release.set()
+        self.addCleanup(self.compaction_release.set)
         threading.Thread(target=provider.serve_forever, daemon=True).start()
         (self.home / "config.toml").write_text('model = "first"\n' + "".join(f'''
 [models.{name}]
@@ -311,6 +316,40 @@ context_window = 100000
         expect(page.locator('#context-usage')).to_have_text('Context 0 / 200K · 0%')
         expect(page.locator('#input-tokens')).to_have_text('Input 0')
         expect(page.locator('#output-tokens')).to_have_text('Output 0')
+
+    def test_manual_and_automatic_compaction_have_a_system_banner_after_refresh(self):
+        for automatic in [False, True]:
+            with self.subTest(automatic=automatic):
+                if automatic:
+                    self.stop(self.process)
+                    config = self.home / 'config.toml'
+                    config.write_text(config.read_text().replace('context_window = 100000',
+                                      'context_window = 100000\nauto_compact_at = 0.8'))
+                    self.process, _ = self.launch(port=urlsplit(self.origin).port)
+                self.compaction_release.clear()
+                self.usage = {'input_tokens': 80000, 'output_tokens': 20}
+                page = self.session(self.page)
+                self.submit(page, 'Alpha images')
+                if not automatic:
+                    expect(page.locator('#model')).to_be_enabled()
+                    page.click('#compact')
+                label = 'Compacting automatically…' if automatic else 'Compacting…'
+                banner = page.get_by_role('status').filter(has_text=label)
+                expect(banner.locator('.role')).to_have_text('SYSTEM')
+                expect(banner.locator('.body')).to_have_text(label)
+                expect(banner.locator('time')).to_have_attribute('datetime', re.compile(r'^\d{4}-'))
+                self.assertEqual(page.locator('.notice').filter(has_text=label).count(), 0)
+                page.reload()
+                expect(banner.locator('.role')).to_have_text('SYSTEM')
+                expect(banner.locator('.body')).to_have_text(label)
+                if automatic:
+                    page.set_viewport_size({'width': 390, 'height': 844})
+                banner.scroll_into_view_if_needed()
+                page.screenshot(path=str(self.artifacts / ('automatic-mobile.png' if automatic else 'manual-desktop.png')))
+                self.usage = {'input_tokens': 512, 'output_tokens': 6}
+                self.compaction_release.set()
+                expect(page.locator('#model')).to_be_enabled()
+                expect(page.locator('.system')).to_have_count(0)
 
     def test_compaction_clears_context_measurement_until_the_next_model_request(self):
         page = self.session(self.page)

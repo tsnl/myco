@@ -73,6 +73,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .message-header { padding-top: 16px; margin-bottom: 14px; border-top: 1px solid var(--line); }
 .role { display: block; color: var(--green); font-weight: 700; }
 .user .role { color: var(--cyan); }
+.system .role { color: var(--dim); }
 .timestamp { display: block; color: var(--dim); }
 .timestamp-age { white-space: nowrap; }
 .user .body { white-space: pre-wrap; }
