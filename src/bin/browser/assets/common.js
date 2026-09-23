@@ -23,6 +23,10 @@ export async function api(path, body) {
   return response;
 }
 
+export function setArchived(id, archived) {
+  return api(`/api/sessions/${encodeURIComponent(id)}/archive`, { session_id: id, archived });
+}
+
 export function newSession() {
   window.open(profilePath('/new'), '_blank', 'noopener');
 }
