@@ -1,4 +1,4 @@
-import { $, api, element, error, newSession, requestId } from './common.js';
+import { $, api, element, error, newSession, requestId, setArchived } from './common.js';
 import { showActivity } from './activity.js';
 import { imageAttachments } from './attachments.js';
 import { linkify, setLinkedText } from './links.js';
@@ -14,6 +14,7 @@ let follow = true;
 let pending = null;
 let selectingModel = false;
 let sending = false;
+let archiving = false;
 let eventPort = null;
 const sessionId = decodeURIComponent(location.pathname.slice(profilePath('/sessions/').length));
 const nodes = [];
@@ -52,6 +53,9 @@ window.addEventListener('scroll', () => {
   $('jump').hidden = follow;
 }, { passive: true });
 $('jump').onclick = () => { follow = true; scrollLatest(); };
+new ResizeObserver(() => {
+  document.documentElement.style.setProperty('--toolbar-height', `${document.querySelector('.toolbar').offsetHeight}px`);
+}).observe(document.querySelector('.toolbar'));
 new ResizeObserver(() => {
   document.documentElement.style.setProperty('--composer-height', `${$('composer').offsetHeight}px`);
   scrollLatest();
@@ -281,6 +285,7 @@ function metadata() {
     }));
   }
   $('compact').disabled = disabled || !state.blocks.length;
+  $('archive').disabled = !connected || !state.session_id || archiving;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';
   transcript.setAttribute('aria-busy', String(!!state.busy));
@@ -382,6 +387,15 @@ $('composer').onsubmit = async (event) => {
 };
 $('prompt').onkeydown = (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing) { event.preventDefault(); $('composer').requestSubmit(); } };
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
+$('archive').onclick = async () => {
+  if (archiving || !state.session_id) return;
+  archiving = true; metadata(); error();
+  try {
+    await setArchived(state.session_id, true);
+    location.assign(profilePath(`/?archived=${encodeURIComponent(state.session_id)}`));
+  } catch (e) { error(e.message); }
+  finally { archiving = false; metadata(); }
+};
 $('cancel').onclick = () => api(`/api/sessions/${encodeURIComponent(state.session_id)}/cancel`, { session_id: state.session_id }).catch((e) => error(e.message));
 $('model').onchange = async () => {
   const key = $('model').value;

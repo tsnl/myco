@@ -147,8 +147,11 @@ bookmarks, middle-click, and browser tab groups. Click the myco name to return
 home. `--resume <id>` opens that session
 directly from the launch URL.
 
-Click **Archive** beside a session to hide it from the active list. Choose
-**Archived sessions** above the list to find archived sessions and **Restore**
+Click **Archive** in the session toolbar to return to that profile's session
+browser. The browser shows **Session Archived.** with an **Undo** button that
+restores the session to the active list. Undo remains available after a refresh.
+Archiving from a row in the session browser shows the same confirmation.
+Choose **Archived sessions** above the list to find archived sessions and **Restore**
 them. Archiving preserves history, the session URL, and running tools; an open
 tab can continue its turn. It does not archive child sessions. A session held
 by another myco process must be archived from that process or after it closes.

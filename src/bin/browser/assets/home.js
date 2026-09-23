@@ -1,4 +1,4 @@
-import { $, api, element, error } from './common.js';
+import { $, api, element, error, setArchived } from './common.js';
 import { showActivity } from './activity.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 
@@ -11,6 +11,28 @@ let connected = false;
 let streamConnected = false;
 let eventPort = null;
 const rows = new Map();
+let archivedSession = null;
+
+function archiveNotice(id) {
+  archivedSession = id;
+  const url = new URL(location.href); url.searchParams.delete('archived');
+  // Keep Undo in this history entry so a refresh cannot lose it or repeat the archive.
+  history.replaceState({ ...history.state, archivedSession: id }, '', url);
+  $('archive-notice').hidden = !id;
+}
+$('undo-archive').onclick = async () => {
+  const id = archivedSession;
+  if (!id) return;
+  $('undo-archive').disabled = true; error();
+  try {
+    await setArchived(id, false);
+    if (archivedSession === id) archiveNotice(null);
+    $('archive-filter').value = 'active'; $('search').value = '';
+    await refresh();
+    rows.get(id)?.querySelector('a').focus();
+  } catch (e) { error(e.message); }
+  finally { $('undo-archive').disabled = false; }
+};
 
 function render() {
   showActivity($('connection'), 'Live', false, connected);
@@ -29,7 +51,10 @@ function render() {
       archive.onclick = async () => {
         archive.disabled = true;
         try {
-          await api(`/api/sessions/${encodeURIComponent(session.id)}/archive`, { session_id: session.id, archived: !row.session.archived });
+          const archived = !row.session.archived;
+          await setArchived(session.id, archived);
+          if (archived) archiveNotice(session.id);
+          else if (archivedSession === session.id) archiveNotice(null);
           if (refreshing) await refreshing;
           await refresh();
         } catch (e) { error(e.message); }
@@ -92,6 +117,8 @@ function connect() {
 }
 $('search').oninput = render;
 $('archive-filter').onchange = refresh;
+const archived = new URLSearchParams(location.search).get('archived') || history.state?.archivedSession;
+if (/^[a-f0-9]{32}$/.test(archived || '')) archiveNotice(archived);
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
 window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); refresh(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
