@@ -25,6 +25,9 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 title: "Test".into(),
                 model: "test".into(),
                 models: vec!["test".into(), "second".into()],
+                attachment_limits: attachments::Limits::new(
+                    myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+                ),
                 busy: false,
                 status: "Ready".into(),
                 tasks: vec![],
@@ -99,6 +102,7 @@ fn action_request() -> ActionRequest {
         session_id: "session".into(),
         action: Action::Submit {
             text: "task".into(),
+            images: vec![],
         },
     }
 }
@@ -111,10 +115,12 @@ fn queued_messages_run_in_order_once_and_preserve_acceptance_time() {
     let mut second = action_request();
     second.action = Action::Submit {
         text: "second".into(),
+        images: vec![],
     };
     let mut third = action_request();
     third.action = Action::Submit {
         text: "third".into(),
+        images: vec![],
     };
     for request in [&second, &third, &second] {
         app.accept(request.clone()).unwrap();

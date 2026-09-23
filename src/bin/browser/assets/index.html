@@ -43,7 +43,9 @@
   </dialog>
   <form id="composer" class="composer">
     <section id="queued" hidden aria-label="Queued messages"><span id="queued-count" role="status"></span><ol id="queued-list"></ol></section>
-    <div class="composer-heading"><label for="prompt">USER</label><select id="model" aria-label="Model" disabled></select></div>
+    <div class="composer-heading"><label for="prompt">USER</label><div class="composer-options"><button id="attach" type="button" title="Attach images, or paste an image into your message" aria-label="Attach images"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 13 7-7a3 3 0 0 1 4 4L9 20a5 5 0 0 1-7-7L13 2a7 7 0 0 1 10 10L12 23" transform="translate(1 -1) scale(.9)"/></svg><span>Attach</span></button><select id="model" aria-label="Model" disabled></select></div></div>
+    <input id="attachment-picker" type="file" accept="image/png,image/jpeg,image/gif,image/webp,.png,.jpg,.jpeg,.gif,.webp" multiple hidden>
+    <section id="attachments" aria-label="Image attachments" hidden><div id="attachment-count" role="status"></div><ul id="attachment-list"></ul></section>
     <textarea id="prompt" rows="2" autofocus placeholder="What are we working on?" aria-describedby="input-hint" spellcheck="false"></textarea>
     <div class="composer-footer"><span id="input-hint">Enter to send · Shift+Enter for a new line</span><button id="cancel" type="button" hidden>Cancel run</button><button id="send" type="submit" disabled>Send ↵</button></div>
     <div id="error" role="alert" hidden></div>

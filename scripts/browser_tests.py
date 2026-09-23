@@ -1,6 +1,7 @@
 """Exercise the embedded UI in Chromium with real tools and a local scripted model."""
 
 import argparse
+import base64
 import http.server
 import json
 import os
@@ -52,10 +53,10 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = item["content"]
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images)\b", content)
             if match:
                 prompts.append(match.group(0))
-        prompt = prompts[-1]
+        prompt = prompts[-1] if prompts else 'Alpha images'
         count = fixture.turns.get(prompt, 0)
         fixture.turns[prompt] = count + 1
         name = "Alpha" if "Alpha" in prompt else "Beta"
@@ -153,7 +154,6 @@ base_url = "http://127.0.0.1:{provider.server_port}"
 auth = {{ source = "none" }}
 context_window = 100000
 ''' for name in ["first", "second"]))
-        import base64
         (self.home / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6cGkAAAAASUVORK5CYII="))
         self.process, launch = self.launch()
@@ -217,6 +217,199 @@ context_window = 100000
         page.fill("#prompt", text)
         page.press("#prompt", "Enter")
         expect(page.locator(".user").last).to_contain_text(text)
+
+    def image_urls(self, request):
+        return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
+                for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
+
+    def choose_image(self, page, name='local image.png', buffer=None):
+        page.set_input_files('#attachment-picker', {'name': name, 'mimeType': 'image/png',
+            'buffer': buffer if buffer is not None else (self.home / 'pixel.png').read_bytes()})
+        expect(page.locator('#attachment-list img').last).to_have_js_property('naturalWidth', 1)
+
+    def test_attached_images_can_be_removed_and_survive_reload_restart_and_resume(self):
+        page = self.session(self.page)
+        with page.expect_file_chooser() as chooser:
+            page.click('#attach')
+        chooser.value.set_files(self.home / 'pixel.png')
+        self.choose_image(page)
+        expect(page.locator('#attachment-list img')).to_have_count(2)
+        page.get_by_role('button', name='Remove pixel.png', exact=True).click()
+        expect(page.locator('#attachment-list img')).to_have_count(1)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#attachments')).to_be_hidden()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        images = self.image_urls(self.requests[-1])
+        self.assertEqual(len(images), 1)
+        self.assertEqual(base64.b64decode(images[0].split(',')[1]), (self.home / 'pixel.png').read_bytes())
+        session_id = page.url.rsplit('/', 1)[1]
+        saved = self.home / f'profiles/default/session/{session_id[:2]}/{session_id}.json'
+        self.assertIn('myco-image:sha256:', saved.read_text())
+        self.assertNotIn('data:image/', saved.read_text())
+        page.reload()
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        expect(page.locator('#model')).to_be_enabled(timeout=15000)
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        self.submit(page, 'Beta images')
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(self.image_urls(self.requests[-1]), images)
+
+    def test_native_clipboard_paste_sends_an_image_only_message_and_keeps_text_paste(self):
+        page = self.session(self.page)
+        self.context.grant_permissions(['clipboard-read', 'clipboard-write'])
+        page.evaluate("""async () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 1;
+            canvas.getContext('2d').fillRect(0, 0, 1, 1);
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+            await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+        }""")
+        page.focus('#prompt')
+        page.keyboard.press('Control+V')
+        expect(page.locator('#attachment-list img')).to_have_js_property('naturalWidth', 1)
+        expect(page.locator('#prompt')).to_have_value('')
+        page.click('#send')
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(self.image_urls(self.requests[-1])), 1)
+        for item in self.requests[-1]['input']:
+            if item.get('role') == 'user':
+                self.assertTrue(all(part.get('text', 'image').strip() for part in item['content']))
+        page.evaluate("navigator.clipboard.writeText('plain pasted text')")
+        page.focus('#prompt')
+        page.keyboard.press('Control+V')
+        expect(page.locator('#prompt')).to_have_value('plain pasted text')
+        expect(page.locator('#attachments')).to_be_hidden()
+
+    def test_dropped_images_queue_with_tool_results_and_survive_a_tab_reload(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        pixel = base64.b64encode((self.home / 'pixel.png').read_bytes()).decode()
+        transfer = page.evaluate_handle("""data => {
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([Uint8Array.from(atob(data), c => c.charCodeAt(0))], 'dropped.png', {type: 'image/png'}));
+            return transfer;
+        }""", pixel)
+        page.dispatch_event('#composer', 'drop', {'dataTransfer': transfer})
+        expect(page.locator('#attachment-list img')).to_have_js_property('naturalWidth', 1)
+        page.fill('#prompt', 'Beta images')
+        page.click('#send')
+        expect(page.locator('#queued-list img')).to_have_js_property('naturalWidth', 1)
+        expect(page.locator('#attachments')).to_be_hidden()
+        page.reload()
+        expect(page.locator('#queued-list img')).to_have_js_property('naturalWidth', 1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        expect(page.locator('#queued')).to_be_hidden()
+        request = self.requests[-1]['input']
+        result = next(i for i, item in enumerate(request) if item.get('type') == 'function_call_output')
+        image = next(i for i, item in enumerate(request) if 'input_image' in json.dumps(item))
+        self.assertGreater(image, result)
+
+    def test_cancel_sends_queued_image_only_messages(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        self.choose_image(page)
+        page.click('#send')
+        expect(page.locator('#queued-list img')).to_have_js_property('naturalWidth', 1)
+        page.click('#cancel')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#queued')).to_be_hidden()
+        expect(page.locator('.user img')).to_have_js_property('naturalWidth', 1)
+        self.assertEqual(len(self.image_urls(self.requests[-1])), 1)
+        self.assertIn('cancel', json.dumps(self.requests[-1]['input']).lower())
+
+    def test_lost_image_submission_response_preserves_draft_and_deduplicates_retry(self):
+        page = self.session(self.page)
+        attempts = []
+        def lose_once(route):
+            attempts.append(route.request.post_data_json['request_id'])
+            response = route.fetch()
+            if len(attempts) == 1:
+                route.abort()
+            else:
+                route.fulfill(response=response)
+        page.route('**/api/sessions/*/action', lose_once)
+        self.choose_image(page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#error')).to_contain_text('Your draft is still here')
+        expect(page.locator('#prompt')).to_have_value('Alpha images')
+        expect(page.locator('#attachment-list img')).to_have_count(1)
+        expect(page.locator('#model')).to_be_enabled()
+        page.click('#send')
+        expect(page.locator('#attachments')).to_be_hidden()
+        expect(page.locator('#prompt')).to_have_value('')
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(len(self.requests), 1)
+        expect(page.locator('.user')).to_have_count(1)
+
+    def test_image_actions_accept_payloads_larger_than_other_json_routes(self):
+        page = self.session(self.page)
+        image = (self.home / 'pixel.png').read_bytes() + bytes(1600 * 1024)
+        self.choose_image(page, buffer=image)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#attachments')).to_be_hidden()
+        self.assertEqual(base64.b64decode(self.image_urls(self.requests[-1])[0].split(',')[1]), image)
+        response = self.context.request.post(self.origin + '/api/markdown', data={'text': 'x' * (2 * 1024 * 1024)})
+        self.assertEqual(response.status, 413)
+
+    def test_invalid_image_actions_keep_the_session_idle(self):
+        page = self.session(self.page)
+        session_id = page.url.rsplit('/', 1)[1]
+        pixel = 'data:image/png;base64,' + base64.b64encode((self.home / 'pixel.png').read_bytes()).decode()
+        for images in [['data:image/png;base64,!'], ['data:image/png;base64,dGV4dA=='], [pixel] * 21, ['file:///tmp/pixel.png']]:
+            response = self.context.request.post(page.url.replace('/sessions/', '/api/sessions/') + '/action',
+                data={'request_id': str(uuid.uuid4()), 'session_id': session_id,
+                      'action': {'kind': 'submit', 'text': 'Alpha images', 'images': images}})
+            self.assertEqual(response.status, 400, response.text())
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.context.request.get(self.origin + '/api/sessions/' + session_id).json()['change']['snapshot']['busy'])
+
+    def test_model_image_limit_is_rechecked_without_losing_the_draft(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text().replace('[models.second]', '[models.second]\nmax_image_base64_bytes = 1048576'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page = self.session(self.page)
+        self.choose_image(page, buffer=(self.home / 'pixel.png').read_bytes() + bytes(1600 * 1024))
+        page.fill('#prompt', 'Alpha images')
+        page.select_option('#model', 'second')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#model')).to_have_value('second')
+        page.click('#send')
+        expect(page.locator('#error')).to_contain_text("the model's limit is 1.0 MiB")
+        expect(page.locator('#prompt')).to_have_value('Alpha images')
+        expect(page.locator('#attachment-list img')).to_have_count(1)
+        self.assertEqual(self.requests, [])
+        page.select_option('#model', 'first')
+        expect(page.locator('#model')).to_be_enabled()
+        page.click('#send')
+        expect(page.locator('#attachments')).to_be_hidden()
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(self.image_urls(self.requests[-1])), 1)
+
+    def test_uploaded_and_server_path_images_share_the_message_budget(self):
+        page = self.session(self.page)
+        paths = [self.home / f'large-{index}.png' for index in range(4)]
+        pixel = (self.home / 'pixel.png').read_bytes()
+        for path in paths:
+            path.write_bytes(pixel + bytes(3 * 1024 * 1024 + 700 * 1024))
+        image = 'data:image/png;base64,' + base64.b64encode(pixel + bytes(512 * 1024)).decode()
+        response = self.context.request.post(page.url.replace('/sessions/', '/api/sessions/') + '/action',
+            data={'request_id': str(uuid.uuid4()), 'session_id': page.url.rsplit('/', 1)[1],
+                  'action': {'kind': 'submit', 'text': ' '.join(f'@{path}' for path in paths), 'images': [image]}})
+        self.assertEqual(response.status, 400, response.text())
+        self.assertIn('per-message limit of 20.0 MiB', response.text())
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(self.requests, [])
 
     def browser_status(self, browser, session):
         path = urlsplit(session.url).path
