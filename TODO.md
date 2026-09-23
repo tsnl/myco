@@ -75,10 +75,12 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
       successor thread in the same session with the summary + a well-formed recent
       tail. The Cancel button stops it.
 - [x] **Auto-compact** when approaching the context limit — per-model
-      `auto_compact_at` fraction of `context_window`, checked after each turn against
-      the provider's reported prompt size. Runs the same worker as `/compact` and
-      switches the runner to the successor thread. Unset = off; a failed automatic run
-      disables itself for the session rather than repeating every turn.
+      `auto_compact_at` fraction of `context_window`, checked at settled model/tool
+      boundaries against the provider's reported prompt size. Runs the same worker
+      as `/compact`, switches to the successor thread, and automatically continues
+      the task. Manual compaction waits for the next user message. Unset = off;
+      failed or ineffective automatic compaction stays disabled until manual
+      compaction or a session change.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`

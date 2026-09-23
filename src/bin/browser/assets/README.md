@@ -38,5 +38,5 @@ interpretation is shared below the settings and rendering modules; worker code
 has no DOM or networking dependencies.
 
 Add embedded assets to `../assets.rs`; the HTTP composition applies the same
-authentication and response policy to every entry. All imports stay on this
+origin checks and response policy to every entry. All imports stay on this
 server, and the browser tests use mocked weather rather than external services.
