@@ -650,18 +650,19 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
 }
 
 #[test]
-fn compaction_updates_one_card_and_separates_tool_first_continuation_from_prior_output() {
+fn compaction_reports_activity_and_separates_tool_first_continuation_without_a_message() {
     let (app, _) = app();
     app.delta("assistant", "Prior answer".into());
-    app.compacting(true);
+    app.compacting();
     let pending = app.snapshot().change["snapshot"].clone();
     assert_eq!(pending["status"], "Compacting");
-    assert_eq!(pending["blocks"][1]["running"], true);
-    app.finish_compaction(None);
+    assert_eq!(pending["blocks"].as_array().unwrap().len(), 1);
+    app.finish_compaction();
     let completed = app.snapshot().change["snapshot"].clone();
     assert_eq!(completed["status"], "Running");
     assert_eq!(completed["blocks"].as_array().unwrap().len(), 2);
-    assert_eq!(completed["blocks"][1]["running"], false);
+    assert_eq!(completed["blocks"][1]["kind"], "boundary");
+    assert!(completed["blocks"][1]["text"].is_null());
     app.emit(AgentEvent::ToolStarted {
         tool_use: ToolUse {
             name: "bash".into(),
@@ -675,14 +676,14 @@ fn compaction_updates_one_card_and_separates_tool_first_continuation_from_prior_
     assert_eq!(blocks[2]["time"], blocks[1]["time"]);
     assert_eq!(blocks[3]["kind"], "tool");
     app.live.lock().unwrap().snapshot.status = "Cancelling".into();
-    app.finish_compaction(None);
+    app.finish_compaction();
     assert_eq!(app.snapshot().change["snapshot"]["status"], "Cancelling");
 }
 
 #[test]
 fn failed_compaction_replaces_progress_with_the_warning_and_restores_running_status() {
     let (app, _) = app();
-    app.compacting(true);
+    app.compacting();
     app.warning("Summary failed; continuing with the existing context".into());
     let snapshot = app.snapshot().change["snapshot"].clone();
     assert_eq!(snapshot["status"], "Running");
@@ -716,8 +717,7 @@ fn completed_compaction_boundary_follows_retained_context_and_precedes_new_outpu
         }],
     };
     let mut session = Session::new("test");
-    // An older automatic continuation may itself be retained by a later manual
-    // compaction; only the marker at the current boundary determines its mode.
+    // Retained internal continuation instructions must stay hidden too.
     session.replace_context(
         vec![
             user,
@@ -735,9 +735,7 @@ fn completed_compaction_boundary_follows_retained_context_and_precedes_new_outpu
         thread.messages.push(assistant("new output"));
         let blocks = serde_json::to_value(view::history(&thread)).unwrap();
         assert_eq!(blocks[2]["text"], "recent output");
-        assert_eq!(blocks[3]["kind"], "compaction");
-        assert_eq!(blocks[3]["automatic"], automatic);
-        assert_eq!(blocks[3]["running"], false);
+        assert_eq!(blocks[3]["kind"], "boundary");
         assert_eq!(blocks[4]["text"], "new output");
         assert_eq!(blocks[4]["time"], view::timestamp(&thread.created_at));
         assert!(!blocks.to_string().contains("internal"));
@@ -745,7 +743,7 @@ fn completed_compaction_boundary_follows_retained_context_and_precedes_new_outpu
 }
 
 #[test]
-fn legacy_compaction_is_labeled_without_guessing_its_boundary_or_mode() {
+fn legacy_compaction_hides_internal_context_without_guessing_a_boundary() {
     let mut session = Session::new("test");
     session.replace_context(
         vec![Message::UserMessage {
@@ -763,9 +761,8 @@ fn legacy_compaction_is_labeled_without_guessing_its_boundary_or_mode() {
             *data = metadata;
         }
         let blocks = serde_json::to_value(view::history(&thread)).unwrap();
-        assert_eq!(blocks[0]["kind"], "compaction");
-        assert!(blocks[0]["automatic"].is_null());
-        assert_eq!(blocks[1]["text"], "retained task");
+        assert_eq!(blocks.as_array().unwrap().len(), 1);
+        assert_eq!(blocks[0]["text"], "retained task");
     }
 }
 
@@ -817,6 +814,56 @@ fn markdown_text_parts_join_without_crossing_images_thinking_or_message_boundari
     );
     assert_eq!(blocks[1]["images"][0], "data:image/png;base64,AAAA");
     assert_eq!(blocks[3]["role"], "thinking");
+}
+
+#[test]
+fn prelude_notices_stay_hidden_in_user_messages_and_tool_results() {
+    let text = |text: &str| Content::Text { text: text.into() };
+    let notices = vec![
+        Content::System {
+            kind: "generation_notice".into(),
+            text: "internal update".into(),
+            data: Value::Null,
+        },
+        text(
+            "\n\n[myco: Prelude changes]\nThe prelude has changed since the snapshot in your context. Files under the profile's workspace/prelude/:\n- added: hidden.md",
+        ),
+        text(
+            "\n\n[myco: Prelude changes]\nThis context may omit earlier prelude updates. Use prelude action=list to reload the full current prelude before relying on the old snapshot.",
+        ),
+    ];
+    let mut session = Session::new("test");
+    let mut user_content = vec![text("Explain [myco: Prelude changes]")];
+    user_content.extend(notices.clone());
+    let mut result = ToolResult::text("actual output");
+    result.content.extend(notices.clone());
+    session.replace_context(
+        vec![
+            Message::UserMessage { content: notices },
+            Message::UserMessage {
+                content: user_content,
+            },
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![ToolUse {
+                    name: "bash".into(),
+                    input: json!({"command":"pwd"}),
+                }],
+                turn_end_reason: None,
+            },
+            Message::ToolResults {
+                tool_use_results: vec![result],
+            },
+        ],
+        None,
+    );
+    let blocks = serde_json::to_value(view::history(session.active_thread())).unwrap();
+    assert_eq!(blocks.as_array().unwrap().len(), 3);
+    assert_eq!(blocks[0]["text"], "Explain [myco: Prelude changes]");
+    assert_eq!(blocks[1]["kind"], "assistant_heading");
+    assert_eq!(blocks[2]["text"], "actual output");
+    assert!(!blocks.to_string().contains("hidden.md"));
+    assert!(!blocks.to_string().contains("internal update"));
 }
 
 #[test]

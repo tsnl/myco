@@ -403,7 +403,9 @@ prompt, read at model build time (session start, model switch, worker spawn).
 Running agents scan the selected profile's prelude before each model step, including
 between tool rounds in a long turn. When visible entry contents change, myco appends
 a small `[myco: Prelude changes]` note listing added, modified, and removed filenames
-to the latest user input or tool result and checkpoints it before the next request.
+as internal system content to the latest user input or tool result and checkpoints
+it before the next request. These updates reach the model but remain hidden in the
+browser conversation, including notices saved by older versions as text parts.
 The agent can read changed files on the local host or use `prelude` action=list;
 current entries supersede the prompt snapshot, and removed entries no longer apply.
 This covers edits from other sessions as well as the agent's own prelude tool calls.

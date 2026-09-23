@@ -141,21 +141,9 @@ function messageHeading(role, time) {
   heading.append(element('span', 'role', role.toUpperCase()), messageTimestamp(time));
   return heading;
 }
-function compactionNode(block) {
-  const article = element('article', 'message system compaction');
-  article.setAttribute('role', 'status');
-  article.append(messageHeading('system', block.time));
-  article.append(element('div', 'compaction-title', block.running ? 'Compacting context…' : 'Context compacted'));
-  const description = block.running
-    ? block.automatic ? 'Saving context before continuing the task.' : 'Saving context. Recent messages will stay visible.'
-    : block.automatic === null ? 'Earlier context was summarized. Showing recent messages.'
-    : block.automatic ? 'Continuing the previous task automatically.' : 'Ready for your next message.';
-  article.append(element('p', 'compaction-description', description));
-  return article;
-}
 function blockNode(block) {
   if (block.kind === 'notice') return element('div', 'notice', block.text);
-  if (block.kind === 'compaction') return compactionNode(block);
+  if (block.kind === 'boundary') { const node = element('div'); node.hidden = true; return node; }
   if (block.kind === 'assistant_heading') return messageHeading('assistant', block.time);
   if (block.kind === 'tool') {
     const outcome = toolState(block);
@@ -230,7 +218,7 @@ function replaceBlock(index, block, previous) {
 }
 function blockKey(block) {
   if (block.kind === 'tool') return JSON.stringify(['tool', block.tool]);
-  if (block.kind === 'compaction') return JSON.stringify(['compaction', block.time]);
+  if (block.kind === 'boundary') return JSON.stringify(['boundary', block.time]);
   if (block.kind === 'message') return JSON.stringify(['message', block.role, block.time, block.images]);
   if (block.kind === 'assistant_heading') return JSON.stringify(['assistant_heading', block.time]);
   return JSON.stringify(['notice', block.text]);

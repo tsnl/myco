@@ -334,7 +334,11 @@ impl AgentState {
         if !matches!(self.phase, Phase::Generating(id) if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
-        let notice = Content::Text { text };
+        let notice = Content::System {
+            kind: "generation_notice".into(),
+            text,
+            data: serde_json::Value::Null,
+        };
         // Notices belong to the current input so user-turn indexes and tool
         // call/result pairing remain stable across rewind and compaction.
         match self.history.last_mut() {

@@ -151,10 +151,10 @@ impl EventSink for NullEventSink {
 pub type Checkpoint = Box<dyn Fn(&AgentState) -> Result<(), String> + Send + Sync>;
 
 /// Supply a pending runtime notice before a generation step. The returned text
-/// is appended to the latest user input or tool result and checkpointed before
-/// generation; this callback does not reload the system prompt. Retries reuse
-/// the same input. Consume the notice only when the future completes, since
-/// cancellation can drop the future.
+/// is appended as internal system content to the latest user input or tool result
+/// and checkpointed before generation; this callback does not reload the system
+/// prompt. Retries reuse the same input. Consume the notice only when the future
+/// completes, since cancellation can drop the future.
 pub type BeforeGenerationNotice =
     Box<dyn Fn(&TraceContext, &[Message]) -> Async<Option<String>> + Send + Sync>;
 
@@ -660,7 +660,8 @@ mod tests {
         let snapshot = saved.lock().unwrap();
         assert!(
             matches!(snapshot.as_slice(), [Message::UserMessage { content }]
-            if matches!(content.last(), Some(Content::Text { text }) if text == "updated context"))
+            if matches!(content.last(), Some(Content::System { kind, text, .. })
+                if kind == "generation_notice" && text == "updated context"))
         );
         assert_eq!(agent.history().len(), 2);
     }
