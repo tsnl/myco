@@ -36,7 +36,8 @@ actions, and live event streams work through the tunnel, including when its
 local and remote ports differ. Requests must address `localhost` or a loopback
 IP; LAN names and other hostnames are refused.
 
-The browser uses square-edged translucent panels over a locally rendered sky.
+The browser uses translucent panels in neutral charcoal with square corners
+over a locally rendered sky.
 The conversation stays in a central well, with the sky visible on both sides;
 floating controls use background blur. The conversation well is the lightest
 surface; the input bar and top banner share darker translucent glass, with
