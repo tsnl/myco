@@ -165,6 +165,9 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 #prompt { display: block; width: 100%; resize: none; min-height: 3.3em; max-height: 32vh; padding: 8px 0; border: 0; background: transparent; outline: 0; }
 #prompt::placeholder { color: var(--dim); }
 #send { color: var(--green); }
+#token-usage { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+.usage-counts { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+#token-usage span { white-space: nowrap; }
 #queued { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
 #queued-count { color: var(--cyan); }
 #queued-list { margin: 6px 0 0; padding-left: 1.5em; max-height: 18vh; overflow: auto; }

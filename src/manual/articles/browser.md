@@ -219,6 +219,22 @@ the change in the session. An unavailable model leaves the current selection
 unchanged and shows an error. The selector does not change the configured
 startup default.
 
+The input bar shows **Context** used versus the selected model's capacity and
+the **Input**, **Output**, and **Cached** token counts. Context and Input use the
+latest provider-reported input count, including cached tokens; Cached is a subset,
+not an additional cost to the context window. Output accumulates across the
+current or most recent run's model requests, including tool round trips. These
+are recorded measurements, not a live estimate of the next prompt: output and
+newly added messages are not included in Context until the next request reports
+them. Hover over a count for its exact value and meaning.
+
+Counts refresh during a run after each completed model request is checkpointed,
+and survive page reloads and server restarts. A dash means no measurement is
+available. Compaction and model changes invalidate the old counts until another
+request reports usage. A failed or cancelled request retains the last recorded
+measurement if its context is unchanged. These counts are not session-wide
+billing totals.
+
 **New** opens a fresh session in a new tab; the current tab, draft, and running
 turn stay in place. **Compact** creates a successor thread without changing
 the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
@@ -272,7 +288,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | --- | --- |
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
 | `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
-| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, and `queued` |
+| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, `queued`, `usage`, and `context_window_tokens` |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |

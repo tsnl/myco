@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use myco::generative_model::ToolUse;
+use myco::generative_model::{TokenUsage, ToolUse};
 use myco::session::{ActiveSession, ArchiveFilter, SessionListEntry, SessionWriteLock};
 use myco::{AgentEvent, CancelToken, EventSink};
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,8 @@ struct Snapshot {
     model: String,
     models: Vec<String>,
     attachment_limits: attachments::Limits,
+    usage: Option<TokenUsage>,
+    context_window_tokens: u64,
     busy: bool,
     status: String,
     tasks: Vec<String>,
@@ -75,7 +77,13 @@ struct Snapshot {
 
 impl Snapshot {
     fn metadata(&self) -> Value {
-        json!({"session_id":self.session_id, "thread_id":self.thread_id, "title":self.title, "model":self.model, "busy":self.busy, "status":self.status, "queued":self.queued, "attachment_limits":self.attachment_limits})
+        json!({
+            "session_id": self.session_id, "thread_id": self.thread_id,
+            "title": self.title, "model": self.model,
+            "busy": self.busy, "status": self.status, "queued": self.queued,
+            "attachment_limits": self.attachment_limits,
+            "usage": self.usage, "context_window_tokens": self.context_window_tokens,
+        })
     }
 }
 
@@ -155,6 +163,8 @@ impl App {
         snapshot.model = boot.catalog_model.spec.key.clone();
         snapshot.attachment_limits =
             attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
+        snapshot.usage = session.active_thread().last_usage;
+        snapshot.context_window_tokens = boot.catalog_model.spec.context_window_tokens;
         snapshot.blocks = blocks;
         snapshot.status = status.into();
         snapshot.tasks = tasks;
@@ -170,17 +180,24 @@ impl App {
 
     fn refresh(&self, session: &ActiveSession, tasks: Vec<String>) {
         self.tasks(tasks);
-        let title = session.with(|session| {
-            session
-                .title
-                .clone()
-                .unwrap_or_else(|| "New session".into())
+        let (title, usage) = session.with(|session| {
+            (
+                session
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "New session".into()),
+                session.active_thread().last_usage,
+            )
         });
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.title != title {
+        let title_changed = live.snapshot.title != title;
+        if title_changed || live.snapshot.usage != usage {
             live.snapshot.title = title;
+            live.snapshot.usage = usage;
             let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
             self.publish(&mut live.snapshot, change);
+        }
+        if title_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -452,6 +469,7 @@ impl Sessions {
             .clone();
         let (work, receiver) = mpsc::channel(1);
         let image_limit = catalog.spec.max_image_base64_bytes;
+        let context_window_tokens = catalog.spec.context_window_tokens;
         let (mut boot, app) = boot_session(
             &self.args,
             self.config.clone(),
@@ -478,6 +496,8 @@ impl Sessions {
                                 .map(str::to_owned)
                                 .collect(),
                             attachment_limits: attachments::Limits::new(image_limit),
+                            usage: session.active_thread().last_usage,
+                            context_window_tokens,
                             busy: false,
                             status: "Ready".into(),
                             tasks: vec![],

@@ -48,6 +48,10 @@
     <section id="attachments" aria-label="Image attachments" hidden><div id="attachment-count" role="status"></div><ul id="attachment-list"></ul></section>
     <textarea id="prompt" rows="2" autofocus placeholder="What are we working on?" aria-describedby="input-hint" spellcheck="false"></textarea>
     <div class="composer-footer"><span id="input-hint">Enter to send · Shift+Enter for a new line</span><button id="cancel" type="button" hidden>Cancel run</button><button id="send" type="submit" disabled>Send ↵</button></div>
+    <div id="token-usage" role="group" aria-label="Token usage">
+      <span id="context-usage">Context — / —</span>
+      <div class="usage-counts"><span id="input-tokens">Input —</span><span id="output-tokens">Output —</span><span id="cached-tokens">Cached —</span></div>
+    </div>
     <div id="error" role="alert" hidden></div>
   </form>
 </body>

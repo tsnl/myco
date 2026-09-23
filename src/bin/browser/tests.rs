@@ -28,6 +28,8 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 attachment_limits: attachments::Limits::new(
                     myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
                 ),
+                usage: None,
+                context_window_tokens: 100_000,
                 busy: false,
                 status: "Ready".into(),
                 tasks: vec![],
@@ -213,6 +215,36 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
         app.snapshot().change["snapshot"]["title"],
         "Renamed while running"
     );
+}
+
+#[test]
+fn recorded_usage_reaches_live_and_reconnect_metadata_without_inventing_unknown_counts() {
+    let (app, _) = app();
+    let mut session = Session::new_with_id("test", "session");
+    session.title = Some("Test".into());
+    let active = ActiveSession::new(session);
+    app.live.lock().unwrap().snapshot.busy = true;
+    let mut updates = app.events.subscribe();
+    for usage in [
+        Some(TokenUsage {
+            input_tokens: 24_321,
+            output_tokens: 30,
+            cached_input_tokens: 12_000,
+        }),
+        Some(TokenUsage::default()),
+        None,
+    ] {
+        active.with_mut(|session| session.replace_context(vec![], usage));
+        app.refresh(&active, vec![]);
+        let update = updates.try_recv().unwrap();
+        assert_eq!(update.change["meta"]["usage"], json!(usage));
+        assert_eq!(update.change["meta"]["context_window_tokens"], 100_000);
+        assert_eq!(update.change["meta"]["busy"], true);
+        assert_eq!(app.snapshot().change["snapshot"]["usage"], json!(usage));
+        app.refresh(&active, vec![]);
+        assert!(updates.try_recv().is_err());
+    }
+    assert_eq!(app.generation.load(Ordering::Relaxed), 0);
 }
 
 #[test]
