@@ -5,7 +5,6 @@
 #sky-stars circle { fill: #e4eeff; animation: twinkle var(--twinkle-duration) ease-in-out var(--twinkle-delay) infinite alternate; }
 #sky.paused circle { animation-play-state: paused; }
 @keyframes twinkle { from { opacity: .2; } to { opacity: var(--star-brightness); } }
-.sky-atmosphere { filter: saturate(1.15); }
 .sky-glow { background: radial-gradient(ellipse 55% 65% at var(--light-x, 50%) var(--light-y, 10%), rgb(var(--light-color, 222 240 255) / 1), rgb(var(--light-color, 222 240 255) / .25) 45%, transparent 80%); }
 #sky::after { content: ''; position: absolute; inset: 0; background: #34435c; opacity: var(--overcast, 0); transition: opacity 12s; }
 
