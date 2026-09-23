@@ -1,5 +1,5 @@
 /* Atmosphere and stars */
-#sky { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; background: linear-gradient(180deg, #030916, #142039 70%, #35334a); }
+#sky { position: fixed; inset: 0; z-index: -2; pointer-events: none; overflow: hidden; background: linear-gradient(180deg, #030916, #142039 70%, #35334a); }
 .sky-atmosphere, .sky-glow, #sky-stars { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity 4s linear; }
 #sky-stars { opacity: 0; }
 #sky-stars circle { fill: #e4eeff; animation: twinkle var(--twinkle-duration) ease-in-out var(--twinkle-delay) infinite alternate; }
