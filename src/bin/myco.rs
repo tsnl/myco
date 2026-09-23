@@ -16,14 +16,24 @@ use myco::{
 
 #[path = "browser/mod.rs"]
 mod browser;
+#[path = "cli/mod.rs"]
+mod cli;
 
 const SYSTEM_PROMPT_PROLOGUE: &str = r#"
 You are a helpful assistant running in an agentic harness with unfettered computer access.
 "#;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Myco browser server", disable_help_flag = true)]
+#[command(
+    version,
+    about = "Myco coding agent: browser, terminal, or one-shot prompts",
+    disable_help_flag = true
+)]
 struct Args {
+    /// Run one prompt and stream answer text to stdout. Bare -p reads stdin;
+    /// with a prompt, piped stdin is prepended as context.
+    #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, conflicts_with_all = ["mode", "port", "bind"])]
+    print: Option<Option<String>>,
     /// Server port (0 chooses a free port).
     #[arg(long, alias = "web", default_value = "8765", num_args = 0..=1, default_missing_value = "8765")]
     port: u16,
@@ -33,7 +43,7 @@ struct Args {
     /// Print launcher help, or an embedded manual article.
     #[arg(long = "help", short = 'h', value_name = "ARTICLE", num_args = 0..=1, default_missing_value = "")]
     help_topic: Option<String>,
-    /// Start the browser server or an internal SSH host worker.
+    /// Start the browser server, scrolling terminal chat, or internal SSH host worker.
     #[arg(long, value_enum, default_value_t = Mode::Server)]
     mode: Mode,
     /// Data profile: overrides MYCO_PROFILE (default: default).
@@ -51,7 +61,7 @@ struct Args {
     /// Dump provider request bodies to stderr.
     #[arg(long)]
     debug_dump_api_requests: bool,
-    /// Open a saved session from the launch URL (id or unique prefix).
+    /// Resume a saved session (id or unique prefix).
     #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
     /// Reasoning effort (low|medium|high|max).
@@ -84,6 +94,8 @@ fn parse_loopback_arg(value: &str) -> Result<std::net::IpAddr, String> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
     Server,
+    #[value(alias = "interactive")]
+    Cli,
     Host,
 }
 
@@ -98,7 +110,7 @@ fn main() {
         eprintln!("myco: {error}");
         std::process::exit(2);
     }
-    if args.mode == Mode::Server
+    if args.mode != Mode::Host
         && let Err(error) = myco::session::migrate_archived_sessions()
     {
         eprintln!("warning: could not organize archived sessions: {error}");
@@ -109,10 +121,22 @@ fn main() {
         .expect("create async runtime")
         .block_on(async {
             match args.mode {
+                Mode::Server if args.print.is_some() => {
+                    let code = cli::run_print(args).await;
+                    if code != 0 {
+                        std::process::exit(code.into());
+                    }
+                }
                 Mode::Server => {
                     if let Err(error) = browser::run(args).await {
                         eprintln!("myco: {error}");
                         std::process::exit(1);
+                    }
+                }
+                Mode::Cli => {
+                    let code = cli::run_interactive(args).await;
+                    if code != 0 {
+                        std::process::exit(code.into());
                     }
                 }
                 Mode::Host => run_host(args).await,
@@ -227,7 +251,7 @@ fn session_warning(message: &str) {
     eprintln!("warning: {message}");
 }
 
-/// The runner and its owned session resources, held until server shutdown.
+/// The runner and its owned session resources, held until the frontend exits.
 struct Boot {
     app_config: Config,
     catalog_model: CatalogModel,
@@ -505,10 +529,28 @@ mod tests {
     }
 
     #[test]
-    fn terminal_chat_options_and_ambiguous_resume_are_rejected() {
+    fn one_shot_and_terminal_modes_are_explicit() {
+        let args = Args::try_parse_from(["myco", "-p", "task"]).unwrap();
+        assert_eq!(args.print, Some(Some("task".into())));
+        let args = Args::try_parse_from(["myco", "-p", "--resume", "id"]).unwrap();
+        assert_eq!(args.print, Some(None));
+        assert_eq!(args.resume.as_deref(), Some("id"));
+        for mode in ["cli", "interactive"] {
+            assert_eq!(Args::parse_from(["myco", "--mode", mode]).mode, Mode::Cli);
+        }
         for flags in [
-            vec!["-p", "task"],
-            vec!["--mode", "interactive"],
+            vec!["-p", "task", "--mode", "host"],
+            vec!["-p", "task", "--mode", "cli"],
+            vec!["-p", "task", "--port", "0"],
+            vec!["-p", "task", "--web-bind", "127.0.0.1"],
+        ] {
+            assert!(Args::try_parse_from(std::iter::once("myco").chain(flags)).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_terminal_flags_and_ambiguous_resume_are_rejected() {
+        for flags in [
             vec!["--mode", "session-browser"],
             vec!["--resume"],
             vec!["--color", "always"],

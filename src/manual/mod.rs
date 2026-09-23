@@ -32,8 +32,8 @@ pub const ARTICLES: &[Article] = &[
     },
     Article {
         id: "cli",
-        title: "Server launcher",
-        summary: "Server launch options, profiles, and internal host worker",
+        title: "Command line",
+        summary: "One-shot prompts, terminal chat, server options, profiles, and host worker",
         body: include_str!("articles/cli.md"),
     },
     Article {

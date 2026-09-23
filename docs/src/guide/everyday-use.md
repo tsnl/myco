@@ -45,6 +45,12 @@ agent can also call `view_image` on a selected host.
 
 ## Automate sessions
 
+For a single task, run `myco -p "prompt"` or `git diff | myco -p "Review this"`.
+The answer streams to stdout; diagnostics and the saved session ID go to stderr.
+Use `--resume ID` to continue later. `myco --mode cli` provides a scrolling chat
+with line editing, tool activity, and `/compact`. The
+[command-line manual](../manual/cli.md) describes input, cancellation, and exit codes.
+
 Use the authenticated server API to create sessions, submit work, observe output,
 compact, and cancel. Clients retain the launch cookie and send an `Origin` header
 on writes. A successful submission means accepted; wait for an idle snapshot and

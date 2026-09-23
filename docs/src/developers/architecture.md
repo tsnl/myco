@@ -1,12 +1,12 @@
 # Application architecture
 
 The `myco` crate assembles the reusable libraries with profiles, prompts,
-sessions, browser rendering, and host tools. Depend on it when you need that
+sessions, browser/terminal rendering, and host tools. Depend on it when you need that
 composition; `myco-model` and `myco-agent` remain sufficient for a custom
 environment.
 
 ```text
-HTTP / SessionRunner
+Browser / CLI → SessionRunner
   ├── Agent (myco-agent)
   │     └── GenerativeModel (myco-model)
   └── SessionRuntime (ToolExecutor + live resource ownership)
@@ -54,8 +54,9 @@ only on the local worker. Model credentials stay with the application process.
 
 | Area | Entry point |
 | --- | --- |
-| Server and host-worker startup | `src/bin/myco.rs` |
+| Server, CLI, and host-worker startup | `src/bin/myco.rs` |
 | Browser frontend, HTTP actions, and transcript projection | `src/bin/browser/` |
+| One-shot prompts and scrolling terminal chat | `src/bin/cli/` |
 | Profiles, models, authentication | `src/config/`, `src/core/fs.rs` |
 | Agent execution | `crates/myco-agent/src/lib.rs`, `generation.rs` |
 | Provider translation and streaming | `crates/myco-model/src/` |

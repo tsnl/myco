@@ -7,7 +7,9 @@ machines over SSH. Tools run on **hosts** (local or remote); nested sessions use
 
 **Agents orchestrate; hosts run tools on machines.** The **local** host is always enabled
 **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. The same
-`myco` binary runs the server (the default mode) and the remote host runtime (`--mode host`).
+`myco` binary runs the server (the default mode), one-shot prompts (`-p`), terminal
+chat (`--mode cli`), and the remote host runtime (`--mode host`). Terminal modes
+use the same durable session runner; see `myco --help cli`.
 
 ```
 myco server / chat adapter
