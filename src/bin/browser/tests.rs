@@ -650,6 +650,56 @@ async fn session_routes_keep_parallel_runs_and_cancellation_independent() {
 }
 
 #[test]
+fn markdown_text_parts_join_without_crossing_images_thinking_or_message_boundaries() {
+    let text = |value: &str| Content::Text { text: value.into() };
+    let assistant = |content| Message::AssistantMessage {
+        content,
+        tool_uses: vec![],
+        turn_end_reason: None,
+    };
+    let session = Session::new("test");
+    let mut thread = session.active_thread().clone();
+    thread.messages = vec![
+        assistant(vec![
+            text(""),
+            text("**bold "),
+            text("text**"),
+            Content::Image {
+                source: "data:image/png;base64,AAAA".into(),
+            },
+            text("after "),
+            text(""),
+            text("image"),
+            Content::Thinking {
+                text: "thinking".into(),
+                signature: None,
+                redacted: false,
+            },
+            text("after thinking"),
+        ]),
+        assistant(vec![text(""), text("next response")]),
+    ];
+    let blocks = serde_json::to_value(view::history(&thread)).unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|block| block["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "**bold text**",
+            "",
+            "after image",
+            "thinking",
+            "after thinking",
+            "next response"
+        ]
+    );
+    assert_eq!(blocks[1]["images"][0], "data:image/png;base64,AAAA");
+    assert_eq!(blocks[3]["role"], "thinking");
+}
+
+#[test]
 fn recorded_history_hides_runtime_context_and_preserves_outcomes_and_turn_times() {
     let session = Session::new("test");
     let mut thread = session.active_thread().clone();

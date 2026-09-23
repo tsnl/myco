@@ -26,8 +26,9 @@ from playwright.sync_api import expect, sync_playwright
 
 
 def reply(text):
-    return [{"type": "response.output_text.delta", "output_index": 0,
-             "content_index": 0, "delta": text}]
+    parts = text if isinstance(text, list) else [text]
+    return [{"type": "response.output_text.delta", "output_index": index,
+             "content_index": 0, "delta": part} for index, part in enumerate(parts)]
 
 
 def tool(arguments, name="bash", index=0):
@@ -132,7 +133,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 fixture.compaction_release.wait(30)
             if "generate" in prompt:
                 fixture.generation_releases[name].wait(30)
-            for event in events:
+            for index, event in enumerate(events):
+                if gate := getattr(fixture, 'event_gates', {}).get(index):
+                    gate.wait(30)
                 self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
                 self.wfile.flush()
                 if "stream" in prompt:
@@ -1478,6 +1481,90 @@ context_window = 100000
         expect(page.locator("#session-list a:visible")).to_have_count(0)
         page.fill("#search", "")
         expect(page.locator("#session-list a:visible")).to_have_count(1)
+
+    def test_markdown_stays_whole_across_provider_text_parts_and_reload(self):
+        self.turns['Alpha links'] = 1
+        self.link_reply = ['# Re', 'view\n\n**Bo', 'ld** and _emphasis_.\n\n```rust\nlet ',
+                           'value = 1;\n```\n\n- First\n  - Nested\n\n| Name | Value |\n| --- | --- |\n',
+                           '| a\\|b | `literal*` |\n\n[Docs][source]\n\n[source]: https://example.com/docs']
+        page = self.session(self.page)
+        self.submit(page, 'Alpha links')
+        expect(page.locator('#model')).to_be_enabled()
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            body = page.locator('.assistant .body')
+            expect(body).to_have_count(1)
+            expect(body.locator('h1')).to_have_text('Review')
+            expect(body.locator('strong')).to_have_text('Bold')
+            expect(body.locator('em')).to_have_text('emphasis')
+            expect(body.locator('pre code')).to_have_text('let value = 1;\n')
+            expect(body.locator('ul ul li')).to_have_text('Nested')
+            expect(body.locator('td').first).to_have_text('a|b')
+            expect(body.locator('td code')).to_have_text('literal*')
+            expect(body.get_by_role('link', name='Docs')).to_have_attribute('href', 'https://example.com/docs')
+
+    def test_table_split_across_text_parts_survives_streaming_completion_and_reload(self):
+        self.turns['Alpha links'] = 1
+        self.link_reply = ['| Component | Status | Count |\n| :--- | :',
+                           '---: | ---: |\n| **Browser** | Rea',
+                           'dy | 128 |\n| `a\\|b` | Pass | 7 |\n']
+        self.event_gates = {index: threading.Event() for index in [1, 2, 3]}
+        self.addCleanup(lambda: [gate.set() for gate in self.event_gates.values()])
+        page = self.session(self.page)
+        self.submit(page, 'Alpha links')
+        body = page.locator('.assistant .body')
+        expect(body).to_contain_text('| Component | Status | Count |')
+        self.event_gates[1].set()
+        table = body.locator('table')
+        expect(table.locator('th')).to_have_text(['Component', 'Status', 'Count'])
+        expect(table.locator('td').nth(1)).to_have_text('Rea')
+        self.event_gates[2].set()
+        expect(table.locator('td')).to_have_text(['Browser', 'Ready', '128', 'a|b', 'Pass', '7'])
+        expect(page.locator('#model')).to_be_disabled()
+        live = table.inner_html()
+        self.event_gates[3].set()
+        expect(page.locator('#model')).to_be_enabled()
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            expect(body).to_have_count(1)
+            expect(table.locator('td')).to_have_text(['Browser', 'Ready', '128', 'a|b', 'Pass', '7'])
+            self.assertEqual(table.inner_html(), live)
+            expect(table.locator('strong')).to_have_text('Browser')
+            expect(table.locator('code')).to_have_text('a|b')
+            self.assertEqual(table.locator('th').evaluate_all('nodes => nodes.map(n => getComputedStyle(n).textAlign)'),
+                             ['left', 'center', 'right'])
+        page.locator('.assistant').screenshot(path=str(self.artifacts / 'table-desktop.png'))
+        page.set_viewport_size({'width': 390, 'height': 844})
+        page.locator('.assistant').screenshot(path=str(self.artifacts / 'table-mobile.png'))
+
+    def test_footnotes_stay_with_their_message_and_cannot_replace_composer_ids(self):
+        page = self.session(self.page)
+        for name in ['Alpha', 'Beta']:
+            self.turns[name + ' links'] = 1
+            self.link_reply = f'{name} note[^prompt].\n\n[^prompt]: {name} footnote.\n\n[External](https://example.com/#intro)'
+            self.submit(page, name + ' links')
+            expect(page.locator('#model')).to_be_enabled()
+            expect(page.locator('.footnote-definition')).to_have_count(1 if name == 'Alpha' else 2)
+            expect(page.locator('#prompt')).to_have_count(1)
+            expect(page.locator('#prompt')).to_be_editable()
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            notes = page.locator('.footnote-definition')
+            expect(notes).to_have_count(2)
+            ids = notes.evaluate_all('nodes => nodes.map(n => n.id)')
+            self.assertEqual(len(set(ids)), 2)
+            links = page.locator('.footnote-reference a')
+            for link in links.all():
+                expect(link).to_have_js_property('target', '')
+                self.assertTrue(link.evaluate('n => n.closest(".body").contains(document.getElementById(n.hash.slice(1)))'))
+            links.last.click()
+            self.assertEqual(page.url.split('#')[-1], ids[-1])
+            self.assertEqual(len(self.context.pages), 1, 'footnotes must stay in the current tab')
+            for link in page.get_by_role('link', name='External').all():
+                expect(link).to_have_attribute('target', '_blank')
 
     def test_failed_markdown_render_retries_on_the_next_snapshot(self):
         page = self.session(self.page)
