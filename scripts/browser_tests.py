@@ -117,7 +117,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = tool({'command': f"printf '%s\\n' {shlex.quote(output)}", 'timeout_ms': 1000})
         elif "profile" in prompt:
             marker = shlex.quote(str(root / (name + '-profile')))
-            events = tool({'command': f'printf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
+            events = tool({'command': f'printf "%s" "$MYCO_PROFILE" > profile-tool.txt\nprintf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
         elif "stream" in prompt:
             events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
         elif "generate" in prompt:
@@ -166,7 +166,7 @@ class BrowserTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
         # A transient startup notice must not make later snapshots replace the conversation.
-        workspace = self.home / "profiles/default/workspace"
+        workspace = self.workspace = self.home / "profiles/default/workspace"
         workspace.mkdir(parents=True)
         (workspace / "prelude").touch()
         self.artifacts = OPTIONS.artifacts / self._testMethodName
@@ -197,6 +197,7 @@ context_window = 100000
 ''' for name in ["first", "second"]))
         (self.home / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6cGkAAAAASUVORK5CYII="))
+        (self.workspace / "pixel.png").write_bytes((self.home / "pixel.png").read_bytes())
         self.process, launch = self.launch()
         parsed = urlsplit(launch)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -214,15 +215,17 @@ context_window = 100000
         (self.artifacts / "requests.json").write_text(json.dumps(self.requests, indent=2))
         self.assertEqual(self.errors, [])
 
-    def launch(self, port=0, resume=None, profile='default'):
+    def launch(self, port=0, resume=None, profile='default', config='config.toml'):
         log = (self.artifacts / f"server-{len(self.processes)}.log").open("w")
         self.addCleanup(log.close)
-        args = [str(OPTIONS.binary), "--port", str(port), "--profile", profile, "--config", str(self.home / "config.toml")]
+        args = [str(OPTIONS.binary), "--port", str(port), "--profile", profile]
+        if config is not None:
+            args += ["--config", config]
         if resume:
             args += ["--resume", resume]
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=log, text=True,
                                    cwd=self.home, env=dict(os.environ, MYCO_HOME=str(self.home), MYCO_PROFILE="default",
-                                                          MYCO_CONFIG=str(self.home / 'config.toml')))
+                                                          MYCO_CONFIG='config.toml'))
         self.processes.append(process)
         self.addCleanup(process.stdout.close)
         self.addCleanup(self.stop, process)
@@ -289,7 +292,13 @@ context_window = 100000
         expect(other.locator('.user .body')).to_have_text('Beta profile')
         for label, profile in [('Alpha', 'default'), ('Beta', 'research')]:
             self.assertEqual((self.home / (label + '-profile')).read_text().splitlines(),
-                             [profile, str(self.home), str(self.home), self.origin + f'/profiles/{profile}'])
+                             [profile, str(self.home), str(self.home / 'profiles' / profile / 'workspace'), self.origin + f'/profiles/{profile}'])
+            workspace = self.home / 'profiles' / profile / 'workspace'
+            self.assertEqual((workspace / 'profile-tool.txt').read_text(), profile)
+            url = self.origin + f'/profiles/{profile}/files/profile-tool.txt'
+            self.assertEqual(self.context.request.get(url).text(), profile)
+        self.assertEqual(self.context.request.get(self.origin + '/files/profile-tool.txt').text(), 'default')
+        self.assertFalse((self.home / 'profile-tool.txt').exists())
         self.assertEqual([item['title'] for item in self.context.request.get(self.origin + '/profiles/default/api/sessions').json()], ['Alpha profile'])
         self.assertEqual([item['title'] for item in self.context.request.get(prefix + '/api/sessions').json()], ['Beta profile'])
         targets = self.context.new_cdp_session(default).send('Target.getTargets')['targetInfos']
@@ -367,6 +376,38 @@ context_window = 100000
         self.assertTrue(launch.endswith('/profiles/research/sessions/' + session_id), launch)
         self.page.goto(launch)
         expect(self.page.locator('#model')).to_be_enabled()
+
+    def test_profile_workspace_is_created_and_bad_paths_fail_without_affecting_other_profiles(self):
+        profile = self.add_profile()
+        workspace = profile / 'workspace'
+        (workspace / 'prelude').rmdir()
+        workspace.rmdir()
+        workspace.write_text('A file cannot be used as a working directory.')
+        response = self.context.request.get(self.origin + '/profiles/research/api/sessions')
+        self.assertEqual(response.status, 503)
+        self.assertIn(str(workspace), response.text())
+        self.assertEqual(self.context.request.get(self.origin + '/profiles/default/api/sessions').status, 200)
+        workspace.unlink()
+        other = self.session(profile='research')
+        self.assertTrue(workspace.is_dir())
+        self.submit(other, 'Beta profile')
+        expect(other.locator('.assistant .body').last).to_have_text('Beta finished.')
+        self.assertEqual((workspace / 'profile-tool.txt').read_text(), 'research')
+        (workspace / 'sibling').symlink_to(self.workspace, target_is_directory=True)
+        for path in ['sibling/pixel.png', '..%2Fconfig.toml']:
+            self.assertIn(self.context.request.get(self.origin + '/profiles/research/files/' + path).status, [403, 404])
+        self.assertEqual(self.context.request.get(self.origin + '/profiles/default/files/config.toml').status, 404)
+
+    def test_relative_environment_config_resolves_before_changing_to_the_profile_workspace(self):
+        self.add_profile()
+        self.stop(self.process)
+        self.process, launch = self.launch(profile='research', config=None)
+        self.origin = launch.split('/profiles/')[0]
+        page = self.session(self.page, profile='research')
+        expect(page.locator('#model option')).to_have_text(['first', 'second'])
+        self.submit(page, 'Alpha profile')
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        self.assertEqual((self.home / 'profiles/research/workspace/profile-tool.txt').read_text(), 'research')
 
     def test_profile_failure_recovers_without_interrupting_another_profiles_tool(self):
         research = self.add_profile()
@@ -667,7 +708,7 @@ context_window = 100000
 
     def test_urls_are_clickable_in_messages_and_tool_output_after_reload(self):
         page = self.session(self.page)
-        (self.home / 'linked.txt').write_text('Opened the link target.')
+        (self.workspace / 'linked.txt').write_text('Opened the link target.')
         url = self.origin + '/files/linked.txt?from=review&mode=full#details'
         self.link_reply = (f'Review {url}.\n\n[Named preview]({url})\n\n`{url}`\n\n```text\n{url}\n```\n\n'
                            'Also https://example.com/a_(b), www.example.com/docs.')
@@ -1163,9 +1204,9 @@ context_window = 100000
         expect(self.page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
 
     def test_workspace_links_and_svg_images_are_mapped_without_login(self):
-        path = self.home / 'plot & space.svg'
+        path = self.workspace / 'plot & space.svg'
         path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8"><rect width="12" height="8" fill="cyan"/></svg>')
-        (self.home / 'notes.txt').write_text('workspace notes')
+        (self.workspace / 'notes.txt').write_text('workspace notes')
         source = f'![relative](plot%20%26%20space.svg) ![absolute](<{path}>) ![file](<{path.as_uri()}>)\n\n[Notes](notes.txt)'
         response = self.context.request.post(self.origin + '/api/markdown',
             headers={'Origin': self.origin}, data={'text': source})
@@ -1179,11 +1220,11 @@ context_window = 100000
         expect(self.page.locator('body')).to_contain_text('workspace notes')
 
     def test_workspace_files_reject_escape_and_preserve_range_and_head_semantics(self):
-        (self.home / 'bytes.bin').write_bytes(b'0123456789')
+        (self.workspace / 'bytes.bin').write_bytes(b'0123456789')
         with tempfile.TemporaryDirectory(prefix='myco-outside-') as outside:
             secret = Path(outside) / 'secret.txt'
             secret.write_text('outside workspace')
-            (self.home / 'escape').symlink_to(outside, target_is_directory=True)
+            (self.workspace / 'escape').symlink_to(outside, target_is_directory=True)
             paths = ['/files/escape/secret.txt', '/files/..%2F' + Path(outside).name + '/secret.txt', '/files/%2Fetc/passwd']
             for path in paths:
                 self.assertIn(self.context.request.get(self.origin + path).status, [403, 404], path)
@@ -1206,13 +1247,13 @@ context_window = 100000
             self.assertEqual(response.headers['content-length'], '10')
             self.assertNotIn('content-range', response.headers)
         self.assertEqual(self.context.request.post(url, headers={'Origin': self.origin}, data='replace').status, 405)
-        self.assertEqual((self.home / 'bytes.bin').read_bytes(), b'0123456789')
+        self.assertEqual((self.workspace / 'bytes.bin').read_bytes(), b'0123456789')
         if hasattr(os, 'mkfifo'):
-            os.mkfifo(self.home / 'pipe')
+            os.mkfifo(self.workspace / 'pipe')
             self.assertEqual(self.context.request.get(self.origin + '/files/pipe', timeout=3000).status, 404)
 
     def test_workspace_html_displays_relative_assets_without_executing_scripts(self):
-        folder = self.home / 'preview'
+        folder = self.workspace / 'preview'
         folder.mkdir()
         (folder / 'style.css').write_text('h1 { color: rgb(12, 34, 56); }')
         (folder / 'index.html').write_text('<link rel="stylesheet" href="style.css"><h1>Preview</h1><img src="../pixel.png"><script>document.documentElement.dataset.executed="yes"; fetch("/api/sessions")</script>')

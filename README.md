@@ -42,7 +42,7 @@ rain. Captured from the [workspace-files preview](https://github.com/tsnl/myco/p
 - **Independent sessions.** Work in several browser tabs, or create hidden child
   sessions through the server API.
 - **Project guidance is injected.** The nearest `AGENTS.md` / `CLAUDE.md` from
-  your launch directory through the repository root is read at session start.
+  the session's working directory through the repository root is read at session start.
 - **Evaluate your actual tasks.** `myco-eval` turns session cutoffs into private,
   repeatable cases with independent graders. Compare models and prelude variants,
   or run the optional GEPA loop. See [task evals](src/manual/articles/evals.md).
@@ -91,9 +91,11 @@ for controls, workspace files, and the HTTP API.
 Each profile has its own URL, such as `/profiles/default/` or
 `/profiles/research/`, with separate config, sessions, images, and tool runtimes.
 The profile selector switches between existing profiles; `/profiles/` lists them.
-Instances start when opened and share the server's launch directory for tools
-and served files. `--profile` chooses the initial profile, and launch overrides
-such as `--config` and `--model` apply only to that profile.
+Instances start when opened. Each uses `$MYCO_HOME/profiles/NAME/workspace/`
+for local tools and served files (`MYCO_HOME` defaults to `~/.myco`); missing
+workspace directories are created automatically. `--profile` chooses the initial
+profile, and launch overrides such as `--config` and `--model` apply only to that
+profile.
 
 For scripts, `myco -p "prompt"` streams answer text to stdout, with diagnostics
 and the saved session ID on stderr. Bare `-p` reads the prompt from stdin;

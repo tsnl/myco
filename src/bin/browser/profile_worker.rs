@@ -2,7 +2,7 @@
 //! and tool children therefore cannot change profile while requests are running.
 
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,14 +64,19 @@ impl Worker {
     pub async fn start(
         args: &Args,
         profile: &str,
+        workspace: &Path,
         selected: &str,
         origin: &str,
         events: broadcast::Sender<Arc<ProfileEvent>>,
     ) -> Result<Arc<Self>, String> {
+        tokio::fs::create_dir_all(workspace)
+            .await
+            .map_err(|e| format!("open profile workspace {}: {e}", workspace.display()))?;
         let directory = SocketDirectory::new()?;
         let socket = directory.0.join("worker");
         let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
         command
+            .current_dir(workspace)
             .args(["--profile", profile, "--profile-worker"])
             .arg(&socket)
             .env("MYCO_PROFILE", profile)
@@ -172,6 +177,13 @@ fn configure(command: &mut Command, args: &Args, selected: bool) -> Result<(), S
         command
             .arg("--config")
             .arg(std::path::absolute(config).map_err(|e| e.to_string())?);
+    }
+    if let Some(config) = std::env::var_os("MYCO_CONFIG") {
+        // Launch overrides keep their meaning after the worker changes cwd.
+        command.env(
+            "MYCO_CONFIG",
+            std::path::absolute(config).map_err(|e| e.to_string())?,
+        );
     }
     if let Some(model) = &args.model {
         command.args(["--model", model]);
