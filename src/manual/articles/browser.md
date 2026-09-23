@@ -119,12 +119,20 @@ The launcher options are documented in `cli`.
 ## Conversation controls
 
 The floating input bar stays pinned while the conversation scrolls. Enter sends;
-Shift-Enter or Alt-Enter inserts a newline. Mention `@path/to/image.png` to attach
-an image. Supported extensions are PNG, JPEG, GIF, and WebP; bytes determine
-the media type. Each image is limited by the model’s `max_image_base64_bytes`
-(default 5 MiB of base64), and attachments in one message have a 20 MiB budget.
-Bad paths or oversized images fail before the model request. Image paths with spaces
-are not supported as attachments.
+Shift-Enter or Alt-Enter inserts a newline. Use **Attach**, paste an image from
+the clipboard, or drop images onto the composer. Preview and remove images before
+sending; an image-only message is allowed. PNG, JPEG, GIF, and WebP are supported,
+with up to 20 selected or pasted images per message. Bytes determine the media
+type. The browser sends the images when you press **Send** or **Queue**;
+rejected sends keep the draft and attachments for retry.
+
+Mention `@path/to/image.png` to attach a file on the server instead. Each image is
+limited by the model’s `max_image_base64_bytes` (default 5 MiB of base64), and all
+attachments in one message share a 20 MiB budget, including `@path` images. Bad
+paths or oversized images fail before the model request. Image paths with spaces
+are not supported in `@path` mentions; selected files may have spaces in their names.
+Accepted uploads use the profile's image store and remain available in saved
+sessions after restart. Unsent attachments stay in the current tab's draft.
 
 During a turn, **Queue** accepts follow-up messages in submission order. The
 composer shows pending messages. They join the next model request after the
@@ -135,6 +143,7 @@ or closes. **Cancel & send queued** stops the current run, records cancelled
 tool results, and sends the pending messages with a fresh cancellation token.
 Queues live in the running server and are not restored after a server restart.
 A rejected submission keeps its draft.
+Queued image thumbnails are visible across session tabs and after a tab reload.
 
 The page heading and browser tab title follow the session title, including the
 first-message title and agent renames during a running turn. Hover over a truncated
@@ -183,7 +192,8 @@ without loading the whole document into memory; a single byte range supports
 media seeking on GET requests. HEAD always describes the complete file. With
 `If-Range`, the server returns the full file because it does not issue validators.
 A directory with `index.html` displays that file; directories
-without an index are not listed. There is no file upload or write route.
+without an index are not listed. Workspace files have no upload or write route;
+message attachments are stored separately in the profile's image store.
 
 Workspace HTML and SVG have their own restrictive content policy. Static HTML,
 relative images, and styles render; scripts, forms, and embedded frames are
@@ -265,6 +275,13 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `GET /files/PATH`, `HEAD /files/PATH` | Launch-directory files; GET supports a single `Range: bytes=START-END` |
 
 Use a fresh UUID per operation and reuse it when retrying that operation.
+Submit actions may include `images`, an array of base64 image data URLs. `text`
+may be omitted when images are present. The server validates image type and size,
+then keeps image-store references in its queue and history. Snapshots include
+`attachment_limits` for the selected model; queued messages include their image
+references. The action route allows up to 22 MiB of JSON for the image budget and
+text envelope; other JSON routes retain their 2 MiB limit.
+
 Creation uses the UUID as the session ID and survives restart without creating
 a duplicate. Action deduplication lasts for the running session worker; after
 restart, inspect the saved snapshot before deciding whether to submit again.

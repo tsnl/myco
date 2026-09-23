@@ -6,9 +6,7 @@ use myco::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
 };
 use myco::host::HostWorker;
-use myco::session::{
-    ActiveSession, Session, SessionLockError, SessionWriteLock, expand_image_attachments,
-};
+use myco::session::{ActiveSession, Session, SessionLockError, SessionWriteLock};
 use myco::{
     Agent, Config, ConfigUserSettings, EventSink, Harness, ListRecentService, PreludeTool,
     SessionHistoryTool, SessionMetaTool, StartupPreflight, prompts,

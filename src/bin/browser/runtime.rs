@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::super::{
     Args, Boot, Config, Session, StartupPreflight, WorkflowEvent, boot_session, persist_session,
 };
+use super::attachments;
 use super::view::{self, Block};
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ const MAX_QUEUED_MESSAGES: usize = 20;
 struct QueuedMessage {
     request_id: Uuid,
     text: String,
+    images: Vec<String>,
     accepted_at: DateTime<Utc>,
 }
 
@@ -63,6 +65,7 @@ struct Snapshot {
     title: String,
     model: String,
     models: Vec<String>,
+    attachment_limits: attachments::Limits,
     busy: bool,
     status: String,
     tasks: Vec<String>,
@@ -72,7 +75,7 @@ struct Snapshot {
 
 impl Snapshot {
     fn metadata(&self) -> Value {
-        json!({"session_id":self.session_id, "thread_id":self.thread_id, "title":self.title, "model":self.model, "busy":self.busy, "status":self.status, "queued":self.queued})
+        json!({"session_id":self.session_id, "thread_id":self.thread_id, "title":self.title, "model":self.model, "busy":self.busy, "status":self.status, "queued":self.queued, "attachment_limits":self.attachment_limits})
     }
 }
 
@@ -150,6 +153,8 @@ impl App {
             .clone()
             .unwrap_or_else(|| "New session".into());
         snapshot.model = boot.catalog_model.spec.key.clone();
+        snapshot.attachment_limits =
+            attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
         snapshot.blocks = blocks;
         snapshot.status = status.into();
         snapshot.tasks = tasks;
@@ -292,9 +297,16 @@ fn same_tool(a: &ToolUse, b: &ToolUse) -> bool {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
-    Submit { text: String },
+    Submit {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        images: Vec<String>,
+    },
     Compact,
-    SelectModel { key: String },
+    SelectModel {
+        key: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -439,6 +451,7 @@ impl Sessions {
             .map_err(Error::Internal)?
             .clone();
         let (work, receiver) = mpsc::channel(1);
+        let image_limit = catalog.spec.max_image_base64_bytes;
         let (mut boot, app) = boot_session(
             &self.args,
             self.config.clone(),
@@ -464,6 +477,7 @@ impl Sessions {
                                 .into_iter()
                                 .map(str::to_owned)
                                 .collect(),
+                            attachment_limits: attachments::Limits::new(image_limit),
                             busy: false,
                             status: "Ready".into(),
                             tasks: vec![],
@@ -661,8 +675,9 @@ async fn execute(
     args: &Args,
 ) -> std::result::Result<(), String> {
     match work.request.action {
-        Action::Submit { text } => match super::super::expand_image_attachments(
+        Action::Submit { text, images } => match attachments::content(
             &text,
+            &images,
             boot.catalog_model.spec.max_image_base64_bytes,
         ) {
             Err(error) => Err(error),
@@ -727,7 +742,7 @@ impl App {
             {
                 break;
             }
-            let content = match super::super::expand_image_attachments(&next.text, image_limit) {
+            let content = match attachments::content(&next.text, &next.images, image_limit) {
                 Ok(content) => content,
                 Err(error) => {
                     self.notice(format!("Queued message could not be sent: {error}"));
@@ -764,7 +779,10 @@ impl App {
         self.publish(snapshot, json!({"kind":"meta", "meta":snapshot.metadata()}));
     }
 
-    pub(super) fn accept(&self, request: ActionRequest) -> Result<()> {
+    pub(super) fn accept(&self, mut request: ActionRequest) -> Result<()> {
+        if let Action::Submit { images, .. } = &mut request.action {
+            attachments::externalize(images).map_err(Error::Invalid)?;
+        }
         let mut live = self.live.lock().unwrap();
         if self.shutdown.is_cancelled() {
             return Err(Error::Unavailable("The server is stopping.".into()));
@@ -788,8 +806,18 @@ impl App {
                 "Wait for the current run or cancel it first.".into(),
             ));
         }
-        if matches!(&request.action, Action::Submit { text } if text.trim().is_empty()) {
-            return Err(Error::Invalid("Enter a message.".into()));
+        if let Action::Submit { text, images } = &request.action {
+            if text.trim().is_empty() && images.is_empty() {
+                return Err(Error::Invalid("Enter a message or attach an image.".into()));
+            }
+            if !images.is_empty() {
+                attachments::content(
+                    text,
+                    images,
+                    live.snapshot.attachment_limits.max_image_base64_bytes,
+                )
+                .map_err(Error::Invalid)?;
+            }
         }
         if live.snapshot.status == "Cancelling" {
             return Err(Error::Conflict("Wait for cancellation to finish.".into()));
@@ -806,12 +834,13 @@ impl App {
                     "The message queue is full (20 messages).".into(),
                 ));
             }
-            let Action::Submit { text } = &request.action else {
+            let Action::Submit { text, images } = &request.action else {
                 unreachable!()
             };
             live.snapshot.queued.push_back(QueuedMessage {
                 request_id: request.request_id,
                 text: text.clone(),
+                images: images.clone(),
                 accepted_at,
             });
         } else {

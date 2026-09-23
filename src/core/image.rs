@@ -1,5 +1,5 @@
-//! Image file policy shared by browser `@path` attachments and the `view_image`
-//! tool: magic-number type detection and file → `data:` URL reading, under a
+//! Image policy shared by browser attachments and the `view_image`
+//! tool: magic-number type detection and byte/file → `data:` URL reading, under a
 //! size cap the caller supplies.
 //!
 //! The cap itself is not decided here. It belongs to the model, so it is
@@ -58,6 +58,9 @@ pub fn read_image_data_url(
     max_base64_bytes: u64,
 ) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("image {label} must be a regular file"));
+    }
     let encoded = base64_len(meta.len());
     if encoded > max_base64_bytes {
         return Err(format!(
@@ -69,11 +72,22 @@ pub fn read_image_data_url(
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
-    let media_type = infer::get(&bytes)
+    image_data_url(&bytes, label, max_base64_bytes)
+}
+
+/// Validate and encode uploaded or file bytes using the same format and size policy.
+pub fn image_data_url(bytes: &[u8], label: &str, max_base64_bytes: u64) -> Result<String, String> {
+    if base64_len(bytes.len() as u64) > max_base64_bytes {
+        return Err(format!(
+            "image {label} exceeds the limit of {} encoded for upload. Resize or re-compress it and resubmit",
+            mib(max_base64_bytes),
+        ));
+    }
+    let media_type = infer::get(bytes)
         .map(|kind| kind.mime_type())
         .filter(|mime| SUPPORTED_MEDIA_TYPES.contains(mime))
         .ok_or_else(|| format!("{label} is not a png, jpeg, gif, or webp image"))?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(format!("data:{media_type};base64,{data}"))
 }
 
@@ -210,5 +224,18 @@ mod tests {
         let err = read_image_data_url(Path::new("/definitely/missing.png"), "@missing.png", CAP)
             .unwrap_err();
         assert!(err.contains("@missing.png"), "{err}");
+    }
+
+    #[test]
+    fn non_files_fail_before_reading_unbounded_or_blocking_sources() {
+        let dir = temp_dir("image-directory");
+        let err = read_image_data_url(dir.path(), "@directory.png", CAP).unwrap_err();
+        assert!(err.contains("must be a regular file"), "{err}");
+        #[cfg(unix)]
+        assert!(
+            read_image_data_url(Path::new("/dev/zero"), "@zero.png", CAP)
+                .unwrap_err()
+                .contains("must be a regular file")
+        );
     }
 }

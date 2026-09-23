@@ -1,5 +1,6 @@
 import { $, api, element, error, newSession, requestId } from '/common.js';
 import { showActivity } from '/activity.js';
+import { imageAttachments } from '/attachments.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -13,6 +14,7 @@ const sessionId = decodeURIComponent(location.pathname.slice('/sessions/'.length
 const nodes = [];
 const markdownJobs = new WeakMap();
 const toolClocks = new WeakMap();
+const attachments = imageAttachments(() => state.attachment_limits, () => metadata());
 
 function updateToolDuration(node, now = performance.now()) {
   const elapsed = Number(node.dataset.elapsed) + (node.dataset.running === 'true' ? now - Number(node.dataset.observed) : 0);
@@ -238,7 +240,8 @@ function metadata() {
   const disabled = !connected || !state.session_id || state.busy || selectingModel;
   model.disabled = disabled;
   activity();
-  $('send').disabled = !connected || !state.session_id || selectingModel || sending || state.status === 'Cancelling';
+  attachments.lock(sending);
+  $('send').disabled = !connected || !state.session_id || selectingModel || sending || !attachments.ready || state.status === 'Cancelling';
   $('send').textContent = state.busy ? 'Queue ↵' : 'Send ↵';
   $('input-hint').textContent = state.busy ? 'Enter to queue · Sent after the current tools finish' : 'Enter to send · Shift+Enter for a new line';
   $('cancel').hidden = !state.busy;
@@ -250,7 +253,11 @@ function metadata() {
   const signature = JSON.stringify(queued);
   if (list.dataset.messages !== signature) {
     list.dataset.messages = signature;
-    list.replaceChildren(...queued.map((message) => element('li', '', message.text)));
+    list.replaceChildren(...queued.map((message) => {
+      const item = element('li', '', message.text);
+      addImages(item, message.images);
+      return item;
+    }));
   }
   $('compact').disabled = disabled || !state.blocks.length;
   $('session-title').textContent = state.title || 'Session';
@@ -330,20 +337,24 @@ async function sendAction(action, id = requestId()) {
 }
 $('composer').onsubmit = async (event) => {
   event.preventDefault();
-  if (!connected || !state.session_id || selectingModel || sending || state.status === 'Cancelling') return;
-  const text = $('prompt').value.trim(); if (!text) return;
-  let action = { kind: 'submit', text };
+  if (!connected || !state.session_id || selectingModel || sending || !attachments.ready || state.status === 'Cancelling') return;
+  const text = $('prompt').value.trim(), imageIds = attachments.ids;
+  if (!text && !imageIds.length) return;
+  let action = { kind: 'submit', text, images: attachments.sources };
   if (text.startsWith('/')) {
+    if (imageIds.length) { error('Send or remove your attached images before using a slash command.'); return; }
     if (text === '/new') { newSession(); $('prompt').value = ''; resizeInput(); return; }
     else if (text === '/compact') action = { kind: 'compact' };
     else if (text.startsWith('/resume ')) { location.assign(`/sessions/${encodeURIComponent(text.slice(8).trim())}`); return; }
     else { error(text === '/verbose' ? 'Expand an individual tool block to see its full input and output.' : 'Use /new, /compact, /resume <id>, or the session controls.'); return; }
   }
-  if (!pending || pending.text !== text || pending.session !== state.session_id) pending = { text, session: state.session_id, id: requestId() };
+  const signature = JSON.stringify([state.session_id, text, imageIds]);
+  if (pending?.signature !== signature) pending = { signature, id: requestId() };
   sending = true; metadata();
   try {
     await sendAction(action, pending.id);
     if ($('prompt').value.trim() === text) { $('prompt').value = ''; resizeInput(); }
+    attachments.discard(imageIds);
     pending = null;
   } catch (e) { error(`${e.message} Your draft is still here.`); }
   finally { sending = false; metadata(); }

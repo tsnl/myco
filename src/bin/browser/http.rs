@@ -59,7 +59,11 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/events", get(events))
         .route("/api/sessions", get(sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_snapshot))
-        .route("/api/sessions/{id}/action", post(session_action))
+        .route(
+            "/api/sessions/{id}/action",
+            post(session_action)
+                .layer(DefaultBodyLimit::max(super::attachments::ACTION_BODY_LIMIT)),
+        )
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/markdown", post(render_markdown))
@@ -160,7 +164,10 @@ pub(super) async fn session_action(
             "The request belongs to a different session.".into(),
         ));
     }
-    server.sessions.open(&id).await?.accept(request)?;
+    let app = server.sessions.open(&id).await?;
+    tokio::task::spawn_blocking(move || app.accept(request))
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))??;
     Ok(StatusCode::ACCEPTED)
 }
 

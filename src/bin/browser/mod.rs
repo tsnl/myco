@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::Args;
 
 mod assets;
+mod attachments;
 mod files;
 mod http;
 mod markdown;
