@@ -62,6 +62,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         fixture = self.server.fixture
         fixture.requests.append(body)
+        fixture.request_received.set()
         prompts = []
         resuming = False
         for item in body["input"]:
@@ -172,6 +173,7 @@ class BrowserTests(unittest.TestCase):
         self.artifacts = OPTIONS.artifacts / self._testMethodName
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.requests = []
+        self.request_received = threading.Event()
         self.turns = {}
         self.processes = []
         self.errors = []
@@ -1012,6 +1014,7 @@ context_window = 100000
         self.pause_browser_polling(home)
         self.submit(page, 'Alpha generate')
         expect(status).to_have_attribute('data-busy', 'true')
+        self.assertTrue(self.request_received.wait(10), 'Generation must reach the provider before disconnecting')
         self.stop(self.process)
         for indicator in [page.locator('#connection'), home.locator('#connection'), status]:
             expect(indicator).to_have_text('Reconnecting…')
