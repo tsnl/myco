@@ -82,7 +82,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown strong { font-weight: 800; }
 .markdown em { font-style: normal; font-weight: 600; }
 .markdown p { margin: .8em 0; }
-.markdown a { color: var(--cyan); text-decoration: underline; text-underline-offset: 3px; }
+.markdown a, .user .body a, .tool .output a, #queued-list a { color: var(--cyan); text-decoration: underline; text-underline-offset: 3px; }
 .markdown blockquote { margin: 1em 0; padding: 0 16px; border-left: 2px solid var(--dim); color: var(--dim); }
 .markdown ul, .markdown ol { padding-left: 2em; }
 .markdown pre, .tool pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0; padding: 12px; background: #060e1f59; border: 1px solid var(--line); border-radius: 0; font: inherit; tab-size: 4; }

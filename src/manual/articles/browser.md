@@ -175,7 +175,9 @@ include remote tools too.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
 blockquote text, code blocks, links, and images. Text uses one font size;
-headings use weight and underlines. Raw HTML is displayed as text. Markdown
+headings use weight and underlines. Plain HTTP(S) and `www.` URLs become clickable
+in messages, queued messages, and tool output, and open in a new tab. Inline and
+fenced Markdown code stays literal. Raw HTML is displayed as text. Markdown
 images can reference HTTP(S) URLs, supported image data URLs, or local files.
 The server rewrites workspace image and file links to `/files/`
 URLs, including browser formats such as SVG and AVIF. Relative paths resolve
