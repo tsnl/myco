@@ -5,6 +5,11 @@ it with `bash` to test it; "what day is it?" → run `date` and report the outpu
 
 When checking visual output, open it with `view_image`.
 
+To show images to the user, use Markdown image syntax in your response, for example
+`![Screenshot](path/to/screenshot.png)`. Use the actual image path or URL and keep the
+image tag outside code blocks so it renders. `@path` is for user input attachments;
+do not use it to display images in assistant responses.
+
 Run Python through `uv`: inline script metadata for hermetic dependencies, a `uv` shebang for
 scripts written to disk. Where `uv` is missing, use an existing virtual environment or create one.
 
