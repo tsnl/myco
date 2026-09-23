@@ -40,6 +40,19 @@ def tool(arguments, name="bash", index=0):
     ]
 
 
+def compaction_reply(body):
+    for spec in body.get('tools', []):
+        fields = spec.get('parameters', {}).get('properties', {})
+        if spec.get('name') != 'session_history' or 'const' not in fields.get('session_id', {}):
+            continue
+        if any(item.get('type') == 'function_call_output' for item in body['input']):
+            return reply('Summary saved.')
+        return tool({'action': 'write_summary', 'session_id': fields['session_id']['const'],
+                     'thread_id': fields['thread_id']['const'], 'markdown': 'Continue the browser fixture task.'},
+                    'session_history')
+    return None
+
+
 class Provider(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
@@ -63,10 +76,13 @@ class Provider(http.server.BaseHTTPRequestHandler):
         fixture.turns[prompt] = count + 1
         name = "Alpha" if "Alpha" in prompt else "Beta"
         root = fixture.home
-        if "fail" in prompt:
+        compact = compaction_reply(body)
+        if compact is not None:
+            events = compact
+        elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
-        if count and "links" in prompt:
+        elif count and "links" in prompt:
             events = reply(fixture.link_reply)
         elif count == 1 and "rename" in prompt:
             release = shlex.quote(str(root / (name + "-rename-release")))
@@ -106,7 +122,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
                            f"![Local image]({root / 'pixel.png'})\n\n"
                            + "\n\n".join(f"Paragraph {i}: session output." for i in range(24)))
         events.append({"type": "response.completed", "response": {
-            "status": "completed", "usage": {"input_tokens": 100, "output_tokens": 20}}})
+            "status": "completed", "usage": getattr(fixture, 'usage', {"input_tokens": 100, "output_tokens": 20})}})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
@@ -228,6 +244,91 @@ context_window = 100000
     def image_urls(self, request):
         return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
                 for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
+
+    def test_token_usage_updates_during_tools_across_tabs_and_survives_restart(self):
+        page = self.session(self.page)
+        expect(page.locator('#context-usage')).to_have_text('Context — / 100K')
+        expect(page.locator('#output-tokens')).to_have_text('Output —')
+        self.usage = {'input_tokens': 24321, 'output_tokens': 30, 'input_tokens_details': {'cached_tokens': 12000}}
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        expect(page.locator('#context-usage')).to_have_text('Context 24.3K / 100K · 24%')
+        expect(page.locator('#context-usage')).to_have_attribute('title', re.compile('24,321 / 100,000 tokens'))
+        expect(page.locator('#input-tokens')).to_have_text('Input 24.3K')
+        expect(page.locator('#output-tokens')).to_have_text('Output 30')
+        expect(page.locator('#cached-tokens')).to_have_text('Cached 12K')
+        mirror = self.context.new_page()
+        mirror.goto(page.url)
+        expect(mirror.locator('#context-usage')).to_have_text('Context 24.3K / 100K · 24%')
+        self.usage = {'input_tokens': 32000, 'output_tokens': 8}
+        (self.home / 'Alpha-release').touch()
+        for tab in [page, mirror]:
+            expect(tab.locator('#model')).to_be_enabled()
+            expect(tab.locator('#context-usage')).to_have_text('Context 32K / 100K · 32%')
+            expect(tab.locator('#output-tokens')).to_have_text('Output 38')
+            expect(tab.locator('#cached-tokens')).to_have_text('Cached 0')
+        self.submit(page, 'Beta generate')
+        expect(page.locator('#cancel')).to_be_visible()
+        page.click('#cancel')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#output-tokens')).to_have_text('Output 38')
+        self.submit(page, 'Alpha fail')
+        expect(page.locator('#connection')).to_have_text('Stopped')
+        expect(page.locator('#output-tokens')).to_have_text('Output 38')
+        session_url = page.url
+        page.reload()
+        expect(page.locator('#context-usage')).to_have_text('Context 32K / 100K · 32%')
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.goto(session_url)
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#output-tokens')).to_have_text('Output 38')
+        expect(page.locator('#context-usage')).to_have_text('Context 32K / 100K · 32%')
+        self.usage = {'input_tokens': 1500, 'output_tokens': 7}
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('#output-tokens')).to_have_text('Output 7')
+
+    def test_model_change_updates_context_capacity_and_distinguishes_missing_usage_from_zero(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        first, second = config.read_text().split('[models.second]')
+        config.write_text(first + '[models.second]' + second.replace('context_window = 100000', 'context_window = 200000'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#output-tokens')).to_have_text('Output 20')
+        expect(page.locator('#model')).to_be_enabled()
+        page.select_option('#model', 'second')
+        expect(page.locator('#model')).to_have_value('second')
+        expect(page.locator('#context-usage')).to_have_text('Context — / 200K')
+        expect(page.locator('#output-tokens')).to_have_text('Output —')
+        self.usage = None
+        self.submit(page, 'Beta images')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#context-usage')).to_have_text('Context — / 200K')
+        self.usage = {'input_tokens': 0, 'output_tokens': 0}
+        self.submit(page, 'Beta images')
+        expect(page.locator('#context-usage')).to_have_text('Context 0 / 200K · 0%')
+        expect(page.locator('#input-tokens')).to_have_text('Input 0')
+        expect(page.locator('#output-tokens')).to_have_text('Output 0')
+
+    def test_compaction_clears_context_measurement_until_the_next_model_request(self):
+        page = self.session(self.page)
+        self.usage = {'input_tokens': 80000, 'output_tokens': 20}
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#context-usage')).to_have_text('Context 80K / 100K · 80%')
+        expect(page.locator('#model')).to_be_enabled()
+        page.click('#compact')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#context-usage')).to_have_text('Context — / 100K')
+        expect(page.locator('#output-tokens')).to_have_text('Output —')
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#context-usage')).to_have_text('Context — / 100K')
+        self.usage = {'input_tokens': 512, 'output_tokens': 6}
+        self.submit(page, 'Beta images')
+        expect(page.locator('#context-usage')).to_have_text('Context 512 / 100K · 1%')
+        expect(page.locator('#output-tokens')).to_have_text('Output 6')
 
     def test_message_timestamps_use_local_time_and_update_without_a_new_turn(self):
         context = self.browser.new_context(locale='en-US', timezone_id='America/Los_Angeles')

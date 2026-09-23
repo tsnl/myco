@@ -3,6 +3,7 @@ import { showActivity } from '/activity.js';
 import { imageAttachments } from '/attachments.js';
 import { linkify, setLinkedText } from '/links.js';
 import { messageTimestamp } from '/timestamps.js';
+import { showUsage } from '/usage.js';
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
@@ -237,6 +238,7 @@ function snapshot(next) {
   metadata();
 }
 function metadata() {
+  showUsage(state);
   const model = $('model');
   const keys = state.models || [];
   if (keys.length !== model.options.length || keys.some((key, index) => model.options[index]?.value !== key)) {
