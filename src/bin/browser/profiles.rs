@@ -166,8 +166,7 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
 }
 
 fn router(profiles: Arc<Profiles>) -> Router {
-    Router::new()
-        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+    super::assets::icons()
         .route("/profiles/", get(chooser))
         .route("/api/profiles", get(list))
         .route("/api/profile-events", get(events))
@@ -302,6 +301,8 @@ fn page(title: &str, content: &str) -> Html<String> {
 <html lang="en"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{title} · myco</title><link rel="stylesheet" href="/profile-style.css">
+  <link rel="icon" href="/favicon.ico" sizes="16x16 32x32">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
 </head><body><main id="session-browser"><h1>{title}</h1>{content}</main></body></html>"#
     ))
 }

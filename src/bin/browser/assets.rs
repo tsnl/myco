@@ -50,7 +50,7 @@ const ASSETS: &[(&str, &str)] = &[
 ];
 
 pub(super) fn routes<S: Clone + Send + Sync + 'static>(base: &str) -> Router<S> {
-    let mut router = Router::new();
+    let mut router = icons();
     for &(path, body) in ASSETS {
         let content_type = match path.rsplit_once('.') {
             Some((_, "js")) => "text/javascript; charset=utf-8",
@@ -81,4 +81,27 @@ pub(super) fn routes<S: Clone + Send + Sync + 'static>(base: &str) -> Router<S> 
         );
     }
     router
+}
+
+// Both the supervisor and each profile serve icons without loading a session.
+pub(super) fn icons<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/svg+xml")],
+                    include_str!("assets/favicon.svg"),
+                )
+            }),
+        )
+        .route(
+            "/favicon.ico",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/vnd.microsoft.icon")],
+                    include_bytes!("assets/favicon.ico").as_slice(),
+                )
+            }),
+        )
 }
