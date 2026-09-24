@@ -142,6 +142,14 @@ when tools remain open after the run. **Ready**, **Stopped**, and **Saved** are 
 disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
 
+The input border also shows the session's state. **Running** and **Compacting**
+carry a travelling highlight and soft glow using the sky's current light color.
+**Ready** keeps the neutral glass border; **Stopped** is steady red.
+**Cancelling** and **Reconnecting…** are amber, and **Background tasks** uses a
+fainter, steady sky glow. A stopped run keeps its red border while background
+tools remain open. Hidden tabs pause the animation; reduced-motion
+preferences keep it still. The text status remains available in every state.
+
 **New session** opens a separate tab, creates a session,
 and navigates that tab to its `/profiles/NAME/sessions/<id>` URL. Session links work with
 bookmarks, middle-click, and browser tab groups. Click the myco name to return

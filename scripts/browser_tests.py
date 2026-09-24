@@ -548,12 +548,14 @@ context_window = 100000
         page = self.session(self.page)
         self.submit(page, 'Alpha images')
         expect(page.locator('#connection')).to_have_text('Compacting')
+        expect(page.locator('#composer-frame')).to_have_attribute('data-state', 'running')
         expect(page.locator('.assistant .body')).to_have_text('Alpha finished.')
         self.usage = {'input_tokens': 512, 'output_tokens': 6}
         self.compaction_release.set()
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('.assistant .body')).to_have_text(['Alpha finished.'] * 2)
         expect(page.locator('#context-usage')).to_have_text('Context 512 / 100K · 1%')
+        expect(page.locator('#composer-frame')).to_have_attribute('data-state', 'ready')
         expect(page.locator('#transcript')).not_to_contain_text('Resumption')
 
     def test_smaller_model_compacts_before_the_next_message_even_after_restart(self):
@@ -1102,6 +1104,46 @@ context_window = 100000
         expect(beta.locator('#connection')).to_have_attribute('data-busy', 'false')
         expect(beta_status).to_have_attribute('data-busy', 'false', timeout=2000)
 
+    def test_composer_light_follows_running_stopped_ready_and_connection_state(self):
+        page = self.session(self.page)
+        frame, composer = page.locator('#composer-frame'), page.locator('#composer')
+        light = page.locator('.composer-light')
+        expect(frame).to_have_attribute('data-state', 'ready')
+        idle_border = composer.evaluate('n => getComputedStyle(n).borderTopColor')
+        self.submit(page, 'Alpha generate')
+        expect(page.locator('#connection')).to_have_text('Running')
+        expect(frame).to_have_attribute('data-state', 'running')
+        expect(composer).not_to_have_css('border-top-color', idle_border)
+        page.wait_for_function("document.querySelector('#composer-frame').getAnimations({subtree: true}).some(a => a.playState === 'running' && a.effect.getComputedTiming().iterations === Infinity)")
+        before = light.evaluate("n => getComputedStyle(n, '::before').backgroundImage")
+        page.wait_for_function("before => getComputedStyle(document.querySelector('.composer-light'), '::before').backgroundImage !== before", arg=before)
+        self.assertIn('drop-shadow', light.evaluate('n => getComputedStyle(n).filter'))
+        page.emulate_media(reduced_motion='reduce')
+        self.assertFalse(frame.evaluate('n => n.getAnimations({subtree: true}).some(a => a.effect.getComputedTiming().iterations === Infinity)'))
+        expect(light).to_have_css('opacity', '1')
+        page.emulate_media(reduced_motion='no-preference')
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertEqual(light.evaluate("n => getComputedStyle(n, '::before').animationPlayState"), 'paused')
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        page.click('#cancel')
+        expect(frame).to_have_attribute('data-state', 'stopped')
+        stopped_border = composer.evaluate('n => getComputedStyle(n).borderTopColor')
+        channels = [float(value) for value in re.findall(r'[\d.]+', stopped_border)][:3]
+        self.assertGreater(channels[0], channels[1])
+        self.assertGreater(channels[0], channels[2])
+        page.reload()
+        expect(frame).to_have_attribute('data-state', 'stopped')
+        expect(composer).to_have_css('border-top-color', stopped_border)
+        self.turns['Beta images'] = 1
+        self.submit(page, 'Beta images')
+        expect(frame).to_have_attribute('data-state', 'ready')
+        expect(composer).to_have_css('border-top-color', idle_border)
+        self.stop(self.process)
+        expect(frame).to_have_attribute('data-state', 'reconnecting')
+        expect(composer).not_to_have_css('border-top-color', idle_border)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        expect(frame).to_have_attribute('data-state', 'ready', timeout=15000)
+
     def test_background_button_keeps_process_alive_across_reload_and_cancellation_of_a_later_turn(self):
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')
@@ -1114,6 +1156,7 @@ context_window = 100000
         expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('#connection')).to_have_text('Background tasks')
+        expect(page.locator('#composer-frame')).to_have_attribute('data-state', 'background')
         results = [item for item in self.requests[-1]['input'] if item.get('type') == 'function_call_output']
         self.assertIn('User backgrounded this call', json.dumps(results))
         self.assertFalse((self.home / 'Alpha-done').exists())
@@ -1124,6 +1167,7 @@ context_window = 100000
         expect(page.locator('#connection')).to_have_text('Running')
         page.click('#cancel')
         expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#composer-frame')).to_have_attribute('data-state', 'stopped')
         (self.home / 'Alpha-release').touch()
         expect(page.locator('#connection')).to_have_text('Stopped')
         self.assertEqual((self.home / 'Alpha-done').read_text(), 'done')
@@ -1666,6 +1710,9 @@ context_window = 100000
         glass = lambda: page.locator('.toolbar').evaluate("n => getComputedStyle(n).backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number)")
         day_glass = glass()
         self.assertGreater(day_glass[2], day_glass[0], 'Daylight glass should carry the cool sky tint')
+        emission = lambda: page.locator('#composer-frame').evaluate("n => getComputedStyle(n).getPropertyValue('--composer-emission').match(/[\\d.]+/g).map(Number)")
+        day_light = emission()
+        self.assertGreater(day_light[2], day_light[0])
         morning = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
         canvas = page.locator(".cloud-low canvas").first
         # Compare rendered alpha and RGB independently: relighting must preserve
@@ -1692,6 +1739,7 @@ context_window = 100000
             page.clock.fast_forward(60000)
             warm = glass()
             self.assertGreater(warm[0], warm[2], 'Twilight glass should follow the warm sky')
+            self.assertGreater(emission()[0], emission()[2], 'Composer light follows dawn and dusk')
             surfaces = page.evaluate("""() => [getComputedStyle(document.body, '::before'),
                 ...['#composer', '#settings', '#activity'].map(selector => getComputedStyle(document.querySelector(selector)))]
                 .map(style => style.backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number))""")
@@ -1705,6 +1753,9 @@ context_window = 100000
         night_glass = glass()
         self.assertGreater(night_glass[2], night_glass[0])
         self.assertLess(sum(night_glass), sum(day_glass), 'Night glass keeps its deeper blue tone')
+        night_light = emission()
+        self.assertGreater(night_light[2], night_light[0])
+        self.assertLess(sum(night_light), sum(day_light))
 
     def test_sky_renderer_failure_keeps_the_fallback_and_conversation_usable(self):
         self.assert_sky_fallback_conversation("cloud-renderer.js")

@@ -45,6 +45,7 @@ export function createAtmosphere(sky) {
   sky.append(atmosphere, glow, stars);
   return state => {
     document.documentElement.style.setProperty('--glass-tint', state.glassTint);
+    document.documentElement.style.setProperty('--sky-light', state.light.color);
     atmosphere.style.backgroundImage = state.gradient;
     atmosphere.style.opacity = String(1 - state.night * 0.92);
     sky.style.setProperty('--overcast', String(state.gloom * 0.55));
