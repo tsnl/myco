@@ -1237,6 +1237,7 @@ context_window = 100000
         expect(page.locator('.tool.running')).to_have_attribute('open', '')
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(2)
+        expect(page.locator('#activity-list .active-call').first).to_contain_text('Alpha-release')
         for indicator in [page.locator('#connection'), status]:
             expect(indicator).to_have_text('Running')
             expect(indicator).to_have_attribute('data-busy', 'true')

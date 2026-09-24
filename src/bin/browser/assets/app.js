@@ -326,6 +326,7 @@ function metadata() {
 function activity() {
   document.body.classList.toggle('activity-disconnected', !connected);
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
+  calls.sort((a, b) => Number(b.block.blocking) - Number(a.block.blocking));
   const count = calls.length;
   $('activity-count').textContent = count;
   $('activity-count').hidden = !count;

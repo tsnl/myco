@@ -242,6 +242,8 @@ commands released with **Background** remain running in that card, with an
 advancing timer and pulsing border, until the process and its output streams
 finish. The same border appears on Activity entries. Reduced-motion preferences
 keep the borders steady; hidden or disconnected tabs pause their animation.
+Calls still blocking the assistant appear first, followed by retained processes,
+with the same controls and styling throughout the list.
 
 Process status refreshes every second without consuming output. Already connected
 remote hosts are included; polling never connects a lazy host. Failed observations

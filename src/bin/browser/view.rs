@@ -52,7 +52,7 @@ pub(super) enum Block {
     Tool {
         #[serde(skip)]
         call_id: uuid::Uuid,
-        #[serde(skip)]
+        #[serde(rename = "blocking")]
         waiting: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         resource: Option<ToolResourceRef>,
