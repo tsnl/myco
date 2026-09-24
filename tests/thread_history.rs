@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use myco::thread::{ContentPart, Entry, EvidenceId, HistoryRef, OperationId, Thread, ThreadId};
+use myco::thread::{ContentPart, Entry, EvidenceId, OperationId, Thread, ThreadId};
 
 //
 // Owned history
@@ -33,27 +33,21 @@ fn cloned_values_can_grow_independently_without_shared_storage() {
 }
 
 #[test]
-fn constructing_a_thread_preserves_external_source_and_evidence_references() {
-    let sources = vec![HistoryRef {
-        thread: ThreadId(100),
-        entries: 2..4,
-    }];
+fn constructing_a_thread_preserves_entries_and_evidence_references() {
     let entries = vec![Entry::Assistant {
         content: vec![ContentPart::Text("summary".into())],
         evidence: Some(EvidenceId(200)),
     }];
-    let mut thread = Thread::from_parts(ThreadId(1), entries.clone(), sources.clone());
+    let mut thread = Thread::from_parts(ThreadId(1), entries.clone());
     let snapshot = thread.clone();
     thread.append(Entry::User("continue".into()));
 
     assert_eq!(snapshot.entries(), entries);
-    assert_eq!(snapshot.sources(), sources);
-    assert_eq!(thread.sources(), sources);
     assert_eq!(thread.id(), ThreadId(1));
 }
 
 //
-// Forks and fixed references
+// Forks
 //
 
 #[test]
@@ -74,39 +68,7 @@ fn forks_copy_only_the_selected_prefix_and_then_grow_independently() {
         ]
     );
     assert_eq!(source.entries()[1], Entry::User("source only".into()));
-    let history = &branch.sources()[0];
-    assert_eq!(
-        history,
-        &HistoryRef {
-            thread: source.id(),
-            entries: 0..1
-        }
-    );
-    assert_eq!(
-        &source.entries()[history.entries.clone()],
-        &branch.entries()[..1]
-    );
-}
-
-#[test]
-fn a_fork_records_its_immediate_source_without_copying_its_ancestry() {
-    let source = Thread::from_parts(
-        ThreadId(1),
-        vec![Entry::User("summary".into())],
-        vec![HistoryRef {
-            thread: ThreadId(100),
-            entries: 0..20,
-        }],
-    );
-    let branch = source.fork(ThreadId(2), 1).unwrap();
-    assert_eq!(
-        branch.sources(),
-        &[HistoryRef {
-            thread: source.id(),
-            entries: 0..1
-        }]
-    );
-    assert_eq!(source.sources()[0].thread, ThreadId(100));
+    assert_eq!(&source.entries()[..1], &branch.entries()[..1]);
 }
 
 #[test]
@@ -163,7 +125,7 @@ fn forks_preserve_ordered_content_tool_correlation_and_evidence() {
         Entry::Error("error".into()),
         Entry::Notification("notice".into()),
     ];
-    let source = Thread::from_parts(ThreadId(1), entries.clone(), vec![]);
+    let source = Thread::from_parts(ThreadId(1), entries.clone());
     let branch = source.fork(ThreadId(2), entries.len()).unwrap();
     assert_eq!(source.entries(), entries);
     assert_eq!(branch.entries(), entries);

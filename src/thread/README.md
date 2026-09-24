@@ -17,29 +17,20 @@ thread.append(Entry::Notification("Review started.".into()));
 
 assert_eq!(snapshot.entries().len(), 1);
 assert_eq!(thread.entries().len(), 2);
-assert_eq!(branch.sources()[0].thread, thread.id());
+assert_eq!(branch.id(), ThreadId(2));
 ```
 
-## Ownership and references
+## Ownership
 
-`Thread` owns dense vectors. Appending requires `&mut self` and leaves existing
-entries unchanged. Cloning copies the entries and source references, preserving
+`Thread` owns its ID and entry vector. Appending requires `&mut self` and leaves
+existing entries unchanged. Cloning copies the entries, preserving
 identity. The copy can grow independently; it has no connection to the original.
 The kernel decides which instance is authoritative for an ID and uses fresh IDs
 for branches that it manages independently.
 
-`fork` copies a prefix under a caller-supplied ID, recording that fixed range as
-its immediate source. Empty and complete prefixes are valid; an out-of-bounds
-prefix returns `None`. Sources are references, not recursively copied histories.
-`from_parts` constructs a value from externally supplied entries and sources;
-it performs no lookup or publication.
-
-A `HistoryRef` identifies a thread and a half-open entry range. Because history
-is append-only, growing that thread leaves the referenced prefix unchanged. The
-kernel allocates unique IDs, resolves and validates references, and retains the
-thread instances or snapshots needed by callers. Replacing existing entries
-requires a new identity; independently modified copies must not be published as
-competing histories under one ID.
+`fork` copies a prefix under a caller-supplied ID. Empty and complete prefixes are
+valid; an out-of-bounds prefix returns `None`. `from_parts` constructs a value from
+an ID and entries. Workflows and the kernel track how threads were derived.
 
 Collections of threads, snapshots, serialization formats, persistence, operation
 receipts, cancellation, and publication checks are responsibilities of the kernel

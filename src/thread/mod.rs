@@ -1,7 +1,5 @@
 #![doc = include_str!("README.md")]
 
-use std::ops::Range;
-
 use serde_json::Value;
 
 //
@@ -12,20 +10,15 @@ use serde_json::Value;
 pub struct Thread {
     id: ThreadId,
     entries: Vec<Entry>,
-    sources: Vec<HistoryRef>,
 }
 
 impl Thread {
     pub fn new(id: ThreadId) -> Self {
-        Self::from_parts(id, vec![], vec![])
+        Self::from_parts(id, vec![])
     }
 
-    pub fn from_parts(id: ThreadId, entries: Vec<Entry>, sources: Vec<HistoryRef>) -> Self {
-        Self {
-            id,
-            entries,
-            sources,
-        }
+    pub fn from_parts(id: ThreadId, entries: Vec<Entry>) -> Self {
+        Self { id, entries }
     }
 
     pub fn id(&self) -> ThreadId {
@@ -36,26 +29,18 @@ impl Thread {
         &self.entries
     }
 
-    pub fn sources(&self) -> &[HistoryRef] {
-        &self.sources
-    }
-
     pub fn append(&mut self, entry: Entry) {
         self.entries.push(entry);
     }
 
     pub fn fork(&self, id: ThreadId, prefix_len: usize) -> Option<Self> {
         let entries = self.entries.get(..prefix_len)?.to_vec();
-        let source = HistoryRef {
-            thread: self.id,
-            entries: 0..prefix_len,
-        };
-        Some(Self::from_parts(id, entries, vec![source]))
+        Some(Self::from_parts(id, entries))
     }
 }
 
 //
-// References
+// Identifiers
 //
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,12 +51,6 @@ pub struct OperationId(pub u128);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EvidenceId(pub u128);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryRef {
-    pub thread: ThreadId,
-    pub entries: Range<usize>,
-}
 
 //
 // Entries

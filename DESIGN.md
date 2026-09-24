@@ -11,7 +11,7 @@ targets of the same package. The browser GUI is a separate Yew application.
 src/
   lib.rs
   model/                       # Inference client, types, and private drivers
-  thread/                      # Owned conversations, history references, and forks
+  thread/                      # Owned conversations and local history operations
   logic/
     agent.rs                   # Conversation and tool loop
     compact.rs                 # Summarization and continuation
@@ -232,40 +232,30 @@ A thread is an owned, append-only conversation in memory. The kernel holds and
 manages distinct `Thread` instances; the history module operates on those values.
 
 ```rust
-pub struct HistoryRef {
-    pub thread: ThreadId,
-    pub entries: std::ops::Range<usize>,
-}
-
 #[derive(Clone)]
 pub struct Thread {
     id: ThreadId,
     entries: Vec<Entry>,
-    sources: Vec<HistoryRef>,
 }
 
 impl Thread {
     pub fn new(id: ThreadId) -> Self;
-    pub fn from_parts(id: ThreadId, entries: Vec<Entry>, sources: Vec<HistoryRef>) -> Self;
+    pub fn from_parts(id: ThreadId, entries: Vec<Entry>) -> Self;
     pub fn id(&self) -> ThreadId;
     pub fn entries(&self) -> &[Entry];
-    pub fn sources(&self) -> &[HistoryRef];
     pub fn append(&mut self, entry: Entry);
     pub fn fork(&self, id: ThreadId, prefix_len: usize) -> Option<Self>;
 }
 ```
 
 Owned values use dense vectors. Appending requires an exclusive borrow and leaves
-existing entries unchanged. Cloning copies entries and source references while
-preserving identity; each copy can grow independently. Fork copies a prefix under
-a caller-supplied ID and records its immediate source range. An out-of-bounds
-prefix returns `None`; empty and full prefixes are valid.
+existing entries unchanged. Cloning copies entries while preserving identity;
+each copy can grow independently. Fork copies a prefix under a caller-supplied ID.
+An out-of-bounds prefix returns `None`; empty and full prefixes are valid.
 
-The kernel allocates unique IDs, resolves and validates history references, and
-retains needed instances or snapshots. A fixed entry range remains unchanged as
-its source grows. The kernel chooses the authoritative instance for each ID;
+The kernel allocates unique IDs, retains needed instances or snapshots, and tracks
+how threads were derived. It chooses the authoritative instance for each ID;
 independent branches and replacements of existing entries require fresh IDs.
-Sources do not recursively copy referenced histories.
 
 Serialization, persistence, collections, grouping, operation records, cancellation,
 and publication checks belong outside `thread`. Its methods are synchronous and
@@ -394,6 +384,11 @@ Application code must yield during long computation.
 ## Context, compaction, and interpretation
 
 ```rust
+pub struct HistoryRef {
+    pub thread: ThreadId,
+    pub entries: std::ops::Range<usize>,
+}
+
 pub struct GenerationIntent {
     pub source: HistoryRef,
     pub instructions: String,
@@ -490,9 +485,8 @@ Review steps are module-sized changes within the engine crate.
 2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned vector histories, rich entries, fixed references, and local
-   append/fork. Check copy independence, prefix bounds, stable source ranges,
-   and content preservation.
+3. **Thread:** owned vector histories, rich entries, and local append/fork.
+   Check copy independence, prefix bounds, and content preservation.
 4. **Agent/compaction logic:** request projection, streamed generation and turn
    publication, tool loops, checkpoints, compaction, and concurrent runs. Use
    scripted dependencies to check complete tool groups, retries, budgets,
