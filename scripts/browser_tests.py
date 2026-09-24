@@ -531,6 +531,116 @@ context_window = 100000
         return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
                 for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
 
+    def test_empty_composer_arrows_visit_user_messages_and_return_to_latest(self):
+        self.turns['Alpha images'] = 1
+        page = self.session(self.page)
+        prompt = page.locator('#prompt')
+        selected = page.locator('.message.user[aria-current="true"]')
+        for key in ['ArrowUp', 'ArrowDown']:
+            prompt.press(key)
+            expect(selected).to_have_count(0)
+        messages = [f'Message {index}\n' + 'A line of context.\n' * 12 for index in range(3)]
+        for message in messages:
+            self.submit(page, message.strip())
+            expect(page.locator('#model')).to_be_enabled()
+        for width in [1200, 390]:
+            page.set_viewport_size({'width': width, 'height': 850})
+            page.reload()
+            expect(page.locator('#model')).to_be_enabled()
+            prompt.press('ArrowDown')
+            expect(selected).to_have_count(0)
+            for index in [2, 1, 0, 0]:
+                prompt.press('ArrowUp')
+                expect(selected.locator('.body')).to_have_text(messages[index].strip())
+                expect(prompt).to_be_focused()
+                expect(prompt).to_have_value('')
+                page.wait_for_function('''() => {
+                    const message = document.querySelector('.user[aria-current="true"]');
+                    const top = message.getBoundingClientRect().top;
+                    return top >= document.querySelector('.toolbar').getBoundingClientRect().bottom
+                        && top < document.querySelector('#composer').getBoundingClientRect().top;
+                }''')
+            page.screenshot(path=str(self.artifacts / f'selected-{width}.png'))
+            for index in [1, 2]:
+                prompt.press('ArrowDown')
+                expect(selected.locator('.body')).to_have_text(messages[index].strip())
+            prompt.press('ArrowDown')
+            expect(selected).to_have_count(0)
+            expect(page.locator('#jump')).to_be_hidden()
+            expect(prompt).to_be_focused()
+            for control in ['Escape', 'Latest output']:
+                prompt.press('ArrowUp')
+                expect(selected).to_have_count(1)
+                if control == 'Escape':
+                    prompt.press(control)
+                else:
+                    page.click('#jump')
+                expect(selected).to_have_count(0)
+                expect(page.locator('#jump')).to_be_hidden()
+
+    def test_message_navigation_preserves_text_editing_modifiers_and_composition(self):
+        self.turns['Alpha images'] = 1
+        page = self.session(self.page)
+        self.submit(page, 'A previous user message')
+        expect(page.locator('#model')).to_be_enabled()
+        prompt = page.locator('#prompt')
+        selected = page.locator('.user[aria-current="true"]')
+        for modifier in ['shiftKey', 'ctrlKey', 'altKey', 'metaKey', 'isComposing']:
+            for key in ['ArrowUp', 'ArrowDown']:
+                self.assertFalse(prompt.evaluate('''(node, args) => {
+                    const event = new KeyboardEvent('keydown', {key: args.key, [args.modifier]: true, bubbles: true, cancelable: true});
+                    node.dispatchEvent(event); return event.defaultPrevented;
+                }''', {'key': key, 'modifier': modifier}))
+                expect(selected).to_have_count(0)
+        prompt.press('ArrowUp')
+        expect(selected).to_have_count(1)
+        prompt.fill('first line\nsecond line')
+        expect(selected).to_have_count(0)
+        prompt.press('ArrowUp')
+        self.assertLess(prompt.evaluate('n => n.selectionStart'), len('first line\n'))
+        prompt.press('ArrowDown')
+        self.assertGreater(prompt.evaluate('n => n.selectionStart'), len('first line\n'))
+        expect(prompt).to_have_value('first line\nsecond line')
+        for draft in ['first line\nsecond line', ' ', '\n']:
+            prompt.fill(draft)
+            for key in ['ArrowUp', 'ArrowDown']:
+                prompt.press(key)
+                expect(selected).to_have_count(0)
+                expect(prompt).to_have_value(draft)
+
+    def test_message_navigation_survives_live_updates_and_reconnects(self):
+        self.turns['Alpha images'] = 1
+        page = self.session(self.page)
+        self.submit(page, 'Earlier message\n' + 'Context.\n' * 40)
+        expect(page.locator('#model')).to_be_enabled()
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        prompt = page.locator('#prompt')
+        prompt.press('ArrowUp')
+        prompt.press('ArrowUp')
+        selected = page.locator('.user[aria-current="true"]')
+        expect(selected).to_contain_text('Earlier message')
+        original = selected.element_handle()
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(selected).to_contain_text('Earlier message')
+        expect(page.locator('#jump')).to_be_visible()
+        self.assertTrue(original.evaluate('n => n.isConnected'))
+        self.stop(self.process)
+        expect(page.locator('#connection')).to_have_text('Reconnecting…')
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        expect(page.locator('#model')).to_be_enabled(timeout=15000)
+        self.assertTrue(original.evaluate('n => n.isConnected'))
+        expect(selected).to_contain_text('Earlier message')
+        prompt.press('ArrowDown')
+        expect(selected).to_contain_text('Alpha wait')
+        page.click('#compact')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(selected).to_have_count(0)
+        prompt.press('ArrowUp')
+        expect(selected).to_contain_text('Alpha wait')
+
     def test_token_usage_updates_during_tools_across_tabs_and_survives_restart(self):
         page = self.session(self.page)
         expect(page.locator('#context-usage')).to_have_text('Context — / 100K')

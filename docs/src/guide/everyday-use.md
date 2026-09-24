@@ -19,6 +19,8 @@ remain notes the agent can read as needed.
 | --- | --- |
 | Submit a message | Enter or Send |
 | Insert a newline | Shift-Enter or Alt-Enter |
+| Highlight earlier or later user messages | Up or Down while the input is empty |
+| Return from a highlighted message to the latest output | Escape, Latest output, or Down past the newest message |
 | Queue a follow-up while busy | Enter or Queue |
 | Edit a queued message in place | Edit, then Save & send |
 | Remove a pending message | Unqueue |
