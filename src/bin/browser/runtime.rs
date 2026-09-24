@@ -1,5 +1,6 @@
 //! Session workers own runners, writer locks, and live tools independently of browser tabs.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,21 @@ pub(super) struct Update {
     session_id: String,
     revision: u64,
     change: Value,
+}
+
+impl Update {
+    // The browser fetches histories only for subscribed sessions. Relaying full
+    // snapshots of every running session can make lag recovery itself lag.
+    pub(super) fn live_update(&self) -> Cow<'_, Self> {
+        if self.change["kind"] != "snapshot" {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Self {
+            session_id: self.session_id.clone(),
+            revision: self.revision,
+            change: json!({"kind":"refresh"}),
+        })
+    }
 }
 
 pub(super) struct App {

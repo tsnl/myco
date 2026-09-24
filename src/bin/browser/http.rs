@@ -10,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response, Sse, sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -66,6 +67,7 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/sky/weather", get(sky_weather))
         .route("/api/sky/locations", get(sky_locations))
         .route("/api/events", get(events))
+        .route("/api/live-events", get(live_events))
         .route("/api/sessions", get(sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_snapshot))
         .route(
@@ -159,6 +161,34 @@ pub(super) async fn events(
         },
     );
     Sse::new(stream).keep_alive(sse::KeepAlive::default())
+}
+
+// The profile relay carries deltas and invalidations, never unsolicited history.
+// Subscribe before announcing a connection so snapshots fetched by clients can
+// be followed by buffered updates without losing changes made during the fetch.
+pub(super) async fn live_events(
+    State(server): State<Arc<Server>>,
+) -> Sse<impl futures::Stream<Item = Result<sse::Event, Infallible>>> {
+    let receiver = server.sessions.events.subscribe();
+    let updates =
+        futures::stream::unfold((server, receiver), |(server, mut receiver)| async move {
+            let event = tokio::select! {
+                _ = server.sessions.shutdown.cancelled() => return None,
+                next = receiver.recv() => match next {
+                    Ok(update) => sse::Event::default().json_data(update.live_update()).unwrap(),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // A fresh snapshot covers the discarded queue. Keep only
+                        // changes made after the request to resynchronize.
+                        receiver = receiver.resubscribe();
+                        sse::Event::default().json_data(json!({"kind":"resync"})).unwrap()
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+            };
+            Some((Ok(event), (server, receiver)))
+        });
+    let initial = futures::stream::once(async { Ok(sse::Event::default().comment("connected")) });
+    Sse::new(initial.chain(updates)).keep_alive(sse::KeepAlive::default())
 }
 
 async fn session_snapshot(

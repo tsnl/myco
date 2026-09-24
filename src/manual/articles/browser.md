@@ -326,6 +326,11 @@ Opened sessions and their locks stay alive until the server stops. Request retri
 do not submit the same action or create the same session twice. If submission
 fails, the input draft remains available. Tabs share a live-output connection
 through a browser SharedWorker so a tab group does not exhaust HTTP connections.
+Only tabs viewing a session fetch its full history. Live events carry deltas and
+small refresh notices; a slow connection resynchronizes subscribed views without
+replaying every running session's history. Activity bursts coalesce into a session
+list refresh, and each session view allows one snapshot request at a time.
+Reload open tabs after upgrading the server to use the updated browser worker.
 
 Restarting the server and resuming a saved session restores conversation history,
 not old bash processes or editor state. Uncertain tool outcomes from an

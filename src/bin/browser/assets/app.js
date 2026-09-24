@@ -1,4 +1,4 @@
-import { $, api, element, error, newSession, requestId, setArchived } from './common.js';
+import { $, api, element, error, clearError, newSession, requestId, setArchived } from './common.js';
 import { showActivity } from './activity.js';
 import { imageAttachments } from './attachments.js';
 import { linkify, setLinkedText } from './links.js';
@@ -345,12 +345,12 @@ function connect() {
   connected = false; metadata();
   const worker = eventsWorker();
   eventPort = worker.port;
-  worker.onerror = () => { connected = false; metadata(); error('Could not connect to live output. Reload this page to reconnect.'); };
+  worker.onerror = () => { connected = false; metadata(); error('Could not connect to live output. Reload this page to reconnect.', 'connection'); };
   eventPort.onmessage = ({ data }) => {
-    if (data.kind === 'snapshot') { revision = -1; error(); updateSession(data.update); }
+    if (data.kind === 'snapshot') { revision = -1; clearError('connection'); updateSession(data.update); }
     else if (data.kind === 'update') updateSession(data.update);
     else if (data.kind === 'connection') { connected = data.connected; metadata(); }
-    else if (data.kind === 'error') { connected = false; metadata(); error(data.message); }
+    else if (data.kind === 'error') { connected = false; metadata(); error(data.message, 'connection'); }
   };
   eventPort.postMessage({ kind: 'subscribe', profile: profileName, session_id: sessionId });
 }

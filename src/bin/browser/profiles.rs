@@ -324,7 +324,10 @@ async fn events(
                 _ = profiles.shutdown.cancelled() => return None,
                 next = receiver.recv() => match next {
                     Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => Arc::new(ProfileEvent::Resync),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        receiver = receiver.resubscribe();
+                        Arc::new(ProfileEvent::Resync { profile: None })
+                    }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 },
             };

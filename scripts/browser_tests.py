@@ -91,6 +91,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif count == 1 and "rename" in prompt:
             release = shlex.quote(str(root / (name + "-rename-release")))
             events = tool({"command": f"while [ ! -f {release} ]; do sleep 0.05; done", "timeout_ms": 60000})
+        elif "stream" in prompt and (not count or hasattr(fixture, 'stream_chunks')):
+            events = [event for i in range(getattr(fixture, 'stream_chunks', 30)) for event in reply(f"Chunk {i}.\n\n")]
         elif count:
             events = reply(f"{name} finished.")
         elif "rename" in prompt:
@@ -119,8 +121,6 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "profile" in prompt:
             marker = shlex.quote(str(root / (name + '-profile')))
             events = tool({'command': f'printf "%s" "$MYCO_PROFILE" > profile-tool.txt\nprintf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
-        elif "stream" in prompt:
-            events = [event for i in range(30) for event in reply(f"Chunk {i}.\n\n")]
         elif "generate" in prompt:
             events = reply(f"{name} finished.")
         else:
@@ -1907,6 +1907,53 @@ context_window = 100000
         page.wait_for_timeout(150)
         self.assertEqual(held, [])
 
+    def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
+        home = self.page
+        expect(home.locator('#connection')).to_have_text('Live')
+        home.evaluate("""Object.defineProperty(document, 'hidden', {configurable: true, value: true});
+            document.dispatchEvent(new Event('visibilitychange'));""")
+        self.stream_chunks = 100
+        release = threading.Event()
+        self.event_gates = {0: release}
+        self.addCleanup(release.set)
+        self.context.add_init_script("""window.liveMessages = [];
+            const Shared = window.SharedWorker;
+            window.SharedWorker = function(...args) {
+                const worker = new Shared(...args);
+                worker.port.addEventListener('message', ({data}) => {
+                    if (data.update) window.liveMessages.push({kind: data.kind,
+                        change: data.update.change.kind, session: data.update.session_id});
+                });
+                return worker;
+            };""")
+        page = self.session()
+        ids = [page.url.rsplit('/', 1)[1]]
+        for _ in range(25):
+            response = self.context.request.post(self.origin + '/api/sessions', data={'request_id': str(uuid.uuid4())})
+            self.assertEqual(response.status, 200)
+            ids.append(response.json()['id'])
+        for session_id in ids:
+            response = self.context.request.post(self.origin + '/api/sessions/' + session_id + '/action',
+                data={'request_id': str(uuid.uuid4()), 'session_id': session_id,
+                      'action': {'kind': 'submit', 'text': 'Alpha stream\n' + 'History. ' * 110_000}})
+            self.assertEqual(response.status, 202)
+        expect(home.locator('.session-status[data-busy="true"]')).to_have_count(26, timeout=30000)
+        deadline = time.monotonic() + 15
+        while len(self.requests) < 26 and time.monotonic() < deadline:
+            page.wait_for_timeout(20)
+        self.assertEqual(len(self.requests), 26)
+        listings = []
+        home.on('request', lambda request: listings.append(request.url) if '/api/sessions?' in request.url else None)
+        release.set()
+        expect(page.locator('.assistant .body p').last).to_have_text('Chunk 99.', timeout=30000)
+        expect(page.locator('#model')).to_be_enabled()
+        expect(home.locator('.session-status[data-busy="false"]')).to_have_count(26, timeout=30000)
+        messages = page.evaluate('window.liveMessages')
+        self.assertEqual({message['session'] for message in messages}, {ids[0]})
+        self.assertTrue(any(message['change'] == 'append' for message in messages))
+        self.assertFalse(any(message['kind'] == 'update' and message['change'] == 'snapshot' for message in messages))
+        self.assertLessEqual(len(listings), 2 * len(ids), 'list refreshes must stay bounded as sessions finish')
+
     def test_sessions_isolate_models_tools_and_cancellation(self):
         alpha = self.session(self.page)
         beta = self.session()
@@ -2084,6 +2131,9 @@ context_window = 100000
         expect(page.locator('#archive-notice')).to_be_visible()
         page.route('**/archive', lambda route: route.fulfill(status=500, body='Restore unavailable'), times=1)
         page.click('#undo-archive')
+        expect(page.locator('#error')).to_have_text('Restore unavailable')
+        with page.expect_response(lambda response: '/api/sessions?' in response.url):
+            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
         expect(page.locator('#error')).to_have_text('Restore unavailable')
         expect(page.locator('#archive-notice')).to_be_visible()
         expect(page.locator('#undo-archive')).to_be_enabled()

@@ -16,7 +16,10 @@ export function element(tag, className, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
-export function error(message = '') { $('error').textContent = message; $('error').hidden = !message; }
+export function error(message = '', source = 'action') {
+  $('error').textContent = message; $('error').hidden = !message; $('error').dataset.source = source;
+}
+export function clearError(source) { if ($('error').dataset.source === source) error(); }
 export async function api(path, body) {
   const response = await fetch(profilePath(path), body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(await response.text());
