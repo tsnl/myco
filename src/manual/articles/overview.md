@@ -323,9 +323,11 @@ keeps its default, so setting one knob does not reset the others. A model entry
 may carry its own `[models.KEY.retry]` — the only way for a gateway-less model to
 configure retry — and, like `auth`, it replaces the gateway's table rather than
 merging with it. Only failures that happen *before* any of the response has
-streamed are retried (connection errors, 408, 429, and 5xx including Anthropic's
-529). A 413 or recognized size rejection goes to the session's context recovery
-instead of retrying the unchanged request; other 400 and 401 errors surface
+streamed are retried (connection errors, including body-read failures after HTTP
+headers but before response parts, 408, 429, and 5xx including Anthropic's 529).
+HTTP headers, keepalives, and Responses `response.created` / `response.in_progress`
+events do not count as response parts. A 413 or recognized size rejection goes to
+the session's context recovery instead of retrying the unchanged request; other 400 and 401 errors surface
 immediately. A failure mid-stream is never retried either, because the
 already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
 is honoured when it asks for longer than the computed backoff, still bounded by

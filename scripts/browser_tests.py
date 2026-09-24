@@ -138,6 +138,17 @@ class Provider(http.server.BaseHTTPRequestHandler):
                            "| Name | Value |\n| --- | --- |\n| Tool | Ready |\n\n"
                            f"![Local image]({root / 'pixel.png'})\n\n"
                            + "\n\n".join(f"Paragraph {i}: session output." for i in range(24)))
+        if interruptions := getattr(fixture, 'stream_interruptions', []):
+            body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in interruptions.pop(0)).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(body) + 100))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            return
         events.append({"type": "response.completed", "response": {
             "status": "completed", "usage": getattr(fixture, 'usage', {"input_tokens": 100, "output_tokens": 20})}})
         self.send_response(200)
@@ -1441,6 +1452,38 @@ context_window = 100000
             expect(indicator).to_have_text('Stopped')
             expect(indicator).to_have_attribute('data-busy', 'false')
             expect(indicator).to_have_attribute('data-state', 'attention')
+
+    def test_early_stream_disconnect_retries_without_replaying_completed_tools(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        self.stream_interruptions = [[{'type': 'response.created'}]]
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('.tool')).to_have_count(1)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.requests[1]['input'], self.requests[2]['input'])
+        self.assertEqual((self.home / 'Alpha-done').read_text(), 'done')
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.tool')).to_have_count(1)
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+
+    def test_midstream_disconnect_stops_cleanly_and_accepts_a_followup(self):
+        self.stream_interruptions = [reply('Partial answer before the connection drops.')]
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#connection')).to_have_text('Stopped')
+        expect(page.locator('.notice').last).to_contain_text('stream body')
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(self.requests), 1, 'Partial output must not trigger a replay')
+        self.turns['Beta images'] = 1
+        self.submit(page, 'Beta images')
+        expect(page.locator('.assistant .body').last).to_have_text('Beta finished.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(len(self.requests), 2)
+        self.assertNotIn('Partial answer', json.dumps(self.requests[-1]['input']))
 
     def test_completion_during_a_slow_browser_refresh_is_not_lost(self):
         home, page = self.page, self.session()
