@@ -1,5 +1,5 @@
-/* Neutral glass takes its color from the sky and darkens toward the user.
-   The composer overlays the .64 well: .36 more tint matches the .77 toolbar. */
+/* Glass follows the sky's light and darkens toward the user.
+   The composer overlays the .58 well: .31 more tint matches the .71 toolbar. */
 :root {
   color-scheme: dark;
   font: 14px/1.65 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -7,12 +7,12 @@
   --dim: #cfcfcf; --cyan: #8bd5dc; --green: #a6da95; --amber: #e5c890; --red: #ed8796;
   --line: #e5e5e526; --composer-height: 180px; --toolbar-height: 65px;
   --composer-bottom: max(16px, env(safe-area-inset-bottom));
-  --glass-tint: 20 20 20;
-  --glass-control: rgb(var(--glass-tint) / .4);
-  --glass-well: rgb(var(--glass-tint) / .64);
-  --glass-raised: rgb(var(--glass-tint) / .77);
-  --glass-composer: rgb(var(--glass-tint) / .36);
-  --glass-panel: rgb(var(--glass-tint) / .84);
+  --glass-tint: 12 20 35;
+  --glass-control: rgb(var(--glass-tint) / .36);
+  --glass-well: rgb(var(--glass-tint) / .58);
+  --glass-raised: rgb(var(--glass-tint) / .71);
+  --glass-composer: rgb(var(--glass-tint) / .31);
+  --glass-panel: rgb(var(--glass-tint) / .80);
   --glass-border: #e5e5e540;
   --glass-filter: blur(24px);
   --glass-shadow: 0 12px 48px #00000066;

@@ -1537,7 +1537,7 @@ context_window = 100000
             self.assertLess(abs(end - start), 2, "Weather updates must not jump drifting clouds")
 
     def test_sky_lighting_follows_city_time_without_changing_cloud_shapes(self):
-        page = self.page
+        page = self.session(self.page)
         page.clock.install()
         page.clock.set_fixed_time("2030-03-20T06:00:00Z")
         report = {"utc_offset_seconds": 10800, "current": {"time": int(time.time()), "interval": 900,
@@ -1549,6 +1549,9 @@ context_window = 100000
         sky, glow = page.locator("#sky"), page.locator(".sky-glow")
         expect(sky).to_have_attribute("data-weather", "live")
         expect(sky).to_have_attribute("data-clouds", "ready")
+        glass = lambda: page.locator('.toolbar').evaluate("n => getComputedStyle(n).backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number)")
+        day_glass = glass()
+        self.assertGreater(day_glass[2], day_glass[0], 'Daylight glass should carry the cool sky tint')
         morning = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
         canvas = page.locator(".cloud-low canvas").first
         # Compare rendered alpha and RGB independently: relighting must preserve
@@ -1570,12 +1573,24 @@ context_window = 100000
         self.assertGreater(afternoon, 50)
         self.assertEqual(before["alpha"], after["alpha"])
         self.assertNotEqual(before["color"], after["color"])
+        for hour in ['03', '15']:  # Dawn and dusk in the selected city's UTC+3 clock.
+            page.clock.set_fixed_time(f"2030-03-20T{hour}:00:00Z")
+            page.clock.fast_forward(60000)
+            warm = glass()
+            self.assertGreater(warm[0], warm[2], 'Twilight glass should follow the warm sky')
+            surfaces = page.evaluate("""() => [getComputedStyle(document.body, '::before'),
+                ...['#composer', '#settings', '#activity'].map(selector => getComputedStyle(document.querySelector(selector)))]
+                .map(style => style.backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number))""")
+            self.assertTrue(all(color == warm for color in surfaces), 'Glass surfaces share the same tint')
         page.clock.set_fixed_time("2030-03-20T21:00:00Z")
         page.clock.fast_forward(60000)
         expect(sky).to_have_attribute("data-phase", "night")
         expect(sky).to_have_attribute("data-clouds", "ready")
         self.assertEqual(before["alpha"], canvas.evaluate(fingerprint)["alpha"])
         self.assertGreater(float(page.locator("#sky-stars").evaluate("n => n.style.opacity")), 0)
+        night_glass = glass()
+        self.assertGreater(night_glass[2], night_glass[0])
+        self.assertLess(sum(night_glass), sum(day_glass), 'Night glass keeps its deeper blue tone')
 
     def test_sky_renderer_failure_keeps_the_fallback_and_conversation_usable(self):
         self.assert_sky_fallback_conversation("cloud-renderer.js")
