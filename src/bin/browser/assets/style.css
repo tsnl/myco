@@ -113,7 +113,8 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown .align-center { text-align: center; }
 .markdown .align-right { text-align: right; font-variant-numeric: tabular-nums; }
 .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 1.5em 0; }
-.markdown.pending { white-space: pre-wrap; }
+.markdown.pending { color: var(--dim); }
+.markdown[data-render-error]::after { content: attr(data-render-error); display: block; margin-top: .8em; color: var(--amber); }
 img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fit: contain; object-position: left center; margin: 14px 0; border-radius: 0; }
 .tool { --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
 .tool.running { --tool-color: var(--cyan); }

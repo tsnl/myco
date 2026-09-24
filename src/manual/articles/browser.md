@@ -270,7 +270,12 @@ compaction continues the task; manual compaction returns to ready. Failures
 remain visible so a stopped or unsuccessful operation can be diagnosed.
 
 Assistant responses render Markdown headings, lists, tables, task lists,
-blockquote text, code blocks, links, footnotes, and images. Adjacent text parts
+blockquote text, code blocks, links, footnotes, and images. Loaded transcripts
+arrive with server-rendered HTML, so opening or reloading a session does not
+briefly display raw Markdown or request formatting once per message. Streaming
+updates also render on the server, with requests coalesced per message; the
+browser keeps existing formatted output while waiting for the next render.
+Adjacent text parts
 in an assistant response are rendered together, keeping Markdown intact after
 streaming and page reloads. Footnotes stay within their message and open in the
 current tab. Text uses one font size;
@@ -422,6 +427,12 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
 | `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
 | `GET /files/PATH`, `HEAD /files/PATH` | Profile workspace files; GET supports a single `Range: bytes=START-END` |
+
+In HTTP snapshots, non-user message blocks include `html` alongside their original
+`text`. The HTML uses the same escaped Markdown and profile workspace URL rewriting
+as streamed output. It describes that snapshot's text; clients applying later text
+deltas must discard the cached HTML. Live events remain compact deltas and refresh
+notices, without rendering unobserved conversations.
 
 Use a fresh UUID per operation and reuse it when retrying that operation.
 Submit actions may include `images`, an array of base64 image data URLs or
