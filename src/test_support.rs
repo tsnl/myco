@@ -22,16 +22,20 @@ use crate::generative_model::{
 // ---------------------------------------------------------------------------
 
 /// Scripted model: each `generate` call consumes the next pre-baked
-/// [`GenerateOutput`] (FIFO) and replays it as a stream of [`MessagePart`]s —
+/// [`GenerateOutput`] or error (FIFO) and replays it as a stream of [`MessagePart`]s —
 /// same shape the agent sees from a real provider. Once the scripts drain,
 /// every call yields the [`Self::then_fail`] error, or panics if none is set.
 pub(crate) struct ScriptedModel {
-    scripts: Mutex<VecDeque<GenerateOutput>>,
+    scripts: Mutex<VecDeque<Result<GenerateOutput, GenerateError>>>,
     fail: Mutex<Option<GenerateError>>,
 }
 
 impl ScriptedModel {
     pub(crate) fn new(scripts: Vec<GenerateOutput>) -> Arc<Self> {
+        Self::from_results(scripts.into_iter().map(Ok).collect())
+    }
+
+    pub(crate) fn from_results(scripts: Vec<Result<GenerateOutput, GenerateError>>) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
             fail: Mutex::new(None),
@@ -53,12 +57,22 @@ impl ScriptedModel {
 
 impl GenerativeModel for ScriptedModel {
     fn generate(&self, _input: &[Message]) -> AsyncStream<GenerationEvent> {
-        let Some(output) = self.scripts.lock().expect("scripts lock").pop_front() else {
-            let err = self.fail.lock().expect("fail lock").clone();
-            let err = err.expect("scripted model ran out of outputs");
-            return Box::pin(stream::once(async move {
-                GenerationEvent::Failure(GenerationFailure::terminal(err))
-            }));
+        let result = self
+            .scripts
+            .lock()
+            .expect("scripts lock")
+            .pop_front()
+            .unwrap_or_else(|| {
+                let err = self.fail.lock().expect("fail lock").clone();
+                Err(err.expect("scripted model ran out of outputs"))
+            });
+        let output = match result {
+            Ok(output) => output,
+            Err(err) => {
+                return Box::pin(stream::once(async move {
+                    GenerationEvent::Failure(GenerationFailure::terminal(err))
+                }));
+            }
         };
 
         let mut parts = vec![MessagePart::MessageStart];

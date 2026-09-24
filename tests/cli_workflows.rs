@@ -193,15 +193,20 @@ async fn invalid_input_fails_before_a_model_call_and_provider_errors_are_nonzero
 }
 
 #[tokio::test]
-async fn gateway_cap_rejects_accumulated_tool_images_before_upload_and_allows_resume() {
+async fn gateway_cap_compacts_accumulated_tool_images_before_upload_and_continues() {
+    let provider = StubHttpServer::sequence(vec![]).await;
+    let env = CliEnv::new(&provider, false);
+    let session = env.seed();
     let provider = StubHttpServer::sequence(vec![
         answer("Earlier answer.", 100),
         tool("view_image", json!({"path":"first.png"})),
         tool("view_image", json!({"path":"second.png"})),
+        summary(&session),
+        answer("private compactor answer", 100),
         answer("Recovered.", 100),
+        answer("Resumed.", 100),
     ])
     .await;
-    let env = CliEnv::new(&provider, false);
     std::fs::write(&env.config, format!(
         "model = \"pipetest\"\n[gateways.test]\nprotocol = \"openai-responses\"\nbase_url = {:?}\nmax_request_bytes = 200_000\n[models.pipetest]\ngateway = \"test\"\ncontext_window = 100000\n",
         provider.base_url(),
@@ -212,40 +217,43 @@ async fn gateway_cap_rejects_accumulated_tool_images_before_upload_and_allows_re
     for name in ["first.png", "second.png"] {
         std::fs::write(env.dir.join(name), &image).unwrap();
     }
-    let first = env.run(&["-p", "remember this"], b"").await;
+    let first = env
+        .run(&["-p", "remember this", "--resume", &session.id], b"")
+        .await;
     assert_eq!(success(&first), "Earlier answer.\n");
     let id = session_id(&first);
-    let rejected = env
+    let recovered = env
         .run(&["-p", "inspect the images", "--resume", &id], b"")
         .await;
-    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert_eq!(success(&recovered), "Recovered.\n");
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("200000 bytes"),
-        "{rejected:?}"
+        String::from_utf8_lossy(&recovered.stderr).contains("compaction complete"),
+        "{recovered:?}"
     );
     assert_eq!(
         provider.connections(),
-        3,
-        "the oversized request must never reach the gateway"
+        6,
+        "the oversized request must be replaced by compaction and continuation"
     );
     let saved = env.saved(&id);
+    assert_eq!(saved.threads().len(), 2);
     let active = serde_json::to_string(&saved.active_thread().messages).unwrap();
     assert!(active.contains("Earlier answer."));
-    assert!(
-        !active.contains("inspect the images"),
-        "the rejected turn must rewind"
-    );
-    assert!(
-        serde_json::to_string(&saved.threads()[0])
-            .unwrap()
-            .contains("inspect the images"),
-        "the predecessor must preserve tool observations"
+    assert!(active.contains("inspect the images"));
+    assert!(active.contains("Image omitted to reduce request size"));
+    assert!(!active.contains("myco-image:sha256:"));
+    let original = serde_json::to_string(&saved.threads()[0]).unwrap();
+    assert!(original.contains("inspect the images"));
+    assert_eq!(
+        original.matches("myco-image:sha256:").count(),
+        2,
+        "the predecessor must preserve both original images"
     );
     let resumed = env
         .run(&["-p", "continue without images", "--resume", &id], b"")
         .await;
-    assert_eq!(success(&resumed), "Recovered.\n");
-    assert_eq!(provider.connections(), 4);
+    assert_eq!(success(&resumed), "Resumed.\n");
+    assert_eq!(provider.connections(), 7);
 }
 
 #[tokio::test]

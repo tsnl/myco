@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::SessionRuntime;
 use crate::agent::{Agent, AgentInteractionError, RunOutcome, StateError};
 use crate::core::{Async, CancelToken, ModelInfo};
-use crate::generative_model::{CatalogModel, Content, GenerativeModel, Message};
+use crate::generative_model::{CatalogModel, Content, GenerateError, GenerativeModel, Message};
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionWriter, Thread};
 
@@ -257,11 +257,24 @@ impl SessionRunner {
         };
         let outcome = self
             .workflow
-            .compact(&mut self.agent, &self.runtime, &writer, cancel, false)
+            .compact(
+                &mut self.agent,
+                &self.runtime,
+                &writer,
+                cancel,
+                CompactionMode::Manual,
+            )
             .await?;
         self.workflow.auto_failed = false;
         Ok(outcome)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactionMode {
+    Manual,
+    Automatic,
+    RequestSize,
 }
 
 pub(super) struct Workflow {
@@ -336,6 +349,7 @@ impl Workflow {
             self.compacted_after_completion = false;
             self.awaiting_compacted_usage = false;
         }
+        let mut recovering_size_error = false;
         loop {
             self.deliver_followups(agent, runtime, &cancel)?;
             let result = agent.step(cancel.clone()).await;
@@ -343,7 +357,49 @@ impl Workflow {
                 return Err(error);
             }
             self.record_runtime(agent, runtime).await?;
-            let outcome = result?;
+            let outcome = match result {
+                Err(
+                    error @ AgentInteractionError::GenerateError(
+                        GenerateError::RequestTooLargeError(_),
+                    ),
+                ) => {
+                    if cancel.is_cancelled() {
+                        agent.cancel_at_boundary()?;
+                        return Err(AgentInteractionError::Cancelled);
+                    }
+                    // A rejected compacted request must not loop through more
+                    // summaries. Allow recovery again only after model progress.
+                    if recovering_size_error || self.compactor.is_none() {
+                        return Err(error);
+                    }
+                    recovering_size_error = true;
+                    match self
+                        .compact(
+                            agent,
+                            runtime,
+                            writer,
+                            cancel.clone(),
+                            CompactionMode::RequestSize,
+                        )
+                        .await
+                    {
+                        Ok(_) => continue,
+                        Err(AgentInteractionError::Compaction(reason)) => {
+                            (self.observer)(WorkflowEvent::Warning(format!(
+                                "request-size recovery failed: {reason}"
+                            )));
+                            return Err(error);
+                        }
+                        Err(AgentInteractionError::Cancelled) => {
+                            agent.cancel_at_boundary()?;
+                            return Err(AgentInteractionError::Cancelled);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                result => result?,
+            };
+            recovering_size_error = false;
             let used = agent.last_usage().map(|usage| usage.context_tokens());
             if self.awaiting_compacted_usage && used.is_some() {
                 self.awaiting_compacted_usage = false;
@@ -370,7 +426,13 @@ impl Workflow {
             if should_compact {
                 self.compacted_after_completion |= outcome.is_some();
                 match self
-                    .compact(agent, runtime, writer, cancel.clone(), true)
+                    .compact(
+                        agent,
+                        runtime,
+                        writer,
+                        cancel.clone(),
+                        CompactionMode::Automatic,
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -418,8 +480,9 @@ impl Workflow {
         runtime: &Arc<SessionRuntime>,
         writer: &SessionWriter,
         cancel: CancelToken,
-        automatic: bool,
+        mode: CompactionMode,
     ) -> Result<CompactOutcome, AgentInteractionError> {
+        let automatic = mode != CompactionMode::Manual;
         if (automatic && !agent.state().can_replace_at_boundary())
             || (!automatic && !agent.state().is_idle())
         {
@@ -459,6 +522,9 @@ impl Workflow {
             CompactWorkerError::Cancelled => AgentInteractionError::Cancelled,
             CompactWorkerError::Failed(message) => AgentInteractionError::Compaction(message),
         })?;
+        if mode == CompactionMode::RequestSize {
+            omit_rejected_images(&mut successor, &outcome);
+        }
         if automatic {
             successor.messages.push(Message::UserMessage {
                 content: vec![Content::System {
@@ -481,6 +547,37 @@ impl Workflow {
     }
 }
 
+// Recent images survive ordinary compaction. A size rejection requires a
+// text-only tail; the committed predecessor keeps the originals inspectable.
+fn omit_rejected_images(thread: &mut Thread, outcome: &CompactOutcome) {
+    let notice = format!(
+        "[Image omitted to reduce request size. Use session_history to inspect the original in session {}, thread {} before relying on its contents.]",
+        outcome.session_id, outcome.predecessor_id,
+    );
+    for message in &mut thread.messages {
+        match message {
+            Message::UserMessage { content } | Message::AssistantMessage { content, .. } => {
+                replace_images_with_notice(content, &notice);
+            }
+            Message::ToolResults { tool_use_results } => {
+                for result in tool_use_results {
+                    replace_images_with_notice(&mut result.content, &notice);
+                }
+            }
+        }
+    }
+}
+
+fn replace_images_with_notice(parts: &mut [Content], notice: &str) {
+    for part in parts {
+        if matches!(part, Content::Image { .. }) {
+            *part = Content::Text {
+                text: notice.into(),
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -490,7 +587,9 @@ mod tests {
 
     use super::*;
     use crate::agent::NullEventSink;
-    use crate::generative_model::{GenerateOutput, TokenUsage, ToolUse, TurnEndReason};
+    use crate::generative_model::{
+        GenerateError, GenerateOutput, TokenUsage, ToolUse, TurnEndReason,
+    };
     use crate::harness::Harness;
     use crate::session::{ActiveSession, compact_thread};
     use crate::test_support::{ScriptedModel, temp_home};
@@ -501,6 +600,7 @@ mod tests {
         calls: AtomicUsize,
         sources: Mutex<Vec<Session>>,
         cancel: bool,
+        failure: Option<&'static str>,
         break_store: Option<std::path::PathBuf>,
     }
 
@@ -514,6 +614,9 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 crate::agent::validate_context(&predecessor.active_thread().messages).unwrap();
                 self.sources.lock().unwrap().push(predecessor.clone());
+                if let Some(reason) = self.failure {
+                    return Err(CompactWorkerError::Failed(reason.into()));
+                }
                 let compacted =
                     compact_thread(&predecessor, "Continue the task with the existing shell")
                         .unwrap();
@@ -558,9 +661,16 @@ mod tests {
         scripts: Vec<GenerateOutput>,
         compactor: Arc<Summarizer>,
     ) -> (SessionRunner, Arc<ScriptedModel>) {
+        setup_results(scripts.into_iter().map(Ok).collect(), compactor).await
+    }
+
+    async fn setup_results(
+        scripts: Vec<Result<GenerateOutput, GenerateError>>,
+        compactor: Arc<Summarizer>,
+    ) -> (SessionRunner, Arc<ScriptedModel>) {
         let session = ActiveSession::new(Session::new("scripted"));
         let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session);
-        let model = ScriptedModel::new(scripts);
+        let model = ScriptedModel::from_results(scripts);
         let agent = Agent::new(model.clone(), runtime.clone(), Arc::new(NullEventSink));
         let mut runner = SessionRunner::new(agent, runtime).await.unwrap();
         runner.set_compactor(compactor, Some(80));
@@ -577,6 +687,260 @@ mod tests {
                 cancel,
             )
             .await
+    }
+
+    #[test]
+    fn oversized_requests_compact_and_continue_without_repeating_tools() {
+        let home = temp_home("runner-request-size");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let effect = home.path().join("effect");
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup_results(
+                vec![
+                    Ok(output(
+                        20,
+                        Some(json!({"command":format!("printf x >> '{}'", effect.display())})),
+                        TurnEndReason::ToolUse,
+                    )),
+                    Err(GenerateError::RequestTooLargeError("HTTP 413".into())),
+                    Ok(output(20, None, TurnEndReason::EndTurn)),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            runner.set_compactor(compactor.clone(), None);
+            let result = submit(&mut runner, CancelToken::new()).await;
+            let outcome = result.result.unwrap();
+            assert!(result.rewound.is_none());
+            assert_eq!(outcome.reason, TurnEndReason::EndTurn);
+            assert_eq!(outcome.usage.unwrap().output_tokens, 14);
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read_to_string(effect).unwrap(), "x");
+            let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
+            assert_eq!(saved.threads().len(), 2);
+            assert!(
+                saved.threads()[0]
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResults { .. }))
+            );
+            assert_eq!(
+                serde_json::to_value(&saved.threads()[0]).unwrap(),
+                serde_json::to_value(compactor.sources.lock().unwrap()[0].active_thread()).unwrap()
+            );
+            assert!(saved.active_thread().pending_operation.is_none());
+            crate::agent::validate_context(&saved.active_thread().messages).unwrap();
+        });
+    }
+
+    #[test]
+    fn oversized_initial_input_recovers_without_usage_and_keeps_original_images() {
+        let _home = temp_home("runner-initial-request-size");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup_results(
+                vec![
+                    Err(GenerateError::RequestTooLargeError(
+                        "local request byte cap".into(),
+                    )),
+                    Ok(output(20, None, TurnEndReason::EndTurn)),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            runner.set_compactor(compactor.clone(), None);
+            let outcome = runner
+                .submit(
+                    vec![Content::Image {
+                        source: "data:image/png;base64,aW1hZ2U=".into(),
+                    }],
+                    Utc::now(),
+                    CancelToken::new(),
+                )
+                .await;
+            outcome.result.unwrap();
+            assert!(outcome.rewound.is_none());
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
+            let original = saved.threads()[0]
+                .messages
+                .iter()
+                .flat_map(Message::content)
+                .find_map(|part| match part {
+                    Content::Image { source } => Some(source),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                crate::core::image_store::ImageStore::for_profile()
+                    .unwrap()
+                    .resolve(original)
+                    .unwrap(),
+                "data:image/png;base64,aW1hZ2U="
+            );
+            assert!(
+                !saved
+                    .active_thread()
+                    .messages
+                    .iter()
+                    .flat_map(Message::content)
+                    .any(|part| matches!(part, Content::Image { .. }))
+            );
+            assert!(
+                serde_json::to_string(&saved.active_thread().messages)
+                    .unwrap()
+                    .contains("Image omitted to reduce request size")
+            );
+            assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+        });
+    }
+
+    #[test]
+    fn repeated_size_rejections_stop_compacting_and_accept_the_next_submission() {
+        let _home = temp_home("runner-repeated-request-size");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup_results(
+                vec![
+                    Err(GenerateError::RequestTooLargeError("HTTP 413".into())),
+                    Err(GenerateError::RequestTooLargeError("HTTP 413 again".into())),
+                    Ok(output(20, None, TurnEndReason::EndTurn)),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            let result = submit(&mut runner, CancelToken::new()).await;
+            assert!(matches!(
+                result.result,
+                Err(AgentInteractionError::GenerateError(
+                    GenerateError::RequestTooLargeError(_)
+                ))
+            ));
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(model.remaining(), 1);
+            assert!(runner.agent().state().is_idle());
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn size_recovery_can_run_again_after_successful_model_progress() {
+        let _home = temp_home("runner-request-size-progress");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup_results(
+                vec![
+                    Err(GenerateError::RequestTooLargeError("HTTP 413".into())),
+                    Ok(output(
+                        20,
+                        Some(json!({"command":"printf observed"})),
+                        TurnEndReason::ToolUse,
+                    )),
+                    Err(GenerateError::RequestTooLargeError(
+                        "HTTP 413 after more work".into(),
+                    )),
+                    Ok(output(20, None, TurnEndReason::EndTurn)),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(model.remaining(), 0);
+        });
+    }
+
+    #[test]
+    fn size_recovery_preserves_the_run_truncation_cap() {
+        let _home = temp_home("runner-request-size-truncation");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup_results(
+                vec![
+                    Ok(output(20, None, TurnEndReason::MaxTokens)),
+                    Err(GenerateError::RequestTooLargeError("HTTP 413".into())),
+                    Ok(output(20, None, TurnEndReason::MaxTokens)),
+                    Ok(output(20, None, TurnEndReason::EndTurn)),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            runner.agent_mut().set_max_truncated_resumes(1);
+            let outcome = submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(outcome.reason, TurnEndReason::MaxTokens);
+            assert_eq!(outcome.usage.unwrap().output_tokens, 14);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(model.remaining(), 1);
+        });
+    }
+
+    #[test]
+    fn failed_size_recovery_preserves_tool_observations_and_remains_usable() {
+        let _home = temp_home("runner-request-size-failures");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for cancelled in [true, false] {
+                let compactor = Arc::new(Summarizer {
+                    cancel: cancelled,
+                    failure: (!cancelled).then_some("summary unavailable"),
+                    ..Default::default()
+                });
+                let (mut runner, model) = setup_results(
+                    vec![
+                        Ok(output(
+                            20,
+                            Some(json!({"command":"printf observed"})),
+                            TurnEndReason::ToolUse,
+                        )),
+                        Err(GenerateError::RequestTooLargeError("HTTP 413".into())),
+                        Ok(output(20, None, TurnEndReason::EndTurn)),
+                    ],
+                    compactor.clone(),
+                )
+                .await;
+                let result = submit(&mut runner, CancelToken::new()).await;
+                if cancelled {
+                    assert!(matches!(
+                        result.result,
+                        Err(AgentInteractionError::Cancelled)
+                    ));
+                    assert!(result.rewound.is_none());
+                } else {
+                    assert!(matches!(
+                        result.result,
+                        Err(AgentInteractionError::GenerateError(
+                            GenerateError::RequestTooLargeError(_)
+                        ))
+                    ));
+                    assert!(result.rewound.is_some());
+                }
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(model.remaining(), 1);
+                let saved =
+                    Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
+                assert!(
+                    saved.threads()[0]
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ToolResults { .. }))
+                );
+                assert!(runner.agent().state().is_idle());
+                submit(&mut runner, CancelToken::new())
+                    .await
+                    .result
+                    .unwrap();
+            }
+        });
     }
 
     #[test]
