@@ -20,6 +20,8 @@ remain notes the agent can read as needed.
 | Submit a message | Enter or Send |
 | Insert a newline | Shift-Enter or Alt-Enter |
 | Queue a follow-up while busy | Enter or Queue |
+| Edit a queued message in place | Edit, then Save & send |
+| Remove a pending message | Unqueue |
 | Cancel the running turn | Cancel |
 | Inspect tool input and output | Expand its tool block |
 | Inspect running tools and background shells | Activity |
@@ -31,6 +33,12 @@ remain notes the agent can read as needed.
 Set reasoning effort with `--effort` when launching the server. A tab can be
 closed or refreshed while work continues. Open the session URL again to observe
 its output. Ctrl-C in the launching terminal stops the server.
+
+Editing holds a message and the messages behind it until you save, discard the
+edit, or unqueue it. Your previous composer draft returns when editing finishes.
+After a reload, held messages remain in the queue; Edit opens their last saved
+content, and Resume sends it unchanged. Cancel stops the current turn and sends
+ready messages while leaving held edits paused.
 
 ## Attach an image
 

@@ -191,8 +191,13 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 #token-usage span { white-space: nowrap; }
 #queued { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
 #queued-count { color: var(--cyan); }
-#queued-list { margin: 6px 0 0; padding-left: 1.5em; max-height: 18vh; overflow: auto; }
-#queued-list li { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+#queued-list { margin: 6px 0 0; padding-left: 2em; max-height: 18vh; overflow: auto; }
+#queued-list li { overflow-wrap: anywhere; margin: 6px 0 12px; }
+.queued-content { white-space: pre-wrap; }
+.queue-controls, #queue-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.queue-controls button, #queue-edit button { padding: 3px 8px; font-size: 12px; }
+.queue-state { color: var(--dim); font-size: 12px; }
+#queue-edit { justify-content: space-between; margin-bottom: 12px; color: var(--cyan); font-size: 12px; }
 #cancel { color: var(--red); margin-left: auto; }
 #error { color: var(--red); padding-top: 8px; white-space: pre-wrap; }
 #jump { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--composer-height) + var(--composer-bottom) + 12px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: var(--glass-raised); backdrop-filter: var(--glass-filter); box-shadow: 0 8px 32px #00000066; }

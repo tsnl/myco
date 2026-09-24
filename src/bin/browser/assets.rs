@@ -10,6 +10,7 @@ const ASSETS: &[(&str, &str)] = &[
     ("/app.js", include_str!("assets/app.js")),
     ("/activity.js", include_str!("assets/activity.js")),
     ("/attachments.js", include_str!("assets/attachments.js")),
+    ("/composer.js", include_str!("assets/composer.js")),
     ("/links.js", include_str!("assets/links.js")),
     (
         "/markdown-content.js",

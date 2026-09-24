@@ -4,7 +4,7 @@ const supported = file => /^image\/(png|jpeg|gif|webp)$/.test(file.type) || /\.(
 const encodedSize = file => Math.ceil(file.size / 3) * 4;
 const mib = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 
-export function imageAttachments(limits, changed) {
+export function imageAttachments(limits, changed, imageSource = source => source) {
   let items = [], locked = false;
   const composer = $('composer'), picker = $('attachment-picker');
 
@@ -15,7 +15,7 @@ export function imageAttachments(limits, changed) {
     $('attachment-list').replaceChildren(...items.map(item => {
       const card = element('li', `attachment${item.error ? ' invalid' : ''}`);
       const preview = item.source ? element('img') : element('span', 'attachment-placeholder', item.error ? 'Unavailable' : 'Reading…');
-      if (item.source) { preview.src = item.source; preview.alt = item.file.name; }
+      if (item.source) { preview.src = imageSource(item.source); preview.alt = item.file.name; }
       const name = element('span', 'attachment-name', item.file.name); name.title = item.file.name;
       const remove = element('button', 'remove-attachment', '×');
       remove.type = 'button'; remove.disabled = locked; remove.dataset.attachment = item.id;
@@ -74,6 +74,7 @@ export function imageAttachments(limits, changed) {
     const files = Array.from(event.clipboardData?.files || []);
     if (!files.length) return;
     event.preventDefault();
+    if (locked) { error('Wait for this message to send before attaching images.'); return; }
     const text = event.clipboardData.getData('text/plain');
     if (text) {
       const prompt = $('prompt');
@@ -97,6 +98,14 @@ export function imageAttachments(limits, changed) {
     get ready() { return items.every(item => item.source && !item.error); },
     get ids() { return items.map(item => item.id); },
     get sources() { return items.map(item => item.source); },
+    capture() { return items.slice(); },
+    restore(saved) {
+      for (const item of items) if (!saved.includes(item) && item.reader?.readyState === FileReader.LOADING) item.reader.abort();
+      items = saved.slice(); render();
+    },
+    load(sources) {
+      this.restore(sources.map((source, index) => ({ id: requestId(), file: { name: `Image ${index + 1}`, size: 0 }, source, error: false })));
+    },
     lock(value) {
       locked = value; $('attach').disabled = value; picker.disabled = value;
       for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value;
