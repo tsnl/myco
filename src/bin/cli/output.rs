@@ -87,9 +87,9 @@ impl EventSink for CliSink {
     fn emit(&self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta { text, context } if context.depth == 0 => self.text(&text),
-            AgentEvent::ToolStarted { tool_use, context }
-                if self.terminal && context.depth == 0 =>
-            {
+            AgentEvent::ToolStarted {
+                tool_use, context, ..
+            } if self.terminal && context.depth == 0 => {
                 let _ = self.finish();
                 eprintln!("\n── {} · running", tool_use.name);
                 if let Some(fields) = tool_use.input.as_object() {
@@ -106,6 +106,7 @@ impl EventSink for CliSink {
                 tool_use,
                 result,
                 context,
+                ..
             } if self.terminal && context.depth == 0 => {
                 let status = result.status.as_deref().unwrap_or(if result.is_error {
                     "failed"

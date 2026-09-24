@@ -124,6 +124,7 @@ mod tests {
                 HostDispatchContext {
                     agent_id: uuid::Uuid::nil(),
                     cancel: CancelToken::new(),
+                    background: CancelToken::new(),
                 },
             ),
         )

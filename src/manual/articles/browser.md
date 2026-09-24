@@ -221,6 +221,23 @@ refresh every second without consuming tool output, and disappear when the task
 ends. Background summaries cover the local host; active calls
 include remote tools too.
 
+Running shell calls offer **Background** in their tool header and in Activity.
+It releases that call's foreground wait, so the assistant can continue once any
+other calls in the same batch finish. The process keeps running and its result
+records a `session_id` for later `bash` reads or `close` on the same host. A
+backgrounded one-shot exec keeps its original closed stdin; use `read`, `signal`,
+or `close`, not `write`. Backgrounding an existing shell-session read or write
+returns its current output without stopping that session.
+
+Background is separate from Cancel: subsequent turn cancellation does not stop
+an already backgrounded process. Its original exec timeout no longer applies;
+the process runs until it exits, is closed, or its owning runtime/host ends.
+Backgrounding does not start another process, so it may retain an already
+running exec even when the admission limit for new shell sessions is full.
+Tabs reconnect to the same background tasks, but server restarts do not restore
+processes. Local tasks remain visible in Activity; remote handles are recorded
+in their tool result and can be queried on that host.
+
 Manual and automatic compaction update the activity indicator to **Compacting**.
 Compaction cards, summaries, internal resumption instructions, and prelude-change
 notices are hidden from the conversation, including after reload. Automatic
@@ -369,6 +386,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
+| `POST /api/sessions/ID/background` | `{"session_id":"ID","call_id":"UUID"}` → 202; use the running tool block's `background_id` |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
 | `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
 | `GET /files/PATH`, `HEAD /files/PATH` | Profile workspace files; GET supports a single `Range: bytes=START-END` |

@@ -46,6 +46,68 @@ fn process_with(command_fragment: &str) -> bool {
         .any(|line| line.contains(command_fragment))
 }
 
+#[tokio::test]
+async fn background_remote_exec_preserves_the_process_and_connection() {
+    let client = subprocess_host();
+    let owner = uuid::Uuid::new_v4();
+    let context = myco::tool_services::HostDispatchContext::new(owner, CancelToken::new());
+    // Request before dispatch to exercise a Background line arriving before the
+    // host's tool task is polled. Registration must retain that request.
+    context.background.cancel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_controlled(
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"command":"echo before-background; sleep 30", "timeout_ms":60000}),
+            },
+            context.clone(),
+        ),
+    )
+    .await
+    .expect("background request did not release the remote wait");
+    assert_eq!(result.status.as_deref(), Some("backgrounded"), "{result:?}");
+    let resources = client.resources(owner).await.unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].details["process_exited"], false);
+    let id = &resources[0].id;
+    context.cancel.cancel();
+    let read = client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"action":"read", "session_id":id, "timeout_ms":1000}),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(!read.is_error, "{read:?}");
+    assert!(format!("{}{}", tool_text(&result), tool_text(&read)).contains("before-background"));
+    let next = client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"command":"echo foreground-ready"}),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(tool_text(&next).contains("foreground-ready"), "{next:?}");
+    client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"action":"close", "session_id":id}),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(client.resources(owner).await.unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_midcall_then_next_call_succeeds() {
     let client = subprocess_host();

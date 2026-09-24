@@ -27,7 +27,12 @@ impl ToolExecutor for EchoTools {
         }]
     }
 
-    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+    fn dispatch(
+        self: Arc<Self>,
+        tool: ToolUse,
+        cancel: CancelToken,
+        _background: CancelToken,
+    ) -> Async<ToolResult> {
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return ToolResult::err("cancelled");

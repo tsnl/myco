@@ -233,23 +233,30 @@ impl HostController {
         tool_use: ToolUse,
         cancel: CancelToken,
     ) -> ToolResult {
+        self.call_controlled(tool_use, HostDispatchContext::new(agent_id, cancel))
+            .await
+    }
+
+    pub async fn call_controlled(
+        &self,
+        tool_use: ToolUse,
+        context: HostDispatchContext,
+    ) -> ToolResult {
         match &self.backend {
             Backend::InProcess { worker } => {
                 let worker = Arc::clone(worker);
-                worker
-                    .dispatch_tool_use(tool_use, HostDispatchContext { agent_id, cancel })
-                    .await
+                worker.dispatch_tool_use(tool_use, context).await
             }
-            Backend::Subprocess { .. } => self.call_subprocess(agent_id, tool_use, cancel).await,
+            Backend::Subprocess { .. } => self.call_subprocess(tool_use, context).await,
         }
     }
 
-    async fn call_subprocess(
-        &self,
-        agent_id: uuid::Uuid,
-        tool_use: ToolUse,
-        cancel: CancelToken,
-    ) -> ToolResult {
+    async fn call_subprocess(&self, tool_use: ToolUse, context: HostDispatchContext) -> ToolResult {
+        let HostDispatchContext {
+            agent_id,
+            cancel,
+            background,
+        } = context;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let response_timeout = response_timeout(&tool_use);
 
@@ -259,28 +266,45 @@ impl HostController {
             tool_use,
         };
 
-        let rx = match self.submit(&id, &request, true).await {
+        let mut rx = match self.submit(&id, &request, true).await {
             Ok(rx) => rx,
             Err(e) => {
                 return ToolResult::err(format!("host {:?}: {e}", self.name));
             }
         };
 
-        let reply = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                self.cancel_remote(&id).await;
-                self.abandon(&id).await;
-                return ToolResult::err("cancelled while awaiting host acknowledgement; effects are unknown");
-            }
-            r = rx => r,
-            _ = tokio::time::sleep(response_timeout) => {
-                let message = format!(
-                    "tool call timed out after {}ms without a host response; connection reset",
-                    response_timeout.as_millis()
-                );
-                self.reset_connection(&message).await;
-                return ToolResult::err(format!("host {:?}: {message}", self.name));
+        let background_request = async {
+            background.cancelled().await;
+            self.background_remote(&id).await
+        };
+        tokio::pin!(background_request);
+        let deadline = tokio::time::sleep(response_timeout);
+        tokio::pin!(deadline);
+        let mut background_sent = false;
+        let reply = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.cancel_remote(&id).await;
+                    self.abandon(&id).await;
+                    return ToolResult::err("cancelled while awaiting host acknowledgement; effects are unknown");
+                }
+                r = &mut rx => break r,
+                result = &mut background_request, if !background_sent => {
+                    background_sent = true;
+                    if let Err(error) = result {
+                        self.abandon(&id).await;
+                        return ToolResult::err(format!("could not background remote tool: {error}; effects are unknown"));
+                    }
+                }
+                _ = &mut deadline => {
+                    let message = format!(
+                        "tool call timed out after {}ms without a host response; connection reset",
+                        response_timeout.as_millis()
+                    );
+                    self.reset_connection(&message).await;
+                    return ToolResult::err(format!("host {:?}: {message}", self.name));
+                }
             }
         };
 
@@ -477,6 +501,24 @@ impl HostController {
             return;
         };
         let _ = tokio::time::timeout(Duration::from_millis(250), write_tx.send(bytes)).await;
+    }
+
+    async fn background_remote(&self, id: &str) -> Result<(), String> {
+        let Backend::Subprocess { conn, .. } = &self.backend else {
+            unreachable!()
+        };
+        let write_tx = conn
+            .lock()
+            .await
+            .as_ref()
+            .filter(|c| !c.dead.load(Ordering::SeqCst))
+            .map(|c| c.write_tx.clone())
+            .ok_or_else(|| "host connection closed".to_string())?;
+        let bytes = Request::Background { id: id.to_owned() }.encode()?;
+        write_tx
+            .send(bytes)
+            .await
+            .map_err(|_| "host connection closed".to_string())
     }
 
     async fn reset_connection(&self, message: &str) {

@@ -21,6 +21,131 @@ fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
     HostDispatchContext::new(agent_id, crate::core::CancelToken::new())
 }
 
+#[tokio::test]
+async fn background_exec_retains_output_owner_and_process_after_turn_cancellation() {
+    let service = Arc::new(BashService::new());
+    let dir = temp_dir("background-exec");
+    let owner = Uuid::new_v4();
+    let ctx = dispatch_ctx(owner);
+    let work = service.clone().dispatch_tool_use(tool_use_json(json!({
+        "command": format!("echo before; touch {0}/started; while [ ! -f {0}/release ]; do sleep 0.01; done; echo after", dir.path().display()),
+        "timeout_ms": 1000,
+    })), ctx.clone());
+    let task = tokio::spawn(work);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !dir.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ctx.background.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status.as_deref(), Some("backgrounded"));
+    assert!(!result.is_error);
+    let text = result_text(&result);
+    assert!(text.contains("stdout:\nbefore\n"), "{text}");
+    let id = text
+        .lines()
+        .find_map(|line| line.strip_prefix("session_id: "))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(service.resources(owner)[0].details["process_exited"], false);
+    ctx.cancel.cancel();
+    assert_eq!(service.running_tool_summaries(owner).len(), 1);
+    let foreign = dispatch_json_as(
+        &service,
+        Uuid::new_v4(),
+        json!({"action":"close", "session_id":id}),
+    )
+    .await;
+    assert!(foreign.is_error);
+    std::fs::write(dir.path().join("release"), "").unwrap();
+    let read = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action":"read", "session_id":id, "timeout_ms":2000}),
+    )
+    .await;
+    assert!(result_text(&read).contains("stdout:\nafter\n"), "{read:?}");
+    assert!(
+        !result_text(&read).contains("stdout:\nbefore\n"),
+        "already returned output must not repeat"
+    );
+    dispatch_json_as(&service, owner, json!({"action":"close", "session_id":id})).await;
+}
+
+#[tokio::test]
+async fn background_releases_a_quiet_session_read_without_killing_the_session() {
+    let service = Arc::new(BashService::new());
+    let owner = Uuid::new_v4();
+    dispatch_json_as(
+        &service,
+        owner,
+        json!({"action":"start", "session_id":"quiet", "command":"cat", "idle_ms":10}),
+    )
+    .await;
+    let ctx = dispatch_ctx(owner);
+    let work = service.clone().dispatch_tool_use(
+        tool_use_json(json!({"action":"read", "session_id":"quiet", "timeout_ms":10000})),
+        ctx.clone(),
+    );
+    let task = tokio::spawn(work);
+    tokio::task::yield_now().await;
+    ctx.background.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status.as_deref(), Some("backgrounded"));
+    let next = dispatch_json_as(
+        &service,
+        owner,
+        json!({"action":"write", "session_id":"quiet", "stdin":"still alive\n", "idle_ms":10}),
+    )
+    .await;
+    assert!(result_text(&next).contains("still alive"));
+    service.on_agent_finished(owner);
+}
+
+#[tokio::test]
+async fn cancellation_wins_over_a_background_request_before_exec_starts() {
+    let service = Arc::new(BashService::new());
+    let ctx = dispatch_ctx(Uuid::new_v4());
+    ctx.cancel.cancel();
+    ctx.background.cancel();
+    let result = service
+        .clone()
+        .dispatch_tool_use(tool_use_json(json!({"command":"sleep 10"})), ctx.clone())
+        .await;
+    assert!(result.is_error);
+    assert!(service.resources(ctx.agent_id).is_empty());
+}
+
+#[tokio::test]
+async fn dropping_the_host_service_stops_background_process_groups() {
+    let service = Arc::new(BashService::new());
+    let ctx = dispatch_ctx(Uuid::new_v4());
+    ctx.background.cancel();
+    let result = service
+        .clone()
+        .dispatch_tool_use(tool_use_json(json!({"command":"sleep 30 & wait"})), ctx)
+        .await;
+    assert_eq!(result.status.as_deref(), Some("backgrounded"));
+    let shared = service.sessions().values().next().unwrap().shared.clone();
+    drop(service);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !lock_unpoisoned(&shared.buffer).is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background process group survived host teardown");
+}
+
 async fn dispatch_json(
     harness: Arc<HostWorker>,
     value: serde_json::Value,

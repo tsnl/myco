@@ -299,9 +299,20 @@ impl Harness {
     /// what the NDJSON protocol carries to remotes.
     pub fn dispatch_tool_use(
         self: Arc<Self>,
-        mut tool_use: generative_model::ToolUse,
+        tool_use: generative_model::ToolUse,
         agent_id: uuid::Uuid,
         cancel: CancelToken,
+    ) -> Async<generative_model::ToolResult> {
+        self.dispatch_tool_use_controlled(
+            tool_use,
+            crate::tool_services::HostDispatchContext::new(agent_id, cancel),
+        )
+    }
+
+    pub fn dispatch_tool_use_controlled(
+        self: Arc<Self>,
+        mut tool_use: generative_model::ToolUse,
+        context: crate::tool_services::HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
             let name = tool_use.name.clone();
@@ -335,7 +346,7 @@ impl Harness {
                 ));
             };
 
-            client.call(agent_id, tool_use, cancel).await
+            client.call_controlled(tool_use, context).await
         })
     }
 
