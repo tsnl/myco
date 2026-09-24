@@ -76,8 +76,9 @@ and automation so their meaning does not depend on the next launch's `--profile`
 
 ## Appearance and session browser
 
-The browser uses translucent panels in neutral charcoal with square corners
-over a locally rendered sky.
+The browser uses translucent panels with square corners over a locally rendered
+sky. Their tint follows the same light: cool blue in daylight, warm rose and amber
+around dawn and dusk, and deeper blue at night. Overcast weather softens the tint.
 The conversation stays in a central well, with the sky visible on both sides;
 its glass background continues below the viewport during native scroll bounce.
 Floating controls use background blur. The conversation well is the lightest

@@ -1,4 +1,4 @@
-/* Neutral glass takes its color from the sky and darkens toward the user.
+/* Glass follows the sky's light and darkens toward the user.
    The composer overlays the .58 well: .31 more tint matches the .71 toolbar. */
 :root {
   color-scheme: dark;
@@ -7,7 +7,7 @@
   --dim: #cfcfcf; --cyan: #8bd5dc; --green: #a6da95; --amber: #e5c890; --red: #ed8796;
   --line: #e5e5e526; --composer-height: 180px; --toolbar-height: 65px;
   --composer-bottom: max(16px, env(safe-area-inset-bottom));
-  --glass-tint: 20 20 20;
+  --glass-tint: 12 20 35;
   --glass-control: rgb(var(--glass-tint) / .36);
   --glass-well: rgb(var(--glass-tint) / .58);
   --glass-raised: rgb(var(--glass-tint) / .71);

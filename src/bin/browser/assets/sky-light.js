@@ -25,12 +25,13 @@ export function sampleSky(now, forecast) {
   const { gloom, clarity } = weatherLight(conditions);
   const light = lightSource(hour, night, twilight, gloom);
   return { conditions, night, gloom, clarity, light, gradient: renderGradient(altitude)[0],
+    glassTint: glassTint(twilight, night, gloom),
     phase: night > 0.5 ? 'night' : altitude < 0.15 ? 'twilight' : 'day',
     lighting: { direction: light.direction, diffusion: gloom, palette: cloudPalette(twilight, night, gloom) } };
 }
 
 //
-// Directional glow and cloud colors
+// Directional glow, glass, and cloud colors
 //
 
 function lightSource(hour, night, twilight, gloom) {
@@ -50,6 +51,14 @@ const NIGHT = ['#172238', '#263850', '#3a4f6a', '#5b7490', '#849bb0', '#b4c6d5']
 const OVERCAST = ['#34475b', '#50657a', '#728597', '#98a7b4', '#b5c3cc', '#d9e1e6'];
 const channels = hex => [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
 const blend = (a, b, weight) => a.map((value, index) => value * (1 - weight) + b[index] * weight);
+
+function glassTint(twilight, night, gloom) {
+  // Grade the glass with the same light as the sky, retaining dark enough
+  // colors for readable text without increasing the surface opacity.
+  const warm = blend([16, 30, 50], [48, 29, 27], twilight);
+  const overcast = blend(warm, [24, 28, 34], gloom * 0.65);
+  return blend(overcast, [12, 20, 35], night).map(Math.round).join(' ');
+}
 
 function cloudPalette(twilight, night, gloom) {
   return DAY.map((color, index) => {
