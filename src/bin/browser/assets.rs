@@ -23,6 +23,7 @@ const ASSETS: &[(&str, &str)] = &[
     ("/timestamps.js", include_str!("assets/timestamps.js")),
     ("/usage.js", include_str!("assets/usage.js")),
     ("/home.js", include_str!("assets/home.js")),
+    ("/rename.js", include_str!("assets/rename.js")),
     ("/common.js", include_str!("assets/common.js")),
     ("/scope.js", include_str!("assets/scope.js")),
     ("/profiles.js", include_str!("assets/profiles.js")),

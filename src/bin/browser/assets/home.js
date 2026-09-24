@@ -1,5 +1,6 @@
 import { $, api, element, error, clearError, setArchived } from './common.js';
 import { showActivity } from './activity.js';
+import { sessionRenamer } from './rename.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 
 document.title = `Sessions · ${profileName} · myco`;
@@ -11,6 +12,7 @@ let connected = false;
 let streamConnected = false;
 let eventPort = null;
 const rows = new Map();
+const renameSession = sessionRenamer(refresh);
 let archivedSession = null;
 
 function archiveNotice(id) {
@@ -47,7 +49,10 @@ function render() {
       row = element('li');
       const link = element('a'); link.href = profilePath(`/sessions/${encodeURIComponent(session.id)}`);
       link.append(element('span', 'session-name'), element('span', 'session-meta'), element('span', 'session-id', session.id));
-      const archive = element('button'); archive.type = 'button';
+      const archive = element('button', 'archive-session'); archive.type = 'button';
+      const rename = element('button', 'rename-session', 'Rename'); rename.type = 'button';
+      rename.setAttribute('aria-haspopup', 'dialog'); rename.setAttribute('aria-controls', 'rename-session');
+      rename.onclick = () => renameSession(row.session, rename);
       archive.onclick = async () => {
         archive.disabled = true; error();
         try {
@@ -60,7 +65,8 @@ function render() {
         } catch (e) { error(e.message); }
         finally { archive.disabled = false; }
       };
-      row.append(link, archive); rows.set(session.id, row);
+      const actions = element('div', 'session-actions'); actions.append(rename, archive);
+      row.append(link, actions); rows.set(session.id, row);
     }
     if (JSON.stringify(row.session) !== JSON.stringify(session)) {
       row.session = session;
@@ -68,9 +74,10 @@ function render() {
       const status = element('span', 'session-status activity-indicator');
       const time = element('time', '', new Date(session.updated_at).toLocaleString()); time.dateTime = session.updated_at;
       row.querySelector('.session-meta').replaceChildren(status, document.createTextNode(` · ${session.model} · `), time);
-      const archive = row.querySelector('button');
+      const archive = row.querySelector('.archive-session');
       archive.textContent = session.archived ? 'Restore' : 'Archive';
       archive.setAttribute('aria-label', `${archive.textContent} ${session.title}`);
+      row.querySelector('.rename-session').setAttribute('aria-label', `Rename ${session.title}`);
     }
     showActivity(row.querySelector('.session-status'), session.status, session.busy, connected);
     if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);

@@ -31,6 +31,7 @@ remain notes the agent can read as needed.
 | Switch configured models | Model selector between turns |
 | Compact context | Compact or `/compact` |
 | Open another session | New or a session link on the home page |
+| Rename a session | Pencil beside its title, or Rename on its session-list row |
 
 Set reasoning effort with `--effort` when launching the server. A tab can be
 closed or refreshed while work continues. Open the session URL again to observe

@@ -166,6 +166,14 @@ by another myco process must be archived from that process or after it closes.
 The list refreshes while the home page is visible; changes made outside this
 server can take up to ten seconds to appear.
 
+Use the pencil beside the session title, or **Rename** on a session-browser row,
+to edit its name. Enter or **Save** applies it; Escape or **Cancel** discards the
+edit. Names must be non-empty and use the existing 120-character title limit.
+The title updates in open session tabs and the browser list. Renaming works
+while tools run and for archived sessions; it preserves the conversation, URL,
+and archive status. Saved sessions are renamed without starting a runtime.
+If saving fails, the dialog keeps your proposed name so you can retry.
+
 The launcher options are documented in `cli`.
 
 ## Conversation controls
@@ -452,6 +460,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
 | `POST /api/sessions/ID/background` | `{"session_id":"ID","call_id":"UUID"}` → 202; use the running tool block's `background_id` |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
+| `POST /api/sessions/ID/rename` | `{"session_id":"ID","title":"New name"}` → 204; blank titles are rejected |
 | `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
 | `GET /files/PATH`, `HEAD /files/PATH` | Profile workspace files; GET supports a single `Range: bytes=START-END` |
 

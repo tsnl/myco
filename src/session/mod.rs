@@ -259,6 +259,19 @@ impl ActiveSession {
         f(&mut self.lock())
     }
 
+    /// Save a title without replacing concurrent conversation or tool updates.
+    /// A failed save leaves the live metadata unchanged.
+    pub fn rename(&self, title: String) -> Result<(), String> {
+        let mut current = self.lock();
+        let mut updated = current.clone();
+        updated.set_title(Some(title))?;
+        updated.touch();
+        updated.externalize_images()?;
+        updated.save()?;
+        *current = updated;
+        Ok(())
+    }
+
     /// Archive only this session, preserving threads, lineage and live tools.
     pub fn set_archived(&self, archived: bool) -> Result<(), String> {
         let mut current = self.lock();

@@ -2435,6 +2435,115 @@ context_window = 100000
         (self.home / "Alpha-rename-release").touch()
         expect(page.locator("#model")).to_be_enabled()
 
+    def test_rename_session_updates_tabs_and_listing_without_interrupting_work(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        expect(page.locator('#session-title')).to_have_text('Alpha wait')
+        card = page.locator('.tool').element_handle()
+        page.fill('#prompt', 'Keep this draft')
+        other = self.context.new_page()
+        other.goto(page.url)
+        home = self.context.new_page()
+        home.goto(self.origin)
+        page.get_by_role('button', name='Rename session', exact=True).click()
+        expect(page.get_by_label('Session name', exact=True)).to_have_value('Alpha wait')
+        name = 'Review <Myco> — 雨'
+        page.get_by_label('Session name', exact=True).fill('  ' + name + '  ')
+        page.get_by_label('Session name', exact=True).press('Enter')
+        expect(page.get_by_role('dialog', name='Rename session')).not_to_be_visible()
+        for tab in [page, other]:
+            expect(tab.locator('#session-title')).to_have_text(name)
+            expect(tab).to_have_title(name + ' · default · myco')
+            expect(tab.locator('.tool.running')).to_have_count(1)
+        expect(home.locator('.session-name')).to_have_text(name)
+        self.assertTrue(card.evaluate('node => node.isConnected'))
+        expect(page.locator('#prompt')).to_have_value('Keep this draft')
+        page.get_by_role('button', name='Rename session', exact=True).click()
+        page.get_by_label('Session name', exact=True).fill('Discard me')
+        page.get_by_label('Session name', exact=True).press('Escape')
+        expect(page.locator('#session-title')).to_have_text(name)
+        expect(page.get_by_role('button', name='Rename session', exact=True)).to_be_focused()
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#connection')).to_have_text('Ready')
+        page.reload()
+        expect(page).to_have_title(name + ' · default · myco')
+        self.assertEqual(len(self.requests), 2, 'Renaming must not invoke the model')
+
+    def test_rename_saved_and_archived_sessions_survives_restart_without_starting_them(self):
+        page = self.session(self.page)
+        session_id = page.url.rsplit('/', 1)[1]
+        page.click('#archive')
+        expect(page).to_have_url(self.origin + '/profiles/default/')
+        expect(page.locator('#archive-notice')).to_be_visible()
+        expect(page.locator('#session-list a')).to_have_count(0)
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        page.select_option('#archive-filter', 'archived')
+        expect(page.locator('.session-status')).to_have_text('Saved')
+        page.get_by_role('button', name='Rename New session', exact=True).click()
+        page.get_by_label('Session name', exact=True).fill('Saved review')
+        page.get_by_role('button', name='Save', exact=True).click()
+        expect(page.locator('.session-name')).to_have_text('Saved review')
+        expect(page.locator('.session-status')).to_have_text('Saved')
+        saved = json.loads((self.home / 'profiles/default/session/archived' / session_id[:2] / f'{session_id}.json').read_text())
+        self.assertEqual(saved['title'], 'Saved review')
+        self.assertTrue(saved['archived'])
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        page.select_option('#archive-filter', 'archived')
+        expect(page.locator('.session-name')).to_have_text('Saved review')
+        expect(page.locator('.session-status')).to_have_text('Saved')
+        self.assertEqual(self.requests, [])
+
+    def test_rename_errors_preserve_title_and_dialog_draft(self):
+        page = self.session(self.page)
+        session_id = page.url.rsplit('/', 1)[1]
+        endpoint = self.origin + f'/profiles/default/api/sessions/{session_id}/rename'
+        for payload, expected in [({'session_id': session_id, 'title': ' \n '}, 400),
+                                  ({'session_id': 'wrong', 'title': 'Wrong session'}, 409)]:
+            response = self.context.request.post(endpoint, data=payload)
+            self.assertEqual(response.status, expected, response.text())
+        page.get_by_role('button', name='Rename session', exact=True).click()
+        page.get_by_label('Session name', exact=True).fill('Keep this rename')
+        store = self.home / 'profiles/default/session'
+        moved = store.with_name('saved-session')
+        store.rename(moved)
+        store.touch()
+        try:
+            page.get_by_role('button', name='Save', exact=True).click()
+            expect(page.locator('#rename-error')).to_be_visible()
+            expect(page.get_by_label('Session name', exact=True)).to_have_value('Keep this rename')
+            expect(page.locator('#session-title')).to_have_text('New session')
+            snapshot = self.context.request.get(endpoint.removesuffix('/rename')).json()['change']['snapshot']
+            self.assertEqual(snapshot['title'], 'New session')
+        finally:
+            store.unlink()
+            moved.rename(store)
+        page.get_by_role('button', name='Save', exact=True).click()
+        expect(page.get_by_role('dialog', name='Rename session')).not_to_be_visible()
+        expect(page.locator('#session-title')).to_have_text('Keep this rename')
+
+    def test_rename_is_scoped_to_the_selected_profile(self):
+        self.add_profile()
+        default = self.session(self.page)
+        session_id = default.url.rsplit('/', 1)[1]
+        prefix = self.origin + '/profiles/research'
+        response = self.context.request.post(prefix + '/api/sessions', data={'request_id': str(uuid.UUID(session_id))})
+        self.assertEqual(response.status, 200)
+        home = self.context.new_page()
+        home.goto(prefix + '/')
+        home.get_by_role('button', name='Rename New session', exact=True).click()
+        home.get_by_label('Session name', exact=True).fill('Research only')
+        home.get_by_role('button', name='Save', exact=True).click()
+        expect(home.locator('.session-name')).to_have_text('Research only')
+        expect(default.locator('#session-title')).to_have_text('New session')
+        default.reload()
+        expect(default.locator('#session-title')).to_have_text('New session')
+        self.assertEqual(self.requests, [])
+
     def test_home_refresh_keeps_links_and_focus(self):
         self.session(self.page)
         page = self.context.new_page()

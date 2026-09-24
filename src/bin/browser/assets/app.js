@@ -2,6 +2,7 @@ import { $, api, element, error, clearError, requestId, setArchived } from './co
 import { showActivity } from './activity.js';
 import { messageComposer } from './composer.js';
 import { messageNavigation } from './message-navigation.js';
+import { sessionRenamer } from './rename.js';
 import { linkify, setLinkedText } from './links.js';
 import { markdownContent } from './markdown-content.js';
 import { messageTimestamp } from './timestamps.js';
@@ -21,6 +22,7 @@ const nodes = [];
 const markdownJobs = new WeakMap();
 const toolClocks = new WeakMap();
 const composer = messageComposer({ sendAction, imageSource, addImages, resizeInput });
+const renameSession = sessionRenamer();
 const navigation = messageNavigation({
   onNavigate() { follow = false; $('jump').hidden = false; },
   onLatest: jumpToLatest,
@@ -329,6 +331,7 @@ function metadata() {
   composer.update(state, connected, selectingModel);
   $('compact').disabled = disabled || !state.blocks.length;
   $('archive').disabled = !connected || !state.session_id || archiving;
+  $('rename').disabled = !connected || !state.session_id || archiving;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';
   transcript.setAttribute('aria-busy', String(!!state.busy));
@@ -421,6 +424,7 @@ async function sendAction(action, id = requestId()) {
   await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: id, session_id: state.session_id, action });
 }
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
+$('rename').onclick = () => renameSession({ id: state.session_id, title: state.title }, $('rename'));
 $('archive').onclick = async () => {
   if (archiving || !state.session_id) return;
   archiving = true; metadata(); error();
