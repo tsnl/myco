@@ -229,9 +229,38 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum ProfileEvent {
-    Update { profile: String, update: Value },
-    Connection { profile: String, connected: bool },
-    Resync,
+    Update {
+        profile: String,
+        update: Value,
+    },
+    // Existing tabs understand resync and refetch their snapshots. Updated tabs
+    // use the revision and session ID to refresh only the affected view.
+    #[serde(rename = "resync")]
+    Refresh {
+        profile: String,
+        update: Value,
+    },
+    Connection {
+        profile: String,
+        connected: bool,
+    },
+    Resync {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+    },
+}
+
+fn profile_update(profile: &str, update: Value) -> ProfileEvent {
+    let profile = profile.into();
+    if update["kind"] == "resync" {
+        ProfileEvent::Resync {
+            profile: Some(profile),
+        }
+    } else if update["change"]["kind"] == "refresh" {
+        ProfileEvent::Refresh { profile, update }
+    } else {
+        ProfileEvent::Update { profile, update }
+    }
 }
 
 async fn relay(
@@ -263,7 +292,9 @@ async fn relay_connection(
     events: &broadcast::Sender<Arc<ProfileEvent>>,
 ) -> Result<(), String> {
     let response = client
-        .get(format!("http://localhost/profiles/{profile}/api/events"))
+        .get(format!(
+            "http://localhost/profiles/{profile}/api/live-events"
+        ))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -277,12 +308,9 @@ async fn relay_connection(
     while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
         // The embedded server emits one compact JSON data line per update.
         if let Some(data) = line.strip_prefix("data:") {
-            let update =
+            let update: Value =
                 serde_json::from_str(data).map_err(|e| format!("invalid worker event: {e}"))?;
-            let _ = events.send(Arc::new(ProfileEvent::Update {
-                profile: profile.into(),
-                update,
-            }));
+            let _ = events.send(Arc::new(profile_update(profile, update)));
         }
     }
     Ok(())
@@ -291,6 +319,21 @@ async fn relay_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_refresh_remains_a_resync_for_tabs_opened_before_a_server_upgrade() {
+        let update = serde_json::json!({
+            "session_id":"session", "revision":42, "change":{"kind":"refresh"}
+        });
+        let event = serde_json::to_value(profile_update("work", update.clone())).unwrap();
+        assert_eq!(event["kind"], "resync");
+        assert_eq!(event["profile"], "work");
+        assert_eq!(event["update"], update);
+        let lag =
+            serde_json::to_value(profile_update("work", serde_json::json!({"kind":"resync"})))
+                .unwrap();
+        assert_eq!(lag, serde_json::json!({"kind":"resync", "profile":"work"}));
+    }
 
     #[test]
     fn proxy_removes_connection_headers_but_preserves_origin_and_file_contracts() {

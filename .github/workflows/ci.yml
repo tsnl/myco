@@ -62,6 +62,7 @@ jobs:
         run: |
           cargo build --locked --bin myco
           for asset in src/bin/browser/assets/*.js; do node --input-type=module --check < "$asset"; done
+          node --test scripts/browser_events_test.mjs
           python3 -m venv "$RUNNER_TEMP/browser"
           "$RUNNER_TEMP/browser/bin/pip" install -r scripts/browser-requirements.txt
           "$RUNNER_TEMP/browser/bin/python" -m playwright install --with-deps chromium

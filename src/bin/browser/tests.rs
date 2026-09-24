@@ -7,7 +7,9 @@ use axum::{
 use futures::StreamExt;
 use myco::generative_model::{Content, Message, ToolResult};
 
-use super::super::http::{Server, SessionRequest, events, session_action, session_cancel};
+use super::super::http::{
+    Server, SessionRequest, events, live_events, session_action, session_cancel,
+};
 use super::*;
 
 fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
@@ -580,6 +582,63 @@ async fn reconnect_and_slow_observers_receive_state_without_replaying_work() {
         );
         assert!(work.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn live_observers_receive_invalidations_instead_of_every_sessions_history() {
+    let updates = broadcast::channel(4).0;
+    let apps: Vec<_> = (0..26)
+        .map(|index| app_for(&index.to_string(), updates.clone()).0)
+        .collect();
+    for app in &apps {
+        app.delta("assistant", "long history ".repeat(10_000));
+    }
+    let response = live_events(State(server(&apps))).await.into_response();
+    let mut stream = response.into_body().into_data_stream();
+    let connected = stream.next().await.unwrap().unwrap();
+    assert_eq!(&connected[..], b": connected\n\n");
+
+    apps[0].delta("assistant", "fresh delta".into());
+    let delta = event_data(&stream.next().await.unwrap().unwrap());
+    assert_eq!(delta["session_id"], "0");
+    assert_eq!(delta["change"]["kind"], "append");
+    assert_eq!(delta["change"]["text"], "fresh delta");
+
+    assert!(updates.send(Arc::new(apps[0].snapshot())).is_ok());
+    let replacement = stream.next().await.unwrap().unwrap();
+    assert!(
+        replacement.len() < 200,
+        "full histories must be fetched explicitly"
+    );
+    let replacement = event_data(&replacement);
+    assert_eq!(replacement["session_id"], "0");
+    assert_eq!(replacement["revision"], apps[0].snapshot().revision);
+    assert_eq!(replacement["change"], json!({"kind":"refresh"}));
+}
+
+#[tokio::test]
+async fn lagged_live_observers_drop_stale_deltas_and_request_one_resync() {
+    let (app, mut work) = app();
+    let response = live_events(State(server(std::slice::from_ref(&app))))
+        .await
+        .into_response();
+    let mut stream = response.into_body().into_data_stream();
+    stream.next().await.unwrap().unwrap();
+    for index in 0..10 {
+        app.notice(format!("notice {index}"));
+    }
+    let resync = event_data(&stream.next().await.unwrap().unwrap());
+    assert_eq!(resync, json!({"kind":"resync"}));
+
+    app.status("Running");
+    let fresh = event_data(&stream.next().await.unwrap().unwrap());
+    assert_eq!(fresh["revision"], app.snapshot().revision);
+    assert_eq!(fresh["change"]["kind"], "meta");
+    assert_eq!(fresh["change"]["meta"]["status"], "Running");
+    assert!(
+        work.try_recv().is_err(),
+        "resynchronizing must never replay work"
+    );
 }
 
 #[tokio::test]

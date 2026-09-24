@@ -135,6 +135,7 @@ scripted model, and real local tools. They require no API credentials:
 
 ```bash
 cargo build --locked --bin myco
+node --test scripts/browser_events_test.mjs
 python3 -m venv /tmp/myco-browser-tests
 /tmp/myco-browser-tests/bin/pip install -r scripts/browser-requirements.txt
 /tmp/myco-browser-tests/bin/python -m playwright install --with-deps chromium

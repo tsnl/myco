@@ -1,4 +1,4 @@
-import { $, api, element, error, setArchived } from './common.js';
+import { $, api, element, error, clearError, setArchived } from './common.js';
 import { showActivity } from './activity.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 
@@ -49,7 +49,7 @@ function render() {
       link.append(element('span', 'session-name'), element('span', 'session-meta'), element('span', 'session-id', session.id));
       const archive = element('button'); archive.type = 'button';
       archive.onclick = async () => {
-        archive.disabled = true;
+        archive.disabled = true; error();
         try {
           const archived = !row.session.archived;
           await setArchived(session.id, archived);
@@ -88,8 +88,8 @@ async function refresh() {
     try {
       sessions = await (await api(`/api/sessions?archived=${archived}`)).json();
       connected = streamConnected;
-      render(); error();
-    } catch (e) { connected = false; render(); error(e.message); }
+      render(); clearError('refresh');
+    } catch (e) { connected = false; render(); error(e.message, 'refresh'); }
   })();
   await refreshing;
   refreshing = null;
@@ -100,7 +100,7 @@ async function refresh() {
 }
 function connection(value) {
   streamConnected = value;
-  if (value) { refresh(); return; }
+  if (value) { clearError('connection'); refresh(); return; }
   connected = false;
   render();
 }
@@ -108,7 +108,7 @@ function connect() {
   connection(false);
   const worker = eventsWorker();
   eventPort = worker.port;
-  worker.onerror = () => { connection(false); error('Could not connect to live activity. Reload this page to reconnect.'); };
+  worker.onerror = () => { connection(false); error('Could not connect to live activity. Reload this page to reconnect.', 'connection'); };
   eventPort.onmessage = ({ data }) => {
     if (data.kind === 'sessions_changed') refresh();
     else if (data.kind === 'connection') connection(data.connected);
