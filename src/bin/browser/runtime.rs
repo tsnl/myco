@@ -21,6 +21,10 @@ use super::super::{
 use super::attachments;
 use super::view::{self, Block};
 
+#[path = "queue.rs"]
+mod queue;
+use queue::{MAX_QUEUED_MESSAGES, QueueUpdate, QueuedMessage};
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -46,16 +50,6 @@ impl std::fmt::Display for Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
-
-const MAX_QUEUED_MESSAGES: usize = 20;
-
-#[derive(Clone, Serialize)]
-struct QueuedMessage {
-    request_id: Uuid,
-    text: String,
-    images: Vec<String>,
-    accepted_at: DateTime<Utc>,
-}
 
 #[derive(Clone, Serialize)]
 struct Snapshot {
@@ -410,6 +404,11 @@ enum Action {
         text: String,
         #[serde(default)]
         images: Vec<String>,
+    },
+    UpdateQueued {
+        message_id: Uuid,
+        revision: u64,
+        update: QueueUpdate,
     },
     Compact,
     SelectModel {
@@ -785,6 +784,7 @@ async fn execute(
     args: &Args,
 ) -> std::result::Result<(), String> {
     match work.request.action {
+        Action::UpdateQueued { .. } => unreachable!("queue mutations do not create worker actions"),
         Action::Submit { text, images } => match attachments::content(
             &text,
             &images,
@@ -844,14 +844,11 @@ impl App {
         session: &ActiveSession,
         image_limit: u64,
     ) -> std::result::Result<bool, myco::agent::AgentInteractionError> {
-        let queued = self.live.lock().unwrap().snapshot.queued.clone();
         let mut delivered = false;
-        for next in queued {
-            if self.shutdown.is_cancelled()
-                || self.live.lock().unwrap().snapshot.status == "Cancelling"
-            {
+        for _ in 0..MAX_QUEUED_MESSAGES {
+            let Some(next) = self.claim_followup() else {
                 break;
-            }
+            };
             let content = match attachments::content(&next.text, &next.images, image_limit) {
                 Ok(content) => content,
                 Err(error) => {
@@ -860,7 +857,12 @@ impl App {
                     continue;
                 }
             };
-            myco::chat::append_followup(agent, session, content.clone(), next.accepted_at)?;
+            if let Err(error) =
+                myco::chat::append_followup(agent, session, content.clone(), next.accepted_at)
+            {
+                self.restore_followup(next.request_id);
+                return Err(error);
+            }
             let block = Block::message("user", &content, Some(view::timestamp(&next.accepted_at)));
             self.finish_followup(next.request_id, Some(block));
             delivered = true;
@@ -868,29 +870,13 @@ impl App {
         Ok(delivered)
     }
 
-    fn finish_followup(&self, request_id: Uuid, block: Option<Block>) {
-        let mut live = self.live.lock().unwrap();
-        let snapshot = &mut live.snapshot;
-        if snapshot
-            .queued
-            .front()
-            .is_some_and(|next| next.request_id == request_id)
-        {
-            snapshot.queued.pop_front();
-        }
-        if let Some(block) = block {
-            let index = snapshot.blocks.len();
-            snapshot.blocks.push(block.clone());
-            self.publish(
-                snapshot,
-                json!({"kind":"block", "index":index, "block":block}),
-            );
-        }
-        self.publish(snapshot, json!({"kind":"meta", "meta":snapshot.metadata()}));
-    }
-
     pub(super) fn accept(&self, mut request: ActionRequest) -> Result<()> {
-        if let Action::Submit { images, .. } = &mut request.action {
+        if let Action::Submit { images, .. }
+        | Action::UpdateQueued {
+            update: QueueUpdate::Save { images, .. },
+            ..
+        } = &mut request.action
+        {
             attachments::externalize(images).map_err(Error::Invalid)?;
         }
         let mut live = self.live.lock().unwrap();
@@ -911,52 +897,47 @@ impl App {
                 "The request belongs to a different session.".into(),
             ));
         }
-        if live.snapshot.busy && !matches!(request.action, Action::Submit { .. }) {
+        let queue_update = matches!(request.action, Action::UpdateQueued { .. });
+        if live.snapshot.busy
+            && !matches!(
+                request.action,
+                Action::Submit { .. } | Action::UpdateQueued { .. }
+            )
+        {
             return Err(Error::Conflict(
                 "Wait for the current run or cancel it first.".into(),
             ));
         }
-        if let Action::Submit { text, images } = &request.action {
-            if text.trim().is_empty() && images.is_empty() {
-                return Err(Error::Invalid("Enter a message or attach an image.".into()));
-            }
-            if !images.is_empty() {
-                attachments::content(
-                    text,
-                    images,
-                    live.snapshot.attachment_limits.max_image_base64_bytes,
-                )
-                .map_err(Error::Invalid)?;
-            }
-        }
-        if live.snapshot.status == "Cancelling" {
+        if live.snapshot.status == "Cancelling" && !queue_update {
             return Err(Error::Conflict("Wait for cancellation to finish.".into()));
         }
         let accepted_at = Utc::now();
-        if live.snapshot.busy {
-            if self.work.is_closed() {
-                return Err(Error::Unavailable(
-                    "The session worker is unavailable.".into(),
-                ));
-            }
-            if live.snapshot.queued.len() >= MAX_QUEUED_MESSAGES {
-                return Err(Error::Conflict(
-                    "The message queue is full (20 messages).".into(),
-                ));
-            }
-            let Action::Submit { text, images } = &request.action else {
-                unreachable!()
-            };
-            live.snapshot.queued.push_back(QueuedMessage {
-                request_id: request.request_id,
-                text: text.clone(),
-                images: images.clone(),
-                accepted_at,
-            });
-        } else {
-            self.start_work(&mut live, request.clone(), accepted_at)?;
+        if self.work.is_closed() {
+            return Err(Error::Unavailable(
+                "The session worker is unavailable.".into(),
+            ));
+        }
+        match &request.action {
+            Action::Submit { .. } => self.enqueue(&mut live, &request, accepted_at)?,
+            Action::UpdateQueued {
+                message_id,
+                revision,
+                update,
+            } => self.update_queued(&mut live, *message_id, *revision, update)?,
+            _ => self.start_work(&mut live, request.clone(), accepted_at)?,
         }
         live.accepted.insert(request.request_id, request);
+        if let Err(error) = self.drain_queue(&mut live) {
+            let block = Block::Notice {
+                text: error.to_string(),
+            };
+            let index = live.snapshot.blocks.len();
+            live.snapshot.blocks.push(block.clone());
+            self.publish(
+                &mut live.snapshot,
+                json!({"kind":"block", "index":index, "block":block}),
+            );
+        }
         let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
         self.publish(&mut live.snapshot, change);
         Ok(())
@@ -979,22 +960,6 @@ impl App {
         live.cancel = Some(cancel);
         live.snapshot.busy = true;
         live.snapshot.status = "Running".into();
-        Ok(())
-    }
-
-    fn start_next(&self, live: &mut Live) -> Result<()> {
-        live.cancel = None;
-        live.snapshot.busy = false;
-        if self.shutdown.is_cancelled() {
-            return Ok(());
-        }
-        if let Some(next) = live.snapshot.queued.pop_front() {
-            let request = live.accepted[&next.request_id].clone();
-            if let Err(error) = self.start_work(live, request, next.accepted_at) {
-                live.snapshot.queued.push_front(next);
-                return Err(error);
-            }
-        }
         Ok(())
     }
 

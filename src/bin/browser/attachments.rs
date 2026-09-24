@@ -51,6 +51,17 @@ fn decode(images: &[String]) -> Result<Vec<Content>, String> {
         .iter()
         .enumerate()
         .map(|(index, source)| {
+            if myco::core::image_store::is_reference(source) {
+                // Queue edits reuse profile-local sidecars instead of uploading
+                // the same images again. Delivery applies the current size caps.
+                let store = ImageStore::for_profile()?;
+                let path = store.path(source)?;
+                std::fs::metadata(path)
+                    .map_err(|error| format!("cannot read attachment: {error}"))?;
+                return Ok(Content::Image {
+                    source: source.clone(),
+                });
+            }
             let label = format!("attachment {}", index + 1);
             let data = source
                 .strip_prefix("data:")

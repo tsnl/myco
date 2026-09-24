@@ -198,6 +198,184 @@ fn cancellation_preserves_followups_and_queue_limits_leave_requests_retryable() 
 }
 
 #[test]
+fn editing_holds_the_queue_and_saving_drains_the_latest_content_once() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    work.try_recv().unwrap();
+    let second = action_request();
+    let third = action_request();
+    app.accept(second.clone()).unwrap();
+    let time = app.live.lock().unwrap().snapshot.queued[0].accepted_at;
+    let edit = queue_update(&second, 0, json!({"kind":"edit"}));
+    app.accept(edit.clone()).unwrap();
+    app.accept(edit).unwrap();
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    app.accept(third.clone()).unwrap();
+    assert!(
+        work.try_recv().is_err(),
+        "Later input cannot overtake an edit"
+    );
+    let save = queue_update(
+        &second,
+        1,
+        json!({"kind":"save", "text":"edited", "images":[]}),
+    );
+    app.accept(save.clone()).unwrap();
+    let next = work.try_recv().unwrap();
+    assert_eq!(next.request.request_id, second.request_id);
+    assert_eq!(next.accepted_at, time);
+    assert_eq!(
+        next.request.action,
+        Action::Submit {
+            text: "edited".into(),
+            images: vec![]
+        }
+    );
+    app.accept(save).unwrap();
+    app.accept(second.clone()).unwrap();
+    assert!(
+        work.try_recv().is_err(),
+        "Retries must not restore the old payload"
+    );
+    assert!(matches!(
+        app.accept(queue_update(&second, 1, json!({"kind":"remove"}))),
+        Err(Error::Conflict(_))
+    ));
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    assert_eq!(work.try_recv().unwrap().request, third);
+}
+
+fn queue_update(message: &ActionRequest, revision: u64, update: Value) -> ActionRequest {
+    serde_json::from_value(json!({
+        "request_id": Uuid::new_v4(), "session_id": message.session_id,
+        "action": {"kind":"update_queued", "message_id":message.request_id, "revision":revision, "update":update}
+    })).unwrap()
+}
+
+#[test]
+fn stale_queue_edits_and_invalid_saves_preserve_the_held_message() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    work.try_recv().unwrap();
+    let queued = action_request();
+    app.accept(queued.clone()).unwrap();
+    app.accept(queue_update(&queued, 0, json!({"kind":"edit"})))
+        .unwrap();
+    for update in [
+        json!({"kind":"remove"}),
+        json!({"kind":"resume"}),
+        json!({"kind":"save", "text":"stale"}),
+    ] {
+        assert!(matches!(
+            app.accept(queue_update(&queued, 0, update)),
+            Err(Error::Conflict(_))
+        ));
+    }
+    assert!(matches!(
+        app.accept(queue_update(&queued, 1, json!({"kind":"save", "text":" "}))),
+        Err(Error::Invalid(_))
+    ));
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    assert!(work.try_recv().is_err());
+    assert_eq!(
+        app.snapshot().change["snapshot"]["queued"][0]["text"],
+        "task"
+    );
+    app.accept(queue_update(&queued, 1, json!({"kind":"resume"})))
+        .unwrap();
+    assert_eq!(work.try_recv().unwrap().request, queued);
+}
+
+#[test]
+fn unqueue_during_cancellation_prevents_delivery_and_retries_do_not_restore_it() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    let current = work.try_recv().unwrap();
+    let removed = action_request();
+    let kept = action_request();
+    app.accept(removed.clone()).unwrap();
+    app.accept(kept.clone()).unwrap();
+    app.cancel("session").unwrap();
+    let remove = queue_update(&removed, 0, json!({"kind":"remove"}));
+    app.accept(remove.clone()).unwrap();
+    app.accept(remove).unwrap();
+    app.accept(removed).unwrap();
+    assert!(current.cancel.is_cancelled());
+    app.start_next(&mut app.live.lock().unwrap()).unwrap();
+    let next = work.try_recv().unwrap();
+    assert_eq!(next.request, kept);
+    assert!(!next.cancel.is_cancelled());
+}
+
+#[test]
+fn claimed_followups_reject_mutation_and_failed_delivery_leaves_them_editable() {
+    let (app, mut work) = app();
+    app.accept(action_request()).unwrap();
+    work.try_recv().unwrap();
+    let queued = action_request();
+    app.accept(queued.clone()).unwrap();
+    let claimed = app.claim_followup().unwrap();
+    for update in [
+        json!({"kind":"edit"}),
+        json!({"kind":"remove"}),
+        json!({"kind":"save", "text":"too late"}),
+    ] {
+        assert!(matches!(
+            app.accept(queue_update(&queued, 0, update)),
+            Err(Error::Conflict(_))
+        ));
+    }
+    assert_eq!(
+        app.snapshot().change["snapshot"]["queued"][0]["state"],
+        "sending"
+    );
+    app.restore_followup(claimed.request_id);
+    app.accept(queue_update(
+        &queued,
+        0,
+        json!({"kind":"save", "text":"retry content"}),
+    ))
+    .unwrap();
+    let retried = app.claim_followup().unwrap();
+    assert_eq!(retried.text, "retry content");
+    assert_eq!(retried.accepted_at, claimed.accepted_at);
+    app.finish_followup(retried.request_id, None);
+    assert!(app.claim_followup().is_none());
+    app.accept(queued).unwrap();
+    assert!(app.claim_followup().is_none());
+}
+
+#[test]
+fn queue_delivery_and_unqueue_have_one_atomic_winner() {
+    for _ in 0..32 {
+        let (app, mut work) = app();
+        app.accept(action_request()).unwrap();
+        work.try_recv().unwrap();
+        let queued = action_request();
+        app.accept(queued.clone()).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let remove = queue_update(&queued, 0, json!({"kind":"remove"}));
+        std::thread::scope(|scope| {
+            let delivery = scope.spawn(|| {
+                barrier.wait();
+                app.claim_followup()
+            });
+            barrier.wait();
+            let removed = app.accept(remove);
+            match delivery.join().unwrap() {
+                Some(claimed) => {
+                    assert!(matches!(removed, Err(Error::Conflict(_))));
+                    assert_eq!(claimed.request_id, queued.request_id);
+                    app.finish_followup(claimed.request_id, None);
+                }
+                None => assert!(removed.is_ok()),
+            }
+        });
+        assert_eq!(app.snapshot().change["snapshot"]["queued"], json!([]));
+    }
+}
+
+#[test]
 fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
     let (app, _) = app();
     let active = ActiveSession::new(Session::new_with_id("test", "session"));

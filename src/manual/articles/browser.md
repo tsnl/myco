@@ -178,13 +178,29 @@ are not supported in `@path` mentions; selected files may have spaces in their n
 Accepted uploads use the profile's image store and remain available in saved
 sessions after restart. Unsent attachments stay in the current tab's draft.
 
-During a turn, **Queue** accepts follow-up messages in submission order. The
-composer shows pending messages. They join the next model request after the
+Submitted messages enter one server-owned queue, drained immediately when the
+session is idle. During a turn, **Queue** accepts follow-ups in submission order.
+The composer shows pending messages. They join the next model request after the
 current tool batch finishes, alongside its recorded results; if no tools are
 running, they are sent when the current response finishes. Up to 20 messages
 can wait per session, shared across its tabs and preserved when a tab refreshes
-or closes. **Cancel & send queued** stops the current run, records cancelled
-tool results, and sends the pending messages with a fresh cancellation token.
+or closes.
+
+**Edit** holds a queued message in its original position and opens its text and
+images in the composer. **Save & send** releases the edited message for delivery;
+**Discard edits** releases the original. Both restore any draft you had before
+editing. Messages behind a held edit wait until it is saved, resumed, or removed.
+**Unqueue** removes a pending message. A message already claimed for delivery
+cannot be edited or removed.
+
+Held messages remain visible after a tab closes or reloads; use **Edit** to
+continue from the last saved text, or **Resume** to send it unchanged. Unsaved
+text and image changes stay in the current tab. Changes from another tab never
+overwrite your local edits; you can explicitly send those edits as a new message
+or discard them. If a response is lost, retrying a save does not send it twice.
+
+**Cancel & send queued** stops the current run, records cancelled tool results,
+and sends ready messages with a fresh cancellation token. Held edits stay paused.
 Queues live in the running server and are not restored after a server restart.
 A rejected submission keeps its draft.
 Queued image thumbnails are visible across session tabs and after a tab reload.
@@ -385,6 +401,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, `queued`, `usage`, and `context_window_tokens` |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
+| `POST /api/sessions/ID/action` | The same envelope with `{"kind":"update_queued","message_id":"UUID","revision":0,"update":{"kind":"edit"}}` |
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
 | `POST /api/sessions/ID/background` | `{"session_id":"ID","call_id":"UUID"}` → 202; use the running tool block's `background_id` |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
@@ -392,12 +409,22 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `GET /files/PATH`, `HEAD /files/PATH` | Profile workspace files; GET supports a single `Range: bytes=START-END` |
 
 Use a fresh UUID per operation and reuse it when retrying that operation.
-Submit actions may include `images`, an array of base64 image data URLs. `text`
+Submit actions may include `images`, an array of base64 image data URLs or
+existing image-store references from this profile. `text`
 may be omitted when images are present. The server validates image type and size,
 then keeps image-store references in its queue and history. Snapshots include
 `attachment_limits` for the selected model; queued messages include their image
 references. The action route allows up to 22 MiB of JSON for the image budget and
 text envelope; other JSON routes retain their 2 MiB limit.
+
+Each queued entry has `request_id`, `revision`, and `state` (`ready`, `editing`,
+or `sending`). An `update_queued` action names that entry and its current
+revision. Its `update.kind` is `edit` (hold), `save` (replace `text` and `images`
+and release), `resume` (release unchanged), or `remove`. Each accepted edit,
+save, or resume increments the entry revision. Saved messages retain their
+original acceptance time and queue position. Stale revisions, removed entries,
+and messages already claimed for delivery return 409. Reuse the mutation's
+request UUID to retry it; the message UUID remains its original submission ID.
 
 Creation uses the UUID as the session ID and survives restart without creating
 a duplicate. Action deduplication lasts for the running session worker; after
