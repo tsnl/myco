@@ -194,13 +194,18 @@ impl ToolExecutor for TestTools {
         self.0.iter().flat_map(|tool| tool.tool_specs()).collect()
     }
 
-    fn dispatch(self: Arc<Self>, call: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+    fn dispatch(
+        self: Arc<Self>,
+        call: ToolUse,
+        cancel: CancelToken,
+        background: CancelToken,
+    ) -> Async<ToolResult> {
         match self
             .0
             .iter()
             .find(|tool| tool.tool_specs().iter().any(|spec| spec.name == call.name))
         {
-            Some(tool) => tool.clone().dispatch(call, cancel),
+            Some(tool) => tool.clone().dispatch(call, cancel, background),
             None => {
                 Box::pin(async move { ToolResult::err(format!("unknown tool '{}'", call.name)) })
             }

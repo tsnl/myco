@@ -128,7 +128,7 @@ impl HostWorker {
         self: Arc<Self>,
         writer: Arc<Mutex<W>>,
         msg: Request,
-        cancel: Option<CancelToken>,
+        context: Option<HostDispatchContext>,
     ) where
         W: AsyncWriteExt + Unpin,
     {
@@ -153,16 +153,13 @@ impl HostWorker {
             }
             Request::ToolCall {
                 id,
-                agent_id,
+                agent_id: _,
                 tool_use,
             } => {
                 let result = self
                     .dispatch_tool_use(
                         tool_use,
-                        HostDispatchContext {
-                            agent_id,
-                            cancel: cancel.expect("tool call has a registered cancel token"),
-                        },
+                        context.expect("tool call has registered controls"),
                     )
                     .await;
                 let response = Response::ToolResult { id, result };
@@ -170,7 +167,9 @@ impl HostWorker {
                     eprintln!("host worker: write tool result failed: {e}");
                 }
             }
-            Request::Cancel { .. } => unreachable!("cancel is handled by the serve loop"),
+            Request::Cancel { .. } | Request::Background { .. } => {
+                unreachable!("controls are handled by the serve loop")
+            }
             Request::AgentFinished { agent_id } => {
                 // Fire-and-forget: no reply message exists for this request.
                 self.notify_agent_finished(agent_id);
@@ -192,17 +191,17 @@ impl HostWorker {
         let mut lines = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
         let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        let cancels: Arc<Mutex<HashMap<String, CancelToken>>> =
+        let controls: Arc<Mutex<HashMap<String, HostDispatchContext>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        self.serve_requests(&mut lines, &writer, &cancels, &mut in_flight)
+        self.serve_requests(&mut lines, &writer, &controls, &mut in_flight)
             .await?;
 
         // EOF means the controller is gone. Cancel host work before joining so
         // a lost SSH connection cannot leave a command running until its own
         // (possibly much longer) timeout.
-        for cancel in cancels.lock().await.values() {
-            cancel.cancel();
+        for context in controls.lock().await.values() {
+            context.cancel.cancel();
         }
         while in_flight.join_next().await.is_some() {}
         Ok(())
@@ -212,7 +211,7 @@ impl HostWorker {
         self: &Arc<Self>,
         lines: &mut BufReader<R>,
         writer: &Arc<Mutex<W>>,
-        cancels: &Arc<Mutex<HashMap<String, CancelToken>>>,
+        controls: &Arc<Mutex<HashMap<String, HostDispatchContext>>>,
         in_flight: &mut tokio::task::JoinSet<()>,
     ) -> Result<(), String>
     where
@@ -251,12 +250,12 @@ impl HostWorker {
                 } => {
                     // Register before spawning so a following Cancel line can
                     // never race ahead of the tool task's token.
-                    let cancel = CancelToken::new();
-                    cancels.lock().await.insert(id.clone(), cancel.clone());
+                    let context = HostDispatchContext::new(agent_id, CancelToken::new());
+                    controls.lock().await.insert(id.clone(), context.clone());
                     let request_id = id.clone();
                     let worker = Arc::clone(self);
                     let writer = Arc::clone(writer);
-                    let cancels = Arc::clone(cancels);
+                    let controls = Arc::clone(controls);
                     in_flight.spawn(async move {
                         worker
                             .handle_request(
@@ -266,15 +265,20 @@ impl HostWorker {
                                     agent_id,
                                     tool_use,
                                 },
-                                Some(cancel),
+                                Some(context),
                             )
                             .await;
-                        cancels.lock().await.remove(&request_id);
+                        controls.lock().await.remove(&request_id);
                     });
                 }
                 Request::Cancel { id } => {
-                    if let Some(cancel) = cancels.lock().await.get(&id).cloned() {
-                        cancel.cancel();
+                    if let Some(context) = controls.lock().await.get(&id) {
+                        context.cancel.cancel();
+                    }
+                }
+                Request::Background { id } => {
+                    if let Some(context) = controls.lock().await.get(&id) {
+                        context.background.cancel();
                     }
                 }
                 other => {
@@ -352,7 +356,7 @@ mod tests {
         let (reader, writer) = tokio::io::split(server);
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
-        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let controls = Arc::new(Mutex::new(HashMap::new()));
         let mut in_flight = tokio::task::JoinSet::new();
 
         let exchange = async {
@@ -381,7 +385,7 @@ mod tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
-                result = worker.serve_requests(&mut reader, &writer, &cancels, &mut in_flight) => {
+                result = worker.serve_requests(&mut reader, &writer, &controls, &mut in_flight) => {
                     panic!("worker stopped before the client disconnected: {result:?}");
                 }
                 _ = exchange => {}

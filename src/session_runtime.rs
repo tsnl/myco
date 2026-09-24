@@ -198,12 +198,24 @@ impl ToolExecutor for SessionRuntime {
         self.harness.tool_specs()
     }
 
-    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+    fn dispatch(
+        self: Arc<Self>,
+        tool: ToolUse,
+        cancel: CancelToken,
+        background: CancelToken,
+    ) -> Async<ToolResult> {
         Box::pin(async move {
             let mut result = self
                 .harness
                 .clone()
-                .dispatch_tool_use(tool, self.owner_id, cancel)
+                .dispatch_tool_use_controlled(
+                    tool,
+                    crate::tool_services::HostDispatchContext {
+                        agent_id: self.owner_id,
+                        cancel,
+                        background,
+                    },
+                )
                 .await;
             let limit = self.max_image_base64_bytes.load(Ordering::Relaxed);
             if result.content.iter().any(|part| matches!(part,

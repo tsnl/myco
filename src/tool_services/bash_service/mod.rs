@@ -14,6 +14,8 @@ use crate::external_command::BASH;
 
 use uuid::Uuid;
 
+mod background;
+
 /// Default hard wait ceiling for a single session start/write/read.
 ///
 /// Sessions return early on idle (`idle_ms`) or byte cap; this is only the
@@ -61,6 +63,19 @@ impl Default for BashService {
     }
 }
 
+impl Drop for BashService {
+    fn drop(&mut self) {
+        for session in self
+            .sessions
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            kill_session_process(session);
+        }
+    }
+}
+
 impl BashService {
     /// Tool schemas served by this service (static: no instance required).
     pub fn specs() -> Vec<generative_model::ToolSpec> {
@@ -79,7 +94,10 @@ impl BashService {
                 Elided exec output is unrecoverable — pipe through grep/head/tail or \
                 redirect to a file when you expect a flood, or raise `max_bytes` when you \
                 truly need more. Prefer `exec` for finite commands (builds, tests, \
-                installs). Raise `timeout_ms` when the job may exceed {exec_default_s}s.\n\
+                installs). Raise `timeout_ms` when the job may exceed {exec_default_s}s. \
+                A user can background a running call from the browser; it then returns \
+                a session_id for read/signal/close, and its original timeout no longer \
+                applies. Continue other work instead of immediately waiting on it again.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
                 `session_id`. `command` is the program line (default: `bash -i`). Optional \
                 `stdin` is written after spawn. Returns a snapshot; the process keeps \
@@ -162,7 +180,7 @@ impl ToolService for BashService {
             };
             let nudge = action.command().and_then(command_nudge);
             // Owner is the agent that issued this tool call (root or subagent).
-            let mut result = self.execute(action, ctx.agent_id, ctx.cancel).await;
+            let mut result = self.execute(action, ctx).await;
             if let Some(text) = nudge {
                 result.content.push(generative_model::Content::Text {
                     text: format!("\nNudge: {text}\n"),
@@ -264,18 +282,15 @@ impl BashService {
     async fn execute(
         &self,
         action: Action,
-        owner: Uuid,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
+        let owner = ctx.agent_id;
         match action {
             Action::Exec {
                 command,
                 timeout_ms,
                 max_bytes,
-            } => {
-                self.run_oneshot(&command, timeout_ms, max_bytes, cancel)
-                    .await
-            }
+            } => self.run_oneshot(&command, timeout_ms, max_bytes, ctx).await,
             Action::Start {
                 session_id,
                 command,
@@ -292,7 +307,7 @@ impl BashService {
                     timeout_ms,
                     idle_ms,
                     max_bytes,
-                    cancel,
+                    ctx,
                 )
                 .await
             }
@@ -310,7 +325,7 @@ impl BashService {
                     timeout_ms,
                     idle_ms,
                     max_bytes,
-                    cancel,
+                    ctx,
                 )
                 .await
             }
@@ -320,7 +335,7 @@ impl BashService {
                 idle_ms,
                 max_bytes,
             } => {
-                self.session_read(&session_id, owner, timeout_ms, idle_ms, max_bytes, cancel)
+                self.session_read(&session_id, owner, timeout_ms, idle_ms, max_bytes, ctx)
                     .await
             }
             Action::Signal {
@@ -337,7 +352,7 @@ impl BashService {
                     timeout_ms,
                     idle_ms,
                     max_bytes,
-                    cancel,
+                    ctx,
                 )
                 .await
             }
@@ -361,7 +376,7 @@ impl BashService {
         command: &str,
         timeout_ms: u64,
         max_bytes: usize,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
         let mut cmd = BASH.tokio_command();
         cmd.args(["-c", command])
@@ -388,10 +403,16 @@ impl BashService {
         let stderr = child.stderr.take().expect("stderr piped");
         // Shared buffers, appended to as data arrives, so the bounded drain
         // below can report partial output even when a reader never hits EOF.
-        let stdout_buf = Arc::new(Mutex::new(CappedCapture::default()));
-        let stderr_buf = Arc::new(Mutex::new(CappedCapture::default()));
-        let stdout_task = spawn_capture(stdout, Arc::clone(&stdout_buf));
-        let stderr_task = spawn_capture(stderr, Arc::clone(&stderr_buf));
+        let shared = Arc::new(SessionShared {
+            buffer: Mutex::new(OutputBuffer {
+                exec_capture: Some(Default::default()),
+                ..Default::default()
+            }),
+            notify: Notify::new(),
+            generation: AtomicU64::new(0),
+        });
+        let stdout_task = spawn_reader(stdout, StreamKind::Stdout, shared.clone());
+        let stderr_task = spawn_reader(stderr, StreamKind::Stderr, shared.clone());
 
         let deadline = Duration::from_millis(timeout_ms.max(1));
         // When cancel/timeout wins, select drops the wait future so we can
@@ -399,23 +420,27 @@ impl BashService {
         enum Outcome {
             Cancelled,
             TimedOut,
+            Background,
             Status(std::io::Result<std::process::ExitStatus>),
         }
         let outcome = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Outcome::Cancelled,
+            _ = ctx.cancel.cancelled() => Outcome::Cancelled,
             _ = tokio::time::sleep(deadline) => Outcome::TimedOut,
             status = child.wait() => Outcome::Status(status),
+            _ = ctx.background.cancelled() => Outcome::Background,
         };
 
         match outcome {
+            Outcome::Background => {
+                self.background_exec(command, ctx.agent_id, child, shared, max_bytes)
+            }
             Outcome::Cancelled => {
                 kill_process_group(child_pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 drain_capture(stdout_task, stderr_task).await;
-                let out = render_locked_capture(&stdout_buf, max_bytes);
-                let err = render_locked_capture(&stderr_buf, max_bytes);
+                let (out, err) = render_exec_capture(&shared, max_bytes);
                 generative_model::ToolResult::err(format!(
                     "exec cancelled\n\
                      stdout:\n{out}\n\
@@ -427,8 +452,7 @@ impl BashService {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 drain_capture(stdout_task, stderr_task).await;
-                let out = render_locked_capture(&stdout_buf, max_bytes);
-                let err = render_locked_capture(&stderr_buf, max_bytes);
+                let (out, err) = render_exec_capture(&shared, max_bytes);
                 generative_model::ToolResult::text(format!(
                     "Exit code: None\n\
                      Termination signal: None\n\
@@ -444,8 +468,7 @@ impl BashService {
             }
             Outcome::Status(status) => {
                 drain_capture(stdout_task, stderr_task).await;
-                let out = render_locked_capture(&stdout_buf, max_bytes);
-                let err = render_locked_capture(&stderr_buf, max_bytes);
+                let (out, err) = render_exec_capture(&shared, max_bytes);
                 match status {
                     Ok(status) => generative_model::ToolResult::text(format!(
                         "Exit code: {:?}\n\
@@ -477,7 +500,7 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
         if session_id.is_empty() {
             return generative_model::ToolResult::err("session_id must be non-empty");
@@ -599,7 +622,7 @@ impl BashService {
                 idle_ms,
                 max_bytes,
                 stdin.is_none_or(str::is_empty),
-                cancel,
+                ctx,
             )
             .await;
         match snapshot {
@@ -617,7 +640,7 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return generative_model::ToolResult::err(e);
@@ -626,7 +649,7 @@ impl BashService {
             return generative_model::ToolResult::err(e);
         }
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => s.tool_result(),
@@ -641,13 +664,13 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return generative_model::ToolResult::err(e);
         }
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => s.tool_result(),
@@ -667,7 +690,7 @@ impl BashService {
         timeout_ms: u64,
         idle_ms: u64,
         max_bytes: usize,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return generative_model::ToolResult::err(e);
@@ -704,7 +727,7 @@ impl BashService {
         }
 
         match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, cancel)
+            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => {
@@ -755,6 +778,7 @@ impl BashService {
             100,
             DEFAULT_MAX_BYTES,
             false,
+            &crate::core::CancelToken::new(),
             &crate::core::CancelToken::new(),
         )
         .await;
@@ -918,7 +942,7 @@ impl BashService {
         idle_ms: u64,
         max_bytes: usize,
         return_on_empty_idle: bool,
-        cancel: crate::core::CancelToken,
+        ctx: HostDispatchContext,
     ) -> Result<SessionSnapshot, String> {
         let (shared, owner, cmdline) = {
             let sessions = self.sessions();
@@ -934,7 +958,7 @@ impl BashService {
                 session.cmdline.clone(),
             )
         };
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return Err("cancelled".into());
         }
         Ok(collect_output(
@@ -946,7 +970,8 @@ impl BashService {
             idle_ms,
             max_bytes,
             return_on_empty_idle,
-            &cancel,
+            &ctx.cancel,
+            &ctx.background,
         )
         .await)
     }
@@ -975,6 +1000,7 @@ struct SessionShared {
 
 #[derive(Default)]
 struct OutputBuffer {
+    exec_capture: Option<(CappedCapture, CappedCapture)>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     /// Oldest bytes dropped since the last read because a stream exceeded
@@ -1020,6 +1046,7 @@ struct SessionSnapshot {
 #[derive(Clone, Copy)]
 enum SnapshotStatus {
     Running,
+    Backgrounded,
     Exited,
     TimedOut,
     Truncated,
@@ -1029,6 +1056,7 @@ impl SnapshotStatus {
     fn as_str(self) -> &'static str {
         match self {
             SnapshotStatus::Running => "running",
+            SnapshotStatus::Backgrounded => "backgrounded",
             SnapshotStatus::Exited => "exited",
             SnapshotStatus::TimedOut => "timed_out",
             SnapshotStatus::Truncated => "truncated",
@@ -1045,12 +1073,19 @@ fn process_status(code: Option<i32>, signal: Option<i32>) -> Option<String> {
 impl SessionSnapshot {
     fn tool_result(&self) -> generative_model::ToolResult {
         let mut result = generative_model::ToolResult::text(self.format());
-        result.status = process_status(self.exit_code, self.exit_signal);
+        result.status = if matches!(self.status, SnapshotStatus::Backgrounded) {
+            Some("backgrounded".into())
+        } else {
+            process_status(self.exit_code, self.exit_signal)
+        };
         result
     }
 
     fn format(&self) -> String {
         let mut out = String::new();
+        if matches!(self.status, SnapshotStatus::Backgrounded) {
+            out.push_str("User backgrounded this call. Continue with other work; use bash read on this session_id and the same host for later output, or bash close to stop it.\n");
+        }
         out.push_str(&format!("session_id: {}\n", self.session_id));
         out.push_str(&format!(
             "owner: {}\n",
@@ -1089,7 +1124,7 @@ impl SessionSnapshot {
             SnapshotStatus::Truncated => {
                 out.push_str("(output truncated at max_bytes; more may be buffered — call read)\n");
             }
-            SnapshotStatus::Running => {
+            SnapshotStatus::Running | SnapshotStatus::Backgrounded => {
                 out.push_str("(session still running; call read/write/close as needed)\n");
             }
             SnapshotStatus::Exited => {
@@ -1146,33 +1181,16 @@ impl CappedCapture {
     }
 }
 
-/// Read `reader` to EOF, appending to `buf` as data arrives (not just at EOF),
-/// so a bounded drain still observes everything read so far.
-fn spawn_capture<R>(mut reader: R, buf: Arc<Mutex<CappedCapture>>) -> tokio::task::JoinHandle<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut chunk = vec![0u8; 4096];
-        loop {
-            match reader.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Ok(mut g) = buf.lock() {
-                        g.push(&chunk[..n]);
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Render a shared capture buffer under the return cap (empty on a poisoned
-/// lock — the capture task panicked, so there is nothing better to report).
-fn render_locked_capture(buf: &Arc<Mutex<CappedCapture>>, max_bytes: usize) -> String {
-    buf.lock()
-        .map(|g| render_capture(&g, max_bytes))
-        .unwrap_or_default()
+fn render_exec_capture(shared: &SessionShared, max_bytes: usize) -> (String, String) {
+    let buffer = lock_unpoisoned(&shared.buffer);
+    let (stdout, stderr) = buffer
+        .exec_capture
+        .as_ref()
+        .expect("foreground exec capture");
+    (
+        render_capture(stdout, max_bytes),
+        render_capture(stderr, max_bytes),
+    )
 }
 
 /// The shared middle-elision shape: verbatim head, one honest marker, tail.
@@ -1271,7 +1289,11 @@ fn cap_session_stream(stream: &mut Vec<u8>) -> usize {
     excess
 }
 
-fn spawn_reader<R>(mut reader: R, kind: StreamKind, shared: Arc<SessionShared>)
+fn spawn_reader<R>(
+    mut reader: R,
+    kind: StreamKind,
+    shared: Arc<SessionShared>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -1282,14 +1304,23 @@ where
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut b) = shared.buffer.lock() {
-                        let dropped = match kind {
-                            StreamKind::Stdout => {
-                                b.stdout.extend_from_slice(&buf[..n]);
-                                cap_session_stream(&mut b.stdout)
+                        let dropped = if let Some((stdout, stderr)) = &mut b.exec_capture {
+                            match kind {
+                                StreamKind::Stdout => stdout,
+                                StreamKind::Stderr => stderr,
                             }
-                            StreamKind::Stderr => {
-                                b.stderr.extend_from_slice(&buf[..n]);
-                                cap_session_stream(&mut b.stderr)
+                            .push(&buf[..n]);
+                            0
+                        } else {
+                            match kind {
+                                StreamKind::Stdout => {
+                                    b.stdout.extend_from_slice(&buf[..n]);
+                                    cap_session_stream(&mut b.stdout)
+                                }
+                                StreamKind::Stderr => {
+                                    b.stderr.extend_from_slice(&buf[..n]);
+                                    cap_session_stream(&mut b.stderr)
+                                }
                             }
                         };
                         b.dropped_bytes = b.dropped_bytes.saturating_add(dropped);
@@ -1304,7 +1335,7 @@ where
             b.eof_streams += 1;
         }
         shared.notify.notify_waiters();
-    });
+    })
 }
 
 /// Best-effort SIGKILL of a session's process group.
@@ -1357,6 +1388,7 @@ async fn collect_output(
     max_bytes: usize,
     return_on_empty_idle: bool,
     cancel: &crate::core::CancelToken,
+    background: &crate::core::CancelToken,
 ) -> SessionSnapshot {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
     let idle = Duration::from_millis(idle_ms.max(1));
@@ -1376,7 +1408,7 @@ async fn collect_output(
     // Track generation so a concurrent write resets idle.
     let mut seen_gen = shared.generation.load(Ordering::SeqCst);
 
-    let mut status;
+    let status;
 
     loop {
         if cancel.is_cancelled() {
@@ -1396,6 +1428,10 @@ async fn collect_output(
             }
         };
 
+        if background.is_cancelled() {
+            status = SnapshotStatus::Backgrounded;
+            break;
+        }
         if total > last_total {
             last_total = total;
             last_activity = Instant::now();
@@ -1444,10 +1480,25 @@ async fn collect_output(
                 status = SnapshotStatus::TimedOut;
                 break;
             }
+            _ = background.cancelled() => {
+                status = SnapshotStatus::Backgrounded;
+                break;
+            }
             _ = tokio::time::timeout(slice, shared.notify.notified()) => {}
         }
     }
 
+    take_snapshot(shared, session_id, owner, cmdline, status, max_bytes)
+}
+
+fn take_snapshot(
+    shared: &SessionShared,
+    session_id: &str,
+    owner: Uuid,
+    cmdline: &str,
+    mut status: SnapshotStatus,
+    max_bytes: usize,
+) -> SessionSnapshot {
     // Drain up to max_bytes from the buffer (stdout first, then stderr).
     let (stdout, stderr, exit_code, exit_signal, background_output, bytes_dropped) = {
         let mut b = match shared.buffer.lock() {
@@ -1483,7 +1534,9 @@ async fn collect_output(
         b.stderr.drain(..take_stderr);
 
         if !b.stdout.is_empty() || !b.stderr.is_empty() {
-            status = SnapshotStatus::Truncated;
+            if !matches!(status, SnapshotStatus::Backgrounded) {
+                status = SnapshotStatus::Truncated;
+            }
         } else if b.is_finished() {
             status = SnapshotStatus::Exited;
         }

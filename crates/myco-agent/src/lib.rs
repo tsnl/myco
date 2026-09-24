@@ -50,7 +50,14 @@ pub trait ToolExecutor: Send + Sync {
     fn tool_specs(&self) -> Vec<generative_model::ToolSpec>;
     /// Execute a call, validating its input and returning failures as tool results.
     /// Calls in a round may overlap. Observe cancellation and clean up owned work.
-    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult>;
+    /// `background` requests an early result while preserving ongoing work,
+    /// when the tool supports it. It must never be treated as cancellation.
+    fn dispatch(
+        self: Arc<Self>,
+        tool: ToolUse,
+        cancel: CancelToken,
+        background: CancelToken,
+    ) -> Async<ToolResult>;
 }
 
 //
@@ -114,10 +121,13 @@ pub enum AgentEvent {
         context: TraceContext,
     },
     ToolStarted {
+        call_id: Uuid,
         tool_use: ToolUse,
+        background: CancelToken,
         context: TraceContext,
     },
     ToolFinished {
+        call_id: Uuid,
         tool_use: ToolUse,
         result: ToolResult,
         context: TraceContext,
@@ -498,15 +508,19 @@ impl Agent {
         if cancel.is_cancelled() {
             return ToolResult::err("cancelled before dispatch");
         }
+        let call_id = Uuid::new_v4();
+        let background = CancelToken::new();
         self.sink.emit(AgentEvent::ToolStarted {
+            call_id,
             tool_use: tool_use.clone(),
+            background: background.clone(),
             context: self.context.clone(),
         });
 
         let work = self
             .tools
             .clone()
-            .dispatch(tool_use.clone(), cancel.clone());
+            .dispatch(tool_use.clone(), cancel.clone(), background);
 
         // Race cancel vs tool — but on cancel, give the dispatch a short grace
         // window instead of dropping it immediately. Cancel-aware tools use it
@@ -530,6 +544,7 @@ impl Agent {
             result = &mut work => result,
         };
         self.sink.emit(AgentEvent::ToolFinished {
+            call_id,
             tool_use,
             result: result.clone(),
             context: self.context.clone(),
@@ -729,7 +744,12 @@ mod tests {
             }]
         }
 
-        fn dispatch(self: Arc<Self>, tool_use: ToolUse, _cancel: CancelToken) -> Async<ToolResult> {
+        fn dispatch(
+            self: Arc<Self>,
+            tool_use: ToolUse,
+            _cancel: CancelToken,
+            _background: CancelToken,
+        ) -> Async<ToolResult> {
             Box::pin(async move {
                 let started = Instant::now();
                 self.starts

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use myco::generative_model::{TokenUsage, ToolUse};
+use myco::generative_model::TokenUsage;
 use myco::session::{ActiveSession, ArchiveFilter, SessionListEntry, SessionWriteLock};
 use myco::{AgentEvent, CancelToken, EventSink};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,7 @@ impl Snapshot {
 }
 
 struct Live {
+    background: HashMap<Uuid, CancelToken>,
     snapshot: Snapshot,
     cancel: Option<CancelToken>,
     accepted: HashMap<Uuid, ActionRequest>,
@@ -125,6 +126,28 @@ pub(super) struct App {
 }
 
 impl App {
+    pub(super) fn background(&self, session_id: &str, call_id: Uuid) -> Result<()> {
+        let mut live = self.live.lock().unwrap();
+        if live.snapshot.session_id != session_id || live.snapshot.status == "Cancelling" {
+            return Err(Error::Conflict(
+                "The session changed or is cancelling.".into(),
+            ));
+        }
+        let token = live.background.get(&call_id).ok_or_else(|| {
+            Error::Conflict("This tool call is no longer running or cannot be backgrounded.".into())
+        })?;
+        token.cancel();
+        if let Some(index) = live.snapshot.blocks.iter().position(|block| matches!(block, Block::Tool { call_id: id, running: true, .. } if *id == call_id)) {
+            if let Block::Tool { background_id, status, .. } = &mut live.snapshot.blocks[index] {
+                *background_id = None;
+                *status = "backgrounding".into();
+            }
+            let change = json!({"kind":"block", "index":index, "block":live.snapshot.blocks[index]});
+            self.publish(&mut live.snapshot, change);
+        }
+        Ok(())
+    }
+
     fn stop(&self) {
         self.shutdown.cancel();
         if let Some(cancel) = &self.live.lock().unwrap().cancel {
@@ -305,7 +328,12 @@ impl EventSink for App {
             AgentEvent::ThinkingDelta { text, context } if context.depth == 0 => {
                 self.delta("thinking", text)
             }
-            AgentEvent::ToolStarted { tool_use, context } if context.depth == 0 => {
+            AgentEvent::ToolStarted {
+                call_id,
+                tool_use,
+                background,
+                context,
+            } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
                 if let Some(heading) = view::assistant_heading(&live.snapshot.blocks) {
                     let index = live.snapshot.blocks.len();
@@ -316,7 +344,24 @@ impl EventSink for App {
                     );
                 }
                 let index = live.snapshot.blocks.len();
-                let block = Block::tool(tool_use, Some(Instant::now()));
+                let can_background = tool_use.name == "bash"
+                    && matches!(
+                        tool_use.input.get("action").and_then(Value::as_str),
+                        None | Some("exec" | "start" | "read" | "write" | "signal")
+                    );
+                let mut block = Block::tool(tool_use, Some(Instant::now()));
+                if let Block::Tool {
+                    call_id: id,
+                    background_id,
+                    ..
+                } = &mut block
+                {
+                    *id = call_id;
+                    if can_background {
+                        *background_id = Some(call_id);
+                        live.background.insert(call_id, background);
+                    }
+                }
                 live.snapshot.blocks.push(block.clone());
                 self.publish(
                     &mut live.snapshot,
@@ -324,13 +369,15 @@ impl EventSink for App {
                 );
             }
             AgentEvent::ToolFinished {
-                tool_use,
+                call_id,
                 result,
                 context,
+                ..
             } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
+                live.background.remove(&call_id);
                 let snapshot = &mut live.snapshot;
-                if let Some(index) = snapshot.blocks.iter().position(|block| matches!(block, Block::Tool { tool, running: true, .. } if same_tool(tool, &tool_use))) {
+                if let Some(index) = snapshot.blocks.iter().position(|block| matches!(block, Block::Tool { call_id: id, running: true, .. } if *id == call_id)) {
                     snapshot.blocks[index].finish(&result);
                     let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
                     self.publish(snapshot, change);
@@ -353,10 +400,6 @@ impl EventSink for App {
             _ => {}
         }
     }
-}
-
-fn same_tool(a: &ToolUse, b: &ToolUse) -> bool {
-    a.name == b.name && a.input == b.input
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -553,6 +596,7 @@ impl Sessions {
                             blocks: view::history(session.active_thread()),
                         },
                         cancel: None,
+                        background: HashMap::new(),
                         accepted: HashMap::new(),
                     }),
                     events: self.events.clone(),

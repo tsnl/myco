@@ -145,6 +145,23 @@ function messageHeading(role, time) {
   heading.append(element('span', 'role', role.toUpperCase()), messageTimestamp(time));
   return heading;
 }
+function backgroundButton(block) {
+  const button = element('button', 'background-tool', 'Background');
+  button.type = 'button';
+  button.title = 'Keep this process running and let the assistant continue';
+  button.disabled = !connected || state.status === 'Cancelling';
+  button.onclick = async event => {
+    event.preventDefault(); event.stopPropagation();
+    button.disabled = true; button.dataset.pending = 'true'; button.textContent = 'Backgrounding…';
+    try {
+      await api(`/api/sessions/${encodeURIComponent(state.session_id)}/background`, { session_id: state.session_id, call_id: block.background_id });
+    } catch (e) {
+      error(e.message); delete button.dataset.pending;
+      button.textContent = 'Background'; button.disabled = !connected;
+    }
+  };
+  return button;
+}
 function blockNode(block) {
   if (block.kind === 'notice') return element('div', 'notice', block.text);
   if (block.kind === 'boundary') { const node = element('div'); node.hidden = true; return node; }
@@ -154,6 +171,7 @@ function blockNode(block) {
     const details = element('details', `tool ${outcome}`);
     const summary = element('summary');
     summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block), element('span', 'tool-args', argumentPreview(block.tool.input)));
+    if (block.running && block.background_id) summary.append(backgroundButton(block));
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
     if (block.text || block.images?.length) body.append(element('span', 'tool-label', 'Output'));
@@ -264,6 +282,7 @@ function metadata() {
   const disabled = !connected || !state.session_id || state.busy || selectingModel;
   model.disabled = disabled;
   activity();
+  for (const button of document.querySelectorAll('.background-tool')) button.disabled = !connected || state.status === 'Cancelling' || button.dataset.pending === 'true';
   attachments.lock(sending);
   $('send').disabled = !connected || !state.session_id || selectingModel || sending || !attachments.ready || state.status === 'Cancelling';
   $('send').textContent = state.busy ? 'Queue ↵' : 'Send ↵';
@@ -318,7 +337,12 @@ function activity() {
       follow = false;
       nodes[index].scrollIntoView({ block: 'center' });
     };
-    item.append(button); list.append(item);
+    item.append(button);
+    if (block.background_id) {
+      const control = backgroundButton(block); control.dataset.blockIndex = index;
+      item.append(control);
+    }
+    list.append(item);
   }
   const background = $('background-list'); background.replaceChildren();
   for (const task of tasks) background.append(element('li', 'background-task', task));

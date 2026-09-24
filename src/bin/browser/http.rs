@@ -76,6 +76,7 @@ pub(super) fn router(server: Arc<Server>) -> Router {
                 .layer(DefaultBodyLimit::max(super::attachments::ACTION_BODY_LIMIT)),
         )
         .route("/api/sessions/{id}/cancel", post(session_cancel))
+        .route("/api/sessions/{id}/background", post(session_background))
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
@@ -238,6 +239,31 @@ async fn create_session(
     Json(request): Json<CreateSession>,
 ) -> Result<Json<Value>, Error> {
     Ok(Json(json!({"id": server.sessions.create(request).await?})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackgroundRequest {
+    session_id: String,
+    call_id: uuid::Uuid,
+}
+
+async fn session_background(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<BackgroundRequest>,
+) -> Result<StatusCode, Error> {
+    if request.session_id != id {
+        return Err(Error::Conflict(
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    server
+        .sessions
+        .open(&id)
+        .await?
+        .background(&request.session_id, request.call_id)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Deserialize)]

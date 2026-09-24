@@ -50,7 +50,12 @@ impl ToolExecutor for CompactTools {
         specs
     }
 
-    fn dispatch(self: Arc<Self>, tool: ToolUse, cancel: CancelToken) -> Async<ToolResult> {
+    fn dispatch(
+        self: Arc<Self>,
+        tool: ToolUse,
+        cancel: CancelToken,
+        _background: CancelToken,
+    ) -> Async<ToolResult> {
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return ToolResult::err("compaction cancelled");
@@ -314,25 +319,25 @@ mod tests {
             let input = json!({"action":"stats", "session_id":session.id, "thread_id":session.active_thread().id});
             let call = |name: &str, input| ToolUse { name: name.into(), input };
             for name in ["bash", "str_replace_based_edit_tool", "prelude", "session_meta"] {
-                assert!(tools.clone().dispatch(call(name, input.clone()), CancelToken::new()).await.is_error);
+                assert!(tools.clone().dispatch(call(name, input.clone()), CancelToken::new(), CancelToken::new()).await.is_error);
             }
             for (key, value) in [("session_id", "other"), ("thread_id", "other"), ("host", "local"), ("action", "threads")] {
                 let mut invalid = input.clone();
                 invalid[key] = value.into();
-                assert!(tools.clone().dispatch(call("session_history", invalid), CancelToken::new()).await.is_error);
+                assert!(tools.clone().dispatch(call("session_history", invalid), CancelToken::new(), CancelToken::new()).await.is_error);
             }
-            assert!(!tools.clone().dispatch(call("session_history", input.clone()), CancelToken::new()).await.is_error);
+            assert!(!tools.clone().dispatch(call("session_history", input.clone()), CancelToken::new(), CancelToken::new()).await.is_error);
             let mut write = input;
             write["action"] = "write_summary".into();
             for markdown in [String::new(), "x".repeat(MAX_SUMMARY_CHARS + 1)] {
                 write["markdown"] = markdown.into();
-                assert!(tools.clone().dispatch(call("session_history", write.clone()), CancelToken::new()).await.is_error);
+                assert!(tools.clone().dispatch(call("session_history", write.clone()), CancelToken::new(), CancelToken::new()).await.is_error);
                 assert!(!session.summary_path().exists());
             }
             write["markdown"] = "# Task\nKeep working.".into();
-            assert!(!tools.clone().dispatch(call("session_history", write.clone()), CancelToken::new()).await.is_error);
+            assert!(!tools.clone().dispatch(call("session_history", write.clone()), CancelToken::new(), CancelToken::new()).await.is_error);
             write["markdown"] = "replaced".into();
-            assert!(tools.dispatch(call("session_history", write), CancelToken::new()).await.is_error);
+            assert!(tools.dispatch(call("session_history", write), CancelToken::new(), CancelToken::new()).await.is_error);
             assert_eq!(std::fs::read_to_string(session.summary_path()).unwrap(), "# Task\nKeep working.");
         });
     }

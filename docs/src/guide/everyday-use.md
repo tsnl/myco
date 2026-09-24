@@ -23,6 +23,7 @@ remain notes the agent can read as needed.
 | Cancel the running turn | Cancel |
 | Inspect tool input and output | Expand its tool block |
 | Inspect running tools and background shells | Activity |
+| Let a running shell call continue while the assistant moves on | Background on the tool or in Activity |
 | Switch configured models | Model selector between turns |
 | Compact context | Compact or `/compact` |
 | Open another session | New or a session link on the home page |

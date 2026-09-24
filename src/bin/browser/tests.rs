@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures::StreamExt;
+use myco::generative_model::ToolUse;
 use myco::generative_model::{Content, Message, ToolResult};
 
 use super::super::http::{
@@ -39,6 +40,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 blocks: vec![],
             },
             cancel: None,
+            background: HashMap::new(),
             accepted: HashMap::new(),
         }),
         events,
@@ -260,8 +262,10 @@ fn tool_calls_appear_before_results_and_finish_independently() {
         name: "editor".into(),
         input: json!({"text":"write this"}),
     };
-    for tool in [&first, &second] {
+    for (index, tool) in [&first, &second].into_iter().enumerate() {
         app.emit(AgentEvent::ToolStarted {
+            call_id: Uuid::from_u128(index as u128),
+            background: CancelToken::new(),
             tool_use: tool.clone(),
             context: Default::default(),
         });
@@ -273,6 +277,7 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     assert!(blocks.iter().all(|block| block["elapsed_ms"].is_u64()));
     assert_eq!(blocks[0]["tool"]["input"], first.input);
     app.emit(AgentEvent::ToolFinished {
+        call_id: Uuid::from_u128(1),
         tool_use: second,
         result: ToolResult::text("saved"),
         context: Default::default(),
@@ -284,6 +289,48 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     assert_eq!(blocks[1]["status"], "done");
     assert_eq!(blocks[1]["text"], "saved");
     assert!(blocks[1]["elapsed_ms"].is_u64());
+}
+
+#[test]
+fn background_controls_target_one_call_and_reject_stale_or_foreign_requests() {
+    let (app, _) = app();
+    let tool = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"sleep 10"}),
+    };
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let first_signal = CancelToken::new();
+    let second_signal = CancelToken::new();
+    for (id, signal) in [
+        (first, first_signal.clone()),
+        (second, second_signal.clone()),
+    ] {
+        app.emit(AgentEvent::ToolStarted {
+            call_id: id,
+            tool_use: tool.clone(),
+            background: signal,
+            context: Default::default(),
+        });
+    }
+    assert!(app.background("foreign", second).is_err());
+    assert!(!second_signal.is_cancelled());
+    app.background("session", second).unwrap();
+    assert!(!first_signal.is_cancelled());
+    assert!(second_signal.is_cancelled());
+    app.emit(AgentEvent::ToolFinished {
+        call_id: second,
+        tool_use: tool,
+        result: ToolResult::text("retained").with_status("backgrounded"),
+        context: Default::default(),
+    });
+    let blocks = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(blocks[0]["running"], true);
+    assert_eq!(blocks[1]["status"], "backgrounded");
+    assert!(app.background("session", second).is_err());
+    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    assert!(app.background("session", first).is_err());
+    assert!(!first_signal.is_cancelled());
 }
 
 #[test]
@@ -305,6 +352,8 @@ fn tool_first_replies_have_one_heading_before_parallel_tools_live_and_replayed()
     };
     for _ in 0..2 {
         app.emit(AgentEvent::ToolStarted {
+            call_id: Uuid::nil(),
+            background: CancelToken::new(),
             tool_use: tool.clone(),
             context: Default::default(),
         });
@@ -381,6 +430,7 @@ fn running_snapshots_measure_time_since_dispatch_instead_of_time_since_reconnect
             >= 5000
     );
     app.emit(AgentEvent::ToolFinished {
+        call_id: Uuid::nil(),
         tool_use: tool,
         result: ToolResult::err("cancelled"),
         context: Default::default(),
@@ -723,6 +773,8 @@ fn compaction_reports_activity_and_separates_tool_first_continuation_without_a_m
     assert_eq!(completed["blocks"][1]["kind"], "boundary");
     assert!(completed["blocks"][1]["text"].is_null());
     app.emit(AgentEvent::ToolStarted {
+        call_id: Uuid::nil(),
+        background: CancelToken::new(),
         tool_use: ToolUse {
             name: "bash".into(),
             input: json!({"command":"pwd"}),

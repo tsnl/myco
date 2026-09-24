@@ -118,11 +118,17 @@ pub struct HostDispatchContext {
     pub agent_id: uuid::Uuid,
     /// Cancel signal for the in-flight call / agent turn.
     pub cancel: CancelToken,
+    /// Stop waiting without terminating retained work, when supported.
+    pub background: CancelToken,
 }
 
 impl HostDispatchContext {
     pub fn new(agent_id: uuid::Uuid, cancel: CancelToken) -> Self {
-        Self { agent_id, cancel }
+        Self {
+            agent_id,
+            cancel,
+            background: CancelToken::new(),
+        }
     }
 }
 

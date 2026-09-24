@@ -7,7 +7,7 @@
 use crate::core::ToolResource;
 use crate::generative_model::{ToolResult, ToolUse};
 
-pub const HOST_PROTOCOL_VERSION: u32 = 2;
+pub const HOST_PROTOCOL_VERSION: u32 = 3;
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -28,6 +28,9 @@ pub enum Request {
     /// Cancel an in-flight tool call. Fire-and-forget: the original
     /// [`Request::ToolCall`] receives the tool's cancelled result.
     Cancel { id: String },
+    /// Release a supported tool's foreground wait, retaining its process and
+    /// returning a handle in the original ToolResult. Never cancels the call.
+    Background { id: String },
     /// Reap agent-owned host state (bash sessions, …). Fire-and-forget: the
     /// worker does not reply (host process exit is the hard guarantee).
     AgentFinished { agent_id: uuid::Uuid },

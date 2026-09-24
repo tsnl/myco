@@ -46,6 +46,10 @@ pub(super) enum Block {
         time: Option<String>,
     },
     Tool {
+        #[serde(skip)]
+        call_id: uuid::Uuid,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        background_id: Option<uuid::Uuid>,
         tool: ToolUse,
         text: String,
         images: Vec<String>,
@@ -77,6 +81,8 @@ impl Block {
 
     pub fn tool(tool: ToolUse, started: Option<Instant>) -> Self {
         Self::Tool {
+            call_id: uuid::Uuid::nil(),
+            background_id: None,
             tool,
             text: String::new(),
             images: vec![],
@@ -98,6 +104,7 @@ impl Block {
             error,
             running,
             timer,
+            background_id,
             ..
         } = self
         {
@@ -115,6 +122,7 @@ impl Block {
                     .and_then(|n| n.parse::<i32>().ok())
                     .is_some_and(|n| n != 0);
             *running = false;
+            *background_id = None;
             if let Some(timer) = timer {
                 timer.finish();
             }

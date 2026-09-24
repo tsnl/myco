@@ -22,6 +22,12 @@ settles matched tool-call/result pairs before generation resumes.
 When cancellation cleanup times out, the result explicitly records unknown
 effects. A transcript does not establish whether those effects stopped.
 
+Dispatch receives separate cancellation and background-request tokens.
+`ToolStarted` exposes the latter to frontends together with a unique call ID;
+`ToolFinished` carries the same ID. Supporting executors can release a foreground
+wait and return a retained-work handle without cancelling that work. Executors
+that cannot background their tools may ignore the background token.
+
 The fallible `Checkpoint` callback receives `AgentState` before each effect and
 after completion. Persist its history, usage, and `pending_operation` together.
 An error stops further effects. `recover_checkpoint` converts interrupted tool
