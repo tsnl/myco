@@ -57,7 +57,8 @@ agent can also call `view_image` on a selected host.
 ## Automate sessions
 
 For a single task, run `myco -p "prompt"` or `git diff | myco -p "Review this"`.
-The answer streams to stdout; diagnostics and the saved session ID go to stderr.
+Each completed model response is written to stdout; diagnostics and the saved
+session ID go to stderr. Interrupted drafts are discarded during retries.
 Use `--resume ID` to continue later. `myco --mode cli` provides a scrolling chat
 with line editing, tool activity, and `/compact`. The
 [command-line manual](../manual/cli.md) describes input, cancellation, and exit codes.

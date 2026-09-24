@@ -83,8 +83,9 @@ are never silently resized or removed to fit a request.
 | `attach_timeout_secs` | Remote connection timeout; default 10, `0` disables |
 
 Retry settings belong in `[gateways.NAME.retry]` or `[models.KEY.retry]`.
-The default is three total attempts with bounded exponential backoff. Only
-transient failures before any response parts arrive are retried. Partial
-responses are not replayed. The
+The default is three total attempts with bounded exponential backoff. Transient
+failures also retry after partial output: the failed draft is discarded and a
+fresh response is generated from unchanged context. Completed tools are not
+replayed. Set `max_attempts = 1` to disable retries. The
 [bundled overview](../manual/overview.md#models--credentials-the-catalog)
 is the complete settings reference.

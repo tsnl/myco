@@ -97,9 +97,9 @@ workspace directories are created automatically. `--profile` chooses the initial
 profile, and launch overrides such as `--config` and `--model` apply only to that
 profile.
 
-For scripts, `myco -p "prompt"` streams answer text to stdout, with diagnostics
-and the saved session ID on stderr. Bare `-p` reads the prompt from stdin;
-piped input precedes an explicit prompt as context. Add `--resume SESSION_ID`
+For scripts, `myco -p "prompt"` writes each completed model response to stdout,
+with diagnostics and the saved session ID on stderr. Bare `-p` reads the prompt
+from stdin; piped input precedes an explicit prompt as context. Add `--resume SESSION_ID`
 to continue a saved conversation. `myco --mode cli` provides terminal chat with
 line editing, tool activity, `/compact`, and Ctrl-C cancellation. Both use the
 same sessions and automatic compaction as the browser; see `myco --help cli`.

@@ -7,6 +7,7 @@ use myco::generative_model::Content;
 use myco::{AgentEvent, CancelToken, EventSink};
 
 struct OutputState {
+    pending: String,
     wrote: bool,
     newline: bool,
     error: Option<String>,
@@ -16,6 +17,7 @@ struct OutputState {
 impl OutputState {
     fn new(cancel: CancelToken) -> Self {
         Self {
+            pending: String::new(),
             wrote: false,
             newline: false,
             error: None,
@@ -86,7 +88,22 @@ impl CliSink {
 impl EventSink for CliSink {
     fn emit(&self, event: AgentEvent) {
         match event {
-            AgentEvent::TextDelta { text, context } if context.depth == 0 => self.text(&text),
+            AgentEvent::GenerationStarted { context } | AgentEvent::TurnFinished { context }
+                if context.depth == 0 =>
+            {
+                self.state.lock().unwrap().pending.clear();
+            }
+            AgentEvent::GenerationFinished { context } if context.depth == 0 => {
+                let text = std::mem::take(&mut self.state.lock().unwrap().pending);
+                self.text(&text);
+            }
+            AgentEvent::TextDelta { text, context } if context.depth == 0 => {
+                if self.terminal {
+                    self.text(&text);
+                } else {
+                    self.state.lock().unwrap().pending.push_str(&text);
+                }
+            }
             AgentEvent::ToolStarted {
                 tool_use, context, ..
             } if self.terminal && context.depth == 0 => {
@@ -123,15 +140,23 @@ impl EventSink for CliSink {
             }
             AgentEvent::Failure {
                 failure,
-                retry_in: Some(delay),
+                retry_in,
+                attempt,
+                max_attempts,
+                context,
                 ..
-            } => {
-                let _ = self.finish();
-                eprintln!(
-                    "myco: {}; retrying in {:.1}s",
-                    failure.cause,
-                    delay.as_secs_f64()
-                );
+            } if context.depth == 0 => {
+                self.state.lock().unwrap().pending.clear();
+                if let Some(delay) = retry_in {
+                    let _ = self.finish();
+                    eprintln!(
+                        "myco: response interrupted; retrying {}/{} in {:.1}s: {}",
+                        attempt + 1,
+                        max_attempts,
+                        delay.as_secs_f64(),
+                        failure.cause
+                    );
+                }
             }
             _ => {}
         }

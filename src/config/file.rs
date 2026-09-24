@@ -70,8 +70,8 @@ pub struct GatewayEntry {
     pub retry: Option<RetryEntry>,
 }
 
-/// `[gateways.NAME.retry]` / `[models.KEY.retry]`: how a driver retries a
-/// request that failed before any of the response streamed.
+/// `[gateways.NAME.retry]` / `[models.KEY.retry]`: how the agent retries
+/// transient generation failures, discarding any unvalidated response draft.
 ///
 /// Per *endpoint*, not per model, because what is being tuned is one gateway's
 /// tolerance for connection blips and its rate-limit behaviour. A model entry

@@ -103,6 +103,14 @@ impl TraceContext {
 /// All ongoing work is attributed via [`TraceContext::agent_id`].
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Begin a provisional response. A retry replaces the failed attempt's draft.
+    GenerationStarted {
+        context: TraceContext,
+    },
+    /// The complete response validated. Its tool calls have not executed yet.
+    GenerationFinished {
+        context: TraceContext,
+    },
     Failure {
         failure: GenerationFailure,
         attempt: u32,
@@ -140,6 +148,8 @@ pub enum AgentEvent {
 /// Consumer of [`AgentEvent`]s (CLI, TUI, metrics, …).
 pub trait EventSink: Send + Sync {
     /// Observe an event synchronously. Avoid blocking the execution task.
+    /// Deltas are provisional until `GenerationFinished`. On a retrying failure,
+    /// discard or clearly separate that draft before displaying the next attempt.
     fn emit(&self, event: AgentEvent);
 }
 

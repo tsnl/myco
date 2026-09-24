@@ -17,10 +17,70 @@ fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
     app_for("session", broadcast::channel(4).0)
 }
 
+#[test]
+fn retry_discards_only_the_current_generation_and_preserves_output_and_live_tools() {
+    let (app, _) = app();
+    let context = myco::TraceContext::root();
+    for text in ["completed answer", "completed continuation"] {
+        app.emit(AgentEvent::GenerationStarted {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::TextDelta {
+            text: text.into(),
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::GenerationFinished {
+            context: context.clone(),
+        });
+    }
+    app.emit(AgentEvent::GenerationStarted {
+        context: context.clone(),
+    });
+    app.emit(AgentEvent::TextDelta {
+        text: "abandoned draft".into(),
+        context: context.clone(),
+    });
+    app.emit(AgentEvent::ThinkingDelta {
+        text: "abandoned thinking".into(),
+        context: context.clone(),
+    });
+    app.resources(vec![process_inventory("local", "retained")]);
+    app.emit(AgentEvent::Failure {
+        failure: myco::generative_model::GenerationFailure::transient(
+            myco::generative_model::GenerateError::ExecutionError("upstream reset".into()),
+            None,
+        ),
+        attempt: 1,
+        max_attempts: 3,
+        retry_in: Some(Duration::from_millis(500)),
+        context: context.clone(),
+    });
+    let snapshot = app.snapshot().change["snapshot"].clone();
+    assert_eq!(snapshot["status"], "Retrying");
+    assert_eq!(snapshot["blocks"][0]["text"], "completed answer");
+    assert_eq!(snapshot["blocks"][1]["text"], "completed continuation");
+    assert_eq!(snapshot["blocks"][2]["resource"]["instance_id"], "retained");
+    assert_eq!(snapshot["blocks"][2]["running"], true);
+    assert!(!snapshot.to_string().contains("abandoned"));
+    app.emit(AgentEvent::GenerationStarted {
+        context: context.clone(),
+    });
+    app.emit(AgentEvent::TextDelta {
+        text: "replacement".into(),
+        context: context.clone(),
+    });
+    app.emit(AgentEvent::GenerationFinished { context });
+    assert_eq!(
+        app.snapshot().change["snapshot"]["blocks"][4]["text"],
+        "replacement"
+    );
+}
+
 fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc::Receiver<Work>) {
     let (work, receiver) = mpsc::channel(1);
     let app = Arc::new(App {
         live: Mutex::new(Live {
+            generation_start: None,
             snapshot: Snapshot {
                 revision: 0,
                 session_id: id.into(),
