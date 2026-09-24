@@ -94,6 +94,9 @@ function openStream() {
     const event = JSON.parse(data);
     if (event.kind === 'connection') { profileConnection(event.profile, event.connected); return; }
     if (event.kind === 'resync' && !event.update) {
+      // Missing events may include a profile's reconnect notification.
+      if (event.profile) available.delete(event.profile);
+      else available.clear();
       for (const client of clients) if (!event.profile || client.profile === event.profile) load(client);
       return;
     }
