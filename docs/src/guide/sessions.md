@@ -32,15 +32,20 @@ summary and bounded recent context. The predecessor keeps its original messages
 and tool results. Live shells and editor read stamps continue through
 compaction, as do the title, links, and scratchpad.
 
-With a per-model `auto_compact_at` threshold, the server compacts at a settled
-boundary between tool rounds or after an answer and asks the agent to continue.
+Automatic compaction is enabled for every model. The per-model `auto_compact_at`
+fraction defaults to `1.0`, the full context window; a lower fraction leaves
+more room for growth. The server checks the last known prompt size before a new
+submission, between tool rounds, or after an answer and asks the agent to continue
+after compaction. Switching models preserves a sizing estimate across restarts,
+so the next message can compact before a request to a smaller model. The new
+message is included in compaction; selecting a model alone does not start work.
 Long tool loops can compact repeatedly as context grows. A completed answer can
 trigger at most one cycle per submission. Manual compaction and reopening a
 saved session wait for input. Failure or ineffective compaction disables automatic
 threshold compaction until a manual compaction succeeds or another session opens.
 
 A request-size rejection (HTTP 413 or the configured request byte cap) also
-compacts and continues automatically, even without a token threshold. This
+compacts and continues automatically, independently of the token threshold. This
 recovery replaces recent images with text references to their saved originals
 and preserves completed tool effects. Cancel interrupts it. If summarization
 fails or the smaller request is still rejected, the run stops retrying and

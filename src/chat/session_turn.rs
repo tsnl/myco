@@ -206,6 +206,7 @@ fn rewind_rejected_input(
     }
     successor.user_turn_timestamps.retain(|&key, _| key < index);
     successor.last_usage = None;
+    successor.context_tokens_estimate = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
             if let Content::System { kind, text, data } = part

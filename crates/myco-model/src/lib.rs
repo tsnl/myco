@@ -234,8 +234,9 @@ pub struct ModelSpec {
     /// model's `max_truncated_resumes` or its default; the agent takes this
     /// value via the agent's continuation policy.
     pub max_truncated_resumes: u32,
-    /// Prompt size at which the REPL compacts without being asked. `None` =
-    /// no auto-compaction (the default; `/compact` still works).
+    /// Prompt size at which the session runner compacts without being asked.
+    /// Myco's config defaults to the full context window. Library callers can
+    /// use `None` when they own compaction policy themselves.
     ///
     /// Resolved from the model's `auto_compact_at` *fraction* against
     /// `context_window_tokens` so the comparison downstream is a plain token

@@ -20,6 +20,10 @@ pub struct Thread {
     pub user_turn_timestamps: BTreeMap<usize, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<TokenUsage>,
+    /// Last known prompt size when a model change invalidates its usage report.
+    /// This is a sizing estimate, not measured usage for the newly selected model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens_estimate: Option<u64>,
     /// Intent saved before external work. It is reconciled before model input
     /// after restart; a pending tool batch must never be dispatched again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +39,7 @@ impl Thread {
             messages: Vec::new(),
             user_turn_timestamps: BTreeMap::new(),
             last_usage: None,
+            context_tokens_estimate: None,
             pending_operation: None,
         }
     }

@@ -551,12 +551,25 @@ impl Sessions {
         if let Some(running) = sessions.get(&session.id) {
             return Ok(running.app.clone());
         }
+        let saved_model = if session.json_path().exists() {
+            myco::RuntimeRecord::latest(&session.active_thread().messages)
+                .map_or_else(|| session.model.clone(), |record| record.model.key)
+        } else {
+            self.config.model.clone()
+        };
         let catalog = self
             .config
             .models
-            .get(&self.config.model)
+            .get(&saved_model)
+            .or_else(|_| self.config.models.get(&self.config.model))
             .map_err(Error::Internal)?
             .clone();
+        let model_fallback = (catalog.spec.key != saved_model).then(|| {
+            format!(
+                "Saved model {saved_model:?} is no longer configured; using {:?}.",
+                catalog.spec.key
+            )
+        });
         let (work, receiver) = mpsc::channel(1);
         let image_limit = catalog.spec.max_image_base64_bytes;
         let context_window_tokens = catalog.spec.context_window_tokens;
@@ -618,6 +631,9 @@ impl Sessions {
             )
             .map_err(Error::Internal)?;
         app.sync(&boot, "Ready");
+        if let Some(notice) = model_fallback {
+            app.notice(notice);
+        }
         if boot.preflight.has_problems() {
             app.notice(boot.preflight.warning_body());
         }

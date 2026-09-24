@@ -369,6 +369,16 @@ impl ActiveSession {
             {
                 times.entry(index).or_insert(time);
             }
+            let previous = session.active_thread();
+            updated.active_thread_mut().context_tokens_estimate =
+                if last_usage.is_none() && messages.len() >= previous.messages.len() {
+                    previous
+                        .last_usage
+                        .map(TokenUsage::context_tokens)
+                        .or(previous.context_tokens_estimate)
+                } else {
+                    None
+                };
             updated.active_thread_mut().last_usage = last_usage;
             updated.touch();
             updated.externalize_images()?;
@@ -489,6 +499,7 @@ impl Session {
         let thread = self.active_thread_mut();
         thread.messages = messages;
         thread.last_usage = usage;
+        thread.context_tokens_estimate = None;
         thread.pending_operation = None;
         thread.user_turn_timestamps.clear();
     }
@@ -528,6 +539,8 @@ impl Session {
         child.parent_session_id = Some(self.id.clone());
         child.active_thread_mut().messages = self.active_thread().messages.clone();
         child.active_thread_mut().last_usage = self.active_thread().last_usage;
+        child.active_thread_mut().context_tokens_estimate =
+            self.active_thread().context_tokens_estimate;
         child.active_thread_mut().pending_operation = self.active_thread().pending_operation;
         child.active_thread_mut().user_turn_timestamps =
             self.active_thread().user_turn_timestamps.clone();
