@@ -503,6 +503,7 @@ pub(super) struct Sessions {
     args: Arc<Args>,
     config: Config,
     preflight: StartupPreflight,
+    root_tools: Vec<Arc<dyn myco::ToolService>>,
     running: tokio::sync::Mutex<HashMap<String, RunningSession>>,
     pub(super) events: broadcast::Sender<Arc<Update>>,
     pub(super) shutdown: CancelToken,
@@ -511,11 +512,17 @@ pub(super) struct Sessions {
 }
 
 impl Sessions {
-    pub(super) fn new(args: Args, config: Config, preflight: StartupPreflight) -> Self {
+    pub(super) fn new(
+        args: Args,
+        config: Config,
+        preflight: StartupPreflight,
+        root_tools: Vec<Arc<dyn myco::ToolService>>,
+    ) -> Self {
         Self {
             args: Arc::new(args),
             config,
             preflight,
+            root_tools,
             running: tokio::sync::Mutex::new(HashMap::new()),
             events: broadcast::channel(256).0,
             shutdown: CancelToken::new(),
@@ -596,6 +603,7 @@ impl Sessions {
             catalog,
             self.preflight.clone(),
             session,
+            self.root_tools.clone(),
             |config, _, session| {
                 let session = session.snapshot();
                 Arc::new(App {

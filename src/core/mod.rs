@@ -2,6 +2,8 @@ mod fs;
 pub mod image;
 pub mod image_store;
 mod runtime_info;
+mod workspace_files;
+pub use workspace_files::WorkspaceFiles;
 
 pub(crate) use runtime_info::latest_runtime_part;
 pub use runtime_info::{HostResources, ModelInfo, ToolResource};

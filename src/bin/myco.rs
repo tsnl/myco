@@ -288,6 +288,7 @@ async fn boot_session<S: EventSink + 'static>(
     catalog_model: CatalogModel,
     preflight: StartupPreflight,
     mut loaded: Session,
+    mut root_tools: Vec<Arc<dyn myco::ToolService>>,
     make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
 ) -> Result<(Boot, Arc<S>), String> {
     let session_lock = lock_session_or_report(&loaded.id)?;
@@ -305,12 +306,8 @@ async fn boot_session<S: EventSink + 'static>(
     let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
     let prelude_tool =
         Arc::new(PreludeTool::new(app_config.max_prelude_bytes)) as Arc<dyn myco::ToolService>;
-    let harness = attach_harness(
-        &app_config,
-        &preflight,
-        vec![session_tool, history_tool, list_recent_tool, prelude_tool],
-    )
-    .await?;
+    root_tools.extend([session_tool, history_tool, list_recent_tool, prelude_tool]);
+    let harness = attach_harness(&app_config, &preflight, root_tools).await?;
 
     let (model, prelude) = build_model(
         &catalog_model,

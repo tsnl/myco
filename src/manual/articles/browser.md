@@ -304,6 +304,18 @@ characters, or use Markdown's angle-bracket syntax for paths with spaces.
 Saved images use the profile's image store. Explicit PNG, JPEG, GIF, and WebP
 paths outside the workspace use the `/api/image` endpoint.
 
+In server sessions, the assistant can call **`getlink`** with a `path` to obtain
+a URL for an existing workspace file. Pass a literal absolute or
+workspace-relative path; the tool encodes spaces and special characters.
+For example, `path: "charts/rain.png"` returns
+`/profiles/NAME/files/charts/rain.png`. Use that URL in
+`![Rain](URL)` or `[Open chart](URL)`; Markdown uses the same file URL mapping.
+URLs are relative to the browser's origin, so SSH tunnels can use a different
+local port. Missing files, paths outside the workspace, and escaping symlinks
+return a tool error. Copy artifacts from other hosts or directories into the
+profile workspace before requesting a link. The tool does not upload or copy
+files; the server serves their current contents.
+
 `GET /files/path/to/file` and `HEAD` expose regular files below the addressed
 profile's workspace, including dotfiles. Anyone able to reach the loopback port can read them.
 Traversal and symlinks that escape that directory are refused. Files stream

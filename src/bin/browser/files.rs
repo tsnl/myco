@@ -1,12 +1,10 @@
 //! Read-only access relative to the profile workspace captured at worker startup.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use cap_std::fs::{Dir, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
@@ -20,59 +18,26 @@ const FILE_POLICY: &str = "sandbox allow-same-origin; default-src 'none'; img-sr
 //
 
 pub(super) struct Files {
-    root: PathBuf,
-    directory: Arc<Dir>,
-    base_path: String,
+    pub(super) workspace: myco::core::WorkspaceFiles,
 }
 
 impl Files {
     pub(super) fn open(root: &Path) -> Result<Self, String> {
-        let root = root
-            .canonicalize()
-            .map_err(|e| format!("resolve workspace directory: {e}"))?;
-        let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority())
-            .map_err(|e| format!("open workspace directory: {e}"))?;
         Ok(Self {
-            root,
-            directory: Arc::new(directory),
-            base_path: String::new(),
+            workspace: myco::core::WorkspaceFiles::open(root)?,
         })
     }
 
     pub(super) fn with_base_path(mut self, base_path: String) -> Self {
-        self.base_path = base_path;
+        self.workspace = self.workspace.with_base_path(base_path);
         self
     }
 
     pub(super) fn route(&self, path: &str) -> String {
-        format!("{}{path}", self.base_path)
+        self.workspace.route(path)
     }
-
     pub(super) fn url(&self, source: &str) -> Option<String> {
-        if source.starts_with("//") {
-            return None;
-        }
-        if source.starts_with("/files/") {
-            return Some(self.route(source));
-        }
-        if !self.base_path.is_empty() && source.starts_with(&self.route("/files/")) {
-            return Some(source.into());
-        }
-        let base = url::Url::from_directory_path(&self.root).ok()?;
-        let source = if let Some(tail) = source.strip_prefix("~/") {
-            url::Url::from_file_path(dirs::home_dir()?.join(tail)).ok()?
-        } else {
-            base.join(source).ok()?
-        };
-        let path = source.to_file_path().ok()?;
-        let relative = path.strip_prefix(&self.root).ok()?;
-        Some(format!(
-            "{}{}",
-            self.route(&path_url(relative)),
-            source
-                .fragment()
-                .map_or(String::new(), |value| format!("#{value}"))
-        ))
+        self.workspace.url(source)
     }
 
     pub(super) async fn serve(
@@ -86,17 +51,21 @@ impl Files {
         if method != Method::GET || headers.contains_key(header::IF_RANGE) {
             headers.remove(header::RANGE);
         }
-        let directory = self.directory.clone();
+        let workspace = self.workspace.clone();
         let requested = path.clone();
-        let opened = tokio::task::spawn_blocking(move || open_file(&directory, &path)).await;
+        let opened =
+            tokio::task::spawn_blocking(move || workspace.open_file(Path::new(&path))).await;
         match opened {
             Ok(Ok((_, path)))
                 if !requested.is_empty()
                     && !requested.ends_with('/')
                     && path != Path::new(&requested) =>
             {
-                Redirect::permanent(&self.route(&format!("{}/", path_url(Path::new(&requested)))))
-                    .into_response()
+                Redirect::permanent(&format!(
+                    "{}/",
+                    self.workspace.path_url(Path::new(&requested))
+                ))
+                .into_response()
             }
             Ok(Ok((file, path))) => stream(file, &path, &headers).await,
             Ok(Err(error)) => {
@@ -122,44 +91,6 @@ impl Files {
             }
         }
     }
-}
-
-fn path_url(path: &Path) -> String {
-    if path.as_os_str().is_empty() {
-        return "/files/".into();
-    }
-    let mut target = url::Url::parse("https://workspace.invalid/files/").unwrap();
-    target
-        .path_segments_mut()
-        .unwrap()
-        .pop_if_empty()
-        .extend(path.iter().map(|part| part.to_string_lossy()));
-    target.path().into()
-}
-
-fn open_file(directory: &Dir, path: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let path = PathBuf::from(if path.is_empty() { "." } else { path });
-    let file = directory.open_with(&path, &options)?;
-    let (file, path) = if file.metadata()?.is_dir() {
-        let index = path.join("index.html");
-        (directory.open_with(&index, &options)?, index)
-    } else {
-        (file, path)
-    };
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not a regular file",
-        ));
-    }
-    Ok((file.into_std(), path))
 }
 
 //
