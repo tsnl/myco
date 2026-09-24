@@ -25,7 +25,7 @@ function fixture() {
     fetch(url) {
       return new Promise((resolve, reject) => requests.push({ url,
         respond: initial => resolve({ ok: true, json: async () => initial }),
-        fail: () => reject(new Error('Snapshot unavailable')),
+        fail: (message = 'Snapshot unavailable') => reject(new Error(message)),
       }));
     },
   });
@@ -47,7 +47,7 @@ function fixture() {
     },
     advance(milliseconds) {
       clock += milliseconds;
-      for (const [id, timer] of [...timers]) if (timer.at <= clock) { timers.delete(id); timer.callback(); }
+      for (const [id, timer] of [...timers]) if (timers.has(id) && timer.at <= clock) { timers.delete(id); timer.callback(); }
     },
   };
 }
@@ -153,6 +153,49 @@ test('failed snapshot recovery buffers deltas and retries only the affected view
   await settle();
   assert.deepEqual(port.messages.filter(message => message.update).map(message => message.update.revision), [1, 4, 5]);
   assert.equal(port.messages.at(-1).connected, true);
+});
+
+for (const profile of [undefined, 'work']) {
+  test(`${profile ? 'profile' : 'global'} resync recovers a lost connection event after a cancelled fetch`, async () => {
+    const f = fixture(), port = f.subscribe('work', 'session');
+    f.requests[0].respond(snapshot('session', 1));
+    await settle();
+    f.send({ kind: 'connection', profile: 'work', connected: false });
+    assert.equal(port.messages.at(-1).connected, false);
+    // The reconnect notification can be among the events dropped on overflow.
+    f.send({ kind: 'resync', profile });
+    f.requests[1].fail('cancelled');
+    await settle();
+    assert.equal(port.messages.at(-1).message, 'cancelled');
+    f.advance(2000);
+    f.requests[2].respond(snapshot('session', 2));
+    await settle();
+    assert.equal(port.messages.at(-1).connected, true);
+    f.update('work', 'session', 3);
+    assert.equal(port.messages.at(-1).update.revision, 3);
+  });
+}
+
+test('scoped resync and session refresh preserve unrelated disconnection state', async () => {
+  const f = fixture(), work = f.subscribe('work', 'session'), personal = f.subscribe('personal', 'session');
+  for (const request of f.requests) request.respond(snapshot('session', 1));
+  await settle();
+  for (const profile of ['work', 'personal']) f.send({ kind: 'connection', profile, connected: false });
+  f.update('work', 'session', 2, 'refresh');
+  f.requests[2].respond(snapshot('session', 2));
+  await settle();
+  assert.equal(work.messages.at(-1).kind, 'snapshot');
+  assert.equal(work.messages.filter(message => message.kind === 'connection').at(-1).connected, false);
+  f.send({ kind: 'resync', profile: 'work' });
+  f.requests[3].respond(snapshot('session', 3));
+  await settle();
+  assert.equal(work.messages.at(-1).connected, true);
+  // A new tab must also respect the other profile's known disconnection.
+  const other = f.subscribe('personal', 'other');
+  f.requests[4].respond(snapshot('other', 1));
+  await settle();
+  assert.equal(other.messages.filter(message => message.kind === 'connection').at(-1).connected, false);
+  assert.equal(personal.messages.at(-1).connected, false);
 });
 
 test('changing a subscription during recovery fetches the new profile and session', async () => {

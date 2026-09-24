@@ -1987,6 +1987,33 @@ context_window = 100000
             self.assertEqual((self.home / f"{name}-marker").read_text(), name)
         self.assertEqual({request["model"] for request in self.requests}, {"first", "second"})
 
+    def test_cancelled_snapshot_and_lost_recovery_event_restore_sending_without_reload(self):
+        page = self.session()
+        cdp = self.browser.new_browser_cdp_session()
+        self.addCleanup(cdp.detach)
+        targets = cdp.send('Target.getTargets')['targetInfos']
+        worker = next(target for target in targets
+                      if target['type'] == 'shared_worker' and target['url'].startswith(self.origin))
+        worker_session = cdp.send('Target.attachToTarget', {'targetId': worker['targetId']})['sessionId']
+        # Exercise the shipped worker: a cancelled snapshot after a disconnection,
+        # with the reconnect notification lost to overflow before the resync.
+        expression = """(() => {
+            const originalFetch = fetch;
+            fetch = () => { fetch = originalFetch; return Promise.reject(new Error('cancelled')); };
+            stream.onmessage({data: JSON.stringify({kind:'connection', profile:'default', connected:false})});
+            stream.onmessage({data: JSON.stringify({kind:'resync'})});
+        })()"""
+        cdp.send('Target.sendMessageToTarget', {'sessionId': worker_session, 'message': json.dumps({
+            'id': 1, 'method': 'Runtime.evaluate', 'params': {'expression': expression}})})
+        expect(page.locator('#error')).to_have_text('cancelled')
+        expect(page.locator('#send')).to_be_enabled(timeout=8000)
+        expect(page.locator('#error')).to_be_hidden()
+        self.generation_releases['Alpha'].set()
+        self.submit(page, 'Alpha generate')
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(self.requests), 1)
+
     def test_tab_history_and_shared_connection_survive_restart(self):
         alpha = self.session(self.page)
         original = alpha.url
