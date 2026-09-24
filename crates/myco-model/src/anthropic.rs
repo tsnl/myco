@@ -952,11 +952,13 @@ mod tests {
                         content: vec![Content::Text { text: "ra".into() }],
                         is_error: false,
                         status: None,
+                        resource: None,
                     },
                     ToolResult {
                         content: vec![Content::Text { text: "rb".into() }],
                         is_error: false,
                         status: None,
+                        resource: None,
                     },
                 ],
             },
@@ -991,6 +993,7 @@ mod tests {
                     }],
                     is_error: false,
                     status: None,
+                    resource: None,
                 }],
             },
         ];

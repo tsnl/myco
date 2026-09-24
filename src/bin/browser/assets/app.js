@@ -40,6 +40,7 @@ function toolDuration(block) {
   return node;
 }
 function updateToolDurations() {
+  if (document.hidden) return;
   const now = performance.now();
   for (const node of document.querySelectorAll('.tool-duration[data-running="true"]')) updateToolDuration(node, now);
 }
@@ -47,6 +48,7 @@ setInterval(updateToolDurations, 100);
 function updateVisibility() {
   updateToolDurations();
   $('composer-frame').classList.toggle('paused', document.hidden);
+  document.body.classList.toggle('activity-paused', document.hidden);
 }
 document.addEventListener('visibilitychange', updateVisibility);
 updateVisibility();
@@ -168,7 +170,7 @@ function argumentPreview(input) {
 function toolState(block) {
   if (block.running) return 'running';
   if (block.error) return 'failed';
-  return block.status === 'outcome not recorded' ? 'unknown' : 'done';
+  return ['outcome not recorded', 'not running', 'state unknown'].includes(block.status) ? 'unknown' : 'done';
 }
 function messageHeading(role, time) {
   const heading = element('header', 'message-header');
@@ -322,9 +324,9 @@ function metadata() {
   document.title = `${state.title || 'myco'} · ${profileName} · myco`;
 }
 function activity() {
+  document.body.classList.toggle('activity-disconnected', !connected);
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
-  const tasks = state.tasks || [];
-  const count = calls.length + tasks.length;
+  const count = calls.length;
   $('activity-count').textContent = count;
   $('activity-count').hidden = !count;
   $('activity-toggle').classList.toggle('has-activity', connected && (state.busy || !!count));
@@ -332,10 +334,23 @@ function activity() {
   $('activity-empty').hidden = !!count;
   $('activity-empty').textContent = !connected ? 'Reconnecting to confirm activity.' : state.busy ? 'Run in progress. No active tool calls.' : 'No running activities.';
   $('active-calls').hidden = !calls.length;
-  $('background-tasks').hidden = !tasks.length;
-  $('activity-divider').hidden = !calls.length || !tasks.length;
+  activityCalls(calls);
+  const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : state.status || 'Ready';
+  const status = $('connection');
+  showActivity(status, state.busy ? state.status : count ? 'Running' : state.status || 'Ready', state.busy, connected);
+  $('composer-frame').dataset.state = !connected ? 'reconnecting'
+    : state.status === 'Stopped' ? 'stopped' : state.status === 'Cancelling' ? 'cancelling'
+    : state.busy || count ? 'running' : 'ready';
+  if (connected) status.title = current;
+}
+function activityCalls(calls) {
+  const list = $('activity-list');
+  const key = JSON.stringify(calls.map(({ block, index }) => [index, block.tool, block.resource, block.background_id]));
+  // Metadata refreshes must not restart the pulse or interrupt a focused button.
+  if (list.dataset.calls === key) return;
+  list.dataset.calls = key;
   const focusedCall = document.activeElement?.dataset.blockIndex;
-  const list = $('activity-list'); list.replaceChildren();
+  list.replaceChildren();
   for (const { block, index } of calls) {
     const item = element('li');
     const button = element('button', 'active-call');
@@ -346,7 +361,8 @@ function activity() {
       $('activity').close();
       nodes[index].open = true;
       follow = false;
-      nodes[index].scrollIntoView({ block: 'center' });
+      nodes[index].querySelector('summary').scrollIntoView({ block: 'start' });
+      nodes[index].querySelector('summary').focus({ preventScroll: true });
     };
     item.append(button);
     if (block.background_id) {
@@ -355,16 +371,7 @@ function activity() {
     }
     list.append(item);
   }
-  const background = $('background-list'); background.replaceChildren();
-  for (const task of tasks) background.append(element('li', 'background-task', task));
   if ($('activity').open && focusedCall !== undefined) (list.querySelector(`[data-block-index="${focusedCall}"]`) || $('activity-close')).focus({ preventScroll: true });
-  const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
-  const status = $('connection');
-  showActivity(status, state.busy ? state.status : count ? 'Background tasks' : state.status || 'Ready', state.busy, connected);
-  $('composer-frame').dataset.state = !connected ? 'reconnecting'
-    : state.status === 'Stopped' ? 'stopped' : state.status === 'Cancelling' ? 'cancelling'
-    : state.busy ? 'running' : count ? 'background' : 'ready';
-  if (connected) status.title = current;
 }
 function updateSession(update) {
   if (update.revision <= revision) return;
@@ -373,7 +380,7 @@ function updateSession(update) {
   if (change.kind === 'snapshot') snapshot(change.snapshot);
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
   else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; activity(); }
-  else if (change.kind === 'tasks') { state.tasks = change.tasks; activity(); }
+  else if (change.kind === 'tasks') state.tasks = change.tasks;
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
     // The cached HTML describes the snapshot, not subsequent streamed text.

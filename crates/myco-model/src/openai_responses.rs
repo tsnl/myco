@@ -763,6 +763,7 @@ mod tests {
                     ],
                     is_error: false,
                     status: None,
+                    resource: None,
                 }],
             },
         ];
@@ -788,6 +789,7 @@ mod tests {
                     }],
                     is_error: false,
                     status: None,
+                    resource: None,
                 }],
             },
         ];

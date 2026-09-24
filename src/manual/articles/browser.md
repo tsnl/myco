@@ -135,9 +135,9 @@ other websites. Restarting does not require signing in again.
 
 The home page lists your visible, unarchived sessions, with search, recent update
 times, and live activity indicators. A pulsing square beside **Running** in the
-session header and browser list means a run is in progress, including time waiting
-for model output and executing tools. **Background tasks** has a steady indicator
-when tools remain open after the run. **Ready**, **Stopped**, and **Saved** are idle;
+session header and browser list means generation or a tool process is running.
+Shells remain **Running** between model turns; you can submit a new message while
+an existing process continues. **Ready**, **Stopped**, and **Saved** are idle;
 **Reconnecting…** means the current state is unknown. Reduced-motion preferences
 disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
@@ -145,9 +145,8 @@ browser also polls for changes made by other server processes.
 The input border also shows the session's state. **Running** and **Compacting**
 carry a travelling highlight and soft glow using the sky's current light color.
 **Ready** keeps the neutral glass border; **Stopped** is steady red.
-**Cancelling** and **Reconnecting…** are amber, and **Background tasks** uses a
-fainter, steady sky glow. A stopped run keeps its red border while background
-tools remain open. Hidden tabs pause the animation; reduced-motion
+**Cancelling** and **Reconnecting…** are amber. Live shell processes use the same
+sky glow between turns. A stopped run keeps its red border while tools remain open. Hidden tabs pause the animation; reduced-motion
 preferences keep it still. The text status remains available in every state.
 
 **New session** opens a separate tab, creates a session,
@@ -237,14 +236,19 @@ page refreshes; completion, failure, or cancellation freezes the final duration.
 Durations are observed by the running browser server and retained while viewing
 the same thread. Saved history opened after a server restart has no timing data.
 
-**Activity** opens a right-hand drawer with separate sections for active tool
-calls and local background tasks, such as bash sessions that continue between
-turns. The drawer starts closed; its button shows the current activity count.
-Click an active call to close the drawer and open its block. Close the drawer
-with its close button, Escape, or a click outside it. Background-task summaries
-refresh every second without consuming tool output, and disappear when the task
-ends. Background summaries cover the local host; active calls
-include remote tools too.
+**Activity** opens a right-hand drawer containing all running tools in one list.
+Every entry opens its transcript card. Shells launched with `bash start` and
+commands released with **Background** remain running in that card, with an
+advancing timer and pulsing border, until the process and its output streams
+finish. The same border appears on Activity entries. Reduced-motion preferences
+keep the borders steady; hidden or disconnected tabs pause their animation.
+
+Process status refreshes every second without consuming output. Already connected
+remote hosts are included; polling never connects a lazy host. Failed observations
+show **state unknown** rather than reporting success. A process whose original
+call is outside the active thread retains a reachable card through compaction.
+The drawer starts closed; its button shows the activity count. Close it with its
+close button, Escape, or a click outside it.
 
 Running shell calls offer **Background** in their tool header and in Activity.
 It releases that call's foreground wait, so the assistant can continue once any
@@ -260,8 +264,11 @@ the process runs until it exits, is closed, or its owning runtime/host ends.
 Backgrounding does not start another process, so it may retain an already
 running exec even when the admission limit for new shell sessions is full.
 Tabs reconnect to the same background tasks, but server restarts do not restore
-processes. Local tasks remain visible in Activity; remote handles are recorded
-in their tool result and can be queried on that host.
+processes. Saved cards without a current handle show **not running**. Process
+identity distinguishes repeated uses of the same `session_id` and keeps hosts
+and owning sessions separate. Tool results retain an optional `resource` reference
+(`id` and `instance_id`); older stored results remain readable. Live status is a
+browser observation and does not rewrite the original result or consume output.
 
 Manual and automatic compaction update the activity indicator to **Compacting**.
 Compaction cards, summaries, internal resumption instructions, and prelude-change

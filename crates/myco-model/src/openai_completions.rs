@@ -694,11 +694,13 @@ mod tests {
                         }],
                         is_error: false,
                         status: None,
+                        resource: None,
                     },
                     ToolResult {
                         content: vec![Content::Text { text: "ok".into() }],
                         is_error: false,
                         status: None,
+                        resource: None,
                     },
                 ],
             },

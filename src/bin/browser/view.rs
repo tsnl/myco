@@ -5,9 +5,13 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use myco::generative_model::{Content, Message, ToolResult, ToolUse};
+use myco::generative_model::{Content, Message, ToolResourceRef, ToolResult, ToolUse};
 use myco::session::Thread;
 use serde::Serialize;
+
+#[path = "processes.rs"]
+mod processes;
+pub(super) use processes::{refresh_processes, retain_processes};
 
 pub(super) fn timestamp(time: &DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -48,6 +52,10 @@ pub(super) enum Block {
     Tool {
         #[serde(skip)]
         call_id: uuid::Uuid,
+        #[serde(skip)]
+        waiting: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resource: Option<ToolResourceRef>,
         #[serde(skip_serializing_if = "Option::is_none")]
         background_id: Option<uuid::Uuid>,
         tool: ToolUse,
@@ -82,6 +90,8 @@ impl Block {
     pub fn tool(tool: ToolUse, started: Option<Instant>) -> Self {
         Self::Tool {
             call_id: uuid::Uuid::nil(),
+            waiting: true,
+            resource: None,
             background_id: None,
             tool,
             text: String::new(),
@@ -105,6 +115,9 @@ impl Block {
             running,
             timer,
             background_id,
+            resource,
+            waiting,
+            tool,
             ..
         } = self
         {
@@ -122,9 +135,38 @@ impl Block {
                     .and_then(|n| n.parse::<i32>().ok())
                     .is_some_and(|n| n != 0);
             *running = false;
+            *waiting = false;
+            if tool.name == "bash"
+                && matches!(
+                    tool.input.get("action").and_then(serde_json::Value::as_str),
+                    None | Some("exec" | "start")
+                )
+            {
+                *resource = result.resource.clone();
+            }
             *background_id = None;
             if let Some(timer) = timer {
                 timer.finish();
+            }
+        }
+    }
+
+    pub fn continue_process(&mut self) {
+        if let Self::Tool {
+            resource: Some(_),
+            running,
+            status,
+            error: false,
+            timer,
+            ..
+        } = self
+            && !status.starts_with("exit ")
+            && !status.starts_with("signal ")
+        {
+            *running = true;
+            *status = "running".into();
+            if let Some(timer) = timer {
+                timer.finished = None;
             }
         }
     }
@@ -287,12 +329,16 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
     }
     for block in &mut blocks {
         if let Block::Tool {
-            status, running, ..
+            status,
+            running,
+            waiting,
+            ..
         } = block
-            && *running
+            && *waiting
         {
             *status = "outcome not recorded".into();
             *running = false;
+            *waiting = false;
         }
     }
     blocks
