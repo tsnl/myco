@@ -3,6 +3,7 @@ import { showActivity } from './activity.js';
 import { messageComposer } from './composer.js';
 import { messageNavigation } from './message-navigation.js';
 import { sessionRenamer } from './rename.js';
+import { imagePreview } from './image-viewer.js';
 import { linkify, setLinkedText } from './links.js';
 import { markdownContent } from './markdown-content.js';
 import { messageTimestamp } from './timestamps.js';
@@ -109,6 +110,7 @@ function addImages(parent, sources) {
     const img = element('img'); img.src = imageSource(source); img.alt = 'Image from the conversation'; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
     img.addEventListener('load', scrollLatest);
     img.addEventListener('error', () => { img.alt = 'Image unavailable'; });
+    imagePreview(img);
     parent.append(img);
   }
 }
@@ -118,7 +120,7 @@ function installMarkdown(node, job, text, html) {
   node.classList.remove('pending');
   delete node.dataset.renderError;
   job.rendered = text; job.failed = false;
-  for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
+  for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); imagePreview(img); }
   scrollLatest();
 }
 function markdown(node, text, html) {

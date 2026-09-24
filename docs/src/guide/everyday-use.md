@@ -26,6 +26,7 @@ remain notes the agent can read as needed.
 | Remove a pending message | Unqueue |
 | Cancel the running turn | Cancel |
 | Inspect tool input and output | Expand its tool block |
+| View an image fullscreen | Click the image; Escape or the close button returns |
 | Inspect running tools and background shells | Activity |
 | Let a running shell call continue while the assistant moves on | Background on the tool or in Activity |
 | Switch configured models | Model selector between turns |

@@ -1,4 +1,5 @@
 import { $, element, error, requestId } from './common.js';
+import { imagePreview } from './image-viewer.js';
 
 const supported = file => /^image\/(png|jpeg|gif|webp)$/.test(file.type) || /\.(png|jpe?g|gif|webp)$/i.test(file.name);
 const encodedSize = file => Math.ceil(file.size / 3) * 4;
@@ -15,7 +16,7 @@ export function imageAttachments(limits, changed, imageSource = source => source
     $('attachment-list').replaceChildren(...items.map(item => {
       const card = element('li', `attachment${item.error ? ' invalid' : ''}`);
       const preview = item.source ? element('img') : element('span', 'attachment-placeholder', item.error ? 'Unavailable' : 'Reading…');
-      if (item.source) { preview.src = imageSource(item.source); preview.alt = item.file.name; }
+      if (item.source) { preview.src = imageSource(item.source); preview.alt = item.file.name; imagePreview(preview); }
       const name = element('span', 'attachment-name', item.file.name); name.title = item.file.name;
       const remove = element('button', 'remove-attachment', '×');
       remove.type = 'button'; remove.disabled = locked; remove.dataset.attachment = item.id;
