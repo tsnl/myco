@@ -134,18 +134,18 @@ html.viewing-image { overflow: hidden; }
 .tool { position: relative; --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
 .tool.running { --tool-color: rgb(var(--sky-light, 139 213 220)); border-color: rgb(var(--sky-light, 139 213 220) / .3); }
 /* Animate only the decorative rim, keeping output and glass steady. */
-.tool.running::after, .active-call::after {
+.tool.running::after, .active-call::after, .active-timer::after {
   content: ''; position: absolute; inset: -1px; pointer-events: none;
   border: 1px solid rgb(var(--sky-light, 139 213 220));
   box-shadow: 0 0 3px rgb(var(--sky-light, 139 213 220) / .3), 0 0 15px rgb(var(--sky-light, 139 213 220) / .13);
   animation: running-border 2.4s ease-in-out infinite;
 }
 @keyframes running-border { 50% { opacity: .2; } }
-.activity-paused :is(.tool.running, .active-call)::after,
-.activity-disconnected :is(.tool.running, .active-call)::after,
+.activity-paused :is(.tool.running, .active-call, .active-timer)::after,
+.activity-disconnected :is(.tool.running, .active-call, .active-timer)::after,
 .activity-paused .activity-indicator::before { animation-play-state: paused; }
-@media (prefers-reduced-motion: reduce) { .tool.running::after, .active-call::after { animation: none; } }
-@media (forced-colors: active) { .tool.running::after, .active-call::after { border-color: Highlight; box-shadow: none; } }
+@media (prefers-reduced-motion: reduce) { .tool.running::after, .active-call::after, .active-timer::after { animation: none; } }
+@media (forced-colors: active) { .tool.running::after, .active-call::after, .active-timer::after { border-color: Highlight; box-shadow: none; } }
 .tool.done { --tool-color: var(--green); }
 .tool.failed { --tool-color: var(--red); }
 .tool.unknown { --tool-color: var(--amber); }
@@ -289,3 +289,11 @@ html.viewing-image { overflow: hidden; }
   .composer-footer { justify-content: flex-end; }
   #model { overflow: hidden; white-space: nowrap; }
 }
+
+.activity-section:not([hidden]) ~ .activity-section:not([hidden]) { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+#timer-list { list-style: none; padding-left: 0; }
+.active-timer { position: relative; padding: 12px; border: 1px solid var(--glass-border); background: var(--glass-raised); }
+.timer-message { margin: 0 0 10px; white-space: pre-wrap; color: #e6e6e6; }
+.timer-countdown, .timer-due { display: block; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+.timer-due, .timer-note { color: var(--dim); font-size: 12px; }
+#timer-error { color: var(--red); }

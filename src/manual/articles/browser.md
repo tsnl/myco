@@ -237,7 +237,7 @@ The page heading and browser tab title follow the session title, including the
 first-message title and agent renames during a running turn. Hover over a truncated
 heading to read its full title. The top bar aligns with the conversation and keeps
 its controls on a separate row on narrow screens. Activity counts appear only
-while tools or background sessions are running.
+while tools, background sessions, or timers are running.
 
 Each tool appears as soon as execution starts, with a truncated argument
 preview in its collapsed header. Running calls are cyan; completed calls turn
@@ -257,6 +257,8 @@ Durations are observed by the running browser server and retained while viewing
 the same thread. Saved history opened after a server restart has no timing data.
 
 **Activity** opens a right-hand drawer containing all running tools in one list.
+Scheduled follow-ups appear in a separate **Timers** section with their own
+countdowns and cancellation controls.
 Every entry opens its transcript card. Shells launched with `bash start` and
 commands released with **Background** remain running in that card, with an
 advancing timer and pulsing border, until the process and its output streams
@@ -291,6 +293,43 @@ identity distinguishes repeated uses of the same `session_id` and keeps hosts
 and owning sessions separate. Tool results retain an optional `resource` reference
 (`id` and `instance_id`); older stored results remain readable. Live status is a
 browser observation and does not rewrite the original result or consume output.
+
+### Session timers
+
+Ask the assistant to check back later, for example, “Check the build in two
+minutes.” In server sessions, the local **`timer`** tool supports:
+
+| Action | Input |
+| --- | --- |
+| Set a delay | `{"action":"set","after_seconds":120,"message":"Check the build and report its result."}` |
+| Set a time | `{"action":"set","at":"2026-09-25T09:00:00-07:00","message":"Check the deployment."}` |
+| List pending timers | `{"action":"list"}` |
+| Cancel before delivery | `{"action":"cancel","timer_id":"UUID"}` |
+
+Use exactly one of `after_seconds` or `at`. Absolute timestamps require a timezone.
+Timers accept delays from 0.1 seconds to 30 days; the worker checks deadlines every
+second. There can be up to 20 pending timers per session, with messages up to 8000
+characters. Scheduling returns immediately and does not keep a model request open.
+
+When a timer becomes due, its message joins the same FIFO as user follow-ups. An
+idle session wakes automatically; a busy session receives it at the next settled
+tool/model boundary. A full queue retains the overdue timer until space is available.
+Held edits keep their queue position. Due timer messages can be edited or unqueued
+using the normal controls, and appear under **SYSTEM · Timer fired** when delivered.
+Their origin remains visible after refresh and in saved history.
+
+**Activity → Timers** shows local due times, countdowns, and **Cancel timer**.
+Countdowns update every 0.1 seconds below one minute. An idle session with a
+scheduled timer shows **Waiting** in its page and the session browser. Cancel
+applies only to that timer; once delivery has started, use the normal run controls.
+
+Timers belong to their session and profile. They survive tab closes, model changes,
+and compaction. Archiving preserves them; **Cancel run** stops the current turn but
+does not cancel scheduled timers. The server must remain running: pending timers
+and undelivered queue entries are in memory and are cleared on restart. Timers are
+one-shot; recurring schedules and terminal-only timers are not supported.
+
+### Compaction activity
 
 Manual and automatic compaction update the activity indicator to **Compacting**.
 Compaction cards, summaries, internal resumption instructions, and prelude-change
@@ -459,10 +498,11 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | --- | --- |
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
 | `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
-| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, `queued`, `usage`, and `context_window_tokens` |
+| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, `queued`, `timers`, `usage`, and `context_window_tokens` |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"update_queued","message_id":"UUID","revision":0,"update":{"kind":"edit"}}` |
+| `POST /api/sessions/ID/action` | The same envelope with `{"kind":"cancel_timer","timer_id":"UUID"}` |
 | `POST /api/sessions/ID/cancel` | `{"session_id":"ID"}` → 204 |
 | `POST /api/sessions/ID/background` | `{"session_id":"ID","call_id":"UUID"}` → 202; use the running tool block's `background_id` |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |

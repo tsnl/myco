@@ -151,8 +151,8 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
       server. Define how running sessions retain their model and tool settings.
 - [ ] **Browser activity sections** — add triggers and cron activity alongside
       tool calls and background sessions in the Activity dialog.
-      Keep each activity type in its own section, separated by short inset
-      dividers; scheduled execution and its controls need a separate design.
+      One-shot session timers have their own section with cancellation. Durable
+      schedules, recurring execution, and triggers need a separate design.
 - [x] (REJECTED) **Permission modes** — e.g. ask / allowlist / autopilot; optional network/fs boundaries.
   - Wrong mechanism: better to use OS-level protection or bubblewrap sandboxing.
 - [ ] **Dangerous-command gates** — `rm -rf`, `git push --force`, `sudo`, curl|sh, etc.

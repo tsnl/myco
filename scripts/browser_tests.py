@@ -72,7 +72,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -89,6 +89,17 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
+        elif "timer" in prompt:
+            if not count:
+                events = tool(getattr(fixture, 'timer_input', {
+                    'action': 'set', 'after_seconds': 3, 'message': f'{name} timer follow-up: check the build.'}), 'timer')
+            elif count == 1 and getattr(fixture, 'timer_wait', False):
+                release = shlex.quote(str(root / (name + '-release')))
+                events = tool({'command': f'while [ ! -f {release} ]; do sleep 0.05; done', 'timeout_ms': 60000})
+            else:
+                events = reply('Timer scheduled.' if count == 1 else 'Timer woke the assistant.')
+                if count > 1 and hasattr(fixture, 'timer_woke'):
+                    fixture.timer_woke.set()
         elif count and "getlink" in prompt:
             output = [item['output'] for item in body['input'] if item.get('type') == 'function_call_output'][-1]
             if not isinstance(output, str):
@@ -545,6 +556,144 @@ context_window = 100000
     def image_urls(self, request):
         return [part['image_url'] for item in request['input'] if item.get('role') == 'user'
                 for part in item['content'] if isinstance(part, dict) and part.get('type') == 'input_image']
+
+    def test_timer_wakes_an_idle_session_with_no_open_tabs_and_replays_as_system(self):
+        self.timer_woke = threading.Event()
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer scheduled.')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        expect(page.locator('#activity-count')).to_have_text('1')
+        page.click('#activity-toggle')
+        expect(page.locator('.active-timer')).to_contain_text('check the build')
+        before = page.locator('.timer-countdown').inner_text()
+        page.wait_for_function("before => document.querySelector('.timer-countdown').textContent !== before", arg=before)
+        expect(page.locator('#active-calls')).to_be_hidden()
+        url = page.url
+        page.close()
+        self.assertTrue(self.timer_woke.wait(10), 'A timer must wake the assistant without a browser tab')
+        page = self.context.new_page()
+        page.goto(url)
+        expect(page.locator('.system .body')).to_contain_text('Timer fired')
+        expect(page.locator('.system .body')).to_contain_text('Alpha timer follow-up: check the build.')
+        expect(page.locator('.user .body')).to_have_text('Alpha timer')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#activity-count')).to_be_hidden()
+        self.assertEqual(len(self.requests), 3)
+        self.assertIn('[myco: Timer fired]', json.dumps(self.requests[-1]['input']))
+        page.reload()
+        expect(page.locator('.system .body')).to_contain_text('Timer fired')
+        self.assertEqual(len(self.requests), 3, 'Reload must not fire a timer twice')
+
+    def test_timer_joins_running_tool_results_and_can_be_edited_before_cancel_delivers_it(self):
+        self.timer_wait = True
+        self.timer_input = {'action': 'set', 'after_seconds': 0.2, 'message': 'Alpha timer original'}
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer original')
+        self.assertEqual(len(self.requests), 2, 'Expiry must not interrupt a running tool')
+        page.get_by_role('button', name='Edit', exact=True).click()
+        page.fill('#prompt', 'Alpha timer edited')
+        page.click('#send')
+        expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer edited')
+        page.reload()
+        expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer edited')
+        page.click('#cancel')
+        expect(page.locator('.system .body')).to_contain_text('Alpha timer edited')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
+        expect(page.locator('#queued')).to_be_hidden()
+        request = self.requests[-1]['input']
+        self.assertIn('cancel', json.dumps([item for item in request if item.get('type') == 'function_call_output']))
+        self.assertIn('[myco: Timer fired]', json.dumps(request))
+        self.assertEqual(len(self.requests), 3)
+
+    def test_timer_activity_cancellation_is_scoped_and_survives_model_changes(self):
+        self.timer_input = {'action': 'set', 'after_seconds': 120, 'message': 'Check deployment status'}
+        self.add_profile()
+        page = self.session(self.page, profile='default')
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        endpoint = page.url.replace('/sessions/', '/api/sessions/')
+        timer = self.context.request.get(endpoint).json()['change']['snapshot']['timers'][0]
+        other = self.session(profile='research')
+        response = self.context.request.post(other.url.replace('/sessions/', '/api/sessions/') + '/action', data={
+            'session_id': other.url.rsplit('/', 1)[1], 'request_id': str(uuid.uuid4()),
+            'action': {'kind': 'cancel_timer', 'timer_id': timer['id']}})
+        self.assertEqual(response.status, 409)
+        page.select_option('#model', 'second')
+        expect(page.locator('#model')).to_have_value('second')
+        page.reload()
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        for width in [1200, 390]:
+            page.set_viewport_size({'width': width, 'height': 850})
+            page.click('#activity-toggle')
+            expect(page.locator('.active-timer')).to_contain_text('Check deployment status')
+            page.screenshot(path=str(self.artifacts / f'timer-{width}.png'))
+            page.click('#activity-close')
+        page.click('#activity-toggle')
+        page.route('**/api/sessions/*/action', lambda route: route.fulfill(status=500, body='Timer cancellation failed'))
+        page.get_by_role('button', name='Cancel timer').click()
+        expect(page.locator('#timer-error')).to_have_text('Timer cancellation failed')
+        expect(page.get_by_role('button', name='Cancel timer')).to_be_enabled()
+        expect(page.locator('.active-timer')).to_have_count(1)
+        page.unroute('**/api/sessions/*/action')
+        page.get_by_role('button', name='Cancel timer').click()
+        expect(page.locator('#active-timers')).to_be_hidden()
+        expect(page.locator('#activity-empty')).to_be_visible()
+        expect(page.locator('#activity-close')).to_be_focused()
+        page.click('#activity-close')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(len(self.requests), 2, 'Cancelling a timer must not call the model')
+
+    def test_timer_expiring_during_compaction_waits_then_resumes_in_the_new_thread(self):
+        page = self.session(self.page)
+        self.timer_input = {'action': 'set', 'after_seconds': 3, 'message': 'Alpha timer after compaction'}
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        old = self.context.request.get(page.url.replace('/sessions/', '/api/sessions/')).json()['change']['snapshot']['thread_id']
+        self.compaction_release.clear()
+        page.click('#compact')
+        expect(page.locator('#connection')).to_have_text('Compacting')
+        expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer after compaction')
+        expect(page.locator('.system')).to_have_count(0)
+        self.compaction_release.set()
+        expect(page.locator('.system .body')).to_contain_text('Alpha timer after compaction')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
+        new = self.context.request.get(page.url.replace('/sessions/', '/api/sessions/')).json()['change']['snapshot']['thread_id']
+        self.assertNotEqual(old, new)
+        expect(page.locator('#connection')).to_have_text('Ready')
+
+    def test_pending_timers_are_cleared_when_the_server_restarts(self):
+        self.timer_input = {'action': 'set', 'after_seconds': 120, 'message': 'Check build later'}
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#activity-count')).to_be_hidden()
+        expect(page.locator('.system')).to_have_count(0)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_archived_session_keeps_its_timer_and_the_browser_shows_waiting(self):
+        self.timer_input = {'action': 'set', 'after_seconds': 5, 'message': 'Alpha timer in archive'}
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        url = page.url
+        page.click('#archive')
+        expect(page.locator('#archive-notice')).to_contain_text('Session Archived.')
+        page.select_option('#archive-filter', 'archived')
+        expect(page.locator('.session-status')).to_have_text('Waiting')
+        expect(page.locator('.session-status')).to_have_attribute('data-active', 'true')
+        expect(page.locator('.session-status')).to_have_text('Ready')
+        page.goto(url)
+        expect(page.locator('.system .body')).to_contain_text('Alpha timer in archive')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
+        self.assertEqual(len(self.requests), 3)
 
     def test_empty_composer_arrows_visit_user_messages_and_return_to_latest(self):
         self.turns['Alpha images'] = 1

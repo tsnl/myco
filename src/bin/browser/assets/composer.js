@@ -41,6 +41,7 @@ export function messageComposer({ sendAction, imageSource, addImages, resizeInpu
       const item = element('li'); item.dataset.messageId = message.request_id;
       const content = element('span', 'queued-content');
       setLinkedText(content, message.text); addImages(content, message.images);
+      if (message.timer) content.prepend(element('span', 'queue-state', 'Timer · '));
       const controls = element('div', 'queue-controls');
       if (message.state !== 'ready') controls.append(element('span', 'queue-state', message.state === 'sending' ? 'Sending…' : 'Paused for editing'));
       const button = (label, kind, action, disabled = false) => {

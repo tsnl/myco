@@ -13,7 +13,7 @@ use super::super::http::{
 };
 use super::*;
 
-fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
+pub(super) fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
     app_for("session", broadcast::channel(4).0)
 }
 
@@ -97,6 +97,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 status: "Ready".into(),
                 tasks: vec![],
                 queued: VecDeque::new(),
+                timers: vec![],
                 blocks: vec![],
             },
             cancel: None,

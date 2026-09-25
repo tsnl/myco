@@ -25,9 +25,16 @@ use super::view::{self, Block};
 mod queue;
 use queue::{MAX_QUEUED_MESSAGES, QueueUpdate, QueuedMessage};
 
+#[path = "timers.rs"]
+mod timers;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "timers_tests.rs"]
+mod timers_tests;
 
 #[derive(Debug)]
 pub(super) enum Error {
@@ -67,6 +74,7 @@ struct Snapshot {
     status: String,
     tasks: Vec<String>,
     queued: VecDeque<QueuedMessage>,
+    timers: Vec<timers::Timer>,
     blocks: Vec<Block>,
 }
 
@@ -75,7 +83,7 @@ impl Snapshot {
         json!({
             "session_id": self.session_id, "thread_id": self.thread_id,
             "title": self.title, "model": self.model,
-            "busy": self.busy, "status": self.status, "queued": self.queued,
+            "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
         })
@@ -341,7 +349,9 @@ impl App {
             );
         } else {
             let time = snapshot.blocks.iter().rev().find_map(|block| match block {
-                Block::Message { role, time, .. } if role == "user" => time.clone(),
+                Block::Message { role, time, .. } if role == "user" || role == "system" => {
+                    time.clone()
+                }
                 Block::Boundary { time } => Some(time.clone()),
                 _ => None,
             });
@@ -474,6 +484,13 @@ enum Action {
         message_id: Uuid,
         revision: u64,
         update: QueueUpdate,
+    },
+    CancelTimer {
+        timer_id: Uuid,
+    },
+    #[serde(skip)]
+    Timer {
+        message: QueuedMessage,
     },
     Compact,
     SelectModel {
@@ -651,7 +668,11 @@ impl Sessions {
             catalog,
             self.preflight.clone(),
             session,
-            self.root_tools.clone(),
+            |app: &Arc<App>| {
+                let mut tools = self.root_tools.clone();
+                tools.push(app.clone());
+                tools
+            },
             |config, _, session| {
                 let session = session.snapshot();
                 Arc::new(App {
@@ -679,6 +700,7 @@ impl Sessions {
                             status: "Ready".into(),
                             tasks: vec![],
                             queued: VecDeque::new(),
+                            timers: vec![],
                             blocks: view::history(session.active_thread()),
                         },
                         cancel: None,
@@ -844,6 +866,7 @@ impl Sessions {
             let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
             let status = live.as_ref().map_or("Saved", |live| {
                 if !live.snapshot.busy && live.snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { "Running" }
+                else if !live.snapshot.busy && !live.snapshot.timers.is_empty() { "Waiting" }
                 else { live.snapshot.status.as_str() }
             });
             let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
@@ -864,7 +887,7 @@ async fn worker(
     args: Arc<Args>,
 ) {
     let runtime = boot.runner.runtime().clone();
-    let observations = async {
+    let resources = async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -873,6 +896,7 @@ async fn worker(
             app.resources(runtime.resources().await);
         }
     };
+    let observations = async { tokio::join!(resources, app.tick_timers()) };
     tokio::pin!(observations);
     loop {
         let work = tokio::select! {
@@ -905,35 +929,20 @@ async fn execute(
     args: &Args,
 ) -> std::result::Result<(), String> {
     match work.request.action {
-        Action::UpdateQueued { .. } => unreachable!("queue mutations do not create worker actions"),
+        Action::UpdateQueued { .. } | Action::CancelTimer { .. } => {
+            unreachable!("queue mutations do not create worker actions")
+        }
+        Action::Timer { message } => {
+            let content = message.content(boot.catalog_model.spec.max_image_base64_bytes)?;
+            submit(boot, app, content, work.accepted_at, work.cancel).await
+        }
         Action::Submit { text, images } => match attachments::content(
             &text,
             &images,
             boot.catalog_model.spec.max_image_base64_bytes,
         ) {
             Err(error) => Err(error),
-            Ok(content) => {
-                let time = work.accepted_at;
-                {
-                    let mut live = app.live.lock().unwrap();
-                    let block = Block::message("user", &content, Some(view::timestamp(&time)));
-                    let index = live.snapshot.blocks.len();
-                    live.snapshot.blocks.push(block.clone());
-                    app.publish(
-                        &mut live.snapshot,
-                        json!({"kind":"block", "index":index, "block":block}),
-                    );
-                }
-                let followups = app.clone();
-                let image_limit = boot.catalog_model.spec.max_image_base64_bytes;
-                boot.runner
-                    .set_followup_handler(Some(Arc::new(move |agent, session| {
-                        followups.deliver_followups(agent, session, image_limit)
-                    })));
-                let outcome = boot.runner.submit(content, time, work.cancel).await;
-                boot.runner.set_followup_handler(None);
-                outcome.result.map(|_| ()).map_err(|e| e.to_string())
-            }
+            Ok(content) => submit(boot, app, content, work.accepted_at, work.cancel).await,
         },
         Action::Compact => boot
             .runner
@@ -958,6 +967,25 @@ async fn execute(
     }
 }
 
+async fn submit(
+    boot: &mut Boot,
+    app: &Arc<App>,
+    content: Vec<myco::generative_model::Content>,
+    time: DateTime<Utc>,
+    cancel: CancelToken,
+) -> std::result::Result<(), String> {
+    app.append_block(Block::input(&content, Some(view::timestamp(&time))));
+    let followups = app.clone();
+    let image_limit = boot.catalog_model.spec.max_image_base64_bytes;
+    boot.runner
+        .set_followup_handler(Some(Arc::new(move |agent, session| {
+            followups.deliver_followups(agent, session, image_limit)
+        })));
+    let outcome = boot.runner.submit(content, time, cancel).await;
+    boot.runner.set_followup_handler(None);
+    outcome.result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 impl App {
     fn deliver_followups(
         &self,
@@ -970,7 +998,7 @@ impl App {
             let Some(next) = self.claim_followup() else {
                 break;
             };
-            let content = match attachments::content(&next.text, &next.images, image_limit) {
+            let content = match next.content(image_limit) {
                 Ok(content) => content,
                 Err(error) => {
                     self.notice(format!("Queued message could not be sent: {error}"));
@@ -984,7 +1012,7 @@ impl App {
                 self.restore_followup(next.request_id);
                 return Err(error);
             }
-            let block = Block::message("user", &content, Some(view::timestamp(&next.accepted_at)));
+            let block = Block::input(&content, Some(view::timestamp(&next.accepted_at)));
             self.finish_followup(next.request_id, Some(block));
             delivered = true;
         }
@@ -1018,11 +1046,14 @@ impl App {
                 "The request belongs to a different session.".into(),
             ));
         }
-        let queue_update = matches!(request.action, Action::UpdateQueued { .. });
+        let queue_update = matches!(
+            request.action,
+            Action::UpdateQueued { .. } | Action::CancelTimer { .. }
+        );
         if live.snapshot.busy
             && !matches!(
                 request.action,
-                Action::Submit { .. } | Action::UpdateQueued { .. }
+                Action::Submit { .. } | Action::UpdateQueued { .. } | Action::CancelTimer { .. }
             )
         {
             return Err(Error::Conflict(
@@ -1045,6 +1076,7 @@ impl App {
                 revision,
                 update,
             } => self.update_queued(&mut live, *message_id, *revision, update)?,
+            Action::CancelTimer { timer_id } => self.remove_timer(&mut live, *timer_id)?,
             _ => self.start_work(&mut live, request.clone(), accepted_at)?,
         }
         live.accepted.insert(request.request_id, request);

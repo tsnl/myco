@@ -27,7 +27,8 @@ remain notes the agent can read as needed.
 | Cancel the running turn | Cancel |
 | Inspect tool input and output | Expand its tool block |
 | View an image fullscreen | Click the image; Escape or the close button returns |
-| Inspect running tools and background shells | Activity |
+| Inspect running tools, background shells, and timers | Activity |
+| Cancel a scheduled follow-up | Activity → Timers → Cancel timer |
 | Let a running shell call continue while the assistant moves on | Background on the tool or in Activity |
 | Switch configured models | Model selector between turns |
 | Compact context | Compact or `/compact` |
@@ -43,6 +44,12 @@ edit, or unqueue it. Your previous composer draft returns when editing finishes.
 After a reload, held messages remain in the queue; Edit opens their last saved
 content, and Resume sends it unchanged. Cancel stops the current turn and sends
 ready messages while leaving held edits paused.
+
+Ask the assistant to check back after a delay or at a specified time. Its `timer`
+tool schedules a follow-up that wakes the session automatically, even with every
+tab closed. Timers wait for the current tools to finish, preserve queued edits,
+and survive compaction. Keep the server running: restarting clears pending timers.
+See [session timers](../manual/browser.md#session-timers) for limits and controls.
 
 ## Attach an image
 
