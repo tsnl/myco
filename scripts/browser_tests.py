@@ -2260,17 +2260,60 @@ context_window = 100000
                 expect(link).to_have_attribute('target', '_blank')
 
     def test_failed_markdown_render_retries_on_the_next_snapshot(self):
+        self.event_gates = {1: threading.Event()}
+        self.addCleanup(self.event_gates[1].set)
         page = self.session(self.page)
         page.route("**/api/markdown", lambda route: route.abort(), times=1)
         with page.expect_event("requestfailed", predicate=lambda request: request.url.endswith("/api/markdown")):
             self.submit(page, "Alpha markdown")
-        expect(page.locator("#model")).to_be_enabled()
+        expect(page.locator('.markdown')).to_have_text('Formatting unavailable. Reload to retry.')
         body = page.locator(".markdown").element_handle()
-        page.select_option("#model", "second")
+        self.event_gates[1].set()
         expect(page.locator(".markdown table")).to_have_count(1)
+        expect(page.locator("#model")).to_be_enabled()
         self.assertTrue(body.evaluate("node => node.isConnected"))
 
-    def test_streaming_coalesces_markdown_requests(self):
+    def test_reloaded_markdown_arrives_formatted_without_extra_requests(self):
+        profile = self.add_profile()
+        (profile / 'workspace/pixel.png').write_bytes((self.home / 'pixel.png').read_bytes())
+        self.turns['Alpha links'] = 1
+        self.link_reply = '# Review\n\n**Ready**\n\n| File | State |\n| --- | --- |\n| src/main.rs | Checked |\n\n![Pixel](pixel.png)\n\n[Notes](notes.txt)\n\n<script>window.injected = true</script>'
+        page = self.session(self.page, profile='research')
+        self.submit(page, 'Alpha links')
+        expect(page.locator('.assistant table')).to_be_visible()
+        expect(page.locator('#model')).to_be_enabled()
+        requests = []
+        page.route('**/api/markdown', lambda route: (requests.append(route.request.url), route.abort()))
+        page.add_init_script("""window.rawPaints = [];
+            new MutationObserver(() => {
+                for (const node of document.querySelectorAll('.assistant .body')) {
+                    if (node.textContent.startsWith('# Review')) window.rawPaints.push(node.textContent);
+                }
+            }).observe(document, {subtree: true, childList: true, characterData: true});""")
+        for restart in [False, True]:
+            if restart:
+                self.stop(self.process)
+                self.process, _ = self.launch(port=urlsplit(self.origin).port)
+            page.reload()
+            body = page.locator('.assistant .body')
+            expect(body.locator('h1')).to_have_text('Review')
+            expect(body.locator('strong')).to_have_text('Ready')
+            expect(body.locator('td')).to_have_text(['src/main.rs', 'Checked'])
+            expect(body.locator('img')).to_have_attribute('src', '/profiles/research/files/pixel.png')
+            expect(body.locator('img')).to_have_js_property('naturalWidth', 1)
+            expect(body.get_by_role('link', name='Notes')).to_have_attribute('href', '/profiles/research/files/notes.txt')
+            expect(body).to_contain_text('<script>window.injected = true</script>')
+            self.assertFalse(page.evaluate('Boolean(window.injected)'))
+            self.assertEqual(page.evaluate('window.rawPaints'), [])
+            self.assertEqual(requests, [], 'Saved Markdown must not need per-message formatting requests')
+            snapshot = self.context.request.get(page.url.replace('/sessions/', '/api/sessions/')).json()['change']['snapshot']
+            assistant = next(block for block in snapshot['blocks'] if block.get('role') == 'assistant')
+            user = next(block for block in snapshot['blocks'] if block.get('role') == 'user')
+            self.assertEqual(assistant['text'], self.link_reply)
+            self.assertIn('<h1>Review</h1>', assistant['html'])
+            self.assertNotIn('html', user)
+
+    def test_streaming_coalesces_renders_and_late_html_cannot_overwrite_a_snapshot(self):
         page = self.session(self.page)
         expect(page.locator(".notice")).to_contain_text("prelude directory unreadable")
         held = []
@@ -2280,15 +2323,12 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         page.wait_for_timeout(200)
         self.assertEqual(len(held), 1, "Only one render of the streaming block may be in flight")
+        expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
         first = held.pop()
         first.fulfill(response=first.fetch())
         page.wait_for_timeout(150)
-        self.assertEqual(len(held), 1, "Render the latest text after the outstanding render finishes")
-        last = held.pop()
-        last.fulfill(response=last.fetch())
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
-        page.wait_for_timeout(150)
-        self.assertEqual(held, [])
+        self.assertEqual(held, [], 'The snapshot already supplied the latest rendered output')
 
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
         home = self.page

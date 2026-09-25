@@ -11,6 +11,7 @@ let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
 let revision = -1;
 let follow = true;
+let scrollPending = false;
 let selectingModel = false;
 let archiving = false;
 let eventPort = null;
@@ -50,7 +51,14 @@ function updateVisibility() {
 document.addEventListener('visibilitychange', updateVisibility);
 updateVisibility();
 
-function scrollLatest() { requestAnimationFrame(() => { if (follow) window.scrollTo({ top: document.documentElement.scrollHeight }); }); }
+function scrollLatest() {
+  if (scrollPending) return;
+  scrollPending = true;
+  requestAnimationFrame(() => {
+    scrollPending = false;
+    if (follow) window.scrollTo({ top: document.documentElement.scrollHeight });
+  });
+}
 window.addEventListener('scroll', () => {
   follow = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 100;
   $('jump').hidden = follow;
@@ -90,29 +98,48 @@ function addImages(parent, sources) {
     parent.append(img);
   }
 }
-function markdown(node, text) {
+function installMarkdown(node, job, text, html) {
+  node.replaceChildren(markdownContent(html, job.scope));
+  linkify(node);
+  node.classList.remove('pending');
+  delete node.dataset.renderError;
+  job.rendered = text; job.failed = false;
+  for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
+  scrollLatest();
+}
+function markdown(node, text, html) {
   let job = markdownJobs.get(node);
-  if (!job) { job = { text: null, pending: false, failed: false, scope: requestId() }; markdownJobs.set(node, job); }
+  if (!job) { job = { text: null, rendered: null, pending: false, failed: false, scope: requestId() }; markdownJobs.set(node, job); }
+  // A snapshot can supersede an outstanding incremental render. Its HTML
+  // already describes this text; a late response must not paint older output.
+  if (typeof html === 'string') {
+    job.text = text; job.failed = false;
+    delete node.dataset.renderError;
+    if (job.rendered !== text) installMarkdown(node, job, text, html);
+    return;
+  }
   if (job.text === text && !job.failed) return;
   job.text = text;
-  if (!node.hasChildNodes()) { node.textContent = text; node.classList.add('pending'); }
+  if (job.rendered === null) { node.textContent = 'Formatting…'; node.classList.add('pending'); }
   if (job.pending) return;
   job.pending = true;
   const render = async () => {
-    if (!node.isConnected) { job.pending = false; return; }
+    if (!node.isConnected || job.rendered === job.text) { job.pending = false; return; }
     const text = job.text;
     job.failed = false;
     try {
       const html = await (await api('/api/markdown', { text })).text();
-      if (!node.isConnected || text !== job.text) return;
-      node.replaceChildren(markdownContent(html, job.scope));
-      linkify(node);
-      node.classList.remove('pending');
-      for (const img of node.querySelectorAll('img')) { img.loading = 'lazy'; img.referrerPolicy = 'no-referrer'; img.addEventListener('load', scrollLatest); }
-      scrollLatest();
-    } catch (e) { job.failed = true; node.textContent = job.text; node.classList.add('pending'); }
+      if (!node.isConnected || text !== job.text || job.rendered === text) return;
+      installMarkdown(node, job, text, html);
+    } catch (e) {
+      if (text === job.text && job.rendered !== text) {
+        job.failed = true;
+        if (job.rendered === null) node.textContent = 'Formatting unavailable. Reload to retry.';
+        else node.dataset.renderError = 'New output could not be formatted. Reload to retry.';
+      }
+    }
     finally {
-      if (node.isConnected && text !== job.text) setTimeout(render, 80);
+      if (node.isConnected && text !== job.text && job.rendered !== job.text) setTimeout(render, 80);
       else job.pending = false;
     }
   };
@@ -203,7 +230,7 @@ function blockNode(block) {
   }
   const body = element('div', `body${block.role === 'user' ? '' : ' markdown'}`);
   if (block.role === 'user') setLinkedText(body, block.text);
-  else markdown(body, block.text);
+  else markdown(body, block.text, block.html);
   article.append(body);
   addImages(article, block.images);
   return article;
@@ -211,7 +238,7 @@ function blockNode(block) {
 function replaceBlock(index, block, previous) {
   if (nodes[index] && previous) {
     if (JSON.stringify(previous) === JSON.stringify(block)) {
-      if (block.kind === 'message' && block.role !== 'user') markdown(nodes[index].querySelector('.body'), block.text);
+      if (block.kind === 'message' && block.role !== 'user') markdown(nodes[index].querySelector('.body'), block.text, block.html);
       return;
     }
     if (block.kind === 'tool' && previous.kind === 'tool') {
@@ -225,7 +252,7 @@ function replaceBlock(index, block, previous) {
     if (block.kind === 'message' && previous.kind === 'message' && block.role === previous.role && block.time === previous.time && JSON.stringify(block.images) === JSON.stringify(previous.images)) {
       const body = nodes[index].querySelector('.body');
       if (block.role === 'user') setLinkedText(body, block.text);
-      else markdown(body, block.text);
+      else markdown(body, block.text, block.html);
       scrollLatest();
       return;
     }
@@ -349,6 +376,8 @@ function updateSession(update) {
   else if (change.kind === 'tasks') { state.tasks = change.tasks; activity(); }
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
+    // The cached HTML describes the snapshot, not subsequent streamed text.
+    delete block.html;
     markdown(nodes[change.index].querySelector('.body'), block.text);
   }
 }

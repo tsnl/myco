@@ -93,7 +93,7 @@ struct Live {
 pub(super) struct Update {
     session_id: String,
     revision: u64,
-    change: Value,
+    pub(super) change: Value,
 }
 
 impl Update {

@@ -196,7 +196,16 @@ async fn session_snapshot(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Json<Update>, Error> {
-    Ok(Json(server.sessions.open(&id).await?.snapshot()))
+    let app = server.sessions.open(&id).await?;
+    // Render only the requested history, outside the runtime lock and reactor.
+    // Live events keep their small deltas even when many sessions are active.
+    tokio::task::spawn_blocking(move || {
+        let mut update = app.snapshot();
+        markdown::render_snapshot(&mut update.change["snapshot"], &server.files);
+        Json(update)
+    })
+    .await
+    .map_err(|error| Error::Internal(format!("Cannot render session: {error}")))
 }
 
 pub(super) async fn session_action(
@@ -313,8 +322,10 @@ struct MarkdownRequest {
 async fn render_markdown(
     State(server): State<Arc<Server>>,
     Json(request): Json<MarkdownRequest>,
-) -> Html<String> {
-    Html(markdown::render(&request.text, &server.files))
+) -> Result<Html<String>, Error> {
+    tokio::task::spawn_blocking(move || Html(markdown::render(&request.text, &server.files)))
+        .await
+        .map_err(|error| Error::Internal(format!("Cannot render Markdown: {error}")))
 }
 
 async fn workspace_file(

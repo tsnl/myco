@@ -1,6 +1,20 @@
 use super::files::Files;
 use pulldown_cmark::{Alignment, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
+pub(super) fn render_snapshot(snapshot: &mut serde_json::Value, files: &Files) {
+    let Some(blocks) = snapshot["blocks"].as_array_mut() else {
+        return;
+    };
+    for block in blocks {
+        if block["kind"] == "message"
+            && block["role"] != "user"
+            && let Some(text) = block["text"].as_str()
+        {
+            block["html"] = render(text, files).into();
+        }
+    }
+}
+
 pub(super) fn image_url(source: &str, files: &Files) -> String {
     if source.starts_with("/api/image?") {
         return files.route(source);
