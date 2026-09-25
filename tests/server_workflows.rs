@@ -495,22 +495,22 @@ async fn manual_compaction_respects_its_budget_and_never_resumes_automatically()
 }
 
 #[tokio::test]
-async fn failed_or_disabled_automatic_compaction_does_not_continue() {
-    for enabled in [false, true] {
+async fn failed_compaction_or_usage_below_threshold_does_not_continue() {
+    for lower_threshold in [false, true] {
         let env = ServerEnv::new("auto-stop");
         let provider = test_utils::StubHttpServer::sequence(vec![
             model_answer("done", 80_000),
             model_answer("no summary written", 100),
         ])
         .await;
-        configure_compact(&env, &provider, enabled);
+        configure_compact(&env, &provider, lower_threshold);
         let server = Server::start(&env, &[]).await;
         let id = server.create(None, false).await;
         server.submit(&id, "task").await;
         let session = session_json(&env.dir, &id);
         assert_eq!(session["threads"].as_array().unwrap().len(), 1);
         assert!(!session.to_string().contains("# Resumption"));
-        assert_eq!(provider.connections(), if enabled { 2 } else { 1 });
+        assert_eq!(provider.connections(), if lower_threshold { 2 } else { 1 });
         server.stop().await;
     }
 }

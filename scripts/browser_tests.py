@@ -541,6 +541,54 @@ context_window = 100000
         expect(page.locator('#input-tokens')).to_have_text('Input 0')
         expect(page.locator('#output-tokens')).to_have_text('Output 0')
 
+    def test_auto_compaction_defaults_to_the_full_context_window(self):
+        self.compaction_release.clear()
+        self.usage = {'input_tokens': 100000, 'output_tokens': 20}
+        self.turns['Alpha images'] = 1
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#connection')).to_have_text('Compacting')
+        expect(page.locator('.assistant .body')).to_have_text('Alpha finished.')
+        self.usage = {'input_tokens': 512, 'output_tokens': 6}
+        self.compaction_release.set()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.assistant .body')).to_have_text(['Alpha finished.'] * 2)
+        expect(page.locator('#context-usage')).to_have_text('Context 512 / 100K · 1%')
+        expect(page.locator('#transcript')).not_to_contain_text('Resumption')
+
+    def test_smaller_model_compacts_before_the_next_message_even_after_restart(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        first, second = config.read_text().split('[models.second]')
+        config.write_text(first + '[models.second]' + second.replace('context_window = 100000', 'context_window = 50000'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.usage = {'input_tokens': 60000, 'output_tokens': 20}
+        self.turns.update({'Alpha images': 1, 'Beta images': 1})
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#model')).to_be_enabled()
+        page.select_option('#model', 'second')
+        expect(page.locator('#model')).to_have_value('second')
+        expect(page.locator('#context-usage')).to_have_text('Context — / 50K')
+        self.assertEqual(len(self.requests), 1, 'Selecting a model must wait for a message')
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#model')).to_have_value('second')
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(len(self.requests), 1, 'Opening a session must not compact or continue')
+        self.compaction_release.clear()
+        self.submit(page, 'Beta images')
+        expect(page.locator('#connection')).to_have_text('Compacting')
+        self.assertEqual(self.turns['Beta images'], 1,
+                         'The new model must not receive the uncompressed task first')
+        self.usage = {'input_tokens': 512, 'output_tokens': 6}
+        self.compaction_release.set()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.user .body')).to_have_text(['Alpha images', 'Beta images'])
+        expect(page.locator('.assistant .body').last).to_have_text('Beta finished.')
+        expect(page.locator('#context-usage')).to_have_text('Context 512 / 50K · 1%')
+
     def test_compaction_reports_activity_without_internal_messages_and_continues_afterward(self):
         for automatic in [False, True]:
             with self.subTest(automatic=automatic):

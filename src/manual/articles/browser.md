@@ -335,8 +335,14 @@ turn stay in place. **Compact** creates a successor thread without changing
 the session URL. These controls also accept `/new`, `/compact`, and `/resume <id>`
 in the input; `/resume` navigates only the current tab. Other slash commands are not available.
 
-Automatic compaction is enabled per model with `auto_compact_at`, a fraction of
-its context window (for example, `0.8`). Without this setting it is disabled.
+Automatic compaction is enabled for every model. `auto_compact_at` is a fraction
+of its context window in `(0, 1]`, defaulting to `1.0`; use `0.8` to compact earlier.
+Before sending a message, the runner checks the last known prompt size against
+the selected model's threshold. This sizing estimate survives model changes and
+restarts, while the usage display waits for a report from the new model.
+Selecting a model alone does not compact. New input is included when compaction runs.
+Reopened sessions restore their last recorded model. If it is no longer configured,
+the server uses its default and shows a notice.
 When the threshold is reached, the runner settles pending tools, saves a summary
 in a successor thread, and continues the task automatically. Queued follow-ups
 join that continued context. Manual **Compact** finishes after creating the

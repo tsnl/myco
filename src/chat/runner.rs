@@ -348,6 +348,18 @@ impl Workflow {
             agent.start_run()?;
             self.compacted_after_completion = false;
             self.awaiting_compacted_usage = false;
+            let used = agent
+                .last_usage()
+                .map(|usage| usage.context_tokens())
+                .or_else(|| {
+                    runtime
+                        .session()
+                        .with(|session| session.active_thread().context_tokens_estimate)
+                });
+            if self.threshold_reached(used) && !cancel.is_cancelled() {
+                self.auto_compact(agent, runtime, writer, cancel.clone())
+                    .await?;
+            }
         }
         let mut recovering_size_error = false;
         loop {
@@ -412,43 +424,20 @@ impl Workflow {
                     (self.observer)(WorkflowEvent::Warning("compaction did not reduce the prompt below its threshold; automatic compaction disabled until manual compaction or a session change".into()));
                 }
             }
-            let should_compact = !(self.auto_failed
-                || cancel.is_cancelled()
+            let should_compact = !(cancel.is_cancelled()
                 || !agent.state().can_replace_at_boundary()
                 || outcome.is_some() && self.compacted_after_completion)
                 && outcome.as_ref().is_none_or(|outcome| {
                     outcome.reason == crate::generative_model::TurnEndReason::EndTurn
                 })
-                && self
-                    .threshold
-                    .zip(used)
-                    .is_some_and(|(threshold, used)| used >= threshold);
+                && self.threshold_reached(used);
             if should_compact {
                 self.compacted_after_completion |= outcome.is_some();
-                match self
-                    .compact(
-                        agent,
-                        runtime,
-                        writer,
-                        cancel.clone(),
-                        CompactionMode::Automatic,
-                    )
-                    .await
+                if self
+                    .auto_compact(agent, runtime, writer, cancel.clone())
+                    .await?
                 {
-                    Ok(_) => {
-                        continue;
-                    }
-                    Err(AgentInteractionError::Compaction(reason)) => {
-                        self.auto_failed = true;
-                        (self.observer)(WorkflowEvent::Warning(format!(
-                            "auto-compaction failed: {reason}; disabled until manual compaction or a session change"
-                        )));
-                    }
-                    Err(AgentInteractionError::Cancelled) => {
-                        agent.cancel_at_boundary()?;
-                        return Err(AgentInteractionError::Cancelled);
-                    }
-                    Err(error) => return Err(error),
+                    continue;
                 }
             }
             if let Some(outcome) = outcome {
@@ -457,6 +446,41 @@ impl Workflow {
                 }
                 return Ok(outcome);
             }
+        }
+    }
+
+    fn threshold_reached(&self, used: Option<u64>) -> bool {
+        !self.auto_failed
+            && self
+                .threshold
+                .zip(used)
+                .is_some_and(|(limit, used)| used >= limit)
+    }
+
+    async fn auto_compact(
+        &mut self,
+        agent: &mut Agent,
+        runtime: &Arc<SessionRuntime>,
+        writer: &SessionWriter,
+        cancel: CancelToken,
+    ) -> Result<bool, AgentInteractionError> {
+        match self
+            .compact(agent, runtime, writer, cancel, CompactionMode::Automatic)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(AgentInteractionError::Compaction(reason)) => {
+                self.auto_failed = true;
+                (self.observer)(WorkflowEvent::Warning(format!(
+                    "auto-compaction failed: {reason}; disabled until manual compaction or a session change"
+                )));
+                Ok(false)
+            }
+            Err(AgentInteractionError::Cancelled) => {
+                agent.cancel_at_boundary()?;
+                Err(AgentInteractionError::Cancelled)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -582,7 +606,7 @@ fn replace_images_with_notice(parts: &mut [Content], notice: &str) {
 mod tests {
     use std::sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use super::*;
@@ -599,7 +623,7 @@ mod tests {
     struct Summarizer {
         calls: AtomicUsize,
         sources: Mutex<Vec<Session>>,
-        cancel: bool,
+        cancel: AtomicBool,
         failure: Option<&'static str>,
         break_store: Option<std::path::PathBuf>,
     }
@@ -620,7 +644,7 @@ mod tests {
                 let compacted =
                     compact_thread(&predecessor, "Continue the task with the existing shell")
                         .unwrap();
-                if self.cancel {
+                if self.cancel.swap(false, Ordering::SeqCst) {
                     cancel.cancel();
                 }
                 if let Some(home) = &self.break_store {
@@ -891,7 +915,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for cancelled in [true, false] {
                 let compactor = Arc::new(Summarizer {
-                    cancel: cancelled,
+                    cancel: AtomicBool::new(cancelled),
                     failure: (!cancelled).then_some("summary unavailable"),
                     ..Default::default()
                 });
@@ -1053,6 +1077,147 @@ mod tests {
                     .count(),
                 1
             );
+        });
+    }
+
+    #[test]
+    fn model_changes_check_the_new_threshold_before_submission_even_after_restart() {
+        let _home = temp_home("runner-model-window");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for restart in [false, true] {
+                for threshold in [80, 90, 200] {
+                    let compactor = Arc::new(Summarizer::default());
+                    let (mut runner, _) = setup(
+                        vec![output(90, None, TurnEndReason::EndTurn)],
+                        compactor.clone(),
+                    )
+                    .await;
+                    runner.set_compactor(compactor.clone(), Some(200));
+                    submit(&mut runner, CancelToken::new())
+                        .await
+                        .result
+                        .unwrap();
+                    let replacement =
+                        ScriptedModel::new(vec![output(20, None, TurnEndReason::EndTurn)]);
+                    runner
+                        .set_model(replacement.clone(), ModelInfo::named("replacement"))
+                        .await
+                        .unwrap();
+                    assert!(runner.agent().last_usage().is_none());
+                    assert_eq!(
+                        compactor.calls.load(Ordering::SeqCst),
+                        0,
+                        "model selection must wait for a submission"
+                    );
+                    if restart {
+                        let saved =
+                            Session::load(&runner.runtime().session().snapshot().json_path())
+                                .unwrap();
+                        drop(runner);
+                        let runtime = SessionRuntime::new(
+                            Harness::local_with_services(vec![]),
+                            ActiveSession::new(saved),
+                        );
+                        let agent = Agent::new(
+                            replacement.clone(),
+                            runtime.clone(),
+                            Arc::new(NullEventSink),
+                        );
+                        runner = SessionRunner::new(agent, runtime).await.unwrap();
+                    }
+                    runner.set_compactor(compactor.clone(), Some(threshold));
+                    submit(&mut runner, CancelToken::new())
+                        .await
+                        .result
+                        .unwrap();
+                    let count = usize::from(threshold <= 90);
+                    assert_eq!(
+                        compactor.calls.load(Ordering::SeqCst),
+                        count,
+                        "restart={restart}, threshold={threshold}"
+                    );
+                    assert_eq!(replacement.remaining(), 0);
+                    let saved = runner.runtime().session().snapshot();
+                    assert_eq!(saved.threads().len(), 1 + count);
+                    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 2);
+                    if count > 0 {
+                        let sources = compactor.sources.lock().unwrap();
+                        assert_eq!(
+                            sources[0]
+                                .active_thread()
+                                .messages
+                                .iter()
+                                .filter(|message| matches!(
+                                    message,
+                                    Message::AssistantMessage { .. }
+                                ))
+                                .count(),
+                            1,
+                            "the new model must not receive an oversized request before compaction"
+                        );
+                        assert_eq!(
+                            sources[0]
+                                .active_thread()
+                                .messages
+                                .iter()
+                                .filter(|message| message.is_user_turn())
+                                .count(),
+                            2,
+                            "compaction must include the newly accepted input"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn manual_compaction_clears_the_estimate_left_by_a_model_change() {
+        let _home = temp_home("runner-estimate-reset");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, _) = setup(
+                vec![output(90, None, TurnEndReason::EndTurn)],
+                compactor.clone(),
+            )
+            .await;
+            runner.set_compactor(compactor.clone(), Some(200));
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            runner
+                .set_model(
+                    ScriptedModel::new(vec![output(20, None, TurnEndReason::EndTurn)]),
+                    ModelInfo::named("replacement"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                runner
+                    .runtime()
+                    .session()
+                    .snapshot()
+                    .active_thread()
+                    .context_tokens_estimate,
+                Some(90)
+            );
+            runner.set_compactor(compactor.clone(), Some(80));
+            runner.compact(CancelToken::new()).await.unwrap();
+            assert!(
+                runner
+                    .runtime()
+                    .session()
+                    .snapshot()
+                    .active_thread()
+                    .context_tokens_estimate
+                    .is_none()
+            );
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -1387,7 +1552,7 @@ mod tests {
         let _home = temp_home("runner-cancel");
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let compactor = Arc::new(Summarizer {
-                cancel: true,
+                cancel: AtomicBool::new(true),
                 ..Default::default()
             });
             let (mut runner, model) = setup(

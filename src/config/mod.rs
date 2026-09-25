@@ -354,13 +354,13 @@ fn resolve_catalog(
         // here so the runner compares plain numbers and a bad value is caught at
         // startup rather than hours into an unattended run.
         let auto_compact_at_tokens = match entry.auto_compact_at {
-            None => None,
+            None | Some(1.0) => Some(entry.context_window),
             Some(fraction) if fraction > 0.0 && fraction < 1.0 => {
                 Some((entry.context_window as f64 * fraction) as u64)
             }
             Some(fraction) => {
                 return Err(format!(
-                    "model `{key}`: auto_compact_at must be greater than 0 and less than 1 \
+                    "model `{key}`: auto_compact_at must be greater than 0 and at most 1 \
                      (got {fraction})"
                 ));
             }
@@ -1157,18 +1157,23 @@ context_window = 200_000
             cfg.models.spec("capped").unwrap().auto_compact_at_tokens,
             Some(160_000)
         );
-        // Unset → no auto-compaction; `/compact` still works.
+        // Unset defaults to the full context window.
         assert_eq!(
             cfg.models.spec("stock").unwrap().auto_compact_at_tokens,
-            None
+            Some(200_000)
+        );
+        let explicit = toml_text.replace("auto_compact_at = 0.8", "auto_compact_at = 1.0");
+        let cfg = resolve_toml(&explicit, ConfigUserSettings::default(), env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.models.spec("capped").unwrap().auto_compact_at_tokens,
+            Some(200_000)
         );
     }
 
-    /// A fraction outside (0, 1) is caught at startup rather than hours into an
-    /// unattended run — 1.0 would only fire once the window is already full.
+    /// A fraction outside (0, 1] is caught at startup.
     #[test]
     fn auto_compact_fraction_out_of_range_is_a_resolve_error() {
-        for bad in ["0.0", "1.0", "1.5", "-0.2"] {
+        for bad in ["0.0", "1.5", "-0.2", "nan", "inf"] {
             let toml_text = format!(
                 "[models.x]\nprotocol = \"openai-responses\"\nbase_url = \"https://h\"\n\
                  context_window = 1000\nauto_compact_at = {bad}\n"

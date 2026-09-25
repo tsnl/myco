@@ -273,11 +273,19 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
-**Auto-compaction** runs through the server’s session runner. `auto_compact_at = 0.8` triggers when reported prompt size reaches 80% of
+**Auto-compaction** is enabled for every configured model through the session runner.
+`auto_compact_at` defaults to `1.0`, the full context window; `0.8` triggers when reported prompt size reaches 80% of
 `context_window`, at a settled boundary between tool rounds or after a normal answer.
 The system prompt tells the agent this
-threshold. Unset (the default) disables threshold-based compaction; the fraction must
-be greater than 0 and less than 1.
+threshold. The fraction must be greater than 0 and at most 1.
+
+The runner also checks saved context before sending a new submission. After a
+model change, it compares the last known prompt size with the selected model's
+threshold. This estimate survives restarts but is kept separate from the new
+model's usage report. Selecting a model or opening a session alone does not
+compact or generate. The newly accepted message is included in any compaction.
+Counts are estimates for a different tokenizer and exclude input added since the
+last report; a fraction below `1.0` leaves more room for growth.
 
 It runs the same compaction as `/compact`, creating a successor thread in the
 same session with live tools intact. After success, a `# Resumption` message
@@ -297,7 +305,7 @@ Compaction workers do not run auto-compaction. Each committed successor retains 
 same live tool owner and the run's usage and truncation accounting.
 
 **Oversized requests** trigger compaction and continuation in browser and CLI
-sessions, even without an `auto_compact_at` threshold. This covers HTTP 413,
+sessions independently of the token threshold. This covers HTTP 413,
 recognized provider size errors, and the local `max_request_bytes` cap. Recovery
 replaces retained images with text references to their originals in the saved
 predecessor thread, so the next request does not resend the same image payloads.
