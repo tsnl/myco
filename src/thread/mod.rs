@@ -12,22 +12,15 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn from_entries(entries: Vec<Entry>) -> Self {
         Self { entries }
     }
-
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
-
-    pub fn append(&mut self, entry: Entry) {
+    pub fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
     }
-
     pub fn fork(&self, prefix_len: usize) -> Option<Self> {
         let entries = self.entries.get(..prefix_len)?.to_vec();
         Some(Self::from_entries(entries))
@@ -38,8 +31,7 @@ impl Thread {
 // Identifiers
 //
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OperationId(pub u128);
+pub type OperationId = uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EvidenceId(pub u128);

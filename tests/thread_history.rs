@@ -8,10 +8,10 @@ use myco::thread::{ContentPart, Entry, EvidenceId, OperationId, Thread};
 
 #[test]
 fn appending_preserves_existing_entries_and_cloned_snapshots() {
-    let mut thread = Thread::new();
-    thread.append(Entry::User("first".into()));
+    let mut thread = Thread::default();
+    thread.push(Entry::User("first".into()));
     let snapshot = thread.clone();
-    thread.append(Entry::Notification("second".into()));
+    thread.push(Entry::Notification("second".into()));
 
     assert_eq!(snapshot.entries(), &[Entry::User("first".into())]);
     assert_eq!(&thread.entries()[..1], snapshot.entries());
@@ -20,11 +20,11 @@ fn appending_preserves_existing_entries_and_cloned_snapshots() {
 
 #[test]
 fn cloned_values_can_grow_independently_without_shared_storage() {
-    let mut original = Thread::new();
-    original.append(Entry::User("shared".into()));
+    let mut original = Thread::default();
+    original.push(Entry::User("shared".into()));
     let mut copy = original.clone();
-    original.append(Entry::User("original only".into()));
-    copy.append(Entry::User("copy only".into()));
+    original.push(Entry::User("original only".into()));
+    copy.push(Entry::User("copy only".into()));
 
     assert_eq!(original.entries()[1], Entry::User("original only".into()));
     assert_eq!(copy.entries()[1], Entry::User("copy only".into()));
@@ -38,7 +38,7 @@ fn constructing_a_thread_preserves_entries_and_evidence_references() {
     }];
     let mut thread = Thread::from_entries(entries.clone());
     let snapshot = thread.clone();
-    thread.append(Entry::User("continue".into()));
+    thread.push(Entry::User("continue".into()));
 
     assert_eq!(snapshot.entries(), entries);
 }
@@ -49,12 +49,12 @@ fn constructing_a_thread_preserves_entries_and_evidence_references() {
 
 #[test]
 fn forks_copy_only_the_selected_prefix_and_then_grow_independently() {
-    let mut source = Thread::new();
-    source.append(Entry::User("shared".into()));
-    source.append(Entry::User("source only".into()));
+    let mut source = Thread::default();
+    source.push(Entry::User("shared".into()));
+    source.push(Entry::User("source only".into()));
     let mut branch = source.fork(1).unwrap();
-    branch.append(Entry::User("branch only".into()));
-    source.append(Entry::Notification("source advanced".into()));
+    branch.push(Entry::User("branch only".into()));
+    source.push(Entry::Notification("source advanced".into()));
 
     assert_eq!(
         branch.entries(),
@@ -69,9 +69,9 @@ fn forks_copy_only_the_selected_prefix_and_then_grow_independently() {
 
 #[test]
 fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
-    let mut source = Thread::new();
+    let mut source = Thread::default();
     assert!(source.fork(0).unwrap().entries().is_empty());
-    source.append(Entry::User("first".into()));
+    source.push(Entry::User("first".into()));
     let snapshot = source.clone();
 
     assert!(source.fork(0).unwrap().entries().is_empty());
@@ -87,17 +87,19 @@ fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
 
 #[test]
 fn forks_preserve_ordered_content_tool_correlation_and_evidence() {
+    let read_operation: OperationId = "5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap();
+    let edit_operation: OperationId = "5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap();
     let content = vec![
         ContentPart::Reasoning("thinking".into()),
         ContentPart::Text("answer".into()),
         ContentPart::Refusal("refusal".into()),
         ContentPart::ToolCall {
-            operation: OperationId(100),
+            operation: read_operation,
             name: "read".into(),
             arguments: Ok(json!({"path": "a.txt"})),
         },
         ContentPart::ToolCall {
-            operation: OperationId(101),
+            operation: edit_operation,
             name: "edit".into(),
             arguments: Err("incomplete JSON".into()),
         },
@@ -110,7 +112,7 @@ fn forks_preserve_ordered_content_tool_correlation_and_evidence() {
             evidence: Some(EvidenceId(200)),
         },
         Entry::ToolResult {
-            operation: OperationId(100),
+            operation: read_operation,
             output: "contents".into(),
             is_error: false,
         },

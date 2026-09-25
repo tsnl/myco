@@ -7,13 +7,13 @@ instances, serialization, grouping, and persistence.
 ```rust
 use myco::thread::{Entry, Thread};
 
-let mut thread = Thread::new();
-thread.append(Entry::User("Explain this repository.".into()));
+let mut thread = Thread::default();
+thread.push(Entry::User("Explain this repository.".into()));
 let snapshot = thread.clone();
 
 let mut branch = thread.fork(1).unwrap();
-branch.append(Entry::User("Focus on the model module.".into()));
-thread.append(Entry::Notification("Review started.".into()));
+branch.push(Entry::User("Focus on the model module.".into()));
+thread.push(Entry::Notification("Review started.".into()));
 
 assert_eq!(snapshot.entries().len(), 1);
 assert_eq!(thread.entries().len(), 2);
@@ -26,7 +26,7 @@ assert_eq!(branch.entries().len(), 2);
 entries unchanged. Cloning copies the entries, and each copy can grow
 independently. Equality compares contents.
 
-`new` and `default` create empty threads; `from_entries` takes an existing vector.
+`default` creates an empty thread; `from_entries` takes an existing vector.
 `fork` copies a prefix. Empty and complete prefixes are valid; an out-of-bounds
 prefix returns `None`. Workflows and the kernel track how threads were derived.
 
@@ -43,8 +43,9 @@ revision counter, or async runtime requirement.
 ## Entries and model evidence
 
 Entries distinguish user input, assistant content, tool results, system
-information, warnings, errors, and notifications. Assistant content is ordered;
-tool calls and results share an operation ID assigned by the workflow. These
+information, warnings, errors, and notifications. Assistant content is ordered.
+`OperationId` is an alias for `uuid::Uuid`. The workflow assigns it once per logical
+operation and reuses it for the tool call, its result, and retries. These
 values describe history without deciding which entries enter a model prompt or
 which tool calls may execute. Workflows compose thread operations with inference.
 

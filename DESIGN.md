@@ -232,16 +232,15 @@ A thread is an owned, append-only conversation in memory. The kernel holds and
 manages distinct `Thread` instances; the history module operates on those values.
 
 ```rust
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Thread {
     entries: Vec<Entry>,
 }
 
 impl Thread {
-    pub fn new() -> Self;
     pub fn from_entries(entries: Vec<Entry>) -> Self;
     pub fn entries(&self) -> &[Entry];
-    pub fn append(&mut self, entry: Entry);
+    pub fn push(&mut self, entry: Entry);
     pub fn fork(&self, prefix_len: usize) -> Option<Self>;
 }
 ```
@@ -266,6 +265,8 @@ these local operations with effectful APIs supplied by the kernel and services.
 tool results, system information, warnings, errors, and notifications. Its content
 types are independent of inference types. A stored entry need not appear in a
 model prompt; the workflow chooses how to interpret it.
+Tool calls and results share a stable `OperationId`, an alias for `uuid::Uuid`.
+The workflow assigns it once per logical operation and retains it across retries.
 
 Assistant entries can carry an `EvidenceId` referencing an immutable inference
 record. Workflow/kernel code retains the complete model message there, including
@@ -437,7 +438,7 @@ instances through direct kernel operations.
 
 The kernel and services record intent before dispatch and retain stable operation
 IDs across retries. Kernel publication records an updated thread value and its
-receipt atomically; a local `Thread::append` performs no persistence. Service
+receipt atomically; a local `Thread::push` performs no persistence. Service
 operations also retain their own records. An uncertain response triggers
 lookup/reconciliation of the existing operation, not a fresh submission under
 a new ID. Request deduplication cannot guarantee exactly-once external effects.
