@@ -39,8 +39,13 @@
   <dialog id="activity" aria-labelledby="activity-title">
     <header class="activity-heading"><h2 id="activity-title">Activity</h2><button id="activity-close" type="button" aria-label="Close activity" autofocus>×</button></header>
     <p id="activity-empty">No running activities.</p>
+    <p id="timer-error" role="alert" hidden></p>
     <section id="active-calls" class="activity-section" hidden>
       <h3>Tool calls</h3><ul id="activity-list"></ul>
+    </section>
+    <section id="active-timers" class="activity-section" hidden>
+      <h3>Timers</h3><ul id="timer-list"></ul>
+      <p class="timer-note">Timers run while this server is running. Restarting clears them.</p>
     </section>
   </dialog>
   <div id="composer-frame" class="composer-frame" data-state="reconnecting">

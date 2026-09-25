@@ -288,7 +288,7 @@ async fn boot_session<S: EventSink + 'static>(
     catalog_model: CatalogModel,
     preflight: StartupPreflight,
     mut loaded: Session,
-    mut root_tools: Vec<Arc<dyn myco::ToolService>>,
+    root_tools: impl FnOnce(&Arc<S>) -> Vec<Arc<dyn myco::ToolService>>,
     make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
 ) -> Result<(Boot, Arc<S>), String> {
     let session_lock = lock_session_or_report(&loaded.id)?;
@@ -299,6 +299,7 @@ async fn boot_session<S: EventSink + 'static>(
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(loaded);
     let sink = make_sink(&app_config, &preflight, &session);
+    let mut root_tools = root_tools(&sink);
 
     let session_tool =
         Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;

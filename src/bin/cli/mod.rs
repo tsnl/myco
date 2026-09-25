@@ -41,7 +41,7 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         model,
         preflight,
         session,
-        vec![],
+        |_| vec![],
         |_, _, _| sink,
     )
     .await?;

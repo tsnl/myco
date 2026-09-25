@@ -10,7 +10,7 @@ use super::{Action, ActionRequest, App, Block, Error, Live, Result, Snapshot, at
 
 pub(super) const MAX_QUEUED_MESSAGES: usize = 20;
 
-#[derive(Clone, Copy, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum QueueState {
     Ready,
@@ -18,7 +18,7 @@ pub(super) enum QueueState {
     Sending,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct QueuedMessage {
     pub(super) request_id: Uuid,
     pub(super) text: String,
@@ -26,6 +26,13 @@ pub(super) struct QueuedMessage {
     pub(super) accepted_at: DateTime<Utc>,
     pub(super) revision: u64,
     pub(super) state: QueueState,
+    pub(super) timer: Option<TimerOrigin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct TimerOrigin {
+    pub(super) id: Uuid,
+    pub(super) scheduled_for: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -47,11 +54,32 @@ impl QueuedMessage {
         ActionRequest {
             request_id: self.request_id,
             session_id: session_id.into(),
-            action: Action::Submit {
-                text: self.text.clone(),
-                images: self.images.clone(),
+            action: if self.timer.is_some() {
+                Action::Timer {
+                    message: self.clone(),
+                }
+            } else {
+                Action::Submit {
+                    text: self.text.clone(),
+                    images: self.images.clone(),
+                }
             },
         }
+    }
+
+    pub(super) fn content(
+        &self,
+        image_limit: u64,
+    ) -> std::result::Result<Vec<myco::generative_model::Content>, String> {
+        let mut content = attachments::content(&self.text, &self.images, image_limit)?;
+        if let Some(timer) = &self.timer {
+            content.insert(0, myco::generative_model::Content::System {
+                kind: "timer".into(),
+                text: format!("[myco: Timer fired]\nTimer {} scheduled for {} has fired. The following is its queued follow-up message.", timer.id, timer.scheduled_for.to_rfc3339()),
+                data: serde_json::to_value(timer).expect("timer metadata"),
+            });
+        }
+        Ok(content)
     }
 }
 
@@ -96,6 +124,7 @@ impl App {
             accepted_at,
             revision: 0,
             state: QueueState::Ready,
+            timer: None,
         });
         Ok(())
     }

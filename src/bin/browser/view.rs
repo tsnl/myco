@@ -77,6 +77,17 @@ pub(super) enum Block {
 }
 
 impl Block {
+    pub fn input(content: &[Content], time: Option<String>) -> Self {
+        let timer = content
+            .iter()
+            .any(|part| matches!(part, Content::System { kind, .. } if kind == "timer"));
+        let mut block = Self::message(if timer { "system" } else { "user" }, content, time);
+        if timer && let Self::Message { text, .. } = &mut block {
+            *text = format!("Timer fired\n\n{text}");
+        }
+        block
+    }
+
     pub fn message(role: &str, content: &[Content], time: Option<String>) -> Self {
         let (text, images) = visible(content);
         Self::Message {
@@ -230,7 +241,7 @@ pub(super) fn assistant_heading(blocks: &[Block]) -> Option<Block> {
                 });
             }
             Block::Message { role, .. } if role == "assistant" => return None,
-            Block::Message { role, time, .. } if role == "user" => {
+            Block::Message { role, time, .. } if role == "user" || role == "system" => {
                 return Some(Block::AssistantHeading { time: time.clone() });
             }
             _ => {}
@@ -255,7 +266,7 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
         match message {
             Message::UserMessage { content } if message.is_user_turn() => {
                 time = thread.user_turn_timestamps.get(&index).map(timestamp);
-                let block = Block::message("user", content, time.clone());
+                let block = Block::input(content, time.clone());
                 if let Block::Message { text, images, .. } = &block
                     && (!text.is_empty() || !images.is_empty() || content.is_empty())
                 {

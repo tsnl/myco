@@ -20,6 +20,11 @@ scripts written to disk. Where `uv` is missing, use an existing virtual environm
 process group. For long work, raise the timeout or use `start` with the program in the foreground
 of that session. A session `read` timeout ends the wait and leaves the process running.
 
+When `timer` is available, use it to resume a server session after a delay or at a
+specified time. Set a concrete follow-up message, then continue other work or finish
+your turn; Myco queues the follow-up when it is due. Timers require the server to
+remain running. Inspect or cancel pending timers with the same tool.
+
 Verify the requested result as well as the command's exit status:
 
 - Check server startup logs and response bodies; an older process may answer on the same port.
