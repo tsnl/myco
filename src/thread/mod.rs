@@ -1,5 +1,7 @@
 #![doc = include_str!("README.md")]
 
+use std::{ops::Index, slice::SliceIndex};
+
 use serde_json::Value;
 
 //
@@ -21,9 +23,13 @@ impl Thread {
     pub fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
     }
-    pub fn fork(&self, prefix_len: usize) -> Option<Self> {
-        let entries = self.entries.get(..prefix_len)?.to_vec();
-        Some(Self::from_entries(entries))
+}
+
+impl<I: SliceIndex<[Entry]>> Index<I> for Thread {
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.entries[index]
     }
 }
 

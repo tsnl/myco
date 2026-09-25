@@ -43,15 +43,16 @@ fn constructing_a_thread_preserves_entries() {
 }
 
 //
-// Forks
+// Slices
 //
 
 #[test]
-fn forks_copy_only_the_selected_prefix_and_then_grow_independently() {
+fn slice_copies_grow_independently() {
     let mut source = Thread::default();
+    source.push(Entry::User("excluded".into()));
     source.push(Entry::User("shared".into()));
     source.push(Entry::User("source only".into()));
-    let mut branch = source.fork(1).unwrap();
+    let mut branch = Thread::from_entries(source[1..2].to_vec());
     branch.push(Entry::User("branch only".into()));
     source.push(Entry::Notification("source advanced".into()));
 
@@ -62,22 +63,30 @@ fn forks_copy_only_the_selected_prefix_and_then_grow_independently() {
             Entry::User("branch only".into())
         ]
     );
-    assert_eq!(source.entries()[1], Entry::User("source only".into()));
-    assert_eq!(&source.entries()[..1], &branch.entries()[..1]);
+    assert_eq!(source[2], Entry::User("source only".into()));
+    assert_eq!(&source[1..2], &branch[..1]);
 }
 
 #[test]
-fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
+fn indexing_borrows_entries_and_ranges() {
     let mut source = Thread::default();
-    assert!(source.fork(0).unwrap().entries().is_empty());
+    assert!(source[..].is_empty());
     source.push(Entry::User("first".into()));
-    let snapshot = source.clone();
+    source.push(Entry::User("second".into()));
 
-    assert!(source.fork(0).unwrap().entries().is_empty());
-    assert_eq!(source.fork(1).unwrap().entries(), source.entries());
-    assert_eq!(source.fork(2), None);
-    assert_eq!(source.fork(usize::MAX), None);
-    assert_eq!(source, snapshot);
+    assert!(source[..0].is_empty());
+    assert!(source[2..].is_empty());
+    assert_eq!(&source[..], source.entries());
+    assert_eq!(&source[..1], &source[..=0]);
+    assert_eq!(&source[1..], &source[1..=1]);
+    assert!(std::ptr::eq(source[1..].as_ptr(), &source.entries()[1]));
+}
+
+#[test]
+#[should_panic]
+fn out_of_bounds_indexing_panics() {
+    let source = Thread::default();
+    let _ = &source[1..];
 }
 
 //
@@ -85,7 +94,7 @@ fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
 //
 
 #[test]
-fn clones_and_forks_preserve_replay_content_and_tool_correlation() {
+fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
     let read_call = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap());
     let edit_call = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap());
     let mut content = reasoning_content();
@@ -120,7 +129,7 @@ fn clones_and_forks_preserve_replay_content_and_tool_correlation() {
     ];
     let source = Thread::from_entries(entries.clone());
     let snapshot = source.clone();
-    let branch = source.fork(entries.len()).unwrap();
+    let branch = Thread::from_entries(source[..].to_vec());
     drop(source);
     assert_eq!(snapshot.entries(), entries);
     assert_eq!(branch.entries(), entries);

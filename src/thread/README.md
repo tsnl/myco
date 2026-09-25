@@ -11,7 +11,7 @@ let mut thread = Thread::default();
 thread.push(Entry::User("Explain this repository.".into()));
 let snapshot = thread.clone();
 
-let mut branch = thread.fork(1).unwrap();
+let mut branch = Thread::from_entries(thread[..1].to_vec());
 branch.push(Entry::User("Focus on the model module.".into()));
 thread.push(Entry::Notification("Review started.".into()));
 
@@ -27,8 +27,10 @@ entries unchanged. Cloning copies the entries, and each copy can grow
 independently. Equality compares contents.
 
 `default` creates an empty thread; `from_entries` takes an existing vector.
-`fork` copies a prefix. Empty and complete prefixes are valid; an out-of-bounds
-prefix returns `None`. Workflows and the kernel track how threads were derived.
+Indexing borrows entries or ranges: `&thread[0]`, `&thread[..n]`, or
+`&thread[start..end]`. A slice's `to_vec()` copies its entries into an independent
+vector. Invalid indices panic; use `thread.entries().get(range)` for checked
+access. Workflows and the kernel track how threads were derived.
 
 The kernel can own a `Box<Thread>` and use references for in-process access. Its
 allocation has a stable address while it remains allocated. Any address-based
@@ -46,7 +48,7 @@ Entries distinguish user input, assistant content, tool results, system
 information, warnings, errors, and notifications. Assistant content is ordered.
 
 `ToolCallId` wraps `uuid::Uuid` and pairs a tool call's `id` with a result's
-`call_id`. Clones and forks preserve that relationship. A model-originated call
+`call_id`. Copies preserve that relationship. A model-originated call
 also retains its original `provider_call_id` for context reconstruction; synthetic
 calls can omit it. Workflows resolve a result's provider ID from the matching call
 in the selected history. Execution IDs and retry policy belong to the kernel and
@@ -54,7 +56,7 @@ services.
 
 Content owns the original reasoning text and signatures, encrypted reasoning IDs,
 summaries and data, and redacted blocks. Preserve these values and their order when
-rebuilding context. Clones and forks copy them directly; no external inference
+rebuilding context. History copies retain them directly; no external inference
 record is needed to recover conversation content.
 
 Workflows choose which entries enter a model prompt, check model compatibility,

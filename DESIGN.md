@@ -244,14 +244,14 @@ impl Thread {
     pub fn from_entries(entries: Vec<Entry>) -> Self;
     pub fn entries(&self) -> &[Entry];
     pub fn push(&mut self, entry: Entry);
-    pub fn fork(&self, prefix_len: usize) -> Option<Self>;
 }
 ```
 
 Owned values use dense vectors. Appending requires an exclusive borrow and leaves
 existing entries unchanged. Cloning copies entries, and each copy can grow
-independently. Fork copies a prefix into a new value.
-An out-of-bounds prefix returns `None`; empty and full prefixes are valid.
+independently. Read-only indexing borrows an entry or slice. A branch is an
+ordinary copy: `Thread::from_entries(thread[..end].to_vec())`. Invalid indices
+panic; `thread.entries().get(range)` provides checked access.
 
 The kernel owns thread instances, retains needed snapshots, and tracks how threads
 were derived. It can own `Box<Thread>` values and borrow them for in-process access.
@@ -269,7 +269,7 @@ tool results, system information, warnings, errors, and notifications. Its conte
 types are independent of inference types. A stored entry need not appear in a
 model prompt; the workflow chooses how to interpret it.
 Tool calls and results share a `ToolCallId`, a newtype around `uuid::Uuid`.
-It identifies the call within conversation history and survives clones and forks.
+It identifies the call within conversation history and survives history copies.
 Execution attempts, deduplication, and retry records belong to the kernel/services.
 
 Assistant content owns reasoning text and signatures, encrypted reasoning IDs,
@@ -493,8 +493,8 @@ Review steps are module-sized changes within the engine crate.
 2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned vector histories, rich entries, and local append/fork.
-   Check copy independence, prefix bounds, and content preservation.
+3. **Thread:** owned vector histories, rich entries, appending, and read-only indexing.
+   Check copy independence, slice bounds, and content preservation.
 4. **Agent/compaction logic:** request projection, streamed generation and turn
    publication, tool loops, checkpoints, compaction, and concurrent runs. Use
    scripted dependencies to check complete tool groups, retries, budgets,
