@@ -156,7 +156,7 @@ impl ThinkingMode {
     }
 }
 
-/// Agent policy for retrying transient failures before any response parts arrive.
+/// Agent policy for retrying transient generation failures, discarding failed drafts.
 /// Resolved from `[gateways.NAME.retry]` or `[models.KEY.retry]`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
@@ -694,7 +694,8 @@ impl GenerationEvent {
 #[derive(Debug, Clone)]
 pub struct GenerationFailure {
     pub cause: GenerateError,
-    /// A transient cause; the caller must also ensure no response parts were emitted.
+    /// A transient cause. Retrying callers must discard the failed attempt's
+    /// provisional parts; only a validated response may execute tool calls.
     pub retryable: bool,
     pub retry_after: Option<std::time::Duration>,
 }

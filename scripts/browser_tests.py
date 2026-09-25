@@ -147,6 +147,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             self.wfile.flush()
+            if gate := getattr(fixture, 'stream_interruption_release', None):
+                gate.wait(30)
             self.close_connection = True
             return
         events.append({"type": "response.completed", "response": {
@@ -1470,20 +1472,89 @@ context_window = 100000
         expect(page.locator('.tool')).to_have_count(1)
         expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
 
-    def test_midstream_disconnect_stops_cleanly_and_accepts_a_followup(self):
-        self.stream_interruptions = [reply('Partial answer before the connection drops.')]
+    def test_exhausted_midstream_retries_stop_cleanly_and_accept_a_followup(self):
+        self.stream_interruptions = [reply('Partial answer before the connection drops.')] * 3
         page = self.session(self.page)
         self.submit(page, 'Alpha images')
         expect(page.locator('#connection')).to_have_text('Stopped')
         expect(page.locator('.notice').last).to_contain_text('stream body')
         expect(page.locator('#model')).to_be_enabled()
-        self.assertEqual(len(self.requests), 1, 'Partial output must not trigger a replay')
+        self.assertEqual(len(self.requests), 3, 'Stop after the configured attempt budget')
         self.turns['Beta images'] = 1
         self.submit(page, 'Beta images')
         expect(page.locator('.assistant .body').last).to_have_text('Beta finished.')
         expect(page.locator('#connection')).to_have_text('Ready')
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), 4)
         self.assertNotIn('Partial answer', json.dumps(self.requests[-1]['input']))
+
+    def test_midstream_retry_replaces_drafts_across_tabs_and_keeps_completed_tools(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        self.stream_interruption_release = threading.Event()
+        self.addCleanup(self.stream_interruption_release.set)
+        self.event_gates = {0: threading.Event()}
+        self.addCleanup(self.event_gates[0].set)
+        self.stream_interruptions = [[
+            {'type': 'response.reasoning_summary_text.delta', 'output_index': 0, 'summary_index': 0, 'delta': 'Abandoned thinking'},
+            {'type': 'response.output_text.delta', 'output_index': 1, 'content_index': 0, 'delta': 'Abandoned answer'},
+        ]]
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.assistant .body')).to_have_text('Abandoned answer')
+        expect(page.locator('.thinking .body')).to_have_text('Abandoned thinking')
+        other = self.context.new_page()
+        other.goto(page.url)
+        expect(other.locator('.assistant .body')).to_have_text('Abandoned answer')
+        self.stream_interruption_release.set()
+        for tab in [page, other]:
+            expect(tab.locator('#transcript')).not_to_contain_text('Abandoned')
+            expect(tab.locator('.tool')).to_have_count(1)
+            expect(tab.locator('#composer-frame')).to_have_attribute('data-state', 'running')
+        page.reload()
+        expect(page.locator('#transcript')).not_to_contain_text('Abandoned')
+        self.event_gates[0].set()
+        for tab in [page, other]:
+            expect(tab.locator('#connection')).to_have_text('Ready')
+            expect(tab.locator('.assistant .body')).to_have_text('Alpha finished.')
+            expect(tab.locator('.thinking')).to_have_count(0)
+            expect(tab.locator('.tool')).to_have_count(1)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.requests[1]['input'], self.requests[2]['input'])
+        self.assertNotIn('Abandoned', json.dumps(self.requests[-1]['input']))
+        page.reload()
+        expect(page.locator('.assistant .body')).to_have_text('Alpha finished.')
+
+    def test_cancel_during_retry_delivers_the_queue_without_another_attempt(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text() + '\n[models.first.retry]\ninitial_backoff_ms = 30000\n')
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.stream_interruptions = [reply('Abandoned answer')]
+        page = self.session(self.page)
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#connection')).to_have_text('Retrying')
+        expect(page.locator('#composer-frame')).to_have_attribute('data-state', 'running')
+        self.turns['Beta images'] = 1
+        page.fill('#prompt', 'Beta images')
+        page.press('#prompt', 'Enter')
+        expect(page.locator('#queued-list .queued-content')).to_have_text('Beta images')
+        page.click('#cancel')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('.assistant .body')).to_have_text('Beta finished.')
+        expect(page.locator('#queued')).to_be_hidden()
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.turns['Alpha images'], 1)
+
+    def test_print_mode_only_emits_validated_responses_when_streams_retry(self):
+        for failures in [1, 3]:
+            self.stream_interruptions = [reply('Abandoned answer')] * failures
+            result = subprocess.run([str(OPTIONS.binary), '--config', 'config.toml', '-p', 'Alpha images'],
+                                    cwd=self.home, env=dict(os.environ, MYCO_HOME=str(self.home),
+                                                           MYCO_PROFILE='default', MYCO_CONFIG='config.toml'),
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0 if failures == 1 else 1, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'Alpha finished.' if failures == 1 else '')
+            self.assertIn('retrying 2/3', result.stderr)
 
     def test_completion_during_a_slow_browser_refresh_is_not_lost(self):
         home, page = self.page, self.session()

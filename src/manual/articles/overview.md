@@ -322,19 +322,23 @@ blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
 keeps its default, so setting one knob does not reset the others. A model entry
 may carry its own `[models.KEY.retry]` — the only way for a gateway-less model to
 configure retry — and, like `auth`, it replaces the gateway's table rather than
-merging with it. Only failures that happen *before* any of the response has
-streamed are retried (connection errors, including body-read failures after HTTP
-headers but before response parts, 408, 429, and 5xx including Anthropic's 529).
-HTTP headers, keepalives, and Responses `response.created` / `response.in_progress`
-events do not count as response parts. A 413 or recognized size rejection goes to
-the session's context recovery instead of retrying the unchanged request; other 400 and 401 errors surface
-immediately. A failure mid-stream is never retried either, because the
-already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
-is honoured when it asks for longer than the computed backoff, still bounded by
-`max_backoff_ms`. The agent starts a fresh generation attempt for each retry;
-provider drivers perform one attempt and report failures. The browser
-shows a notice describing the failure and whether it will retry. Cancel stops
-the request, including retry waits. Notices are not added to model history.
+merging with it. Transient connection and body-read failures, HTTP 408, 429, and
+5xx (including Anthropic's 529) are retried even after partial output. Each
+attempt generates a fresh response from unchanged conversation history; it
+does not resume the broken stream. Failed drafts never enter model history or
+execute tools. Earlier completed tool calls stay in context and are not replayed.
+The browser replaces the interrupted draft; `myco -p` buffers each response
+until it validates. Terminal chat keeps streamed drafts visible, separated by
+retry diagnostics.
+
+A 413 or recognized size rejection goes to the session's context recovery instead
+of retrying the unchanged request. Other 400 and 401 errors, malformed response
+data, and incomplete responses that end without a transport error surface
+immediately. A provider's `Retry-After` is honoured when it asks for longer than
+the computed backoff, still bounded by `max_backoff_ms`. The agent owns retries;
+provider drivers perform one attempt and report failures. The browser shows
+“Retrying” during backoff and a notice with the next attempt and delay. Cancel
+stops the request, including retry waits. Notices are not added to model history.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

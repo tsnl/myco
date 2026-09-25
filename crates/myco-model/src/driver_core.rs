@@ -218,8 +218,7 @@ async fn drive_sse_stream<A: SseAccumulator>(
                 .handle_data(&data)
                 .map_err(GenerationFailure::terminal)?;
             // HTTP headers and SSE keepalives are not model output. Delay the
-            // synthetic start so an early disconnect remains retryable; after
-            // any part is emitted, the agent prevents replaying the response.
+            // synthetic start until there is a response part to consume.
             if !started && !parts.is_empty() {
                 parts.insert(0, MessagePart::MessageStart);
                 started = true;

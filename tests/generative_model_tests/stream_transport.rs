@@ -110,13 +110,13 @@ async fn early_disconnects_retry_even_after_non_output_sse_events() {
         assert_eq!(server.connections(), 2);
         assert_eq!(agent.history().len(), 2);
         let events = events.0.lock().unwrap();
-        assert!(matches!(
-            events.first(),
-            Some(AgentEvent::Failure {
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Failure {
                 retry_in: Some(_),
                 ..
-            })
-        ));
+            }
+        )));
         assert_eq!(
             events
                 .iter()
@@ -128,7 +128,7 @@ async fn early_disconnects_retry_even_after_non_output_sse_events() {
 }
 
 #[tokio::test]
-async fn body_failures_after_text_or_tool_parts_never_replay_the_response() {
+async fn body_failures_retry_text_or_tool_drafts_without_executing_them() {
     for partial in [
         json!({"type":"response.output_text.delta", "output_index":0, "delta":"Partial answer"}),
         json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"function_call", "name":"bash", "call_id":"call_1", "arguments":""}}),
@@ -139,25 +139,29 @@ async fn body_failures_after_text_or_tool_parts_never_replay_the_response() {
         ])
         .await;
         let (mut agent, events) = agent(&server, 3);
-        myco::chat::interact(&mut agent, prompt(), CancelToken::new())
+        let output = myco::chat::interact(&mut agent, prompt(), CancelToken::new())
             .await
-            .unwrap_err();
-        assert_eq!(server.connections(), 1);
+            .unwrap();
+        assert!(matches!(output.as_slice(), [Content::Text { text }] if text == "OK"));
+        assert_eq!(server.connections(), 2);
         assert_eq!(
             agent.history().len(),
-            1,
-            "partial responses must not enter model history"
+            2,
+            "only the input and successful response enter model history"
+        );
+        assert!(
+            !serde_json::to_string(agent.history())
+                .unwrap()
+                .contains("Partial answer")
         );
         let events = events.0.lock().unwrap();
         assert!(
-            events.iter().any(|event| matches!(event, AgentEvent::Failure { failure, retry_in: None, .. } if failure.retryable))
+            events.iter().any(|event| matches!(event, AgentEvent::Failure { failure, retry_in: Some(_), .. } if failure.retryable))
         );
         assert!(
-            events.iter().all(|e| matches!(
+            events.iter().all(|e| !matches!(
                 e,
-                AgentEvent::TextDelta { .. }
-                    | AgentEvent::Failure { .. }
-                    | AgentEvent::TurnFinished { .. }
+                AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. }
             )),
             "no tools may execute"
         );

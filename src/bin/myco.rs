@@ -28,7 +28,7 @@ You are a helpful assistant running in an agentic harness with unfettered comput
     disable_help_flag = true
 )]
 struct Args {
-    /// Run one prompt and stream answer text to stdout. Bare -p reads stdin;
+    /// Run one prompt and write completed responses to stdout. Bare -p reads stdin;
     /// with a prompt, piped stdin is prepended as context.
     #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, conflicts_with_all = ["mode", "port", "bind"])]
     print: Option<Option<String>>,

@@ -9,7 +9,7 @@ the internal SSH host worker. `myco-eval` remains a separate evaluation utility.
 
 | Option | Meaning |
 | --- | --- |
-| `-p [PROMPT]`, `--print [PROMPT]` | Run one prompt and stream answer text to stdout; bare `-p` reads stdin |
+| `-p [PROMPT]`, `--print [PROMPT]` | Run one prompt and write completed responses to stdout; bare `-p` reads stdin |
 | `--mode cli` | Scrolling terminal chat (`--mode interactive` is an alias) |
 | `--port PORT` | Loopback HTTP port, default 8765; `0` chooses a free port |
 | `--bind ADDR` | Loopback IP or `localhost`, default `127.0.0.1`; `::1` selects IPv6 |
@@ -64,8 +64,10 @@ with exit code 2. Only explicit prompt text expands `@./image.png` attachments;
 piped text is treated literally. `-p` conflicts with explicit server flags and
 `--mode`.
 
-Stdout contains streamed assistant text, including narration between tool calls.
-Thinking, tool output, compactor output, and session metadata are excluded.
+Stdout contains assistant text, including narration between tool calls. Each
+model response is buffered until it completes and validates, so interrupted
+drafts cannot leak into scripts when generation retries. Thinking, tool output,
+compactor output, and session metadata are excluded.
 Diagnostics and `session=ID` go to stderr. Exit codes are 0 for success, 1 for
 runtime/provider/output errors, 2 for input/config errors, and 130 for Ctrl-C.
 Cancellation settles tool results and persists the session before exiting.
@@ -90,7 +92,9 @@ or cancelled turn returns to the prompt.
 | `/compact` | Compact into a new thread in this session; return to the prompt |
 | `/quit`, `/exit` | Exit |
 
-Assistant text goes to stdout; tool activity and diagnostics go to stderr.
+Assistant text streams to stdout; tool activity and diagnostics go to stderr.
+A transient generation failure starts a fresh attempt with a retry diagnostic
+separating it from the interrupted draft, which remains visible in the terminal.
 Tool inputs show each top-level field separately. Long tool output is abbreviated;
 complete observations remain in saved session history. Use the browser to browse
 old messages, manage sessions, or switch models during a conversation.

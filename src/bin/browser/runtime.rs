@@ -83,6 +83,8 @@ impl Snapshot {
 }
 
 struct Live {
+    // Only message blocks from the current, unvalidated generation are replaceable.
+    generation_start: Option<usize>,
     background: HashMap<Uuid, CancelToken>,
     snapshot: Snapshot,
     cancel: Option<CancelToken>,
@@ -192,7 +194,7 @@ impl App {
 
     fn status(&self, status: &str) {
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.status != "Cancelling" {
+        if live.snapshot.status != "Cancelling" && live.snapshot.status != status {
             live.snapshot.status = status.into();
             let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
             self.publish(&mut live.snapshot, change);
@@ -209,10 +211,32 @@ impl App {
         );
     }
 
+    fn discard_generation(&self) {
+        let mut live = self.live.lock().unwrap();
+        let Some(start) = live.generation_start.take() else {
+            return;
+        };
+        let previous_len = live.snapshot.blocks.len();
+        let mut index = 0;
+        // Resource refreshes may append live tool cards while a draft is streaming.
+        live.snapshot.blocks.retain(|block| {
+            let keep = index < start
+                || !matches!(block, Block::Message { role, .. } if role == "assistant" || role == "thinking");
+            index += 1;
+            keep
+        });
+        if live.snapshot.blocks.len() == previous_len {
+            return;
+        }
+        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
+        self.publish(&mut live.snapshot, change);
+    }
+
     fn sync(&self, boot: &Boot, status: &str) {
         let session = boot.session.snapshot();
         let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
+        live.generation_start = None;
         let snapshot = &mut live.snapshot;
         let mut blocks = view::history(session.active_thread());
         if snapshot.thread_id == session.active_thread().id {
@@ -293,6 +317,9 @@ impl App {
 
     fn delta(&self, role: &str, text: String) {
         let mut live = self.live.lock().unwrap();
+        let can_append = live
+            .generation_start
+            .is_none_or(|start| live.snapshot.blocks.len() > start);
         let snapshot = &mut live.snapshot;
         if let Some(Block::Message {
             role: last_role,
@@ -300,6 +327,7 @@ impl App {
             ..
         }) = snapshot.blocks.last_mut()
             && last_role == role
+            && can_append
         {
             last_text.push_str(&text);
             let index = snapshot.blocks.len() - 1;
@@ -332,6 +360,15 @@ impl App {
 impl EventSink for App {
     fn emit(&self, event: AgentEvent) {
         match event {
+            AgentEvent::GenerationStarted { context } if context.depth == 0 => {
+                let mut live = self.live.lock().unwrap();
+                live.generation_start = Some(live.snapshot.blocks.len());
+                drop(live);
+                self.status("Running");
+            }
+            AgentEvent::GenerationFinished { context } if context.depth == 0 => {
+                self.live.lock().unwrap().generation_start = None;
+            }
             AgentEvent::TextDelta { text, context } if context.depth == 0 => {
                 self.delta("assistant", text)
             }
@@ -397,17 +434,24 @@ impl EventSink for App {
             AgentEvent::Failure {
                 failure,
                 retry_in,
+                attempt,
+                max_attempts,
                 context,
-                ..
-            } if context.depth == 0 => self.notice(format!(
-                "{}{}",
-                failure.cause,
-                if retry_in.is_some() {
-                    " — retrying"
+            } if context.depth == 0 => {
+                let retry = if let Some(delay) = retry_in {
+                    self.discard_generation();
+                    self.status("Retrying");
+                    format!(
+                        " — retrying {}/{} in {:.1}s",
+                        attempt + 1,
+                        max_attempts,
+                        delay.as_secs_f64()
+                    )
                 } else {
-                    ""
-                }
-            )),
+                    String::new()
+                };
+                self.notice(format!("{}{retry}", failure.cause));
+            }
             _ => {}
         }
     }
@@ -608,6 +652,7 @@ impl Sessions {
                 let session = session.snapshot();
                 Arc::new(App {
                     live: Mutex::new(Live {
+                        generation_start: None,
                         snapshot: Snapshot {
                             revision: 0,
                             session_id: session.id.clone(),

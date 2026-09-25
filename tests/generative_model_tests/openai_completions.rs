@@ -312,7 +312,7 @@ async fn agent_retry_can_be_disabled() {
 }
 
 #[tokio::test]
-async fn agent_never_retries_after_partial_response() {
+async fn agent_does_not_retry_malformed_responses_missing_a_stop_reason() {
     let partial = StubHttpServer::sse_response(vec![serde_json::json!({
         "choices": [{"index": 0, "delta": {"content": "partial"}}]
     })]);
