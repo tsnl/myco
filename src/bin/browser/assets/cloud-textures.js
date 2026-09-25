@@ -1,6 +1,28 @@
 import { random } from './sky-noise.js';
 
 //
+// Cached image textures
+//
+
+// Cloud pixels change only with lighting. Share a lossless image across the
+// wrapping copies so their canvases do not become separate compositor surfaces.
+function encodeTexture(spec, draw) {
+  const canvas = document.createElement('canvas');
+  canvas.width = spec.width; canvas.height = spec.height;
+  canvas.getContext('2d', { willReadFrequently: true });
+  draw(canvas);
+  return canvas.toDataURL();
+}
+
+async function updateTexture(texture, data) {
+  const source = encodeTexture(data, canvas => {
+    canvas.getContext('2d').putImageData(new ImageData(data.pixels, data.width, data.height), 0, 0);
+  });
+  for (const image of texture.images) image.src = source;
+  await Promise.all(texture.images.map(image => image.decode()));
+}
+
+//
 // Lightweight fallback
 //
 
@@ -35,7 +57,6 @@ export class CloudTextures {
   }
 
   start() {
-    this.renderFallback();
     try {
       this.worker = new Worker(new URL('./cloud-renderer.js', import.meta.url), { type: 'module' });
       this.worker.onmessage = ({ data }) => this.accept(data);
@@ -64,18 +85,24 @@ export class CloudTextures {
       lighting: this.lighting, generation: this.generation });
   }
 
-  accept(data) {
+  async accept(data) {
     // A changed city or clock can supersede textures still being painted.
     if (data.generation !== this.generation) return;
     const texture = this.textures.get(data.id);
-    const frame = new ImageData(data.pixels, data.width, data.height);
-    for (const canvas of texture.canvases) canvas.getContext('2d').putImageData(frame, 0, 0);
+    try { await updateTexture(texture, data); }
+    catch {
+      if (data.generation === this.generation) this.fail();
+      return;
+    }
+    if (data.generation !== this.generation) return;
     texture.ready = true;
     if ([...this.textures.values()].every(item => item.ready)) this.sky.dataset.clouds = 'ready';
   }
 
   fail() {
     this.worker?.terminate(); this.worker = null;
+    // Image decoding may still finish after the worker stops.
+    this.generation++;
     this.sky.dataset.clouds = 'fallback';
     this.renderFallback();
   }
@@ -83,13 +110,8 @@ export class CloudTextures {
   renderFallback() {
     if (!this.lighting) return;
     for (const texture of this.textures.values()) {
-      const [first, ...copies] = texture.canvases;
-      fallback(first, texture.spec.seed, this.lighting.palette);
-      for (const canvas of copies) {
-        const context = canvas.getContext('2d');
-        context.clearRect(0, 0, canvas.width, canvas.height);
-        context.drawImage(first, 0, 0);
-      }
+      const source = encodeTexture(texture.spec, canvas => fallback(canvas, texture.spec.seed, this.lighting.palette));
+      for (const image of texture.images) image.src = source;
     }
   }
 }

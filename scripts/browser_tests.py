@@ -2174,22 +2174,25 @@ context_window = 100000
         day_light = emission()
         self.assertGreater(day_light[2], day_light[0])
         morning = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
-        canvas = page.locator(".cloud-low canvas").first
+        cloud = page.locator(".cloud-low img").first
         # Compare rendered alpha and RGB independently: relighting must preserve
         # every edge and opening while visibly changing the direction of shading.
-        fingerprint = """canvas => {
+        fingerprint = """image => {
+            const canvas = document.createElement('canvas');
+            canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+            canvas.getContext('2d').drawImage(image, 0, 0);
             const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
             let alpha = 0, color = 0;
             pixels.forEach((v, i) => { if (i % 4 === 3) alpha = (Math.imul(alpha, 31) + v) | 0;
                 else color = (Math.imul(color, 31) + v) | 0; });
             return {alpha, color};
         }"""
-        before = canvas.evaluate(fingerprint)
+        before = cloud.evaluate(fingerprint)
         page.clock.set_fixed_time("2030-03-20T12:00:00Z")
         page.clock.fast_forward(60000)
         expect(sky).to_have_attribute("data-clouds", "ready")
         afternoon = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
-        after = canvas.evaluate(fingerprint)
+        after = cloud.evaluate(fingerprint)
         self.assertLess(morning, 50)
         self.assertGreater(afternoon, 50)
         self.assertEqual(before["alpha"], after["alpha"])
@@ -2208,7 +2211,7 @@ context_window = 100000
         page.clock.fast_forward(60000)
         expect(sky).to_have_attribute("data-phase", "night")
         expect(sky).to_have_attribute("data-clouds", "ready")
-        self.assertEqual(before["alpha"], canvas.evaluate(fingerprint)["alpha"])
+        self.assertEqual(before["alpha"], cloud.evaluate(fingerprint)["alpha"])
         self.assertGreater(float(page.locator("#sky-stars").evaluate("n => n.style.opacity")), 0)
         night_glass = glass()
         self.assertGreater(night_glass[2], night_glass[0])
@@ -2216,6 +2219,80 @@ context_window = 100000
         night_light = emission()
         self.assertGreater(night_light[2], night_light[0])
         self.assertLess(sum(night_light), sum(day_light))
+
+    def test_cloud_images_share_textures_and_preserve_rendered_pixels(self):
+        self.context.add_init_script("""(() => {
+            const NativeWorker = Worker;
+            window.Worker = class extends NativeWorker {
+                constructor(...args) {
+                    super(...args);
+                    this.addEventListener('message', ({data}) => {
+                        if (data.id === 'low-0') window.cloudPixels = data;
+                    });
+                }
+            };
+        })();""")
+        page = self.page
+        page.clock.install()
+        page.clock.set_fixed_time('2030-03-20T12:00:00Z')
+        page.reload()
+        expect(page.locator('#sky')).to_have_attribute('data-clouds', 'ready')
+        images = page.locator('.cloud-sprite img')
+        expect(images).to_have_count(72)
+        self.assertEqual(images.evaluate_all('nodes => new Set(nodes.map(n => n.src)).size'), 24)
+        self.assertTrue(images.evaluate_all('nodes => nodes.every(n => n.complete && n.naturalWidth === 512)'))
+        self.assertTrue(page.evaluate("""() => {
+            const {width, height, pixels} = window.cloudPixels;
+            const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+            const context = canvas.getContext('2d', {willReadFrequently: true});
+            context.putImageData(new ImageData(pixels, width, height), 0, 0);
+            const before = context.getImageData(0, 0, width, height).data;
+            context.clearRect(0, 0, width, height);
+            context.drawImage(document.querySelector('.cloud-low img'), 0, 0);
+            return context.getImageData(0, 0, width, height).data.every((v, i) => v === before[i]);
+        }"""), 'Lossless caching must preserve the cloud renderer output')
+        sources = images.evaluate_all('nodes => nodes.map(n => n.src)')
+        page.clock.fast_forward(60000)
+        self.assertEqual(images.evaluate_all('nodes => nodes.map(n => n.src)'), sources)
+
+    def test_cloud_decode_completion_cannot_supersede_new_lighting_or_worker_failure(self):
+        self.context.add_init_script("""(() => {
+            const NativeWorker = Worker, decode = HTMLImageElement.prototype.decode;
+            window.Worker = class extends NativeWorker {
+                constructor(...args) { super(...args); window.cloudWorker = this; }
+            };
+            window.cloudDecodes = []; window.holdClouds = false;
+            HTMLImageElement.prototype.decode = function() {
+                return decode.call(this).then(() => {
+                    if (window.holdClouds && this.closest('.cloud-sprite'))
+                        return new Promise(resolve => window.cloudDecodes.push(resolve));
+                });
+            };
+        })();""")
+        page, sky = self.page, self.page.locator('#sky')
+        page.clock.install()
+        page.clock.set_fixed_time('2030-03-20T12:00:00Z')
+        page.reload()
+        expect(sky).to_have_attribute('data-clouds', 'ready')
+        page.evaluate('window.holdClouds = true')
+        for index, hour in enumerate(['18', '21']):
+            page.clock.set_fixed_time(f'2030-03-20T{hour}:00:00Z')
+            page.clock.fast_forward(60000)
+            page.wait_for_function('count => cloudDecodes.length === count', arg=(index + 1) * 72)
+        page.evaluate('cloudDecodes.splice(0, 72).forEach(resolve => resolve())')
+        page.wait_for_timeout(100)
+        expect(sky).to_have_attribute('data-clouds', 'painting')
+        page.evaluate('cloudDecodes.splice(0).forEach(resolve => resolve())')
+        expect(sky).to_have_attribute('data-clouds', 'ready')
+        page.clock.set_fixed_time('2030-03-21T12:00:00Z')
+        page.clock.fast_forward(60000)
+        page.wait_for_function('() => cloudDecodes.length === 72')
+        page.evaluate("cloudWorker.dispatchEvent(new Event('error', {cancelable: true}))")
+        expect(sky).to_have_attribute('data-clouds', 'fallback')
+        page.evaluate('cloudDecodes.splice(0).forEach(resolve => resolve())')
+        page.wait_for_timeout(100)
+        expect(sky).to_have_attribute('data-clouds', 'fallback')
+        page.wait_for_function("() => [...document.querySelectorAll('.cloud-sprite img')].every(n => n.complete && n.naturalWidth === 512)")
 
     def test_stars_sleep_in_daylight_and_twinkle_again_at_night(self):
         page = self.page

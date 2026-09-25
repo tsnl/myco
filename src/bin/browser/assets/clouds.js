@@ -27,10 +27,11 @@ function sprite(spec, layer, index, form, roll) {
 function wrapCloud(track, cloud, texture, position) {
   // Three copies cover both viewport edges throughout either wind direction.
   for (const offset of [-100, 0, 100]) {
-    const copy = cloud.cloneNode(true), canvas = document.createElement('canvas');
+    const copy = cloud.cloneNode(true), image = document.createElement('img');
     copy.style.left = `${position + offset}%`;
-    canvas.width = texture.spec.width; canvas.height = texture.spec.height;
-    copy.append(canvas); texture.canvases.push(canvas);
+    image.width = texture.spec.width; image.height = texture.spec.height;
+    image.alt = ''; image.decoding = 'async';
+    copy.append(image); texture.images.push(image);
     track.append(copy);
   }
 }
@@ -48,7 +49,7 @@ function makeLayer(spec, index, textures) {
     const cloud = sprite(spec, index, i, form, roll);
     const id = `${spec.name}-${i}`;
     const texture = { spec: { id, kind: spec.name, form, seed: 781 + index * 100 + i * 7,
-      width: 512, height: spec.resolution }, canvases: [] };
+      width: 512, height: spec.resolution }, images: [] };
     textures.set(id, texture);
     wrapCloud(track, cloud, texture, (i * 61.803 + index * 23) % 100);
   }
