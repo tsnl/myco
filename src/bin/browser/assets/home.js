@@ -74,6 +74,7 @@ function render() {
       const status = element('span', 'session-status activity-indicator');
       const time = element('time', '', new Date(session.updated_at).toLocaleString()); time.dateTime = session.updated_at;
       row.querySelector('.session-meta').replaceChildren(status, document.createTextNode(` · ${session.model} · `), time);
+      if (session.archived) row.querySelector('.session-meta').append(document.createTextNode(' · '), element('span', 'archive-indicator', 'Archived'));
       const archive = row.querySelector('.archive-session');
       archive.textContent = session.archived ? 'Restore' : 'Archive';
       archive.setAttribute('aria-label', `${archive.textContent} ${session.title}`);

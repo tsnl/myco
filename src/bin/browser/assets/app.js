@@ -335,6 +335,8 @@ function metadata() {
   composer.update(state, connected, selectingModel);
   $('compact').disabled = disabled || !state.blocks.length;
   $('archive').disabled = !connected || !state.session_id || archiving;
+  $('archive').textContent = state.archived ? 'Restore' : 'Archive';
+  $('archived-status').hidden = !state.archived;
   $('rename').disabled = !connected || !state.session_id || archiving;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';
@@ -434,9 +436,10 @@ $('rename').onclick = () => renameSession({ id: state.session_id, title: state.t
 $('archive').onclick = async () => {
   if (archiving || !state.session_id) return;
   archiving = true; metadata(); error();
+  const archived = !state.archived;
   try {
-    await setArchived(state.session_id, true);
-    location.assign(profilePath(`/?archived=${encodeURIComponent(state.session_id)}`));
+    await setArchived(state.session_id, archived);
+    if (archived) location.assign(profilePath(`/?archived=${encodeURIComponent(state.session_id)}`));
   } catch (e) { error(e.message); }
   finally { archiving = false; metadata(); }
 };

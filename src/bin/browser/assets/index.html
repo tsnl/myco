@@ -21,7 +21,10 @@
         <h1 id="session-title">Session</h1>
         <button id="rename" type="button" aria-label="Rename session" title="Rename session" aria-haspopup="dialog" aria-controls="rename-session" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15z"/></svg></button>
       </div>
-      <span id="connection" class="activity-indicator" role="status" data-state="attention">Connecting…</span>
+      <div class="session-state">
+        <span id="archived-status" class="archive-indicator" role="status" hidden>Archived</span>
+        <span id="connection" class="activity-indicator" role="status" data-state="attention">Connecting…</span>
+      </div>
       <div class="toolbar-actions" role="group" aria-label="Session controls">
         <div class="toolbar-tools">
           <button id="compact" type="button">Compact</button>
