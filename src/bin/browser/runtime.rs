@@ -269,6 +269,10 @@ impl App {
 
     fn refresh(&self, session: &ActiveSession, tasks: Vec<String>) {
         self.tasks(tasks);
+        self.refresh_metadata(session);
+    }
+
+    fn refresh_metadata(&self, session: &ActiveSession) {
         let (title, usage) = session.with(|session| {
             (
                 session
@@ -753,6 +757,34 @@ impl Sessions {
                 .worker
                 .await
                 .map_err(|e| Error::Internal(format!("browser worker: {e}")))?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn rename(&self, id: String, title: String) -> Result<()> {
+        let title = myco::session::normalize_title(&title).map_err(Error::Invalid)?;
+        // Hold the registry gate so opening a saved session cannot race its save.
+        let running = self.running.lock().await;
+        let entry = running.get(&id);
+        let active = entry.map(|s| s.session.clone());
+        let session = tokio::task::spawn_blocking(move || {
+            let (_lock, active) = if let Some(active) = active {
+                (None, active)
+            } else {
+                let id = myco::session::resolve_session_id(&id).map_err(Error::NotFound)?;
+                let lock =
+                    SessionWriteLock::acquire(&id).map_err(|e| Error::Conflict(e.to_string()))?;
+                let session = Session::load_by_id_or_prefix(&id).map_err(Error::NotFound)?;
+                (Some(lock), ActiveSession::new(session))
+            };
+            active.rename(title).map_err(Error::Internal)?;
+            Ok::<_, Error>(active)
+        })
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))??;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = entry {
+            entry.app.refresh_metadata(&session);
         }
         Ok(())
     }

@@ -78,6 +78,7 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/background", post(session_background))
         .route("/api/sessions/{id}/archive", post(session_archive))
+        .route("/api/sessions/{id}/rename", post(session_rename))
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
         .route("/files/{*path}", get(workspace_file))
@@ -298,6 +299,27 @@ async fn session_archive(
         ));
     }
     server.sessions.set_archived(id, request.archived).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRequest {
+    session_id: String,
+    title: String,
+}
+
+async fn session_rename(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<RenameRequest>,
+) -> Result<StatusCode, Error> {
+    if request.session_id != id {
+        return Err(Error::Conflict(
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    server.sessions.rename(id, request.title).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
