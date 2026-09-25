@@ -7,6 +7,7 @@ mod anthropic;
 mod openai_completions;
 mod openai_responses;
 mod request_limits;
+mod stream_transport;
 
 /// Multi-turn messaging smoke test against any dyn GenerativeModel.
 pub async fn test_generative_model_messaging(model: Arc<dyn GenerativeModel>) {

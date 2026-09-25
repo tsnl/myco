@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use myco::generative_model::{
-    BackendConfig, GenerationEvent, GenerativeModelConfig, Message, MessagePart, ModelSpec,
-    OpenAIBackendConfig, Protocol, ThinkingMode,
+    BackendConfig, GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol,
+    ThinkingMode,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -42,10 +42,12 @@ async fn run_cancellation_case(headers: &'static str) {
     let mut generation = model(&base_url).generate(&[Message::UserMessage { content: vec![] }]);
     ready_rx.await.unwrap();
     if headers.starts_with("HTTP/1.1 200") {
-        assert!(matches!(
-            generation.next().await,
-            Some(GenerationEvent::Part(MessagePart::MessageStart))
-        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), generation.next())
+                .await
+                .is_err(),
+            "headers alone must not start a response"
+        );
     }
     drop(generation);
     let read = tokio::time::timeout(Duration::from_secs(1), server)

@@ -28,6 +28,10 @@ does not undo tool side effects.
 ## Repeated failures or interruption
 
 Only transient failures before response parts arrive are retried automatically.
+This includes a dropped response connection after HTTP headers but before model
+output. HTTP/2 errors such as `Reset(..., INTERNAL_ERROR, Remote)` mean the
+remote server or gateway reset the stream; a surrounding `Decode` label does
+not imply invalid model JSON. These resets can occur before or during output.
 An error after partial output is surfaced rather than replayed. The Cancel button cancels
 the turn, including retry waits; tools have their own cancellation cleanup.
 Inspect current files and processes before resubmitting work with side effects.

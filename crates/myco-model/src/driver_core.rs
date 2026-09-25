@@ -101,9 +101,7 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
             )
             .map_err(GenerationFailure::terminal)?;
             let response = attempt_send(&client, request, provider).await?;
-            drive_sse_stream(response, &tx, acc, provider)
-                .await
-                .map_err(GenerationFailure::terminal)
+            drive_sse_stream(response, &tx, acc, provider).await
         };
         tokio::select! {
             _ = tx.closed() => {}
@@ -200,27 +198,33 @@ async fn drive_sse_stream<A: SseAccumulator>(
     tx: &tokio::sync::mpsc::Sender<GenerationEvent>,
     mut acc: A,
     provider: &str,
-) -> Result<(), GenerateError> {
-    if tx
-        .send(GenerationEvent::Part(MessagePart::MessageStart))
-        .await
-        .is_err()
-    {
-        // Consumer dropped (turn cancelled): stop reading so the response
-        // body drops and the provider stops generating/billing.
-        return Ok(());
-    }
-
+) -> Result<(), GenerationFailure> {
     let mut byte_stream = response.bytes_stream();
     let mut sse = SseParser::default();
+    let mut started = false;
 
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk.map_err(|e| {
-            GenerateError::ExecutionError(format!("Error reading {provider} stream body: {e:?}"))
+            GenerationFailure::transient(
+                GenerateError::ExecutionError(format!(
+                    "Error reading {provider} stream body: {e:?}"
+                )),
+                None,
+            )
         })?;
 
         for data in sse.push(&chunk) {
-            for item in acc.handle_data(&data)? {
+            let mut parts = acc
+                .handle_data(&data)
+                .map_err(GenerationFailure::terminal)?;
+            // HTTP headers and SSE keepalives are not model output. Delay the
+            // synthetic start so an early disconnect remains retryable; after
+            // any part is emitted, the agent prevents replaying the response.
+            if !started && !parts.is_empty() {
+                parts.insert(0, MessagePart::MessageStart);
+                started = true;
+            }
+            for item in parts {
                 if tx.send(GenerationEvent::Part(item)).await.is_err() {
                     return Ok(());
                 }
@@ -236,7 +240,7 @@ async fn drive_sse_stream<A: SseAccumulator>(
         }
     }
 
-    acc.finish()
+    acc.finish().map_err(GenerationFailure::terminal)
 }
 
 /// Maps a provider's unified stream indices (Anthropic content blocks, OpenAI
