@@ -11,19 +11,31 @@ function star(roll) {
   node.setAttribute('cx', String(roll() * 1600));
   node.setAttribute('cy', String(roll() * 850));
   node.setAttribute('r', String(0.4 + Math.pow(roll(), 3) * 1.4));
-  node.style.setProperty('--star-brightness', String(0.35 + roll() * 0.6));
-  node.style.setProperty('--twinkle-duration', `${4 + roll() * 5}s`);
-  node.style.setProperty('--twinkle-delay', `${-roll() * 12}s`);
+  node.style.opacity = String(0.35 + roll() * 0.6);
   return node;
 }
 
-function starfield() {
-  const stars = document.createElementNS(namespace, 'svg'), roll = random(2048);
-  stars.id = 'sky-stars';
+function starLayer(index) {
+  const layer = document.createElement('div'), stars = document.createElementNS(namespace, 'svg');
+  const duration = 6 + index * 1.25;
+  layer.className = 'star-layer';
+  layer.style.setProperty('--twinkle-duration', `${duration}s`);
+  layer.style.setProperty('--twinkle-steps', duration * 4);
+  layer.style.setProperty('--twinkle-delay', `${-index * 1.5}s`);
   stars.setAttribute('viewBox', '0 0 1600 1000');
   stars.setAttribute('preserveAspectRatio', 'xMidYMid slice');
   stars.setAttribute('focusable', 'false');
-  stars.append(...Array.from({ length: 110 }, () => star(roll)));
+  layer.append(stars);
+  return layer;
+}
+
+function starfield() {
+  const stars = document.createElement('div'), roll = random(2048);
+  const layers = Array.from({ length: 4 }, (_, index) => starLayer(index));
+  stars.id = 'sky-stars';
+  // Animate a few cached planes, rather than repainting individual SVG stars.
+  for (let index = 0; index < 110; index++) layers[index % layers.length].firstElementChild.append(star(roll));
+  stars.append(...layers);
   return stars;
 }
 
@@ -51,6 +63,7 @@ export function createAtmosphere(sky) {
     sky.style.setProperty('--overcast', String(state.gloom * 0.55));
     sky.style.setProperty('--sky-clarity', String(state.clarity));
     sky.dataset.phase = state.phase;
+    stars.hidden = state.night === 0;
     stars.style.opacity = String(state.night * state.clarity);
     updateGlow(glow, state.light);
   };

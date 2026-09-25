@@ -37,12 +37,12 @@ function fixture() {
       send({ kind: kind === 'refresh' ? 'resync' : 'update', profile,
         update: { session_id, revision, change: { kind, text: `delta ${revision}` } } });
     },
-    subscribe(profile, session_id) {
+    subscribe(profile, session_id, visible = true) {
       const port = { messages: [], postMessage(message) { this.messages.push(structuredClone(message)); }, close() {} };
       context.onconnect({ ports: [port] });
       if (stream.readyState === 0) { stream.readyState = EventSource.OPEN; stream.onopen(); }
       port.send = data => port.onmessage({ data });
-      port.send({ kind: session_id ? 'subscribe' : 'subscribe_list', profile, session_id });
+      port.send({ kind: session_id ? 'subscribe' : 'subscribe_list', profile, session_id, visible });
       return port;
     },
     advance(milliseconds) {
@@ -69,6 +69,90 @@ test('bursts across 26 sessions coalesce catalog notifications and stop after un
   port.send({ kind: 'unsubscribe' });
   f.advance(100);
   assert.equal(changed(), 2);
+});
+
+test('hidden sessions skip deltas and resyncs, then resume from one current snapshot', async () => {
+  const f = fixture(), hidden = f.subscribe('work', 'hidden'), visible = f.subscribe('work', 'visible');
+  f.requests[0].respond(snapshot('hidden', 1));
+  f.requests[1].respond(snapshot('visible', 1));
+  await settle();
+  hidden.messages.length = 0;
+  hidden.send({ kind: 'visibility', visible: false });
+  for (let revision = 2; revision < 1000; revision++) f.update('work', 'hidden', revision);
+  f.update('work', 'hidden', 1000, 'refresh');
+  f.update('work', 'visible', 2);
+  assert.equal(hidden.messages.length, 0);
+  assert.equal(visible.messages.at(-1).update.revision, 2);
+  assert.equal(f.requests.length, 2);
+  hidden.send({ kind: 'visibility', visible: true });
+  assert.equal(f.requests.length, 3);
+  f.update('work', 'hidden', 1002);
+  f.requests[2].respond(snapshot('hidden', 1001));
+  await settle();
+  assert.deepEqual(hidden.messages.filter(message => message.update).map(message => message.update.revision), [1001, 1002]);
+  assert.equal(hidden.messages.at(-1).connected, true);
+});
+
+test('hiding during a fetch discards its result and cannot restart background recovery', async () => {
+  const f = fixture(), port = f.subscribe('work', 'session');
+  port.send({ kind: 'visibility', visible: false });
+  f.requests[0].respond(snapshot('session', 1));
+  await settle();
+  f.send({ kind: 'resync', profile: 'work' });
+  f.send({ kind: 'connection', profile: 'work', connected: false });
+  f.advance(2000);
+  f.send({ kind: 'connection', profile: 'work', connected: true });
+  assert.equal(f.requests.length, 1);
+  assert.equal(port.messages.filter(message => message.update).length, 0);
+  port.send({ kind: 'visibility', visible: true });
+  f.requests[1].respond(snapshot('session', 2));
+  await settle();
+  assert.deepEqual(port.messages.filter(message => message.update).map(message => message.update.revision), [2]);
+});
+
+test('visibility changes during a fetch converge on the latest visible snapshot', async () => {
+  const f = fixture(), port = f.subscribe('work', 'session');
+  for (const visible of [false, true, false, true]) port.send({ kind: 'visibility', visible });
+  assert.equal(f.requests.length, 1);
+  f.requests[0].respond(snapshot('session', 1));
+  await settle();
+  assert.equal(f.requests.length, 2);
+  f.requests[1].respond(snapshot('session', 2));
+  await settle();
+  assert.deepEqual(port.messages.filter(message => message.update).map(message => message.update.revision), [2]);
+});
+
+test('hidden initial subscriptions and catalog timers wait until visible', async () => {
+  const f = fixture(), session = f.subscribe('work', 'session', false), list = f.subscribe('work', undefined, false);
+  const changed = () => list.messages.filter(message => message.kind === 'sessions_changed').length;
+  f.update('work', 'session', 1, 'meta');
+  f.advance(100);
+  assert.equal(f.requests.length, 0);
+  assert.equal(changed(), 0);
+  list.send({ kind: 'visibility', visible: true });
+  list.send({ kind: 'visibility', visible: false });
+  f.advance(100);
+  assert.equal(changed(), 0);
+  list.send({ kind: 'visibility', visible: true });
+  f.advance(100);
+  assert.equal(changed(), 1);
+  session.send({ kind: 'visibility', visible: true });
+  f.requests[0].respond(snapshot('session', 2));
+  await settle();
+  assert.equal(session.messages.filter(message => message.kind === 'snapshot').length, 1);
+});
+
+test('hiding cancels a failed snapshot retry until the tab is visible again', async () => {
+  const f = fixture(), port = f.subscribe('work', 'session');
+  f.requests[0].fail();
+  await settle();
+  port.send({ kind: 'visibility', visible: false });
+  f.advance(2000);
+  assert.equal(f.requests.length, 1);
+  port.send({ kind: 'visibility', visible: true });
+  f.requests[1].respond(snapshot('session', 2));
+  await settle();
+  assert.equal(port.messages.at(-1).connected, true);
 });
 
 test('repeated resyncs allow one fetch in flight and discard stale responses', async () => {

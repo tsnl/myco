@@ -121,7 +121,7 @@ function connect() {
     if (data.kind === 'sessions_changed') refresh();
     else if (data.kind === 'connection') connection(data.connected);
   };
-  eventPort.postMessage({ kind: 'subscribe_list', profile: profileName });
+  eventPort.postMessage({ kind: 'subscribe_list', profile: profileName, visible: !document.hidden });
 }
 $('search').oninput = render;
 $('archive-filter').onchange = refresh;
@@ -129,6 +129,9 @@ const archived = new URLSearchParams(location.search).get('archived') || history
 if (/^[a-f0-9]{32}$/.test(archived || '')) archiveNotice(archived);
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
 window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); refresh(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+document.addEventListener('visibilitychange', () => {
+  eventPort?.postMessage({ kind: 'visibility', visible: !document.hidden });
+  if (!document.hidden) refresh();
+});
 setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 connect();

@@ -29,6 +29,9 @@ even where layers overlap.
 The worker yields between textures, pauses in hidden tabs, and tags replies with
 a generation so superseded lighting cannot overwrite the current scene. Only
 changed lighting repaints textures; CSS handles drifting, twinkling, and rain.
+Slow drift and twinkling advance four times a second so tiny changes do not
+continuously recomposite the glass. Stars use four cached planes and stop
+animating entirely in daylight. Rain and aircraft keep smooth motion.
 Worker startup or import failure retains a lightweight fallback. Reduced motion
 keeps clouds and stars still and hides rain and aircraft.
 

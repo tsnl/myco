@@ -18,14 +18,14 @@ function connection(connected, profile) {
   }
 }
 function listChanged(client) {
-  if (client.listTimer) return;
+  if (!client.visible || client.listTimer) return;
   client.listTimer = setTimeout(() => {
     client.listTimer = null;
     if (clients.has(client)) client.port.postMessage({ kind: 'sessions_changed' });
   }, 100);
 }
 async function load(client) {
-  if (!clients.has(client) || !client.profile) return;
+  if (!clients.has(client) || !client.profile || !client.visible) return;
   clearTimeout(client.retry);
   client.retry = null;
   const version = ++client.version;
@@ -103,7 +103,7 @@ function openStream() {
     const update = event.update;
     if (!update) return;
     for (const client of clients) {
-      if (client.profile !== event.profile) continue;
+      if (client.profile !== event.profile || !client.visible) continue;
       if (client.list) {
         if (['refresh', 'snapshot', 'meta', 'tasks'].includes(update.change.kind)) listChanged(client);
       } else if (client.pending) {
@@ -116,7 +116,7 @@ function openStream() {
   };
 }
 onconnect = ({ ports: [port] }) => {
-  const client = { port, profile: null, id: null, requested: null, list: false, pending: [], version: 0, loading: false, connected: null, listTimer: null, retry: null };
+  const client = { port, profile: null, id: null, requested: null, list: false, visible: true, pending: [], version: 0, loading: false, connected: null, listTimer: null, retry: null };
   clients.add(client);
   if (!stream) openStream();
   port.onmessage = ({ data }) => {
@@ -130,10 +130,23 @@ onconnect = ({ ports: [port] }) => {
       }
       return;
     }
+    if (data.kind === 'visibility') {
+      if (typeof data.visible !== 'boolean' || client.visible === data.visible) return;
+      client.visible = data.visible;
+      // Hidden tabs need neither deltas nor a growing recovery buffer. A fresh
+      // snapshot restores block indices before updates resume on visibility.
+      client.version++;
+      client.pending = client.list ? null : [];
+      clearTimeout(client.listTimer); client.listTimer = null;
+      clearTimeout(client.retry); client.retry = null;
+      if (client.visible) load(client);
+      return;
+    }
     if (!['subscribe', 'subscribe_list'].includes(data.kind) || !/^[A-Za-z0-9_-]+$/.test(data.profile)) return;
     client.profile = data.profile;
     client.id = null;
     client.list = data.kind === 'subscribe_list';
+    client.visible = data.visible !== false;
     if (client.list) client.pending = null;
     client.requested = data.session_id;
     load(client);

@@ -56,6 +56,7 @@ function updateToolDurations() {
 }
 setInterval(updateToolDurations, 100);
 function updateVisibility() {
+  eventPort?.postMessage({ kind: 'visibility', visible: !document.hidden });
   updateToolDurations();
   $('composer-frame').classList.toggle('paused', document.hidden);
   document.body.classList.toggle('activity-paused', document.hidden);
@@ -422,7 +423,7 @@ function connect() {
     else if (data.kind === 'connection') { connected = data.connected; metadata(); }
     else if (data.kind === 'error') { connected = false; metadata(); error(data.message, 'connection'); }
   };
-  eventPort.postMessage({ kind: 'subscribe', profile: profileName, session_id: sessionId });
+  eventPort.postMessage({ kind: 'subscribe', profile: profileName, session_id: sessionId, visible: !document.hidden });
 }
 window.addEventListener('pagehide', () => { eventPort?.postMessage({ kind: 'unsubscribe' }); eventPort?.close(); });
 window.addEventListener('pageshow', (event) => { if (event.persisted) connect(); });
