@@ -43,7 +43,12 @@ function updateToolDurations() {
   for (const node of document.querySelectorAll('.tool-duration[data-running="true"]')) updateToolDuration(node, now);
 }
 setInterval(updateToolDurations, 100);
-document.addEventListener('visibilitychange', updateToolDurations);
+function updateVisibility() {
+  updateToolDurations();
+  $('composer-frame').classList.toggle('paused', document.hidden);
+}
+document.addEventListener('visibilitychange', updateVisibility);
+updateVisibility();
 
 function scrollLatest() { requestAnimationFrame(() => { if (follow) window.scrollTo({ top: document.documentElement.scrollHeight }); }); }
 window.addEventListener('scroll', () => {
@@ -329,6 +334,9 @@ function activity() {
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : tasks.length ? `${tasks.length} background ${tasks.length === 1 ? 'task' : 'tasks'}` : state.status || 'Ready';
   const status = $('connection');
   showActivity(status, state.busy ? state.status : count ? 'Background tasks' : state.status || 'Ready', state.busy, connected);
+  $('composer-frame').dataset.state = !connected ? 'reconnecting'
+    : state.status === 'Stopped' ? 'stopped' : state.status === 'Cancelling' ? 'cancelling'
+    : state.busy ? 'running' : count ? 'background' : 'ready';
   if (connected) status.title = current;
 }
 function updateSession(update) {
