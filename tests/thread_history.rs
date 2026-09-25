@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use myco::thread::{
-    ContentPart, Entry, Reasoning, Sender, Thread, ToolCallId, ToolResponseResult, Turn,
+    ContentPart, Entry, ReasoningContentPart, Sender, Thread, ToolCallId, ToolResponseResult, Turn,
 };
 
 //
@@ -187,19 +187,21 @@ fn tool_response(id: ToolCallId, result: ToolResponseResult) -> Entry {
 
 fn reasoning_content() -> Vec<ContentPart> {
     vec![
-        ContentPart::Reasoning(Reasoning::Text {
+        ContentPart::Reasoning(ReasoningContentPart::Text {
             text: "thinking".into(),
             signature: Some("original-signature".into()),
         }),
-        ContentPart::Reasoning(Reasoning::Text {
+        ContentPart::Reasoning(ReasoningContentPart::Text {
             text: "unsigned observation".into(),
             signature: None,
         }),
-        ContentPart::Reasoning(Reasoning::Encrypted {
+        ContentPart::Reasoning(ReasoningContentPart::Encrypted {
             id: "reasoning_original".into(),
             summary: vec!["first summary".into(), "second summary".into()],
             data: "opaque-encrypted-data".into(),
         }),
-        ContentPart::Reasoning(Reasoning::Redacted("opaque-redacted-data".into())),
+        ContentPart::Reasoning(ReasoningContentPart::Redacted(
+            "opaque-redacted-data".into(),
+        )),
     ]
 }

@@ -10,46 +10,48 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Thread {
-    entries: Vec<Entry>,
+    turns: Vec<TurnPair>,
 }
 
 impl Thread {
-    pub fn from_entries(entries: Vec<Entry>) -> Self {
-        Self { entries }
+    pub fn new(turns: Vec<TurnPair>) -> Self {
+        Self { turns }
     }
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    pub fn turns(&self) -> &[TurnPair] {
+        &self.turns
     }
-    pub fn push(&mut self, entry: Entry) {
-        self.entries.push(entry);
+    pub fn push(&mut self, turn: Turn) -> Result<(), TurnPushError> {
+        let expected = self.next_turn_kind();
+        let received = turn.kind();
+
+        if received != expected {
+            return Err(TurnPushError::BadKind { expected, received });
+        }
+
+        // TODO: finish this implementation
+    }
+
+    fn next_turn_kind(&self) -> TurnKind {
+        if let Some(back) = self.turns.back() {
+            back.next_turn_kind()
+        } else {
+            TurnKind::User
+        }
     }
 }
 
-impl<I: SliceIndex<[Entry]>> Index<I> for Thread {
+impl<I: SliceIndex<[TurnPair]>> Index<I> for Thread {
     type Output = I::Output;
 
     fn index(&self, index: I) -> &Self::Output {
-        &self.entries[index]
+        &self.turns[index]
     }
 }
 
-//
-// Identifiers
-//
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ToolCallId(pub uuid::Uuid);
-
-//
-// Entries
-//
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Entry {
-    Turn(Turn),
-    Warning(String),
-    Error(String),
-    Notification(String),
+#[thiserror::Error]
+pub enum TurnPushError {
+    #[err("Expected turn kind {expected}, received turn kind {received}")]
+    BadKind { expected: TurnKind, received: TurnKind }
 }
 
 //
@@ -57,43 +59,75 @@ pub enum Entry {
 //
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Turn {
-    pub sender: Sender,
-    pub content: Vec<ContentPart>,
+pub struct TurnPair {
+    user_turn: UserTurn,
+    assistant_turn: Option<AssistantTurn>,
+}
+impl TurnPair {
+    fn next_turn_kind(&self) -> TurnKind {
+        match &self.assistant_turn {
+            None => TurnKind::Assistant,
+            Some(_) => TurnKind::User,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sender {
-    Assistant,
+pub enum Turn {
+    User(UserTurn),
+    Assistant(AssistantTurn),
+}
+impl Turn {
+    fn kind(&self) -> TurnKind {
+        match self {
+            User(_) => TurnKind::User,
+            Assistant(_) => TurnKind::Assistant,
+        }
+    }
+}
+
+pub enum TurnKind {
     User,
-    Tool,
-    System,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserTurn {
+    author: Author,
+    content: Content,
+    tool_use_responses: Vec<ToolUseResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantTurn {
+    content: Content,
+    tool_use_requests: Vec<ToolUseRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Author {
+    Human,
+    System,`
+}
+
+//
+// Content
+//
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Content {
+    parts: Vec<ContentPart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
-    Text {
-        content: String,
-    },
-    Image {
-        url: String,
-    },
-    Reasoning(Reasoning),
-    Refusal(String),
-    ToolCall {
-        id: ToolCallId,
-        provider_call_id: Option<String>,
-        name: String,
-        arguments: Result<Value, String>,
-    },
-    ToolResponse {
-        id: ToolCallId,
-        result: ToolResponseResult,
-    },
+    Text { content: String },
+    Image { url: String },
+    Reasoning(ReasoningContentPart),
+    Refusal(RefusalContentPart),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reasoning {
+pub enum ReasoningContentPart {
     Text {
         text: String,
         signature: Option<String>,
@@ -107,7 +141,35 @@ pub enum Reasoning {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolResponseResult {
-    Completed { result: String, is_error: bool },
+pub struct RefusalContentPart {
+    kind: Option<String>,
+    message: String,
+}
+
+//
+// Tools
+//
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolCallId(pub uuid::Uuid);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUseRequest {
+    id: ToolCallId,
+    provider_call_id: Option<String>,
+    name: String,
+    arguments: Result<Value, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUseResponse {
+    kind: ToolUseResponseKind,
+    content: Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolUseResponseKind {
+    Error,
+    Success,
     Backgrounded,
 }
