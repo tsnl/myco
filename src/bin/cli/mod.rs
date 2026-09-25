@@ -35,8 +35,16 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
     if preflight.has_problems() {
         eprintln!("{}", preflight.warning_body());
     }
-    let (mut boot, _) =
-        boot_session(args, config, model, preflight, session, |_, _, _| sink).await?;
+    let (mut boot, _) = boot_session(
+        args,
+        config,
+        model,
+        preflight,
+        session,
+        vec![],
+        |_, _, _| sink,
+    )
+    .await?;
     boot.runner.set_observer(Arc::new(|event| match event {
         myco::chat::WorkflowEvent::Compacting { .. } => eprintln!("myco: compacting…"),
         myco::chat::WorkflowEvent::Compacted(_) => eprintln!("myco: compaction complete"),

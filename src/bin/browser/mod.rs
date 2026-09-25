@@ -24,7 +24,6 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
 }
 
 async fn run_worker(args: Args) -> Result<(), String> {
-    let files = files::Files::open(&std::env::current_dir().map_err(|e| e.to_string())?)?;
     let listener = tokio::net::UnixListener::bind(
         args.profile_worker
             .as_ref()
@@ -32,6 +31,11 @@ async fn run_worker(args: Args) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot listen for profile: {e}"))?;
     let profile = std::env::var("MYCO_PROFILE").map_err(|e| e.to_string())?;
+    let files = files::Files::open(&std::env::current_dir().map_err(|e| e.to_string())?)?
+        .with_base_path(format!("/profiles/{profile}"));
+    let getlink = Arc::new(myco::tool_services::GetLinkTool::new(
+        files.workspace.clone(),
+    ));
     let (config, _, preflight) = super::prepare_boot(&args);
     let initial = args
         .resume
@@ -43,8 +47,11 @@ async fn run_worker(args: Args) -> Result<(), String> {
         |s| format!("/profiles/{profile}/sessions/{}", s.id),
     );
     let server = Arc::new(
-        http::Server::new(runtime::Sessions::new(args, config, preflight), files)
-            .with_profile(&profile),
+        http::Server::new(
+            runtime::Sessions::new(args, config, preflight, vec![getlink]),
+            files,
+        )
+        .with_profile(&profile),
     );
     if let Some(session) = initial {
         server

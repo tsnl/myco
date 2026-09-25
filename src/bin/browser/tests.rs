@@ -78,6 +78,7 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         <Args as clap::Parser>::parse_from(["myco", "--web"]),
         config,
         StartupPreflight::default(),
+        vec![],
     );
     sessions.running = tokio::sync::Mutex::new(
         apps.iter()

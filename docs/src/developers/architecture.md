@@ -75,9 +75,10 @@ profile and session ID. A profile crash can be recovered without restarting its
 neighbors. Parent shutdown closes worker stdin pipes and stops their sessions.
 
 `origin.rs` applies loopback Host and browser-origin checks to UI assets, event
-streams, images, files, and actions. `files.rs` holds a
-directory capability for read-only workspace access and streams regular files.
-Markdown rendering maps local links to those routes on the server. Workspace
+streams, images, files, and actions. `core::WorkspaceFiles` owns the directory
+capability and URL mapping shared by Markdown rendering, the `getlink` tool, and
+static file reads. The browser composition installs `getlink` with that profile's
+capability; `files.rs` handles HTTP streaming, ranges, and response headers. Workspace
 documents have a stricter content policy than the application: their scripts
 cannot execute with the conversation UI's privileges.
 

@@ -31,6 +31,9 @@ pub use prelude_service::PreludeTool;
 pub mod list_recent_service;
 pub use list_recent_service::ListRecentService;
 
+pub mod getlink_service;
+pub use getlink_service::GetLinkTool;
+
 /// Model-facing JSON Schema for a tool input type.
 ///
 /// `schemars`' default output is hostile to OpenAI-compatible gateways and

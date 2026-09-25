@@ -72,7 +72,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -89,6 +89,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
+        elif count and "getlink" in prompt:
+            output = [item['output'] for item in body['input'] if item.get('type') == 'function_call_output'][-1]
+            if not isinstance(output, str):
+                output = ''.join(part.get('text', '') for part in output)
+            events = reply(f'[Open file]({output})\n\n![Preview]({output})' if output.startswith('/') else 'Could not create link.')
         elif count and "links" in prompt:
             events = reply(fixture.link_reply)
         elif count == 1 and "rename" in prompt:
@@ -98,6 +103,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = [event for i in range(getattr(fixture, 'stream_chunks', 30)) for event in reply(f"Chunk {i}.\n\n")]
         elif count:
             events = reply(f"{name} finished.")
+        elif "getlink" in prompt:
+            events = tool({"path": fixture.static_path}, "getlink")
         elif "rename" in prompt:
             events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
         elif "parallel" in prompt:
@@ -317,6 +324,56 @@ context_window = 100000
         other.screenshot(path=str(self.artifacts / 'profiles-desktop.png'))
         other.set_viewport_size({'width': 390, 'height': 844})
         other.screenshot(path=str(self.artifacts / 'profiles-mobile.png'))
+
+    def test_getlink_matches_markdown_urls_and_serves_files_in_the_correct_profile(self):
+        self.add_profile()
+        name = 'chart #1? 50% 雪).png'
+        from urllib.parse import quote
+        for profile, prompt in [('default', 'Alpha getlink'), ('research', 'Beta getlink')]:
+            workspace = self.home / 'profiles' / profile / 'workspace'
+            path = workspace / name
+            path.write_bytes((self.home / 'pixel.png').read_bytes())
+            self.static_path = name if profile == 'default' else str(path)
+            page = self.session(profile=profile)
+            self.submit(page, prompt)
+            expect(page.locator('.tool.done')).to_have_count(1)
+            expected = f'/profiles/{profile}/files/' + quote(name)
+            page.locator('.tool summary').click()
+            expect(page.locator('.tool .output')).to_have_text(expected)
+            expect(page.locator('.assistant img')).to_have_attribute('src', expected)
+            expect(page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
+            expect(page.locator('.assistant a')).to_have_attribute('href', expected)
+            response = self.context.request.get(self.origin + expected)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.body(), path.read_bytes())
+            rendered = self.context.request.post(self.origin + f'/profiles/{profile}/api/markdown',
+                data={'text': f'![same](./{quote(name)}) [same](./{quote(name)})'}).text()
+            self.assertIn(f'src="{expected}"', rendered)
+            self.assertIn(f'href="{expected}"', rendered)
+            other = 'research' if profile == 'default' else 'default'
+            shared = self.context.request.post(self.origin + f'/profiles/{other}/api/markdown',
+                data={'text': f'![shared]({expected})'}).text()
+            self.assertIn(f'src="{expected}"', shared)
+            page.reload()
+            expect(page.locator('.assistant img')).to_have_js_property('naturalWidth', 1)
+            expect(page.locator('.assistant img')).to_have_attribute('src', expected)
+            self.assertTrue(any(tool.get('name') == 'getlink' for tool in self.requests[-1]['tools']))
+
+    def test_getlink_reports_unserved_paths_instead_of_returning_broken_links(self):
+        outside = self.home / 'outside.txt'
+        outside.write_text('outside the profile workspace')
+        (self.workspace / 'escape.txt').symlink_to(outside)
+        page = self.session(self.page)
+        paths = ['missing.png', str(outside), '../config.toml', 'escape.txt', 'https://example.com/image.png']
+        for count, path in enumerate(paths, 1):
+            self.static_path = path
+            self.turns['Alpha getlink'] = 0
+            self.submit(page, 'Alpha getlink')
+            expect(page.locator('#model')).to_be_enabled()
+            expect(page.locator('.tool.failed')).to_have_count(count)
+            page.locator('.tool summary').last.click()
+            expect(page.locator('.tool .output').last).to_contain_text('workspace')
+        expect(page.locator('.assistant img')).to_have_count(0)
 
     def test_profile_images_and_weather_preferences_stay_in_their_profile(self):
         self.add_profile()

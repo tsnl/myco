@@ -9,6 +9,9 @@ To show images to the user, use Markdown image syntax in your response, for exam
 `![Screenshot](path/to/screenshot.png)`. Use the actual image path or URL and keep the
 image tag outside code blocks so it renders. `@path` is for user input attachments;
 do not use it to display images in assistant responses.
+When `getlink` is available, use it to obtain a served URL for a workspace file.
+Use the returned URL in Markdown image tags or file links without changing its
+profile prefix.
 
 Run Python through `uv`: inline script metadata for hermetic dependencies, a `uv` shebang for
 scripts written to disk. Where `uv` is missing, use an existing virtual environment or create one.
