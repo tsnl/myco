@@ -1439,6 +1439,7 @@ context_window = 100000
         page = self.session(self.page)
         frame, composer = page.locator('#composer-frame'), page.locator('#composer')
         light = page.locator('.composer-light')
+        ring = page.locator('.composer-light-ring')
         expect(frame).to_have_attribute('data-state', 'ready')
         idle_border = composer.evaluate('n => getComputedStyle(n).borderTopColor')
         self.submit(page, 'Alpha generate')
@@ -1446,15 +1447,15 @@ context_window = 100000
         expect(frame).to_have_attribute('data-state', 'running')
         expect(composer).not_to_have_css('border-top-color', idle_border)
         page.wait_for_function("document.querySelector('#composer-frame').getAnimations({subtree: true}).some(a => a.playState === 'running' && a.effect.getComputedTiming().iterations === Infinity)")
-        before = light.evaluate("n => getComputedStyle(n, '::before').backgroundImage")
-        page.wait_for_function("before => getComputedStyle(document.querySelector('.composer-light'), '::before').backgroundImage !== before", arg=before)
+        before = ring.evaluate("n => getComputedStyle(n, '::before').transform")
+        page.wait_for_function("before => getComputedStyle(document.querySelector('.composer-light-ring'), '::before').transform !== before", arg=before)
         self.assertIn('drop-shadow', light.evaluate('n => getComputedStyle(n).filter'))
         page.emulate_media(reduced_motion='reduce')
         self.assertFalse(frame.evaluate('n => n.getAnimations({subtree: true}).some(a => a.effect.getComputedTiming().iterations === Infinity)'))
         expect(light).to_have_css('opacity', '1')
         page.emulate_media(reduced_motion='no-preference')
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
-        self.assertEqual(light.evaluate("n => getComputedStyle(n, '::before').animationPlayState"), 'paused')
+        self.assertEqual(ring.evaluate("n => getComputedStyle(n, '::before').animationPlayState"), 'paused')
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
         page.click('#cancel')
         expect(frame).to_have_attribute('data-state', 'stopped')
@@ -2216,6 +2217,40 @@ context_window = 100000
         self.assertGreater(night_light[2], night_light[0])
         self.assertLess(sum(night_light), sum(day_light))
 
+    def test_stars_sleep_in_daylight_and_twinkle_again_at_night(self):
+        page = self.page
+        page.clock.install()
+        page.clock.set_fixed_time('2030-03-20T12:00:00Z')
+        self.context.route('**/api/sky/weather?*', lambda route: route.fulfill(json={
+            'utc_offset_seconds': 0, 'current': {'time': int(time.time()),
+            'cloud_cover_low': 0, 'cloud_cover_mid': 0, 'cloud_cover_high': 0,
+            'wind_speed_10m': 4, 'wind_direction_10m': 250}}))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        expect(page.locator('#sky')).to_have_attribute('data-weather', 'live')
+        stars = page.locator('#sky-stars')
+        expect(stars).to_be_hidden()
+        self.assertEqual(stars.evaluate('n => n.getAnimations({subtree: true}).length'), 0)
+        page.clock.set_fixed_time('2030-03-20T21:00:00Z')
+        page.clock.fast_forward(60000)
+        expect(stars).to_be_visible()
+        expect(stars.locator('circle')).to_have_count(110)
+        layer = stars.locator('.star-layer').first
+        before = layer.evaluate('n => getComputedStyle(n).opacity')
+        expect(layer).not_to_have_css('opacity', before)
+        self.assertTrue(stars.locator('circle').evaluate_all("nodes => nodes.every(n => n.getAnimations().length === 0)"))
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        expect(layer).to_have_css('animation-play-state', 'paused')
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        expect(layer).to_have_css('animation-play-state', 'running')
+        page.emulate_media(reduced_motion='reduce')
+        expect(layer).to_have_css('animation-name', 'none')
+        page.emulate_media(reduced_motion='no-preference')
+        page.clock.set_fixed_time('2030-03-21T12:00:00Z')
+        page.clock.fast_forward(60000)
+        expect(stars).to_be_hidden()
+        self.assertEqual(stars.evaluate('n => n.getAnimations({subtree: true}).length'), 0)
+
     def test_sky_renderer_failure_keeps_the_fallback_and_conversation_usable(self):
         self.assert_sky_fallback_conversation("cloud-renderer.js")
 
@@ -2898,6 +2933,33 @@ context_window = 100000
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
         self.assertEqual(held, [], 'The snapshot already supplied the latest rendered output')
 
+    def test_hidden_tabs_defer_stream_rendering_and_catch_up_without_losing_drafts(self):
+        self.stream_chunks = 100
+        self.event_gates = {1: threading.Event()}
+        self.addCleanup(self.event_gates[1].set)
+        page = self.session(self.page)
+        self.submit(page, 'Alpha stream')
+        expect(page.locator('.markdown p')).to_have_text('Chunk 0.')
+        observer = self.context.new_page()
+        observer.goto(page.url)
+        expect(observer.locator('.markdown p')).to_have_text('Chunk 0.')
+        page.fill('#prompt', 'Keep this unsent draft.')
+        renders = []
+        page.route('**/api/markdown', lambda route: (renders.append(route.request.url), route.continue_()))
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
+        page.wait_for_timeout(150)
+        self.event_gates[1].set()
+        expect(observer.locator('.markdown p').last).to_have_text('Chunk 99.')
+        expect(observer.locator('#model')).to_be_enabled()
+        expect(page.locator('.markdown p')).to_have_text('Chunk 0.')
+        self.assertEqual(renders, [], 'Hidden tabs must not format streamed output')
+        page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        expect(page.locator('.markdown p').last).to_have_text('Chunk 99.')
+        expect(page.locator('.markdown p')).to_have_count(100)
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('#prompt')).to_have_value('Keep this unsent draft.')
+        self.assertEqual(renders, [], 'Returning to the tab uses the rendered snapshot')
+
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
         home = self.page
         expect(home.locator('#connection')).to_have_text('Live')
@@ -2928,6 +2990,8 @@ context_window = 100000
                 data={'request_id': str(uuid.uuid4()), 'session_id': session_id,
                       'action': {'kind': 'submit', 'text': 'Alpha stream\n' + 'History. ' * 110_000}})
             self.assertEqual(response.status, 202)
+        home.evaluate("""Object.defineProperty(document, 'hidden', {configurable: true, value: false});
+            document.dispatchEvent(new Event('visibilitychange'));""")
         expect(home.locator('.session-status[data-busy="true"]')).to_have_count(26, timeout=30000)
         deadline = time.monotonic() + 15
         while len(self.requests) < 26 and time.monotonic() < deadline:

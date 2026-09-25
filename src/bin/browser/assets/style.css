@@ -80,7 +80,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .activity-indicator[data-state="busy"] { color: var(--cyan); }
 .activity-indicator[data-state="attention"] { color: var(--amber); }
 .activity-indicator[data-active="true"]::before { animation: activity-pulse 1.6s ease-in-out infinite; }
-@keyframes activity-pulse { 50% { opacity: .35; box-shadow: 0 0 0 4px #8bd5dc1c; } }
+@keyframes activity-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .activity-indicator[data-active="true"]::before { animation: none; } }
 #connection { flex: none; font-size: 12px; }
 #transcript { max-width: 980px; margin: 0 auto; padding: 40px 32px calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
@@ -175,7 +175,6 @@ html.viewing-image { overflow: hidden; }
 .composer:focus-within { border-color: #8a8a8a; }
 /* Keep emitted light outside the scrolling glass. Filtering the glass itself
    would isolate its backdrop and flatten its translucency. */
-@property --composer-light-angle { syntax: '<angle>'; inherits: true; initial-value: 0deg; }
 .composer-light {
   position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0;
   transition: opacity .25s ease;
@@ -183,17 +182,23 @@ html.viewing-image { overflow: hidden; }
     drop-shadow(0 0 10px color-mix(in srgb, var(--composer-emission) 60%, transparent))
     drop-shadow(0 10px 28px color-mix(in srgb, var(--composer-emission) 35%, transparent));
 }
-.composer-light::before {
-  content: ''; position: absolute; inset: 0; padding: 1px; background: var(--composer-emission);
+.composer-light-ring {
+  position: absolute; inset: 0; padding: 1px; overflow: hidden;
   mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   mask-composite: exclude;
 }
+.composer-light-ring::before { content: ''; position: absolute; inset: 0; background: var(--composer-emission); }
 .composer-frame:not([data-state="ready"]) .composer { border-color: color-mix(in srgb, var(--composer-emission) 45%, transparent); }
 .composer-frame:not([data-state="ready"]) .composer-light { opacity: 1; }
 .composer-frame[data-state="stopped"] { --composer-emission: var(--red); }
 .composer-frame:is([data-state="reconnecting"], [data-state="cancelling"]) { --composer-emission: var(--amber); }
-.composer-frame[data-state="running"] .composer-light::before {
-  background: conic-gradient(from var(--composer-light-angle),
+.composer-frame[data-state="running"] .composer-light-ring::before {
+  /* Rotate a fixed texture behind the border mask. Repainting a gradient angle
+     would also rerasterize the glow on every frame. The square covers the
+     composer's diagonal at every angle, including a resized message draft. */
+  inset: auto; left: 50%; top: 50%; width: calc(100% + var(--composer-height)); aspect-ratio: 1;
+  transform: translate(-50%, -50%) rotate(0deg);
+  background: conic-gradient(
     color-mix(in srgb, var(--composer-emission) 25%, transparent) 0deg 215deg,
     var(--composer-emission) 285deg,
     color-mix(in srgb, var(--composer-emission) 35%, white) 310deg,
@@ -201,11 +206,11 @@ html.viewing-image { overflow: hidden; }
     color-mix(in srgb, var(--composer-emission) 25%, transparent) 360deg);
   animation: composer-orbit 7s linear infinite;
 }
-.composer-frame.paused .composer-light::before { animation-play-state: paused; }
-@keyframes composer-orbit { to { --composer-light-angle: 360deg; } }
+.composer-frame.paused .composer-light-ring::before { animation-play-state: paused; }
+@keyframes composer-orbit { to { transform: translate(-50%, -50%) rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .composer-light { transition: none; }
-  .composer-frame[data-state="running"] .composer-light::before { animation: none; }
+  .composer-frame[data-state="running"] .composer-light-ring::before { animation: none; }
 }
 @media (forced-colors: active) {
   .composer-light { display: none; }

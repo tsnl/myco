@@ -63,6 +63,9 @@ function drift(layer, spec, conditions) {
   const track = layer.firstElementChild;
   const progress = track.getAnimations()[0]?.effect.getComputedTiming().progress || 0;
   layer.style.setProperty('--drift-duration', `${duration}s`);
+  // Subpixel drift needs only four updates a second. Avoid recompositing the
+  // full-screen glass for imperceptible changes at the display's refresh rate.
+  layer.style.setProperty('--drift-steps', Math.ceil(duration * 4));
   layer.style.setProperty('--drift-direction', reverse ? 'reverse' : 'normal');
   // Changing CSS duration or direction otherwise jumps the clouds across the
   // screen. Preserve their position when a new weather report changes the wind.

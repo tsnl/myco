@@ -142,6 +142,10 @@ an existing process continues. **Ready**, **Stopped**, and **Saved** are idle;
 disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
 
+Hidden tabs defer live transcript rendering to save browser CPU. Generation,
+tools, and timers continue on the server. Returning to a tab loads the current
+transcript and activity state while preserving your unsent draft.
+
 The input border also shows the session's state. **Running** and **Compacting**
 carry a travelling highlight and soft glow using the sky's current light color.
 **Ready** keeps the neutral glass border; **Stopped** is steady red.
