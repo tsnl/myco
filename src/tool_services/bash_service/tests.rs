@@ -52,6 +52,12 @@ async fn background_exec_retains_output_owner_and_process_after_turn_cancellatio
         .lines()
         .find_map(|line| line.strip_prefix("session_id: "))
         .unwrap();
+    let handle = result.resource.as_ref().unwrap();
+    assert_eq!(handle.id, id);
+    assert_eq!(
+        service.resources(owner)[0].details["instance_id"],
+        handle.instance_id
+    );
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(service.resources(owner)[0].details["process_exited"], false);
     ctx.cancel.cancel();
@@ -71,11 +77,42 @@ async fn background_exec_retains_output_owner_and_process_after_turn_cancellatio
     )
     .await;
     assert!(result_text(&read).contains("stdout:\nafter\n"), "{read:?}");
+    assert_eq!(read.resource, result.resource);
+    assert!(
+        service.resources(owner)[0].details["duration_ms"]
+            .as_u64()
+            .unwrap()
+            >= 1100
+    );
     assert!(
         !result_text(&read).contains("stdout:\nbefore\n"),
         "already returned output must not repeat"
     );
     dispatch_json_as(&service, owner, json!({"action":"close", "session_id":id})).await;
+}
+
+#[tokio::test]
+async fn reused_shell_handles_have_distinct_process_identities() {
+    let service = Arc::new(BashService::new());
+    let owner = Uuid::new_v4();
+    let start = json!({"action":"start", "session_id":"same", "command":"cat", "idle_ms":10});
+    let first = dispatch_json_as(&service, owner, start.clone())
+        .await
+        .resource
+        .unwrap();
+    dispatch_json_as(
+        &service,
+        owner,
+        json!({"action":"close", "session_id":"same"}),
+    )
+    .await;
+    let next = dispatch_json_as(&service, owner, start)
+        .await
+        .resource
+        .unwrap();
+    assert_eq!(first.id, next.id);
+    assert_ne!(first.instance_id, next.instance_id);
+    service.on_agent_finished(owner);
 }
 
 #[tokio::test]

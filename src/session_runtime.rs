@@ -182,6 +182,11 @@ impl SessionRuntime {
         self.harness.running_tool_summaries(self.owner_id)
     }
 
+    /// Current resource observations; unavailable hosts remain explicitly unknown.
+    pub async fn resources(&self) -> Vec<crate::core::HostResources> {
+        self.harness.resources(self.owner_id).await
+    }
+
     pub async fn observe(
         &self,
         history: &[crate::generative_model::Message],

@@ -72,11 +72,11 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .activity-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--dim); white-space: nowrap; }
 .activity-indicator::before { content: ''; flex: none; width: 7px; height: 7px; background: currentColor; }
 .activity-indicator[data-state="ready"] { color: var(--green); }
-.activity-indicator[data-state="busy"], .activity-indicator[data-state="background"] { color: var(--cyan); }
+.activity-indicator[data-state="busy"] { color: var(--cyan); }
 .activity-indicator[data-state="attention"] { color: var(--amber); }
-.activity-indicator[data-busy="true"]::before { animation: activity-pulse 1.6s ease-in-out infinite; }
+.activity-indicator[data-active="true"]::before { animation: activity-pulse 1.6s ease-in-out infinite; }
 @keyframes activity-pulse { 50% { opacity: .35; box-shadow: 0 0 0 4px #8bd5dc1c; } }
-@media (prefers-reduced-motion: reduce) { .activity-indicator[data-busy="true"]::before { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .activity-indicator[data-active="true"]::before { animation: none; } }
 #connection { flex: none; font-size: 12px; }
 #transcript { max-width: 980px; margin: 0 auto; padding: 40px 32px calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
 .welcome { color: var(--dim); padding: 25px 0; }
@@ -116,12 +116,25 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown.pending { color: var(--dim); }
 .markdown[data-render-error]::after { content: attr(data-render-error); display: block; margin-top: .8em; color: var(--amber); }
 img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fit: contain; object-position: left center; margin: 14px 0; border-radius: 0; }
-.tool { --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
-.tool.running { --tool-color: var(--cyan); }
+.tool { position: relative; --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
+.tool.running { --tool-color: rgb(var(--sky-light, 139 213 220)); border-color: rgb(var(--sky-light, 139 213 220) / .3); }
+/* Animate only the decorative rim, keeping output and glass steady. */
+.tool.running::after, .active-call::after {
+  content: ''; position: absolute; inset: -1px; pointer-events: none;
+  border: 1px solid rgb(var(--sky-light, 139 213 220));
+  box-shadow: 0 0 3px rgb(var(--sky-light, 139 213 220) / .3), 0 0 15px rgb(var(--sky-light, 139 213 220) / .13);
+  animation: running-border 2.4s ease-in-out infinite;
+}
+@keyframes running-border { 50% { opacity: .2; } }
+.activity-paused :is(.tool.running, .active-call)::after,
+.activity-disconnected :is(.tool.running, .active-call)::after,
+.activity-paused .activity-indicator::before { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) { .tool.running::after, .active-call::after { animation: none; } }
+@media (forced-colors: active) { .tool.running::after, .active-call::after { border-color: Highlight; box-shadow: none; } }
 .tool.done { --tool-color: var(--green); }
 .tool.failed { --tool-color: var(--red); }
 .tool.unknown { --tool-color: var(--amber); }
-.tool summary { padding: 11px 15px; cursor: pointer; color: var(--tool-color); overflow-wrap: anywhere; }
+.tool summary { scroll-margin-top: calc(var(--toolbar-height) + 16px); padding: 11px 15px; cursor: pointer; color: var(--tool-color); overflow-wrap: anywhere; }
 .tool-name { font-weight: 700; }
 .tool-status { margin-left: 12px; }
 .tool-duration { margin-left: 12px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -160,7 +173,6 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 }
 .composer-frame:not([data-state="ready"]) .composer { border-color: color-mix(in srgb, var(--composer-emission) 45%, transparent); }
 .composer-frame:not([data-state="ready"]) .composer-light { opacity: 1; }
-.composer-frame[data-state="background"] .composer-light { opacity: .4; }
 .composer-frame[data-state="stopped"] { --composer-emission: var(--red); }
 .composer-frame:is([data-state="reconnecting"], [data-state="cancelling"]) { --composer-emission: var(--amber); }
 .composer-frame[data-state="running"] .composer-light::before {
@@ -194,8 +206,7 @@ img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fi
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
-#activity-divider { border: 0; border-top: 1px solid #545454; width: 48px; margin: 24px 0; }
-.active-call { display: block; width: 100%; text-align: left; border: 0; background: none; color: inherit; padding: 0; white-space: normal; overflow-wrap: anywhere; }
+.active-call { position: relative; display: block; width: 100%; text-align: left; border: 1px solid var(--line); background: var(--glass-control); color: inherit; padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { text-decoration: underline; }
 /* Settings modal */
 .toolbar #settings-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 8px; }

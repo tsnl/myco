@@ -218,6 +218,7 @@ impl App {
         if snapshot.thread_id == session.active_thread().id {
             view::retain_tool_timers(&mut blocks, &snapshot.blocks);
         }
+        view::retain_processes(&mut blocks, &snapshot.blocks);
         snapshot.session_id = session.id.clone();
         snapshot.thread_id = session.active_thread().id.clone();
         snapshot.title = session
@@ -271,6 +272,21 @@ impl App {
         if live.snapshot.tasks != tasks {
             live.snapshot.tasks = tasks;
             let change = json!({"kind":"tasks", "tasks":live.snapshot.tasks});
+            self.publish(&mut live.snapshot, change);
+        }
+    }
+
+    fn resources(&self, resources: Vec<myco::core::HostResources>) {
+        let mut live = self.live.lock().unwrap();
+        let changed = view::refresh_processes(&mut live.snapshot.blocks, &resources);
+        if !changed.is_empty() {
+            // Catalog subscribers do not consume transcript blocks.
+            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
+            self.publish(&mut live.snapshot, change);
+        }
+        for index in changed {
+            let change =
+                json!({"kind":"block", "index":index, "block":live.snapshot.blocks[index]});
             self.publish(&mut live.snapshot, change);
         }
     }
@@ -373,6 +389,7 @@ impl EventSink for App {
                 let snapshot = &mut live.snapshot;
                 if let Some(index) = snapshot.blocks.iter().position(|block| matches!(block, Block::Tool { call_id: id, running: true, .. } if *id == call_id)) {
                     snapshot.blocks[index].finish(&result);
+                    snapshot.blocks[index].continue_process();
                     let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
                     self.publish(snapshot, change);
                 }
@@ -741,7 +758,7 @@ impl Sessions {
         Ok(Value::Array(entries.into_iter().filter(|s| s.archived == archived).map(|s| {
             let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
             let status = live.as_ref().map_or("Saved", |live| {
-                if !live.snapshot.busy && !live.snapshot.tasks.is_empty() { "Background tasks" }
+                if !live.snapshot.busy && live.snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { "Running" }
                 else { live.snapshot.status.as_str() }
             });
             let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
@@ -761,26 +778,29 @@ async fn worker(
     mut receiver: mpsc::Receiver<Work>,
     args: Arc<Args>,
 ) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let runtime = boot.runner.runtime().clone();
+    let observations = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            app.refresh(runtime.session(), runtime.running_tool_summaries());
+            app.resources(runtime.resources().await);
+        }
+    };
+    tokio::pin!(observations);
     loop {
         let work = tokio::select! {
             _ = app.shutdown.cancelled() => break,
-            _ = tick.tick() => {
-                app.refresh(&boot.session, boot.runner.runtime().running_tool_summaries());
-                continue;
-            }
+            _ = &mut observations => unreachable!("resource observation loop ended"),
             work = receiver.recv() => match work { Some(work) => work, None => break },
         };
         let result = {
-            let runtime = boot.runner.runtime().clone();
             let operation = execute(&mut boot, &app, work, &args);
             tokio::pin!(operation);
-            loop {
-                tokio::select! {
-                    result = &mut operation => break result,
-                    _ = tick.tick() => app.refresh(runtime.session(), runtime.running_tool_summaries()),
-                }
+            tokio::select! {
+                result = &mut operation => result,
+                _ = &mut observations => unreachable!("resource observation loop ended"),
             }
         };
         app.sync(&boot, if result.is_ok() { "Ready" } else { "Stopped" });

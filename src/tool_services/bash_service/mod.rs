@@ -235,6 +235,9 @@ impl ToolService for BashService {
                     id: id.clone(),
                     details: serde_json::json!({
                         "command": session.cmdline, "pid": session.pid,
+                        "instance_id": session.shared.instance_id,
+                        "started_at": session.shared.started_at,
+                        "duration_ms": buffer.finished.map(|end| end.duration_since(session.shared.started).as_millis() as u64),
                         "process_exited": buffer.exited, "output_closed": buffer.is_finished(),
                         "exit_code": buffer.exit_code, "exit_signal": buffer.exit_signal,
                     }),
@@ -404,6 +407,9 @@ impl BashService {
         // Shared buffers, appended to as data arrives, so the bounded drain
         // below can report partial output even when a reader never hits EOF.
         let shared = Arc::new(SessionShared {
+            instance_id: Uuid::new_v4().to_string(),
+            started_at: chrono::Utc::now().timestamp_millis(),
+            started: Instant::now(),
             buffer: Mutex::new(OutputBuffer {
                 exec_capture: Some(Default::default()),
                 ..Default::default()
@@ -565,6 +571,9 @@ impl BashService {
         };
 
         let shared = Arc::new(SessionShared {
+            instance_id: Uuid::new_v4().to_string(),
+            started_at: chrono::Utc::now().timestamp_millis(),
+            started: Instant::now(),
             buffer: Mutex::new(OutputBuffer::default()),
             notify: Notify::new(),
             generation: AtomicU64::new(0),
@@ -992,6 +1001,9 @@ struct Session {
 }
 
 struct SessionShared {
+    instance_id: String,
+    started_at: i64,
+    started: Instant,
     buffer: Mutex<OutputBuffer>,
     notify: Notify,
     /// Bumped on each write so waiters reset their idle clock.
@@ -1013,9 +1025,16 @@ struct OutputBuffer {
     exit_signal: Option<i32>,
     /// Captured output streams whose readers have finished (stdout and stderr).
     eof_streams: u8,
+    finished: Option<Instant>,
 }
 
 impl OutputBuffer {
+    fn record_completion(&mut self) {
+        if self.is_finished() {
+            self.finished.get_or_insert_with(Instant::now);
+        }
+    }
+
     fn is_finished(&self) -> bool {
         self.exited && self.eof_streams >= 2
     }
@@ -1028,6 +1047,7 @@ enum StreamKind {
 }
 
 struct SessionSnapshot {
+    instance_id: String,
     session_id: String,
     owner: Uuid,
     cmdline: String,
@@ -1073,6 +1093,10 @@ fn process_status(code: Option<i32>, signal: Option<i32>) -> Option<String> {
 impl SessionSnapshot {
     fn tool_result(&self) -> generative_model::ToolResult {
         let mut result = generative_model::ToolResult::text(self.format());
+        result.resource = Some(generative_model::ToolResourceRef {
+            id: self.session_id.clone(),
+            instance_id: self.instance_id.clone(),
+        });
         result.status = if matches!(self.status, SnapshotStatus::Backgrounded) {
             Some("backgrounded".into())
         } else {
@@ -1333,6 +1357,7 @@ where
         }
         if let Ok(mut b) = shared.buffer.lock() {
             b.eof_streams += 1;
+            b.record_completion();
         }
         shared.notify.notify_waiters();
     })
@@ -1367,6 +1392,7 @@ fn spawn_waiter(mut child: Child, shared: Arc<SessionShared>) {
                 b.exit_code = st.code();
                 b.exit_signal = st.signal();
             }
+            b.record_completion();
         }
         shared.notify.notify_waiters();
         // `child` drops here; kill_on_drop is a no-op if already exited.
@@ -1505,6 +1531,7 @@ fn take_snapshot(
             Ok(g) => g,
             Err(_) => {
                 return SessionSnapshot {
+                    instance_id: shared.instance_id.clone(),
                     session_id: session_id.to_string(),
                     owner,
                     cmdline: cmdline.to_string(),
@@ -1553,6 +1580,7 @@ fn take_snapshot(
 
     let bytes_returned = stdout.len().saturating_add(stderr.len());
     SessionSnapshot {
+        instance_id: shared.instance_id.clone(),
         session_id: session_id.to_string(),
         owner,
         cmdline: cmdline.to_string(),

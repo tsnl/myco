@@ -622,6 +622,78 @@ fn running_snapshots_measure_time_since_dispatch_instead_of_time_since_reconnect
     );
 }
 
+fn process_inventory(host: &str, instance: &str) -> myco::core::HostResources {
+    myco::core::HostResources {
+        host: host.into(),
+        error: None,
+        resources: Some(vec![myco::core::ToolResource {
+            tool: "bash".into(),
+            id: "shell".into(),
+            details: json!({"instance_id":instance, "command":"cat", "started_at":Utc::now().timestamp_millis() - 5000,
+                "output_closed":false, "exit_code":null, "exit_signal":null, "duration_ms":null}),
+        }]),
+    }
+}
+
+#[test]
+fn live_process_cards_survive_compaction_and_keep_exit_results_after_close() {
+    let (app, _) = app();
+    let mut observed = process_inventory("remote", "first");
+    app.resources(vec![observed.clone()]);
+    let initial = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(initial[0]["running"], true);
+    assert!(initial[0]["elapsed_ms"].as_u64().unwrap() >= 5000);
+    let mut compacted = vec![];
+    view::retain_processes(&mut compacted, &app.live.lock().unwrap().snapshot.blocks);
+    assert_eq!(compacted.len(), 1);
+    app.live.lock().unwrap().snapshot.blocks = compacted;
+    observed.resources.as_mut().unwrap()[0].details["output_closed"] = json!(true);
+    observed.resources.as_mut().unwrap()[0].details["exit_code"] = json!(7);
+    observed.resources.as_mut().unwrap()[0].details["duration_ms"] = json!(6500);
+    app.resources(vec![observed.clone()]);
+    let ended = app.snapshot().change["snapshot"]["blocks"][0].clone();
+    assert_eq!(ended["running"], false);
+    assert_eq!(ended["status"], "exit 7");
+    assert_eq!(ended["error"], true);
+    assert_eq!(ended["elapsed_ms"], 6500);
+    observed.resources = Some(vec![]);
+    app.resources(vec![observed]);
+    assert_eq!(app.snapshot().change["snapshot"]["blocks"][0], ended);
+}
+
+#[test]
+fn resource_observations_distinguish_hosts_reused_handles_and_unknown_connections() {
+    let (app, _) = app();
+    app.resources(vec![
+        process_inventory("local", "first"),
+        process_inventory("remote", "second"),
+    ]);
+    assert_eq!(
+        app.snapshot().change["snapshot"]["blocks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut remote = process_inventory("remote", "second");
+    remote.error = Some("connection lost".into());
+    app.resources(vec![process_inventory("local", "first"), remote]);
+    let blocks = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(blocks[0]["running"], true);
+    assert_eq!(blocks[1]["running"], false);
+    assert_eq!(blocks[1]["status"], "state unknown");
+    app.resources(vec![
+        process_inventory("local", "third"),
+        process_inventory("remote", "second"),
+    ]);
+    let blocks = app.snapshot().change["snapshot"]["blocks"].clone();
+    assert_eq!(blocks.as_array().unwrap().len(), 3);
+    assert_eq!(blocks[0]["running"], false);
+    assert_eq!(blocks[0]["status"], "not running");
+    assert_eq!(blocks[1]["running"], true);
+    assert_eq!(blocks[2]["running"], true);
+}
+
 #[tokio::test]
 async fn background_tasks_update_idle_clients_and_survive_reconnect() {
     let (app, _) = app();

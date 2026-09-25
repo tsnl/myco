@@ -503,12 +503,23 @@ pub struct ToolUse {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolResourceRef {
+    pub id: String,
+    /// Distinguishes separate processes that reuse the same caller-chosen handle.
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
     pub content: Vec<Content>,
     pub is_error: bool,
     /// Brief tool-authored outcome for transcripts, independent of model narration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// A retained resource observed by this call. Presentation metadata only;
+    /// provider adapters send `content`, not this handle, to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ToolResourceRef>,
 }
 
 impl ToolResult {
@@ -517,6 +528,7 @@ impl ToolResult {
             content,
             is_error: false,
             status: None,
+            resource: None,
         }
     }
 
@@ -525,6 +537,7 @@ impl ToolResult {
             content: vec![Content::Text { text: text.into() }],
             is_error: false,
             status: None,
+            resource: None,
         }
     }
 
@@ -533,6 +546,7 @@ impl ToolResult {
             content: vec![Content::Text { text: text.into() }],
             is_error: true,
             status: None,
+            resource: None,
         }
     }
 
@@ -1257,6 +1271,7 @@ mod tests {
                     }],
                     is_error: false,
                     status: None,
+                    resource: None,
                 }],
             },
             Message::AssistantMessage {
