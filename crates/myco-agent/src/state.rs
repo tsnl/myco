@@ -47,6 +47,7 @@ enum Next {
 #[derive(Debug, Clone)]
 enum Phase {
     Ready,
+    GenerationFailed,
     Finished {
         answer: Vec<Content>,
         reason: TurnEndReason,
@@ -117,13 +118,15 @@ impl AgentState {
     pub fn is_idle(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Ready | Phase::Finished { .. } | Phase::Cancelled
+            Phase::Ready | Phase::GenerationFailed | Phase::Finished { .. } | Phase::Cancelled
         )
     }
 
     pub fn pending_operation(&self) -> Option<PendingOperation> {
         match self.phase {
-            Phase::Ready | Phase::Finished { .. } | Phase::Cancelled => None,
+            Phase::Ready | Phase::GenerationFailed | Phase::Finished { .. } | Phase::Cancelled => {
+                None
+            }
             Phase::Generating(operation) => Some(PendingOperation::Generation { operation }),
             Phase::Tools { operation, .. } => Some(PendingOperation::Tools { operation }),
         }
@@ -138,7 +141,7 @@ impl AgentState {
     /// The next effect, or terminal outcome, without advancing the controller.
     pub fn effect(&self) -> Option<Effect> {
         match &self.phase {
-            Phase::Ready => None,
+            Phase::Ready | Phase::GenerationFailed => None,
             Phase::Generating(operation) => Some(Effect::Generate {
                 operation: *operation,
             }),
@@ -181,7 +184,10 @@ impl AgentState {
     }
 
     pub fn can_replace_at_boundary(&self) -> bool {
-        matches!(self.phase, Phase::Generating(_) | Phase::Finished { .. }) && !self.executing
+        matches!(
+            self.phase,
+            Phase::Generating(_) | Phase::GenerationFailed | Phase::Finished { .. }
+        ) && !self.executing
     }
 
     pub fn cancel_at_boundary(&mut self) -> Result<(), StateError> {
@@ -317,11 +323,12 @@ impl AgentState {
     }
 
     /// Stop a failed or cancelled generation without adding a partial response.
+    /// Context can be repaired at this boundary without resetting run counters.
     pub fn generation_failed(&mut self, operation: OperationId) -> Result<(), StateError> {
         if !matches!(self.phase, Phase::Generating(id) if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
-        self.phase = Phase::Ready;
+        self.phase = Phase::GenerationFailed;
         self.executing = false;
         Ok(())
     }

@@ -65,6 +65,12 @@ history level from `Recovery::OmitLastMessage`, used when input must shrink.
 It is not a promise that retrying will succeed or an instruction to retry all
 errors indefinitely.
 
+Myco's `SessionRunner` handles `RequestTooLargeError` before that fallback:
+it compacts saved context, omits retained image payloads, and continues at the
+failed generation boundary without resetting run accounting or replaying tools.
+Another size recovery requires a successful model response; a repeated size
+rejection uses the fallback. Other failures keep their existing retry policy.
+
 ## Preserve message structure
 
 Messages contain user input, assistant output with optional tool calls, or

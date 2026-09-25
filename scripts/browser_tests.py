@@ -83,6 +83,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
         compact = compaction_reply(body)
         if compact is not None:
             events = compact
+        elif getattr(fixture, 'reject_payload', lambda _body: False)(body):
+            self.send_error(413, 'Fixture payload too large')
+            return
         elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
@@ -586,6 +589,69 @@ context_window = 100000
                 expect(page.locator('.assistant .body')).to_have_text(['Alpha finished.'] * (2 if automatic else 1))
                 expect(page.locator('#transcript')).not_to_contain_text(re.compile('Summary saved|Continue the browser fixture task|Resumption|Prelude changes|SYSTEM'))
                 self.assertEqual(len(self.requests), requests, 'Reloading must not generate another continuation')
+
+    def test_payload_rejection_recovers_after_tools_without_resending_images(self):
+        self.reject_payload = lambda body: (any(item.get('type') == 'function_call_output'
+                                               for item in body['input'])
+                                            and '"type": "input_image"' in json.dumps(body))
+        self.compaction_release.clear()
+        page = self.session(self.page)
+        state_url = page.url.replace('/sessions/', '/api/sessions/')
+        original_thread = self.context.request.get(state_url).json()['change']['snapshot']['thread_id']
+        self.choose_image(page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#connection')).to_have_text('Compacting')
+        expect(page.locator('.tool.running')).to_have_count(0)
+        self.compaction_release.set()
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual((self.home / 'Alpha-done').read_text(), 'done')
+        recovered = self.context.request.get(state_url).json()['change']['snapshot']
+        self.assertNotEqual(recovered['thread_id'], original_thread)
+        self.assertNotIn('"type": "input_image"', json.dumps(self.requests[-1]))
+        for refreshed in [False, True]:
+            if refreshed:
+                page.reload()
+            expect(page.locator('.user .body')).to_contain_text('Alpha wait')
+            expect(page.locator('.user .body')).to_contain_text('Image omitted to reduce request size')
+            expect(page.locator('.user img')).to_have_count(0)
+            expect(page.locator('.tool')).to_have_count(1)
+            expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+
+    def test_local_request_size_cap_compacts_before_upload_and_continues(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text().replace('[models.first]',
+                          '[models.first]\nmax_request_bytes = 100000'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.compaction_release.clear()
+        self.turns['Alpha images'] = 1
+        page = self.session(self.page)
+        self.choose_image(page, buffer=(self.home / 'pixel.png').read_bytes() + bytes(150000))
+        self.submit(page, 'Alpha images')
+        expect(page.locator('#connection')).to_have_text('Compacting')
+        self.compaction_release.set()
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        expect(page.locator('#model')).to_be_enabled()
+        expect(page.locator('.user .body')).to_contain_text('Image omitted to reduce request size')
+        self.assertTrue(self.requests)
+        self.assertTrue(all(not self.image_urls(request) for request in self.requests),
+                        'The oversized image request must fail locally before upload')
+
+    def test_print_mode_recovers_from_http_413_and_exits_successfully(self):
+        self.reject_payload = lambda _body: self.turns.get('Alpha markdown') == 1
+        result = subprocess.run([str(OPTIONS.binary), '--config', 'config.toml', '-p', 'Alpha markdown'],
+                                cwd=self.home, env=dict(os.environ, MYCO_HOME=str(self.home),
+                                                       MYCO_PROFILE='default', MYCO_CONFIG='config.toml'),
+                                capture_output=True, text=True, timeout=20)
+        (self.artifacts / 'cli.stdout').write_text(result.stdout)
+        (self.artifacts / 'cli.stderr').write_text(result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'Alpha finished.')
+        self.assertIn('compaction complete', result.stderr)
+        self.assertEqual(self.turns['Alpha markdown'], 2)
 
     def test_cancelled_compaction_keeps_the_source_and_delivers_queued_input_without_a_success_card(self):
         self.turns.update({'Alpha images': 1, 'Beta images': 1})

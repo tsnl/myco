@@ -276,7 +276,7 @@ model's `max_output_tokens` versus how much it tends to write.
 **Auto-compaction** runs through the server’s session runner. `auto_compact_at = 0.8` triggers when reported prompt size reaches 80% of
 `context_window`, at a settled boundary between tool rounds or after a normal answer.
 The system prompt tells the agent this
-threshold. Unset (the default) disables automatic compaction; the fraction must
+threshold. Unset (the default) disables threshold-based compaction; the fraction must
 be greater than 0 and less than 1.
 
 It runs the same compaction as `/compact`, creating a successor thread in the
@@ -291,10 +291,21 @@ Long tool loops can compact repeatedly when the context shrinks then grows again
 A completed answer triggers at most one compact-and-continue cycle per submission.
 If the next usage report remains above the threshold, or summarization fails,
 automatic compaction is disabled until manual compaction succeeds or another session
-is opened. Failed generation, cancellation, refusal, and an exhausted truncation cap
+is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
 do not start automatic continuation. Manual `/compact` waits for the next user input.
 Compaction workers do not run auto-compaction. Each committed successor retains the
 same live tool owner and the run's usage and truncation accounting.
+
+**Oversized requests** trigger compaction and continuation in browser and CLI
+sessions, even without an `auto_compact_at` threshold. This covers HTTP 413,
+recognized provider size errors, and the local `max_request_bytes` cap. Recovery
+replaces retained images with text references to their originals in the saved
+predecessor thread, so the next request does not resend the same image payloads.
+Completed tools are not replayed. Cancel interrupts recovery. If summarization
+fails or the compacted request is still too large, the run reports the error and
+falls back to removing the rejected submission from active context; the saved
+threads keep the input and completed observations. The session still accepts new
+input. Another size recovery is allowed after a successful model response.
 
 **Retry** is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
@@ -305,8 +316,9 @@ may carry its own `[models.KEY.retry]` — the only way for a gateway-less model
 configure retry — and, like `auth`, it replaces the gateway's table rather than
 merging with it. Only failures that happen *before* any of the response has
 streamed are retried (connection errors, 408, 429, and 5xx including Anthropic's
-529); a 400, a 401 or a 413 fails the same way however often it is sent, so it
-surfaces immediately. A failure mid-stream is never retried either, because the
+529). A 413 or recognized size rejection goes to the session's context recovery
+instead of retrying the unchanged request; other 400 and 401 errors surface
+immediately. A failure mid-stream is never retried either, because the
 already-emitted parts would be replayed as duplicates. A provider's `Retry-After`
 is honoured when it asks for longer than the computed backoff, still bounded by
 `max_backoff_ms`. The agent starts a fresh generation attempt for each retry;

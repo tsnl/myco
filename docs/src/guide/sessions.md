@@ -37,7 +37,15 @@ boundary between tool rounds or after an answer and asks the agent to continue.
 Long tool loops can compact repeatedly as context grows. A completed answer can
 trigger at most one cycle per submission. Manual compaction and reopening a
 saved session wait for input. Failure or ineffective compaction disables automatic
-compaction until a manual compaction succeeds or another session opens.
+threshold compaction until a manual compaction succeeds or another session opens.
+
+A request-size rejection (HTTP 413 or the configured request byte cap) also
+compacts and continues automatically, even without a token threshold. This
+recovery replaces recent images with text references to their saved originals
+and preserves completed tool effects. Cancel interrupts it. If summarization
+fails or the smaller request is still rejected, the run stops retrying and
+removes the rejected submission from active context. Its original input and tool
+results remain in saved threads, and the session accepts new input.
 
 The agent can inspect old threads with `session_history`, using `threads`,
 `stats`, and `expand` actions. Compaction bounds active model context; it does
