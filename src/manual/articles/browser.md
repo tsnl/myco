@@ -178,6 +178,12 @@ with up to 20 selected or pasted images per message. Bytes determine the media
 type. The browser sends the images when you press **Send** or **Queue**;
 rejected sends keep the draft and attachments for retry.
 
+When the input is empty, Up highlights the newest user message; press Up again
+for earlier messages and Down for later ones. The input keeps focus and stays
+empty. Down past the newest message, Escape, or **Latest output** returns to
+the live output. Typing clears the highlight, and arrows edit text normally
+whenever the input contains a draft.
+
 Mention `@path/to/image.png` to attach a file on the server instead. Each image is
 limited by the model’s `max_image_base64_bytes` (default 5 MiB of base64), and all
 attachments in one message share a 20 MiB budget, including `@path` images. Bad

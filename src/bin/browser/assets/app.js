@@ -1,6 +1,7 @@
 import { $, api, element, error, clearError, requestId, setArchived } from './common.js';
 import { showActivity } from './activity.js';
 import { messageComposer } from './composer.js';
+import { messageNavigation } from './message-navigation.js';
 import { linkify, setLinkedText } from './links.js';
 import { markdownContent } from './markdown-content.js';
 import { messageTimestamp } from './timestamps.js';
@@ -20,6 +21,10 @@ const nodes = [];
 const markdownJobs = new WeakMap();
 const toolClocks = new WeakMap();
 const composer = messageComposer({ sendAction, imageSource, addImages, resizeInput });
+const navigation = messageNavigation({
+  onNavigate() { follow = false; $('jump').hidden = false; },
+  onLatest: jumpToLatest,
+});
 
 function updateToolDuration(node, now = performance.now()) {
   const elapsed = Number(node.dataset.elapsed) + (node.dataset.running === 'true' ? now - Number(node.dataset.observed) : 0);
@@ -62,10 +67,15 @@ function scrollLatest() {
   });
 }
 window.addEventListener('scroll', () => {
-  follow = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 100;
+  follow = !navigation.active && document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 100;
   $('jump').hidden = follow;
 }, { passive: true });
-$('jump').onclick = () => { follow = true; scrollLatest(); };
+function jumpToLatest() {
+  navigation.clear(); follow = true; scrollLatest();
+  $('jump').hidden = true;
+  $('prompt').focus({ preventScroll: true });
+}
+$('jump').onclick = jumpToLatest;
 new ResizeObserver(() => {
   document.documentElement.style.setProperty('--toolbar-height', `${document.querySelector('.toolbar').offsetHeight}px`);
 }).observe(document.querySelector('.toolbar'));
@@ -301,6 +311,7 @@ function snapshot(next) {
     welcome.append(element('h1', '', 'MYCO'), element('p', '', 'Write a prompt to begin. Tool inputs and output expand in place.'));
     transcript.append(welcome);
   }
+  navigation.refresh();
   metadata();
 }
 function metadata() {
@@ -380,7 +391,7 @@ function updateSession(update) {
   const change = update.change;
   if (change.kind === 'snapshot') snapshot(change.snapshot);
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
-  else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; activity(); }
+  else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; navigation.refresh(); activity(); }
   else if (change.kind === 'tasks') state.tasks = change.tasks;
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
