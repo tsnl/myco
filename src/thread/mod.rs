@@ -6,23 +6,18 @@ use serde_json::Value;
 // Thread
 //
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Thread {
-    id: ThreadId,
     entries: Vec<Entry>,
 }
 
 impl Thread {
-    pub fn new(id: ThreadId) -> Self {
-        Self::from_parts(id, vec![])
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn from_parts(id: ThreadId, entries: Vec<Entry>) -> Self {
-        Self { id, entries }
-    }
-
-    pub fn id(&self) -> ThreadId {
-        self.id
+    pub fn from_entries(entries: Vec<Entry>) -> Self {
+        Self { entries }
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -33,18 +28,15 @@ impl Thread {
         self.entries.push(entry);
     }
 
-    pub fn fork(&self, id: ThreadId, prefix_len: usize) -> Option<Self> {
+    pub fn fork(&self, prefix_len: usize) -> Option<Self> {
         let entries = self.entries.get(..prefix_len)?.to_vec();
-        Some(Self::from_parts(id, entries))
+        Some(Self::from_entries(entries))
     }
 }
 
 //
 // Identifiers
 //
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ThreadId(pub u128);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u128);

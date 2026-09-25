@@ -234,28 +234,28 @@ manages distinct `Thread` instances; the history module operates on those values
 ```rust
 #[derive(Clone)]
 pub struct Thread {
-    id: ThreadId,
     entries: Vec<Entry>,
 }
 
 impl Thread {
-    pub fn new(id: ThreadId) -> Self;
-    pub fn from_parts(id: ThreadId, entries: Vec<Entry>) -> Self;
-    pub fn id(&self) -> ThreadId;
+    pub fn new() -> Self;
+    pub fn from_entries(entries: Vec<Entry>) -> Self;
     pub fn entries(&self) -> &[Entry];
     pub fn append(&mut self, entry: Entry);
-    pub fn fork(&self, id: ThreadId, prefix_len: usize) -> Option<Self>;
+    pub fn fork(&self, prefix_len: usize) -> Option<Self>;
 }
 ```
 
 Owned values use dense vectors. Appending requires an exclusive borrow and leaves
-existing entries unchanged. Cloning copies entries while preserving identity;
-each copy can grow independently. Fork copies a prefix under a caller-supplied ID.
+existing entries unchanged. Cloning copies entries, and each copy can grow
+independently. Fork copies a prefix into a new value.
 An out-of-bounds prefix returns `None`; empty and full prefixes are valid.
 
-The kernel allocates unique IDs, retains needed instances or snapshots, and tracks
-how threads were derived. It chooses the authoritative instance for each ID;
-independent branches and replacements of existing entries require fresh IDs.
+The kernel owns thread instances, retains needed snapshots, and tracks how threads
+were derived. It can own `Box<Thread>` values and borrow them for in-process access.
+Address-based identity is valid only for an allocation's lifetime. Thread IDs in
+application observations and history references are kernel-managed handles;
+`Thread` itself has no ID. Equality compares contents.
 
 Serialization, persistence, collections, grouping, operation records, cancellation,
 and publication checks belong outside `thread`. Its methods are synchronous and
@@ -272,7 +272,7 @@ record. Workflow/kernel code retains the complete model message there, including
 signed/encrypted reasoning, and resolves it when constructing model context.
 Persistence keeps that evidence available before publishing a durable reference.
 Thread values carry the reference without managing evidence or depending on model
-types. The kernel can construct values with `from_parts` using its own format.
+types. The kernel can construct values with `from_entries` using its own format.
 
 ## Workflow composition and streaming
 
@@ -371,9 +371,10 @@ and repeats as policy requires. An active run exclusively borrows its agent thro
 
 Agent state contains its selected thread references, policy/budget state, and
 pending operation IDs. Injected storage records explicit logical checkpoints.
-The threads remain independently addressable. Forking an agent creates new
-thread identities from fixed histories and copies the relevant policy state;
-it does not clone a running stream, future, tool process, or writer.
+The kernel keeps threads independently addressable. Forking an agent copies its
+selected thread histories and policy state, and the kernel registers those copies
+as distinct objects. It does not clone a running stream, future, tool process,
+or writer.
 
 The kernel polls concurrent agent streams as updates become ready. Ordinary
 async scheduling advances their I/O; it need not reconstruct a function on every

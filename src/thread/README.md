@@ -5,32 +5,35 @@ synchronous and work directly on its entries. The kernel manages distinct thread
 instances, serialization, grouping, and persistence.
 
 ```rust
-use myco::thread::{Entry, Thread, ThreadId};
+use myco::thread::{Entry, Thread};
 
-let mut thread = Thread::new(ThreadId(1));
+let mut thread = Thread::new();
 thread.append(Entry::User("Explain this repository.".into()));
 let snapshot = thread.clone();
 
-let mut branch = thread.fork(ThreadId(2), 1).unwrap();
+let mut branch = thread.fork(1).unwrap();
 branch.append(Entry::User("Focus on the model module.".into()));
 thread.append(Entry::Notification("Review started.".into()));
 
 assert_eq!(snapshot.entries().len(), 1);
 assert_eq!(thread.entries().len(), 2);
-assert_eq!(branch.id(), ThreadId(2));
+assert_eq!(branch.entries().len(), 2);
 ```
 
 ## Ownership
 
-`Thread` owns its ID and entry vector. Appending requires `&mut self` and leaves
-existing entries unchanged. Cloning copies the entries, preserving
-identity. The copy can grow independently; it has no connection to the original.
-The kernel decides which instance is authoritative for an ID and uses fresh IDs
-for branches that it manages independently.
+`Thread` owns its entry vector. Appending requires `&mut self` and leaves existing
+entries unchanged. Cloning copies the entries, and each copy can grow
+independently. Equality compares contents.
 
-`fork` copies a prefix under a caller-supplied ID. Empty and complete prefixes are
-valid; an out-of-bounds prefix returns `None`. `from_parts` constructs a value from
-an ID and entries. Workflows and the kernel track how threads were derived.
+`new` and `default` create empty threads; `from_entries` takes an existing vector.
+`fork` copies a prefix. Empty and complete prefixes are valid; an out-of-bounds
+prefix returns `None`. Workflows and the kernel track how threads were derived.
+
+The kernel can own a `Box<Thread>` and use references for in-process access. Its
+allocation has a stable address while it remains allocated. Any address-based
+identity is limited to that lifetime; identifiers used for HTTP or persistence
+are managed separately by the kernel. A thread value carries no identity.
 
 Collections of threads, snapshots, serialization formats, persistence, operation
 receipts, cancellation, and publication checks are responsibilities of the kernel
