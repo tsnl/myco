@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use myco::thread::{ContentPart, Entry, InferenceRecordId, OperationId, Thread};
+use myco::thread::{ContentPart, Entry, Thread, ToolCallId};
 
 //
 // Owned history
@@ -31,12 +31,9 @@ fn cloned_values_can_grow_independently_without_shared_storage() {
 }
 
 #[test]
-fn constructing_a_thread_preserves_inference_record_references() {
-    let inference_record =
-        InferenceRecordId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c200".parse().unwrap());
+fn constructing_a_thread_preserves_entries() {
     let entries = vec![Entry::Assistant {
         content: vec![ContentPart::Text("summary".into())],
-        inference_record: Some(inference_record),
     }];
     let mut thread = Thread::from_entries(entries.clone());
     let snapshot = thread.clone();
@@ -88,35 +85,32 @@ fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
 //
 
 #[test]
-fn forks_preserve_content_order_tool_correlation_and_inference_record_references() {
-    let read_operation = OperationId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap());
-    let edit_operation = OperationId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap());
-    let inference_record =
-        InferenceRecordId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c200".parse().unwrap());
-    let content = vec![
-        ContentPart::Reasoning("thinking".into()),
+fn clones_and_forks_preserve_replay_content_and_tool_correlation() {
+    let read_call = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap());
+    let edit_call = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap());
+    let mut content = reasoning_content();
+    content.extend([
         ContentPart::Text("answer".into()),
         ContentPart::Refusal("refusal".into()),
         ContentPart::ToolCall {
-            operation: read_operation,
+            id: read_call,
+            provider_call_id: Some("call_read_original".into()),
             name: "read".into(),
             arguments: Ok(json!({"path": "a.txt"})),
         },
         ContentPart::ToolCall {
-            operation: edit_operation,
+            id: edit_call,
+            provider_call_id: None,
             name: "edit".into(),
             arguments: Err("incomplete JSON".into()),
         },
-    ];
+    ]);
     let entries = vec![
         Entry::User("prompt".into()),
         Entry::System("instructions".into()),
-        Entry::Assistant {
-            content,
-            inference_record: Some(inference_record),
-        },
+        Entry::Assistant { content },
         Entry::ToolResult {
-            operation: read_operation,
+            call_id: read_call,
             output: "contents".into(),
             is_error: false,
         },
@@ -125,7 +119,28 @@ fn forks_preserve_content_order_tool_correlation_and_inference_record_references
         Entry::Notification("notice".into()),
     ];
     let source = Thread::from_entries(entries.clone());
+    let snapshot = source.clone();
     let branch = source.fork(entries.len()).unwrap();
-    assert_eq!(source.entries(), entries);
+    drop(source);
+    assert_eq!(snapshot.entries(), entries);
     assert_eq!(branch.entries(), entries);
+}
+
+fn reasoning_content() -> Vec<ContentPart> {
+    vec![
+        ContentPart::Reasoning {
+            text: "thinking".into(),
+            signature: Some("original-signature".into()),
+        },
+        ContentPart::Reasoning {
+            text: "unsigned observation".into(),
+            signature: None,
+        },
+        ContentPart::EncryptedReasoning {
+            id: "reasoning_original".into(),
+            summary: vec!["first summary".into(), "second summary".into()],
+            data: "opaque-encrypted-data".into(),
+        },
+        ContentPart::RedactedReasoning("opaque-redacted-data".into()),
+    ]
 }

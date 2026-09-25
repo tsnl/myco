@@ -40,24 +40,24 @@ receipts, cancellation, and publication checks are responsibilities of the kerne
 and its callers. The thread module has no storage dependency, shared registry,
 revision counter, or async runtime requirement.
 
-## Entries and inference records
+## Conversation content
 
 Entries distinguish user input, assistant content, tool results, system
 information, warnings, errors, and notifications. Assistant content is ordered.
-`OperationId` and `InferenceRecordId` are distinct newtypes around `uuid::Uuid`.
-The workflow assigns an `OperationId` once per logical operation and reuses it for
-the tool call, its result, and retries. These values describe history without
-deciding which entries enter a model prompt or which tool calls may execute.
-Workflows compose thread operations with inference.
 
-An assistant entry's `inference_record: Option<InferenceRecordId>` references an
-immutable inference record. The workflow retains the complete model message there,
-including signed/encrypted reasoning and provider call IDs, and resolves it when
-rebuilding context. The kernel persists that record before publishing a durable
-reference to it and retains it while referenced. A missing record must not be
-reconstructed from the portable reasoning text. Synthetic entries can omit the
-reference.
+`ToolCallId` wraps `uuid::Uuid` and pairs a tool call's `id` with a result's
+`call_id`. Clones and forks preserve that relationship. A model-originated call
+also retains its original `provider_call_id` for context reconstruction; synthetic
+calls can omit it. Workflows resolve a result's provider ID from the matching call
+in the selected history. Execution IDs and retry policy belong to the kernel and
+services.
 
-The thread module only carries the reference and portable content. Managing
-inference records, model compatibility, and context projection belongs to
-workflow/kernel code. `model` and `thread` have no dependency on one another.
+Content owns the original reasoning text and signatures, encrypted reasoning IDs,
+summaries and data, and redacted blocks. Preserve these values and their order when
+rebuilding context. Clones and forks copy them directly; no external inference
+record is needed to recover conversation content.
+
+Workflows choose which entries enter a model prompt, check model compatibility,
+and decide which tool calls may execute. Request traces, usage, timing, and
+execution records stay outside the thread. `model` and `thread` have no dependency
+on one another.

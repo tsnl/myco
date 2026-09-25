@@ -108,6 +108,9 @@ configuration, including host and working directory/root where applicable.
 Different services keep their own request/result types. The kernel maps operation
 IDs into service records and pins bindings for retries; discovery never silently
 substitutes another instance for an unavailable target.
+These execution IDs belong to the kernel and services. A conversation's
+`thread::ToolCallId` pairs a tool call with its result; one call can involve
+several service operations.
 
 Kernel tools can create, fork, read, submit input to, or request work on another
 thread in the workspace. A subagent tool starts an agent on a new thread and
@@ -265,17 +268,18 @@ these local operations with effectful APIs supplied by the kernel and services.
 tool results, system information, warnings, errors, and notifications. Its content
 types are independent of inference types. A stored entry need not appear in a
 model prompt; the workflow chooses how to interpret it.
-Tool calls and results share a stable `OperationId`.
-The workflow assigns it once per logical operation and retains it across retries.
-`OperationId` and `InferenceRecordId` are distinct newtypes around `uuid::Uuid`.
+Tool calls and results share a `ToolCallId`, a newtype around `uuid::Uuid`.
+It identifies the call within conversation history and survives clones and forks.
+Execution attempts, deduplication, and retry records belong to the kernel/services.
 
-Assistant entries can carry an `inference_record: Option<InferenceRecordId>`
-referencing an immutable inference record. Workflow/kernel code retains the
-complete model message there, including signed/encrypted reasoning, and resolves
-it when constructing model context.
-Persistence keeps that record available before publishing a durable reference.
-Thread values carry the reference without managing records or depending on model
-types. The kernel can construct values with `from_entries` using its own format.
+Assistant content owns reasoning text and signatures, encrypted reasoning IDs,
+summaries and data, and redacted blocks. Tool calls retain the original
+`provider_call_id` alongside their conversation ID; synthetic calls can omit it.
+Workflow code resolves each result's provider ID from its matching call and
+preserves reasoning fields and order when rebuilding model context. This content
+is copied with the thread, without an external record lookup or a dependency on
+model types. The kernel can construct values with `from_entries` using its own
+format.
 
 ## Workflow composition and streaming
 
@@ -299,10 +303,9 @@ an enclosing agent object.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
 The richer roles in `thread` are interpreted by each workflow, not mechanically
-converted into model roles. Raw provider events stay in inference records alongside
-the portable thread entries; workflows need no provider-specific response types.
-Selected reasoning retains its original text, signature/encrypted data, and order
-when rebuilding model history.
+converted into model roles. Raw provider events, usage, and timing stay in workflow
+records. The thread carries the content needed for model history, including the
+original reasoning text, signature/encrypted data, and provider call IDs.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
@@ -318,11 +321,11 @@ pub enum TurnUpdate {
 attempt identity and content-block coordinates, including incomplete tool arguments.
 `model::Event::Completed { message, finish, usage }` supplies the assembled message
 and validated inference outcome, including fields absent from provisional deltas.
-Workflow code retains the inference record, checks conversation structure and
-correlation, and appends the accepted entry. Before an update is exposed as
-`Committed`, the kernel publishes the resulting thread value and operation receipt, checking
-expected source history and cancellation. A refusal or output limit can be
-recorded as such; incomplete arguments never authorize tool execution.
+Workflow code checks conversation structure and correlation, preserves replay
+data in the content, and appends the accepted entry. Before an update is exposed
+as `Committed`, the kernel publishes the resulting thread value and operation
+receipt, checking expected source history and cancellation. A refusal or output
+limit can be recorded as such; incomplete arguments never authorize tool execution.
 
 The model stream yields one completed response or terminal error, then ends.
 EOF without a terminal provider outcome is an error. A workflow may fail after
@@ -428,9 +431,10 @@ Workflow adapters pin model configuration and capabilities, record the exact
 request before polling the inference stream into dispatch, and translate progress
 and its final outcome into thread values.
 
-Raw provider metadata and provider-call/invocation-ID mappings remain in
-interpreter records. These records are durable before a thread or operation can
-reference them. Retained history keeps the records reachable.
+Raw provider metadata, usage, and timing remain in workflow/kernel records.
+Conversation content carries reasoning replay data and original provider call IDs.
+Execution records separately associate tool calls with the service operations they
+trigger.
 
 Tool adapters validate against pinned schemas, invoke a service or internal kernel
 operation, and record a translated outcome. GUI controls use those same service

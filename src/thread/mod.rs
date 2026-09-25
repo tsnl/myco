@@ -32,10 +32,7 @@ impl Thread {
 //
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OperationId(pub uuid::Uuid);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InferenceRecordId(pub uuid::Uuid);
+pub struct ToolCallId(pub uuid::Uuid);
 
 //
 // Entries
@@ -46,10 +43,9 @@ pub enum Entry {
     User(String),
     Assistant {
         content: Vec<ContentPart>,
-        inference_record: Option<InferenceRecordId>,
     },
     ToolResult {
-        operation: OperationId,
+        call_id: ToolCallId,
         output: String,
         is_error: bool,
     },
@@ -62,10 +58,20 @@ pub enum Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
     Text(String),
-    Reasoning(String),
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
+    EncryptedReasoning {
+        id: String,
+        summary: Vec<String>,
+        data: String,
+    },
+    RedactedReasoning(String),
     Refusal(String),
     ToolCall {
-        operation: OperationId,
+        id: ToolCallId,
+        provider_call_id: Option<String>,
         name: String,
         arguments: Result<Value, String>,
     },
