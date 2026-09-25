@@ -46,24 +46,38 @@ pub struct ToolCallId(pub uuid::Uuid);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    User(String),
-    Assistant {
-        content: Vec<ContentPart>,
-    },
-    ToolResult {
-        call_id: ToolCallId,
-        output: String,
-        is_error: bool,
-    },
-    System(String),
+    Turn(Turn),
     Warning(String),
     Error(String),
     Notification(String),
 }
 
+//
+// Turns
+//
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub sender: Sender,
+    pub content: Vec<ContentPart>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender {
+    Assistant,
+    User,
+    Tool,
+    System,
+}
+
+//
+// Content
+//
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
     Text(String),
+    Image(String),
     Reasoning {
         text: String,
         signature: Option<String>,
@@ -81,4 +95,14 @@ pub enum ContentPart {
         name: String,
         arguments: Result<Value, String>,
     },
+    ToolResponse {
+        id: ToolCallId,
+        result: ToolResponseResult,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolResponseResult {
+    Completed { result: String, is_error: bool },
+    Backgrounded,
 }

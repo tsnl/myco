@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use myco::thread::{ContentPart, Entry, Thread, ToolCallId};
+use myco::thread::{ContentPart, Entry, Sender, Thread, ToolCallId, ToolResponseResult, Turn};
 
 //
 // Owned history
@@ -9,11 +9,11 @@ use myco::thread::{ContentPart, Entry, Thread, ToolCallId};
 #[test]
 fn appending_preserves_existing_entries_and_cloned_snapshots() {
     let mut thread = Thread::default();
-    thread.push(Entry::User("first".into()));
+    thread.push(user("first"));
     let snapshot = thread.clone();
     thread.push(Entry::Notification("second".into()));
 
-    assert_eq!(snapshot.entries(), &[Entry::User("first".into())]);
+    assert_eq!(snapshot.entries(), &[user("first")]);
     assert_eq!(&thread.entries()[..1], snapshot.entries());
     assert_eq!(thread.entries().len(), 2);
 }
@@ -21,25 +21,32 @@ fn appending_preserves_existing_entries_and_cloned_snapshots() {
 #[test]
 fn cloned_values_can_grow_independently_without_shared_storage() {
     let mut original = Thread::default();
-    original.push(Entry::User("shared".into()));
+    original.push(user("shared"));
     let mut copy = original.clone();
-    original.push(Entry::User("original only".into()));
-    copy.push(Entry::User("copy only".into()));
+    original.push(user("original only"));
+    copy.push(user("copy only"));
 
-    assert_eq!(original.entries()[1], Entry::User("original only".into()));
-    assert_eq!(copy.entries()[1], Entry::User("copy only".into()));
+    assert_eq!(original.entries()[1], user("original only"));
+    assert_eq!(copy.entries()[1], user("copy only"));
 }
 
 #[test]
-fn constructing_a_thread_preserves_entries() {
-    let entries = vec![Entry::Assistant {
-        content: vec![ContentPart::Text("summary".into())],
-    }];
-    let mut thread = Thread::from_entries(entries.clone());
+fn completed_tool_response_preserves_backgrounded_history() {
+    let id = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap());
+    let backgrounded = tool_response(id, ToolResponseResult::Backgrounded);
+    let completed = tool_response(
+        id,
+        ToolResponseResult::Completed {
+            result: "finished".into(),
+            is_error: false,
+        },
+    );
+    let mut thread = Thread::from_entries(vec![backgrounded.clone()]);
     let snapshot = thread.clone();
-    thread.push(Entry::User("continue".into()));
+    thread.push(completed.clone());
 
-    assert_eq!(snapshot.entries(), entries);
+    assert_eq!(snapshot.entries(), std::slice::from_ref(&backgrounded));
+    assert_eq!(thread.entries(), &[backgrounded, completed]);
 }
 
 //
@@ -49,21 +56,15 @@ fn constructing_a_thread_preserves_entries() {
 #[test]
 fn slice_copies_grow_independently() {
     let mut source = Thread::default();
-    source.push(Entry::User("excluded".into()));
-    source.push(Entry::User("shared".into()));
-    source.push(Entry::User("source only".into()));
+    source.push(user("excluded"));
+    source.push(user("shared"));
+    source.push(user("source only"));
     let mut branch = Thread::from_entries(source[1..2].to_vec());
-    branch.push(Entry::User("branch only".into()));
+    branch.push(user("branch only"));
     source.push(Entry::Notification("source advanced".into()));
 
-    assert_eq!(
-        branch.entries(),
-        &[
-            Entry::User("shared".into()),
-            Entry::User("branch only".into())
-        ]
-    );
-    assert_eq!(source[2], Entry::User("source only".into()));
+    assert_eq!(branch.entries(), &[user("shared"), user("branch only")]);
+    assert_eq!(source[2], user("source only"));
     assert_eq!(&source[1..2], &branch[..1]);
 }
 
@@ -71,8 +72,8 @@ fn slice_copies_grow_independently() {
 fn indexing_borrows_entries_and_ranges() {
     let mut source = Thread::default();
     assert!(source[..].is_empty());
-    source.push(Entry::User("first".into()));
-    source.push(Entry::User("second".into()));
+    source.push(user("first"));
+    source.push(user("second"));
 
     assert!(source[..0].is_empty());
     assert!(source[2..].is_empty());
@@ -115,14 +116,32 @@ fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
         },
     ]);
     let entries = vec![
-        Entry::User("prompt".into()),
-        Entry::System("instructions".into()),
-        Entry::Assistant { content },
-        Entry::ToolResult {
-            call_id: read_call,
-            output: "contents".into(),
-            is_error: false,
-        },
+        turn(
+            Sender::User,
+            vec![
+                ContentPart::Text("prompt".into()),
+                ContentPart::Image("diagram.png".into()),
+            ],
+        ),
+        turn(
+            Sender::System,
+            vec![ContentPart::Text("instructions".into())],
+        ),
+        turn(Sender::Assistant, content),
+        tool_response(
+            read_call,
+            ToolResponseResult::Completed {
+                result: "contents".into(),
+                is_error: false,
+            },
+        ),
+        tool_response(
+            edit_call,
+            ToolResponseResult::Completed {
+                result: "invalid arguments".into(),
+                is_error: true,
+            },
+        ),
         Entry::Warning("warning".into()),
         Entry::Error("error".into()),
         Entry::Notification("notice".into()),
@@ -133,6 +152,22 @@ fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
     drop(source);
     assert_eq!(snapshot.entries(), entries);
     assert_eq!(branch.entries(), entries);
+}
+
+//
+// Fixtures
+//
+
+fn user(text: &str) -> Entry {
+    turn(Sender::User, vec![ContentPart::Text(text.into())])
+}
+
+fn turn(sender: Sender, content: Vec<ContentPart>) -> Entry {
+    Entry::Turn(Turn { sender, content })
+}
+
+fn tool_response(id: ToolCallId, result: ToolResponseResult) -> Entry {
+    turn(Sender::Tool, vec![ContentPart::ToolResponse { id, result }])
 }
 
 fn reasoning_content() -> Vec<ContentPart> {

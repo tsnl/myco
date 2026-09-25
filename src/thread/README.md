@@ -5,14 +5,20 @@ synchronous and work directly on its entries. The kernel manages distinct thread
 instances, serialization, grouping, and persistence.
 
 ```rust
-use myco::thread::{Entry, Thread};
+use myco::thread::{ContentPart, Entry, Sender, Thread, Turn};
 
 let mut thread = Thread::default();
-thread.push(Entry::User("Explain this repository.".into()));
+thread.push(Entry::Turn(Turn {
+    sender: Sender::User,
+    content: vec![ContentPart::Text("Explain this repository.".into())],
+}));
 let snapshot = thread.clone();
 
 let mut branch = Thread::from_entries(thread[..1].to_vec());
-branch.push(Entry::User("Focus on the model module.".into()));
+branch.push(Entry::Turn(Turn {
+    sender: Sender::User,
+    content: vec![ContentPart::Text("Focus on the model module.".into())],
+}));
 thread.push(Entry::Notification("Review started.".into()));
 
 assert_eq!(snapshot.entries().len(), 1);
@@ -44,22 +50,30 @@ revision counter, or async runtime requirement.
 
 ## Conversation content
 
-Entries distinguish user input, assistant content, tool results, system
-information, warnings, errors, and notifications. Assistant content is ordered.
+An entry holds a `Turn`, warning, error, or notification. Each turn has a `Sender`
+(assistant, user, tool, or system) and ordered content parts. All senders share the
+same content representation, including text and images. `Image(String)` is retained
+as supplied; image loading and provider encoding belong to application code.
 
-`ToolCallId` wraps `uuid::Uuid` and pairs a tool call's `id` with a result's
-`call_id`. Copies preserve that relationship. A model-originated call
-also retains its original `provider_call_id` for context reconstruction; synthetic
-calls can omit it. Workflows resolve a result's provider ID from the matching call
-in the selected history. Execution IDs and retry policy belong to the kernel and
-services.
+`ToolCallId` wraps `uuid::Uuid` and pairs the `id` fields of `ToolCall` and
+`ToolResponse` content parts. Copies preserve that relationship. A model-originated
+call also retains its original `provider_call_id` for context reconstruction;
+synthetic calls can omit it. Workflows resolve a response's provider ID from the
+matching call in the selected history. Execution IDs and retry policy belong to
+the kernel and services.
+
+`ToolResponseResult` distinguishes `Completed { result, is_error }` from
+`Backgrounded`. A later completion can be appended with the same call ID while
+retaining the backgrounding observation. Workflows decide how these observations
+are represented in model context; the kernel manages the actual execution state.
 
 Content owns the original reasoning text and signatures, encrypted reasoning IDs,
 summaries and data, and redacted blocks. Preserve these values and their order when
 rebuilding context. History copies retain them directly; no external inference
 record is needed to recover conversation content.
 
-Workflows choose which entries enter a model prompt, check model compatibility,
-and decide which tool calls may execute. Request traces, usage, timing, and
-execution records stay outside the thread. `model` and `thread` have no dependency
-on one another.
+Workflows choose which entries enter a model prompt, check sender/content and
+model compatibility, and decide which tool calls may execute. The current model
+API remains text-only; these history types do not add image inference support.
+Request traces, usage, timing, and execution records stay outside the thread.
+`model` and `thread` have no dependency on one another.

@@ -264,13 +264,19 @@ and publication checks belong outside `thread`. Its methods are synchronous and
 have no injected storage, registry, or revision counters. Workflow code composes
 these local operations with effectful APIs supplied by the kernel and services.
 
-`thread` owns the canonical conversation entries: user and assistant messages,
-tool results, system information, warnings, errors, and notifications. Its content
-types are independent of inference types. A stored entry need not appear in a
-model prompt; the workflow chooses how to interpret it.
-Tool calls and results share a `ToolCallId`, a newtype around `uuid::Uuid`.
+`thread` owns the canonical history: `Entry::Turn(Turn)`, warnings, errors, and
+notifications. A turn contains a `Sender` (assistant, user, tool, or system) and
+ordered content parts, including text and images. These types are independent of
+inference types. The workflow checks sender/content compatibility and chooses
+which entries enter a model prompt. Image strings are retained as supplied;
+provider image encoding is future work in the model/workflow layer.
+
+Tool calls and responses share a `ToolCallId`, a newtype around `uuid::Uuid`.
 It identifies the call within conversation history and survives history copies.
 Execution attempts, deduplication, and retry records belong to the kernel/services.
+`ToolResponseResult` records `Completed { result, is_error }` or `Backgrounded`.
+A later completion is another observation with the same call ID; workflow
+projection decides how those observations become provider tool results.
 
 Assistant content owns reasoning text and signatures, encrypted reasoning IDs,
 summaries and data, and redacted blocks. Tool calls retain the original
@@ -313,7 +319,7 @@ can expose:
 ```rust
 pub enum TurnUpdate {
     Delta(TurnDelta),
-    Committed(Turn),
+    Committed(thread::Turn),
 }
 ```
 
