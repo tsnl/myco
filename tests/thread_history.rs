@@ -102,7 +102,9 @@ fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
     let edit_call = ToolCallId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap());
     let mut content = reasoning_content();
     content.extend([
-        ContentPart::Text("answer".into()),
+        ContentPart::Text {
+            content: "answer".into(),
+        },
         ContentPart::Refusal("refusal".into()),
         ContentPart::ToolCall {
             id: read_call,
@@ -121,13 +123,19 @@ fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
         turn(
             Sender::User,
             vec![
-                ContentPart::Text("prompt".into()),
-                ContentPart::Image("diagram.png".into()),
+                ContentPart::Text {
+                    content: "prompt".into(),
+                },
+                ContentPart::Image {
+                    url: "https://example.test/diagram.png".into(),
+                },
             ],
         ),
         turn(
             Sender::System,
-            vec![ContentPart::Text("instructions".into())],
+            vec![ContentPart::Text {
+                content: "instructions".into(),
+            }],
         ),
         turn(Sender::Assistant, content),
         tool_response(
@@ -161,7 +169,12 @@ fn clones_and_slice_copies_preserve_replay_content_and_tool_correlation() {
 //
 
 fn user(text: &str) -> Entry {
-    turn(Sender::User, vec![ContentPart::Text(text.into())])
+    turn(
+        Sender::User,
+        vec![ContentPart::Text {
+            content: text.into(),
+        }],
+    )
 }
 
 fn turn(sender: Sender, content: Vec<ContentPart>) -> Entry {

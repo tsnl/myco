@@ -268,8 +268,9 @@ these local operations with effectful APIs supplied by the kernel and services.
 notifications. A turn contains a `Sender` (assistant, user, tool, or system) and
 ordered content parts, including text and images. These types are independent of
 inference types. The workflow checks sender/content compatibility and chooses
-which entries enter a model prompt. Image strings are retained as supplied;
-provider image encoding is future work in the model/workflow layer.
+which entries enter a model prompt. Text uses `Text { content }`; images use
+`Image { url }`. Image URLs are retained as supplied; provider image encoding is
+future work in the model/workflow layer.
 
 Tool calls and responses share a `ToolCallId`, a newtype around `uuid::Uuid`.
 It identifies the call within conversation history and survives history copies.

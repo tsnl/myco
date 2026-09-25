@@ -72,8 +72,12 @@ pub enum Sender {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
-    Text(String),
-    Image(String),
+    Text {
+        content: String,
+    },
+    Image {
+        url: String,
+    },
     Reasoning(Reasoning),
     Refusal(String),
     ToolCall {

@@ -10,14 +10,18 @@ use myco::thread::{ContentPart, Entry, Sender, Thread, Turn};
 let mut thread = Thread::default();
 thread.push(Entry::Turn(Turn {
     sender: Sender::User,
-    content: vec![ContentPart::Text("Explain this repository.".into())],
+    content: vec![ContentPart::Text {
+        content: "Explain this repository.".into(),
+    }],
 }));
 let snapshot = thread.clone();
 
 let mut branch = Thread::from_entries(thread[..1].to_vec());
 branch.push(Entry::Turn(Turn {
     sender: Sender::User,
-    content: vec![ContentPart::Text("Focus on the model module.".into())],
+    content: vec![ContentPart::Text {
+        content: "Focus on the model module.".into(),
+    }],
 }));
 thread.push(Entry::Notification("Review started.".into()));
 
@@ -52,8 +56,9 @@ revision counter, or async runtime requirement.
 
 An entry holds a `Turn`, warning, error, or notification. Each turn has a `Sender`
 (assistant, user, tool, or system) and ordered content parts. All senders share the
-same content representation, including text and images. `Image(String)` is retained
-as supplied; image loading and provider encoding belong to application code.
+same content representation, including `Text { content }` and `Image { url }`.
+Image URLs are retained as supplied; image loading and provider encoding belong
+to application code.
 
 `ToolCallId` wraps `uuid::Uuid` and pairs the `id` fields of `ToolCall` and
 `ToolResponse` content parts. Copies preserve that relationship. A model-originated
