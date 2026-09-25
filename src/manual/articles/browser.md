@@ -186,6 +186,12 @@ with up to 20 selected or pasted images per message. Bytes determine the media
 type. The browser sends the images when you press **Send** or **Queue**;
 rejected sends keep the draft and attachments for retry.
 
+Click an image in a message, tool result, queued message, or attachment preview
+to open the fullscreen viewer. The image fits the viewport without changing its
+aspect ratio. Press Escape, use **Close image viewer**, or click the space around
+the image to return. Images also open with Enter or Space when focused. Viewing
+an image does not send a message or interrupt running work.
+
 When the input is empty, Up highlights the newest user message; press Up again
 for earlier messages and Down for later ones. The input keeps focus and stays
 empty. Down past the newest message, Escape, or **Latest output** returns to

@@ -72,7 +72,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -105,6 +105,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = reply(f"{name} finished.")
         elif "getlink" in prompt:
             events = tool({"path": fixture.static_path}, "getlink")
+        elif "view image" in prompt:
+            events = tool({"path": str(fixture.workspace / 'pixel.png')}, "view_image")
         elif "rename" in prompt:
             events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
         elif "parallel" in prompt:
@@ -2923,6 +2925,94 @@ context_window = 100000
         expect(page.get_by_role('region', name='Markdown table')).to_have_count(2)
         expect(tables.first.locator('th').nth(1)).to_have_css('text-align', 'center')
         self.assertEqual(violations, [])
+
+    def test_image_viewer_fits_markdown_images_and_preserves_linked_image_navigation(self):
+        profile = self.add_profile()
+        for name, width, height in [('wide', 1600, 900), ('tall', 900, 1600)]:
+            (profile / 'workspace' / f'{name}.svg').write_text(
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="cornflowerblue"/></svg>')
+        self.link_reply = '[![Wide preview](wide.svg)](wide.svg)\n\n![Tall preview](tall.svg)'
+        page = self.session(self.page, profile='research')
+        self.submit(page, 'Alpha links')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        location, tabs = page.url, len(self.context.pages)
+        for width in [1200, 390]:
+            page.set_viewport_size({'width': width, 'height': 844})
+            for index, ratio in [(0, 1600 / 900), (1, 900 / 1600)]:
+                original = page.locator('.markdown img').nth(index)
+                original.click()
+                viewer = page.get_by_role('dialog', name='Image viewer')
+                expect(viewer).to_be_visible()
+                expanded = viewer.locator('img')
+                expect(expanded).to_have_js_property('naturalWidth', 1600 if index == 0 else 900)
+                self.assertEqual(expanded.get_attribute('src'), original.evaluate('img => img.currentSrc'))
+                self.assertIn('/profiles/research/files/', expanded.get_attribute('src'))
+                self.assertEqual(viewer.bounding_box(), {'x': 0, 'y': 0, 'width': width, 'height': 844})
+                box = expanded.bounding_box()
+                self.assertAlmostEqual(box['width'] / box['height'], ratio, places=2)
+                self.assertLessEqual(box['width'], width)
+                self.assertLessEqual(box['height'], 844)
+                expanded.click()
+                expect(viewer).to_be_visible()
+                page.keyboard.press('Escape')
+                expect(viewer).not_to_be_visible()
+                expect(original).to_be_focused()
+                original.press('Enter')
+                viewer.get_by_role('button', name='Close image viewer').click()
+                original.press('Space')
+                viewer.click(position={'x': 4, 'y': 4})
+                expect(viewer).not_to_be_visible()
+                self.assertEqual(page.url, location)
+                self.assertEqual(len(self.context.pages), tabs)
+        page.reload()
+        page.locator('.markdown img').first.click()
+        expect(page.get_by_role('dialog', name='Image viewer')).to_be_visible()
+
+    def test_image_viewer_previews_attachments_queue_and_saved_messages_without_sending(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        self.choose_image(page)
+        page.fill('#prompt', 'Beta images')
+        page.locator('#attachment-list img').press('Space')
+        viewer = page.get_by_role('dialog', name='Image viewer')
+        expect(viewer.locator('img')).to_have_js_property('naturalWidth', 1)
+        page.keyboard.press('Escape')
+        expect(page.locator('#prompt')).to_have_value('Beta images')
+        self.assertEqual(len(self.requests), 1)
+        page.click('#send')
+        page.locator('#queued-list img').click()
+        expect(viewer.locator('img')).to_have_js_property('naturalWidth', 1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#queued')).to_be_hidden()
+        expect(viewer).to_be_visible()
+        page.keyboard.press('Escape')
+        expect(page.locator('#prompt')).to_be_focused()
+        page.reload()
+        page.locator('.user img').click()
+        expect(viewer.locator('img')).to_have_js_property('naturalWidth', 1)
+        viewer.get_by_role('button', name='Close image viewer').click()
+        expect(page.locator('.user img')).to_be_focused()
+
+    def test_image_viewer_opens_tool_images_and_reports_unavailable_images(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha view image')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        page.locator('.tool summary').click()
+        original = page.locator('.tool img')
+        expect(original).to_have_js_property('naturalWidth', 1)
+        source = original.evaluate('img => img.currentSrc')
+        original.click()
+        viewer = page.get_by_role('dialog', name='Image viewer')
+        expect(viewer.locator('img')).to_have_js_property('naturalWidth', 1)
+        page.keyboard.press('Escape')
+        page.route(source, lambda route: route.fulfill(status=404, body='Missing image'))
+        original.click()
+        expect(viewer.locator('[role="status"]')).to_have_text('Image unavailable.')
+        page.keyboard.press('Escape')
+        expect(viewer).not_to_be_visible()
+        expect(original).to_be_focused()
 
     def test_markdown_images_and_floating_controls(self):
         page = self.session(self.page)

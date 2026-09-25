@@ -122,6 +122,15 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .markdown.pending { color: var(--dim); }
 .markdown[data-render-error]::after { content: attr(data-render-error); display: block; margin-top: .8em; color: var(--amber); }
 img { display: block; max-width: 100%; height: auto; max-height: 75vh; object-fit: contain; object-position: left center; margin: 14px 0; border-radius: 0; }
+.image-preview { cursor: zoom-in; }
+.image-preview:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+html.viewing-image { overflow: hidden; }
+#image-viewer { position: fixed; inset: 0; width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: max(64px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left)); border: 0; background: var(--glass-panel); backdrop-filter: var(--glass-filter); color: inherit; overflow: hidden; overscroll-behavior: contain; }
+#image-viewer[open] { display: flex; align-items: center; justify-content: center; }
+#image-viewer::backdrop { background: #00000080; }
+#image-viewer .image-viewer-image { flex: none; width: auto; height: auto; max-width: 100%; max-height: 100%; margin: 0; object-position: center; }
+.image-viewer-close { position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); min-width: 40px; min-height: 40px; padding: 0; font-size: 24px; background: var(--glass-raised); }
+#image-viewer [role="status"] { color: var(--dim); }
 .tool { position: relative; --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
 .tool.running { --tool-color: rgb(var(--sky-light, 139 213 220)); border-color: rgb(var(--sky-light, 139 213 220) / .3); }
 /* Animate only the decorative rim, keeping output and glass steady. */
