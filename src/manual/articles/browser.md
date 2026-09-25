@@ -160,8 +160,12 @@ browser. The browser shows **Session Archived.** with an **Undo** button that
 restores the session to the active list. Undo remains available after a refresh.
 Archiving from a row in the session browser shows the same confirmation.
 Choose **Archived sessions** above the list to find archived sessions and **Restore**
-them. Archiving preserves history, the session URL, and running tools; an open
-tab can continue its turn. It does not archive child sessions. A session held
+them. Archived sessions have an **Archived** badge in the list and session header,
+alongside their activity status. The session toolbar offers **Restore**, which
+restores the session in place and keeps your draft. The badge updates in other
+open tabs when you archive, restore, or undo. Opening an archived session does
+not restore it. Archiving preserves history, the session URL, and running tools;
+an open tab can continue its turn. It does not archive child sessions. A session held
 by another myco process must be archived from that process or after it closes.
 The list refreshes while the home page is visible; changes made outside this
 server can take up to ten seconds to appear.
@@ -498,7 +502,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | --- | --- |
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
 | `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
-| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `busy`, `status`, `blocks`, `queued`, `timers`, `usage`, and `context_window_tokens` |
+| `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `archived`, `busy`, `status`, `blocks`, `queued`, `timers`, `usage`, and `context_window_tokens` |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"update_queued","message_id":"UUID","revision":0,"update":{"kind":"edit"}}` |

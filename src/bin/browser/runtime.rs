@@ -65,6 +65,7 @@ struct Snapshot {
     session_id: String,
     thread_id: String,
     title: String,
+    archived: bool,
     model: String,
     models: Vec<String>,
     attachment_limits: attachments::Limits,
@@ -82,7 +83,7 @@ impl Snapshot {
     fn metadata(&self) -> Value {
         json!({
             "session_id": self.session_id, "thread_id": self.thread_id,
-            "title": self.title, "model": self.model,
+            "title": self.title, "archived": self.archived, "model": self.model,
             "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
@@ -257,6 +258,7 @@ impl App {
             .title
             .clone()
             .unwrap_or_else(|| "New session".into());
+        snapshot.archived = session.archived;
         snapshot.model = boot.catalog_model.spec.key.clone();
         snapshot.attachment_limits =
             attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
@@ -281,24 +283,26 @@ impl App {
     }
 
     fn refresh_metadata(&self, session: &ActiveSession) {
-        let (title, usage) = session.with(|session| {
+        let (title, archived, usage) = session.with(|session| {
             (
                 session
                     .title
                     .clone()
                     .unwrap_or_else(|| "New session".into()),
+                session.archived,
                 session.active_thread().last_usage,
             )
         });
         let mut live = self.live.lock().unwrap();
-        let title_changed = live.snapshot.title != title;
-        if title_changed || live.snapshot.usage != usage {
+        let listing_changed = live.snapshot.title != title || live.snapshot.archived != archived;
+        if listing_changed || live.snapshot.usage != usage {
             live.snapshot.title = title;
+            live.snapshot.archived = archived;
             live.snapshot.usage = usage;
             let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
             self.publish(&mut live.snapshot, change);
         }
-        if title_changed {
+        if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -686,6 +690,7 @@ impl Sessions {
                                 .title
                                 .clone()
                                 .unwrap_or_else(|| "New session".into()),
+                            archived: session.archived,
                             model: config.model.clone(),
                             models: config
                                 .models
@@ -813,7 +818,8 @@ impl Sessions {
 
     pub(super) async fn set_archived(&self, id: String, archived: bool) -> Result<()> {
         let running = self.running.lock().await;
-        let active = running.get(&id).map(|s| s.session.clone());
+        let entry = running.get(&id);
+        let active = entry.map(|s| s.session.clone());
         tokio::task::spawn_blocking(move || {
             if let Some(active) = active {
                 active.set_archived(archived).map_err(Error::Internal)
@@ -830,6 +836,9 @@ impl Sessions {
         .await
         .map_err(|e| Error::Internal(e.to_string()))??;
         self.generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = entry {
+            entry.app.refresh_metadata(&entry.session);
+        }
         Ok(())
     }
 

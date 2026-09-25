@@ -86,6 +86,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 session_id: id.into(),
                 thread_id: "thread".into(),
                 title: "Test".into(),
+                archived: false,
                 model: "test".into(),
                 models: vec!["test".into(), "second".into()],
                 attachment_limits: attachments::Limits::new(
