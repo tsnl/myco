@@ -19,12 +19,14 @@ never participates in session state or conversation requests.
 | `rain.js`, `aircraft.js` | Independent precipitation and decorative flight layers |
 | `sky.css` | Sky layers, weather settings, and motion preferences |
 
-The renderer keeps 24 density fields (eight per altitude). Each texture has three
-canvas copies to wrap in either wind direction. Density determines alpha and is
-independent of lighting, so relighting preserves the outline. Higher coverage
-fades in additional clouds, including broad veils, without changing existing
-shapes. The whole cloud bank is composited before fading, which limits opacity
-even where layers overlap.
+The renderer keeps 24 density fields (eight per altitude). Each texture becomes
+one lossless image shared by three copies to wrap in either wind direction.
+Only offscreen scratch canvases encode pixels, so the browser can combine static
+cloud images instead of maintaining 72 independent canvas surfaces. Density
+determines alpha and is independent of lighting, so relighting preserves the
+outline. Higher coverage fades in additional clouds, including broad veils,
+without changing existing shapes. The whole cloud bank is composited before
+fading, which limits opacity even where layers overlap.
 
 The worker yields between textures, pauses in hidden tabs, and tags replies with
 a generation so superseded lighting cannot overwrite the current scene. Only

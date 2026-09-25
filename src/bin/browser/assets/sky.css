@@ -17,7 +17,7 @@
 .cloud-layer { position: absolute; inset: 0 auto 0 50%; width: max(100vw, 1440px); transform: translateX(-50%); }
 .cloud-track { position: absolute; inset: 0; animation: cloud-drift var(--drift-duration, 4800s) steps(var(--drift-steps, 19200)) infinite; animation-direction: var(--drift-direction, normal); }
 .cloud-sprite { position: absolute; transform: translate(-50%, -50%); opacity: 0; transition: opacity 12s; }
-.cloud-sprite canvas { display: block; width: 100%; height: 100%; transform: rotate(var(--cloud-tilt, 0deg)); }
+.cloud-sprite img { display: block; width: 100%; height: 100%; max-height: none; margin: 0; object-fit: fill; transform: rotate(var(--cloud-tilt, 0deg)); }
 .cloud-high { opacity: .64; }
 .cloud-mid { opacity: .87; }
 #sky.paused .cloud-track { animation-play-state: paused; }
