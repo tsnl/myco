@@ -67,10 +67,11 @@ the kernel and services.
 retaining the backgrounding observation. Workflows decide how these observations
 are represented in model context; the kernel manages the actual execution state.
 
-Content owns the original reasoning text and signatures, encrypted reasoning IDs,
-summaries and data, and redacted blocks. Preserve these values and their order when
-rebuilding context. History copies retain them directly; no external inference
-record is needed to recover conversation content.
+Reasoning uses one content variant, `ContentPart::Reasoning(Reasoning)`. Its payload
+is `Text { text, signature }`, `Encrypted { id, summary, data }`, or
+`Redacted(String)`. Preserve these fields, summary boundaries, and content order
+when rebuilding context. History copies retain them directly; no external
+inference record is needed to recover conversation content.
 
 Workflows choose which entries enter a model prompt, check sender/content and
 model compatibility, and decide which tool calls may execute. The current model

@@ -70,24 +70,11 @@ pub enum Sender {
     System,
 }
 
-//
-// Content
-//
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
     Text(String),
     Image(String),
-    Reasoning {
-        text: String,
-        signature: Option<String>,
-    },
-    EncryptedReasoning {
-        id: String,
-        summary: Vec<String>,
-        data: String,
-    },
-    RedactedReasoning(String),
+    Reasoning(Reasoning),
     Refusal(String),
     ToolCall {
         id: ToolCallId,
@@ -99,6 +86,20 @@ pub enum ContentPart {
         id: ToolCallId,
         result: ToolResponseResult,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reasoning {
+    Text {
+        text: String,
+        signature: Option<String>,
+    },
+    Encrypted {
+        id: String,
+        summary: Vec<String>,
+        data: String,
+    },
+    Redacted(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

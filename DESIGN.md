@@ -278,8 +278,9 @@ Execution attempts, deduplication, and retry records belong to the kernel/servic
 A later completion is another observation with the same call ID; workflow
 projection decides how those observations become provider tool results.
 
-Assistant content owns reasoning text and signatures, encrypted reasoning IDs,
-summaries and data, and redacted blocks. Tool calls retain the original
+`thread::ContentPart::Reasoning(Reasoning)` groups text, encrypted, and redacted
+reasoning. Its payload retains the original text and signature, encrypted reasoning
+ID/summary/data, or opaque redacted block, respectively. Tool calls retain the original
 `provider_call_id` alongside their conversation ID; synthetic calls can omit it.
 Workflow code resolves each result's provider ID from its matching call and
 preserves reasoning fields and order when rebuilding model context. This content
