@@ -40,7 +40,7 @@ receipts, cancellation, and publication checks are responsibilities of the kerne
 and its callers. The thread module has no storage dependency, shared registry,
 revision counter, or async runtime requirement.
 
-## Entries and model evidence
+## Entries and inference records
 
 Entries distinguish user input, assistant content, tool results, system
 information, warnings, errors, and notifications. Assistant content is ordered.
@@ -49,13 +49,14 @@ operation and reuses it for the tool call, its result, and retries. These
 values describe history without deciding which entries enter a model prompt or
 which tool calls may execute. Workflows compose thread operations with inference.
 
-An assistant entry can reference an immutable inference record with `EvidenceId`.
-The workflow retains the complete model message there, including signed/encrypted
-reasoning and provider call IDs, and resolves it when rebuilding context. The
-kernel persists that record before publishing a durable reference to it and
-retains it while referenced. Missing evidence must not be silently replaced with
-reconstructed reasoning. Synthetic entries can omit it.
+An assistant entry's `inference_record: Option<InferenceRecordId>` references an
+immutable inference record. The workflow retains the complete model message there,
+including signed/encrypted reasoning and provider call IDs, and resolves it when
+rebuilding context. The kernel persists that record before publishing a durable
+reference to it and retains it while referenced. A missing record must not be
+reconstructed from the portable reasoning text. Synthetic entries can omit the
+reference.
 
-The thread module only carries the reference and portable content. Evidence
-management, model compatibility, and context projection belong to workflow/kernel
-code. `model` and `thread` have no dependency on one another.
+The thread module only carries the reference and portable content. Managing
+inference records, model compatibility, and context projection belongs to
+workflow/kernel code. `model` and `thread` have no dependency on one another.

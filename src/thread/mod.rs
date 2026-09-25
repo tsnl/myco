@@ -34,7 +34,7 @@ impl Thread {
 pub type OperationId = uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EvidenceId(pub u128);
+pub struct InferenceRecordId(pub u128);
 
 //
 // Entries
@@ -45,7 +45,7 @@ pub enum Entry {
     User(String),
     Assistant {
         content: Vec<ContentPart>,
-        evidence: Option<EvidenceId>,
+        inference_record: Option<InferenceRecordId>,
     },
     ToolResult {
         operation: OperationId,

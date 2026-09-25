@@ -268,11 +268,12 @@ model prompt; the workflow chooses how to interpret it.
 Tool calls and results share a stable `OperationId`, an alias for `uuid::Uuid`.
 The workflow assigns it once per logical operation and retains it across retries.
 
-Assistant entries can carry an `EvidenceId` referencing an immutable inference
-record. Workflow/kernel code retains the complete model message there, including
-signed/encrypted reasoning, and resolves it when constructing model context.
-Persistence keeps that evidence available before publishing a durable reference.
-Thread values carry the reference without managing evidence or depending on model
+Assistant entries can carry an `inference_record: Option<InferenceRecordId>`
+referencing an immutable inference record. Workflow/kernel code retains the
+complete model message there, including signed/encrypted reasoning, and resolves
+it when constructing model context.
+Persistence keeps that record available before publishing a durable reference.
+Thread values carry the reference without managing records or depending on model
 types. The kernel can construct values with `from_entries` using its own format.
 
 ## Workflow composition and streaming
@@ -316,9 +317,9 @@ pub enum TurnUpdate {
 attempt identity and content-block coordinates, including incomplete tool arguments.
 `model::Event::Completed { message, finish, usage }` supplies the assembled message
 and validated inference outcome, including fields absent from provisional deltas.
-Workflow code records its evidence, checks conversation structure and correlation,
-and appends the accepted entry. Before an update is exposed as `Committed`, the
-kernel publishes the resulting thread value and operation receipt, checking
+Workflow code retains the inference record, checks conversation structure and
+correlation, and appends the accepted entry. Before an update is exposed as
+`Committed`, the kernel publishes the resulting thread value and operation receipt, checking
 expected source history and cancellation. A refusal or output limit can be
 recorded as such; incomplete arguments never authorize tool execution.
 
@@ -427,8 +428,8 @@ request before polling the inference stream into dispatch, and translate progres
 and its final outcome into thread values.
 
 Raw provider metadata and provider-call/invocation-ID mappings remain in
-interpreter records. Evidence is durable before a thread or operation can
-reference it. Retained history keeps evidence reachable.
+interpreter records. These records are durable before a thread or operation can
+reference them. Retained history keeps the records reachable.
 
 Tool adapters validate against pinned schemas, invoke a service or internal kernel
 operation, and record a translated outcome. GUI controls use those same service
@@ -446,7 +447,7 @@ a new ID. Request deduplication cannot guarantee exactly-once external effects.
 The kernel checks generation's expected source history and cancellation state in
 the same publication transaction. A lost response after commit is recovered from
 its receipt.
-Partial streamed output stays in attempt evidence unless explicitly accepted as
+Partial streamed output stays in attempt records unless explicitly accepted as
 an incomplete turn; it is never mistaken for a finished reply.
 
 Cancellation is an explicit request to the supervised operation. It prevents
