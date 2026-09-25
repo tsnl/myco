@@ -265,8 +265,9 @@ these local operations with effectful APIs supplied by the kernel and services.
 tool results, system information, warnings, errors, and notifications. Its content
 types are independent of inference types. A stored entry need not appear in a
 model prompt; the workflow chooses how to interpret it.
-Tool calls and results share a stable `OperationId`, an alias for `uuid::Uuid`.
+Tool calls and results share a stable `OperationId`.
 The workflow assigns it once per logical operation and retains it across retries.
+`OperationId` and `InferenceRecordId` are distinct newtypes around `uuid::Uuid`.
 
 Assistant entries can carry an `inference_record: Option<InferenceRecordId>`
 referencing an immutable inference record. Workflow/kernel code retains the

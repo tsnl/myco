@@ -32,9 +32,11 @@ fn cloned_values_can_grow_independently_without_shared_storage() {
 
 #[test]
 fn constructing_a_thread_preserves_inference_record_references() {
+    let inference_record =
+        InferenceRecordId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c200".parse().unwrap());
     let entries = vec![Entry::Assistant {
         content: vec![ContentPart::Text("summary".into())],
-        inference_record: Some(InferenceRecordId(200)),
+        inference_record: Some(inference_record),
     }];
     let mut thread = Thread::from_entries(entries.clone());
     let snapshot = thread.clone();
@@ -87,8 +89,10 @@ fn empty_and_full_prefixes_fork_but_an_out_of_bounds_prefix_does_not() {
 
 #[test]
 fn forks_preserve_content_order_tool_correlation_and_inference_record_references() {
-    let read_operation: OperationId = "5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap();
-    let edit_operation: OperationId = "5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap();
+    let read_operation = OperationId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c100".parse().unwrap());
+    let edit_operation = OperationId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c101".parse().unwrap());
+    let inference_record =
+        InferenceRecordId("5cb5a034-074d-4c5a-90b0-a2fdf8a9c200".parse().unwrap());
     let content = vec![
         ContentPart::Reasoning("thinking".into()),
         ContentPart::Text("answer".into()),
@@ -109,7 +113,7 @@ fn forks_preserve_content_order_tool_correlation_and_inference_record_references
         Entry::System("instructions".into()),
         Entry::Assistant {
             content,
-            inference_record: Some(InferenceRecordId(200)),
+            inference_record: Some(inference_record),
         },
         Entry::ToolResult {
             operation: read_operation,

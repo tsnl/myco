@@ -44,10 +44,11 @@ revision counter, or async runtime requirement.
 
 Entries distinguish user input, assistant content, tool results, system
 information, warnings, errors, and notifications. Assistant content is ordered.
-`OperationId` is an alias for `uuid::Uuid`. The workflow assigns it once per logical
-operation and reuses it for the tool call, its result, and retries. These
-values describe history without deciding which entries enter a model prompt or
-which tool calls may execute. Workflows compose thread operations with inference.
+`OperationId` and `InferenceRecordId` are distinct newtypes around `uuid::Uuid`.
+The workflow assigns an `OperationId` once per logical operation and reuses it for
+the tool call, its result, and retries. These values describe history without
+deciding which entries enter a model prompt or which tool calls may execute.
+Workflows compose thread operations with inference.
 
 An assistant entry's `inference_record: Option<InferenceRecordId>` references an
 immutable inference record. The workflow retains the complete model message there,

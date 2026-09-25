@@ -31,10 +31,11 @@ impl Thread {
 // Identifiers
 //
 
-pub type OperationId = uuid::Uuid;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OperationId(pub uuid::Uuid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InferenceRecordId(pub u128);
+pub struct InferenceRecordId(pub uuid::Uuid);
 
 //
 // Entries
