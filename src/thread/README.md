@@ -109,4 +109,4 @@ Neither map nor content contains executable callbacks.
 
 Execution records, timestamps, usage, retry decisions, cancellation, and partial
 streamed drafts belong to the workflow/kernel. Only accepted generation outcomes
-are appended. `model` and `thread` remain independent modules.
+are appended. `gen_ai` and `thread` remain independent modules.

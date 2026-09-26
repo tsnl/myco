@@ -1,4 +1,4 @@
-# myco::model
+# myco::gen_ai
 
 One inference attempt, independent of agent behavior, storage, and tool execution.
 `GenAiClient` is a concrete type; `Config` selects OpenAI Responses or Anthropic
@@ -7,7 +7,7 @@ limits are supplied by the caller. Backend drivers are private.
 
 ```no_run
 use futures_util::StreamExt;
-use myco::model::{Config, DeltaKind, Event, GenAiClient, InputContentPart, Message, MessageKind, Request};
+use myco::gen_ai::{Config, DeltaKind, Event, GenAiClient, InputContentPart, Message, MessageKind, Request};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = GenAiClient::new(Config::OpenAi {
@@ -45,7 +45,7 @@ by reference or through `Arc<GenAiClient>` for concurrent requests. Additional
 provider settings, such as `reasoning` or `thinking`, go in
 `Request::driver_options`; these cannot replace managed context, tool, or
 stream fields. No model catalog, environment loading, or policy defaults are
-embedded in the model module.
+embedded in the `gen_ai` module.
 
 Workflow code in `logic` translates selected thread history into a `Request`
 and translates stream events into conversation turns. Every request supplies
@@ -129,13 +129,13 @@ not change earlier wire IDs. This mapping does not translate reasoning formats.
 User messages and tool results contain `Vec<InputContentPart>`: text or an image's
 media type and reference-counted bytes. Workflows currently resolve thread `BlobRef`s
 using a `BlobStore` before constructing these inputs. No URL or file loading
-occurs in the model module. Encoders construct base64 only for the outbound
+occurs in the `gen_ai` module. Encoders construct base64 only for the outbound
 request, preserving images inside their correlated tool result. Empty image bytes
 and unsupported media types fail before dispatch; file validation, image decoding,
 and input-size policy belong to the caller.
 
 The planned API exposes a shared `BlobStore` through `GenAiClient` and accepts blob
-references in requests, moving resolution into the model boundary. This integration
+references in requests, moving resolution into the `gen_ai` boundary. This integration
 is a subsequent step in [DESIGN.md](../../DESIGN.md#thread-history).
 
 Reasoning metadata is explicit in the completed message: `ContentPart::Reasoning`

@@ -10,7 +10,7 @@ targets of the same package. The browser GUI is a separate Yew application.
 ```text
 src/
   lib.rs
-  model/                       # Inference client, types, and private drivers
+  gen_ai/                      # Inference client, types, and private drivers
   thread/                      # Owned conversations and local history operations
   logic/
     agent.rs                   # Conversation and tool loop
@@ -34,13 +34,13 @@ flowchart LR
         kernel --> agent[logic::agent]
         agent --> compact[logic::compact]
         agent --> thread
-        agent --> model
+        agent --> gen_ai
         compact --> thread
-        compact --> model
+        compact --> gen_ai
         kernel --> thread
-        kernel --> model
+        kernel --> gen_ai
         thread[thread]
-        model[model]
+        gen_ai[gen_ai]
         kernel --> terminal[service::terminal_service]
         kernel --> filesystem[service::filesystem_service]
     end
@@ -58,7 +58,7 @@ flowchart LR
     scripts -. HTTP / event streams .-> server
 ```
 
-`model`, `thread`, and `service` do not depend on each other or on `logic`.
+`gen_ai`, `thread`, and `service` do not depend on each other or on `logic`.
 Workflow modules compose them; `logic::kernel` constructs dependencies and runs
 workflows. `api` calls the kernel's Rust API. Most implementation details remain
 private or `pub(crate)`; module interfaces and review enforce dependency direction.
@@ -85,7 +85,7 @@ implementing `Stream<Item = Result<Event, Error>>`; network I/O waits for pollin
 It yields the request before dispatch, raw progress, normalized deltas, and one
 `Completed { message, finish, usage }` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
-trait; there is no public model trait. The model module does not commit turns.
+trait; there is no public model trait. The `gen_ai` module does not commit turns.
 Each request supplies the complete selected conversation history. Backends rebuild
 their request from those messages. `MessageKind::Assistant` holds an ordered
 `content: Vec<ContentPart>` for both generated replies and request history.
@@ -116,7 +116,7 @@ Kernel tools can create, fork, read, submit input to, or request work on another
 thread in the workspace. A subagent tool starts an agent on a new thread and
 records its relationship to the requesting operation. Creation is deduplicated
 by operation ID; input acceptance and the eventual reply are separate observations.
-These tools call kernel operations directly. Inference uses `model::GenAiClient`.
+These tools call kernel operations directly. Inference uses `gen_ai::GenAiClient`.
 
 ### Hosts and remote transport
 
@@ -259,10 +259,10 @@ share blob bytes. The kernel handles loading, access, size limits, persistence,
 export, and retention. Blobs must be durable before publishing their references,
 and remain available while any saved history needs them.
 
-Currently, workflows resolve blobs into model input bytes. The planned model API
+Currently, workflows resolve blobs into model input bytes. The planned `gen_ai` API
 exposes a caller-supplied shared `BlobStore` through `GenAiClient` and accepts
 `BlobRef`s in requests. Encoding resolves references and constructs provider wire
-data. Blob contracts will live below both `model` and `thread`, so inference does
+data. Blob contracts will live below both `gen_ai` and `thread`, so inference does
 not depend on history types. The kernel owns the store's lifetime across threads,
 clients, and generation attempts; dropping a generation does not discard blobs.
 
@@ -298,7 +298,7 @@ Search candidates isolate tool workspaces or defer tool effects until selection.
 A session can group threads; background work can create successive threads without
 an enclosing agent object.
 
-`model` has its own inference input, content, and incremental-part vocabulary.
+`gen_ai` has its own inference input, content, and incremental-part vocabulary.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
 Thread authorship and tool observations are interpreted by each workflow. Raw
@@ -317,7 +317,7 @@ pub enum TurnUpdate {
 
 `TurnUpdate` belongs to `logic`, not the history API. Deltas carry generation/
 attempt identity and content-block coordinates, including incomplete tool arguments.
-`model::Event::Completed { message, finish, usage }` supplies the assembled message
+`gen_ai::Event::Completed { message, finish, usage }` supplies the assembled message
 and validated inference outcome, including fields absent from provisional deltas.
 Workflow code checks conversation structure and correlation, preserves replay
 data in the content, and appends the accepted entry. Before an update is exposed
@@ -424,7 +424,7 @@ on the expected source/selection state. A late summary cannot replace newer work
 Failure before publication leaves the sources intact; cancellation committed first
 prevents publication. Already published history remains available.
 
-Provider request/response types stay in `model` and its callers in `logic`.
+Provider request/response types stay in `gen_ai` and its callers in `logic`.
 Workflow adapters pin model configuration and capabilities, record the exact
 request before polling the inference stream into dispatch, and translate progress
 and its final outcome into thread values.
@@ -488,7 +488,7 @@ Review steps are module-sized changes within the engine crate.
 
 1. **Interfaces:** module boundaries, history operations, workflow composition,
    stream completion, persistence, cancellation, and recovery.
-2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
+2. **Gen AI:** `gen_ai::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
 3. **Thread:** owned turn histories, blob stores, multimodal tool results,

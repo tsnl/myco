@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{
+use myco::gen_ai::{
     Config, Error, Event, Finish, GenAiClient, Generation, InputContentPart, Message, MessageKind,
     Request, Usage,
 };

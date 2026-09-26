@@ -1,11 +1,11 @@
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
-use myco::model::{Event, InputContentPart, Message, MessageKind, Request};
+use myco::gen_ai::{Event, InputContentPart, Message, MessageKind, Request};
 
 mod common;
 
 use common::*;
-use myco::model::{ContentPart, DeltaKind, Error, Finish, Tool, ToolCall};
+use myco::gen_ai::{ContentPart, DeltaKind, Error, Finish, Tool, ToolCall};
 use serde_json::{Value, json};
 
 #[test]

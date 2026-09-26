@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{
+use myco::gen_ai::{
     Config, Error, Event, GenAiClient, InputContentPart, Message, MessageKind, Request,
 };
 use tokio::{net::TcpListener, time::timeout};
