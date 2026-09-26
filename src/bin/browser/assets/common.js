@@ -2,6 +2,14 @@ import { profilePath } from './scope.js';
 
 export const $ = (id) => document.getElementById(id);
 
+// Both pages reserve the fixed toolbar's actual height, including wrapped rows.
+export function trackToolbarHeight() {
+  const toolbar = document.querySelector('.toolbar');
+  const measure = () => document.documentElement.style.setProperty('--toolbar-height', `${toolbar.getBoundingClientRect().height}px`);
+  measure();
+  new ResizeObserver(measure).observe(toolbar);
+}
+
 // Request ids deduplicate retries, so they must be unique, not unguessable.
 // Keep the fallback for browsers that do not expose randomUUID.
 export const requestId = () =>

@@ -1,4 +1,4 @@
-import { $, api, element, error, clearError, requestId, setArchived } from './common.js';
+import { $, api, element, error, clearError, requestId, setArchived, trackToolbarHeight } from './common.js';
 import { showActivity } from './activity.js';
 import { sessionTimers } from './timers.js';
 import { messageComposer } from './composer.js';
@@ -82,9 +82,7 @@ function jumpToLatest() {
   $('prompt').focus({ preventScroll: true });
 }
 $('jump').onclick = jumpToLatest;
-new ResizeObserver(() => {
-  document.documentElement.style.setProperty('--toolbar-height', `${document.querySelector('.toolbar').offsetHeight}px`);
-}).observe(document.querySelector('.toolbar'));
+trackToolbarHeight();
 new ResizeObserver(() => {
   document.documentElement.style.setProperty('--composer-height', `${$('composer').offsetHeight}px`);
   scrollLatest();

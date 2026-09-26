@@ -1,9 +1,10 @@
-import { $, api, element, error, clearError, setArchived } from './common.js';
+import { $, api, element, error, clearError, setArchived, trackToolbarHeight } from './common.js';
 import { showActivity } from './activity.js';
 import { sessionRenamer } from './rename.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 
 document.title = `Sessions · ${profileName} · myco`;
+trackToolbarHeight();
 
 let sessions = [];
 let refreshing = null;
