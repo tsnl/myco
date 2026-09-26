@@ -1,11 +1,11 @@
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
-use myco::model::{Event, Message, Request};
+use myco::gen_ai::{Event, InputContentPart, Message, MessageKind, Request};
 
 mod common;
 
 use common::*;
-use myco::model::{ContentPart, DeltaKind, Error, Finish, Tool, ToolCall};
+use myco::gen_ai::{ContentPart, DeltaKind, Error, Finish, Tool, ToolCall};
 use serde_json::{Value, json};
 
 #[test]
@@ -41,7 +41,7 @@ async fn request_capture_precedes_any_network_io() {
     let trace = collect(
         &model,
         Request {
-            messages: vec![Message::User("hello".into())],
+            messages: vec![user("hello")],
             ..request()
         },
     )
@@ -83,9 +83,9 @@ async fn ordered_progress_precedes_one_final_response_and_permanent_exhaustion()
     };
     assert_eq!(
         message,
-        Message::Assistant {
+        Message::new(MessageKind::Assistant {
             content: vec![ContentPart::Text("hello".into())]
-        }
+        })
     );
     assert_eq!(finish, Finish::Stop);
     assert_eq!(usage.input_tokens, None);
@@ -111,7 +111,7 @@ async fn completed_messages_rebuild_full_history_including_reasoning_for_each_ba
         });
         let trace = collect(&model, initial).await;
         let reply = completed(&trace);
-        let Message::Assistant { content: output } = &reply.message else {
+        let MessageKind::Assistant { content: output } = &reply.message.kind else {
             panic!("missing assistant message");
         };
         assert_eq!(reply.finish, Finish::ToolCalls);
@@ -124,7 +124,7 @@ async fn completed_messages_rebuild_full_history_including_reasoning_for_each_ba
                 _ => None,
             })
             .unwrap();
-        assert_eq!(call.id, "call_fixture");
+        assert!(uuid::Uuid::parse_str(&call.id).is_ok());
         assert_eq!(call.arguments, Ok(json!({"path":"note.txt"})));
         let arguments: String = trace
             .events
@@ -151,12 +151,14 @@ async fn completed_messages_rebuild_full_history_including_reasoning_for_each_ba
         let mut next = request();
         next.messages.extend([
             reply.message.clone(),
-            Message::User("Continue.".into()),
-            Message::ToolResult {
+            user("Continue."),
+            Message::new(MessageKind::ToolResult {
                 call_id: call.id.clone(),
-                output: "Note content".into(),
+                content: vec![InputContentPart::Text {
+                    content: "Note content".into(),
+                }],
                 is_error: false,
-            },
+            }),
         ]);
         assert_eq!(next.messages[1], reply.message);
         let restored = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
@@ -219,7 +221,7 @@ async fn unknown_output_stays_in_raw_events_without_entering_history() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant { content: output } = &reply.message else {
+    let MessageKind::Assistant { content: output } = &reply.message.kind else {
         panic!("missing assistant message");
     };
     assert_eq!(output, &[ContentPart::Text("full response".into())]);
@@ -386,11 +388,13 @@ fn unmatched_and_duplicate_tool_results_are_rejected_before_dispatch() {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
         for id in ["missing", "call"] {
             let mut input = tool_history(Ok(json!({})));
-            input.messages.push(Message::ToolResult {
+            input.messages.push(Message::new(MessageKind::ToolResult {
                 call_id: id.into(),
-                output: "extra result".into(),
+                content: vec![InputContentPart::Text {
+                    content: "extra result".into(),
+                }],
                 is_error: false,
-            });
+            }));
             assert!(matches!(model.generate(input),
                 Err(Error::InvalidRequest(error)) if error.contains("unmatched or duplicate")));
         }
@@ -405,9 +409,9 @@ async fn edited_text_history_is_rebuilt_from_the_callers_content() {
     ] {
         let trace = run(protocol, fixture_body).await;
         let mut message = completed(&trace).message.clone();
-        let Message::Assistant {
+        let MessageKind::Assistant {
             content: output, ..
-        } = &mut message
+        } = &mut message.kind
         else {
             panic!("missing assistant message");
         };
@@ -416,14 +420,23 @@ async fn edited_text_history_is_rebuilt_from_the_callers_content() {
             .find(|part| matches!(part, ContentPart::Text(_)))
             .unwrap();
         *text = ContentPart::Text("edited text".into());
+        let call_id = output
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::ToolCall(call) => Some(call.id.clone()),
+                _ => None,
+            })
+            .unwrap();
         let mut input = request();
         input.messages.extend([
             message,
-            Message::ToolResult {
-                call_id: "call_fixture".into(),
-                output: "note contents".into(),
+            Message::new(MessageKind::ToolResult {
+                call_id,
+                content: vec![InputContentPart::Text {
+                    content: "note contents".into(),
+                }],
                 is_error: false,
-            },
+            }),
         ]);
         let model = client(protocol, "http://127.0.0.1:1/inference", "").unwrap();
         let body = encoded_request(&model, input).await.to_string();
@@ -519,18 +532,18 @@ async fn concurrent_requests(protocol: Backend) {
     });
     let model = client(protocol, &endpoint, "").unwrap();
     let a = Request {
-        messages: vec![Message::User("a".into())],
+        messages: vec![user("a")],
         ..request()
     };
     let b = Request {
-        messages: vec![Message::User("b".into())],
+        messages: vec![user("b")],
         ..request()
     };
     let (a, b) = tokio::join!(collect(&model, a), collect(&model, b));
-    assert!(matches!(&completed(&a).message,
-        Message::Assistant { content: output, .. } if output == &[ContentPart::Text("a".into())]));
-    assert!(matches!(&completed(&b).message,
-        Message::Assistant { content: output, .. } if output == &[ContentPart::Text("b".into())]));
+    assert!(matches!(&completed(&a).message.kind,
+        MessageKind::Assistant { content: output, .. } if output == &[ContentPart::Text("a".into())]));
+    assert!(matches!(&completed(&b).message.kind,
+        MessageKind::Assistant { content: output, .. } if output == &[ContentPart::Text("b".into())]));
     server.await.unwrap();
 }
 
@@ -617,7 +630,7 @@ async fn visible_reasoning_and_truncated_arguments_remain_observations() {
     )
     .await;
     let reply = completed(&trace);
-    let Message::Assistant { content: output } = &reply.message else {
+    let MessageKind::Assistant { content: output } = &reply.message.kind else {
         panic!("missing assistant message");
     };
     assert_eq!(reply.finish, Finish::Length);
@@ -682,18 +695,20 @@ fn invalid_tool_arguments_cannot_be_used_in_history() {
 fn tool_history(arguments: Result<Value, String>) -> Request {
     let mut input = request();
     input.messages.extend([
-        Message::Assistant {
+        Message::new(MessageKind::Assistant {
             content: vec![ContentPart::ToolCall(ToolCall {
                 id: "call".into(),
                 name: "read".into(),
                 arguments,
             })],
-        },
-        Message::ToolResult {
+        }),
+        Message::new(MessageKind::ToolResult {
             call_id: "call".into(),
-            output: "note contents".into(),
+            content: vec![InputContentPart::Text {
+                content: "note contents".into(),
+            }],
             is_error: false,
-        },
+        }),
     ]);
     input
 }
@@ -764,9 +779,9 @@ async fn dropping_a_pending_next_wait_preserves_the_attempt_and_partial_frame() 
     };
     assert_eq!(
         message,
-        Message::Assistant {
+        Message::new(MessageKind::Assistant {
             content: vec![ContentPart::Text("first雪".into())]
-        }
+        })
     );
     assert!(generation.next().await.is_none());
     server.await.unwrap();
@@ -784,12 +799,12 @@ async fn interleaved_deltas_keep_part_coordinates_and_completion_supplies_the_wh
     ])).await;
     assert_eq!(
         completed(&trace).message,
-        Message::Assistant {
+        Message::new(MessageKind::Assistant {
             content: vec![
                 ContentPart::Text("a雪".into()),
                 ContentPart::Text("b".into())
             ],
-        }
+        })
     );
     let text: Vec<_> = trace
         .events
@@ -809,7 +824,7 @@ async fn initial_thinking_and_signature_fragments_are_assembled_once() {
         "\"thinking\":\"Plan. \",\"signature\":\"prefix-\"",
     );
     let trace = run(Backend::AnthropicMessages, &body).await;
-    let Message::Assistant { content: output } = &completed(&trace).message else {
+    let MessageKind::Assistant { content: output } = &completed(&trace).message.kind else {
         panic!()
     };
     assert_eq!(
@@ -838,13 +853,13 @@ async fn encrypted_reasoning_survives_without_a_visible_summary() {
     .await;
     assert_eq!(
         completed(&trace).message,
-        Message::Assistant {
+        Message::new(MessageKind::Assistant {
             content: vec![ContentPart::EncryptedReasoning {
                 id: "rs_secret".into(),
                 summary: vec![],
                 data: "opaque".into(),
             }],
-        }
+        })
     );
 }
 
@@ -874,13 +889,13 @@ async fn unsigned_reasoning_is_observation_only_in_history() {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
         let mut input = request();
         input.messages.extend([
-            Message::Assistant {
+            Message::new(MessageKind::Assistant {
                 content: vec![ContentPart::Reasoning {
                     text: "private observation".into(),
                     signature: None,
                 }],
-            },
-            Message::User("next question".into()),
+            }),
+            user("next question"),
         ]);
         let body = encoded_request(&model, input).await;
         assert!(!body.to_string().contains("private observation"));
@@ -916,12 +931,258 @@ fn incompatible_reasoning_formats_fail_before_network_io() {
     ] {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
         let mut input = request();
-        input.messages.push(Message::Assistant {
+        input.messages.push(Message::new(MessageKind::Assistant {
             content: vec![output],
-        });
+        }));
         assert!(
             matches!(model.generate(input), Err(Error::InvalidRequest(error))
             if error.contains("another backend"))
+        );
+    }
+}
+
+//
+// Provider identities
+//
+
+#[tokio::test]
+async fn generated_calls_keep_portable_ids_and_replay_only_selected_provider_metadata() {
+    let raw = json!({"status":"completed", "output":[
+        {"type":"function_call", "call_id":"native_shared", "name":"read", "arguments":"{}"}
+    ]});
+    let fixture = events(&[json!({"type":"response.completed", "response":raw})]);
+    let first = completed(&run(Backend::OpenAiResponses, &fixture).await)
+        .message
+        .clone();
+    let second = completed(&run(Backend::OpenAiResponses, &fixture).await)
+        .message
+        .clone();
+    let first_id = generated_call_id(&first);
+    let second_id = generated_call_id(&second);
+    assert_ne!(first_id, second_id);
+    assert!(uuid::Uuid::parse_str(&first_id).is_ok());
+    assert_eq!(
+        first.provider_info["openai.responses"]["tool_call_ids"][&first_id],
+        "native_shared"
+    );
+    let mut input = request();
+    input
+        .messages
+        .extend([first, result(&first_id), second, result(&second_id)]);
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let client = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        let body = encoded_request(&client, input.clone()).await;
+        assert_eq!(body, encoded_request(&client, input.clone()).await);
+        let (call_a, result_a, call_b, result_b) = match backend {
+            Backend::OpenAiResponses => (
+                &body["input"][1]["call_id"],
+                &body["input"][2]["call_id"],
+                &body["input"][3]["call_id"],
+                &body["input"][4]["call_id"],
+            ),
+            Backend::AnthropicMessages => (
+                &body["messages"][1]["content"][0]["id"],
+                &body["messages"][2]["content"][0]["tool_use_id"],
+                &body["messages"][3]["content"][0]["id"],
+                &body["messages"][4]["content"][0]["tool_use_id"],
+            ),
+        };
+        assert_eq!(call_a, result_a);
+        assert_eq!(call_b, result_b);
+        assert_ne!(call_a, call_b);
+        match backend {
+            Backend::OpenAiResponses => assert_eq!(call_a, "native_shared"),
+            Backend::AnthropicMessages => assert!(!body.to_string().contains("native_shared")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn metadata_is_namespaced_and_malformed_selected_metadata_fails_before_dispatch() {
+    let openai = client(Backend::OpenAiResponses, "http://127.0.0.1:1/inference", "").unwrap();
+    let anthropic = client(
+        Backend::AnthropicMessages,
+        "http://127.0.0.1:1/inference",
+        "",
+    )
+    .unwrap();
+    for info in [
+        json!("invalid"),
+        json!({"version":2,"tool_call_ids":{}}),
+        json!({"version":1,"tool_call_ids":[]}),
+        json!({"version":1,"tool_call_ids":{"call":false}}),
+        json!({"version":1,"tool_call_ids":{"call":"bad id!"}}),
+    ] {
+        let mut input = tool_history(Ok(json!({})));
+        input.messages[1]
+            .provider_info
+            .insert("openai.responses".into(), info);
+        assert!(matches!(
+            openai.generate(input.clone()),
+            Err(Error::InvalidRequest(_))
+        ));
+        let body = encoded_request(&anthropic, input).await;
+        assert_eq!(
+            body["messages"][1]["content"][0]["id"],
+            body["messages"][2]["content"][0]["tool_use_id"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn synthetic_tool_ids_are_encoded_without_exposing_caller_id_syntax() {
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        let mut input = tool_history(Ok(json!({})));
+        let MessageKind::Assistant { content } = &mut input.messages[1].kind else {
+            unreachable!()
+        };
+        let ContentPart::ToolCall(call) = &mut content[0] else {
+            unreachable!()
+        };
+        call.id = "application/id with spaces".into();
+        let MessageKind::ToolResult { call_id, .. } = &mut input.messages[2].kind else {
+            unreachable!()
+        };
+        *call_id = "application/id with spaces".into();
+        let body = encoded_request(&model, input).await;
+        assert!(!body.to_string().contains("application/id"));
+        assert!(body.to_string().contains("call_1_0"));
+    }
+}
+
+//
+// Multimodal input
+//
+
+#[tokio::test]
+async fn blob_content_resolves_into_user_input_and_correlated_tool_results() {
+    use myco::thread::{Blob, BlobRef, BlobStore};
+    let mut store = BlobStore::default();
+    let reference = BlobRef(uuid::Uuid::from_u128(1));
+    store
+        .insert(
+            reference,
+            Blob {
+                media_type: "image/png".into(),
+                data: vec![0, 1, 2].into(),
+            },
+        )
+        .unwrap();
+    let blob = store.get(reference).unwrap();
+    let image = InputContentPart::Image {
+        media_type: blob.media_type.clone(),
+        data: blob.data.clone(),
+    };
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        let mut input = tool_history(Ok(json!({})));
+        let MessageKind::User { content } = &mut input.messages[0].kind else {
+            unreachable!()
+        };
+        content.push(image.clone());
+        let MessageKind::ToolResult {
+            content, is_error, ..
+        } = &mut input.messages[2].kind
+        else {
+            unreachable!()
+        };
+        content.push(image.clone());
+        *is_error = true;
+        let body = encoded_request(&model, input).await;
+        match backend {
+            Backend::OpenAiResponses => {
+                assert_eq!(
+                    body["input"][0]["content"][1]["image_url"],
+                    "data:image/png;base64,AAEC"
+                );
+                assert_eq!(body["input"][2]["output"][0]["text"], "Tool error:");
+                assert_eq!(
+                    body["input"][2]["output"][2]["image_url"],
+                    "data:image/png;base64,AAEC"
+                );
+                assert_eq!(body["input"][2]["call_id"], body["input"][1]["call_id"]);
+            }
+            Backend::AnthropicMessages => {
+                assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "AAEC");
+                let result = &body["messages"][2]["content"][0];
+                assert_eq!(
+                    result["content"][1]["source"],
+                    json!({"type":"base64","media_type":"image/png","data":"AAEC"})
+                );
+                assert_eq!(result["is_error"], true);
+                assert_eq!(
+                    result["tool_use_id"],
+                    body["messages"][1]["content"][0]["id"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_image_input_is_rejected_before_dispatch() {
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        for (media_type, bytes) in [("image/png", vec![]), ("text/html", vec![1])] {
+            for index in [0, 2] {
+                let mut input = tool_history(Ok(json!({})));
+                let content = match &mut input.messages[index].kind {
+                    MessageKind::User { content } | MessageKind::ToolResult { content, .. } => {
+                        content
+                    }
+                    _ => unreachable!(),
+                };
+                content.push(InputContentPart::Image {
+                    media_type: media_type.into(),
+                    data: bytes.clone().into(),
+                });
+                assert!(matches!(
+                    model.generate(input),
+                    Err(Error::InvalidRequest(_))
+                ));
+            }
+        }
+    }
+}
+
+fn generated_call_id(message: &Message) -> String {
+    let MessageKind::Assistant { content } = &message.kind else {
+        panic!("missing assistant")
+    };
+    content
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::ToolCall(call) => Some(call.id.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn result(call_id: &str) -> Message {
+    Message::new(MessageKind::ToolResult {
+        call_id: call_id.into(),
+        content: vec![InputContentPart::Text {
+            content: "result".into(),
+        }],
+        is_error: false,
+    })
+}
+
+#[test]
+fn an_assistant_turn_cannot_cross_an_unanswered_tool_batch() {
+    let mut input = tool_history(Ok(json!({})));
+    input.messages.insert(
+        2,
+        Message::new(MessageKind::Assistant {
+            content: vec![ContentPart::Text("too early".into())],
+        }),
+    );
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        assert!(
+            matches!(model.generate(input.clone()), Err(Error::InvalidRequest(message))
+            if message.contains("unanswered tool batch"))
         );
     }
 }

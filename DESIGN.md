@@ -10,8 +10,8 @@ targets of the same package. The browser GUI is a separate Yew application.
 ```text
 src/
   lib.rs
-  model/                       # Inference client, types, and private drivers
-  thread/                      # History, fixed references, storage, and forks
+  gen_ai/                      # Inference client, types, and private drivers
+  thread/                      # Owned conversations and local history operations
   logic/
     agent.rs                   # Conversation and tool loop
     compact.rs                 # Summarization and continuation
@@ -34,13 +34,13 @@ flowchart LR
         kernel --> agent[logic::agent]
         agent --> compact[logic::compact]
         agent --> thread
-        agent --> model
+        agent --> gen_ai
         compact --> thread
-        compact --> model
+        compact --> gen_ai
         kernel --> thread
-        kernel --> model
+        kernel --> gen_ai
         thread[thread]
-        model[model]
+        gen_ai[gen_ai]
         kernel --> terminal[service::terminal_service]
         kernel --> filesystem[service::filesystem_service]
     end
@@ -58,7 +58,7 @@ flowchart LR
     scripts -. HTTP / event streams .-> server
 ```
 
-`model`, `thread`, and `service` do not depend on each other or on `logic`.
+`gen_ai`, `thread`, and `service` do not depend on each other or on `logic`.
 Workflow modules compose them; `logic::kernel` constructs dependencies and runs
 workflows. `api` calls the kernel's Rust API. Most implementation details remain
 private or `pub(crate)`; module interfaces and review enforce dependency direction.
@@ -85,9 +85,9 @@ implementing `Stream<Item = Result<Event, Error>>`; network I/O waits for pollin
 It yields the request before dispatch, raw progress, normalized deltas, and one
 `Completed { message, finish, usage }` after validation. The caller can
 persist each item before polling again. Backend dispatch uses a private `Driver`
-trait; there is no public model trait. The model module does not commit turns.
+trait; there is no public model trait. The `gen_ai` module does not commit turns.
 Each request supplies the complete selected conversation history. Backends rebuild
-their request from those messages. `Message::Assistant` holds an ordered
+their request from those messages. `MessageKind::Assistant` holds an ordered
 `content: Vec<ContentPart>` for both generated replies and request history.
 Parts include text, reasoning, and tool calls; reasoning retains its signature or
 encrypted data explicitly. Finish reason and usage describe the generation.
@@ -96,7 +96,8 @@ encrypted data explicitly. Finish reason and usage describe the generation.
 
 A workspace contains multiple agents, independent threads, and shared service
 bindings on one or more hosts. Agents, including subagents, progress concurrently.
-Each thread has its own writer; agents keep references to the threads they use.
+The kernel owns the collection of thread values and coordinates their writers;
+agents keep references to the threads they use.
 A session or GUI may group related threads without making that grouping part of
 the threads API.
 
@@ -107,12 +108,15 @@ configuration, including host and working directory/root where applicable.
 Different services keep their own request/result types. The kernel maps operation
 IDs into service records and pins bindings for retries; discovery never silently
 substitutes another instance for an unavailable target.
+These execution IDs belong to the kernel and services. A conversation's
+`thread::ToolCallId` pairs a tool call with its result; one call can involve
+several service operations.
 
 Kernel tools can create, fork, read, submit input to, or request work on another
 thread in the workspace. A subagent tool starts an agent on a new thread and
 records its relationship to the requesting operation. Creation is deduplicated
 by operation ID; input acceptance and the eventual reply are separate observations.
-These tools call kernel operations directly. Inference uses `model::GenAiClient`.
+These tools call kernel operations directly. Inference uses `gen_ai::GenAiClient`.
 
 ### Hosts and remote transport
 
@@ -227,77 +231,60 @@ replayed. Filesystem and terminal bindings can address the same host/files.
 
 ## Thread history
 
-A thread is an identified, ordered, append-only conversation. Existing entries
-and published revisions are immutable; appending produces a new revision under
-the same ID. A fork gets a new ID and copies a fixed prefix. A reference used as
-generation context pins a revision and range, so later appends cannot change it.
+`Thread` owns a dense `Vec<Turn>`. Its synchronous API is `new`, `turns`, `push`,
+and read-only indexing. A branch is `Thread::new(thread[..end].to_vec())`;
+`clone` copies the whole history. Neither operation starts tool work. Consecutive
+user turns are allowed; workflow context construction validates model sequencing.
 
-```rust
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ThreadVersion {
-    pub thread: ThreadId,
-    pub revision: Revision,
-}
+`Turn { kind, provider_info }` wraps `TurnKind::User(UserTurn)` or
+`Assistant(AssistantTurn)`. User turns have an `Author` (human or system), content,
+and tool responses. Assistant turns have content and tool requests. `Author`
+describes provenance, not model instruction priority. GUI-only notices and runtime
+lifecycle facts stay in kernel observations. There are no turn pairs.
 
-#[derive(Clone)]
-pub struct HistoryRef {
-    pub version: ThreadVersion,
-    pub entries: std::ops::Range<usize>,
-}
+`Content` holds text, image references, reasoning, and refusals. It contains no tool
+requests/responses, so multimodal tool responses use the same content type without
+recursion. `ToolCallId(uuid::Uuid)` correlates a request and its observations.
+Responses distinguish success, error, backgrounding, and unknown effects. A later
+observation appends without overwriting the earlier one. After a background
+acknowledgement closes the model-facing call, a later completion can be a runtime
+notice; the workflow chooses that representation.
 
-#[derive(Clone)]
-pub struct Thread {
-    version: ThreadVersion,
-    entries: Vec<Entry>,
-    sources: Vec<HistoryRef>,
-}
+Images contain `BlobRef(uuid::Uuid)`, never a URL or inline bytes. A separate
+`BlobStore` registers immutable blobs (media type and shared bytes), rejects
+rebinding a UUID, and reports missing references. A store serves multiple
+threads. `Thread::blob_refs()` includes references in tool responses;
+`validate_content` checks resolution without I/O. Copies preserve references and
+share blob bytes. The kernel handles loading, access, size limits, persistence,
+export, and retention. Blobs must be durable before publishing their references,
+and remain available while any saved history needs them.
 
-impl Thread {
-    pub fn version(&self) -> ThreadVersion;
-    pub fn entries(&self) -> &[Entry];
-    pub fn sources(&self) -> &[HistoryRef];
-}
-```
+Currently, workflows resolve blobs into model input bytes. The planned `gen_ai` API
+exposes a caller-supplied shared `BlobStore` through `GenAiClient` and accepts
+`BlobRef`s in requests. Encoding resolves references and constructs provider wire
+data. Blob contracts will live below both `gen_ai` and `thread`, so inference does
+not depend on history types. The kernel owns the store's lifetime across threads,
+clients, and generation attempts; dropping a generation does not discard blobs.
 
-Owned values use dense vectors. Cloning copies that value's entries and provenance,
-preserving identity and revision; it grants no writer and does not recursively
-copy referenced threads. The kernel chooses the storage format.
+Turns preserve provider-specific JSON under namespaced `provider_info` keys.
+Model messages expose the same map. Native call IDs live in the originating
+backend's metadata; tool requests have no provider-ID field. Model encoding maps
+logical call IDs and their results together, reusing its own compatible metadata
+or generating deterministic wire IDs. Reasoning retains exact text/signature,
+encrypted ID/summary/data, or redacted payloads. Changing backends still requires
+an explicit policy for incompatible reasoning. History and inference message types
+remain independent; workflows select context and translate turns.
 
-`thread` owns the canonical conversation entries: user and assistant messages,
-tool results, system information, warnings, errors, and notifications. Its content
-types are independent of inference types. A stored entry need not appear in a
-model prompt. Workflow code chooses how to render it or retain it only for humans.
-Thread data has no agent policy, foreground selection, or live operation state.
-
-`thread::Threads` exposes history operations through an injected store:
-
-```rust
-impl Threads {
-    pub fn new(store: Arc<dyn ThreadStore>) -> Self;
-
-    pub async fn create(&self, request: CreateThread) -> Result<ThreadVersion, ThreadError>;
-    pub async fn read(&self, version: ThreadVersion) -> Result<Thread, ThreadError>;
-    pub async fn append(&self, request: AppendEntries) -> Result<ThreadVersion, ThreadError>;
-    pub async fn fork(&self, request: ForkThread) -> Result<ThreadVersion, ThreadError>;
-}
-```
-
-Mutation requests carry an operation ID and the expected revisions of existing
-threads. `ThreadStore` is a narrow, dyn-compatible storage interface defined by
-`thread`. It loads history and atomically publishes mutations with their receipts.
-The kernel supplies its implementation. Create and fork return new identities;
-append preserves identity and advances the revision.
-
-Publication is serialized per thread. Reading and forking published history do
-not wait for inference. Workflow code decides whether to queue competing input
-while it generates; storage checks revisions regardless of that policy. A cloned
-snapshot grants no writer. A stale append cannot silently attach to newer history.
+The kernel owns thread instances, derivation relationships, and external handles.
+It can use references to boxed threads while their allocations remain alive.
+Serialization, grouping, operation records, and publication checks remain outside
+`Thread`; a local push performs no persistence.
 
 ## Workflow composition and streaming
 
 Workflow code constructs a model request, consumes its stream, validates the
-outcome, and appends accepted entries through `Threads`. Inference and history
-publication are separate operations. The shared history API serves several uses:
+outcome, and appends accepted turns to a `Thread`. The kernel handles publication
+and persistence around those local updates. The history API serves several uses:
 
 | Workflow | Composition |
 | --- | --- |
@@ -311,14 +298,12 @@ Search candidates isolate tool workspaces or defer tool effects until selection.
 A session can group threads; background work can create successive threads without
 an enclosing agent object.
 
-`model` has its own inference input, content, and incremental-part vocabulary.
+`gen_ai` has its own inference input, content, and incremental-part vocabulary.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
-The richer roles in `thread` are interpreted by each workflow, not mechanically
-converted into model roles. Raw provider events stay in inference records alongside
-the portable thread entries; workflows need no provider-specific response types.
-Selected reasoning retains its original text, signature/encrypted data, and order
-when rebuilding model history.
+Thread authorship and tool observations are interpreted by each workflow. Raw
+provider events, usage, and timing stay in workflow records. Threads retain
+reasoning text, signature/encrypted data, blob references, and provider metadata.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
@@ -326,23 +311,25 @@ can expose:
 ```rust
 pub enum TurnUpdate {
     Delta(TurnDelta),
-    Committed(Turn),
+    Committed(thread::Turn),
 }
 ```
 
 `TurnUpdate` belongs to `logic`, not the history API. Deltas carry generation/
 attempt identity and content-block coordinates, including incomplete tool arguments.
-`model::Event::Completed { message, finish, usage }` supplies the assembled message
+`gen_ai::Event::Completed { message, finish, usage }` supplies the assembled message
 and validated inference outcome, including fields absent from provisional deltas.
-Workflow code records its evidence, checks conversation structure and correlation, and
-appends it with the expected revision and operation receipt before yielding
-`Committed`. A refusal or output limit can be recorded as such; incomplete
-arguments never authorize tool execution.
+Workflow code checks conversation structure and correlation, preserves replay
+data in the content, and appends the accepted entry. Before an update is exposed
+as `Committed`, the kernel publishes the resulting thread value and operation
+receipt, checking expected source history and cancellation. A refusal or output
+limit can be recorded as such; incomplete arguments never authorize tool execution.
 
 The model stream yields one completed response or terminal error, then ends.
 EOF without a terminal provider outcome is an error. A workflow may fail after
-inference succeeds, for example when its append conflicts. It must not report
-that candidate as committed. Stale candidates remain available in attempt records.
+inference succeeds, for example when the kernel rejects a stale candidate. It must
+not report that candidate as committed. Stale candidates remain available in
+attempt records.
 
 The caller owns polling and backpressure. Dropping a pending `next()` wait leaves
 the stream available for subsequent polling. Dropping the owning generation stream
@@ -388,9 +375,10 @@ and repeats as policy requires. An active run exclusively borrows its agent thro
 
 Agent state contains its selected thread references, policy/budget state, and
 pending operation IDs. Injected storage records explicit logical checkpoints.
-The threads remain independently addressable. Forking an agent creates new
-thread identities from fixed histories and copies the relevant policy state;
-it does not clone a running stream, future, tool process, or writer.
+The kernel keeps threads independently addressable. Forking an agent copies its
+selected thread histories and policy state, and the kernel registers those copies
+as distinct objects. It does not clone a running stream, future, tool process,
+or writer.
 
 The kernel polls concurrent agent streams as updates become ready. Ordinary
 async scheduling advances their I/O; it need not reconstruct a function on every
@@ -401,8 +389,13 @@ Application code must yield during long computation.
 ## Context, compaction, and interpretation
 
 ```rust
+pub struct HistoryRef {
+    pub thread: ThreadId,
+    pub turns: std::ops::Range<usize>,
+}
+
 pub struct GenerationIntent {
-    pub source: ThreadVersion,
+    pub source: HistoryRef,
     pub instructions: String,
     pub context: Vec<HistoryInput>,
 }
@@ -425,20 +418,21 @@ runs generation/tool helpers there, and creates a continuation thread from the
 summary and retained turns. Source and worker histories remain available.
 Cuts preserve complete tool invocation/result groups.
 
-Sources can continue to grow because compaction reads fixed revisions. Selecting
-the continuation and resuming work there are explicit policy decisions, conditional
+Sources can continue to grow because compaction reads fixed ranges or snapshots.
+Selecting the continuation and resuming work there are explicit policy decisions, conditional
 on the expected source/selection state. A late summary cannot replace newer work.
 Failure before publication leaves the sources intact; cancellation committed first
 prevents publication. Already published history remains available.
 
-Provider request/response types stay in `model` and its callers in `logic`.
+Provider request/response types stay in `gen_ai` and its callers in `logic`.
 Workflow adapters pin model configuration and capabilities, record the exact
 request before polling the inference stream into dispatch, and translate progress
 and its final outcome into thread values.
 
-Raw provider metadata and provider-call/invocation-ID mappings remain in
-interpreter records. Evidence is durable before a thread or operation can
-reference it. Retained history keeps evidence reachable.
+Raw traces, usage, and timing remain in workflow/kernel records. Conversation
+content carries reasoning replay data; turn metadata carries native call IDs.
+Execution records separately associate tool calls with the service operations they
+trigger.
 
 Tool adapters validate against pinned schemas, invoke a service or internal kernel
 operation, and record a translated outcome. GUI controls use those same service
@@ -446,15 +440,17 @@ instances through direct kernel operations.
 
 ## Persistence, cancellation, and lifecycle
 
-Each effectful API records intent before dispatch and retains stable operation
-IDs across retries. Thread mutations publish history and their receipts atomically.
-Service operations also retain their own records. An uncertain response triggers
+The kernel and services record intent before dispatch and retain stable operation
+IDs across retries. Kernel publication records an updated thread value and its
+receipt atomically; a local `Thread::push` performs no persistence. Service
+operations also retain their own records. An uncertain response triggers
 lookup/reconciliation of the existing operation, not a fresh submission under
 a new ID. Request deduplication cannot guarantee exactly-once external effects.
 
-Generation's final append checks its expected revision and cancellation state in
-the same transaction. A lost response after commit is recovered from its receipt.
-Partial streamed output stays in attempt evidence unless explicitly accepted as
+The kernel checks generation's expected source history and cancellation state in
+the same publication transaction. A lost response after commit is recovered from
+its receipt.
+Partial streamed output stays in attempt records unless explicitly accepted as
 an incomplete turn; it is never mistaken for a finished reply.
 
 Cancellation is an explicit request to the supervised operation. It prevents
@@ -482,7 +478,7 @@ Workspace membership alone provides no filesystem isolation.
 
 ## Evaluation and review sequence
 
-Evaluations inject scripted inference, an in-memory store, and a recording tool
+Evaluations use ordinary thread values, scripted inference, and a recording tool
 executor, then inspect updates and resulting histories. Real trials use service
 adapters with budgets, isolated workspaces, and graders. Neither requires HTTP.
 GEPA varies prompts or agent policy and consumes trial scores, traces, and
@@ -492,12 +488,12 @@ Review steps are module-sized changes within the engine crate.
 
 1. **Interfaces:** module boundaries, history operations, workflow composition,
    stream completion, persistence, cancellation, and recovery.
-2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
+2. **Gen AI:** `gen_ai::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned vector histories, rich entries, fixed references, injected
-   storage, and atomic append/fork. Check stale writes, independent forks,
-   ambiguous commits, and cancellation/publication races.
+3. **Thread:** owned turn histories, blob stores, multimodal tool results,
+   and read-only indexing.
+   Check copy independence, slice bounds, and content preservation.
 4. **Agent/compaction logic:** request projection, streamed generation and turn
    publication, tool loops, checkpoints, compaction, and concurrent runs. Use
    scripted dependencies to check complete tool groups, retries, budgets,
@@ -508,9 +504,11 @@ Review steps are module-sized changes within the engine crate.
 6. **Filesystem service:** bounded reads, versioned create/edit, operation records,
    and local/SSH backends. Check stale edits, ambiguous matches, symlink targets,
    create conflicts, and recovery after interrupted writes.
-7. **Kernel logic:** storage and service adapters, discovery, agent supervision,
-   observation delivery, and shutdown. Check provider/thread translation, several
-   agents per workspace, internal delegation, and subscriber reconnects.
+7. **Kernel logic:** thread ownership and grouping, serialization/persistence,
+   service adapters, discovery, supervision, observation delivery, and shutdown.
+   Check stale publication, ambiguous commits, cancellation races, provider/thread
+   translation, several agents per workspace, internal delegation, and subscriber
+   reconnects.
 8. **HTTP API and GUI:** HTTP schemas/streams exercised by scripted clients,
    then thread browsing, conversation grouping, and shared service controls in Yew.
 9. **Evaluation/GEPA:** isolated trial fixtures and inspectable optimizer feedback.

@@ -1,4 +1,4 @@
-# myco::model
+# myco::gen_ai
 
 One inference attempt, independent of agent behavior, storage, and tool execution.
 `GenAiClient` is a concrete type; `Config` selects OpenAI Responses or Anthropic
@@ -7,14 +7,16 @@ limits are supplied by the caller. Backend drivers are private.
 
 ```no_run
 use futures_util::StreamExt;
-use myco::model::{Config, DeltaKind, Event, GenAiClient, Message, Request};
+use myco::gen_ai::{Config, DeltaKind, Event, GenAiClient, InputContentPart, Message, MessageKind, Request};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = GenAiClient::new(Config::OpenAi {
     endpoint: "https://api.openai.com/v1/responses".into(),
     api_key: std::env::var("OPENAI_API_KEY")?,
 })?;
-let mut messages = vec![Message::User("Explain this repository.".into())];
+let mut messages = vec![Message::new(MessageKind::User {
+    content: vec![InputContentPart::Text { content: "Explain this repository.".into() }],
+})];
 let request = Request {
     model: std::env::var("OPENAI_MODEL")?,
     messages: messages.clone(),
@@ -43,14 +45,14 @@ by reference or through `Arc<GenAiClient>` for concurrent requests. Additional
 provider settings, such as `reasoning` or `thinking`, go in
 `Request::driver_options`; these cannot replace managed context, tool, or
 stream fields. No model catalog, environment loading, or policy defaults are
-embedded in the model module.
+embedded in the `gen_ai` module.
 
 Workflow code in `logic` translates selected thread history into a `Request`
-and translates stream events into conversation entries. Every request supplies
+and translates stream events into conversation turns. Every request supplies
 the complete history it wants the model to see; the backend rebuilds the provider
 request from that history. The `thread` module supplies history operations;
-each workflow chooses its context and publication policy. These modules are specified in
-[DESIGN.md](../../DESIGN.md) and are subsequent implementation steps.
+each workflow chooses its context and publication policy. Workflow logic is a
+subsequent implementation step in [DESIGN.md](../../DESIGN.md).
 
 Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
 assistant message, finish reason, and usage. Workflow code decides whether to
@@ -103,10 +105,38 @@ the raw progress events. Valid tool arguments must be JSON objects. Streaming ar
 deltas remain text until the response is decoded.
 
 Append the returned message directly to the next request, followed by linked
-`ToolResult` messages when needed. `Message::Assistant` holds an ordered
+`ToolResult` messages when needed. `MessageKind::Assistant` holds an ordered
 `content: Vec<ContentPart>` for both generated replies and request history;
-finish reason and usage belong to the completion event. Every request is rebuilt
-from the supplied history. No whole native response is attached to it.
+finish reason and usage belong to the completion event. `Message` wraps this
+`MessageKind` with `provider_info: Map<String, Value>`. Every request is rebuilt
+from supplied content; metadata never replaces the caller's text or tool arguments.
+
+Generated `ToolCall::id` values are fresh UUID strings, independent of a provider's
+wire IDs. Caller-supplied history may use any unique nonempty logical call ID.
+The originating driver records original IDs in its `provider_info` namespace
+(`openai.responses` or `anthropic.messages`). Version 1 metadata contains a
+`tool_call_ids` object mapping logical IDs to native IDs. Preserve this map when
+copying messages into thread turns and back. Unknown namespaces are retained by
+the caller and ignored by a driver. Malformed selected metadata is rejected before
+network dispatch.
+
+Request encoding maps both calls and results through one table. It uses compatible
+native IDs from its own namespace when available, and deterministic wire IDs for
+synthetic/cross-provider history or collisions. A provider reusing a native ID in
+another generation cannot merge two logical calls. Appending later messages does
+not change earlier wire IDs. This mapping does not translate reasoning formats.
+
+User messages and tool results contain `Vec<InputContentPart>`: text or an image's
+media type and reference-counted bytes. Workflows currently resolve thread `BlobRef`s
+using a `BlobStore` before constructing these inputs. No URL or file loading
+occurs in the `gen_ai` module. Encoders construct base64 only for the outbound
+request, preserving images inside their correlated tool result. Empty image bytes
+and unsupported media types fail before dispatch; file validation, image decoding,
+and input-size policy belong to the caller.
+
+The planned API exposes a shared `BlobStore` through `GenAiClient` and accepts blob
+references in requests, moving resolution into the `gen_ai` boundary. This integration
+is a subsequent step in [DESIGN.md](../../DESIGN.md#thread-history).
 
 Reasoning metadata is explicit in the completed message: `ContentPart::Reasoning`
 has an optional `signature`; `EncryptedReasoning` carries its ID, summaries, and
@@ -136,8 +166,8 @@ chooses how request events, raw progress, responses, and errors enter its record
 
 ## Scope and validation
 
-The interface covers text input/output, function tools with textual results,
-and signed/encrypted reasoning. Image/audio input, Chat Completions, provider-hosted
+The interface covers text/image input, text output, multimodal function-tool
+results, and signed/encrypted reasoning. Audio, Chat Completions, provider-hosted
 tools, conversion between reasoning formats, and provider-specific beta headers
 are outside this step. Unknown events and output items remain in raw progress;
 unsupported Anthropic content deltas fail explicitly.
@@ -146,7 +176,8 @@ Tests use local HTTP fixtures and need no credentials. They cover fragmented SSE
 Unicode, both providers, reuse of completed messages through fresh clients,
 reasoning metadata, interleaved parts, cumulative usage, truncation, errors,
 request-before-dispatch, ordered completion, stream termination, concurrent calls,
-stream drop, and retaining a partial frame across a dropped `next()` wait.
+stream drop, retaining a partial frame across a dropped `next()` wait, provider
+metadata isolation, native-ID collisions, and text/image user and tool inputs.
 Live provider/account compatibility has not been exercised.
 
 Protocol references:
@@ -155,3 +186,6 @@ Protocol references:
 - [OpenAI reasoning continuation](https://developers.openai.com/api/docs/guides/reasoning)
 - [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)
 - [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)
+
+- [OpenAI text/image function outputs](https://developers.openai.com/api/docs/guides/tools-computer-use-integration#use-your-own-ui-tools)
+- [Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)

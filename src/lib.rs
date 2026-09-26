@@ -1,5 +1,6 @@
 //! Myco's conversation engine.
 //!
-//! Inference is available through [`model`].
+//! Inference is available through [`gen_ai`], and conversation history through [`thread`].
 
-pub mod model;
+pub mod gen_ai;
+pub mod thread;

@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{Config, Error, Event, Finish, GenAiClient, Generation, Message, Request, Usage};
+use myco::gen_ai::{
+    Config, Error, Event, Finish, GenAiClient, Generation, InputContentPart, Message, MessageKind,
+    Request, Usage,
+};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -111,7 +114,7 @@ pub async fn unfinished_body(body: String) -> (String, tokio::task::JoinHandle<(
 pub fn request() -> Request {
     Request {
         model: "test-model".into(),
-        messages: vec![Message::User("Read the note".into())],
+        messages: vec![user("Read the note")],
         max_output_tokens: 64,
         ..Default::default()
     }
@@ -202,4 +205,12 @@ pub fn events(values: &[Value]) -> String {
 
 pub fn text_response(text: &str) -> Value {
     serde_json::json!({"status":"completed", "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}]})
+}
+
+pub fn user(text: &str) -> Message {
+    Message::new(MessageKind::User {
+        content: vec![InputContentPart::Text {
+            content: text.into(),
+        }],
+    })
 }

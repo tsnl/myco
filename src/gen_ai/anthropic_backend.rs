@@ -1,11 +1,13 @@
+use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
 use super::backend_helpers::{
-    Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, index, wire_messages,
 };
 use super::http_helpers::Transport;
 use super::{
-    ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
+    ContentPart, Delta, DeltaKind, Error, Finish, InputContentPart, MessageKind, Request, Tool,
+    ToolCall, Usage,
 };
 
 //
@@ -43,7 +45,8 @@ impl Driver for Backend {
 //
 
 fn encode_request(request: &Request) -> Result<Value, Error> {
-    let mut body = json!({"model": request.model, "messages": messages(&request.messages)?,
+    let input = wire_messages(Protocol::AnthropicMessages, &request.messages)?;
+    let mut body = json!({"model": request.model, "messages": messages(&input)?,
         "max_tokens": request.max_output_tokens, "stream": true});
     if !request.instructions.is_empty() {
         body["system"] = request.instructions.clone().into();
@@ -60,7 +63,7 @@ struct Content {
     tool_result: bool,
 }
 
-fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
+fn messages(input: &[MessageKind]) -> Result<Vec<Value>, Error> {
     let mut messages: Vec<Value> = vec![];
     for message in input {
         let content = content(message)?;
@@ -79,18 +82,18 @@ fn messages(input: &[Message]) -> Result<Vec<Value>, Error> {
     Ok(messages)
 }
 
-fn content(message: &Message) -> Result<Content, Error> {
+fn content(message: &MessageKind) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
-        Message::User(text) => ("user", vec![json!({"type": "text", "text": text})], false),
-        Message::Assistant { content } => ("assistant", assistant(content)?, false),
-        Message::ToolResult {
+        MessageKind::User { content } => ("user", content.iter().map(input_part).collect(), false),
+        MessageKind::Assistant { content } => ("assistant", assistant(content)?, false),
+        MessageKind::ToolResult {
             call_id,
-            output,
+            content,
             is_error,
         } => (
             "user",
             vec![json!({
-                "type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": is_error,
+                "type": "tool_result", "tool_use_id": call_id, "content": input_content(content), "is_error": is_error,
             })],
             true,
         ),
@@ -100,6 +103,23 @@ fn content(message: &Message) -> Result<Content, Error> {
         blocks,
         tool_result,
     })
+}
+
+fn input_content(content: &[InputContentPart]) -> Value {
+    if let [InputContentPart::Text { content }] = content {
+        return content.clone().into();
+    }
+    content.iter().map(input_part).collect()
+}
+
+fn input_part(part: &InputContentPart) -> Value {
+    match part {
+        InputContentPart::Text { content } => json!({"type":"text", "text":content}),
+        InputContentPart::Image { media_type, data } => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            json!({"type":"image", "source":{"type":"base64", "media_type":media_type, "data":encoded}})
+        }
+    }
 }
 
 fn merge(message: &mut Value, content: Content) {
