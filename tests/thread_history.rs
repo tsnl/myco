@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use myco::thread::{
-    AssistantTurn, Author, Blob, BlobRef, Content, ContentContext, ContentError, ContentPart,
+    AssistantTurn, Author, Blob, BlobRef, BlobStore, Content, ContentError, ContentPart,
     ReasoningContentPart, RefusalContentPart, Thread, ToolCallId, ToolUseRequest, ToolUseResponse,
     ToolUseResponseKind, Turn, TurnKind, UserTurn,
 };
@@ -171,15 +171,15 @@ fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
 }
 
 //
-// Content context
+// Blob store
 //
 
 #[test]
 fn history_copies_retain_references_without_copying_blob_bytes() {
     let reference = blob_ref(1);
     let data: Arc<[u8]> = Arc::from(vec![7; 1024 * 1024]);
-    let mut context = ContentContext::default();
-    context
+    let mut store = BlobStore::default();
+    store
         .insert(
             reference,
             Blob {
@@ -199,19 +199,19 @@ fn history_copies_retain_references_without_copying_blob_bytes() {
     let snapshot = thread.clone();
     drop(thread);
     for history in [snapshot, branch] {
-        history.validate_content(&context).unwrap();
+        history.validate_content(&store).unwrap();
         assert_eq!(history.blob_refs().collect::<Vec<_>>(), vec![reference]);
     }
-    assert!(Arc::ptr_eq(&context.get(reference).unwrap().data, &data));
+    assert!(Arc::ptr_eq(&store.get(reference).unwrap().data, &data));
     assert!(Arc::ptr_eq(
-        &context.clone().get(reference).unwrap().data,
+        &store.clone().get(reference).unwrap().data,
         &data
     ));
 }
 
 #[test]
 fn missing_blobs_in_turns_and_tool_responses_fail_explicitly() {
-    let context = ContentContext::default();
+    let store = BlobStore::default();
     let reference = blob_ref(1);
     let content = Content {
         parts: vec![ContentPart::Image { blob: reference }],
@@ -230,7 +230,7 @@ fn missing_blobs_in_turns_and_tool_responses_fail_explicitly() {
     ] {
         let thread = Thread::new(vec![Turn::new(kind)]);
         assert_eq!(
-            thread.validate_content(&context),
+            thread.validate_content(&store),
             Err(ContentError::Missing(reference))
         );
     }
@@ -239,21 +239,21 @@ fn missing_blobs_in_turns_and_tool_responses_fail_explicitly() {
 #[test]
 fn a_blob_reference_cannot_be_rebound_to_different_content() {
     let reference = blob_ref(1);
-    let mut context = ContentContext::default();
+    let mut store = BlobStore::default();
     let original = Blob {
         media_type: "image/png".into(),
         data: Arc::from([1, 2, 3]),
     };
-    context.insert(reference, original.clone()).unwrap();
+    store.insert(reference, original.clone()).unwrap();
     let replacement = Blob {
         media_type: "image/jpeg".into(),
         data: Arc::from([4, 5, 6]),
     };
     assert_eq!(
-        context.insert(reference, replacement),
+        store.insert(reference, replacement),
         Err(ContentError::AlreadyExists(reference))
     );
-    assert_eq!(context.get(reference), Ok(&original));
+    assert_eq!(store.get(reference), Ok(&original));
 }
 
 //

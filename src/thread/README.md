@@ -1,7 +1,7 @@
 # myco::thread
 
-An owned conversation in memory, with bulky content held in a separate content
-context. The kernel manages thread instances, persistence, and workspace access.
+An owned conversation in memory, with bulky content held in a separate blob
+store. The kernel manages thread instances, persistence, and workspace access.
 
 ```rust
 use myco::thread::{Author, Content, ContentPart, Thread, Turn, TurnKind, UserTurn};
@@ -47,30 +47,30 @@ can own boxed threads and borrow their stable allocation addresses while alive.
 Persistent/public handles, publication checks, and derivation relationships remain
 external. Cloning history never starts or duplicates tool execution.
 
-## Content context
+## Blob store
 
 Images hold `Image { blob: BlobRef }`. `BlobRef` is a UUID newtype, with no URL,
-inline bytes, or base64 field in the history. `ContentContext` registers immutable
+inline bytes, or base64 field in the history. `BlobStore` registers immutable
 `Blob { media_type, data }` values under these references. `insert` rejects an
 already registered UUID; `get` reports a missing blob explicitly. UUID allocation
-and persistence belong to the caller. A context can serve multiple threads.
+and persistence belong to the caller. A store can serve multiple threads.
 
 ```rust
-use myco::thread::{Blob, BlobRef, ContentContext};
+use myco::thread::{Blob, BlobRef, BlobStore};
 
 let reference = BlobRef(uuid::Uuid::from_u128(1));
-let mut context = ContentContext::default();
-context.insert(reference, Blob {
+let mut store = BlobStore::default();
+store.insert(reference, Blob {
     media_type: "image/png".into(),
     data: vec![0x89, b'P', b'N', b'G'].into(),
 })?;
-assert_eq!(context.get(reference)?.media_type, "image/png");
+assert_eq!(store.get(reference)?.media_type, "image/png");
 # Ok::<(), myco::thread::ContentError>(())
 ```
 
-The context owns reference-counted immutable bytes. Thread copies retain UUIDs;
-context copies share the bytes. `blob_refs()` enumerates references in ordinary
-content and tool responses, including repeats. `validate_content(&context)` checks
+The store owns reference-counted immutable bytes. Thread copies retain UUIDs;
+store copies share the bytes. `blob_refs()` enumerates references in ordinary
+content and tool responses, including repeats. `validate_content(&store)` checks
 that every reference resolves; it performs no file/network I/O or image decoding.
 
 The kernel must retain blobs referenced by live or saved histories, persist blobs
@@ -78,8 +78,10 @@ before publishing references, and restore the same UUID-to-content bindings.
 Exporting a history also requires its referenced blobs. References confer no
 workspace authorization. Fetching files, content hashing/deduplication, MIME and
 size validation, retention, and garbage collection belong to the application.
-For inference, the workflow resolves selected blobs into model input bytes.
+Currently, the workflow resolves selected blobs into model input bytes.
 The model encoder alone constructs the provider's base64 wire representation.
+The planned `GenAiClient` integration exposes the shared store and resolves
+references during request encoding; see [DESIGN.md](../../DESIGN.md#thread-history).
 
 ## Tools and provider metadata
 

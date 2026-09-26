@@ -34,9 +34,9 @@ impl Thread {
             .flat_map(Turn::contents)
             .flat_map(Content::blob_refs)
     }
-    pub fn validate_content(&self, context: &ContentContext) -> Result<(), ContentError> {
+    pub fn validate_content(&self, store: &BlobStore) -> Result<(), ContentError> {
         for reference in self.blob_refs() {
-            context.get(reference)?;
+            store.get(reference)?;
         }
         Ok(())
     }
@@ -148,7 +148,7 @@ pub struct RefusalContentPart {
 }
 
 //
-// Content context
+// Blob store
 //
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,11 +161,11 @@ pub struct Blob {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ContentContext {
+pub struct BlobStore {
     blobs: HashMap<BlobRef, Blob>,
 }
 
-impl ContentContext {
+impl BlobStore {
     pub fn insert(&mut self, reference: BlobRef, blob: Blob) -> Result<(), ContentError> {
         match self.blobs.entry(reference) {
             Entry::Vacant(entry) => {

@@ -127,12 +127,16 @@ another generation cannot merge two logical calls. Appending later messages does
 not change earlier wire IDs. This mapping does not translate reasoning formats.
 
 User messages and tool results contain `Vec<InputContentPart>`: text or an image's
-media type and reference-counted bytes. Workflows resolve thread `BlobRef`s using
-their content context before constructing these inputs. No URL or file loading
+media type and reference-counted bytes. Workflows currently resolve thread `BlobRef`s
+using a `BlobStore` before constructing these inputs. No URL or file loading
 occurs in the model module. Encoders construct base64 only for the outbound
 request, preserving images inside their correlated tool result. Empty image bytes
 and unsupported media types fail before dispatch; file validation, image decoding,
 and input-size policy belong to the caller.
+
+The planned API exposes a shared `BlobStore` through `GenAiClient` and accepts blob
+references in requests, moving resolution into the model boundary. This integration
+is a subsequent step in [DESIGN.md](../../DESIGN.md#thread-history).
 
 Reasoning metadata is explicit in the completed message: `ContentPart::Reasoning`
 has an optional `signature`; `EncryptedReasoning` carries its ID, summaries, and

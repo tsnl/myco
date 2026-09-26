@@ -1057,10 +1057,10 @@ async fn synthetic_tool_ids_are_encoded_without_exposing_caller_id_syntax() {
 
 #[tokio::test]
 async fn blob_content_resolves_into_user_input_and_correlated_tool_results() {
-    use myco::thread::{Blob, BlobRef, ContentContext};
-    let mut context = ContentContext::default();
+    use myco::thread::{Blob, BlobRef, BlobStore};
+    let mut store = BlobStore::default();
     let reference = BlobRef(uuid::Uuid::from_u128(1));
-    context
+    store
         .insert(
             reference,
             Blob {
@@ -1069,7 +1069,7 @@ async fn blob_content_resolves_into_user_input_and_correlated_tool_results() {
             },
         )
         .unwrap();
-    let blob = context.get(reference).unwrap();
+    let blob = store.get(reference).unwrap();
     let image = InputContentPart::Image {
         media_type: blob.media_type.clone(),
         data: blob.data.clone(),

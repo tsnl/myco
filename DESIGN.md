@@ -251,13 +251,20 @@ acknowledgement closes the model-facing call, a later completion can be a runtim
 notice; the workflow chooses that representation.
 
 Images contain `BlobRef(uuid::Uuid)`, never a URL or inline bytes. A separate
-`ContentContext` registers immutable blobs (media type and shared bytes), rejects
-rebinding a UUID, and reports missing references. A context serves multiple
+`BlobStore` registers immutable blobs (media type and shared bytes), rejects
+rebinding a UUID, and reports missing references. A store serves multiple
 threads. `Thread::blob_refs()` includes references in tool responses;
 `validate_content` checks resolution without I/O. Copies preserve references and
 share blob bytes. The kernel handles loading, access, size limits, persistence,
 export, and retention. Blobs must be durable before publishing their references,
 and remain available while any saved history needs them.
+
+Currently, workflows resolve blobs into model input bytes. The planned model API
+exposes a caller-supplied shared `BlobStore` through `GenAiClient` and accepts
+`BlobRef`s in requests. Encoding resolves references and constructs provider wire
+data. Blob contracts will live below both `model` and `thread`, so inference does
+not depend on history types. The kernel owns the store's lifetime across threads,
+clients, and generation attempts; dropping a generation does not discard blobs.
 
 Turns preserve provider-specific JSON under namespaced `provider_info` keys.
 Model messages expose the same map. Native call IDs live in the originating
@@ -265,8 +272,8 @@ backend's metadata; tool requests have no provider-ID field. Model encoding maps
 logical call IDs and their results together, reusing its own compatible metadata
 or generating deterministic wire IDs. Reasoning retains exact text/signature,
 encrypted ID/summary/data, or redacted payloads. Changing backends still requires
-an explicit policy for incompatible reasoning. Thread and model types remain
-independent; the workflow resolves blobs and translates their content.
+an explicit policy for incompatible reasoning. History and inference message types
+remain independent; workflows select context and translate turns.
 
 The kernel owns thread instances, derivation relationships, and external handles.
 It can use references to boxed threads while their allocations remain alive.
@@ -484,7 +491,7 @@ Review steps are module-sized changes within the engine crate.
 2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned turn histories, content contexts, multimodal tool results,
+3. **Thread:** owned turn histories, blob stores, multimodal tool results,
    and read-only indexing.
    Check copy independence, slice bounds, and content preservation.
 4. **Agent/compaction logic:** request projection, streamed generation and turn

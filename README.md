@@ -12,7 +12,7 @@ Implemented so far:
 - [`myco::model`](src/model/README.md): a concrete `GenAiClient`, private provider
   drivers, multimodal input, and a generation stream.
 - [`myco::thread`](src/thread/README.md): owned conversation values with synchronous
-  appends, read-only slicing, copies, and a context for referenced blobs.
+  appends, read-only slicing, copies, and a store for referenced blobs.
 
 Each module's public interface lives in its `mod.rs`. Workflow logic, durable
 storage, services, and the HTTP API are subsequent review steps in the design.
