@@ -87,7 +87,7 @@ It yields the request before dispatch, raw progress, normalized deltas, and one
 persist each item before polling again. Backend dispatch uses a private `Driver`
 trait; there is no public model trait. The model module does not commit turns.
 Each request supplies the complete selected conversation history. Backends rebuild
-their request from those messages. `Message::Assistant` holds an ordered
+their request from those messages. `MessageKind::Assistant` holds an ordered
 `content: Vec<ContentPart>` for both generated replies and request history.
 Parts include text, reasoning, and tool calls; reasoning retains its signature or
 encrypted data explicitly. Finish reason and usage describe the generation.
@@ -231,68 +231,52 @@ replayed. Filesystem and terminal bindings can address the same host/files.
 
 ## Thread history
 
-A thread is an owned, append-only conversation in memory. The kernel holds and
-manages distinct `Thread` instances; the history module operates on those values.
+`Thread` owns a dense `Vec<Turn>`. Its synchronous API is `new`, `turns`, `push`,
+and read-only indexing. A branch is `Thread::new(thread[..end].to_vec())`;
+`clone` copies the whole history. Neither operation starts tool work. Consecutive
+user turns are allowed; workflow context construction validates model sequencing.
 
-```rust
-#[derive(Clone, Default)]
-pub struct Thread {
-    entries: Vec<Entry>,
-}
+`Turn { kind, provider_info }` wraps `TurnKind::User(UserTurn)` or
+`Assistant(AssistantTurn)`. User turns have an `Author` (human or system), content,
+and tool responses. Assistant turns have content and tool requests. `Author`
+describes provenance, not model instruction priority. GUI-only notices and runtime
+lifecycle facts stay in kernel observations. There are no turn pairs.
 
-impl Thread {
-    pub fn from_entries(entries: Vec<Entry>) -> Self;
-    pub fn entries(&self) -> &[Entry];
-    pub fn push(&mut self, entry: Entry);
-}
-```
+`Content` holds text, image references, reasoning, and refusals. It contains no tool
+requests/responses, so multimodal tool responses use the same content type without
+recursion. `ToolCallId(uuid::Uuid)` correlates a request and its observations.
+Responses distinguish success, error, backgrounding, and unknown effects. A later
+observation appends without overwriting the earlier one. After a background
+acknowledgement closes the model-facing call, a later completion can be a runtime
+notice; the workflow chooses that representation.
 
-Owned values use dense vectors. Appending requires an exclusive borrow and leaves
-existing entries unchanged. Cloning copies entries, and each copy can grow
-independently. Read-only indexing borrows an entry or slice. A branch is an
-ordinary copy: `Thread::from_entries(thread[..end].to_vec())`. Invalid indices
-panic; `thread.entries().get(range)` provides checked access.
+Images contain `BlobRef(uuid::Uuid)`, never a URL or inline bytes. A separate
+`ContentContext` registers immutable blobs (media type and shared bytes), rejects
+rebinding a UUID, and reports missing references. A context serves multiple
+threads. `Thread::blob_refs()` includes references in tool responses;
+`validate_content` checks resolution without I/O. Copies preserve references and
+share blob bytes. The kernel handles loading, access, size limits, persistence,
+export, and retention. Blobs must be durable before publishing their references,
+and remain available while any saved history needs them.
 
-The kernel owns thread instances, retains needed snapshots, and tracks how threads
-were derived. It can own `Box<Thread>` values and borrow them for in-process access.
-Address-based identity is valid only for an allocation's lifetime. Thread IDs in
-application observations and history references are kernel-managed handles;
-`Thread` itself has no ID. Equality compares contents.
+Turns preserve provider-specific JSON under namespaced `provider_info` keys.
+Model messages expose the same map. Native call IDs live in the originating
+backend's metadata; tool requests have no provider-ID field. Model encoding maps
+logical call IDs and their results together, reusing its own compatible metadata
+or generating deterministic wire IDs. Reasoning retains exact text/signature,
+encrypted ID/summary/data, or redacted payloads. Changing backends still requires
+an explicit policy for incompatible reasoning. Thread and model types remain
+independent; the workflow resolves blobs and translates their content.
 
-Serialization, persistence, collections, grouping, operation records, cancellation,
-and publication checks belong outside `thread`. Its methods are synchronous and
-have no injected storage, registry, or revision counters. Workflow code composes
-these local operations with effectful APIs supplied by the kernel and services.
-
-`thread` owns the canonical history: `Entry::Turn(Turn)`, warnings, errors, and
-notifications. A turn contains a `Sender` (assistant, user, tool, or system) and
-ordered content parts, including text and images. These types are independent of
-inference types. The workflow checks sender/content compatibility and chooses
-which entries enter a model prompt. Text uses `Text { content }`; images use
-`Image { url }`. Image URLs are retained as supplied; provider image encoding is
-future work in the model/workflow layer.
-
-Tool calls and responses share a `ToolCallId`, a newtype around `uuid::Uuid`.
-It identifies the call within conversation history and survives history copies.
-Execution attempts, deduplication, and retry records belong to the kernel/services.
-`ToolResponseResult` records `Completed { result, is_error }` or `Backgrounded`.
-A later completion is another observation with the same call ID; workflow
-projection decides how those observations become provider tool results.
-
-`thread::ContentPart::Reasoning(Reasoning)` groups text, encrypted, and redacted
-reasoning. Its payload retains the original text and signature, encrypted reasoning
-ID/summary/data, or opaque redacted block, respectively. Tool calls retain the original
-`provider_call_id` alongside their conversation ID; synthetic calls can omit it.
-Workflow code resolves each result's provider ID from its matching call and
-preserves reasoning fields and order when rebuilding model context. This content
-is copied with the thread, without an external record lookup or a dependency on
-model types. The kernel can construct values with `from_entries` using its own
-format.
+The kernel owns thread instances, derivation relationships, and external handles.
+It can use references to boxed threads while their allocations remain alive.
+Serialization, grouping, operation records, and publication checks remain outside
+`Thread`; a local push performs no persistence.
 
 ## Workflow composition and streaming
 
 Workflow code constructs a model request, consumes its stream, validates the
-outcome, and appends accepted entries to a `Thread`. The kernel handles publication
+outcome, and appends accepted turns to a `Thread`. The kernel handles publication
 and persistence around those local updates. The history API serves several uses:
 
 | Workflow | Composition |
@@ -310,10 +294,9 @@ an enclosing agent object.
 `model` has its own inference input, content, and incremental-part vocabulary.
 Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
-The richer roles in `thread` are interpreted by each workflow, not mechanically
-converted into model roles. Raw provider events, usage, and timing stay in workflow
-records. The thread carries the content needed for model history, including the
-original reasoning text, signature/encrypted data, and provider call IDs.
+Thread authorship and tool observations are interpreted by each workflow. Raw
+provider events, usage, and timing stay in workflow records. Threads retain
+reasoning text, signature/encrypted data, blob references, and provider metadata.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
@@ -401,7 +384,7 @@ Application code must yield during long computation.
 ```rust
 pub struct HistoryRef {
     pub thread: ThreadId,
-    pub entries: std::ops::Range<usize>,
+    pub turns: std::ops::Range<usize>,
 }
 
 pub struct GenerationIntent {
@@ -439,8 +422,8 @@ Workflow adapters pin model configuration and capabilities, record the exact
 request before polling the inference stream into dispatch, and translate progress
 and its final outcome into thread values.
 
-Raw provider metadata, usage, and timing remain in workflow/kernel records.
-Conversation content carries reasoning replay data and original provider call IDs.
+Raw traces, usage, and timing remain in workflow/kernel records. Conversation
+content carries reasoning replay data; turn metadata carries native call IDs.
 Execution records separately associate tool calls with the service operations they
 trigger.
 
@@ -501,7 +484,8 @@ Review steps are module-sized changes within the engine crate.
 2. **Model:** `model::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned vector histories, rich entries, appending, and read-only indexing.
+3. **Thread:** owned turn histories, content contexts, multimodal tool results,
+   and read-only indexing.
    Check copy independence, slice bounds, and content preservation.
 4. **Agent/compaction logic:** request projection, streamed generation and turn
    publication, tool loops, checkpoints, compaction, and concurrent runs. Use

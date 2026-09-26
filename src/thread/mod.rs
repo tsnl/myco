@@ -1,8 +1,13 @@
 #![doc = include_str!("README.md")]
 
-use std::{ops::Index, slice::SliceIndex};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    ops::Index,
+    slice::SliceIndex,
+    sync::Arc,
+};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 //
 // Thread
@@ -10,37 +15,34 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Thread {
-    turns: Vec<TurnPair>,
+    turns: Vec<Turn>,
 }
 
 impl Thread {
-    pub fn new(turns: Vec<TurnPair>) -> Self {
+    pub fn new(turns: Vec<Turn>) -> Self {
         Self { turns }
     }
-    pub fn turns(&self) -> &[TurnPair] {
+    pub fn turns(&self) -> &[Turn] {
         &self.turns
     }
-    pub fn push(&mut self, turn: Turn) -> Result<(), TurnPushError> {
-        let expected = self.next_turn_kind();
-        let received = turn.kind();
-
-        if received != expected {
-            return Err(TurnPushError::BadKind { expected, received });
-        }
-
-        // TODO: finish this implementation
+    pub fn push(&mut self, turn: Turn) {
+        self.turns.push(turn);
     }
-
-    fn next_turn_kind(&self) -> TurnKind {
-        if let Some(back) = self.turns.back() {
-            back.next_turn_kind()
-        } else {
-            TurnKind::User
+    pub fn blob_refs(&self) -> impl Iterator<Item = BlobRef> + '_ {
+        self.turns
+            .iter()
+            .flat_map(Turn::contents)
+            .flat_map(Content::blob_refs)
+    }
+    pub fn validate_content(&self, context: &ContentContext) -> Result<(), ContentError> {
+        for reference in self.blob_refs() {
+            context.get(reference)?;
         }
+        Ok(())
     }
 }
 
-impl<I: SliceIndex<[TurnPair]>> Index<I> for Thread {
+impl<I: SliceIndex<[Turn]>> Index<I> for Thread {
     type Output = I::Output;
 
     fn index(&self, index: I) -> &Self::Output {
@@ -48,80 +50,79 @@ impl<I: SliceIndex<[TurnPair]>> Index<I> for Thread {
     }
 }
 
-#[thiserror::Error]
-pub enum TurnPushError {
-    #[err("Expected turn kind {expected}, received turn kind {received}")]
-    BadKind { expected: TurnKind, received: TurnKind }
-}
-
 //
 // Turns
 //
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnPair {
-    user_turn: UserTurn,
-    assistant_turn: Option<AssistantTurn>,
+pub struct Turn {
+    pub kind: TurnKind,
+    pub provider_info: Map<String, Value>,
 }
-impl TurnPair {
-    fn next_turn_kind(&self) -> TurnKind {
-        match &self.assistant_turn {
-            None => TurnKind::Assistant,
-            Some(_) => TurnKind::User,
+
+impl Turn {
+    pub fn new(kind: TurnKind) -> Self {
+        Self {
+            kind,
+            provider_info: Map::new(),
         }
+    }
+    fn contents(&self) -> impl Iterator<Item = &Content> {
+        let (content, responses): (&Content, &[ToolUseResponse]) = match &self.kind {
+            TurnKind::User(turn) => (&turn.content, &turn.tool_use_responses),
+            TurnKind::Assistant(turn) => (&turn.content, &[]),
+        };
+        std::iter::once(content).chain(responses.iter().map(|response| &response.content))
     }
 }
 
-pub enum Turn {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnKind {
     User(UserTurn),
     Assistant(AssistantTurn),
-}
-impl Turn {
-    fn kind(&self) -> TurnKind {
-        match self {
-            User(_) => TurnKind::User,
-            Assistant(_) => TurnKind::Assistant,
-        }
-    }
-}
-
-pub enum TurnKind {
-    User,
-    Assistant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTurn {
-    author: Author,
-    content: Content,
-    tool_use_responses: Vec<ToolUseResponse>,
+    pub author: Author,
+    pub content: Content,
+    pub tool_use_responses: Vec<ToolUseResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AssistantTurn {
-    content: Content,
-    tool_use_requests: Vec<ToolUseRequest>,
+    pub content: Content,
+    pub tool_use_requests: Vec<ToolUseRequest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Author {
     Human,
-    System,`
+    System,
 }
 
 //
 // Content
 //
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Content {
-    parts: Vec<ContentPart>,
+    pub parts: Vec<ContentPart>,
+}
+
+impl Content {
+    pub fn blob_refs(&self) -> impl Iterator<Item = BlobRef> + '_ {
+        self.parts.iter().filter_map(|part| match part {
+            ContentPart::Image { blob } => Some(*blob),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
     Text { content: String },
-    Image { url: String },
+    Image { blob: BlobRef },
     Reasoning(ReasoningContentPart),
     Refusal(RefusalContentPart),
 }
@@ -142,8 +143,51 @@ pub enum ReasoningContentPart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalContentPart {
-    kind: Option<String>,
-    message: String,
+    pub kind: Option<String>,
+    pub message: String,
+}
+
+//
+// Content context
+//
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlobRef(pub uuid::Uuid);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    pub media_type: String,
+    pub data: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContentContext {
+    blobs: HashMap<BlobRef, Blob>,
+}
+
+impl ContentContext {
+    pub fn insert(&mut self, reference: BlobRef, blob: Blob) -> Result<(), ContentError> {
+        match self.blobs.entry(reference) {
+            Entry::Vacant(entry) => {
+                entry.insert(blob);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(ContentError::AlreadyExists(reference)),
+        }
+    }
+    pub fn get(&self, reference: BlobRef) -> Result<&Blob, ContentError> {
+        self.blobs
+            .get(&reference)
+            .ok_or(ContentError::Missing(reference))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContentError {
+    #[error("missing content blob {0:?}")]
+    Missing(BlobRef),
+    #[error("content blob {0:?} is already registered")]
+    AlreadyExists(BlobRef),
 }
 
 //
@@ -155,21 +199,22 @@ pub struct ToolCallId(pub uuid::Uuid);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolUseRequest {
-    id: ToolCallId,
-    provider_call_id: Option<String>,
-    name: String,
-    arguments: Result<Value, String>,
+    pub id: ToolCallId,
+    pub name: String,
+    pub arguments: Result<Value, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolUseResponse {
-    kind: ToolUseResponseKind,
-    content: Content,
+    pub id: ToolCallId,
+    pub kind: ToolUseResponseKind,
+    pub content: Content,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolUseResponseKind {
     Error,
     Success,
     Backgrounded,
+    Unknown,
 }

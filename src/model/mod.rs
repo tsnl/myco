@@ -2,6 +2,7 @@
 
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -71,16 +72,39 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Message {
-    User(String),
+pub struct Message {
+    pub kind: MessageKind,
+    pub provider_info: Map<String, Value>,
+}
+
+impl Message {
+    pub fn new(kind: MessageKind) -> Self {
+        Self {
+            kind,
+            provider_info: Map::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageKind {
+    User {
+        content: Vec<InputContentPart>,
+    },
     Assistant {
         content: Vec<ContentPart>,
     },
     ToolResult {
         call_id: String,
-        output: String,
+        content: Vec<InputContentPart>,
         is_error: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputContentPart {
+    Text { content: String },
+    Image { media_type: String, data: Arc<[u8]> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

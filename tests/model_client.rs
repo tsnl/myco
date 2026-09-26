@@ -1,13 +1,19 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{Config, Error, Event, GenAiClient, Message, Request};
+use myco::model::{
+    Config, Error, Event, GenAiClient, InputContentPart, Message, MessageKind, Request,
+};
 use tokio::{net::TcpListener, time::timeout};
 
 fn request() -> Request {
     Request {
         model: "test-model".into(),
-        messages: vec![Message::User("hello".into())],
+        messages: vec![Message::new(MessageKind::User {
+            content: vec![InputContentPart::Text {
+                content: "hello".into(),
+            }],
+        })],
         max_output_tokens: 64,
         ..Default::default()
     }

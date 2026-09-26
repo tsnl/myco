@@ -1,11 +1,13 @@
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::backend_helpers::{
-    Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, index, wire_messages,
 };
 use super::http_helpers::Transport;
 use super::{
-    ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
+    ContentPart, Delta, DeltaKind, Error, Finish, InputContentPart, MessageKind, Request, Tool,
+    ToolCall, Usage,
 };
 
 //
@@ -40,8 +42,8 @@ impl Driver for Backend {
 //
 
 fn encode_request(request: &Request) -> Result<Value, Error> {
-    let input = request
-        .messages
+    let messages = wire_messages(Protocol::OpenAiResponses, &request.messages)?;
+    let input = messages
         .iter()
         .map(encode_message)
         .collect::<Result<Vec<_>, _>>()?;
@@ -54,15 +56,17 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
     }))
 }
 
-fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
+fn encode_message(message: &MessageKind) -> Result<Vec<Value>, Error> {
     match message {
-        Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant { content } => assistant(content),
-        Message::ToolResult {
+        MessageKind::User { content } => Ok(vec![
+            json!({"role": "user", "content": input_content(content)}),
+        ]),
+        MessageKind::Assistant { content } => assistant(content),
+        MessageKind::ToolResult {
             call_id,
-            output,
+            content,
             is_error,
-        } => Ok(vec![tool_result(call_id, output, *is_error)]),
+        } => Ok(vec![tool_result(call_id, content, *is_error)]),
     }
 }
 
@@ -95,14 +99,36 @@ fn encode_part(part: &ContentPart) -> Result<Option<Value>, Error> {
     })
 }
 
-fn tool_result(id: &str, output: &str, is_error: bool) -> Value {
+fn tool_result(id: &str, content: &[InputContentPart], is_error: bool) -> Value {
     // Responses has no error flag; the observation itself must carry the error.
-    let output = if is_error {
-        format!("Tool error: {output}")
-    } else {
-        output.into()
-    };
+    let mut output = input_content(content);
+    if is_error {
+        match &mut output {
+            Value::String(text) => *text = format!("Tool error: {text}"),
+            Value::Array(parts) => {
+                parts.insert(0, json!({"type":"input_text", "text":"Tool error:"}))
+            }
+            _ => unreachable!(),
+        }
+    }
     json!({"type": "function_call_output", "call_id": id, "output": output})
+}
+
+fn input_content(content: &[InputContentPart]) -> Value {
+    if let [InputContentPart::Text { content }] = content {
+        return content.clone().into();
+    }
+    content.iter().map(input_part).collect()
+}
+
+fn input_part(part: &InputContentPart) -> Value {
+    match part {
+        InputContentPart::Text { content } => json!({"type":"input_text", "text":content}),
+        InputContentPart::Image { media_type, data } => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            json!({"type":"input_image", "image_url":format!("data:{media_type};base64,{encoded}"), "detail":"auto"})
+        }
+    }
 }
 
 fn tool(tool: &Tool) -> Value {
