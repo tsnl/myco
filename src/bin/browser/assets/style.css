@@ -19,10 +19,11 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100dvh; isolation: isolate; }
-/* Keep the glass independent of document height. The extra viewport below it
-   covers rubber-band overscroll without extending the scrollable content. */
+body:has(> .toolbar) { padding-top: var(--toolbar-height); }
+/* Anchor both glass surfaces to the viewport so native scroll bounce cannot
+   separate the toolbar from the well. Extra glass never adds scrollable space. */
 body::before {
-  content: ''; position: fixed; inset: 0 0 -100lvh; z-index: -1;
+  content: ''; position: fixed; inset: -100lvh 0 -100lvh; z-index: -1;
   max-width: 980px; margin-inline: auto; box-sizing: border-box;
   border-inline: 1px solid #e5e5e51c; background: var(--glass-well);
   backdrop-filter: blur(18px); pointer-events: none;
@@ -38,7 +39,9 @@ button:hover, .button:hover { border-color: var(--dim); }
 button:disabled { opacity: .45; cursor: default; }
 button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, .brand:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 [hidden] { display: none !important; }
-.toolbar { position: sticky; top: 0; z-index: 2; border-bottom: 1px solid var(--line); background: var(--glass-raised); backdrop-filter: var(--glass-filter); }
+.toolbar { position: fixed; inset: 0 0 auto; z-index: 2; border-bottom: 1px solid var(--line); }
+/* One continuous surface fills the area above the bar without stacking tint. */
+.toolbar::before { content: ''; position: absolute; inset: -100lvh 0 0; z-index: -1; background: var(--glass-raised); backdrop-filter: var(--glass-filter); pointer-events: none; }
 .toolbar-inner { display: flex; align-items: center; gap: 16px; max-width: 980px; min-height: 64px; padding: 12px 32px; margin: 0 auto; }
 .toolbar-heading { display: flex; align-items: center; gap: 16px; flex: 1; min-width: 0; min-height: 24px; }
 .brand { flex: none; color: var(--green); text-decoration: none; font-weight: 800; }
