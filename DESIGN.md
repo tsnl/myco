@@ -237,14 +237,17 @@ and read-only indexing. A branch is `Thread::new(thread[..end].to_vec())`;
 user turns are allowed; workflow context construction validates model sequencing.
 
 `Turn { kind, provider_info }` wraps `TurnKind::User(UserTurn)` or
-`Assistant(AssistantTurn)`. User turns have an `Author` (human or system), content,
-and tool responses. Assistant turns have content and tool requests. `Author`
-describes provenance, not model instruction priority. GUI-only notices and runtime
-lifecycle facts stay in kernel observations. There are no turn pairs.
+`Assistant(AssistantTurn)`. User turns have content and tool responses. Assistant
+turns have content and tool requests. Each `ContentPart { author, kind }` records
+its contributor as human, assistant, tool, or system. A turn can mix authors;
+copying or regrouping parts preserves their attribution. `Author` describes
+provenance independently of conversational role and model instruction priority.
+GUI-only notices and runtime lifecycle facts stay in kernel observations. There
+are no turn pairs.
 
-`Content` holds text, image references, reasoning, and refusals. It contains no tool
-requests/responses, so multimodal tool responses use the same content type without
-recursion. `ToolCallId(uuid::Uuid)` correlates a request and its observations.
+`ContentPartKind` holds text, image references, reasoning, and refusals. `Content`
+contains no tool requests or responses, so multimodal tool results can use it
+without recursion. `ToolCallId(uuid::Uuid)` correlates a request and its observations.
 Responses distinguish success, error, backgrounding, and unknown effects. A later
 observation appends without overwriting the earlier one. After a background
 acknowledgement closes the model-facing call, a later completion can be a runtime

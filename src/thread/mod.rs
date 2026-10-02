@@ -84,7 +84,6 @@ pub enum TurnKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTurn {
-    pub author: Author,
     pub content: Content,
     pub tool_use_responses: Vec<ToolUseResponse>,
 }
@@ -93,12 +92,6 @@ pub struct UserTurn {
 pub struct AssistantTurn {
     pub content: Content,
     pub tool_use_requests: Vec<ToolUseRequest>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Author {
-    Human,
-    System,
 }
 
 //
@@ -112,15 +105,29 @@ pub struct Content {
 
 impl Content {
     pub fn blob_refs(&self) -> impl Iterator<Item = BlobRef> + '_ {
-        self.parts.iter().filter_map(|part| match part {
-            ContentPart::Image { blob } => Some(*blob),
+        self.parts.iter().filter_map(|part| match &part.kind {
+            ContentPartKind::Image { blob } => Some(*blob),
             _ => None,
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContentPart {
+pub struct ContentPart {
+    pub author: Author,
+    pub kind: ContentPartKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Author {
+    Human,
+    Assistant,
+    Tool,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPartKind {
     Text { content: String },
     Image { blob: BlobRef },
     Reasoning(ReasoningContentPart),

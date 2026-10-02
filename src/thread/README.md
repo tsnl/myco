@@ -4,21 +4,27 @@ An owned conversation in memory, with bulky content held in a separate blob
 store. The kernel manages thread instances, persistence, and workspace access.
 
 ```rust
-use myco::thread::{Author, Content, ContentPart, Thread, Turn, TurnKind, UserTurn};
+use myco::thread::{Author, Content, ContentPart, ContentPartKind, Thread, Turn, TurnKind, UserTurn};
 
 let mut thread = Thread::default();
 thread.push(Turn::new(TurnKind::User(UserTurn {
-    author: Author::Human,
     content: Content {
-        parts: vec![ContentPart::Text { content: "Explain this repository.".into() }],
+        parts: vec![ContentPart {
+            author: Author::Human,
+            kind: ContentPartKind::Text { content: "Explain this repository.".into() },
+        }],
     },
     tool_use_responses: vec![],
 })));
 let snapshot = thread.clone();
 let mut branch = Thread::new(thread[..1].to_vec());
 branch.push(Turn::new(TurnKind::User(UserTurn {
-    author: Author::System,
-    content: Content::default(),
+    content: Content {
+        parts: vec![ContentPart {
+            author: Author::System,
+            kind: ContentPartKind::Text { content: "Working directory: /workspace".into() },
+        }],
+    },
     tool_use_responses: vec![],
 })));
 assert_eq!(thread, snapshot);
@@ -36,10 +42,17 @@ follow-ups, runtime notices, and tool completions are ordinary turns. The workfl
 selects a valid generation context from that history.
 
 A `Turn` contains its `TurnKind` and a `provider_info` map. `UserTurn` carries
-`Author::Human` or `Author::System`, content, and tool responses. `AssistantTurn`
-carries content and tool requests. Content contains no tool requests or responses,
-so the type graph is not recursive. `Author::System` records provenance; it does
-not promote text to a model's system-instruction field. GUI-only warnings and
+content and tool responses; `AssistantTurn` carries content and tool requests.
+Each `ContentPart { author, kind }` records its contributor as `Author::Human`,
+`Assistant`, `Tool`, or `System`. A turn can mix authors, and copying or regrouping
+parts preserves their attribution. `ContentPartKind` holds text, image references,
+reasoning, or refusals. Content contains no tool requests or responses, so the
+type graph is not recursive.
+
+Authorship is independent of conversational role and model instruction priority.
+`Author::System` identifies runtime-supplied content; the workflow decides where
+to place it in an inference request. `Author::Tool` describes provenance, while
+`ToolUseResponse::id` correlates the response with its call. GUI-only warnings and
 activity, including structured lifecycle facts, remain kernel observations.
 
 `Thread` has no identity, serialization format, or storage dependency. The kernel

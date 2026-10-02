@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use myco::thread::{
     AssistantTurn, Author, Blob, BlobRef, BlobStore, Content, ContentError, ContentPart,
-    ReasoningContentPart, RefusalContentPart, Thread, ToolCallId, ToolUseRequest, ToolUseResponse,
-    ToolUseResponseKind, Turn, TurnKind, UserTurn,
+    ContentPartKind, ReasoningContentPart, RefusalContentPart, Thread, ToolCallId, ToolUseRequest,
+    ToolUseResponse, ToolUseResponseKind, Turn, TurnKind, UserTurn,
 };
 use serde_json::json;
 
@@ -23,6 +23,34 @@ fn consecutive_human_and_system_turns_preserve_provenance_and_snapshots() {
     assert_eq!(&thread[..1], snapshot.turns());
     assert_eq!(thread[1], user(Author::System, "runtime notice"));
     assert_eq!(thread.turns().len(), 3);
+}
+
+#[test]
+fn regrouping_parts_preserves_mixed_authorship_in_one_turn() {
+    let authors = [
+        Author::Human,
+        Author::System,
+        Author::Assistant,
+        Author::Tool,
+    ];
+    let parts = authors
+        .into_iter()
+        .flat_map(|author| text(author, "contributed text").parts)
+        .collect::<Vec<_>>();
+    let thread = Thread::new(vec![Turn::new(TurnKind::User(UserTurn {
+        content: Content { parts },
+        tool_use_responses: vec![],
+    }))]);
+    let snapshot = thread.clone();
+    let branch = Thread::new(thread[..1].to_vec());
+    drop(thread);
+    for history in [snapshot, branch] {
+        let TurnKind::User(turn) = &history[0].kind else {
+            panic!("expected user turn")
+        };
+        let actual = turn.content.parts.iter().map(|part| part.author);
+        assert_eq!(actual.collect::<Vec<_>>(), authors);
+    }
 }
 
 #[test]
@@ -82,32 +110,38 @@ fn tool_results_keep_multimodal_content_correlated_without_recursive_tool_payloa
     thread.push(response(
         id,
         ToolUseResponseKind::Success,
-        Content {
-            parts: vec![
-                ContentPart::Text {
+        content(
+            Author::Tool,
+            vec![
+                ContentPartKind::Text {
                     content: "screenshot".into(),
                 },
-                ContentPart::Image { blob: reference },
+                ContentPartKind::Image { blob: reference },
             ],
-        },
+        ),
     ));
     let TurnKind::User(turn) = &thread[1].kind else {
         panic!("expected tool response")
     };
-    assert_eq!(turn.author, Author::System);
     assert_eq!(turn.tool_use_responses[0].id, id);
-    assert_eq!(turn.tool_use_responses[0].content.parts.len(), 2);
+    let parts = &turn.tool_use_responses[0].content.parts;
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().all(|part| part.author == Author::Tool));
     assert_eq!(thread.blob_refs().collect::<Vec<_>>(), vec![reference]);
 }
 
 #[test]
 fn backgrounded_and_unknown_outcomes_remain_observations_after_completion() {
     let id = call_id(1);
-    let initial = response(id, ToolUseResponseKind::Backgrounded, text("still running"));
+    let initial = response(
+        id,
+        ToolUseResponseKind::Backgrounded,
+        text(Author::System, "still running"),
+    );
     let uncertain = response(
         id,
         ToolUseResponseKind::Unknown,
-        text("connection lost; effects unknown"),
+        text(Author::System, "connection lost; effects unknown"),
     );
     let mut thread = Thread::new(vec![
         assistant_request(id),
@@ -118,7 +152,7 @@ fn backgrounded_and_unknown_outcomes_remain_observations_after_completion() {
     thread.push(response(
         id,
         ToolUseResponseKind::Success,
-        text("reconciled result"),
+        text(Author::Tool, "reconciled result"),
     ));
 
     assert_eq!(snapshot.turns(), &thread[..3]);
@@ -135,31 +169,32 @@ fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
     let TurnKind::Assistant(assistant) = &mut turn.kind else {
         unreachable!()
     };
-    assistant.content = Content {
-        parts: vec![
-            ContentPart::Reasoning(ReasoningContentPart::Text {
+    assistant.content = content(
+        Author::Assistant,
+        vec![
+            ContentPartKind::Reasoning(ReasoningContentPart::Text {
                 text: "thinking".into(),
                 signature: Some("signed".into()),
             }),
-            ContentPart::Reasoning(ReasoningContentPart::Encrypted {
+            ContentPartKind::Reasoning(ReasoningContentPart::Encrypted {
                 id: "reasoning".into(),
                 summary: vec!["first".into(), "second".into()],
                 data: "encrypted".into(),
             }),
-            ContentPart::Reasoning(ReasoningContentPart::Redacted("redacted".into())),
-            ContentPart::Refusal(RefusalContentPart {
+            ContentPartKind::Reasoning(ReasoningContentPart::Redacted("redacted".into())),
+            ContentPartKind::Refusal(RefusalContentPart {
                 kind: Some("policy".into()),
                 message: "cannot comply".into(),
             }),
         ],
-    };
+    );
     assistant.tool_use_requests[0].arguments = Err("incomplete JSON".into());
     let expected = vec![
         turn,
         response(
             call_id(1),
             ToolUseResponseKind::Error,
-            text("invalid arguments"),
+            text(Author::System, "invalid arguments"),
         ),
     ];
     let source = Thread::new(expected.clone());
@@ -191,9 +226,10 @@ fn history_copies_retain_references_without_copying_blob_bytes() {
     let thread = Thread::new(vec![response(
         call_id(1),
         ToolUseResponseKind::Success,
-        Content {
-            parts: vec![ContentPart::Image { blob: reference }],
-        },
+        content(
+            Author::Tool,
+            vec![ContentPartKind::Image { blob: reference }],
+        ),
     )]);
     let branch = Thread::new(thread[..].to_vec());
     let snapshot = thread.clone();
@@ -213,12 +249,12 @@ fn history_copies_retain_references_without_copying_blob_bytes() {
 fn missing_blobs_in_turns_and_tool_responses_fail_explicitly() {
     let store = BlobStore::default();
     let reference = blob_ref(1);
-    let content = Content {
-        parts: vec![ContentPart::Image { blob: reference }],
-    };
+    let content = content(
+        Author::Human,
+        vec![ContentPartKind::Image { blob: reference }],
+    );
     for kind in [
         TurnKind::User(UserTurn {
-            author: Author::Human,
             content: content.clone(),
             tool_use_responses: vec![],
         }),
@@ -262,18 +298,27 @@ fn a_blob_reference_cannot_be_rebound_to_different_content() {
 
 fn user(author: Author, message: &str) -> Turn {
     Turn::new(TurnKind::User(UserTurn {
-        author,
-        content: text(message),
+        content: text(author, message),
         tool_use_responses: vec![],
     }))
 }
 
-fn text(content: &str) -> Content {
+fn content(author: Author, kinds: Vec<ContentPartKind>) -> Content {
     Content {
-        parts: vec![ContentPart::Text {
-            content: content.into(),
-        }],
+        parts: kinds
+            .into_iter()
+            .map(|kind| ContentPart { author, kind })
+            .collect(),
     }
+}
+
+fn text(author: Author, text: &str) -> Content {
+    content(
+        author,
+        vec![ContentPartKind::Text {
+            content: text.into(),
+        }],
+    )
 }
 
 fn call_id(value: u128) -> ToolCallId {
@@ -285,7 +330,7 @@ fn blob_ref(value: u128) -> BlobRef {
 
 fn assistant_request(id: ToolCallId) -> Turn {
     Turn::new(TurnKind::Assistant(AssistantTurn {
-        content: text("I'll check"),
+        content: text(Author::Assistant, "I'll check"),
         tool_use_requests: vec![ToolUseRequest {
             id,
             name: "read".into(),
@@ -296,7 +341,6 @@ fn assistant_request(id: ToolCallId) -> Turn {
 
 fn response(id: ToolCallId, kind: ToolUseResponseKind, content: Content) -> Turn {
     Turn::new(TurnKind::User(UserTurn {
-        author: Author::System,
         content: Content::default(),
         tool_use_responses: vec![ToolUseResponse { id, kind, content }],
     }))
