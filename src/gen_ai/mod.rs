@@ -8,9 +8,12 @@ use std::{
 use futures_core::{Stream, stream::FusedStream};
 use serde_json::{Map, Value};
 
+use crate::blob::{BlobError, BlobRef, BlobStore};
+
 mod anthropic_backend;
 mod backend_helpers;
 mod http_helpers;
+mod openai_completions_backend;
 mod openai_responses_backend;
 
 use backend_helpers::{Driver, EventStream};
@@ -21,19 +24,25 @@ use backend_helpers::{Driver, EventStream};
 
 pub struct GenAiClient {
     driver: Box<dyn Driver>,
+    blobs: BlobStore,
 }
 pub enum Config {
-    OpenAi { endpoint: String, api_key: String },
+    OpenAiResponses { endpoint: String, api_key: String },
+    OpenAiCompletions { endpoint: String, api_key: String },
     Anthropic { endpoint: String, api_key: String },
 }
 impl GenAiClient {
-    pub fn new(config: Config) -> Result<Self, Error> {
+    pub fn new(config: Config, blobs: BlobStore) -> Result<Self, Error> {
         Ok(Self {
             driver: backend_helpers::driver(config)?,
+            blobs,
         })
     }
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
+    }
     pub fn generate(&self, request: Request) -> Result<Generation<'_>, Error> {
-        backend_helpers::generate(self.driver.as_ref(), request)
+        backend_helpers::generate(self.driver.as_ref(), request, &self.blobs)
     }
 }
 
@@ -71,16 +80,35 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Message {
-    User(String),
+pub struct Message {
+    pub kind: MessageKind,
+}
+
+impl Message {
+    pub fn new(kind: MessageKind) -> Self {
+        Self { kind }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageKind {
+    User {
+        content: Vec<InputContentPart>,
+    },
     Assistant {
         content: Vec<ContentPart>,
     },
     ToolResult {
         call_id: String,
-        output: String,
+        content: Vec<InputContentPart>,
         is_error: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputContentPart {
+    Text { content: String },
+    Image { blob: BlobRef },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +121,7 @@ pub struct Tool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
+    pub provider_id: Option<String>,
     pub name: String,
     pub arguments: Result<Value, String>,
 }
@@ -105,7 +134,7 @@ pub enum ContentPart {
         signature: Option<String>,
     },
     EncryptedReasoning {
-        id: String,
+        provider_id: String,
         summary: Vec<String>,
         data: String,
     },
@@ -150,7 +179,7 @@ pub enum DeltaKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delta {
-    /// Provider output-item or content-block index.
+    /// Output-item or content-block index; Chat Completions reserves zero for message content.
     pub index: usize,
     pub part: usize,
     pub kind: DeltaKind,
@@ -179,6 +208,8 @@ pub enum Event {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Blob(#[from] BlobError),
     #[error("invalid inference request: {0}")]
     InvalidRequest(String),
     #[error("inference transport failed: {0}")]

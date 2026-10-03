@@ -1,23 +1,33 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{Config, Error, Event, GenAiClient, Message, Request};
+use myco::blob::{Blob, BlobStore, MediaType};
+use myco::gen_ai::{
+    Config, Error, Event, GenAiClient, InputContentPart, Message, MessageKind, Request,
+};
 use tokio::{net::TcpListener, time::timeout};
 
 fn request() -> Request {
     Request {
         model: "test-model".into(),
-        messages: vec![Message::User("hello".into())],
+        messages: vec![Message::new(MessageKind::User {
+            content: vec![InputContentPart::Text {
+                content: "hello".into(),
+            }],
+        })],
         max_output_tokens: 64,
         ..Default::default()
     }
 }
 
 fn client(endpoint: String) -> GenAiClient {
-    GenAiClient::new(Config::OpenAi {
-        endpoint,
-        api_key: "test-key".into(),
-    })
+    GenAiClient::new(
+        Config::OpenAiResponses {
+            endpoint,
+            api_key: "test-key".into(),
+        },
+        BlobStore::default(),
+    )
     .unwrap()
 }
 
@@ -77,4 +87,23 @@ fn invalid_options_fail_before_a_stream_is_returned_without_a_runtime() {
         client.generate(request),
         Err(Error::InvalidRequest(_))
     ));
+}
+
+#[test]
+fn dropping_a_generation_and_client_preserves_blobs_for_other_handles() {
+    let client = client("http://127.0.0.1:1/responses".into());
+    let store = client.blobs().clone();
+    let blob = Blob {
+        media_type: MediaType::Png,
+        data: vec![0, 1, 2].into(),
+    };
+    let reference = store.insert(blob.clone()).unwrap();
+    let mut input = request();
+    input.messages = vec![Message::new(MessageKind::User {
+        content: vec![InputContentPart::Image { blob: reference }],
+    })];
+    let generation = client.generate(input).unwrap();
+    drop(generation);
+    drop(client);
+    assert_eq!(store.get(reference), Ok(blob));
 }
