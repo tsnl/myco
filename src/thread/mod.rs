@@ -1,13 +1,10 @@
 #![doc = include_str!("README.md")]
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    ops::Index,
-    slice::SliceIndex,
-    sync::Arc,
-};
+use std::{ops::Index, slice::SliceIndex};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
+
+use crate::blob::{BlobError, BlobRef, BlobStore};
 
 //
 // Thread
@@ -34,7 +31,7 @@ impl Thread {
             .flat_map(Turn::contents)
             .flat_map(Content::blob_refs)
     }
-    pub fn validate_content(&self, store: &BlobStore) -> Result<(), ContentError> {
+    pub fn validate_content(&self, store: &BlobStore) -> Result<(), BlobError> {
         for reference in self.blob_refs() {
             store.get(reference)?;
         }
@@ -57,15 +54,11 @@ impl<I: SliceIndex<[Turn]>> Index<I> for Thread {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     pub kind: TurnKind,
-    pub provider_info: Map<String, Value>,
 }
 
 impl Turn {
     pub fn new(kind: TurnKind) -> Self {
-        Self {
-            kind,
-            provider_info: Map::new(),
-        }
+        Self { kind }
     }
     fn contents(&self) -> impl Iterator<Item = &Content> {
         let (content, responses): (&Content, &[ToolUseResponse]) = match &self.kind {
@@ -141,7 +134,7 @@ pub enum ReasoningContentPart {
         signature: Option<String>,
     },
     Encrypted {
-        id: String,
+        provider_id: String,
         summary: Vec<String>,
         data: String,
     },
@@ -155,49 +148,6 @@ pub struct RefusalContentPart {
 }
 
 //
-// Blob store
-//
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlobRef(pub uuid::Uuid);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Blob {
-    pub media_type: String,
-    pub data: Arc<[u8]>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BlobStore {
-    blobs: HashMap<BlobRef, Blob>,
-}
-
-impl BlobStore {
-    pub fn insert(&mut self, reference: BlobRef, blob: Blob) -> Result<(), ContentError> {
-        match self.blobs.entry(reference) {
-            Entry::Vacant(entry) => {
-                entry.insert(blob);
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(ContentError::AlreadyExists(reference)),
-        }
-    }
-    pub fn get(&self, reference: BlobRef) -> Result<&Blob, ContentError> {
-        self.blobs
-            .get(&reference)
-            .ok_or(ContentError::Missing(reference))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ContentError {
-    #[error("missing content blob {0:?}")]
-    Missing(BlobRef),
-    #[error("content blob {0:?} is already registered")]
-    AlreadyExists(BlobRef),
-}
-
-//
 // Tools
 //
 
@@ -207,6 +157,7 @@ pub struct ToolCallId(pub uuid::Uuid);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolUseRequest {
     pub id: ToolCallId,
+    pub provider_id: Option<String>,
     pub name: String,
     pub arguments: Result<Value, String>,
 }

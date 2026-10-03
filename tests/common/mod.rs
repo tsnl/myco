@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use myco::blob::BlobStore;
 use myco::gen_ai::{
     Config, Error, Event, Finish, GenAiClient, Generation, InputContentPart, Message, MessageKind,
     Request, Usage,
@@ -121,12 +122,24 @@ pub fn request() -> Request {
 }
 
 pub fn client(protocol: Backend, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
+    client_with_blobs(protocol, endpoint, key, BlobStore::default())
+}
+
+pub fn client_with_blobs(
+    protocol: Backend,
+    endpoint: &str,
+    key: &str,
+    blobs: BlobStore,
+) -> Result<GenAiClient, Error> {
     let endpoint = endpoint.into();
     let api_key = key.into();
-    GenAiClient::new(match protocol {
-        Backend::OpenAiResponses => Config::OpenAi { endpoint, api_key },
-        Backend::AnthropicMessages => Config::Anthropic { endpoint, api_key },
-    })
+    GenAiClient::new(
+        match protocol {
+            Backend::OpenAiResponses => Config::OpenAiResponses { endpoint, api_key },
+            Backend::AnthropicMessages => Config::Anthropic { endpoint, api_key },
+        },
+        blobs,
+    )
 }
 
 #[derive(Debug)]

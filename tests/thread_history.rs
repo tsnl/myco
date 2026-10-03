@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use myco::blob::{Blob, BlobError, BlobRef, BlobStore, MediaType};
 use myco::thread::{
-    AssistantTurn, Author, Blob, BlobRef, BlobStore, Content, ContentError, ContentPart,
-    ContentPartKind, ReasoningContentPart, RefusalContentPart, Thread, ToolCallId, ToolUseRequest,
-    ToolUseResponse, ToolUseResponseKind, Turn, TurnKind, UserTurn,
+    AssistantTurn, Author, Content, ContentPart, ContentPartKind, ReasoningContentPart,
+    RefusalContentPart, Thread, ToolCallId, ToolUseRequest, ToolUseResponse, ToolUseResponseKind,
+    Turn, TurnKind, UserTurn,
 };
 use serde_json::json;
 
@@ -162,10 +163,8 @@ fn backgrounded_and_unknown_outcomes_remain_observations_after_completion() {
 }
 
 #[test]
-fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
+fn copies_preserve_provider_ids_reasoning_refusals_and_tool_errors() {
     let mut turn = assistant_request(call_id(1));
-    turn.provider_info
-        .insert("example.backend".into(), json!({"opaque":"original"}));
     let TurnKind::Assistant(assistant) = &mut turn.kind else {
         unreachable!()
     };
@@ -177,7 +176,7 @@ fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
                 signature: Some("signed".into()),
             }),
             ContentPartKind::Reasoning(ReasoningContentPart::Encrypted {
-                id: "reasoning".into(),
+                provider_id: "reasoning".into(),
                 summary: vec!["first".into(), "second".into()],
                 data: "encrypted".into(),
             }),
@@ -189,6 +188,7 @@ fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
         ],
     );
     assistant.tool_use_requests[0].arguments = Err("incomplete JSON".into());
+    assistant.tool_use_requests[0].provider_id = Some("provider-call".into());
     let expected = vec![
         turn,
         response(
@@ -211,17 +211,13 @@ fn copies_preserve_provider_metadata_reasoning_refusals_and_tool_errors() {
 
 #[test]
 fn history_copies_retain_references_without_copying_blob_bytes() {
-    let reference = blob_ref(1);
     let data: Arc<[u8]> = Arc::from(vec![7; 1024 * 1024]);
-    let mut store = BlobStore::default();
-    store
-        .insert(
-            reference,
-            Blob {
-                media_type: "image/png".into(),
-                data: data.clone(),
-            },
-        )
+    let store = BlobStore::default();
+    let reference = store
+        .insert(Blob {
+            media_type: MediaType::Png,
+            data: data.clone(),
+        })
         .unwrap();
     let thread = Thread::new(vec![response(
         call_id(1),
@@ -267,29 +263,9 @@ fn missing_blobs_in_turns_and_tool_responses_fail_explicitly() {
         let thread = Thread::new(vec![Turn::new(kind)]);
         assert_eq!(
             thread.validate_content(&store),
-            Err(ContentError::Missing(reference))
+            Err(BlobError::Missing(reference))
         );
     }
-}
-
-#[test]
-fn a_blob_reference_cannot_be_rebound_to_different_content() {
-    let reference = blob_ref(1);
-    let mut store = BlobStore::default();
-    let original = Blob {
-        media_type: "image/png".into(),
-        data: Arc::from([1, 2, 3]),
-    };
-    store.insert(reference, original.clone()).unwrap();
-    let replacement = Blob {
-        media_type: "image/jpeg".into(),
-        data: Arc::from([4, 5, 6]),
-    };
-    assert_eq!(
-        store.insert(reference, replacement),
-        Err(ContentError::AlreadyExists(reference))
-    );
-    assert_eq!(store.get(reference), Ok(&original));
 }
 
 //
@@ -324,8 +300,8 @@ fn text(author: Author, text: &str) -> Content {
 fn call_id(value: u128) -> ToolCallId {
     ToolCallId(uuid::Uuid::from_u128(value))
 }
-fn blob_ref(value: u128) -> BlobRef {
-    BlobRef(uuid::Uuid::from_u128(value))
+fn blob_ref(value: u8) -> BlobRef {
+    BlobRef([value; 32])
 }
 
 fn assistant_request(id: ToolCallId) -> Turn {
@@ -333,6 +309,7 @@ fn assistant_request(id: ToolCallId) -> Turn {
         content: text(Author::Assistant, "I'll check"),
         tool_use_requests: vec![ToolUseRequest {
             id,
+            provider_id: None,
             name: "read".into(),
             arguments: Ok(json!({"path":"note.txt"})),
         }],

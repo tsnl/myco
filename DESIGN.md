@@ -10,6 +10,7 @@ targets of the same package. The browser GUI is a separate Yew application.
 ```text
 src/
   lib.rs
+  blob/                        # Shared blob references and in-memory storage
   gen_ai/                      # Inference client, types, and private drivers
   thread/                      # Owned conversations and local history operations
   logic/
@@ -39,8 +40,11 @@ flowchart LR
         compact --> gen_ai
         kernel --> thread
         kernel --> gen_ai
+        kernel --> blob
         thread[thread]
         gen_ai[gen_ai]
+        thread --> blob[blob]
+        gen_ai --> blob
         kernel --> terminal[service::terminal_service]
         kernel --> filesystem[service::filesystem_service]
     end
@@ -59,6 +63,7 @@ flowchart LR
 ```
 
 `gen_ai`, `thread`, and `service` do not depend on each other or on `logic`.
+`gen_ai` and `thread` share the lower-level `blob` module.
 Workflow modules compose them; `logic::kernel` constructs dependencies and runs
 workflows. `api` calls the kernel's Rust API. Most implementation details remain
 private or `pub(crate)`; module interfaces and review enforce dependency direction.
@@ -236,8 +241,8 @@ and read-only indexing. A branch is `Thread::new(thread[..end].to_vec())`;
 `clone` copies the whole history. Neither operation starts tool work. Consecutive
 user turns are allowed; workflow context construction validates model sequencing.
 
-`Turn { kind, provider_info }` wraps `TurnKind::User(UserTurn)` or
-`Assistant(AssistantTurn)`. User turns have content and tool responses. Assistant
+`Turn { kind }` wraps `TurnKind::User(UserTurn)` or `Assistant(AssistantTurn)`.
+User turns have content and tool responses. Assistant
 turns have content and tool requests. Each `ContentPart { author, kind }` records
 its contributor as human, assistant, tool, or system. A turn can mix authors;
 copying or regrouping parts preserves their attribution. `Author` describes
@@ -253,30 +258,45 @@ observation appends without overwriting the earlier one. After a background
 acknowledgement closes the model-facing call, a later completion can be a runtime
 notice; the workflow chooses that representation.
 
-Images contain `BlobRef(uuid::Uuid)`, never a URL or inline bytes. A separate
-`BlobStore` registers immutable blobs (media type and shared bytes), rejects
-rebinding a UUID, and reports missing references. A store serves multiple
-threads. `Thread::blob_refs()` includes references in tool responses;
-`validate_content` checks resolution without I/O. Copies preserve references and
-share blob bytes. The kernel handles loading, access, size limits, persistence,
-export, and retention. Blobs must be durable before publishing their references,
-and remain available while any saved history needs them.
+Images contain `BlobRef([u8; 32])`, never a URL or inline bytes. The `blob` module's
+`BlobStore::insert(blob)` hashes the `MediaType` and bytes with SHA-256, returning a
+stable reference and deduplicating identical content. Blobs are immutable, and
+missing references are errors. A store serves multiple threads.
+`Thread::blob_refs()` includes references in tool responses;
+`validate_content` checks resolution without I/O. Thread copies preserve references;
+store clones share the registry, including subsequent insertions. Lookups return
+owned blob handles sharing immutable bytes, with no lock retained by the caller.
+The kernel handles loading, access, size limits, persistence, export, and retention.
+Blobs must be durable before publishing their references and remain available
+while any saved history needs them.
 
-Currently, workflows resolve blobs into model input bytes. The planned `gen_ai` API
-exposes a caller-supplied shared `BlobStore` through `GenAiClient` and accepts
-`BlobRef`s in requests. Encoding resolves references and constructs provider wire
-data. Blob contracts will live below both `gen_ai` and `thread`, so inference does
-not depend on history types. The kernel owns the store's lifetime across threads,
-clients, and generation attempts; dropping a generation does not discard blobs.
+`GenAiClient::new(config, blobs)` takes a shared store handle and exposes it through
+`blobs()`. Inference image inputs use `BlobRef`s. Request encoding resolves them
+and constructs provider wire data; missing blobs fail before dispatch. Blob types
+live below both `gen_ai` and `thread`, so inference does not depend on history types.
+The kernel owns the store's lifetime across threads, clients, and generation
+attempts; dropping a generation does not discard blobs. The in-memory store is
+append-only, retaining blobs until its last handle is dropped. Local persistence
+is a separate feature outside `gen_ai`.
 
-Turns preserve provider-specific JSON under namespaced `provider_info` keys.
-Model messages expose the same map. Native call IDs live in the originating
-backend's metadata; tool requests have no provider-ID field. Model encoding maps
-logical call IDs and their results together, reusing its own compatible metadata
-or generating deterministic wire IDs. Reasoning retains exact text/signature,
-encrypted ID/summary/data, or redacted payloads. Changing backends still requires
-an explicit policy for incompatible reasoning. History and inference message types
-remain independent; workflows select context and translate turns.
+Provider storage belongs inside the `gen_ai` drivers. Where its endpoint supports
+file handles, a driver will upload local blobs and cache `BlobRef` to remote file-handle bindings within its configured
+endpoint and account. Thread history and inference inputs keep local references;
+remote handles remain private and can be rebuilt from local bytes. This uses the
+[OpenAI Files API](https://developers.openai.com/api/reference/resources/files/methods/create)
+or [Anthropic Files API](https://platform.claude.com/docs/en/build-with-claude/files).
+Provider uploads are a separate implementation step; current drivers inline image
+bytes. Upload preparation is asynchronous and precedes final request encoding,
+so its cancellation and request tracing must be integrated with generation.
+
+Tool requests preserve their original wire IDs in `provider_id: Option<String>`;
+logical IDs remain UUIDs. These are call labels, without a provider identity or
+metadata namespace. Model encoding maps calls and their results together, reusing
+valid native IDs or generating deterministic wire IDs when absent or colliding.
+Reasoning retains exact text/signature, encrypted provider ID/summary/data, or
+redacted payloads. Changing backends still requires an explicit policy for
+incompatible reasoning. History and inference message types remain independent;
+workflows select context and translate turns.
 
 The kernel owns thread instances, derivation relationships, and external handles.
 It can use references to boxed threads while their allocations remain alive.
@@ -306,7 +326,7 @@ Its conversational roles are user and assistant; backends encode structured tool
 calls/results in their provider's format. System instructions are request fields.
 Thread authorship and tool observations are interpreted by each workflow. Raw
 provider events, usage, and timing stay in workflow records. Threads retain
-reasoning text, signature/encrypted data, blob references, and provider metadata.
+reasoning text, signature/encrypted data, blob references, and original tool-call IDs.
 
 All generation increments belong to one logical turn. Workflow observation streams
 can expose:
@@ -494,9 +514,11 @@ Review steps are module-sized changes within the engine crate.
 2. **Gen AI:** `gen_ai::GenAiClient`, private drivers, and a concrete stream.
    Check request-before-dispatch, ordered progress, explicit completion, history
    reconstruction, consumer backpressure, concurrent requests, and stream drop.
-3. **Thread:** owned turn histories, blob stores, multimodal tool results,
+3. **Thread and blobs:** owned turn histories, shared blob stores, multimodal tool results,
    and read-only indexing.
-   Check copy independence, slice bounds, and content preservation.
+   Check history copy independence, deduplicated inserts, slice bounds, content
+   preservation, image resolution, and missing references before dispatch.
+   Follow with provider uploads inside `gen_ai`; add local persistence separately.
 4. **Agent/compaction logic:** request projection, streamed generation and turn
    publication, tool loops, checkpoints, compaction, and concurrent runs. Use
    scripted dependencies to check complete tool groups, retries, budgets,

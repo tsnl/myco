@@ -1,8 +1,11 @@
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
+use crate::blob::{BlobRef, BlobStore};
+
 use super::backend_helpers::{
-    Completion, Decoded, Driver, EventStream, Protocol, array, field, index, wire_messages,
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, image_blob, index,
+    wire_messages,
 };
 use super::http_helpers::Transport;
 use super::{
@@ -27,16 +30,14 @@ impl Backend {
 }
 
 impl Driver for Backend {
-    fn encode(&self, request: &Request) -> Result<Value, Error> {
-        encode_request(request)
+    fn encode(&self, request: &Request, blobs: &BlobStore) -> Result<Value, Error> {
+        encode_request(request, blobs)
     }
 
     fn generate(&self, body: Value) -> EventStream<'_> {
         let mut accumulator = Accumulator::default();
         self.transport
-            .generate(Protocol::AnthropicMessages, body, move |event| {
-                accumulator.event(event)
-            })
+            .generate(body, move |frame| accumulator.event(frame.json()?))
     }
 }
 
@@ -44,9 +45,9 @@ impl Driver for Backend {
 // Request encoding
 //
 
-fn encode_request(request: &Request) -> Result<Value, Error> {
-    let input = wire_messages(Protocol::AnthropicMessages, &request.messages)?;
-    let mut body = json!({"model": request.model, "messages": messages(&input)?,
+fn encode_request(request: &Request, blobs: &BlobStore) -> Result<Value, Error> {
+    let input = wire_messages(&request.messages)?;
+    let mut body = json!({"model": request.model, "messages": messages(&input, blobs)?,
         "max_tokens": request.max_output_tokens, "stream": true});
     if !request.instructions.is_empty() {
         body["system"] = request.instructions.clone().into();
@@ -63,10 +64,10 @@ struct Content {
     tool_result: bool,
 }
 
-fn messages(input: &[MessageKind]) -> Result<Vec<Value>, Error> {
+fn messages(input: &[MessageKind], blobs: &BlobStore) -> Result<Vec<Value>, Error> {
     let mut messages: Vec<Value> = vec![];
     for message in input {
-        let content = content(message)?;
+        let content = content(message, blobs)?;
         if content.blocks.is_empty() {
             continue;
         }
@@ -82,9 +83,9 @@ fn messages(input: &[MessageKind]) -> Result<Vec<Value>, Error> {
     Ok(messages)
 }
 
-fn content(message: &MessageKind) -> Result<Content, Error> {
+fn content(message: &MessageKind, blobs: &BlobStore) -> Result<Content, Error> {
     let (role, blocks, tool_result) = match message {
-        MessageKind::User { content } => ("user", content.iter().map(input_part).collect(), false),
+        MessageKind::User { content } => ("user", input_blocks(content, blobs)?, false),
         MessageKind::Assistant { content } => ("assistant", assistant(content)?, false),
         MessageKind::ToolResult {
             call_id,
@@ -93,7 +94,7 @@ fn content(message: &MessageKind) -> Result<Content, Error> {
         } => (
             "user",
             vec![json!({
-                "type": "tool_result", "tool_use_id": call_id, "content": input_content(content), "is_error": is_error,
+                "type": "tool_result", "tool_use_id": call_id, "content": input_content(content, blobs)?, "is_error": is_error,
             })],
             true,
         ),
@@ -105,21 +106,30 @@ fn content(message: &MessageKind) -> Result<Content, Error> {
     })
 }
 
-fn input_content(content: &[InputContentPart]) -> Value {
+fn input_content(content: &[InputContentPart], blobs: &BlobStore) -> Result<Value, Error> {
     if let [InputContentPart::Text { content }] = content {
-        return content.clone().into();
+        return Ok(content.clone().into());
     }
-    content.iter().map(input_part).collect()
+    Ok(input_blocks(content, blobs)?.into())
 }
 
-fn input_part(part: &InputContentPart) -> Value {
-    match part {
+fn input_blocks(content: &[InputContentPart], blobs: &BlobStore) -> Result<Vec<Value>, Error> {
+    content.iter().map(|part| input_part(part, blobs)).collect()
+}
+
+fn input_part(part: &InputContentPart, blobs: &BlobStore) -> Result<Value, Error> {
+    Ok(match part {
         InputContentPart::Text { content } => json!({"type":"text", "text":content}),
-        InputContentPart::Image { media_type, data } => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-            json!({"type":"image", "source":{"type":"base64", "media_type":media_type, "data":encoded}})
-        }
-    }
+        InputContentPart::Image { blob } => image(*blob, blobs)?,
+    })
+}
+
+fn image(reference: BlobRef, blobs: &BlobStore) -> Result<Value, Error> {
+    let blob = image_blob(reference, blobs)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&blob.data);
+    Ok(
+        json!({"type":"image", "source":{"type":"base64", "media_type":blob.media_type.as_str(), "data":encoded}}),
+    )
 }
 
 fn merge(message: &mut Value, content: Content) {
@@ -182,7 +192,7 @@ fn tool(tool: &Tool) -> Value {
 // Response decoding
 //
 
-pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
+fn decode_response(body: &Value) -> Result<Completion, Error> {
     if field(body, "type")? != "message" {
         return Err(Error::Protocol("expected an Anthropic message".into()));
     }
@@ -227,6 +237,7 @@ fn decode_tool_call(block: &Value) -> Result<ToolCall, Error> {
         .ok_or_else(|| Error::Protocol("tool_use.input must be an object".into()))?;
     let call = ToolCall {
         id: field(block, "id")?.into(),
+        provider_id: None,
         name: field(block, "name")?.into(),
         arguments: Ok(input.clone()),
     };
@@ -283,7 +294,7 @@ impl Accumulator {
                 self.metadata(event)?;
                 None
             }
-            "message_stop" => return self.finish().map(Decoded::Completed),
+            "message_stop" => return decode_response(&self.finish()?).map(Decoded::Completed),
             "content_block_start" => {
                 self.start_block(event)?;
                 None
@@ -299,7 +310,7 @@ impl Accumulator {
             }
             _ => None,
         };
-        Ok(Decoded::Progress(delta))
+        Ok(Decoded::Progress(delta.into_iter().collect()))
     }
 
     fn start(&mut self, event: &Value) -> Result<(), Error> {

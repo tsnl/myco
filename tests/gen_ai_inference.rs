@@ -1,5 +1,6 @@
 use futures_core::stream::FusedStream;
 use futures_util::StreamExt;
+use myco::blob::{Blob, BlobError, BlobRef, BlobStore, MediaType};
 use myco::gen_ai::{Event, InputContentPart, Message, MessageKind, Request};
 
 mod common;
@@ -125,6 +126,7 @@ async fn completed_messages_rebuild_full_history_including_reasoning_for_each_ba
             })
             .unwrap();
         assert!(uuid::Uuid::parse_str(&call.id).is_ok());
+        assert_eq!(call.provider_id.as_deref(), Some("call_fixture"));
         assert_eq!(call.arguments, Ok(json!({"path":"note.txt"})));
         let arguments: String = trace
             .events
@@ -698,6 +700,7 @@ fn tool_history(arguments: Result<Value, String>) -> Request {
         Message::new(MessageKind::Assistant {
             content: vec![ContentPart::ToolCall(ToolCall {
                 id: "call".into(),
+                provider_id: None,
                 name: "read".into(),
                 arguments,
             })],
@@ -855,7 +858,7 @@ async fn encrypted_reasoning_survives_without_a_visible_summary() {
         completed(&trace).message,
         Message::new(MessageKind::Assistant {
             content: vec![ContentPart::EncryptedReasoning {
-                id: "rs_secret".into(),
+                provider_id: "rs_secret".into(),
                 summary: vec![],
                 data: "opaque".into(),
             }],
@@ -923,7 +926,7 @@ fn incompatible_reasoning_formats_fail_before_network_io() {
         (
             Backend::AnthropicMessages,
             ContentPart::EncryptedReasoning {
-                id: "rs".into(),
+                provider_id: "rs".into(),
                 summary: vec![],
                 data: "opaque".into(),
             },
@@ -942,11 +945,11 @@ fn incompatible_reasoning_formats_fail_before_network_io() {
 }
 
 //
-// Provider identities
+// Tool identities
 //
 
 #[tokio::test]
-async fn generated_calls_keep_portable_ids_and_replay_only_selected_provider_metadata() {
+async fn generated_calls_keep_logical_and_provider_ids_separate_across_collisions() {
     let raw = json!({"status":"completed", "output":[
         {"type":"function_call", "call_id":"native_shared", "name":"read", "arguments":"{}"}
     ]});
@@ -961,10 +964,13 @@ async fn generated_calls_keep_portable_ids_and_replay_only_selected_provider_met
     let second_id = generated_call_id(&second);
     assert_ne!(first_id, second_id);
     assert!(uuid::Uuid::parse_str(&first_id).is_ok());
-    assert_eq!(
-        first.provider_info["openai.responses"]["tool_call_ids"][&first_id],
-        "native_shared"
-    );
+    let MessageKind::Assistant { content } = &first.kind else {
+        unreachable!()
+    };
+    let ContentPart::ToolCall(call) = &content[0] else {
+        unreachable!()
+    };
+    assert_eq!(call.provider_id.as_deref(), Some("native_shared"));
     let mut input = request();
     input
         .messages
@@ -990,42 +996,28 @@ async fn generated_calls_keep_portable_ids_and_replay_only_selected_provider_met
         assert_eq!(call_a, result_a);
         assert_eq!(call_b, result_b);
         assert_ne!(call_a, call_b);
-        match backend {
-            Backend::OpenAiResponses => assert_eq!(call_a, "native_shared"),
-            Backend::AnthropicMessages => assert!(!body.to_string().contains("native_shared")),
-        }
+        assert_eq!(call_a, "native_shared");
     }
 }
 
-#[tokio::test]
-async fn metadata_is_namespaced_and_malformed_selected_metadata_fails_before_dispatch() {
-    let openai = client(Backend::OpenAiResponses, "http://127.0.0.1:1/inference", "").unwrap();
-    let anthropic = client(
-        Backend::AnthropicMessages,
-        "http://127.0.0.1:1/inference",
-        "",
-    )
-    .unwrap();
-    for info in [
-        json!("invalid"),
-        json!({"version":2,"tool_call_ids":{}}),
-        json!({"version":1,"tool_call_ids":[]}),
-        json!({"version":1,"tool_call_ids":{"call":false}}),
-        json!({"version":1,"tool_call_ids":{"call":"bad id!"}}),
-    ] {
-        let mut input = tool_history(Ok(json!({})));
-        input.messages[1]
-            .provider_info
-            .insert("openai.responses".into(), info);
-        assert!(matches!(
-            openai.generate(input.clone()),
-            Err(Error::InvalidRequest(_))
-        ));
-        let body = encoded_request(&anthropic, input).await;
-        assert_eq!(
-            body["messages"][1]["content"][0]["id"],
-            body["messages"][2]["content"][0]["tool_use_id"]
-        );
+#[test]
+fn invalid_provider_call_ids_fail_before_dispatch() {
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        for id in ["", "bad id!", "雪"] {
+            let mut input = tool_history(Ok(json!({})));
+            let MessageKind::Assistant { content } = &mut input.messages[1].kind else {
+                unreachable!()
+            };
+            let ContentPart::ToolCall(call) = &mut content[0] else {
+                unreachable!()
+            };
+            call.provider_id = Some(id.into());
+            assert!(matches!(
+                model.generate(input),
+                Err(Error::InvalidRequest(_))
+            ));
+        }
     }
 }
 
@@ -1056,26 +1048,22 @@ async fn synthetic_tool_ids_are_encoded_without_exposing_caller_id_syntax() {
 //
 
 #[tokio::test]
-async fn blob_content_resolves_into_user_input_and_correlated_tool_results() {
-    use myco::thread::{Blob, BlobRef, BlobStore};
-    let mut store = BlobStore::default();
-    let reference = BlobRef(uuid::Uuid::from_u128(1));
-    store
-        .insert(
-            reference,
-            Blob {
-                media_type: "image/png".into(),
-                data: vec![0, 1, 2].into(),
-            },
-        )
+async fn clients_resolve_shared_blobs_in_user_input_and_correlated_tool_results() {
+    let store = BlobStore::default();
+    let clients = [Backend::OpenAiResponses, Backend::AnthropicMessages].map(|backend| {
+        let model = client_with_blobs(backend, "http://127.0.0.1:1/inference", "", store.clone());
+        (backend, model.unwrap())
+    });
+    let reference = clients[0]
+        .1
+        .blobs()
+        .insert(Blob {
+            media_type: MediaType::Png,
+            data: vec![0, 1, 2].into(),
+        })
         .unwrap();
-    let blob = store.get(reference).unwrap();
-    let image = InputContentPart::Image {
-        media_type: blob.media_type.clone(),
-        data: blob.data.clone(),
-    };
-    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
-        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+    let image = InputContentPart::Image { blob: reference };
+    for (backend, model) in clients {
         let mut input = tool_history(Ok(json!({})));
         let MessageKind::User { content } = &mut input.messages[0].kind else {
             unreachable!()
@@ -1118,13 +1106,21 @@ async fn blob_content_resolves_into_user_input_and_correlated_tool_results() {
             }
         }
     }
+    assert_eq!(store.get(reference).unwrap().data.as_ref(), &[0, 1, 2]);
 }
 
 #[test]
 fn invalid_image_input_is_rejected_before_dispatch() {
     for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
         let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
-        for (media_type, bytes) in [("image/png", vec![]), ("text/html", vec![1])] {
+        for (media_type, bytes) in [(MediaType::Png, vec![]), (MediaType::PlainText, vec![1])] {
+            let reference = model
+                .blobs()
+                .insert(Blob {
+                    media_type,
+                    data: bytes.into(),
+                })
+                .unwrap();
             for index in [0, 2] {
                 let mut input = tool_history(Ok(json!({})));
                 let content = match &mut input.messages[index].kind {
@@ -1133,15 +1129,32 @@ fn invalid_image_input_is_rejected_before_dispatch() {
                     }
                     _ => unreachable!(),
                 };
-                content.push(InputContentPart::Image {
-                    media_type: media_type.into(),
-                    data: bytes.clone().into(),
-                });
+                content.push(InputContentPart::Image { blob: reference });
                 assert!(matches!(
                     model.generate(input),
                     Err(Error::InvalidRequest(_))
                 ));
             }
+        }
+    }
+}
+
+#[test]
+fn missing_image_blobs_in_user_input_and_tool_results_fail_before_dispatch() {
+    let reference = BlobRef([1; 32]);
+    for backend in [Backend::OpenAiResponses, Backend::AnthropicMessages] {
+        let model = client(backend, "http://127.0.0.1:1/inference", "").unwrap();
+        for index in [0, 2] {
+            let mut input = tool_history(Ok(json!({})));
+            let content = match &mut input.messages[index].kind {
+                MessageKind::User { content } | MessageKind::ToolResult { content, .. } => content,
+                _ => unreachable!(),
+            };
+            content.push(InputContentPart::Image { blob: reference });
+            assert!(matches!(
+                model.generate(input),
+                Err(Error::Blob(BlobError::Missing(id))) if id == reference
+            ));
         }
     }
 }

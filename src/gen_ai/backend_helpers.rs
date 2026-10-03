@@ -5,11 +5,13 @@ use std::{
 };
 
 use futures_core::Stream;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
+
+use crate::blob::{Blob, BlobRef, BlobStore, MediaType};
 
 use super::{
-    Config, ContentPart, Delta, Error, Event, Finish, Generation, InputContentPart, Message,
-    MessageKind, Request, ToolCall, Usage, anthropic_backend, openai_responses_backend,
+    Config, ContentPart, Delta, Error, Event, Finish, Generation, Message, MessageKind, Request,
+    ToolCall, Usage, anthropic_backend, openai_completions_backend, openai_responses_backend,
 };
 
 //
@@ -19,28 +21,20 @@ use super::{
 pub(super) type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send + 'a>>;
 
 pub(super) trait Driver: Send + Sync {
-    fn encode(&self, request: &Request) -> Result<Value, Error>;
+    fn encode(&self, request: &Request, blobs: &BlobStore) -> Result<Value, Error>;
     fn generate(&self, body: Value) -> EventStream<'_>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Protocol {
     OpenAiResponses,
+    OpenAiCompletions,
     AnthropicMessages,
 }
 
-impl Protocol {
-    fn namespace(self) -> &'static str {
-        match self {
-            Self::OpenAiResponses => "openai.responses",
-            Self::AnthropicMessages => "anthropic.messages",
-        }
-    }
-}
-
 pub(super) enum Decoded {
-    Progress(Option<Delta>),
-    Completed(Value),
+    Progress(Vec<Delta>),
+    Completed(Completion),
 }
 
 pub(super) struct Completion {
@@ -51,9 +45,12 @@ pub(super) struct Completion {
 
 pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
     Ok(match config {
-        Config::OpenAi { endpoint, api_key } => {
+        Config::OpenAiResponses { endpoint, api_key } => {
             Box::new(openai_responses_backend::Backend::new(&endpoint, &api_key)?)
         }
+        Config::OpenAiCompletions { endpoint, api_key } => Box::new(
+            openai_completions_backend::Backend::new(&endpoint, &api_key)?,
+        ),
         Config::Anthropic { endpoint, api_key } => {
             Box::new(anthropic_backend::Backend::new(&endpoint, &api_key)?)
         }
@@ -64,9 +61,13 @@ pub(super) fn driver(config: Config) -> Result<Box<dyn Driver>, Error> {
 // Generation
 //
 
-pub(super) fn generate(driver: &dyn Driver, request: Request) -> Result<Generation<'_>, Error> {
+pub(super) fn generate<'a>(
+    driver: &'a dyn Driver,
+    request: Request,
+    blobs: &BlobStore,
+) -> Result<Generation<'a>, Error> {
     validate(&request)?;
-    let mut body = driver.encode(&request)?;
+    let mut body = driver.encode(&request, blobs)?;
     apply_options(&mut body, &request)?;
     Ok(Generation {
         inner: Some(driver.generate(body)),
@@ -90,46 +91,31 @@ pub(super) fn poll_generation(
     next
 }
 
-pub(super) fn completed(protocol: Protocol, body: &Value) -> Result<Event, Error> {
-    let completion = match protocol {
-        Protocol::OpenAiResponses => openai_responses_backend::decode_response(body)?,
-        Protocol::AnthropicMessages => anthropic_backend::decode_response(body)?,
-    };
+pub(super) fn completed(completion: Completion) -> Result<Event, Error> {
     validate_call_ids(&completion.output)?;
     Ok(Event::Completed {
-        message: portable_message(protocol, completion.output),
+        message: portable_message(completion.output),
         finish: completion.finish,
         usage: completion.usage,
     })
 }
 
 //
-// Provider metadata and tool identities
+// Tool identities
 //
 
-fn portable_message(protocol: Protocol, mut content: Vec<ContentPart>) -> Message {
-    let mut ids = Map::new();
+fn portable_message(mut content: Vec<ContentPart>) -> Message {
     for part in &mut content {
         if let ContentPart::ToolCall(call) = part {
             let native = std::mem::replace(&mut call.id, uuid::Uuid::new_v4().to_string());
-            ids.insert(call.id.clone(), native.into());
+            call.provider_id = Some(native);
         }
     }
-    let mut message = Message::new(MessageKind::Assistant { content });
-    if !ids.is_empty() {
-        message.provider_info.insert(
-            protocol.namespace().into(),
-            json!({"version":1,"tool_call_ids":ids}),
-        );
-    }
-    message
+    Message::new(MessageKind::Assistant { content })
 }
 
-pub(super) fn wire_messages(
-    protocol: Protocol,
-    input: &[Message],
-) -> Result<Vec<MessageKind>, Error> {
-    let ids = wire_call_ids(protocol, input)?;
+pub(super) fn wire_messages(input: &[Message]) -> Result<Vec<MessageKind>, Error> {
+    let ids = wire_call_ids(input)?;
     Ok(input
         .iter()
         .map(|message| wire_message(&message.kind, &ids))
@@ -152,49 +138,26 @@ fn wire_message(kind: &MessageKind, ids: &HashMap<String, String>) -> MessageKin
     kind
 }
 
-fn wire_call_ids(protocol: Protocol, input: &[Message]) -> Result<HashMap<String, String>, Error> {
+fn wire_call_ids(input: &[Message]) -> Result<HashMap<String, String>, Error> {
     let mut ids = HashMap::new();
     let mut used = HashSet::new();
     for (index, message) in input.iter().enumerate() {
-        let native = native_ids(message, protocol)?;
         if let MessageKind::Assistant { content } = &message.kind {
-            assign_call_ids(index, content, native, &mut ids, &mut used)?;
+            assign_call_ids(index, content, &mut ids, &mut used)?;
         }
     }
     Ok(ids)
 }
 
-fn native_ids(message: &Message, protocol: Protocol) -> Result<Option<&Map<String, Value>>, Error> {
-    let Some(info) = message.provider_info.get(protocol.namespace()) else {
-        return Ok(None);
-    };
-    if info["version"] != 1 {
-        return Err(Error::InvalidRequest(
-            "unsupported provider metadata version".into(),
-        ));
-    }
-    info.get("tool_call_ids")
-        .map(|ids| {
-            ids.as_object().ok_or_else(|| {
-                Error::InvalidRequest("provider tool_call_ids must be an object".into())
-            })
-        })
-        .transpose()
-}
-
 fn assign_call_ids(
     message: usize,
     content: &[ContentPart],
-    native: Option<&Map<String, Value>>,
     ids: &mut HashMap<String, String>,
     used: &mut HashSet<String>,
 ) -> Result<(), Error> {
     for (part, content) in content.iter().enumerate() {
         if let ContentPart::ToolCall(call) = content {
-            let preferred = native
-                .and_then(|ids| ids.get(&call.id))
-                .map(native_id)
-                .transpose()?;
+            let preferred = call.provider_id.as_deref().map(native_id).transpose()?;
             let wire = unique_wire_id(preferred, message, part, used);
             ids.insert(call.id.clone(), wire);
         }
@@ -202,16 +165,17 @@ fn assign_call_ids(
     Ok(())
 }
 
-fn native_id(value: &Value) -> Result<&str, Error> {
-    value
-        .as_str()
-        .filter(|id| {
-            !id.is_empty()
-                && id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
-        })
-        .ok_or_else(|| Error::InvalidRequest("invalid provider tool call ID".into()))
+fn native_id(id: &str) -> Result<&str, Error> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+    {
+        return Err(Error::InvalidRequest(
+            "invalid provider tool call ID".into(),
+        ));
+    }
+    Ok(id)
 }
 
 fn unique_wire_id(
@@ -322,13 +286,8 @@ impl<'a> History<'a> {
     fn message(&mut self, message: &'a Message) -> Result<(), Error> {
         match &message.kind {
             MessageKind::Assistant { content } => self.assistant(content),
-            MessageKind::ToolResult {
-                call_id, content, ..
-            } => {
-                validate_input(content)?;
-                self.result(call_id)
-            }
-            MessageKind::User { content } => validate_input(content),
+            MessageKind::ToolResult { call_id, .. } => self.result(call_id),
+            MessageKind::User { .. } => Ok(()),
         }
     }
 
@@ -368,21 +327,19 @@ impl<'a> History<'a> {
     }
 }
 
-fn validate_input(content: &[InputContentPart]) -> Result<(), Error> {
-    for part in content {
-        if let InputContentPart::Image { media_type, data } = part
-            && (data.is_empty()
-                || !matches!(
-                    media_type.as_str(),
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ))
-        {
-            return Err(Error::InvalidRequest(
-                "images require bytes and a supported image media type".into(),
-            ));
-        }
+pub(super) fn image_blob(reference: BlobRef, blobs: &BlobStore) -> Result<Blob, Error> {
+    let blob = blobs.get(reference)?;
+    if blob.data.is_empty()
+        || !matches!(
+            blob.media_type,
+            MediaType::Png | MediaType::Jpeg | MediaType::Gif | MediaType::WebP
+        )
+    {
+        return Err(Error::InvalidRequest(format!(
+            "image {reference:?} requires bytes and a supported image media type"
+        )));
     }
-    Ok(())
+    Ok(blob)
 }
 
 //
@@ -412,7 +369,12 @@ fn managed_field(name: &str) -> bool {
             | "tools"
             | "max_tokens"
             | "max_output_tokens"
+            | "max_completion_tokens"
             | "stream"
+            | "stream_options"
+            | "n"
+            | "functions"
+            | "function_call"
             | "store"
             | "include"
             | "previous_response_id"
