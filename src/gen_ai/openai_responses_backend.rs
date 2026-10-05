@@ -1,11 +1,16 @@
+use base64::Engine as _;
 use serde_json::{Value, json};
 
+use crate::blob::{BlobRef, BlobStore};
+
 use super::backend_helpers::{
-    Completion, Decoded, Driver, EventStream, Protocol, array, field, index,
+    Completion, Decoded, Driver, EventStream, Protocol, array, field, image_blob, index,
+    wire_messages,
 };
 use super::http_helpers::Transport;
 use super::{
-    ContentPart, Delta, DeltaKind, Error, Finish, Message, Request, Tool, ToolCall, Usage,
+    ContentPart, Delta, DeltaKind, Error, Finish, InputContentPart, MessageKind, Request, Tool,
+    ToolCall, Usage,
 };
 
 //
@@ -25,13 +30,13 @@ impl Backend {
 }
 
 impl Driver for Backend {
-    fn encode(&self, request: &Request) -> Result<Value, Error> {
-        encode_request(request)
+    fn encode(&self, request: &Request, blobs: &BlobStore) -> Result<Value, Error> {
+        encode_request(request, blobs)
     }
 
     fn generate(&self, body: Value) -> EventStream<'_> {
         self.transport
-            .generate(Protocol::OpenAiResponses, body, decode_event)
+            .generate(body, |frame| decode_event(frame.json()?))
     }
 }
 
@@ -39,11 +44,11 @@ impl Driver for Backend {
 // Request encoding
 //
 
-fn encode_request(request: &Request) -> Result<Value, Error> {
-    let input = request
-        .messages
+fn encode_request(request: &Request, blobs: &BlobStore) -> Result<Value, Error> {
+    let messages = wire_messages(&request.messages)?;
+    let input = messages
         .iter()
-        .map(encode_message)
+        .map(|message| encode_message(message, blobs))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "model": request.model, "instructions": request.instructions,
@@ -54,15 +59,17 @@ fn encode_request(request: &Request) -> Result<Value, Error> {
     }))
 }
 
-fn encode_message(message: &Message) -> Result<Vec<Value>, Error> {
+fn encode_message(message: &MessageKind, blobs: &BlobStore) -> Result<Vec<Value>, Error> {
     match message {
-        Message::User(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Message::Assistant { content } => assistant(content),
-        Message::ToolResult {
+        MessageKind::User { content } => Ok(vec![
+            json!({"role": "user", "content": input_content(content, blobs)?}),
+        ]),
+        MessageKind::Assistant { content } => assistant(content),
+        MessageKind::ToolResult {
             call_id,
-            output,
+            content,
             is_error,
-        } => Ok(vec![tool_result(call_id, output, *is_error)]),
+        } => Ok(vec![tool_result(call_id, content, *is_error, blobs)?]),
     }
 }
 
@@ -80,8 +87,12 @@ fn encode_part(part: &ContentPart) -> Result<Option<Value>, Error> {
         }
         ContentPart::ToolCall(call) => Some(json!({"type":"function_call", "call_id":call.id,
             "name":call.name, "arguments":call.arguments()?.to_string()})),
-        ContentPart::EncryptedReasoning { id, summary, data } => Some(json!({
-            "type":"reasoning", "id":id, "encrypted_content":data,
+        ContentPart::EncryptedReasoning {
+            provider_id,
+            summary,
+            data,
+        } => Some(json!({
+            "type":"reasoning", "id":provider_id, "encrypted_content":data,
             "summary":summary.iter().map(|text| json!({"type":"summary_text", "text":text})).collect::<Vec<_>>(),
         })),
         ContentPart::Reasoning {
@@ -95,14 +106,45 @@ fn encode_part(part: &ContentPart) -> Result<Option<Value>, Error> {
     })
 }
 
-fn tool_result(id: &str, output: &str, is_error: bool) -> Value {
+fn tool_result(
+    id: &str,
+    content: &[InputContentPart],
+    is_error: bool,
+    blobs: &BlobStore,
+) -> Result<Value, Error> {
     // Responses has no error flag; the observation itself must carry the error.
-    let output = if is_error {
-        format!("Tool error: {output}")
-    } else {
-        output.into()
-    };
-    json!({"type": "function_call_output", "call_id": id, "output": output})
+    let mut output = input_content(content, blobs)?;
+    if is_error {
+        match &mut output {
+            Value::String(text) => *text = format!("Tool error: {text}"),
+            Value::Array(parts) => {
+                parts.insert(0, json!({"type":"input_text", "text":"Tool error:"}))
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(json!({"type": "function_call_output", "call_id": id, "output": output}))
+}
+
+fn input_content(content: &[InputContentPart], blobs: &BlobStore) -> Result<Value, Error> {
+    if let [InputContentPart::Text { content }] = content {
+        return Ok(content.clone().into());
+    }
+    content.iter().map(|part| input_part(part, blobs)).collect()
+}
+
+fn input_part(part: &InputContentPart, blobs: &BlobStore) -> Result<Value, Error> {
+    Ok(match part {
+        InputContentPart::Text { content } => json!({"type":"input_text", "text":content}),
+        InputContentPart::Image { blob } => image(*blob, blobs)?,
+    })
+}
+
+fn image(reference: BlobRef, blobs: &BlobStore) -> Result<Value, Error> {
+    let blob = image_blob(reference, blobs)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&blob.data);
+    let url = format!("data:{};base64,{encoded}", blob.media_type.as_str());
+    Ok(json!({"type":"input_image", "image_url":url, "detail":"auto"}))
 }
 
 fn tool(tool: &Tool) -> Value {
@@ -114,7 +156,7 @@ fn tool(tool: &Tool) -> Value {
 // Response decoding
 //
 
-pub(super) fn decode_response(body: &Value) -> Result<Completion, Error> {
+fn decode_response(body: &Value) -> Result<Completion, Error> {
     let status = field(body, "status")?;
     if !matches!(status, "completed" | "incomplete") {
         return Err(Error::Provider(body.clone()));
@@ -168,7 +210,7 @@ fn reasoning(item: &Value) -> Result<Vec<ContentPart>, Error> {
 
 fn encrypted_reasoning(item: &Value) -> Result<ContentPart, Error> {
     Ok(ContentPart::EncryptedReasoning {
-        id: field(item, "id")?.into(),
+        provider_id: field(item, "id")?.into(),
         summary: array(item, "summary")?
             .iter()
             .map(|part| field(part, "text").map(str::to_owned))
@@ -191,6 +233,7 @@ fn reasoning_text(item: &Value) -> Result<Vec<String>, Error> {
 fn tool_call(item: &Value, complete: bool) -> Result<ToolCall, Error> {
     let call = ToolCall {
         id: field(item, "call_id")?.into(),
+        provider_id: None,
         name: field(item, "name")?.into(),
         arguments: serde_json::from_str(field(item, "arguments")?)
             .map_err(|error| error.to_string()),
@@ -239,12 +282,14 @@ fn usage(body: &Value) -> Usage {
 fn decode_event(event: &Value) -> Result<Decoded, Error> {
     match field(event, "type")? {
         "error" | "response.failed" => Err(Error::Provider(event.clone())),
-        "response.completed" | "response.incomplete" => terminal(event).map(Decoded::Completed),
-        _ => delta(event).map(Decoded::Progress),
+        "response.completed" | "response.incomplete" => {
+            decode_response(terminal(event)?).map(Decoded::Completed)
+        }
+        _ => Ok(Decoded::Progress(delta(event)?.into_iter().collect())),
     }
 }
 
-fn terminal(event: &Value) -> Result<Value, Error> {
+fn terminal(event: &Value) -> Result<&Value, Error> {
     let body = event
         .get("response")
         .ok_or_else(|| Error::Protocol("missing final response".into()))?;
@@ -258,7 +303,7 @@ fn terminal(event: &Value) -> Result<Value, Error> {
             "terminal event disagrees with response status".into(),
         ));
     }
-    Ok(body.clone())
+    Ok(body)
 }
 
 fn delta(event: &Value) -> Result<Option<Delta>, Error> {

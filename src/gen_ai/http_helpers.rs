@@ -35,15 +35,14 @@ impl Transport {
 
     pub(super) fn generate<'a>(
         &'a self,
-        protocol: Protocol,
         body: Value,
-        decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send + 'a,
+        decode: impl FnMut(&Frame) -> Result<Decoded, Error> + Send + 'a,
     ) -> EventStream<'a> {
         Box::pin(try_stream! {
             let request = self.request(&body)?;
             yield Event::Request { body };
             let response = self.send(request).await?;
-            let mut events = std::pin::pin!(response_events(response, protocol, decode));
+            let mut events = std::pin::pin!(response_events(response, decode));
             while let Some(event) = events.next().await {
                 yield event?;
             }
@@ -89,7 +88,9 @@ fn headers(protocol: Protocol, api_key: &str) -> Result<HeaderMap, Error> {
 
 fn authenticate(headers: &mut HeaderMap, protocol: Protocol, key: &str) -> Result<(), Error> {
     let (name, value) = match protocol {
-        Protocol::OpenAiResponses => ("authorization", format!("Bearer {key}")),
+        Protocol::OpenAiResponses | Protocol::OpenAiCompletions => {
+            ("authorization", format!("Bearer {key}"))
+        }
         Protocol::AnthropicMessages => ("x-api-key", key.into()),
     };
     let mut value = HeaderValue::from_str(&value)
@@ -130,21 +131,20 @@ fn validate_content_type(headers: &HeaderMap) -> Result<(), Error> {
 
 fn response_events(
     response: reqwest::Response,
-    protocol: Protocol,
-    mut decode: impl FnMut(&Value) -> Result<Decoded, Error> + Send,
+    mut decode: impl FnMut(&Frame) -> Result<Decoded, Error> + Send,
 ) -> impl Stream<Item = Result<Event, Error>> + Send {
     try_stream! {
         let mut events = Events::new(response);
-        while let Some(raw) = events.next().await? {
-            let decoded = decode(&raw);
-            // Expose valid JSON before any decoding or normalization failure.
-            yield Event::Progress { raw };
+        while let Some(frame) = events.next().await? {
+            let decoded = decode(&frame);
+            // Expose provider evidence before decoding or normalization failures.
+            yield Event::Progress { raw: frame.into_raw() };
             match decoded? {
-                Decoded::Progress(delta) => if let Some(delta) = delta {
+                Decoded::Progress(deltas) => for delta in deltas {
                     yield Event::Delta(delta);
                 },
-                Decoded::Completed(body) => {
-                    yield completed(protocol, &body)?;
+                Decoded::Completed(completion) => {
+                    yield completed(completion)?;
                     return;
                 }
             }
@@ -168,7 +168,7 @@ impl Events {
         }
     }
 
-    async fn next(&mut self) -> Result<Option<Value>, Error> {
+    async fn next(&mut self) -> Result<Option<Frame>, Error> {
         loop {
             if let Some(frame) = self.frames.pop_front() {
                 if frame.is_empty() {
@@ -191,8 +191,34 @@ impl Events {
     }
 }
 
-fn decode_frame(frame: &str) -> Result<Value, Error> {
-    serde_json::from_str(frame).map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))
+pub(super) enum Frame {
+    Json(Value),
+    Done,
+}
+
+impl Frame {
+    pub(super) fn json(&self) -> Result<&Value, Error> {
+        match self {
+            Self::Json(value) => Ok(value),
+            Self::Done => Err(Error::Protocol("unexpected [DONE] marker".into())),
+        }
+    }
+
+    fn into_raw(self) -> Value {
+        match self {
+            Self::Json(value) => value,
+            Self::Done => "[DONE]".into(),
+        }
+    }
+}
+
+fn decode_frame(frame: &str) -> Result<Frame, Error> {
+    if frame == "[DONE]" {
+        return Ok(Frame::Done);
+    }
+    serde_json::from_str(frame)
+        .map(Frame::Json)
+        .map_err(|e| Error::Protocol(format!("invalid SSE JSON: {e}")))
 }
 
 //

@@ -1,7 +1,11 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use myco::model::{Config, Error, Event, Finish, GenAiClient, Generation, Message, Request, Usage};
+use myco::blob::BlobStore;
+use myco::gen_ai::{
+    Config, Error, Event, Finish, GenAiClient, Generation, InputContentPart, Message, MessageKind,
+    Request, Usage,
+};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -111,19 +115,31 @@ pub async fn unfinished_body(body: String) -> (String, tokio::task::JoinHandle<(
 pub fn request() -> Request {
     Request {
         model: "test-model".into(),
-        messages: vec![Message::User("Read the note".into())],
+        messages: vec![user("Read the note")],
         max_output_tokens: 64,
         ..Default::default()
     }
 }
 
 pub fn client(protocol: Backend, endpoint: &str, key: &str) -> Result<GenAiClient, Error> {
+    client_with_blobs(protocol, endpoint, key, BlobStore::default())
+}
+
+pub fn client_with_blobs(
+    protocol: Backend,
+    endpoint: &str,
+    key: &str,
+    blobs: BlobStore,
+) -> Result<GenAiClient, Error> {
     let endpoint = endpoint.into();
     let api_key = key.into();
-    GenAiClient::new(match protocol {
-        Backend::OpenAiResponses => Config::OpenAi { endpoint, api_key },
-        Backend::AnthropicMessages => Config::Anthropic { endpoint, api_key },
-    })
+    GenAiClient::new(
+        match protocol {
+            Backend::OpenAiResponses => Config::OpenAiResponses { endpoint, api_key },
+            Backend::AnthropicMessages => Config::Anthropic { endpoint, api_key },
+        },
+        blobs,
+    )
 }
 
 #[derive(Debug)]
@@ -202,4 +218,12 @@ pub fn events(values: &[Value]) -> String {
 
 pub fn text_response(text: &str) -> Value {
     serde_json::json!({"status":"completed", "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}]})
+}
+
+pub fn user(text: &str) -> Message {
+    Message::new(MessageKind::User {
+        content: vec![InputContentPart::Text {
+            content: text.into(),
+        }],
+    })
 }

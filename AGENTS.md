@@ -16,6 +16,15 @@ happen at runtime. `DESIGN.md` describes component boundaries and interfaces.
   or responsibilities clearer, and test their contracts.
 - Prefer functions around ten lines, each doing one named operation. Keep
   formatting readable; flat dispatch tables can be longer.
+- Group related types and functions into clearly named sections in both public
+  interfaces and implementation files. Use short headings in this form:
+
+  ```rust
+  //
+  // Requests and messages
+  //
+  ```
+
 - Comments explain constraints and non-obvious decisions. Documentation describes
   the supported behavior, with consistent terminology.
 - Test externally observable behavior and failure paths. Run formatting, relevant
