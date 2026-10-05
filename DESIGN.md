@@ -9,7 +9,8 @@ below describe the proposed server and application layers.
 
 ## Components
 
-Keep the engine in one `myco` library crate. `myco-server` is a binary target.
+`myco` names both the library crate and the planned server executable. Keep them
+in one Cargo package, with the server as a binary target.
 First-party apps can initially be separate binaries in the same package; the app
 protocol allows implementations in other languages and separate deployments.
 
@@ -32,7 +33,7 @@ interpretation boundary.
 ```mermaid
 flowchart LR
     subgraph Server["Server / myco"]
-        server[myco-server / HTTP] --> kernel
+        server[myco / HTTP] --> kernel
         kernel --> logic["logic / pure transitions"]
         logic --> thread
         kernel --> thread
