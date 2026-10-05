@@ -59,12 +59,13 @@ store to clients that should share blobs. `client.blobs()` exposes that handle,
 including `insert(blob)`, which returns a content-addressed `BlobRef`. Later
 insertions are visible to all clients using the same store.
 
-Workflow code in `logic` translates selected thread history into a `Request`
-and translates stream events into conversation turns. Every request supplies
+The planned kernel adapter translates history selected by pure `logic` into a
+`Request` and feeds generation outcomes back into that logic. Every request supplies
 the complete history it wants the model to see; the backend rebuilds the provider
 request from that history. The `thread` module supplies history operations;
-each workflow chooses its context and publication policy. Workflow logic is a
-subsequent implementation step in [DESIGN.md](../../DESIGN.md).
+each workflow chooses its context and publication policy. The kernel publishes
+accepted turns. These adapters and workflow logic are subsequent implementation
+steps in [DESIGN.md](../../DESIGN.md).
 
 Operation, turn, and attempt IDs belong to the caller. `Completed` carries the
 assistant message, finish reason, and usage. Workflow code decides whether to
