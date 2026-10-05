@@ -1,11 +1,11 @@
 # myco
 
-A programmable conversation server with shared services and a web GUI.
+An extensible HTTP server and Rust library for building agents.
 
 The implementation is organized into separately reviewable steps in
-[DESIGN.md](DESIGN.md). The engine is one `myco` crate, organized into `blob`, `gen_ai`,
-`thread`, `logic`, `service`, and `api` modules. The server and remote workers are
-planned binary targets; the browser GUI is a separate application.
+[DESIGN.md](DESIGN.md). The engine is one `myco` crate, with planned `logic`,
+`kernel`, `app`, and `api` modules building on the foundation below. Installable
+apps supply tools; scripts, integrations, and a later web GUI use the same API.
 
 Implemented so far:
 
@@ -15,8 +15,8 @@ Implemented so far:
 - [`myco::thread`](src/thread/README.md): owned conversation values with synchronous
   appends, read-only slicing, copies, and blob references.
 
-Each module's public interface lives in its `mod.rs`. Workflow logic, durable
-storage, services, and the HTTP API are subsequent review steps in the design.
+Each module's public interface lives in its `mod.rs`. Pure workflow logic, durable
+execution, apps, and the HTTP API are subsequent review steps in the design.
 
 ```sh
 cargo test --locked --offline --workspace
