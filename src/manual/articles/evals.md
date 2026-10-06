@@ -95,6 +95,10 @@ are read from the named config/auth sources and are not copied into artifacts.
 Do not put credentials in gateway URLs. Full traces can still contain private
 work data or secrets encountered by the evaluated task.
 
+Generation failure traces include attempt counts, the next retry delay, and
+`recovery_remaining_ms` for an optional elapsed retry budget (null when inactive).
+
+
 Re-running the same command reuses finished results whose case, model, prelude,
 limits, repetition, and Myco build fingerprints match. Interrupted attempts are
 retained and retried in fresh workspaces; a still-running worker prevents reuse.

@@ -336,10 +336,40 @@ of retrying the unchanged request. Other 400 and 401 errors surface immediately.
 Malformed response data, including truncated tool JSON and incomplete streams,
 use the same bounded retry budget; no calls from an invalid response execute.
 A provider's `Retry-After` is honoured when it asks for longer than
-the computed backoff, still bounded by `max_backoff_ms`. The agent owns retries;
+the computed backoff. If that minimum exceeds `max_backoff_ms` or the remaining
+recovery budget, automatic retry stops with a limit diagnostic; it never sends
+early by shortening the provider's requested wait. The agent owns retries;
 provider drivers perform one attempt and report failures. The browser shows
 “Retrying” during backoff and a notice with the next attempt and delay. Cancel
 stops the request, including retry waits. Notices are not added to model history.
+
+For longer temporary outages, opt into an elapsed recovery budget in the same
+table and raise its attempt count:
+
+```toml
+[models.my-model.retry]
+max_attempts = 24
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+max_elapsed_ms = 300000
+```
+
+`max_elapsed_ms` accepts 1–300000 milliseconds (at most five minutes). It starts
+at the first retryable failure of one generation and includes all later waits
+and requests, including partial streams. It does not impose a deadline on the
+original request or the whole task. Exhaustion discards the unvalidated draft
+and stops at the committed conversation boundary. CLI and browser
+retry notices show the remaining budget. Cancel interrupts both waiting and
+streaming. A validated response resets the budget for the next generation;
+earlier completed tool effects are never restarted.
+Malformed drafts use the same finite attempt/time budget. Authentication and
+deterministic request errors still stop immediately.
+
+Without `max_elapsed_ms`, existing attempt/backoff limits apply (three attempts
+by default). Model retry tables replace gateway retry tables, so a model override
+must repeat this field to retain the gateway's elapsed budget. Compaction's
+separate request cap and eval run budgets still apply. These are recovery limits,
+not a spending limit for an entire autonomous task.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

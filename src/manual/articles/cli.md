@@ -95,6 +95,9 @@ or cancelled turn returns to the prompt.
 Assistant text streams to stdout; tool activity and diagnostics go to stderr.
 A transient generation failure starts a fresh attempt with a retry diagnostic
 separating it from the interrupted draft, which remains visible in the terminal.
+The retry table's optional `max_elapsed_ms` supports longer bounded recovery;
+notices show its remaining time, and Ctrl-C interrupts waits or active retries.
+See `overview` for the attempt, backoff, and elapsed-budget settings.
 Tool inputs show each top-level field separately. Long tool output is abbreviated;
 complete observations remain in saved session history. Use the browser to browse
 old messages, manage sessions, or switch models during a conversation.

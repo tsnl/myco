@@ -116,6 +116,8 @@ pub enum AgentEvent {
         attempt: u32,
         max_attempts: u32,
         retry_in: Option<std::time::Duration>,
+        /// Remaining elapsed recovery budget, if configured and recovery started.
+        recovery_remaining: Option<std::time::Duration>,
         context: TraceContext,
     },
     /// Incremental assistant text (for streaming UX).

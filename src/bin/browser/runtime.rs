@@ -454,13 +454,17 @@ impl EventSink for App {
                 retry_in,
                 attempt,
                 max_attempts,
+                recovery_remaining,
                 context,
             } if context.depth == 0 => {
                 let retry = if let Some(delay) = retry_in {
                     self.discard_generation();
                     self.status("Retrying");
+                    let budget = recovery_remaining
+                        .map(|left| format!(" ({:.1}s recovery budget left)", left.as_secs_f64()))
+                        .unwrap_or_default();
                     format!(
-                        " — retrying {}/{} in {:.1}s",
+                        " — retrying {}/{} in {:.1}s{budget}",
                         attempt + 1,
                         max_attempts,
                         delay.as_secs_f64()

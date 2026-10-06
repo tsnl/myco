@@ -71,7 +71,7 @@ impl EventSink for Recorder {
                 if result.is_error { self.metrics.lock().unwrap().tool_errors += 1; }
                 self.event(serde_json::json!({"event":"tool_finished", "tool":tool_use.name, "is_error":result.is_error, "status":result.status}));
             },
-            AgentEvent::Failure { failure, attempt, .. } => self.event(serde_json::json!({"event":"generation_failed", "attempt":attempt, "error":failure.cause.to_string()})),
+            AgentEvent::Failure { failure, attempt, max_attempts, retry_in, recovery_remaining, .. } => self.event(serde_json::json!({"event":"generation_failed", "attempt":attempt, "max_attempts":max_attempts, "retry_in_ms":retry_in.map(|delay| delay.as_millis()), "recovery_remaining_ms":recovery_remaining.map(|left| left.as_millis()), "error":failure.cause.to_string()})),
             _ => {},
         }
     }

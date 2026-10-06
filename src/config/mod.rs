@@ -387,7 +387,8 @@ fn resolve_catalog(
             .map_or(crate::generative_model::MAX_REQUEST_BYTES, |limit| {
                 limit.get()
             });
-        let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)));
+        let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)))
+            .map_err(|error| format!("model `{key}` retry: {error}"))?;
         let backend = match protocol {
             Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
                 anthropic_base_url: base_url,
@@ -433,10 +434,16 @@ fn resolve_catalog(
 ///
 /// `max_attempts` is clamped to at least 1: `0` reads as "do not retry", not
 /// "never send the request".
-fn resolve_retry(entry: Option<RetryEntry>) -> RetryPolicy {
+fn resolve_retry(entry: Option<RetryEntry>) -> Result<RetryPolicy, String> {
     let base = RetryPolicy::default();
-    let Some(entry) = entry else { return base };
-    RetryPolicy {
+    let Some(entry) = entry else { return Ok(base) };
+    if entry
+        .max_elapsed_ms
+        .is_some_and(|millis| !(1..=300_000).contains(&millis))
+    {
+        return Err("max_elapsed_ms must be between 1 and 300000 (five minutes)".into());
+    }
+    Ok(RetryPolicy {
         max_attempts: entry.max_attempts.unwrap_or(base.max_attempts).max(1),
         initial_backoff: entry
             .initial_backoff_ms
@@ -447,7 +454,8 @@ fn resolve_retry(entry: Option<RetryEntry>) -> RetryPolicy {
             .map(std::time::Duration::from_millis)
             .unwrap_or(base.max_backoff),
         backoff_multiplier: entry.backoff_multiplier.unwrap_or(base.backoff_multiplier),
-    }
+        max_elapsed: entry.max_elapsed_ms.map(std::time::Duration::from_millis),
+    })
 }
 
 /// `--model` → config file `model` → sole catalog entry. The chosen key must
@@ -1071,6 +1079,7 @@ base_url = "https://h"
 [gateways.g.retry]
 max_attempts = 7
 initial_backoff_ms = 250
+max_elapsed_ms = 300000
 
 [models.inherits]
 gateway = "g"
@@ -1104,12 +1113,17 @@ context_window = 1000
         );
         assert_eq!(inherits.max_backoff, default.max_backoff);
         assert_eq!(inherits.backoff_multiplier, default.backoff_multiplier);
+        assert_eq!(
+            inherits.max_elapsed,
+            Some(std::time::Duration::from_secs(300))
+        );
 
         // The model's own table wins wholesale: the gateway's 250ms is gone,
         // and the unset field falls back to the default, not to the gateway.
         let overrides = retry_of("overrides");
         assert_eq!(overrides.max_attempts, 2);
         assert_eq!(overrides.initial_backoff, default.initial_backoff);
+        assert_eq!(overrides.max_elapsed, None);
 
         // Configured nowhere → the built-in policy.
         assert_eq!(retry_of("bare"), default);
@@ -1131,6 +1145,18 @@ max_attempts = 0
         match &cfg.models.get("x").unwrap().backend {
             BackendConfig::OpenAIResponses(b) => assert_eq!(b.retry.max_attempts, 1),
             other => panic!("unexpected backend {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generation_recovery_deadline_rejects_zero_and_more_than_five_minutes() {
+        for millis in [0, 300001, u64::MAX] {
+            let text = format!(
+                "[models.x]\nprotocol='openai-responses'\nbase_url='https://h'\ncontext_window=1000\n[models.x.retry]\nmax_elapsed_ms={millis}"
+            );
+            let error =
+                resolve_toml(&text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
+            assert!(error.contains("max_elapsed_ms"), "{error}");
         }
     }
 

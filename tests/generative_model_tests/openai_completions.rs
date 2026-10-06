@@ -90,6 +90,7 @@ fn fast_retry(max_attempts: u32) -> RetryPolicy {
         initial_backoff: std::time::Duration::from_millis(1),
         max_backoff: std::time::Duration::from_millis(5),
         backoff_multiplier: 2.0,
+        max_elapsed: None,
     }
 }
 
