@@ -187,9 +187,9 @@ impl Config {
             }
         };
 
-        let file = load_file(&config_path, named_by_user).map_err(&with_path)?;
+        let file = load_file(&config_path, named_by_user).map_err(with_path)?;
 
-        let models = resolve_catalog(&file, &env, &read_auth_file).map_err(&with_path)?;
+        let models = resolve_catalog(&file, &env, &read_auth_file).map_err(with_path)?;
         // The one validation a fresh install always trips: myco ships no models,
         // so an empty catalog is the default state, not a corner case. It is
         // checked here rather than at model selection so the message can name
@@ -198,7 +198,7 @@ impl Config {
             return Err(with_path(no_models_configured_message()));
         }
         let model = resolve_default_model(model_override, file.model.clone(), &models)
-            .map_err(&with_path)?;
+            .map_err(with_path)?;
 
         let max_prelude_bytes = file
             .max_prelude_bytes
