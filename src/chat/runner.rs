@@ -667,7 +667,7 @@ mod tests {
         sources: Mutex<Vec<Session>>,
         cancel: AtomicBool,
         failure: Option<&'static str>,
-        transient_failures: AtomicUsize,
+        transient_failure: AtomicBool,
         break_store: Option<std::path::PathBuf>,
     }
 
@@ -681,13 +681,7 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 crate::agent::validate_context(&predecessor.active_thread().messages).unwrap();
                 self.sources.lock().unwrap().push(predecessor.clone());
-                if self
-                    .transient_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                        count.checked_sub(1)
-                    })
-                    .is_ok()
-                {
+                if self.transient_failure.swap(false, Ordering::SeqCst) {
                     return Err(CompactWorkerError::Failed("temporary outage".into()));
                 }
                 if let Some(reason) = self.failure {
@@ -1604,7 +1598,7 @@ mod tests {
         let _home = temp_home("runner-compact-recovery");
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let compactor = Arc::new(Summarizer {
-                transient_failures: AtomicUsize::new(1),
+                transient_failure: AtomicBool::new(true),
                 ..Default::default()
             });
             let (mut runner, model) = setup(
