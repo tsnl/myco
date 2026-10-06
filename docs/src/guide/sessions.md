@@ -44,9 +44,10 @@ The agent continues after compaction. New input is included; selecting a model a
 does not start work.
 Long tool loops can compact repeatedly as context grows. A completed answer can
 trigger at most one cycle per submission. Manual compaction and reopening a
-saved session wait for input. Failed compaction stops the run and can retry on a later
-submission. An ineffective successor estimate or usage report disables automatic threshold
-compaction until manual compaction succeeds or another session opens.
+saved session wait for input. An oversized successor estimate suspends automatic
+compaction until the next provider usage report calibrates it. A report still above
+the threshold, or a compaction failure, disables automatic compaction until manual
+compaction succeeds or another session opens.
 
 A request-size rejection (HTTP 413 or the configured request byte cap) also
 compacts and continues automatically, independently of the token threshold. This
