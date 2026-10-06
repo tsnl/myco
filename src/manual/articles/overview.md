@@ -305,8 +305,9 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the successor's text estimate or its next usage report remains above the threshold,
-or summarization fails,
+An oversized successor estimate suspends automatic compaction until the next
+provider usage report calibrates that estimate. If that report remains above the
+threshold, or summarization fails,
 automatic compaction is disabled until manual compaction succeeds or another session
 is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
 do not start automatic continuation. Manual `/compact` waits for the next user input.

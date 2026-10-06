@@ -370,7 +370,7 @@ impl Workflow {
                 if std::mem::take(&mut self.skip_preflight) {
                     if reached {
                         self.auto_failed = true;
-                        (self.observer)(WorkflowEvent::Warning("compaction did not reduce the estimated text prompt below its threshold; automatic compaction disabled until manual compaction or a session change. Token estimates are approximate; request-size recovery remains available.".into()));
+                        (self.observer)(WorkflowEvent::Warning("compaction did not reduce the estimated text prompt below its threshold; automatic compaction is suspended pending the next provider usage report. Manual compaction or a session change also resets it. Token estimates are approximate; request-size recovery remains available.".into()));
                     }
                 } else if reached {
                     self.auto_compact(agent, runtime, writer, cancel.clone())
