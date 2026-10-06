@@ -369,7 +369,7 @@ impl Workflow {
                 let reached = self.threshold_reached(Some(agent.context_tokens_estimate()));
                 if std::mem::take(&mut self.skip_preflight) {
                     if reached {
-                        self.auto_ineffective = true;
+                        self.auto_failed = true;
                         (self.observer)(WorkflowEvent::Warning("compaction did not reduce the estimated text prompt below its threshold; automatic compaction disabled until manual compaction or a session change. Token estimates are approximate; request-size recovery remains available.".into()));
                     }
                 } else if reached {
@@ -429,12 +429,13 @@ impl Workflow {
             let used = agent.last_usage().map(|usage| usage.context_tokens());
             if self.awaiting_compacted_usage && used.is_some() {
                 self.awaiting_compacted_usage = false;
-                if self
+                // A conservative successor estimate can suspend preflight
+                // until this measurement establishes the actual input size.
+                self.auto_failed = self
                     .threshold
                     .zip(used)
-                    .is_some_and(|(threshold, used)| used >= threshold)
-                {
-                    self.auto_failed = true;
+                    .is_some_and(|(threshold, used)| used >= threshold);
+                if self.auto_failed {
                     (self.observer)(WorkflowEvent::Warning("compaction did not reduce the prompt below its threshold; automatic compaction disabled until manual compaction or a session change".into()));
                 }
             }
@@ -1341,6 +1342,37 @@ mod tests {
             assert_eq!(compactor.calls.load(Ordering::SeqCst), 0);
             let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
             assert!(saved.active_thread().pending_operation.is_none());
+        });
+    }
+
+    #[test]
+    fn measured_successor_usage_reenables_preflight_after_a_conservative_estimate() {
+        let _home = temp_home("preflight-measured-successor");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup(
+                vec![output(2, None, TurnEndReason::EndTurn); 2],
+                compactor.clone(),
+            )
+            .await;
+            runner.set_compactor(compactor.clone(), Some(5_000));
+            for (size, expected_compactions) in [(24_000, 1), (12_000, 2)] {
+                runner
+                    .submit(
+                        vec![Content::Text {
+                            text: "x".repeat(size),
+                        }],
+                        Utc::now(),
+                        CancelToken::new(),
+                    )
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), expected_compactions);
+                assert!(!runner.workflow.auto_failed);
+                assert!(runner.agent().context_tokens_estimate() < 5_000);
+            }
+            assert_eq!(model.remaining(), 0);
         });
     }
 

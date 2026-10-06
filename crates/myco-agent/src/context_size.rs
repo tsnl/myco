@@ -35,8 +35,7 @@ impl ContextSize {
 
     pub(crate) fn tokens(&self) -> u64 {
         self.measured.map_or(self.estimated, |(tokens, prefix)| {
-            self.estimated
-                .max(tokens.saturating_add(self.estimated.saturating_sub(prefix)))
+            tokens.saturating_add(self.estimated.saturating_sub(prefix))
         })
     }
 
@@ -123,6 +122,20 @@ mod tests {
             cached_input_tokens: 9000,
         });
         assert_eq!(size.tokens(), 12_000);
+    }
+
+    #[test]
+    fn a_live_measurement_replaces_the_heuristic_for_its_exact_input_prefix() {
+        let mut size = ContextSize::restored(&[text(&"x".repeat(100_000))], None);
+        assert!(size.tokens() > 30_000);
+        size.observe_input(TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cached_input_tokens: 0,
+        });
+        assert_eq!(size.tokens(), 10_000);
+        size.append(&text(&"new".repeat(1000)));
+        assert_eq!(size.tokens(), 11_008);
     }
 
     #[test]
