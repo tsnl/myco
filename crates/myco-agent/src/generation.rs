@@ -34,7 +34,14 @@ async fn generate_attempts(agent: &Agent) -> Result<GenerateOutput, GenerateErro
                 });
                 return Ok(output);
             }
-            Err(failed) => failed,
+            Err(mut failed) => {
+                // Provider decoders and the accumulator can both reject a
+                // truncated tool argument. Nothing from this draft executed;
+                // retry from the same committed boundary, within one budget.
+                failed.retryable |=
+                    matches!(failed.cause, GenerateError::MalformedResponseError(_));
+                failed
+            }
         };
         let retry_in = retry_delay(agent, &failed, attempt);
         agent.sink.emit(AgentEvent::Failure {
@@ -269,5 +276,94 @@ mod tests {
             Err(AgentInteractionError::Cancelled)
         ));
         assert!(model.inputs.lock().unwrap().is_empty());
+    }
+
+    fn tool_round(inputs: &[&str]) -> Vec<GenerationEvent> {
+        let mut parts = vec![MessagePart::MessageStart];
+        for (index, input) in inputs.iter().enumerate() {
+            parts.push(MessagePart::ToolUseStart(myco_model::ToolUseStart {
+                index,
+                name: "effect".into(),
+            }));
+            parts.push(MessagePart::ToolUseDelta(myco_model::ToolUseDelta {
+                index,
+                input_json_delta: (*input).into(),
+            }));
+        }
+        parts.push(MessagePart::TurnEndReason(TurnEndReason::ToolUse));
+        parts.into_iter().map(GenerationEvent::Part).collect()
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_json_retries_the_whole_draft_without_replaying_completed_tools() {
+        let events = Arc::new(Events::default());
+        let (mut agent, model) = setup(
+            vec![
+                tool_round(&["{}"]),
+                tool_round(&["{}", "{\"command\":"]),
+                answer(),
+            ],
+            events.clone(),
+        );
+        agent.run(CancelToken::new()).await.unwrap();
+        let inputs = model.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[1], inputs[2]);
+        assert_eq!(inputs[1].as_array().unwrap().len(), 3);
+        let events = events.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(agent.history().len(), 4);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Failure {
+                retry_in: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn malformed_response_recovery_is_bounded_and_preserves_history() {
+        let events = Arc::new(Events::default());
+        let (mut agent, model) = setup(vec![tool_round(&["{"]); 3], events.clone());
+        assert!(matches!(
+            agent.run(CancelToken::new()).await,
+            Err(AgentInteractionError::GenerateError(
+                GenerateError::MalformedResponseError(_)
+            ))
+        ));
+        assert_eq!(model.inputs.lock().unwrap().len(), 3);
+        assert_eq!(agent.history().len(), 1);
+        assert!(agent.state().is_idle());
+        assert!(events.events.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::Failure {
+                attempt: 3,
+                retry_in: None,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_decoder_malformed_output_retries_but_authentication_does_not() {
+        let malformed = GenerationEvent::Failure(GenerationFailure::terminal(
+            GenerateError::MalformedResponseError("incomplete arguments".into()),
+        ));
+        let (agent, model) = setup(vec![vec![malformed], answer()], Arc::new(Events::default()));
+        generate(&agent, CancelToken::new()).await.unwrap();
+        assert_eq!(model.inputs.lock().unwrap().len(), 2);
+        let authentication = GenerationEvent::Failure(GenerationFailure::terminal(
+            GenerateError::ExecutionError("HTTP 401".into()),
+        ));
+        let (agent, model) = setup(vec![vec![authentication]], Arc::new(Events::default()));
+        assert!(generate(&agent, CancelToken::new()).await.is_err());
+        assert_eq!(model.inputs.lock().unwrap().len(), 1);
     }
 }

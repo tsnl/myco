@@ -332,9 +332,10 @@ until it validates. Terminal chat keeps streamed drafts visible, separated by
 retry diagnostics.
 
 A 413 or recognized size rejection goes to the session's context recovery instead
-of retrying the unchanged request. Other 400 and 401 errors, malformed response
-data, and incomplete responses that end without a transport error surface
-immediately. A provider's `Retry-After` is honoured when it asks for longer than
+of retrying the unchanged request. Other 400 and 401 errors surface immediately.
+Malformed response data, including truncated tool JSON and incomplete streams,
+use the same bounded retry budget; no calls from an invalid response execute.
+A provider's `Retry-After` is honoured when it asks for longer than
 the computed backoff, still bounded by `max_backoff_ms`. The agent owns retries;
 provider drivers perform one attempt and report failures. The browser shows
 “Retrying” during backoff and a notice with the next attempt and delay. Cancel
