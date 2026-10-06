@@ -88,6 +88,20 @@ class MycoGepaTests(unittest.TestCase):
                     restarted.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
                 run.assert_not_called()
 
+    def test_visible_ancestor_after_failed_flush_cannot_bypass_admission_durability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def reject_ancestor(path):
+                if path == root:
+                    raise OSError("ancestor flush failed")
+            with patch("myco_gepa.sync_directory", side_effect=reject_ancestor):
+                for _ in range(2):
+                    with patch.object(MycoAdapter, "_run") as run:
+                        with self.assertRaisesRegex(OSError, "ancestor flush failed"):
+                            self.adapter(root / "new-parent").propose_new_texts(
+                                {"prelude": "seed"}, {}, ["prelude"])
+                        run.assert_not_called()
+
     def test_real_gepa_loop_uses_myco_adapter_reflection_and_keeps_test_split_held_out(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -21,10 +21,11 @@ def sync_directory(path):
 
 
 def create_output(path):
-    if not path.parent.exists():
-        create_output(path.parent)
-    path.mkdir(exist_ok=True)
-    sync_directory(path.parent)
+    path.mkdir(parents=True, exist_ok=True)
+    # An existing ancestor may be visible from another caller's mkdir before
+    # that caller flushes it, or after that caller failed. Repair the full chain.
+    for directory in (path, *path.parents):
+        sync_directory(directory)
 
 
 class MycoAdapter:
