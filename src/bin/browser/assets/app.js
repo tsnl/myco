@@ -78,7 +78,9 @@ window.addEventListener('scroll', () => {
   $('jump').hidden = follow;
 }, { passive: true });
 function jumpToLatest() {
-  navigation.clear(); follow = true; scrollLatest();
+  navigation.clear(); follow = true;
+  // A queued history scroll must not cancel this explicit jump.
+  window.scrollTo({ top: document.documentElement.scrollHeight });
   $('jump').hidden = true;
   $('prompt').focus({ preventScroll: true });
 }

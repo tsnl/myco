@@ -747,6 +747,39 @@ context_window = 100000
                 expect(selected).to_have_count(0)
                 expect(page.locator('#jump')).to_be_hidden()
 
+    def test_explicit_latest_jump_survives_a_queued_history_scroll(self):
+        page = self.session(self.page)
+        for index in range(3):
+            self.submit(page, f'Message {index}\n' + 'A line of context.\n' * 12)
+            expect(page.locator('#model')).to_be_enabled()
+        for _ in range(3):
+            page.locator('#prompt').press('ArrowUp')
+        expect(page.locator('.user[aria-current="true"] .body')).to_contain_text('Message 0')
+        page.evaluate('''() => new Promise(resolve => {
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })''')
+        result = page.evaluate('''() => {
+            const original = window.requestAnimationFrame;
+            const pending = [];
+            window.requestAnimationFrame = callback => { pending.push(callback); return 0; };
+            try {
+                document.querySelector('#jump').click();
+                // Deliver the previous history scroll before the next animation frame.
+                window.dispatchEvent(new Event('scroll'));
+                for (const callback of pending) callback(performance.now());
+                return {
+                    remaining: document.documentElement.scrollHeight - scrollY - innerHeight,
+                    hidden: document.querySelector('#jump').hidden,
+                };
+            } finally {
+                window.requestAnimationFrame = original;
+            }
+        }''')
+        self.assertLessEqual(result['remaining'], 1)
+        self.assertTrue(result['hidden'])
+        expect(page.locator('.user[aria-current="true"]')).to_have_count(0)
+        expect(page.locator('#prompt')).to_be_focused()
+
     def test_message_navigation_preserves_text_editing_modifiers_and_composition(self):
         self.turns['Alpha images'] = 1
         page = self.session(self.page)
