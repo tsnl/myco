@@ -105,6 +105,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
             cancel: None,
             background: HashMap::new(),
             accepted: HashMap::new(),
+            service: service::Receipts::default(),
         }),
         events,
         work,

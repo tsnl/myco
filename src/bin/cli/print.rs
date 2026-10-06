@@ -45,7 +45,7 @@ async fn print_turn(args: Args) -> Result<(), (u8, String)> {
     report_outcome(outcome)
 }
 
-fn read_prompt(argument: Option<&str>) -> Result<String, String> {
+pub(super) fn read_prompt(argument: Option<&str>) -> Result<String, String> {
     let mut piped = String::new();
     if !std::io::stdin().is_terminal() {
         std::io::stdin()
@@ -67,7 +67,7 @@ fn assemble_prompt(argument: Option<&str>, piped: &str) -> Result<String, String
     }
 }
 
-fn print_content(
+pub(super) fn print_content(
     argument: Option<&str>,
     prompt: String,
     limit: u64,

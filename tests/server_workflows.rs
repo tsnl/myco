@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 mod test_utils;
 
+#[path = "server_workflows/service.rs"]
+mod service;
+
 struct ServerEnv {
     dir: PathBuf,
     config: PathBuf,

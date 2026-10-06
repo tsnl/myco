@@ -102,7 +102,31 @@ pub(super) fn content(
     images: &[String],
     image_limit: u64,
 ) -> Result<Vec<Content>, String> {
-    let mut expanded = expand_image_attachments(text, image_limit)?;
+    append_uploads(
+        expand_image_attachments(text, image_limit)?,
+        images,
+        image_limit,
+    )
+}
+
+/// Native clients resolve image mentions in their own cwd before submitting.
+pub(super) fn literal_content(
+    text: &str,
+    images: &[String],
+    image_limit: u64,
+) -> Result<Vec<Content>, String> {
+    append_uploads(
+        vec![Content::Text { text: text.into() }],
+        images,
+        image_limit,
+    )
+}
+
+fn append_uploads(
+    mut expanded: Vec<Content>,
+    images: &[String],
+    image_limit: u64,
+) -> Result<Vec<Content>, String> {
     if images.is_empty() {
         return Ok(expanded);
     }
