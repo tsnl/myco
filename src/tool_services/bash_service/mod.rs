@@ -15,6 +15,9 @@ use crate::external_command::BASH;
 use uuid::Uuid;
 
 mod background;
+mod process;
+
+use process::ProcessOwner;
 
 /// Default hard wait ceiling for a single session start/write/read.
 ///
@@ -59,19 +62,6 @@ impl Default for BashService {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl Drop for BashService {
-    fn drop(&mut self) {
-        for session in self
-            .sessions
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-        {
-            kill_session_process(session);
         }
     }
 }
@@ -234,7 +224,7 @@ impl ToolService for BashService {
                     tool: "bash".into(),
                     id: id.clone(),
                     details: serde_json::json!({
-                        "command": session.cmdline, "pid": session.pid,
+                        "command": session.cmdline, "pid": session.process.pid(),
                         "instance_id": session.shared.instance_id,
                         "started_at": session.shared.started_at,
                         "duration_ms": buffer.finished.map(|end| end.duration_since(session.shared.started).as_millis() as u64),
@@ -546,8 +536,6 @@ impl BashService {
             }
         };
 
-        let pid = child.id();
-
         let child_stdin = match child.stdin.take() {
             Some(s) => s,
             None => {
@@ -582,7 +570,7 @@ impl BashService {
         // Reader tasks push into the shared buffer and notify waiters.
         spawn_reader(stdout, StreamKind::Stdout, Arc::clone(&shared));
         spawn_reader(stderr, StreamKind::Stderr, Arc::clone(&shared));
-        spawn_waiter(child, Arc::clone(&shared));
+        let process = ProcessOwner::retain(child, Arc::clone(&shared));
 
         let session = Session {
             owner,
@@ -591,23 +579,19 @@ impl BashService {
             shared,
             created_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
-            pid,
+            process,
         };
 
         {
             let mut sessions = self.sessions();
             // Re-check under lock in case of concurrent start with same id.
-            // The child is already running (readers + waiter own it), so a
-            // losing start must kill it here or it leaks unkillable: its pid
-            // is never stored anywhere the agent can reach.
+            // A losing start drops its process owner, killing the group.
             if sessions.contains_key(session_id) {
-                kill_process_group(pid);
                 return generative_model::ToolResult::err(format!(
                     "session {session_id:?} already exists; close it first"
                 ));
             }
             if sessions.len() >= MAX_SESSIONS {
-                kill_process_group(pid);
                 return generative_model::ToolResult::err(format!(
                     "too many sessions (max {MAX_SESSIONS}); close one first"
                 ));
@@ -704,36 +688,31 @@ impl BashService {
         if let Err(e) = self.ensure_owner(session_id, owner) {
             return generative_model::ToolResult::err(e);
         }
-        let pid = {
+        let process = {
             let sessions = self.sessions();
             let Some(session) = sessions.get(session_id) else {
                 return generative_model::ToolResult::err(format!(
                     "unknown session {session_id:?}"
                 ));
             };
-            if session
-                .shared
-                .buffer
-                .lock()
-                .map(|b| b.exited)
-                .unwrap_or(false)
-            {
+            if lock_unpoisoned(&session.shared.buffer).exited {
                 return generative_model::ToolResult::err(format!(
-                    "session {session_id:?} has already exited; nothing to signal"
+                    "session {session_id:?} has already exited; use close to stop remaining descendants"
                 ));
             }
             // Bump generation so the collect below measures its idle gap from
             // the signal, not from output that predates it.
             session.shared.generation.fetch_add(1, Ordering::SeqCst);
-            session.pid
+            Arc::clone(&session.process)
         };
 
-        if let Err(e) = signal_process_group(pid, signal.as_libc()) {
+        if let Err(e) = process.signal(signal.as_libc()) {
             return generative_model::ToolResult::err(format!(
                 "could not send {} to session {session_id:?}: {e}",
                 signal.name()
             ));
         }
+        drop(process);
 
         match self
             .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
@@ -774,7 +753,7 @@ impl BashService {
                 .expect("session present after check")
         };
 
-        // Drop stdin (EOF). The waiter task owns the Child with kill_on_drop.
+        // Drop stdin (EOF), keeping the process owner until output is drained.
         *lock_unpoisoned(&session.stdin) = None;
 
         // Drain any final buffered output (short wait).
@@ -792,7 +771,7 @@ impl BashService {
         )
         .await;
 
-        kill_session_process(&session);
+        drop(session);
 
         let mut text = snapshot.format();
         text.push_str("\n(session closed)\n");
@@ -869,11 +848,7 @@ impl BashService {
                 .filter_map(|id| sessions.remove(&id))
                 .collect()
         };
-        for session in victims {
-            // Drop stdin (EOF) then best-effort SIGKILL.
-            *lock_unpoisoned(&session.stdin) = None;
-            kill_session_process(&session);
-        }
+        drop(victims);
     }
 
     async fn write_to_session(&self, session_id: &str, data: &str) -> Result<(), String> {
@@ -996,8 +971,8 @@ struct Session {
     shared: Arc<SessionShared>,
     created_at: Instant,
     last_used: Mutex<Instant>,
-    /// OS pid for best-effort kill on close / reap.
-    pid: Option<u32>,
+    /// Own the group identity until the handle is closed, including after exit.
+    process: Arc<ProcessOwner>,
 }
 
 struct SessionShared {
@@ -1361,42 +1336,6 @@ where
         }
         shared.notify.notify_waiters();
     })
-}
-
-/// Best-effort SIGKILL of a session's process group.
-/// Sync so it is safe to call from `Drop` / `on_agent_finished`.
-///
-/// Skipped when the leader exited *and* both pipes hit EOF: the group is then
-/// almost certainly empty, and `kill(-pgid)` on a fully-dead group could hit
-/// an unrelated process that recycled the pid. If anything still holds a pipe
-/// open (a live grandchild), we do kill — that is exactly the process close
-/// is meant to stop.
-fn kill_session_process(session: &Session) {
-    let group_done = session
-        .shared
-        .buffer
-        .lock()
-        .map(|b| b.is_finished())
-        .unwrap_or(false);
-    if !group_done {
-        kill_process_group(session.pid);
-    }
-}
-
-fn spawn_waiter(mut child: Child, shared: Arc<SessionShared>) {
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        if let Ok(mut b) = shared.buffer.lock() {
-            b.exited = true;
-            if let Ok(st) = status {
-                b.exit_code = st.code();
-                b.exit_signal = st.signal();
-            }
-            b.record_completion();
-        }
-        shared.notify.notify_waiters();
-        // `child` drops here; kill_on_drop is a no-op if already exited.
-    });
 }
 
 /// Drain the shared buffer until idle / timeout / exit / byte cap / cancel.
