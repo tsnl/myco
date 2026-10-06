@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from gepa import optimize
 from myco_gepa import MycoAdapter, dataset
@@ -27,6 +29,65 @@ print(json.dumps({"groups":[{"estimated_cost_usd":0.0}]}))
 
 
 class MycoGepaTests(unittest.TestCase):
+    def adapter(self, root, **kwargs):
+        return MycoAdapter(root / "binary", root / "config", "free", root / "runs",
+                           max_reflections=1, **kwargs)
+
+    def fail_reflection(self, adapter):
+        with patch.object(adapter, "_run", side_effect=RuntimeError("provider failed")) as run:
+            with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                adapter.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+            self.assertEqual(run.call_count, 1)
+
+    def test_failed_reflection_cannot_spend_again_after_stale_checkpoint_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fail_reflection(self.adapter(root))
+            restarted = self.adapter(root)
+            restarted.set_adapter_state({"reflections": 0})
+            with patch.object(restarted, "_run") as run:
+                with self.assertRaisesRegex(RuntimeError, "reflection budget"):
+                    restarted.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+                run.assert_not_called()
+
+    def test_concurrent_adapters_share_one_durable_reflection_allowance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapters = [self.adapter(Path(directory)) for _ in range(2)]
+            def attempt(adapter):
+                with patch.object(adapter, "_run", side_effect=RuntimeError("provider failed")) as run:
+                    try:
+                        adapter.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+                    except RuntimeError:
+                        pass
+                    return run.call_count
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                self.assertEqual(sum(workers.map(attempt, adapters)), 1)
+
+    def test_existing_proposals_count_even_without_a_saved_adapter_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs/proposals/old-attempt/workspace").mkdir(parents=True)
+            adapter = self.adapter(root)
+            with patch.object(adapter, "_run") as run:
+                with self.assertRaisesRegex(RuntimeError, "reflection budget"):
+                    adapter.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+                run.assert_not_called()
+
+    def test_unflushed_reservation_stops_work_and_remains_spent_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = self.adapter(root)
+            with patch("myco_gepa.sync_directory", side_effect=[None, OSError("disk full")]):
+                with patch.object(adapter, "_run") as run:
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        adapter.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+                    run.assert_not_called()
+            restarted = self.adapter(root)
+            with patch.object(restarted, "_run") as run:
+                with self.assertRaisesRegex(RuntimeError, "reflection budget"):
+                    restarted.propose_new_texts({"prelude": "seed"}, {}, ["prelude"])
+                run.assert_not_called()
+
     def test_real_gepa_loop_uses_myco_adapter_reflection_and_keeps_test_split_held_out(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
