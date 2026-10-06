@@ -49,7 +49,7 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
   even if another shell reuses the same handle name. Closing or reaping a handle
   still stops its process group while reads or writes are outstanding.
 - **Shell cleanup:** closing a retained bash handle, ending its owning runtime,
-  or stopping its host kills the owned process group, including children that
+  or gracefully shutting down its host kills the owned process group, including children that
   outlive the shell after redirecting their output. An exited shell remains
   waitable until the handle closes, reserving its process-group identity for
   safe cleanup; close unused handles to release that process-table entry.
