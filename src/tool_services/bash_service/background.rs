@@ -26,10 +26,10 @@ impl BashService {
             Session {
                 owner,
                 cmdline: command.into(),
-                stdin: Mutex::new(None),
+                stdin: Arc::new(Mutex::new(None)),
                 shared: shared.clone(),
                 created_at: Instant::now(),
-                last_used: Mutex::new(Instant::now()),
+                last_used: Arc::new(Mutex::new(Instant::now())),
                 process,
             },
         );

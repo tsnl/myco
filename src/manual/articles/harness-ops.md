@@ -45,6 +45,9 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
       ControlPath ~/.ssh/cm-%r@%h:%p
       ControlPersist 10m
   ```
+- **Shell handles:** an in-flight operation keeps its original input/output and owner
+  even if another shell reuses the same handle name. Closing or reaping a handle
+  still stops its process group while reads or writes are outstanding.
 - **Shell cleanup:** closing a retained bash handle, ending its owning runtime,
   or stopping its host kills the owned process group, including children that
   outlive the shell after redirecting their output. An exited shell remains

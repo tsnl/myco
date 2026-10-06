@@ -15,8 +15,10 @@ use crate::external_command::BASH;
 use uuid::Uuid;
 
 mod background;
+mod operation;
 mod process;
 
+use operation::SessionOperation;
 use process::ProcessOwner;
 
 /// Default hard wait ceiling for a single session start/write/read.
@@ -575,12 +577,13 @@ impl BashService {
         let session = Session {
             owner,
             cmdline: cmdline.to_string(),
-            stdin: Mutex::new(Some(child_stdin)),
+            stdin: Arc::new(Mutex::new(Some(child_stdin))),
             shared,
             created_at: Instant::now(),
-            last_used: Mutex::new(Instant::now()),
+            last_used: Arc::new(Mutex::new(Instant::now())),
             process,
         };
+        let operation = session.operation(session_id);
 
         {
             let mut sessions = self.sessions();
@@ -601,16 +604,15 @@ impl BashService {
 
         // Optional initial stdin, then collect a first snapshot.
         if let Some(data) = stdin
-            && let Err(e) = self.write_to_session(session_id, data).await
+            && let Err(e) = operation.write(data).await
         {
             return generative_model::ToolResult::err(format!(
                 "session {session_id:?} started but initial stdin write failed: {e}"
             ));
         }
 
-        let snapshot = self
-            .collect_from_session(
-                session_id,
+        let snapshot = operation
+            .collect(
                 timeout_ms,
                 idle_ms,
                 max_bytes,
@@ -635,14 +637,15 @@ impl BashService {
         max_bytes: usize,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        if let Err(e) = self.ensure_owner(session_id, owner) {
+        let operation = match self.operation(session_id, owner) {
+            Ok(operation) => operation,
+            Err(error) => return generative_model::ToolResult::err(error),
+        };
+        if let Err(e) = operation.write(stdin).await {
             return generative_model::ToolResult::err(e);
         }
-        if let Err(e) = self.write_to_session(session_id, stdin).await {
-            return generative_model::ToolResult::err(e);
-        }
-        match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
+        match operation
+            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => s.tool_result(),
@@ -659,11 +662,12 @@ impl BashService {
         max_bytes: usize,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        if let Err(e) = self.ensure_owner(session_id, owner) {
-            return generative_model::ToolResult::err(e);
-        }
-        match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
+        let operation = match self.operation(session_id, owner) {
+            Ok(operation) => operation,
+            Err(error) => return generative_model::ToolResult::err(error),
+        };
+        match operation
+            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => s.tool_result(),
@@ -685,37 +689,16 @@ impl BashService {
         max_bytes: usize,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        if let Err(e) = self.ensure_owner(session_id, owner) {
-            return generative_model::ToolResult::err(e);
-        }
-        let process = {
-            let sessions = self.sessions();
-            let Some(session) = sessions.get(session_id) else {
-                return generative_model::ToolResult::err(format!(
-                    "unknown session {session_id:?}"
-                ));
-            };
-            if lock_unpoisoned(&session.shared.buffer).exited {
-                return generative_model::ToolResult::err(format!(
-                    "session {session_id:?} has already exited; use close to stop remaining descendants"
-                ));
-            }
-            // Bump generation so the collect below measures its idle gap from
-            // the signal, not from output that predates it.
-            session.shared.generation.fetch_add(1, Ordering::SeqCst);
-            Arc::clone(&session.process)
+        let operation = match self.operation(session_id, owner) {
+            Ok(operation) => operation,
+            Err(error) => return generative_model::ToolResult::err(error),
         };
-
-        if let Err(e) = process.signal(signal.as_libc()) {
-            return generative_model::ToolResult::err(format!(
-                "could not send {} to session {session_id:?}: {e}",
-                signal.name()
-            ));
+        if let Err(error) = operation.signal(signal) {
+            return generative_model::ToolResult::err(error);
         }
-        drop(process);
 
-        match self
-            .collect_from_session(session_id, timeout_ms, idle_ms, max_bytes, false, ctx)
+        match operation
+            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
             .await
         {
             Ok(s) => {
@@ -821,7 +804,7 @@ impl BashService {
         generative_model::ToolResult::text(lines.join("\n"))
     }
 
-    fn ensure_owner(&self, session_id: &str, owner: Uuid) -> Result<(), String> {
+    fn operation(&self, session_id: &str, owner: Uuid) -> Result<SessionOperation, String> {
         let sessions = self.sessions();
         let session = sessions
             .get(session_id)
@@ -831,7 +814,7 @@ impl BashService {
                 "session {session_id:?} is owned by another myco session"
             ));
         }
-        Ok(())
+        Ok(session.operation(session_id))
     }
 
     /// Synchronously kill and drop every session owned by `owner`.
@@ -850,115 +833,6 @@ impl BashService {
         };
         drop(victims);
     }
-
-    async fn write_to_session(&self, session_id: &str, data: &str) -> Result<(), String> {
-        // Bump generation so an in-flight collect doesn't treat pre-write idle as done.
-        // Take stdin out briefly to write without holding the sessions map lock across await.
-        let (stdin_slot, shared) = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| format!("unknown session {session_id:?}"))?;
-            session.shared.generation.fetch_add(1, Ordering::SeqCst);
-            let shared = Arc::clone(&session.shared);
-            let stdin = lock_unpoisoned(&session.stdin).take();
-            (stdin, shared)
-        };
-
-        let Some(mut stdin) = stdin_slot else {
-            let exited = shared.buffer.lock().ok().map(|b| b.exited).unwrap_or(false);
-            if exited {
-                return Err(format!(
-                    "session {session_id:?} has exited; close it and start a new one"
-                ));
-            }
-            return Err(format!("session {session_id:?} stdin is closed"));
-        };
-
-        // Bound the write so a full pipe / stuck child cannot hang the agent.
-        // Keep this independent of the larger session timeout_ms ceiling.
-        let write_timeout = Duration::from_millis(STDIN_WRITE_TIMEOUT_MS);
-        let write_result = tokio::time::timeout(write_timeout, async {
-            stdin.write_all(data.as_bytes()).await?;
-            stdin.flush().await
-        })
-        .await;
-        match write_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.return_stdin(session_id, stdin);
-                return Err(format!("stdin write failed: {e}"));
-            }
-            Err(_elapsed) => {
-                self.return_stdin(session_id, stdin);
-                return Err(format!(
-                    "stdin write timed out after {}ms (child may not be reading stdin)",
-                    STDIN_WRITE_TIMEOUT_MS
-                ));
-            }
-        }
-
-        self.return_stdin(session_id, stdin);
-        {
-            let sessions = self.sessions();
-            if let Some(session) = sessions.get(session_id)
-                && let Ok(mut t) = session.last_used.lock()
-            {
-                *t = Instant::now();
-            }
-        }
-        shared.notify.notify_waiters();
-        Ok(())
-    }
-
-    fn return_stdin(&self, session_id: &str, stdin: ChildStdin) {
-        let sessions = self.sessions();
-        let Some(session) = sessions.get(session_id) else {
-            return;
-        };
-        *lock_unpoisoned(&session.stdin) = Some(stdin);
-    }
-
-    async fn collect_from_session(
-        &self,
-        session_id: &str,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-        return_on_empty_idle: bool,
-        ctx: HostDispatchContext,
-    ) -> Result<SessionSnapshot, String> {
-        let (shared, owner, cmdline) = {
-            let sessions = self.sessions();
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| format!("unknown session {session_id:?}"))?;
-            if let Ok(mut t) = session.last_used.lock() {
-                *t = Instant::now();
-            }
-            (
-                Arc::clone(&session.shared),
-                session.owner,
-                session.cmdline.clone(),
-            )
-        };
-        if ctx.cancel.is_cancelled() {
-            return Err("cancelled".into());
-        }
-        Ok(collect_output(
-            &shared,
-            session_id,
-            owner,
-            &cmdline,
-            timeout_ms,
-            idle_ms,
-            max_bytes,
-            return_on_empty_idle,
-            &ctx.cancel,
-            &ctx.background,
-        )
-        .await)
-    }
 }
 
 // --- session internals -------------------------------------------------------
@@ -967,10 +841,10 @@ struct Session {
     /// Agent that started this session; only this agent may write/read/close it.
     owner: Uuid,
     cmdline: String,
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     shared: Arc<SessionShared>,
     created_at: Instant,
-    last_used: Mutex<Instant>,
+    last_used: Arc<Mutex<Instant>>,
     /// Own the group identity until the handle is closed, including after exit.
     process: Arc<ProcessOwner>,
 }
