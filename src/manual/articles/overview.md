@@ -365,6 +365,16 @@ earlier completed tool effects are never restarted.
 Malformed drafts use the same finite attempt/time budget. Authentication and
 deterministic request errors still stop immediately.
 
+Errors reported inside an HTTP 200 stream use that same recovery policy. Myco
+retries Anthropic `overloaded_error`, `api_error`, `timeout_error`, and
+`rate_limit_error`, and OpenAI `server_error`, `rate_limit_exceeded`, `slow_down`,
+and `server_is_overloaded` codes. Unknown codes, authentication errors, and
+invalid requests stop immediately; error-message wording never selects retries.
+Anthropic's `rate_limit_error` can also represent a spend cap, so its finite
+recovery budget may expire until account access is restored. Failed draft text
+and tool calls do not enter committed history or execute, even if they arrived
+before the error. A `Retry-After` response header remains a minimum delay.
+
 Without `max_elapsed_ms`, existing attempt/backoff limits apply (three attempts
 by default). Model retry tables replace gateway retry tables, so a model override
 must repeat this field to retain the gateway's elapsed budget. Compaction's

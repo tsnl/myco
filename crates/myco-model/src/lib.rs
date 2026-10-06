@@ -723,6 +723,12 @@ impl GenerationFailure {
     }
 }
 
+impl From<GenerateError> for GenerationFailure {
+    fn from(cause: GenerateError) -> Self {
+        Self::terminal(cause)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MessagePart {
     MessageStart,

@@ -178,6 +178,41 @@ async fn prolonged_provider_outage_recovers_without_replaying_completed_tools() 
 }
 
 #[tokio::test]
+async fn stream_overload_recovery_keeps_completed_tools_and_discards_draft_calls() {
+    let provider = StubHttpServer::sequence(vec![
+        tool("bash", json!({"command":"printf once >> effects.txt"})),
+        StubHttpServer::sse_response(vec![
+            json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"type":"function_call", "name":"bash", "arguments":""}}),
+            json!({"type":"response.function_call_arguments.done", "output_index":0,
+                "arguments":json!({"command":"printf UNVALIDATED >> effects.txt"}).to_string()}),
+            json!({"type":"error", "code":"server_error", "message":"controlled overload"}),
+        ]),
+        answer("Recovered.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    env.retry("initial_backoff_ms=1\nmax_elapsed_ms=300000");
+    let output = env.run(&["-p", "work"], b"").await;
+    assert_eq!(success(&output), "Recovered.\n");
+    assert_eq!(provider.connections(), 3);
+    assert_eq!(
+        std::fs::read_to_string(env.dir.join("effects.txt")).unwrap(),
+        "once"
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("server_error") && diagnostics.contains("retrying 2/3"));
+    let saved = env.saved(&session_id(&output));
+    assert!(saved.active_thread().pending_operation.is_none());
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("UNVALIDATED")
+    );
+    myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+}
+
+#[tokio::test]
 async fn recovery_deadline_aborts_a_stalled_retry_and_saves_a_settled_boundary() {
     let provider = StubHttpServer::sequence_then_pending(vec![StubHttpServer::status_response(
         503,

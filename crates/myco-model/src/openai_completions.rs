@@ -256,11 +256,12 @@ impl StreamAccumulator {
     fn handle_chunk(
         &mut self,
         chunk: ChatCompletionChunk,
-    ) -> Result<Vec<MessagePart>, GenerateError> {
+    ) -> Result<Vec<MessagePart>, GenerationFailure> {
         if let Some(error) = chunk.error {
-            return Err(GenerateError::ExecutionError(format!(
-                "OpenAI Chat Completions stream error: {error}"
-            )));
+            return Err(super::openai_common::stream_failure(
+                error.get("code").and_then(serde_json::Value::as_str),
+                format!("OpenAI Chat Completions stream error: {error}"),
+            ));
         }
 
         let mut out = Vec::new();
@@ -320,7 +321,8 @@ impl StreamAccumulator {
                     "content_filter" => {
                         return Err(GenerateError::RefusalError(
                             "OpenAI Chat Completions stopped for content_filter".into(),
-                        ));
+                        )
+                        .into());
                     }
                     // Some servers report "stop" even when they emitted tool calls.
                     "stop" if self.saw_tool_call => TurnEndReason::ToolUse,
@@ -393,7 +395,7 @@ impl StreamAccumulator {
 }
 
 impl SseAccumulator for StreamAccumulator {
-    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerationFailure> {
         let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(|e| {
             GenerateError::MalformedResponseError(format!(
                 "Failed to parse OpenAI Chat Completions SSE event JSON: {e}; data={data}"
@@ -889,7 +891,10 @@ mod tests {
                 "choices": [{"delta": {}, "finish_reason": "content_filter"}]
             })))
             .unwrap_err();
-        assert!(matches!(err, GenerateError::RefusalError(_)), "{err:?}");
+        assert!(
+            matches!(err.cause, GenerateError::RefusalError(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -902,7 +907,7 @@ mod tests {
                 ]}}]
             })))
             .unwrap_err();
-        match err {
+        match err.cause {
             GenerateError::MalformedResponseError(msg) => {
                 assert!(msg.contains("without a name"), "{msg}");
             }
@@ -918,7 +923,7 @@ mod tests {
                 "error": {"message": "upstream is down", "code": 502}
             })))
             .unwrap_err();
-        match err {
+        match err.cause {
             GenerateError::ExecutionError(msg) => {
                 assert!(msg.contains("upstream is down"), "{msg}")
             }
