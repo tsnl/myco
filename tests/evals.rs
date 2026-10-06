@@ -88,6 +88,14 @@ impl Fixture {
         }
         results
     }
+
+    fn run_path(&self) -> PathBuf {
+        std::fs::read_dir(self.root.join("runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("result.json").is_file())
+            .unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
