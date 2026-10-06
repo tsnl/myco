@@ -20,6 +20,13 @@ def sync_directory(path):
         os.close(descriptor)
 
 
+def create_output(path):
+    if not path.parent.exists():
+        create_output(path.parent)
+    path.mkdir(exist_ok=True)
+    sync_directory(path.parent)
+
+
 class MycoAdapter:
     def __init__(self, binary, config, model, output, *, free_only=True,
                  max_requests=40, timeout_secs=600, reflection_requests=8,
@@ -28,7 +35,7 @@ class MycoAdapter:
         self.config = str(Path(config).resolve())
         self.model = model
         self.output = Path(output).resolve()
-        self.output.mkdir(parents=True, exist_ok=True)
+        create_output(self.output)
         self.free_only = free_only
         self.max_requests = max_requests
         self.timeout_secs = timeout_secs
@@ -194,7 +201,7 @@ def main():
         parser.error("all budgets must be positive")
     splits = dataset(args.dataset)
     root = Path(args.output).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    create_output(root)
     # Saved scores must not silently become evidence for changed tasks or models.
     signature = hashlib.sha256()
     for name in [args.binary, args.config, args.seed_prelude]:
