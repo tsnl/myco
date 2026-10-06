@@ -69,7 +69,7 @@ pub(super) async fn run_turn(
         writer = session.writer() => writer,
         _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
     };
-    if let Err(error) = runtime.bind_agent(agent) {
+    if let Err(error) = settle_stopped_run(agent).and_then(|()| runtime.bind_agent(agent)) {
         return SessionTurnOutcome {
             result: Err(error),
             rewound: None,
@@ -101,6 +101,18 @@ pub(super) async fn run_turn(
         Err(error) => Err(error),
     };
     finish_turn(agent, runtime, &writer, result, on_warning)
+}
+
+/// A new user action supersedes a stopped run, including one paused by a failed
+/// save. Settle its intent before rebinding; never reload over unsaved results.
+/// The caller holds the session writer and owns the stopped interpreter.
+pub(super) fn settle_stopped_run(agent: &mut Agent) -> Result<(), AgentInteractionError> {
+    if !agent.state().is_idle() {
+        agent.recover_interrupted()?;
+    } else if agent.checkpoint_failed() {
+        agent.checkpoint()?;
+    }
+    Ok(())
 }
 
 pub(super) fn finish_turn(

@@ -64,11 +64,16 @@ observations. The session's top-level `model` is its initial catalog key; runtim
 identify the model used afterward. These parts reach the model but are omitted from
 transcript replay, titles, and human acceptance timestamps.
 
-State checkpoints fail closed: a save error stops further model/tool work. An interrupted
-tool batch is recovered with explicit unknown outcomes and a hidden runtime notice, since
-the calls may have taken effect before their results were saved. Inspect external state
-before retrying those actions. Stored histories remain readable for inspection, but
-malformed call/result pairs cannot be used as executable context.
+State checkpoints fail closed: a save error stops further model/tool work. After restoring
+writable storage, submit another message, compact, or select a model to recover the live
+session. Completed tool observations are saved before new work; a tool batch that never
+started is recorded as not executed. Tools are not automatically replayed.
+
+After a restart or an abandoned running tool future, a pending batch has unknown outcomes:
+the calls may have taken effect before their results were saved. A hidden runtime notice
+records the interruption. Inspect external state before retrying those actions. Stored
+histories remain readable for inspection, but malformed call/result pairs cannot be used
+as executable context.
 
 Use `session_history` to read saved threads without loading all of them into context:
 
