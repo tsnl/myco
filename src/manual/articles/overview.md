@@ -42,6 +42,14 @@ works on one thread at a time, and session turns and compaction share a writer g
 the summary, followed by bounded recent context. The predecessor retains its original
 messages and tool output. Title, links, and scratchpad remain attached to the same session.
 
+The recent tail retains up to two complete human turns, at most 64 messages and
+64 KiB of serialized context. Image sidecars count at their resolved base64 size
+without loading their bytes; unavailable or unknown-size images omit that turn.
+A turn that exceeds either bound is represented by the summary, with its original
+history still available through `session_history`. The summary and latest runtime
+inventory are separate from this tail budget. These bounds limit retained history;
+the selected model's context and request-size limits still apply.
+
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.
 A recorded tool result remains an observation from its original thread: a shell or file
