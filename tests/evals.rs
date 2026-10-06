@@ -72,9 +72,10 @@ impl Fixture {
             "test".into(),
             "--output".into(),
             self.path("runs"),
-            "--timeout-secs".into(),
-            "5".into(),
         ];
+        if !extra.contains(&"--timeout-secs") {
+            args.extend(["--timeout-secs".into(), "5".into()]);
+        }
         args.extend(extra.iter().map(|value| (*value).into()));
         self.cli(args).await
     }
