@@ -297,7 +297,13 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, or summarization fails,
+Compaction retries transient or malformed model responses under the gateway's retry
+policy, within the same worker and its shared `compaction_max_requests` budget.
+Retry waits are visible and cancellable; completed summary writes are not replayed.
+Exhausting recovery stops the run with the original context retained; a later submission
+or manual compaction can try again. Authentication, request-budget, and persistence
+errors stop immediately. Repair storage before retrying a failed save.
+If the next usage report after a successful summary remains above the threshold,
 automatic compaction is disabled until manual compaction succeeds or another session
 is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
 do not start automatic continuation. Manual `/compact` waits for the next user input.

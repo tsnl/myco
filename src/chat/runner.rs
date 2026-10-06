@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::SessionRuntime;
-use crate::agent::{Agent, AgentInteractionError, RunOutcome, StateError};
+use crate::agent::{Agent, AgentEvent, AgentInteractionError, EventSink, RunOutcome, StateError};
 use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{CatalogModel, Content, GenerateError, GenerativeModel, Message};
 use crate::prompts;
@@ -23,6 +23,16 @@ pub trait Compactor: Send + Sync {
         predecessor: Session,
         cancel: CancelToken,
     ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>>;
+
+    /// Observe recovery while preserving the same worker's request budget.
+    fn compact_observed(
+        self: Arc<Self>,
+        predecessor: Session,
+        cancel: CancelToken,
+        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
+    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        self.compact(predecessor, cancel)
+    }
 }
 
 pub struct ModelCompactor {
@@ -39,6 +49,47 @@ impl Compactor for ModelCompactor {
         Box::pin(async move {
             run_compact_worker(&predecessor, &self.model, self.max_requests, cancel).await
         })
+    }
+
+    fn compact_observed(
+        self: Arc<Self>,
+        predecessor: Session,
+        cancel: CancelToken,
+        observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
+    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        Box::pin(async move {
+            super::compact_worker::run_compact_worker_with_sink(
+                &predecessor,
+                &self.model,
+                self.max_requests,
+                cancel,
+                Arc::new(CompactionObserver(observer)),
+            )
+            .await
+        })
+    }
+}
+
+struct CompactionObserver(Arc<dyn Fn(WorkflowEvent) + Send + Sync>);
+
+impl EventSink for CompactionObserver {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::Failure {
+            failure,
+            attempt,
+            max_attempts,
+            retry_in: Some(delay),
+            ..
+        } = event
+        {
+            (self.0)(WorkflowEvent::Warning(format!(
+                "compaction response interrupted; retrying {}/{} in {:.1}s: {}",
+                attempt + 1,
+                max_attempts,
+                delay.as_secs_f64(),
+                failure.cause
+            )));
+        }
     }
 }
 
@@ -99,7 +150,7 @@ impl SessionRunner {
     pub fn set_compactor(&mut self, compactor: Arc<dyn Compactor>, auto_compact_at: Option<u64>) {
         self.workflow.compactor = Some(compactor);
         self.workflow.threshold = auto_compact_at.map(|tokens| tokens.max(1));
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
     }
 
     pub fn set_observer(&mut self, observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>) {
@@ -161,7 +212,7 @@ impl SessionRunner {
         runtime.bind_agent(&mut self.agent)?;
         wire_checkpoint(&mut self.agent, runtime.session());
         self.runtime = runtime;
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
         self.workflow.resume_notice = true;
         self.forked = false;
         self.workflow
@@ -265,7 +316,7 @@ impl SessionRunner {
                 CompactionMode::Manual,
             )
             .await?;
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
         Ok(outcome)
     }
 }
@@ -282,7 +333,7 @@ pub(super) struct Workflow {
     resume_notice: bool,
     compactor: Option<Arc<dyn Compactor>>,
     threshold: Option<u64>,
-    auto_failed: bool,
+    auto_ineffective: bool,
     compacted_after_completion: bool,
     awaiting_compacted_usage: bool,
     observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
@@ -296,7 +347,7 @@ impl Default for Workflow {
             resume_notice: false,
             compactor: None,
             threshold: None,
-            auto_failed: false,
+            auto_ineffective: false,
             compacted_after_completion: false,
             awaiting_compacted_usage: false,
             observer: Arc::new(|_| {}),
@@ -420,7 +471,7 @@ impl Workflow {
                     .zip(used)
                     .is_some_and(|(threshold, used)| used >= threshold)
                 {
-                    self.auto_failed = true;
+                    self.auto_ineffective = true;
                     (self.observer)(WorkflowEvent::Warning("compaction did not reduce the prompt below its threshold; automatic compaction disabled until manual compaction or a session change".into()));
                 }
             }
@@ -433,12 +484,9 @@ impl Workflow {
                 && self.threshold_reached(used);
             if should_compact {
                 self.compacted_after_completion |= outcome.is_some();
-                if self
-                    .auto_compact(agent, runtime, writer, cancel.clone())
-                    .await?
-                {
-                    continue;
-                }
+                self.auto_compact(agent, runtime, writer, cancel.clone())
+                    .await?;
+                continue;
             }
             if let Some(outcome) = outcome {
                 if self.deliver_followups(agent, runtime, &cancel)? {
@@ -450,7 +498,7 @@ impl Workflow {
     }
 
     fn threshold_reached(&self, used: Option<u64>) -> bool {
-        !self.auto_failed
+        !self.auto_ineffective
             && self
                 .threshold
                 .zip(used)
@@ -463,19 +511,12 @@ impl Workflow {
         runtime: &Arc<SessionRuntime>,
         writer: &SessionWriter,
         cancel: CancelToken,
-    ) -> Result<bool, AgentInteractionError> {
+    ) -> Result<(), AgentInteractionError> {
         match self
             .compact(agent, runtime, writer, cancel, CompactionMode::Automatic)
             .await
         {
-            Ok(_) => Ok(true),
-            Err(AgentInteractionError::Compaction(reason)) => {
-                self.auto_failed = true;
-                (self.observer)(WorkflowEvent::Warning(format!(
-                    "auto-compaction failed: {reason}; disabled until manual compaction or a session change"
-                )));
-                Ok(false)
-            }
+            Ok(_) => Ok(()),
             Err(AgentInteractionError::Cancelled) => {
                 agent.cancel_at_boundary()?;
                 Err(AgentInteractionError::Cancelled)
@@ -526,7 +567,8 @@ impl Workflow {
             automatic,
         });
         let started = std::time::Instant::now();
-        let mut work = compactor.compact(predecessor, cancel.clone());
+        let mut work =
+            compactor.compact_observed(predecessor, cancel.clone(), self.observer.clone());
         let mut progress = tokio::time::interval(std::time::Duration::from_secs(10));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         progress.tick().await;
@@ -625,6 +667,7 @@ mod tests {
         sources: Mutex<Vec<Session>>,
         cancel: AtomicBool,
         failure: Option<&'static str>,
+        transient_failures: AtomicUsize,
         break_store: Option<std::path::PathBuf>,
     }
 
@@ -638,6 +681,15 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 crate::agent::validate_context(&predecessor.active_thread().messages).unwrap();
                 self.sources.lock().unwrap().push(predecessor.clone());
+                if self
+                    .transient_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                        count.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(CompactWorkerError::Failed("temporary outage".into()));
+                }
                 if let Some(reason) = self.failure {
                     return Err(CompactWorkerError::Failed(reason.into()));
                 }
@@ -1544,6 +1596,40 @@ mod tests {
                 assert_eq!(model.remaining(), 0);
                 assert_eq!(compactor.calls.load(Ordering::SeqCst), 0);
             }
+        });
+    }
+
+    #[test]
+    fn failed_auto_compaction_stops_work_and_a_later_submission_can_retry() {
+        let _home = temp_home("runner-compact-recovery");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer {
+                transient_failures: AtomicUsize::new(1),
+                ..Default::default()
+            });
+            let (mut runner, model) = setup(
+                vec![
+                    output(90, None, TurnEndReason::EndTurn),
+                    output(20, None, TurnEndReason::EndTurn),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            let error = submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap_err();
+            assert!(matches!(error, AgentInteractionError::Compaction(_)));
+            assert_eq!(model.remaining(), 1);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runner.runtime().session().snapshot().threads().len(), 1);
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(runner.runtime().session().snapshot().threads().len(), 2);
         });
     }
 
