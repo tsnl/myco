@@ -1016,7 +1016,21 @@ context_window = 100000
         self.compaction_release.set()
         expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
         expect(page.locator('#model')).to_be_enabled()
-        expect(page.locator('.user .body')).to_contain_text('Image omitted to reduce request size')
+        # The whole oversized turn is outside the bounded successor tail.
+        # Its original image and text remain in the predecessor audit history.
+        session_id = page.url.rsplit('/', 1)[1]
+        saved = self.home / f'profiles/default/session/{session_id[:2]}/{session_id}.json'
+        threads = json.loads(saved.read_text())['threads']
+        self.assertGreaterEqual(len(threads), 2)
+        self.assertIn('Alpha images', json.dumps(threads[0]['messages']))
+        self.assertIn('myco-image:sha256:', json.dumps(threads[0]['messages']))
+        self.assertEqual(threads[-1]['predecessor_id'], threads[-2]['id'])
+        self.assertIn('Continue the browser fixture task.', json.dumps(threads[-1]['messages']))
+        for refreshed in [False, True]:
+            if refreshed:
+                page.reload()
+            expect(page.locator('.user')).to_have_count(0)
+            expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
         self.assertTrue(self.requests)
         self.assertTrue(all(not self.image_urls(request) for request in self.requests),
                         'The oversized image request must fail locally before upload')
