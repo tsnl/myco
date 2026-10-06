@@ -274,18 +274,26 @@ much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
 **Auto-compaction** is enabled for every configured model through the session runner.
-`auto_compact_at` defaults to `1.0`, the full context window; `0.8` triggers when reported prompt size reaches 80% of
-`context_window`, at a settled boundary between tool rounds or after a normal answer.
-The system prompt tells the agent this
-threshold. The fraction must be greater than 0 and at most 1.
+`auto_compact_at` defaults to `0.8`. The effective threshold is the smaller of
+`floor(context_window * auto_compact_at)` and `context_window - max_output_tokens`.
+The output reservation applies only when the output cap is smaller than the window;
+larger caps retain compatibility with existing small-window configurations. An explicit
+fraction of `1.0` still reserves usable output capacity. Fractions must be greater than
+0 and at most 1. The default 20% headroom allows growth but cannot guarantee that a
+future tool result or response will fit. The system prompt reports the resolved threshold.
 
-The runner also checks saved context before sending a new submission. After a
-model change, it compares the last known prompt size with the selected model's
-threshold. This estimate survives restarts but is kept separate from the new
-model's usage report. Selecting a model or opening a session alone does not
-compact or generate. The newly accepted message is included in any compaction.
-Counts are estimates for a different tokenizer and exclude input added since the
-last report; a fraction below `1.0` leaves more room for growth.
+Before each model request, the runner counts newly accepted input, dynamic prelude
+notices, assistant tool arguments, and completed tool results. It adds estimated growth
+to the last measured input size, or estimates text from scratch when usage is absent.
+The heuristic uses three UTF-8 bytes per token plus message/tool framing; it excludes
+hidden metadata and thinking that providers do not receive. Images, tokenizer differences,
+and provider-owned instructions/schema remain outside this estimate and may require
+request-size recovery. Tracking updates incrementally without serializing the full history.
+
+After restart, saved usage lacks its exact measured prefix, so sizing conservatively
+includes the restored text as well and may compact early. Model changes preserve sizing
+hints separately from reported usage. Selecting a model or opening a session alone does
+not compact or generate. Compaction includes newly accepted input and settled tool results.
 
 It runs the same compaction as `/compact`, creating a successor thread in the
 same session with live tools intact. After success, a `# Resumption` message
@@ -297,7 +305,8 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, or summarization fails,
+If the successor's text estimate or its next usage report remains above the threshold,
+or summarization fails,
 automatic compaction is disabled until manual compaction succeeds or another session
 is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
 do not start automatic continuation. Manual `/compact` waits for the next user input.
