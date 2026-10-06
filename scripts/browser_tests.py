@@ -3361,9 +3361,13 @@ context_window = 100000
 
         page.click("#jump")
         expect(page.locator("#jump")).to_be_hidden()
-        page.set_viewport_size({"width": 390, "height": 844})
-        self.assertTrue(page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
-        expect(page.locator("#composer")).to_be_in_viewport()
+        for width in [320, 390, 760, 768, 1200]:
+            page.set_viewport_size({"width": width, "height": 844})
+            self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+            expect(page.locator("#composer")).to_be_in_viewport()
+            for control in page.locator('.toolbar-actions button, #new-session').all():
+                expect(control).to_be_in_viewport(ratio=1)
+
     def test_session_archive_redirects_and_undo_survives_reload_within_its_profile(self):
         self.add_profile()
         default = self.session(self.page)

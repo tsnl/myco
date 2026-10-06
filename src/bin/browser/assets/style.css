@@ -48,6 +48,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .toolbar #rename { flex: none; display: inline-flex; padding: 6px; color: var(--dim); }
 #rename svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; }
 .toolbar-actions, .toolbar-tools { display: flex; align-items: center; gap: 8px; }
+.toolbar-tools { flex-wrap: wrap; justify-content: flex-end; }
 .toolbar-actions { flex: none; flex-wrap: wrap; gap: 12px; }
 .toolbar button { min-height: 36px; padding: 5px 9px; font-size: 13px; white-space: nowrap; }
 .toolbar-tools button { border-color: var(--glass-border); background: var(--glass-control); color: var(--dim); }
