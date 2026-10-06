@@ -27,7 +27,10 @@ a model reliably completes your work.
 Run artifacts include versioned `provenance.json` with effective settings and
 the main-agent prompt, plus timestamped `events.jsonl` with request/tool identity
 and failed or abandoned attempts. Authentication values are excluded from the
-configuration snapshot. The [task eval manual](../manual/evals.md) documents
+configuration snapshot. Git runs include a self-contained pinned source bundle
+and a relative frozen recipe; they can replay after moving the run and removing
+the original repository, using separately supplied configuration and tools.
+The [task eval manual](../manual/evals.md) documents
 artifact portability, event fields, and fingerprint reuse.
 
 `cargo test --locked --offline --test evals` exercises the executable against

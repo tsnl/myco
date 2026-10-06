@@ -14,7 +14,6 @@ use crate::core::{
     Async, CancelToken, ModelInfo,
     image_store::{ImageStore, sha256, with_images},
 };
-use crate::external_command::GIT;
 use crate::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message,
     TurnEndReason,
@@ -22,7 +21,7 @@ use crate::generative_model::{
 use crate::session::{ActiveSession, CompactOutcome, Session, Thread};
 use crate::{Config, ConfigUserSettings, Harness, SessionRuntime};
 
-use super::case::{Workspace, copy_tree, git};
+use super::case::copy_tree;
 use super::metrics::{Metrics, Recorder};
 use super::{discover_cases, load_case, read_json, write_json};
 
@@ -58,6 +57,8 @@ struct Job {
     free_only: bool,
     effort: Effort,
     case_hash: String,
+    #[serde(default)]
+    frozen_case_hash: Option<String>,
     fingerprint: String,
     repetition: u32,
 }
@@ -208,7 +209,7 @@ fn tree_hash(root: &Path) -> Result<String, String> {
                     .mode();
                 entries.push((
                     format!("{}:{mode}", path.strip_prefix(root).unwrap().display()),
-                    sha256(&std::fs::read(&path).map_err(|error| error.to_string())?),
+                    file_hash(&path)?,
                 ));
             } else {
                 return Err(format!(
@@ -223,6 +224,27 @@ fn tree_hash(root: &Path) -> Result<String, String> {
     collect(root, root, &mut entries)?;
     entries.sort();
     Ok(sha256(&serde_json::to_vec(&entries).unwrap()))
+}
+
+fn file_hash(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => digest.update(&buffer[..size]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
@@ -243,10 +265,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
     options.models.sort();
     options.models.dedup();
     let cases = discover_cases(&options.cases)?;
-    let binary_hash = sha256(
-        &std::fs::read(std::env::current_exe().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?,
-    );
+    let binary_hash = file_hash(&std::env::current_exe().map_err(|error| error.to_string())?)?;
     let cohort_hash = sha256(
         format!(
             "{:?}|{}|{}|{}|{}|{:?}|{}|{binary_hash}",
@@ -317,6 +336,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
                     free_only: options.free_only,
                     effort: options.effort,
                     case_hash: case_hash.clone(),
+                    frozen_case_hash: None,
                     fingerprint,
                     repetition,
                 });
@@ -411,7 +431,7 @@ async fn run_one_inner(mut job: Job) -> Result<(), String> {
         std::fs::rename(&job.output, previous).map_err(|error| error.to_string())?;
     }
     std::fs::create_dir(&job.output).map_err(|error| error.to_string())?;
-    let case = load_case(&job.case)?;
+    let mut case = load_case(&job.case)?;
     eprintln!(
         "running: {} / {} repetition {}",
         case.name,
@@ -425,29 +445,9 @@ async fn run_one_inner(mut job: Job) -> Result<(), String> {
     }
     job.case = frozen;
     let workspace = job.output.join("workspace");
-    match &case.workspace {
-        Workspace::Fixture => {
-            copy_tree(&job.case.join("workspace"), &workspace)?;
-            git(&workspace, &["init", "--quiet"])?;
-        }
-        Workspace::Git { repo, revision } => {
-            let output = GIT
-                .tokio_command()
-                .args(["clone", "--shared", "--no-checkout", "--"])
-                .arg(repo)
-                .arg(&workspace)
-                .output()
-                .await
-                .map_err(|error| error.to_string())?;
-            if !output.status.success() {
-                return Err(format!(
-                    "prepare git workspace: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            git(&workspace, &["checkout", "--detach", revision])?;
-        }
-    }
+    super::workspace::prepare(&mut case, &job.case, &workspace).await?;
+    let frozen_case_hash = tree_hash(&job.case)?;
+    job.frozen_case_hash = Some(frozen_case_hash.clone());
     write_json(&job.output.join("job.json"), &job)?;
     let stdout = std::fs::File::create(job.output.join("worker.stdout"))
         .map_err(|error| error.to_string())?;
@@ -506,7 +506,7 @@ async fn run_one_inner(mut job: Job) -> Result<(), String> {
     };
     if !status.success() || result.agent.is_none() {
         result.feedback = "worker failed; inspect worker.stderr".into();
-    } else if tree_hash(&job.case)? != job.case_hash {
+    } else if tree_hash(&job.case)? != frozen_case_hash {
         result.status = "case_modified".into();
         result.feedback = "frozen case or grader changed during execution".into();
     } else {
@@ -563,7 +563,7 @@ async fn run_one_inner(mut job: Job) -> Result<(), String> {
                 }
             }
         }
-        if tree_hash(&job.case)? != job.case_hash {
+        if tree_hash(&job.case)? != frozen_case_hash {
             result.status = "case_modified".into();
             result.score = None;
             result.feedback = "grader or frozen inputs changed".into();
@@ -684,6 +684,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
             "myco_commit": crate::manual::GIT_COMMIT,
             "fingerprint": job.fingerprint,
             "case_hash": job.case_hash,
+            "frozen_case_hash": job.frozen_case_hash.as_ref().unwrap_or(&job.case_hash),
             "model_hash": job.model_hash,
             "environment": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
             "configuration": super::provenance::configuration(&config, &model_config),

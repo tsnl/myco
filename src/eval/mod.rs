@@ -5,6 +5,7 @@ mod case;
 mod metrics;
 mod provenance;
 mod run;
+mod workspace;
 
 pub use case::{
     Case, CaseSource, CreateOptions, Workspace, create_case, discover_cases, load_case,

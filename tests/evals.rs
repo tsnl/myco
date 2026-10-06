@@ -133,6 +133,151 @@ fn report(output: &std::process::Output) -> Value {
         .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)))
 }
 
+fn git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["-c", "init.templateDir=", "-C"])
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+#[tokio::test]
+async fn git_run_replays_after_moving_artifacts_and_deleting_original_sources() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("fixture");
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["add", "input.txt"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Pinned input",
+        ],
+    );
+    let revision = git(&source, &["rev-parse", "HEAD"]);
+    git(
+        &source,
+        &[
+            "config",
+            "http.extraHeader",
+            "Authorization: LOCAL_CONFIG_SECRET",
+        ],
+    );
+    git(
+        &source,
+        &[
+            "config",
+            "remote.private.url",
+            "https://user:LOCAL_URL_SECRET@example.invalid/private",
+        ],
+    );
+    // The snapshot includes only ancestry of the pinned commit, not later refs.
+    std::fs::write(source.join("unrelated.txt"), "UNRELATED_COMMIT_SECRET").unwrap();
+    git(&source, &["add", "unrelated.txt"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Unrelated later commit",
+        ],
+    );
+    let later = git(&source, &["rev-parse", "HEAD"]);
+    let created = fixture
+        .cli(vec![
+            "create".into(),
+            fixture.path("case"),
+            "--task-file".into(),
+            fixture.path("task.txt"),
+            "--repo".into(),
+            fixture.path("fixture"),
+            "--revision".into(),
+            revision.clone(),
+            "--grader".into(),
+            fixture.path("grader.py"),
+        ])
+        .await;
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let mut replies = vec![];
+    for _ in 0..2 {
+        replies.extend([
+            tool(
+                "test -f input.txt && test ! -e unrelated.txt && printf done > result.txt",
+                100,
+                5,
+            ),
+            answer(70, 7),
+        ]);
+    }
+    let server = StubHttpServer::sequence(replies).await;
+    fixture.configure(&server);
+    assert_eq!(
+        report(&fixture.run(&[]).await)["groups"][0]["success_rate"],
+        1.0
+    );
+
+    let moved = fixture.root.join("moved-run");
+    std::fs::rename(fixture.run_path(), &moved).unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("case")).unwrap();
+    std::fs::remove_file(fixture.root.join("config.toml")).unwrap();
+    let workspace = moved.join("workspace");
+    assert!(!workspace.join(".git/objects/info/alternates").exists());
+    assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), revision);
+    git(&workspace, &["fsck", "--full"]);
+    assert!(!git(&workspace, &["rev-list", "--all"]).contains(&later));
+    let local_config = std::fs::read_to_string(workspace.join(".git/config")).unwrap();
+    assert!(!local_config.contains("SECRET"));
+    let frozen: Value =
+        serde_json::from_slice(&std::fs::read(moved.join("case/case.json")).unwrap()).unwrap();
+    assert_eq!(frozen["workspace"]["repo"], "source.bundle");
+    let provenance: Value =
+        serde_json::from_slice(&std::fs::read(moved.join("provenance.json")).unwrap()).unwrap();
+    assert_ne!(provenance["case_hash"], provenance["frozen_case_hash"]);
+    myco::eval::load_case(&moved.join("case")).unwrap();
+
+    // Replay supplies a new config; the original auth/environment is not bundled.
+    fixture.configure(&server);
+    let replay = fixture
+        .cli(vec![
+            "run".into(),
+            moved.join("case").to_string_lossy().into_owned(),
+            "--config".into(),
+            fixture.path("config.toml"),
+            "--model".into(),
+            "test".into(),
+            "--output".into(),
+            fixture.path("replayed"),
+            "--timeout-secs".into(),
+            "5".into(),
+        ])
+        .await;
+    assert_eq!(report(&replay)["groups"][0]["success_rate"], 1.0);
+    assert_eq!(server.connections(), 4);
+}
+
 #[tokio::test]
 async fn repeated_cases_use_fresh_workspaces_count_all_requests_and_resume_finished_results() {
     let fixture = Fixture::new();

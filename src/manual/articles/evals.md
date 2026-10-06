@@ -28,8 +28,11 @@ cases and results outside public repositories unless reviewed for publication.
 A session is conversation context, **not a filesystem snapshot**. Pick the
 starting commit explicitly. Earlier shell handles and editor state are not
 restored. Adapt tasks that depend on external services or unavailable files.
-Git workspaces require the local repository and commit to remain available;
-submodules, dependency installation, and external fixtures need preparation.
+The initial Git run requires the local repository and pinned commit. Each run
+then freezes that commit and its ancestors in `case/source.bundle`, with a
+relative path in `case/case.json`. The run workspace owns its Git objects and
+does not borrow the original repository's object store. Submodules, dependency
+installation, and external fixtures still need separate preparation.
 
 For a new task, or a small directory snapshot:
 
@@ -101,9 +104,24 @@ the initial main-agent system prompt, and tool schemas. Its artifact paths are
 relative to the run directory so inspection survives moving the bundle. Backend
 settings use an explicit allowlist excluding authentication; endpoint user info,
 query strings, and fragments are removed. Prompts and tool content are retained
-as task evidence, so review them before sharing. A moved Git workspace can still
-depend on its source repository's object store; the bundle is inspection evidence,
-not a self-contained executable environment.
+as task evidence, so review them before sharing. Git snapshots include committed
+source history reachable from the pinned commit, excluding unrelated refs and
+the source repository's local configuration, hooks, and authentication settings.
+`case_hash` identifies the original recipe; `frozen_case_hash` identifies the
+portable snapshot checked for modification during execution and grading.
+
+To replay a moved run, pass its frozen case and separately supplied configuration:
+
+```bash
+myco-eval run /moved/run/case --config /new/config.toml \
+  --model MODEL_KEY --output /new/results
+```
+
+`job.json` records the original execution paths; it is not a relocation script.
+The bundle preserves task inputs, not an operating system or installed tools.
+Use the same build, dependencies, model settings, and candidate prelude for a
+controlled comparison. Git recipes accept an absolute repository path or a
+relative path inside the case; relative paths cannot escape via `..`.
 
 Each new trace line has `version: 1`, a one-based `sequence`, UTC `timestamp`,
 and monotonic `elapsed_ms`. `request_started` and `request_finished` share a
