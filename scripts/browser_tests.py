@@ -1794,6 +1794,55 @@ context_window = 100000
         sessions = self.context.request.get(self.origin + '/api/sessions').json()
         self.assertEqual(len(sessions), 1)
 
+    def test_restoring_original_new_tab_urls_without_history_state_reuses_sessions(self):
+        opened_urls = []
+        self.context.on('request', lambda request: opened_urls.append(request.url)
+                        if urlsplit(request.url).path.endswith('/new') else None)
+        session_urls = []
+        for _ in range(2):
+            with self.context.expect_page() as opened:
+                self.page.click('#new-session')
+            page = opened.value
+            page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+            session_urls.append(page.url)
+            page.close()
+        self.assertEqual(len(opened_urls), 2)
+        self.assertNotEqual(opened_urls[0], opened_urls[1])
+        self.assertNotEqual(session_urls[0], session_urls[1])
+        for original, expected in zip(list(opened_urls), session_urls):
+            self.assertIn('?id=', original)
+            restored = self.context.new_page()
+            self.assertIsNone(restored.evaluate('history.state'))
+            restored.goto(original)
+            restored.wait_for_url(expected)
+            restored.close()
+        sessions = self.context.request.get(self.origin + '/api/sessions').json()
+        self.assertEqual(len(sessions), 2)
+
+    def test_bare_new_url_retains_its_identity_after_history_state_is_lost(self):
+        attempts = []
+        def lose_once(route):
+            if route.request.method != 'POST':
+                route.continue_()
+                return
+            attempts.append(route.request.post_data_json['request_id'])
+            response = route.fetch()
+            if len(attempts) == 1:
+                route.abort()
+            else:
+                route.fulfill(response=response)
+        self.context.route('**/api/sessions', lose_once)
+        page = self.context.new_page()
+        page.goto(self.origin + '/profiles/default/new')
+        expect(page.locator('#retry')).to_be_visible()
+        self.assertIn('?id=', page.url)
+        page.evaluate("history.replaceState(null, '')")
+        page.reload()
+        page.wait_for_url(re.compile(r'.*/sessions/[a-f0-9]{32}$'))
+        self.assertEqual(attempts, [attempts[0], attempts[0]])
+        sessions = self.context.request.get(self.origin + '/api/sessions').json()
+        self.assertEqual(len(sessions), 1)
+
     def test_assistant_heading_precedes_tool_first_output_live_after_reload_and_restart(self):
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')

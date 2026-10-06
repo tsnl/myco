@@ -31,5 +31,14 @@ export function setArchived(id, archived) {
 }
 
 export function newSession() {
-  window.open(profilePath('/new'), '_blank', 'noopener');
+  window.open(newSessionUrl(), '_blank', 'noopener');
+}
+
+const newSessionUrl = () => profilePath(`/new?id=${requestId()}`);
+
+export function bindNewSessionLink(link) {
+  const renew = () => { link.href = newSessionUrl(); };
+  renew();
+  // Each activation needs its own identity in the URL originally opened by the browser.
+  for (const event of ['click', 'auxclick', 'contextmenu']) link.addEventListener(event, renew);
 }

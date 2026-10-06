@@ -3,9 +3,11 @@ import { profileName, profilePath } from './scope.js';
 
 document.title = `New session · ${profileName} · myco`;
 
-// Reloads and retries must keep the same durable identity after a lost response.
-const createId = history.state?.createId || requestId();
-history.replaceState({ createId }, '');
+// Browser restores may preserve the URL without restoring history.state.
+const url = new URL(location.href);
+const createId = url.searchParams.get('id') || history.state?.createId || requestId();
+url.searchParams.set('id', createId);
+history.replaceState({ ...history.state, createId }, '', url);
 async function create() {
   $('retry').hidden = true;
   $('creation-status').textContent = 'Creating your session…';
