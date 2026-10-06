@@ -256,6 +256,7 @@ impl HostController {
             agent_id,
             cancel,
             background,
+            max_image_base64_bytes,
         } = context;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let response_timeout = response_timeout(&tool_use);
@@ -263,6 +264,7 @@ impl HostController {
         let request = Request::ToolCall {
             id: id.clone(),
             agent_id,
+            max_image_base64_bytes,
             tool_use,
         };
 
@@ -960,16 +962,26 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_host_protocol_is_rejected_before_tool_dispatch() {
-        let hello = serde_json::json!({"type":"hello_ok", "version":env!("CARGO_PKG_VERSION")});
-        let ctl = scripted_host(
-            "old-protocol",
-            format!("read -r _line; printf '%s\\n' '{hello}'; sleep 5"),
-        );
-        let result = bash_call(&ctl, "true").await;
-        assert!(result.is_error);
-        let text = text_parts(&result).join("");
-        assert!(text.contains("protocol 0"), "{text}");
-        assert!(text.contains("rebuild"), "{text}");
+        for protocol in [None, Some(3)] {
+            let hello = serde_json::json!({"type":"hello_ok", "version":env!("CARGO_PKG_VERSION")});
+            let mut hello = hello;
+            if let Some(protocol) = protocol {
+                hello["protocol"] = protocol.into();
+            }
+            let ctl = scripted_host(
+                "old-protocol",
+                format!("read -r _line; printf '%s\\n' '{hello}'; sleep 5"),
+            );
+            let result = bash_call(&ctl, "true").await;
+            assert!(result.is_error);
+            let text = text_parts(&result).join("");
+            assert!(
+                text.contains(&format!("protocol {}", protocol.unwrap_or(0))),
+                "{text}"
+            );
+            assert!(text.contains("local 4"), "{text}");
+            assert!(text.contains("rebuild"), "{text}");
+        }
     }
 
     #[tokio::test]

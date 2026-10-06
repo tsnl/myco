@@ -208,16 +208,18 @@ impl Config {
                 "compaction_max_requests must be greater than zero".into(),
             ));
         }
-        // Host workers enforce the image cap where the file is read, so they
-        // are spawned with the cap of the model this process will run — fixed
-        // for the process, since the model is chosen once at startup.
+        // Hosts outlive model selections and serve sessions with different caps.
+        // The catalog bounds worker reads; each session supplies its active cap.
         let harness = HarnessConfig::from_ssh_aliases(
             ssh_aliases()?,
             file.attach_timeout_secs
                 .unwrap_or(DEFAULT_ATTACH_TIMEOUT_SECS),
             models
-                .spec(&model)
-                .map(|s| s.max_image_base64_bytes)
+                .keys()
+                .into_iter()
+                .filter_map(|key| models.spec(key))
+                .map(|spec| spec.max_image_base64_bytes)
+                .max()
                 .unwrap_or(DEFAULT_MAX_IMAGE_BASE64_BYTES),
         );
         Ok(Self {
@@ -679,12 +681,9 @@ context_window = 1000
         }
     }
 
-    /// `max_image_base64_bytes` is per model and defaults to the shared cap. The
-    /// resolved value must also reach the harness, which is what remote hosts
-    /// are spawned with — a default there would let a remote `view_image`
-    /// return images the model rejects.
+    /// Worker ceilings cover the whole catalog, independent of startup selection.
     #[test]
-    fn per_model_image_cap_defaults_and_reaches_the_harness() {
+    fn per_model_image_caps_resolve_to_a_catalog_worker_ceiling() {
         let default_cfg = resolve_catalog_cfg(&[("OPENROUTER_API_KEY", "or-key")]);
         assert_eq!(
             default_cfg
@@ -700,7 +699,7 @@ context_window = 1000
         );
 
         let toml_text = r#"
-model = "big-images"
+model = "stock"
 
 [models.big-images]
 protocol = "openai-responses"
@@ -726,8 +725,31 @@ context_window = 32_768
             cfg.models.spec("stock").unwrap().max_image_base64_bytes,
             DEFAULT_MAX_IMAGE_BASE64_BYTES
         );
-        // Hosts follow the *selected* model.
+        // Hosts support the larger catalog entry even when stock starts the service.
         assert_eq!(cfg.harness.max_image_base64_bytes, 12 * 1024 * 1024);
+        let changed = resolve_toml(
+            toml_text.replace("model = \"stock\"", "model = \"big-images\""),
+            ConfigUserSettings::default(),
+            env_of(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            changed.harness.max_image_base64_bytes,
+            cfg.harness.max_image_base64_bytes
+        );
+        assert_eq!(
+            changed
+                .harness
+                .remote_hosts
+                .iter()
+                .map(|host| &host.command)
+                .collect::<Vec<_>>(),
+            cfg.harness
+                .remote_hosts
+                .iter()
+                .map(|host| &host.command)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

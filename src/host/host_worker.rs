@@ -38,10 +38,9 @@ impl HostWorker {
 
     /// Standard host catalog (same on every host / remote binary).
     ///
-    /// `max_image_base64_bytes` is the driving model's image cap: it bounds what
-    /// `view_image` will read and is quoted in the tool's description, so a
-    /// remote worker must be spawned with the same value the agent side
-    /// resolved (`--max-image-base64-bytes`).
+    /// `max_image_base64_bytes` is the catalog ceiling, passed to remote workers
+    /// with `--max-image-base64-bytes`. Calls lower it to their active model's
+    /// cap without replacing the worker or its live resources.
     pub fn standard(name: impl Into<String>, max_image_base64_bytes: u64) -> Self {
         Self::new(name, Self::standard_services(max_image_base64_bytes))
     }
@@ -154,6 +153,7 @@ impl HostWorker {
             Request::ToolCall {
                 id,
                 agent_id: _,
+                max_image_base64_bytes: _,
                 tool_use,
             } => {
                 let result = self
@@ -246,11 +246,13 @@ impl HostWorker {
                 Request::ToolCall {
                     id,
                     agent_id,
+                    max_image_base64_bytes,
                     tool_use,
                 } => {
                     // Register before spawning so a following Cancel line can
                     // never race ahead of the tool task's token.
-                    let context = HostDispatchContext::new(agent_id, CancelToken::new());
+                    let mut context = HostDispatchContext::new(agent_id, CancelToken::new());
+                    context.max_image_base64_bytes = max_image_base64_bytes;
                     controls.lock().await.insert(id.clone(), context.clone());
                     let request_id = id.clone();
                     let worker = Arc::clone(self);
@@ -263,6 +265,7 @@ impl HostWorker {
                                 Request::ToolCall {
                                     id,
                                     agent_id,
+                                    max_image_base64_bytes,
                                     tool_use,
                                 },
                                 Some(context),
@@ -365,6 +368,7 @@ mod tests {
                 let request = Request::ToolCall {
                     id: index.to_string(),
                     agent_id: uuid::Uuid::nil(),
+                    max_image_base64_bytes: None,
                     tool_use: ToolUse {
                         name: "unknown".into(),
                         input: serde_json::json!({}),

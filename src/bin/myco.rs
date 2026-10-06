@@ -404,7 +404,7 @@ fn build_model(
     let (epilogue, prelude) = prompts::agent_prompt_epilogue();
     let model = generative_model::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
-        tools: harness.tool_specs(),
+        tools: harness.tool_specs_with_image_limit(catalog_model.spec.max_image_base64_bytes),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
             epilogue,
@@ -421,6 +421,7 @@ fn build_model(
     let model = myco::core::image_store::with_images(
         model,
         myco::core::image_store::ImageStore::for_profile()?,
+        catalog_model.spec.max_image_base64_bytes,
     );
     Ok((model, prelude))
 }

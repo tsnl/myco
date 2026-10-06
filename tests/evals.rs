@@ -350,3 +350,56 @@ async fn session_export_ends_at_the_selected_task_and_copies_images_without_muta
             .exists()
     );
 }
+
+#[tokio::test]
+async fn candidate_image_cap_above_default_reaches_eval_tools_and_provider_input() {
+    let fixture = Fixture::new();
+    let image_path = fixture.root.join("fixture/large.png");
+    let mut bytes = vec![0; 4 * 1024 * 1024]; // 5.3MiB base64: above the default, below this model's cap.
+    bytes[..4].copy_from_slice(b"\x89PNG");
+    std::fs::write(image_path, bytes).unwrap();
+    fixture.create().await;
+    let view = StubHttpServer::sse_response(vec![
+        json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"function_call", "name":"view_image", "call_id":"image", "arguments":""}}),
+        json!({"type":"response.function_call_arguments.done", "output_index":0, "arguments":json!({"path":"large.png"}).to_string()}),
+        json!({"type":"response.completed", "response":{"status":"completed", "usage":{"input_tokens":100,"output_tokens":1}}}),
+    ]);
+    let server = StubHttpServer::sequence(vec![view, answer(200, 2)]).await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap().replace(
+        "context_window = 100000",
+        "context_window = 100000\nmax_image_base64_bytes = 12582912",
+    );
+    std::fs::write(config, text).unwrap();
+    let output = fixture.run(&["--timeout-secs", "15"]).await;
+    report(&output);
+    assert_eq!(server.connections(), 2);
+    let request = server.captured().await;
+    let view = request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "view_image")
+        .unwrap();
+    assert!(
+        view["description"]
+            .as_str()
+            .unwrap()
+            .contains("12582912 bytes")
+    );
+    let agent: Value =
+        serde_json::from_slice(&std::fs::read(fixture.run_path().join("agent.json")).unwrap())
+            .unwrap();
+    let id = agent["session_id"].as_str().unwrap();
+    let path = fixture
+        .run_path()
+        .join("home/profiles/eval/session")
+        .join(&id[..2])
+        .join(format!("{id}.json"));
+    let saved = std::fs::read_to_string(path).unwrap();
+    assert!(
+        saved.contains("myco-image:sha256:"),
+        "view_image did not produce a saved image"
+    );
+}

@@ -242,9 +242,19 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 the name says measured on the uploaded base64 payload — 4/3 of the file on
 disk; default 5 MiB, matching Anthropic's per-image cap). The image cap is enforced locally by
 `view_image` and by browser `@path` attachments, so an oversized image fails with a
-clear message naming both sizes instead of a provider 400. Remote hosts are
-spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
-which keeps every host in a session on the same limit.
+clear message naming both sizes instead of a provider 400. Worker startup uses the
+largest cap in the configured model catalog (`myco --mode host --max-image-base64-bytes`).
+Every tool call carries its session's selected model cap; workers enforce the smaller
+of that cap and their startup ceiling. Sessions with different models can share a
+worker, and switching models preserves live shells and editor read stamps. Tool
+descriptions quote the active limit in exact bytes.
+
+Provider input is checked again against the selected model, including older inline
+images and saved image sidecars. Sidecars are checked before reading and read under
+a byte bound. An image retained from a larger model may require compaction, resizing,
+or selecting that model again. Remote image URLs have no locally known payload size;
+the provider validates their content. The whole serialized request remains subject
+to `max_request_bytes`.
 
 `max_request_bytes` on `[gateways.NAME]` caps the **entire serialized JSON
 request body**, including the system prompt, tool schemas, conversation history,

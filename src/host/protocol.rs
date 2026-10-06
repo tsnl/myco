@@ -7,7 +7,7 @@
 use crate::core::ToolResource;
 use crate::generative_model::{ToolResult, ToolUse};
 
-pub const HOST_PROTOCOL_VERSION: u32 = 3;
+pub const HOST_PROTOCOL_VERSION: u32 = 4;
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -23,6 +23,9 @@ pub enum Request {
         id: String,
         /// Agent that owns this call (session ownership on the host).
         agent_id: uuid::Uuid,
+        /// Per-call cap; absent/null retains the worker startup ceiling.
+        /// Version 4 peers enforce the smaller of this cap and that ceiling.
+        max_image_base64_bytes: Option<u64>,
         tool_use: ToolUse,
     },
     /// Cancel an in-flight tool call. Fire-and-forget: the original
@@ -113,6 +116,7 @@ mod tests {
         let msg = Request::ToolCall {
             id: "1".into(),
             agent_id: uuid::Uuid::nil(),
+            max_image_base64_bytes: Some(1234),
             tool_use: ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo hi"}),
@@ -122,9 +126,15 @@ mod tests {
         assert!(line.contains(r#""type":"tool_call""#));
         let back = Request::decode(&line).unwrap();
         match back {
-            Request::ToolCall { id, tool_use, .. } => {
+            Request::ToolCall {
+                id,
+                tool_use,
+                max_image_base64_bytes,
+                ..
+            } => {
                 assert_eq!(id, "1");
                 assert_eq!(tool_use.name, "bash");
+                assert_eq!(max_image_base64_bytes, Some(1234));
             }
             other => panic!("unexpected {other:?}"),
         }

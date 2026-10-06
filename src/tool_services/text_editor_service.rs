@@ -581,6 +581,7 @@ mod tests {
                 agent_id: uuid::Uuid::nil(),
                 cancel: crate::core::CancelToken::new(),
                 background: crate::core::CancelToken::new(),
+                max_image_base64_bytes: None,
             },
         ))
     }

@@ -164,7 +164,10 @@ When tools fail or the user asks why something is broken, investigate with tools
    - On remote: `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` via the
      **local** host's bash. Compare that path and version with the expected install;
      connection requires matching package and host-protocol versions. A protocol
-     mismatch names the host to rebuild before tool calls can run.
+     mismatch names the host to rebuild before tool calls can run. Host protocol 4
+     carries each call's selected model image limit; version 3 workers must be rebuilt
+     before use, even when the package versions match. A missing call limit retains
+     the worker startup ceiling; no call can raise that ceiling.
      An interactive login may use a different PATH. If missing/outdated: install a
      **binary built for that platform** (matching release asset), or **build on that host**
      from source. Do not copy binaries across mismatched OS/arch/glibc.
