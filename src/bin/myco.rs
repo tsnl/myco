@@ -384,10 +384,13 @@ async fn boot_session<S: EventSink + 'static>(
         }),
         catalog_model.spec.auto_compact_at_tokens,
     );
-    runner.set_observer(Arc::new(|event| {
-        if let WorkflowEvent::Warning(message) = event {
-            session_warning(&message);
-        }
+    runner.set_observer(Arc::new(|event| match event {
+        WorkflowEvent::Warning(message) => session_warning(&message),
+        WorkflowEvent::Retrying { error, delay } => session_warning(&format!(
+            "auto-continue retrying in {:.1}s: {error}",
+            delay.as_secs_f64()
+        )),
+        _ => {}
     }));
 
     Ok((

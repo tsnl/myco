@@ -22,8 +22,8 @@
 //! See the [agent guide](https://tsnl.github.io/myco/developers/agents.html) and
 //! run `cargo run -p myco-agent --example headless` for an offline model/tool round.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::future;
 use myco_model::{
@@ -113,7 +113,8 @@ pub enum AgentEvent {
     },
     /// A validated response was installed in history and its configured
     /// checkpoint succeeded. Its tool calls have not executed yet. Emitted
-    /// only when a checkpoint callback is installed.
+    /// only when a checkpoint callback is installed, including when a later
+    /// checkpoint repairs an earlier save failure.
     GenerationCommitted {
         context: TraceContext,
     },
@@ -223,6 +224,8 @@ pub struct Agent {
     checkpoint: Option<Checkpoint>,
     before_generation_notice: Option<BeforeGenerationNotice>,
     checkpoint_failed: AtomicBool,
+    /// A failed save must not discard the validated response's commit notification.
+    pending_generation_commit: Mutex<Option<TraceContext>>,
 }
 
 impl Agent {
@@ -251,6 +254,7 @@ impl Agent {
             checkpoint: None,
             before_generation_notice: None,
             checkpoint_failed: AtomicBool::new(false),
+            pending_generation_commit: Mutex::new(None),
         }
     }
 
@@ -266,6 +270,9 @@ impl Agent {
 
     /// Install the durable effect checkpoint (see [`Checkpoint`]).
     pub fn set_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
+        if checkpoint.is_none() {
+            self.pending_generation_commit.get_mut().unwrap().take();
+        }
         self.checkpoint = checkpoint;
     }
 
@@ -280,7 +287,14 @@ impl Agent {
             .map_or(Ok(()), |checkpoint| checkpoint(&self.state));
         self.checkpoint_failed
             .store(result.is_err(), Ordering::Relaxed);
-        result.map_err(AgentInteractionError::Checkpoint)
+        result.map_err(AgentInteractionError::Checkpoint)?;
+        if self.checkpoint.is_some() {
+            let pending = self.pending_generation_commit.lock().unwrap().take();
+            if let Some(context) = pending {
+                self.sink.emit(AgentEvent::GenerationCommitted { context });
+            }
+        }
+        Ok(())
     }
 
     pub fn checkpoint_failed(&self) -> bool {
@@ -302,7 +316,9 @@ impl Agent {
         history: Vec<Message>,
         usage: Option<TokenUsage>,
     ) -> Result<(), StateError> {
-        self.state.replace_context(history, usage)
+        self.state.replace_context(history, usage)?;
+        self.pending_generation_commit.get_mut().unwrap().take();
+        Ok(())
     }
 
     pub fn state(&self) -> &AgentState {
@@ -335,6 +351,7 @@ impl Agent {
         index: usize,
     ) -> Result<Vec<Message>, AgentInteractionError> {
         let dropped = self.state.truncate_history(index)?;
+        self.pending_generation_commit.get_mut().unwrap().take();
         self.emit_checkpoint()?;
         Ok(dropped)
     }
@@ -414,7 +431,9 @@ impl Agent {
         history: Vec<Message>,
         usage: Option<TokenUsage>,
     ) -> Result<(), StateError> {
-        self.state.replace_at_boundary(history, usage)
+        self.state.replace_at_boundary(history, usage)?;
+        self.pending_generation_commit.get_mut().unwrap().take();
+        Ok(())
     }
 
     pub fn recover_interrupted(&mut self) -> Result<(), AgentInteractionError> {
@@ -434,17 +453,31 @@ impl Agent {
         &mut self,
         cancel: CancelToken,
     ) -> Result<Option<RunOutcome>, AgentInteractionError> {
-        let generated = matches!(self.state.effect(), Some(Effect::Generate { .. }));
-        let result = self.step_effect(cancel).await;
+        self.step_with_policy(cancel, self.retry_policy).await
+    }
+
+    /// Execute one effect with at most one provider attempt. A caller that owns
+    /// recovery timing can retry failed generation without nesting backoff loops.
+    /// Tool dispatch, cancellation, and checkpoint boundaries match [`Self::step`].
+    pub async fn step_once(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<Option<RunOutcome>, AgentInteractionError> {
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            ..self.retry_policy
+        };
+        self.step_with_policy(cancel, policy).await
+    }
+
+    async fn step_with_policy(
+        &mut self,
+        cancel: CancelToken,
+        policy: RetryPolicy,
+    ) -> Result<Option<RunOutcome>, AgentInteractionError> {
+        let result = self.step_effect(cancel, policy).await;
         let result = match self.emit_checkpoint() {
-            Ok(()) => {
-                if generated && result.is_ok() && self.checkpoint.is_some() {
-                    self.sink.emit(AgentEvent::GenerationCommitted {
-                        context: self.context.clone(),
-                    });
-                }
-                result
-            }
+            Ok(()) => result,
             Err(error) => Err(error),
         };
         if !matches!(result, Ok(None)) {
@@ -462,6 +495,7 @@ impl Agent {
     async fn step_effect(
         &mut self,
         cancel: CancelToken,
+        policy: RetryPolicy,
     ) -> Result<Option<RunOutcome>, AgentInteractionError> {
         self.emit_checkpoint()?;
         let effect = self
@@ -473,7 +507,7 @@ impl Agent {
                 self.state.begin_effect(operation)?;
                 let output = match async {
                     self.append_pending_notice(operation, &cancel).await?;
-                    generation::generate(self, cancel).await
+                    generation::generate(self, cancel, policy).await
                 }
                 .await
                 {
@@ -483,7 +517,11 @@ impl Agent {
                         return Err(error);
                     }
                 };
-                self.state.generated(operation, output)?
+                let next = self.state.generated(operation, output)?;
+                if self.checkpoint.is_some() {
+                    *self.pending_generation_commit.get_mut().unwrap() = Some(self.context.clone());
+                }
+                next
             }
             Effect::ExecuteTools { operation, calls } => {
                 self.state.begin_effect(operation)?;
@@ -588,7 +626,7 @@ pub enum AgentInteractionError {
     Cancelled,
     #[error("{0}")]
     State(StateError),
-    #[error("could not persist agent state; execution stopped: {0}")]
+    #[error("could not persist agent state: {0}")]
     Checkpoint(String),
     #[error("compaction failed: {0}")]
     Compaction(String),
@@ -623,6 +661,9 @@ impl AgentInteractionError {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1482,8 +1523,7 @@ mod tests {
         assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
     }
 
-    /// A tool_use stop with zero streamed tool uses must fail loud, not loop
-    /// generate forever on unchanged history or push empty ToolResults.
+    /// A tool_use stop with zero streamed tool uses is an invalid draft.
     #[tokio::test]
     async fn tool_use_stop_with_zero_tool_uses_errors_not_loops() {
         let tools = TestTools::new(vec![]);
@@ -1502,12 +1542,8 @@ mod tests {
         .await
         .expect_err("malformed turn should error");
         assert!(matches!(err, AgentInteractionError::GenerateError(_)));
-        // History stays well-formed: user + assistant, no ToolResults message.
-        assert_eq!(agent.history().len(), 2);
-        assert!(matches!(
-            agent.history()[1],
-            Message::AssistantMessage { .. }
-        ));
+        assert_eq!(agent.history().len(), 1);
+        assert!(matches!(agent.history()[0], Message::UserMessage { .. }));
     }
 
     /// A truncated call still needs a result before generation can continue,

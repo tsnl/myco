@@ -22,8 +22,12 @@ output caps. The agent disables it with `session_meta action=disable_auto_contin
 when finished or when it needs user input. The control works during a run: turning
 it off prevents further automatic follow-ups; **Stop** cancels the current run.
 The setting persists across compaction and restart, but enabling it or reopening
-a session does not start work. Provider and persistence errors still stop the run;
-provider retries are bounded. This mode has no spending or elapsed-time limit.
+a session does not start work. Generation, persistence, and automatic compaction
+errors retry after 1, 2, 4, then 5 seconds, remaining at 5 seconds until recovery.
+The latest error and wait appear in the transcript. Failed saves retain live state
+and retry before advancing, without repeating input or completed tools. Turning
+the control off or pressing **Stop** interrupts the wait. This mode has no retry
+count, spending, or elapsed-time limit.
 
 For remote access, start Myco on the remote host, then open an SSH tunnel from
 the computer running your browser:

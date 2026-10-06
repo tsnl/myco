@@ -76,10 +76,15 @@ impl MessageAccumulator {
         let tool_uses = filled_slots(self.tool_uses, "tool use")?
             .into_iter()
             .map(IncompleteToolUse::finish)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let turn_end_reason = self
             .turn_end_reason
             .ok_or_else(|| malformed("no turn end reason provided"))?;
+        if turn_end_reason == TurnEndReason::ToolUse && tool_uses.is_empty() {
+            return Err(malformed(
+                "turn ended in tool_use but streamed zero tool uses",
+            ));
+        }
         Ok(GenerateOutput {
             content,
             tool_uses,
@@ -277,6 +282,34 @@ mod tests {
                 ),
                 "{parts:?}"
             );
+        }
+    }
+
+    #[test]
+    fn tool_use_requires_a_call_but_empty_end_turn_is_valid() {
+        let output = assemble(&[
+            MessagePart::MessageStart,
+            MessagePart::TurnEndReason(TurnEndReason::EndTurn),
+        ])
+        .unwrap();
+        assert!(output.content.is_empty());
+        assert!(output.tool_uses.is_empty());
+        for content in [false, true] {
+            let mut parts = vec![MessagePart::MessageStart];
+            if content {
+                parts.extend([
+                    MessagePart::ContentStart(ContentStart::Text { index: 0 }),
+                    MessagePart::ContentDelta(ContentDelta::Text {
+                        index: 0,
+                        delta: "unfinished draft".into(),
+                    }),
+                ]);
+            }
+            parts.push(MessagePart::TurnEndReason(TurnEndReason::ToolUse));
+            assert!(matches!(
+                assemble(&parts),
+                Err(GenerateError::MalformedResponseError(_))
+            ));
         }
     }
 }

@@ -344,6 +344,60 @@ mod tests {
     }
 
     #[test]
+    fn automatic_retry_keeps_validated_output_for_checkpoint_repair_only() {
+        for validated in [false, true] {
+            let (app, _receiver) = super::super::tests::app();
+            let input = input();
+            app.accept_service(input.clone(), "session".into()).unwrap();
+            let context = TraceContext::root();
+            app.emit(AgentEvent::TextDelta {
+                text: "prior answer".into(),
+                context: context.clone(),
+            });
+            app.emit(AgentEvent::GenerationFinished {
+                context: context.clone(),
+            });
+            app.emit(AgentEvent::GenerationCommitted {
+                context: context.clone(),
+            });
+            app.emit(AgentEvent::GenerationStarted {
+                context: context.clone(),
+            });
+            app.emit(AgentEvent::TextDelta {
+                text: "pending answer".into(),
+                context: context.clone(),
+            });
+            if validated {
+                app.emit(AgentEvent::GenerationFinished {
+                    context: context.clone(),
+                });
+            }
+            app.retrying(
+                "checkpoint or stream failed".into(),
+                std::time::Duration::from_secs(1),
+            );
+            let pending = app
+                .service_output(input.instance, input.request_id, 0)
+                .unwrap();
+            assert_eq!(pending.output, "prior answer");
+            assert!(pending.exit_code.is_none());
+            assert_eq!(app.snapshot().change["snapshot"]["status"], "Retrying");
+            app.emit(AgentEvent::GenerationCommitted { context });
+            let output = app
+                .service_output(input.instance, input.request_id, 0)
+                .unwrap();
+            assert_eq!(
+                output.output,
+                if validated {
+                    "prior answerpending answer"
+                } else {
+                    "prior answer"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn expired_receipts_never_replay_and_cancelling_an_old_turn_leaves_current_work_running() {
         let (app, mut receiver) = super::super::tests::app();
         let old = input();

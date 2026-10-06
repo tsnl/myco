@@ -63,6 +63,15 @@ class Provider(http.server.BaseHTTPRequestHandler):
         fixture = self.server.fixture
         fixture.requests.append(body)
         fixture.request_received.set()
+        if hasattr(fixture, 'completion_replies'):
+            events = fixture.completion_replies.pop(0)
+            payload = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events) + 'data: [DONE]\n\n'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(payload.encode())))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+            return
         prompts = []
         resuming = False
         for item in body["input"]:
@@ -90,6 +99,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "Fixture model failure")
             return
         elif "autonomy" in prompt:
+            failures = getattr(fixture, 'autonomy_failures', [])
+            if count < len(failures):
+                self.send_error(failures[count], 'Fixture automatic-mode failure')
+                return
+            count -= len(failures)
             if count == 1:
                 events = tool({'action': 'disable_auto_continue'}, 'session_meta')
             else:
@@ -2768,6 +2782,123 @@ context_window = 100000
         (self.home / 'Alpha-release').touch()
         expect(page.locator('#connection')).to_have_text('Ready')
         self.assertEqual(len(self.requests), 2)
+
+    def saved_session(self, page):
+        session_id = page.url.rsplit('/', 1)[1]
+        path = self.home / 'profiles/default/session' / session_id[:2] / f'{session_id}.json'
+        return json.loads(path.read_text())
+
+    def test_auto_continue_retries_transient_and_terminal_errors_without_reaccepting_input(self):
+        self.autonomy_failures = [503, 400]
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        self.submit(page, 'Alpha autonomy')
+        expect(page.locator('#connection')).to_have_text('Retrying')
+        expect(page.locator('#connection')).to_have_attribute('data-busy', 'true')
+        expect(page.locator('.notice').last).to_contain_text('auto-continue retrying in 1.0s')
+        expect(page.locator('.notice').last).to_contain_text('Fixture automatic-mode failure')
+        times = self.saved_session(page)['threads'][-1]['user_turn_timestamps']
+        self.assertEqual(len(times), 1)
+        expect(page.locator('.assistant .body').last).to_have_text('Task complete.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        self.assertEqual(len(self.requests), 5)
+        self.assertEqual(self.requests[0]['input'], self.requests[1]['input'])
+        self.assertEqual(self.requests[1]['input'], self.requests[2]['input'])
+        self.assertEqual(self.saved_session(page)['threads'][-1]['user_turn_timestamps'], times)
+        page.reload()
+        expect(page.locator('.user .body')).to_have_text('Alpha autonomy')
+        self.assertEqual(self.saved_session(page)['threads'][-1]['user_turn_timestamps'], times)
+
+    def stop_automatic_retry(self, control):
+        self.autonomy_failures = [400] * 20
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        self.submit(page, 'Alpha autonomy')
+        expect(page.locator('#connection')).to_have_text('Retrying')
+        times = self.saved_session(page)['threads'][-1]['user_turn_timestamps']
+        page.click(control)
+        expect(page.locator('#connection')).to_have_text('Stopped')
+        expect(page.locator('#connection')).to_have_attribute('data-busy', 'false')
+        attempts = len(self.requests)
+        # Outwait the longest automatic retry to detect an orphaned retry task.
+        page.wait_for_timeout(5200)
+        self.assertEqual(len(self.requests), attempts)
+        self.assertEqual(self.saved_session(page)['threads'][-1]['user_turn_timestamps'], times)
+        expect(page.locator('.user .body')).to_have_text('Alpha autonomy')
+        return page
+
+    def test_auto_continue_can_be_disabled_during_error_retry(self):
+        page = self.stop_automatic_retry('#auto-continue')
+        page.reload()
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        self.assertFalse(self.saved_session(page).get('auto_continue', False))
+
+    def test_auto_continue_rejects_empty_tool_turns_before_accepting_their_drafts(self):
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text().replace('openai-responses', 'openai-completions'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        malformed = [{'choices': [{'delta': {'content': 'Abandoned invalid tool turn'},
+                                    'finish_reason': 'tool_calls'}]}]
+        disable = [{'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'disable',
+                    'type': 'function', 'function': {'name': 'session_meta',
+                    'arguments': '{"action":"disable_auto_continue"}'}}]}, 'finish_reason': 'tool_calls'}]}]
+        answer = [{'choices': [{'delta': {'content': 'Valid recovery.'}, 'finish_reason': 'stop'}]}]
+        self.completion_replies = [malformed, malformed, disable, answer]
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        self.submit(page, 'Finish the task')
+        expect(page.locator('#connection')).to_have_text('Retrying')
+        expect(page.locator('#transcript')).not_to_contain_text('Abandoned invalid tool turn')
+        times = self.saved_session(page)['threads'][-1]['user_turn_timestamps']
+        expect(page.locator('.assistant .body')).to_have_text('Valid recovery.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('.tool')).to_have_count(1)
+        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(self.requests[0]['messages'], self.requests[1]['messages'])
+        self.assertEqual(self.requests[1]['messages'], self.requests[2]['messages'])
+        self.assertNotIn('Abandoned invalid tool turn', json.dumps(self.requests[-1]['messages']))
+        saved = self.saved_session(page)
+        self.assertNotIn('Abandoned invalid tool turn', json.dumps(saved))
+        self.assertEqual(saved['threads'][-1]['user_turn_timestamps'], times)
+        page.reload()
+        expect(page.locator('.assistant .body')).to_have_text('Valid recovery.')
+        expect(page.locator('.user .body')).to_have_text('Finish the task')
+
+    def test_auto_continue_error_retry_can_be_cancelled(self):
+        self.stop_automatic_retry('#cancel')
+
+    def test_auto_continue_stream_retry_discards_drafts_and_keeps_completed_tools(self):
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        self.stream_interruption_release = threading.Event()
+        self.addCleanup(self.stream_interruption_release.set)
+        self.event_gates = {0: threading.Event()}
+        self.addCleanup(self.event_gates[0].set)
+        self.stream_interruptions = [reply('Abandoned automatic answer')]
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.assistant .body')).to_have_text('Abandoned automatic answer')
+        other = self.context.new_page()
+        other.goto(page.url)
+        expect(other.locator('.assistant .body')).to_have_text('Abandoned automatic answer')
+        self.stream_interruption_release.set()
+        for tab in [page, other]:
+            expect(tab.locator('#connection')).to_have_text('Retrying')
+            expect(tab.locator('#transcript')).not_to_contain_text('Abandoned automatic answer')
+            expect(tab.locator('.tool')).to_have_count(1)
+        expect(page.locator('#connection')).to_have_text('Running')
+        page.click('#auto-continue')
+        self.event_gates[0].set()
+        for tab in [page, other]:
+            expect(tab.locator('#connection')).to_have_text('Ready')
+            expect(tab.locator('.assistant .body')).to_have_text('Alpha finished.')
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.requests[1]['input'], self.requests[2]['input'])
+        self.assertEqual((self.home / 'Alpha-done').read_text(), 'done')
+        self.assertEqual(len(self.saved_session(page)['threads'][-1]['user_turn_timestamps']), 1)
 
     def test_rename_session_updates_tabs_and_listing_without_interrupting_work(self):
         page = self.session(self.page)
