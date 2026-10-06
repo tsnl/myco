@@ -3,6 +3,7 @@
 
 mod case;
 mod metrics;
+mod provenance;
 mod run;
 
 pub use case::{

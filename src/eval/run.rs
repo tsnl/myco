@@ -53,6 +53,7 @@ struct Job {
     prelude: String,
     output: PathBuf,
     timeout_secs: u64,
+    grader_timeout_secs: u64,
     max_requests: u64,
     free_only: bool,
     effort: Effort,
@@ -123,7 +124,7 @@ fn enforce_free(model: &CatalogModel) -> Result<(), String> {
     Ok(())
 }
 
-fn model_hash(model: &CatalogModel) -> String {
+fn model_hash(model: &CatalogModel, config: &Config) -> String {
     let mut backend = model.backend.clone();
     match &mut backend {
         BackendConfig::Anthropic(c) => {
@@ -135,7 +136,15 @@ fn model_hash(model: &CatalogModel) -> String {
             c.debug_dump_api_requests = false;
         }
     }
-    sha256(format!("{:?}|{:?}", model.spec, backend).as_bytes())
+    sha256(
+        format!(
+            "{:?}|{:?}|{}",
+            model.spec,
+            backend,
+            super::provenance::runtime_settings(config)
+        )
+        .as_bytes(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -275,11 +284,11 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
         }
         let case_hash = tree_hash(&case_path)?;
         for model_key in &options.models {
-            let (_, model) = config(&options.config, model_key)?;
+            let (config, model) = config(&options.config, model_key)?;
             if options.free_only {
                 enforce_free(&model)?;
             }
-            let model_hash = model_hash(&model);
+            let model_hash = model_hash(&model, &config);
             for repetition in 0..options.repeat {
                 let fingerprint = sha256(
                     format!(
@@ -303,6 +312,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
                     prelude: prelude.clone(),
                     output,
                     timeout_secs: options.timeout_secs,
+                    grader_timeout_secs: options.grader_timeout_secs,
                     max_requests: options.max_requests,
                     free_only: options.free_only,
                     effort: options.effort,
@@ -329,7 +339,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
         return Err("another eval runner owns this output directory".into());
     }
     let results: Vec<_> = stream::iter(jobs)
-        .map(|job| run_one(job, options.grader_timeout_secs))
+        .map(run_one)
         .buffer_unordered(options.jobs)
         .collect()
         .await;
@@ -339,7 +349,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
     report(&options.output, None)
 }
 
-async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
+async fn run_one(job: Job) -> Result<(), String> {
     if !job.output.join("result.json").exists()
         && let Ok(pid) = std::fs::read_to_string(job.output.join("worker.pid"))
         && let Ok(pid) = pid.trim().parse::<i32>()
@@ -351,7 +361,7 @@ async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
             job.output.display()
         ));
     }
-    if let Err(error) = run_one_inner(job.clone(), grader_timeout).await {
+    if let Err(error) = run_one_inner(job.clone()).await {
         if job.output.join("result.json").exists() {
             return Err(error);
         }
@@ -381,7 +391,7 @@ async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> {
+async fn run_one_inner(mut job: Job) -> Result<(), String> {
     let result_path = job.output.join("result.json");
     if result_path.exists() {
         let result: ResultRecord = read_json(&result_path)?;
@@ -522,7 +532,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
             .spawn()
             .map_err(|error| format!("start grader: {error}"))?;
         let grade_status =
-            tokio::time::timeout(Duration::from_secs(grader_timeout), child.wait()).await;
+            tokio::time::timeout(Duration::from_secs(job.grader_timeout_secs), child.wait()).await;
         if grade_status.is_err() {
             if let Some(pid) = child.id() {
                 unsafe {
@@ -597,7 +607,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     if job.free_only {
         enforce_free(&catalog)?;
     }
-    if model_hash(&catalog) != job.model_hash {
+    if model_hash(&catalog, &config) != job.model_hash {
         return Err("model configuration changed after planning the run".into());
     }
     let home = crate::core::myco_home()?;
@@ -650,10 +660,44 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         }
     }
     let (epilogue, prelude) = crate::prompts::agent_prompt_epilogue();
-    let model = generative_model::new(GenerativeModelConfig {
-        model: catalog.spec.clone(), tools: harness.tool_specs(), backend_config: catalog.backend.clone(),
-        system_prompt: format!("You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.", epilogue, crate::prompts::model_stamp(&job.model), crate::prompts::auto_compact_notice(catalog.spec.auto_compact_at_tokens, catalog.spec.context_window_tokens), job.output.join("workspace").display()),
-    }).map_err(|error| error.to_string())?;
+    let model_config = GenerativeModelConfig {
+        model: catalog.spec.clone(),
+        tools: harness.tool_specs(),
+        backend_config: catalog.backend.clone(),
+        system_prompt: format!(
+            "You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.",
+            epilogue,
+            crate::prompts::model_stamp(&job.model),
+            crate::prompts::auto_compact_notice(
+                catalog.spec.auto_compact_at_tokens,
+                catalog.spec.context_window_tokens
+            ),
+            job.output.join("workspace").display()
+        ),
+    };
+    write_json(
+        &job.output.join("provenance.json"),
+        &serde_json::json!({
+            "version": 1,
+            "created_at": chrono::Utc::now(),
+            "myco_version": crate::manual::VERSION,
+            "myco_commit": crate::manual::GIT_COMMIT,
+            "fingerprint": job.fingerprint,
+            "case_hash": job.case_hash,
+            "model_hash": job.model_hash,
+            "environment": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+            "configuration": super::provenance::configuration(&config, &model_config),
+            "limits": {
+                "max_requests": job.max_requests, "timeout_secs": job.timeout_secs,
+                "grader_timeout_secs": job.grader_timeout_secs, "free_only": job.free_only,
+            },
+            "artifacts": {
+                "case": "case", "workspace": "workspace", "trace": "events.jsonl",
+                "agent": "agent.json", "result": "result.json", "sessions": "home/profiles/eval/session",
+            },
+        }),
+    )?;
+    let model = generative_model::new(model_config).map_err(|error| error.to_string())?;
     let recorder = Recorder::new(
         job.max_requests,
         std::fs::File::create(job.output.join("events.jsonl"))
@@ -684,7 +728,13 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     );
     let observer = recorder.clone();
     runner.set_observer(Arc::new(move |event| match event {
-        WorkflowEvent::Compacted(_) => observer.metrics.lock().unwrap().compactions += 1,
+        WorkflowEvent::Compacting { session_id, thread_id, automatic } => {
+            observer.event(serde_json::json!({"event":"compaction_started", "session_id":session_id, "thread_id":thread_id, "automatic":automatic}));
+        }
+        WorkflowEvent::Compacted(_) => {
+            observer.metrics.lock().unwrap().compactions += 1;
+            observer.event(serde_json::json!({"event":"compaction_finished"}));
+        }
         WorkflowEvent::Warning(message) => {
             observer.event(serde_json::json!({"event":"warning", "message":message}))
         }
@@ -743,6 +793,8 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         elapsed_ms: started.elapsed().as_millis(),
         metrics,
     };
+    recorder.event(serde_json::json!({"event":"run_finished", "status":result.status}));
+    recorder.check_trace()?;
     write_json(&job.output.join("agent.json"), &result)
 }
 

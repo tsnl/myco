@@ -72,9 +72,10 @@ impl Fixture {
             "test".into(),
             "--output".into(),
             self.path("runs"),
-            "--timeout-secs".into(),
-            "5".into(),
         ];
+        if !extra.contains(&"--timeout-secs") {
+            args.extend(["--timeout-secs".into(), "5".into()]);
+        }
         args.extend(extra.iter().map(|value| (*value).into()));
         self.cli(args).await
     }
@@ -87,6 +88,20 @@ impl Fixture {
             }
         }
         results
+    }
+    fn run_path(&self) -> PathBuf {
+        std::fs::read_dir(self.root.join("runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("result.json").is_file())
+            .unwrap()
+    }
+    fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.run_path().join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 }
 impl Drop for Fixture {
@@ -192,6 +207,176 @@ async fn model_aliases_get_distinct_runs_and_effort_changes_do_not_reuse_scores(
     assert_eq!(changed["groups"].as_array().unwrap().len(), 4);
     assert_eq!(fixture.results().len(), 4);
     assert_eq!(server.connections(), 4);
+}
+
+#[tokio::test]
+async fn runtime_policy_changes_invalidate_cached_results_and_record_effective_settings() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let server = StubHttpServer::sequence(vec![answer(10, 1); 3]).await;
+    fixture.configure(&server);
+    let path = fixture.root.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap().replace(
+        "auth = { source = \"none\" }",
+        "auth = \"fixture-auth-secret\"",
+    );
+    for settings in [
+        "",
+        "compaction_max_requests = 2\n",
+        "compaction_max_requests = 2\nmax_prelude_bytes = 10000\n",
+    ] {
+        std::fs::write(&path, format!("{settings}{original}")).unwrap();
+        report(&fixture.run(&[]).await);
+    }
+    assert_eq!(fixture.results().len(), 3);
+    assert_eq!(server.connections(), 3);
+    report(&fixture.run(&[]).await);
+    assert_eq!(server.connections(), 3);
+    let provenance = std::fs::read_to_string(fixture.run_path().join("provenance.json")).unwrap();
+    assert!(!provenance.contains("fixture-auth-secret"));
+    let provenance: Value = serde_json::from_str(&provenance).unwrap();
+    assert_eq!(provenance["version"], 1);
+    assert_eq!(provenance["configuration"]["backend"]["effort"], "high");
+    assert_eq!(
+        provenance["configuration"]["model"]["context_window_tokens"],
+        100000
+    );
+    assert!(provenance["configuration"]["runtime"]["compaction_max_requests"].is_u64());
+    assert!(
+        provenance["configuration"]["system_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("current task workspace")
+    );
+    assert!(
+        provenance["configuration"]["tools"]
+            .as_array()
+            .unwrap()
+            .len()
+            > 1
+    );
+    assert_eq!(provenance["artifacts"]["trace"], "events.jsonl");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(provenance["created_at"].as_str().unwrap()).is_ok()
+    );
+}
+
+#[tokio::test]
+async fn transient_and_broken_stream_recovery_retains_attempts_without_replaying_tools() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let partial = json!({"type":"response.output_text.delta", "output_index":0, "content_index":0, "delta":"Abandoned draft"});
+    let body = format!("data: {partial}\n\n");
+    let broken = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len() + 100).into_bytes();
+    let server = StubHttpServer::sequence(vec![
+        tool(
+            "printf done > result.txt; printf once >> effects.txt",
+            100,
+            5,
+        ),
+        StubHttpServer::status_response(503, r#"{"error":{"message":"fixture outage"}}"#),
+        broken,
+        answer(70, 7),
+    ])
+    .await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    std::fs::write(
+        &config,
+        std::fs::read_to_string(&config).unwrap().replace(
+            "max_attempts = 1",
+            "max_attempts = 3\ninitial_backoff_ms = 1",
+        ),
+    )
+    .unwrap();
+    let result = report(&fixture.run(&[]).await);
+    assert_eq!(
+        result["groups"][0]["success_rate"],
+        1.0,
+        "{:?}",
+        fixture.results()
+    );
+    assert_eq!(result["groups"][0]["requests"], 4);
+    assert_eq!(result["groups"][0]["requests_without_usage"], 2);
+    assert_eq!(server.connections(), 4);
+    assert_eq!(
+        std::fs::read_to_string(fixture.run_path().join("workspace/effects.txt")).unwrap(),
+        "once"
+    );
+    assert_eq!(fixture.results()[0]["agent"]["answer"], "Done.");
+    let events = fixture.events();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["version"], 1);
+        assert_eq!(event["sequence"], index + 1);
+        assert!(chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap()).is_ok());
+    }
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0]["elapsed_ms"].as_u64() <= pair[1]["elapsed_ms"].as_u64())
+    );
+    let requests: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "request_finished")
+        .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|event| event["outcome"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["finished", "failed", "failed", "finished"]
+    );
+    for (index, event) in requests.iter().enumerate() {
+        assert_eq!(event["request_id"], index + 1);
+    }
+    let started = events
+        .iter()
+        .find(|event| event["event"] == "tool_started")
+        .unwrap();
+    let finished = events
+        .iter()
+        .find(|event| event["event"] == "tool_finished")
+        .unwrap();
+    assert_eq!(started["call_id"], finished["call_id"]);
+    assert!(started["call_id"].is_string());
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "generation_failed")
+        .collect();
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().all(|event| event["retry_in_ms"].is_u64()));
+}
+
+#[tokio::test]
+async fn deadline_cancels_retry_backoff_without_starting_another_request() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":{"message":"fixture outage"}}"#),
+        answer(70, 7),
+    ])
+    .await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    std::fs::write(
+        &config,
+        std::fs::read_to_string(&config).unwrap().replace(
+            "max_attempts = 1",
+            "max_attempts = 3\ninitial_backoff_ms = 30000",
+        ),
+    )
+    .unwrap();
+    report(&fixture.run(&["--timeout-secs", "1"]).await);
+    assert_eq!(fixture.results()[0]["status"], "timeout");
+    assert_eq!(server.connections(), 1);
+    let events = fixture.events();
+    let failure = events
+        .iter()
+        .find(|event| event["event"] == "generation_failed")
+        .unwrap();
+    assert_eq!(failure["retry_in_ms"], 30000);
+    assert_eq!(events.last().unwrap()["event"], "run_finished");
+    assert_eq!(events.last().unwrap()["status"], "timeout");
 }
 
 #[tokio::test]

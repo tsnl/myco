@@ -24,6 +24,19 @@ infrastructure failure. They retain request/token counts, tool observations,
 latency, and cost estimates. Repetitions and held-out tasks help measure whether
 a model reliably completes your work.
 
+Run artifacts include versioned `provenance.json` with effective settings and
+the main-agent prompt, plus timestamped `events.jsonl` with request/tool identity
+and failed or abandoned attempts. Authentication values are excluded from the
+configuration snapshot. The [task eval manual](../manual/evals.md) documents
+artifact portability, event fields, and fingerprint reuse.
+
+`cargo test --locked --offline --test evals` exercises the executable against
+local scripted providers: isolated fixtures, cache invalidation after policy
+changes, grader failures, request limits, broken streams, transient recovery
+without repeating completed tool effects, and deadline cancellation during
+backoff. These exact runtime checks need no model credentials; they do not
+measure real-model completion across repeated compactions.
+
 The optional GEPA adapter optimizes the prelude using bounded Myco task and
 reflection runs. It separates train/validation/test cases and defaults to
 explicit free OpenRouter models. It requires no additional dependency in the

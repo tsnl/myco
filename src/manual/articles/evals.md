@@ -95,11 +95,33 @@ are read from the named config/auth sources and are not copied into artifacts.
 Do not put credentials in gateway URLs. Full traces can still contain private
 work data or secrets encountered by the evaluated task.
 
+`provenance.json` records format version 1, build revision, creation time, task
+and model fingerprints, OS/architecture, effective model/runtime settings, limits,
+the initial main-agent system prompt, and tool schemas. Its artifact paths are
+relative to the run directory so inspection survives moving the bundle. Backend
+settings use an explicit allowlist excluding authentication; endpoint user info,
+query strings, and fragments are removed. Prompts and tool content are retained
+as task evidence, so review them before sharing. A moved Git workspace can still
+depend on its source repository's object store; the bundle is inspection evidence,
+not a self-contained executable environment.
+
+Each new trace line has `version: 1`, a one-based `sequence`, UTC `timestamp`,
+and monotonic `elapsed_ms`. `request_started` and `request_finished` share a
+`request_id`; completions distinguish `finished`, `failed`, and `abandoned`
+streams. A finished stream is not itself proof of valid model output:
+`generation_accepted` records validation by the main agent. Retry failures include
+attempt counts and `retry_in_ms`; tool starts/finishes share a `call_id`.
+Compaction boundaries and the final run status are recorded too. The session
+store retains tool content and accepted conversation history. A trace write
+failure is an evaluator error, even if the task produced a useful artifact.
+
 Re-running the same command reuses finished results whose case, model, prelude,
 limits, repetition, and Myco build fingerprints match. Interrupted attempts are
 retained and retried in fresh workspaces; a still-running worker prevents reuse.
 Use a new output directory for fresh stochastic samples. Model aliases and
 external services can change independently of these local fingerprints.
+Runtime policy such as `max_prelude_bytes` and `compaction_max_requests` is part
+of the configuration fingerprint; changing either produces a fresh run.
 
 Reports separate cohorts with different tasks/settings and group by model,
 prelude, and split. Success means a normally completed run with score 1. The
