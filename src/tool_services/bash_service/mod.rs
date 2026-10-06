@@ -133,6 +133,10 @@ impl BashService {
                 `status: exited` means that process exited and both output streams closed. \
                 Descendants may keep output open; use `read` for later output or `close` \
                 to stop the process group.\n\n\
+                **Terminal:** sessions use pipes, with no TTY or job control. Prefer \
+                `host=<alias>` with a plain shell (`command: \"bash\"` or `\"bash -l\"`) \
+                for long-lived remote work. Check whether a program supports noninteractive \
+                operation before using raw `ssh -tt`; many programs work without a terminal.\n\n\
                 **Working directory:** use `cd /path && command` in `exec` / `start`. \
                 A directory change in an exec call affects only that call; a live shell \
                 session keeps directory changes made through `write`.",
@@ -178,15 +182,7 @@ impl ToolService for BashService {
                 Ok(a) => a,
                 Err(e) => return generative_model::ToolResult::err(e),
             };
-            let nudge = action.command().and_then(command_nudge);
-            // Owner is the agent that issued this tool call (root or subagent).
-            let mut result = self.execute(action, ctx).await;
-            if let Some(text) = nudge {
-                result.content.push(generative_model::Content::Text {
-                    text: format!("\nNudge: {text}\n"),
-                });
-            }
-            result
+            self.execute(action, ctx).await
         })
     }
 
@@ -1729,36 +1725,6 @@ enum Action {
         session_id: String,
     },
     List,
-}
-
-impl Action {
-    fn command(&self) -> Option<&str> {
-        match self {
-            Action::Exec { command, .. } => Some(command),
-            Action::Start { command, .. } => command.as_deref(),
-            _ => None,
-        }
-    }
-}
-
-/// Guidance attached to a completed command that bypasses a first-class bash
-/// field. The command still runs; its result teaches the next call.
-fn command_nudge(command: &str) -> Option<&'static str> {
-    if command_starts_with_word(command, "ssh") {
-        Some(
-            "for a configured myco host, pass its alias as bash's `host` field instead of \
-             invoking `ssh`; direct SSH is for setup, diagnosis, or unconfigured machines.",
-        )
-    } else {
-        None
-    }
-}
-
-fn command_starts_with_word(command: &str, word: &str) -> bool {
-    let Some(rest) = command.trim_start().strip_prefix(word) else {
-        return false;
-    };
-    rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace()
 }
 
 /// Message for a `bash` tool use whose input object carries nothing at all.

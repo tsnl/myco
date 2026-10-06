@@ -413,26 +413,6 @@ fn accepts_command_starting_with_cd() {
     }
 }
 
-#[test]
-fn command_nudges_match_only_leading_ssh_words() {
-    assert!(command_nudge("cd /tmp && pwd").is_none());
-    assert!(command_nudge("  cd\t/tmp").is_none());
-    assert!(command_nudge("ssh devbox uname -a").is_some());
-    assert!(command_nudge("ssh").is_some());
-    for command in ["cdo thing", "ssh-add -l", "echo ssh devbox", "pwd"] {
-        assert!(command_nudge(command).is_none(), "command={command:?}");
-    }
-}
-
-#[tokio::test]
-async fn direct_ssh_runs_and_returns_a_host_routing_nudge() {
-    let result = dispatch_json(harness(), json!({"command": "ssh -V"})).await;
-    assert!(!result.is_error, "{result:?}");
-    let text = result_text(&result);
-    assert!(text.contains("OpenSSH"), "{text}");
-    assert!(text.contains("Nudge:") && text.contains("`host`"), "{text}");
-}
-
 /// Shared timeout-resolution contract for one action shape: the default
 /// applies when omitted, an explicit under-ceiling value is preserved, and a
 /// value above the safety ceiling is rejected (not clamped).

@@ -260,3 +260,219 @@ async fn remote_inventory_preserves_lazy_connections_and_partitions_resources_by
         .await;
     assert!(client.resources(owner).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_lost_tool_reply_preserves_other_remote_shells_when_health_check_succeeds() {
+    // Suppress only the second tool result, as if its response was lost. Keep
+    // forwarding inventory and later replies from a real host worker.
+    let script = r#""$1" --mode host | while IFS= read -r line; do
+        case "$line" in
+            *'"type":"tool_result","id":"2"'*) ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done"#;
+    let client = HostController::new(
+        HostConfig {
+            name: "lossy".into(),
+            command: vec![
+                "bash".into(),
+                "-c".into(),
+                script.into(),
+                "proxy".into(),
+                env!("CARGO_BIN_EXE_myco").into(),
+            ],
+        },
+        myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+    );
+    let owner = uuid::Uuid::new_v4();
+    let start = client.call(owner, ToolUse { name: "bash".into(), input: json!({
+        "action":"start", "session_id":"keep", "command":"bash", "stdin":"saved=still-here\n", "idle_ms":10, "timeout_ms":100,
+    }) }, CancelToken::new()).await;
+    assert!(!start.is_error, "{start:?}");
+    let lost = client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input: json!({
+                    "command":"true", "timeout_ms":1,
+                }),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(lost.is_error, "{lost:?}");
+    assert!(
+        tool_text(&lost).contains("connection and other sessions preserved"),
+        "{lost:?}"
+    );
+    let read = client.call(owner, ToolUse { name: "bash".into(), input: json!({
+        "action":"write", "session_id":"keep", "stdin":"printf '%s\\n' \"$saved\"\n", "idle_ms":10, "timeout_ms":1000,
+    }) }, CancelToken::new()).await;
+    assert!(!read.is_error, "{read:?}");
+    assert!(tool_text(&read).contains("still-here"), "{read:?}");
+}
+
+fn quickly_reaped_host() -> Arc<HostController> {
+    HostController::with_timeouts(
+        HostConfig {
+            name: "idle".into(),
+            command: vec![
+                env!("CARGO_BIN_EXE_myco").into(),
+                "--mode".into(),
+                "host".into(),
+            ],
+        },
+        10,
+        1,
+        myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+    )
+}
+
+async fn remote_json(
+    client: &HostController,
+    owner: uuid::Uuid,
+    input: serde_json::Value,
+) -> myco::generative_model::ToolResult {
+    client
+        .call(
+            owner,
+            ToolUse {
+                name: "bash".into(),
+                input,
+            },
+            CancelToken::new(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn idle_workers_reap_despite_inventory_polling_and_reconnect_lazily() {
+    let client = quickly_reaped_host();
+    let owner = uuid::Uuid::new_v4();
+    let result = remote_json(&client, owner, json!({"command":"echo first"})).await;
+    assert!(!result.is_error, "{result:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.is_connected() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle worker survived inventory polls"
+        );
+        let _ = client.resources(owner).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let idle = client.resources(owner).await.unwrap_err();
+    assert!(idle.contains("connects on first tool use"), "{idle}");
+    assert!(!client.is_connected(), "inventory must not reconnect");
+    let result = remote_json(&client, owner, json!({"command":"echo reconnected"})).await;
+    assert!(!result.is_error, "{result:?}");
+    assert!(tool_text(&result).contains("reconnected"), "{result:?}");
+}
+
+#[tokio::test]
+async fn retained_shells_and_unread_output_pin_workers_until_explicit_close() {
+    let client = quickly_reaped_host();
+    let owner = uuid::Uuid::new_v4();
+    let start = remote_json(&client, owner, json!({
+        "action":"start", "session_id":"keep", "command":"bash", "stdin":"saved=preserved\n", "idle_ms":10, "timeout_ms":100,
+    })).await;
+    assert!(!start.is_error, "{start:?}");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let read = remote_json(&client, owner, json!({
+        "action":"write", "session_id":"keep", "stdin":"printf '%s\\n' \"$saved\"; exit\n", "idle_ms":10, "timeout_ms":1000,
+    })).await;
+    assert!(!read.is_error, "{read:?}");
+    assert!(tool_text(&read).contains("preserved"), "{read:?}");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        client.is_connected(),
+        "exited but retained handles also pin the worker"
+    );
+    let close = remote_json(
+        &client,
+        owner,
+        json!({"action":"close", "session_id":"keep"}),
+    )
+    .await;
+    assert!(!close.is_error, "{close:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.is_connected() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker was not released after close"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn in_flight_calls_pin_workers_even_when_the_caller_drops_its_waiter() {
+    let client = quickly_reaped_host();
+    let owner = uuid::Uuid::new_v4();
+    let marker = std::env::temp_dir().join(format!("myco-idle-{}", uuid::Uuid::new_v4()));
+    let input =
+        json!({"command":format!("sleep 3; touch '{}'", marker.display()), "timeout_ms":5000});
+    tokio::select! {
+        result = remote_json(&client, owner, input) => panic!("slow call completed early: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+    }
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(
+        client.is_connected(),
+        "dropping a waiter must not reap its active effect"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "active effect was killed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    std::fs::remove_file(marker).unwrap();
+}
+
+#[tokio::test]
+async fn editor_read_fingerprints_expire_with_idle_workers_and_require_a_fresh_read() {
+    let client = quickly_reaped_host();
+    let owner = uuid::Uuid::new_v4();
+    let path = std::env::temp_dir().join(format!("myco-idle-editor-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, "before\n").unwrap();
+    let view = client
+        .call(
+            owner,
+            ToolUse {
+                name: "str_replace_based_edit_tool".into(),
+                input: json!({
+                    "command":"view", "path":path,
+                }),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(!view.is_error, "{view:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.is_connected() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "read fingerprints pinned idle worker"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let edit = client
+        .call(
+            owner,
+            ToolUse {
+                name: "str_replace_based_edit_tool".into(),
+                input: json!({
+                    "command":"str_replace", "path":path, "old_str":"before", "new_str":"after",
+                }),
+            },
+            CancelToken::new(),
+        )
+        .await;
+    assert!(edit.is_error, "{edit:?}");
+    assert!(tool_text(&edit).contains("was not read"), "{edit:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+    std::fs::remove_file(path).unwrap();
+}
