@@ -111,6 +111,12 @@ pub enum AgentEvent {
     GenerationFinished {
         context: TraceContext,
     },
+    /// A validated response was installed in history and its configured
+    /// checkpoint succeeded. Its tool calls have not executed yet. Emitted
+    /// only when a checkpoint callback is installed.
+    GenerationCommitted {
+        context: TraceContext,
+    },
     Failure {
         failure: GenerationFailure,
         attempt: u32,
@@ -148,8 +154,9 @@ pub enum AgentEvent {
 /// Consumer of [`AgentEvent`]s (CLI, TUI, metrics, …).
 pub trait EventSink: Send + Sync {
     /// Observe an event synchronously. Avoid blocking the execution task.
-    /// Deltas are provisional until `GenerationFinished`. On a retrying failure,
-    /// discard or clearly separate that draft before displaying the next attempt.
+    /// `GenerationFinished` validates a draft; `GenerationCommitted` also confirms
+    /// its history checkpoint. On a retrying failure, discard or clearly separate
+    /// that draft before displaying the next attempt.
     fn emit(&self, event: AgentEvent);
 }
 
@@ -427,9 +434,17 @@ impl Agent {
         &mut self,
         cancel: CancelToken,
     ) -> Result<Option<RunOutcome>, AgentInteractionError> {
+        let generated = matches!(self.state.effect(), Some(Effect::Generate { .. }));
         let result = self.step_effect(cancel).await;
         let result = match self.emit_checkpoint() {
-            Ok(()) => result,
+            Ok(()) => {
+                if generated && result.is_ok() && self.checkpoint.is_some() {
+                    self.sink.emit(AgentEvent::GenerationCommitted {
+                        context: self.context.clone(),
+                    });
+                }
+                result
+            }
             Err(error) => Err(error),
         };
         if !matches!(result, Ok(None)) {
@@ -627,6 +642,61 @@ mod tests {
 
     #[derive(Default)]
     struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    #[tokio::test]
+    async fn generation_commit_events_require_a_successful_history_checkpoint() {
+        for fails in [false, true] {
+            let model = ScriptedModel::new(vec![GenerateOutput {
+                content: vec![Content::Text {
+                    text: "answer".into(),
+                }],
+                tool_uses: vec![],
+                usage: None,
+                turn_end_reason: TurnEndReason::EndTurn,
+            }]);
+            let events = Arc::new(EventLog::default());
+            let mut agent = Agent::new(model, TestTools::new(vec![]), events.clone());
+            agent.append_input(user("task")).unwrap();
+            agent.set_checkpoint(Some(Box::new(move |state| {
+                if fails
+                    && state
+                        .history()
+                        .iter()
+                        .any(|message| matches!(message, Message::AssistantMessage { .. }))
+                {
+                    Err("disk full".into())
+                } else {
+                    Ok(())
+                }
+            })));
+            agent.start_run().unwrap();
+            let result = agent.step(CancelToken::new()).await;
+            assert_eq!(result.is_ok(), !fails);
+            let events = events.0.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GenerationFinished { .. }))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GenerationCommitted { .. })),
+                !fails
+            );
+            if !fails {
+                let committed = events
+                    .iter()
+                    .position(|event| matches!(event, AgentEvent::GenerationCommitted { .. }))
+                    .unwrap();
+                let finished = events
+                    .iter()
+                    .position(|event| matches!(event, AgentEvent::TurnFinished { .. }))
+                    .unwrap();
+                assert!(committed < finished);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cancelling_notice_poll_preserves_the_update_for_the_next_run() {

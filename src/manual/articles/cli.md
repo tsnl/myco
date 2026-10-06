@@ -103,7 +103,9 @@ fallback, or interactive service client yet.
 `run=INSTANCE:REQUEST` on stderr identifies an accepted or possibly accepted
 turn. Transport retries reuse this identity. `--detach` exits after acceptance;
 closing a client leaves the turn running. `--observe` reconnects to the same
-instance and prints its committed assistant output from the beginning. Automatic
+instance and prints its committed assistant output from the beginning. Output is
+published only after the response's history checkpoint succeeds; a later save
+failure retains earlier committed output and reports an error. Automatic
 reconnect within one invocation resumes after its last printed byte. Ctrl-C
 requests cancellation of that turn and waits for its recorded outcome. Browser
 follow-ups accepted during the run may join it under the usual queue policy.

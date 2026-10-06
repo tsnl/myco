@@ -78,11 +78,93 @@ async fn native_cli_detaches_reconnects_and_resolves_images_only_in_the_client_c
     let replay = run_cli(cli(&env, &server, &id, &["--observe", &reconnect]), b"").await;
     assert_eq!(replay.stdout, output.stdout);
     assert_eq!(provider.connections(), 1);
+    assert!(
+        session_json(&env.dir, &id)
+            .to_string()
+            .contains("committed answer")
+    );
     assert!(!env.dir.join("unused-client-home").exists());
     let request = provider.captured().await.body.to_string();
     assert!(request.contains("data:image/png;base64,"), "{request}");
     assert!(request.contains("piped @missing.png"), "{request}");
     server.stop().await;
+}
+
+#[tokio::test]
+async fn failed_generation_checkpoint_keeps_unsaved_text_out_of_native_stdout_and_receipts() {
+    let env = ServerEnv::new("native-checkpoint");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = std::fs::read_to_string(&env.config).unwrap().replace(
+        "http://127.0.0.1:1/v1",
+        &format!("http://{}/v1", listener.local_addr().unwrap()),
+    );
+    std::fs::write(&env.config, config).unwrap();
+    let (started, requested) = tokio::sync::oneshot::channel();
+    let (release, ready) = tokio::sync::oneshot::channel();
+    let provider = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_provider_request(&mut stream).await;
+        started.send(()).unwrap();
+        ready.await.unwrap();
+        stream
+            .write_all(&model_answer("unsaved service answer", 100))
+            .await
+            .unwrap();
+    });
+    let server = Server::start(&env, &[]).await;
+    let id = server.create(None, false).await;
+    let client = tokio::spawn(run_cli(cli(&env, &server, &id, &["-p", "work"]), b""));
+    tokio::time::timeout(Duration::from_secs(10), requested)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The generation intent is durable; make its result checkpoint fail.
+    let store = env.dir.join("profiles/default/session");
+    let backup = env.dir.join("saved-store");
+    std::fs::rename(&store, &backup).unwrap();
+    std::fs::write(&store, b"storage unavailable").unwrap();
+    release.send(()).unwrap();
+    let output = client.await.unwrap();
+    provider.await.unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not persist"));
+    let saved = std::fs::read_to_string(backup.join(&id[..2]).join(format!("{id}.json"))).unwrap();
+    assert!(!saved.contains("unsaved service answer"));
+    let reconnect = token(&output);
+    let replay = run_cli(cli(&env, &server, &id, &["--observe", &reconnect]), b"").await;
+    assert_eq!(replay.status.code(), Some(1), "{replay:?}");
+    assert!(replay.stdout.is_empty(), "{replay:?}");
+
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(backup, store).unwrap();
+    server.stop().await;
+}
+
+async fn read_provider_request(stream: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert!(count > 0, "provider request ended early");
+        request.extend_from_slice(&buffer[..count]);
+        let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..end]).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        if request.len() >= end + 4 + length {
+            return;
+        }
+    }
 }
 
 #[tokio::test]

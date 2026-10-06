@@ -115,8 +115,8 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
     (app, receiver)
 }
 
-fn server(apps: &[Arc<App>]) -> Arc<Server> {
-    let config = Config::resolve_with(
+fn test_config() -> Config {
+    Config::resolve_with(
         myco::ConfigUserSettings {
             config_path: Some("/unused/config.toml".into()),
             ..Default::default()
@@ -137,10 +137,13 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         || Ok(vec![]),
         |_| unreachable!(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn server(apps: &[Arc<App>]) -> Arc<Server> {
     let mut sessions = Sessions::new(
         <Args as clap::Parser>::parse_from(["myco", "--web"]),
-        config,
+        test_config(),
         StartupPreflight::default(),
         vec![],
     );
@@ -1366,4 +1369,103 @@ fn recorded_history_hides_runtime_context_and_preserves_outcomes_and_turn_times(
     assert_eq!(blocks[2]["running"], false);
     assert!(blocks[2].get("elapsed_ms").is_none());
     assert!(blocks[3]["time"].is_null());
+}
+
+struct UnusedModel;
+
+impl myco::generative_model::GenerativeModel for UnusedModel {
+    fn generate(
+        &self,
+        _: &[Message],
+    ) -> myco::generative_model::AsyncStream<myco::generative_model::GenerationEvent> {
+        panic!("settlement must not call a model")
+    }
+}
+
+async fn settlement_boot(app: &Arc<App>) -> Boot {
+    let config = test_config();
+    let mut saved = Session::new("test");
+    saved.id = app.snapshot().session_id;
+    let session = ActiveSession::new(saved);
+    let harness = myco::Harness::local_with_services(vec![]);
+    let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
+    let agent = myco::Agent::new(Arc::new(UnusedModel), runtime.clone(), app.clone());
+    Boot {
+        catalog_model: config.models.get("test").unwrap().clone(),
+        app_config: config,
+        preflight: StartupPreflight::default(),
+        session,
+        _session_lock: None,
+        harness,
+        runner: myco::chat::SessionRunner::new(agent, runtime)
+            .await
+            .unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
+    for queued in [false, true] {
+        let (app, mut receiver) = app();
+        let boot = settlement_boot(&app).await;
+        let input = crate::service_protocol::Submit {
+            instance: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            text: "first".into(),
+            images: vec![],
+        };
+        app.accept_service(input.clone(), "session".into()).unwrap();
+        receiver.try_recv().unwrap();
+        let followup = action_request();
+        if queued {
+            app.accept(followup.clone()).unwrap();
+        }
+        assert_eq!(app.snapshot().change["snapshot"]["busy"], true);
+        assert_eq!(
+            app.service_output(input.instance, input.request_id, 0)
+                .unwrap()
+                .exit_code,
+            None
+        );
+
+        app.sync_with(&boot, "Ready", |receipts| {
+            receipts.finish(input.request_id, &Ok(()), false);
+            assert!(
+                matches!(
+                    app.live.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "receipt completion must hold the same lock as snapshot settlement and admission"
+            );
+        });
+
+        assert_eq!(
+            app.service_output(input.instance, input.request_id, 0)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+        assert_eq!(app.snapshot().change["snapshot"]["busy"], queued);
+        let next = crate::service_protocol::Submit {
+            request_id: Uuid::new_v4(),
+            text: "next".into(),
+            ..input.clone()
+        };
+        if queued {
+            let work = receiver.try_recv().unwrap();
+            assert_eq!(work.request.request_id, followup.request_id);
+            assert!(matches!(
+                app.accept_service(next, "session".into()),
+                Err(Error::Conflict(_))
+            ));
+            app.cancel_service(input.request_id).unwrap();
+            assert!(!work.cancel.is_cancelled());
+        } else {
+            app.accept_service(next.clone(), "session".into()).unwrap();
+            let work = receiver.try_recv().unwrap();
+            assert_eq!(work.request.request_id, next.request_id);
+            app.cancel_service(input.request_id).unwrap();
+            assert!(!work.cancel.is_cancelled());
+        }
+    }
 }

@@ -250,9 +250,16 @@ impl App {
     }
 
     fn sync(&self, boot: &Boot, status: &str) {
+        self.sync_with(boot, status, |_| {});
+    }
+
+    fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
         let session = boot.session.snapshot();
         let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
+        // The receipt and snapshot settle under one lock. A completed native
+        // command cannot expose stale settings or cancel a subsequent turn.
+        finish(&mut live.service);
         live.generation_start = None;
         let snapshot = &mut live.snapshot;
         let mut blocks = view::history(session.active_thread());
@@ -400,8 +407,10 @@ impl EventSink for App {
                 self.status("Running");
             }
             AgentEvent::GenerationFinished { context } if context.depth == 0 => {
+                self.live.lock().unwrap().generation_start = None;
+            }
+            AgentEvent::GenerationCommitted { context } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
-                live.generation_start = None;
                 if live.service.commit() {
                     self.cancel_live(&mut live);
                 }
@@ -969,8 +978,11 @@ async fn worker(
                 _ = &mut observations => unreachable!("resource observation loop ended"),
             }
         };
-        app.finish_service(request_id, &result, cancel.is_cancelled());
-        app.sync(&boot, if result.is_ok() { "Ready" } else { "Stopped" });
+        app.sync_with(
+            &boot,
+            if result.is_ok() { "Ready" } else { "Stopped" },
+            |receipts| receipts.finish(request_id, &result, cancel.is_cancelled()),
+        );
         if let Err(error) = result {
             app.notice(error);
         }

@@ -29,6 +29,37 @@ pub(super) struct Receipts {
 }
 
 impl Receipts {
+    pub(super) fn finish(
+        &mut self,
+        id: Uuid,
+        result: &std::result::Result<(), String>,
+        cancelled: bool,
+    ) {
+        if self.active != Some(id) {
+            return;
+        }
+        let receipt = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .unwrap();
+        receipt.exit_code = Some(if receipt.error.is_some() {
+            1
+        } else if cancelled {
+            130
+        } else if result.is_err() {
+            1
+        } else {
+            0
+        });
+        if receipt.error.is_none() {
+            receipt.error = result.as_ref().err().cloned();
+        }
+        receipt.revision += 1;
+        self.active = None;
+        self.draft.clear();
+    }
+
     pub(super) fn contains(&self, id: &Uuid) -> bool {
         self.accepted.contains_key(id)
     }
@@ -144,7 +175,7 @@ impl App {
                 "The session worker is unavailable.".into(),
             ));
         }
-        if live.snapshot.busy || !live.snapshot.queued.is_empty() {
+        if live.snapshot.busy || live.service.active.is_some() || !live.snapshot.queued.is_empty() {
             return Err(Error::Conflict("The session has active or queued work. Observe it or wait before submitting a service turn.".into()));
         }
         let Action::ServiceSubmit { text, images } = &request.action else {
@@ -169,37 +200,18 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish_service(
         &self,
         id: Uuid,
         result: &std::result::Result<(), String>,
         cancelled: bool,
     ) {
-        let mut live = self.live.lock().unwrap();
-        if live.service.active != Some(id) {
-            return;
-        }
-        let receipt = live
+        self.live
+            .lock()
+            .unwrap()
             .service
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .unwrap();
-        receipt.exit_code = Some(if receipt.error.is_some() {
-            1
-        } else if cancelled {
-            130
-        } else if result.is_err() {
-            1
-        } else {
-            0
-        });
-        if receipt.error.is_none() {
-            receipt.error = result.as_ref().err().cloned();
-        }
-        receipt.revision += 1;
-        live.service.active = None;
-        live.service.draft.clear();
+            .finish(id, result, cancelled);
     }
 
     pub(crate) fn service_output(&self, instance: Uuid, id: Uuid, offset: usize) -> Result<Output> {
@@ -268,7 +280,10 @@ mod tests {
             text: text.into(),
             context: context.clone(),
         });
-        app.emit(AgentEvent::GenerationFinished { context });
+        app.emit(AgentEvent::GenerationFinished {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::GenerationCommitted { context });
         app.finish_service(id, &Ok(()), false);
         let mut live = app.live.lock().unwrap();
         live.snapshot.busy = false;
@@ -373,7 +388,14 @@ mod tests {
             context: context.clone(),
         });
         assert!(app.live.lock().unwrap().service.draft.len() <= MAX_OUTPUT_BYTES);
-        app.emit(AgentEvent::GenerationFinished { context });
+        app.emit(AgentEvent::GenerationFinished {
+            context: context.clone(),
+        });
+        assert!(
+            !work.cancel.is_cancelled(),
+            "validation alone has not committed output"
+        );
+        app.emit(AgentEvent::GenerationCommitted { context });
         assert!(work.cancel.is_cancelled());
         app.finish_service(input.request_id, &Ok(()), true);
         let output = app
@@ -383,6 +405,47 @@ mod tests {
         assert!(output.error.unwrap().contains("4 MiB"));
         assert!(output.output.is_empty());
     }
+
+    #[test]
+    fn validated_output_waits_for_its_checkpoint_and_later_save_failure_keeps_prior_chunks() {
+        let (app, mut receiver) = super::super::tests::app();
+        let input = input();
+        app.accept_service(input.clone(), "session".into()).unwrap();
+        let _work = receiver.try_recv().unwrap();
+        let context = TraceContext::root();
+        app.emit(AgentEvent::TextDelta {
+            text: "saved".into(),
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::GenerationFinished {
+            context: context.clone(),
+        });
+        assert!(
+            app.service_output(input.instance, input.request_id, 0)
+                .unwrap()
+                .output
+                .is_empty()
+        );
+        app.emit(AgentEvent::GenerationCommitted {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::GenerationStarted {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::TextDelta {
+            text: "not saved".into(),
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::GenerationFinished { context });
+        app.finish_service(input.request_id, &Err("checkpoint failed".into()), false);
+        let output = app
+            .service_output(input.instance, input.request_id, 0)
+            .unwrap();
+        assert_eq!(output.output, "saved");
+        assert_eq!(output.exit_code, Some(1));
+        assert_eq!(output.error.as_deref(), Some("checkpoint failed"));
+    }
+
     #[test]
     fn output_chunks_preserve_unicode_and_finish_only_after_all_committed_bytes() {
         let (app, mut receiver) = super::super::tests::app();
