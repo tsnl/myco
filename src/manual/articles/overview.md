@@ -82,11 +82,13 @@ Use `session_history` to read saved threads without loading all of them into con
 - `{"session_id":"…","thread_id":"…","action":"expand","index":12}` reads an original message.
 
 Omitting `thread_id` selects the active thread. Older threads are read-only.
-Session files use schema version 5, including archive status, per-user-turn acceptance
+Session files use schema version 6, including archive status, per-user-turn acceptance
 times, and structured system content. System parts carry model-visible runtime context
-without appearing in transcript replay. Formats 2 through 4 are accepted and upgraded
+without appearing in transcript replay. Formats 2 through 5 are accepted and upgraded
 on read; loading alone does not rewrite their files. Older turns keep unknown timestamps.
-Older binaries reject version 5. Existing predecessor/successor session links
+The optional `auto_continue` metadata field defaults to false in older files;
+it survives thread compaction but does not start work when a session loads.
+Binaries that predate schema 6 reject these files. Existing predecessor/successor session links
 remain metadata; separate saved sessions are not automatically combined.
 
 The browser’s Archive and Restore controls change a session's browsing visibility while retaining

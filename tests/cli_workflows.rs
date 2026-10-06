@@ -143,6 +143,49 @@ fn summary(session: &Session) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn print_auto_continues_until_the_agent_disables_and_persists_the_setting() {
+    let provider = StubHttpServer::sequence(vec![
+        answer("More work remains.", 100),
+        tool("session_meta", json!({"action":"disable_auto_continue"})),
+        answer("Complete.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(&["-p", "finish the task", "--auto-continue"], b"")
+        .await;
+    assert_eq!(success(&output), "More work remains.Complete.\n");
+    assert_eq!(provider.connections(), 3);
+    let saved = env.saved(&session_id(&output));
+    assert!(!saved.auto_continue);
+    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_auto_continue_command_persists_without_starting_model_work() {
+    let provider = StubHttpServer::sequence(vec![]).await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(
+            &["--mode", "cli"],
+            b"/auto-continue on\n/auto-continue\n/quit\n",
+        )
+        .await;
+    success(&output);
+    let id = session_id(&output);
+    assert!(env.saved(&id).auto_continue);
+    assert_eq!(provider.connections(), 0);
+    let output = env
+        .run(
+            &["--mode", "cli", "--resume", &id, "--auto-continue=false"],
+            b"/quit\n",
+        )
+        .await;
+    success(&output);
+    assert!(!env.saved(&id).auto_continue);
+}
+
+#[tokio::test]
 async fn print_accepts_an_argument_stdin_or_both_and_keeps_stdout_clean() {
     for (args, input, expected) in [
         (vec!["-p", "hello"], "", "hello"),

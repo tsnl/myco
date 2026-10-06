@@ -87,6 +87,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 thread_id: "thread".into(),
                 title: "Test".into(),
                 archived: false,
+                auto_continue: false,
                 model: "test".into(),
                 models: vec!["test".into(), "second".into()],
                 attachment_limits: attachments::Limits::new(
@@ -459,6 +460,26 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
     assert_eq!(
         app.snapshot().change["snapshot"]["title"],
         "Renamed while running"
+    );
+}
+
+#[test]
+fn auto_continue_changes_reach_live_clients_while_the_run_is_busy() {
+    let (app, _) = app();
+    let active = ActiveSession::new(Session::new_with_id("test", "session"));
+    active.with_mut(|session| session.auto_continue = true);
+    app.live.lock().unwrap().snapshot.busy = true;
+    let mut updates = app.events.subscribe();
+    app.refresh_metadata(&active);
+    let update = updates.try_recv().unwrap();
+    assert_eq!(update.change["meta"]["auto_continue"], true);
+    assert_eq!(update.change["meta"]["busy"], true);
+    assert_eq!(app.snapshot().change["snapshot"]["auto_continue"], true);
+    active.with_mut(|session| session.auto_continue = false);
+    app.refresh_metadata(&active);
+    assert_eq!(
+        updates.try_recv().unwrap().change["meta"]["auto_continue"],
+        false
     );
 }
 

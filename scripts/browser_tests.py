@@ -72,7 +72,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -89,6 +89,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
+        elif "autonomy" in prompt:
+            if count == 1:
+                events = tool({'action': 'disable_auto_continue'}, 'session_meta')
+            else:
+                events = reply('More work remains.' if not count else 'Task complete.')
         elif "timer" in prompt:
             if not count:
                 events = tool(getattr(fixture, 'timer_input', {
@@ -2697,6 +2702,39 @@ context_window = 100000
         expect(page.locator(".tool.running")).to_have_count(1)
         (self.home / "Alpha-rename-release").touch()
         expect(page.locator("#model")).to_be_enabled()
+
+    def test_auto_continue_finishes_only_after_the_agent_disables_it(self):
+        page = self.session(self.page)
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_attribute('aria-pressed', 'true')
+        self.assertEqual(len(self.requests), 0, 'Enabling does not start a task')
+        self.submit(page, 'Alpha autonomy')
+        expect(page.locator('.assistant .body').last).to_have_text('Task complete.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        self.assertEqual(len(self.requests), 3)
+        expect(page.locator('.user')).to_have_count(1)
+        page.reload()
+        expect(page.locator('#auto-continue')).to_have_attribute('aria-pressed', 'false')
+
+    def test_auto_continue_persists_and_can_be_disabled_during_live_work(self):
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: on')
+        self.stop(self.process)
+        self.process, _ = self.launch(urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: on')
+        self.assertEqual(len(self.requests), 0, 'Restart must not start the saved mode')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(len(self.requests), 2)
 
     def test_rename_session_updates_tabs_and_listing_without_interrupting_work(self):
         page = self.session(self.page)

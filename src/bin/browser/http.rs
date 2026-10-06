@@ -79,6 +79,10 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/sessions/{id}/background", post(session_background))
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/sessions/{id}/rename", post(session_rename))
+        .route(
+            "/api/sessions/{id}/auto-continue",
+            post(session_auto_continue),
+        )
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
         .route("/files/{*path}", get(workspace_file))
@@ -307,6 +311,30 @@ async fn session_archive(
 struct RenameRequest {
     session_id: String,
     title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutoContinueRequest {
+    session_id: String,
+    enabled: bool,
+}
+
+async fn session_auto_continue(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<AutoContinueRequest>,
+) -> Result<StatusCode, Error> {
+    if request.session_id != id {
+        return Err(Error::Conflict(
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    server
+        .sessions
+        .set_auto_continue(id, request.enabled)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn session_rename(

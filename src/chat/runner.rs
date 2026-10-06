@@ -341,6 +341,7 @@ impl Workflow {
     ) -> Result<RunOutcome, AgentInteractionError> {
         self.record_runtime(agent, runtime).await?;
         if start {
+            super::autonomy::announce(agent, runtime.session())?;
             agent.start_run()?;
             self.compacted_after_completion = false;
             self.awaiting_compacted_usage = false;
@@ -438,6 +439,10 @@ impl Workflow {
             }
             if let Some(outcome) = outcome {
                 if self.deliver_followups(agent, runtime, &cancel)? {
+                    continue;
+                }
+                if super::autonomy::continue_after(agent, runtime.session(), &outcome, &cancel)? {
+                    self.compacted_after_completion = false;
                     continue;
                 }
                 return Ok(outcome);

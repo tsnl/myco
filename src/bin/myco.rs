@@ -65,6 +65,9 @@ struct Args {
     /// Resume a saved session (id or unique prefix).
     #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
+    /// CLI: keep continuing until the agent disables the mode. Persisted per session.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    auto_continue: Option<bool>,
     /// Reasoning effort (low|medium|high|max).
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
     effort: Effort,
@@ -102,6 +105,12 @@ enum Mode {
 
 fn main() {
     let args = Args::parse();
+    if args.auto_continue.is_some() && args.mode != Mode::Cli && args.print.is_none() {
+        eprintln!(
+            "myco: --auto-continue requires --mode cli or -p; use the browser's session control in server mode"
+        );
+        std::process::exit(2);
+    }
     if args.profile_worker.is_none() {
         let _ = dotenvy::dotenv();
     }

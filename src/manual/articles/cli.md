@@ -18,6 +18,7 @@ the internal SSH host worker. `myco-eval` remains a separate evaluation utility.
 | `--model KEY` | Default model from the config catalog |
 | `--effort LEVEL` | Reasoning effort: `low`, `medium`, `high`, `max`; default `high` |
 | `--resume ID` | Resume a saved session or unique prefix; in server mode, open it from the launch URL |
+| `--auto-continue[=true\|false]` | CLI/one-shot only: persist automatic continuation for this session; omit to keep its current setting |
 | `--debug-dump-api-requests` | Write provider request bodies to stderr |
 | `--help [ARTICLE]` | Launcher help or the embedded manual article |
 | `--version` | Package and build identity |
@@ -90,6 +91,7 @@ or cancelled turn returns to the prompt.
 | `/help` | Show terminal controls |
 | `/session` | Show the session ID and model |
 | `/compact` | Compact into a new thread in this session; return to the prompt |
+| `/auto-continue [on\|off]` | Show or change automatic continuation for the current session |
 | `/quit`, `/exit` | Exit |
 
 Assistant text streams to stdout; tool activity and diagnostics go to stderr.
@@ -98,6 +100,18 @@ separating it from the interrupted draft, which remains visible in the terminal.
 Tool inputs show each top-level field separately. Long tool output is abbreviated;
 complete observations remain in saved session history. Use the browser to browse
 old messages, manage sessions, or switch models during a conversation.
+
+Auto-continue is off by default. When enabled, a completed answer or exhausted
+output cap receives an internal continuation prompt until the agent calls
+`session_meta action=disable_auto_continue`. The prompt tells it to disable when
+the task is complete or it needs user input. Enabling the mode does not itself
+start work; submit a task normally. It survives compaction and restart, but does
+not propagate to child sessions. Restarting never starts a saved task by itself.
+Ctrl-C stops the current run, including automatic continuations; the setting
+remains enabled for later submissions. Use `/auto-continue off` or
+`--auto-continue=false` to disable it. Provider errors still stop after their
+bounded retry policy, and persistence errors stop immediately. There is no
+automatic spending or elapsed-time limit in this mode.
 
 Both terminal modes share the browser's checkpoints, writer locks, attachment
 limits, and automatic compaction/continuation. `--resume` uses the saved model
