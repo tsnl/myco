@@ -304,10 +304,16 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, or summarization fails,
-automatic compaction is disabled until manual compaction succeeds or another session
-is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
-do not start automatic continuation. Manual `/compact` waits for the next user input.
+If the next usage report remains above the threshold, automatic compaction is
+disabled until manual compaction succeeds or another session is opened. With
+auto-continue off, a summarization failure also disables automatic compaction;
+other generation failures, cancellation, refusal, and an exhausted truncation
+cap do not start another generation. With auto-continue enabled, generation,
+persistence, and automatic summarization errors retry indefinitely with waits
+of 1–5 seconds. Retries retain live state and any successfully produced summary;
+failed saves are repaired before work advances. Cancellation or disabling
+auto-continue stops retries. Manual `/compact` retains bounded retries and waits
+for the next user input after success.
 Compaction workers do not run auto-compaction. Each committed successor retains the
 same live tool owner and the run's usage and truncation accounting.
 

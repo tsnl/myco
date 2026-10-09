@@ -101,6 +101,7 @@ impl Snapshot {
 struct Live {
     // Only message blocks from the current, unvalidated generation are replaceable.
     generation_start: Option<usize>,
+    retry_notice: Option<usize>,
     background: HashMap<Uuid, CancelToken>,
     snapshot: Snapshot,
     cancel: Option<CancelToken>,
@@ -209,6 +210,15 @@ impl App {
         self.notice(text);
     }
 
+    fn retrying(&self, error: String, delay: Duration) {
+        self.discard_generation();
+        self.status("Retrying");
+        self.retry_notice(format!(
+            "{error} — auto-continue retrying in {:.1}s",
+            delay.as_secs_f64()
+        ));
+    }
+
     fn status(&self, status: &str) {
         let mut live = self.live.lock().unwrap();
         if live.snapshot.status != "Cancelling" && live.snapshot.status != status {
@@ -228,20 +238,47 @@ impl App {
         );
     }
 
+    fn retry_notice(&self, text: String) {
+        let mut live = self.live.lock().unwrap();
+        let block = Block::Notice { text };
+        let index = if let Some(index) = live.retry_notice {
+            live.snapshot.blocks[index] = block.clone();
+            index
+        } else {
+            let index = live.snapshot.blocks.len();
+            live.snapshot.blocks.push(block.clone());
+            live.retry_notice = Some(index);
+            index
+        };
+        self.publish(
+            &mut live.snapshot,
+            json!({"kind":"block", "index":index, "block":block}),
+        );
+    }
+
     fn discard_generation(&self) {
         let mut live = self.live.lock().unwrap();
         let Some(start) = live.generation_start.take() else {
             return;
         };
+        // A finished generation may still need its checkpoint repaired. Its
+        // validated service output must survive until GenerationCommitted.
+        live.service.reset_draft();
         let previous_len = live.snapshot.blocks.len();
         let mut index = 0;
+        let retry_notice = live.retry_notice;
+        let mut removed_before_notice = 0;
         // Resource refreshes may append live tool cards while a draft is streaming.
         live.snapshot.blocks.retain(|block| {
             let keep = index < start
                 || !matches!(block, Block::Message { role, .. } if role == "assistant" || role == "thinking");
+            if !keep && retry_notice.is_some_and(|notice| index < notice) {
+                removed_before_notice += 1;
+            }
             index += 1;
             keep
         });
+        live.retry_notice = retry_notice.map(|index| index - removed_before_notice);
         if live.snapshot.blocks.len() == previous_len {
             return;
         }
@@ -261,6 +298,7 @@ impl App {
         // command cannot expose stale settings or cancel a subsequent turn.
         finish(&mut live.service);
         live.generation_start = None;
+        live.retry_notice = None;
         let snapshot = &mut live.snapshot;
         let mut blocks = view::history(session.active_thread());
         if snapshot.thread_id == session.active_thread().id {
@@ -498,7 +536,7 @@ impl EventSink for App {
                 } else {
                     String::new()
                 };
-                self.notice(format!("{}{retry}", failure.cause));
+                self.retry_notice(format!("{}{retry}", failure.cause));
             }
             _ => {}
         }
@@ -717,6 +755,7 @@ impl Sessions {
                 Arc::new(App {
                     live: Mutex::new(Live {
                         generation_start: None,
+                        retry_notice: None,
                         snapshot: Snapshot {
                             revision: 0,
                             session_id: session.id.clone(),
@@ -782,6 +821,7 @@ impl Sessions {
                 observer.finish_compaction();
             }
             WorkflowEvent::Warning(text) => observer.warning(text),
+            WorkflowEvent::Retrying { error, delay } => observer.retrying(error, delay),
             WorkflowEvent::CompactionProgress { .. } => {}
         }));
         let id = boot.session.id();

@@ -55,6 +55,10 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         myco::chat::WorkflowEvent::Compacting { .. } => eprintln!("myco: compacting…"),
         myco::chat::WorkflowEvent::Compacted(_) => eprintln!("myco: compaction complete"),
         myco::chat::WorkflowEvent::Warning(message) => eprintln!("myco: {message}"),
+        myco::chat::WorkflowEvent::Retrying { error, delay } => eprintln!(
+            "myco: auto-continue retrying in {:.1}s: {error}",
+            delay.as_secs_f64()
+        ),
         myco::chat::WorkflowEvent::CompactionProgress { .. } => {}
     }));
     Ok(boot)

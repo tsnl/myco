@@ -76,11 +76,61 @@ fn retry_discards_only_the_current_generation_and_preserves_output_and_live_tool
     );
 }
 
+#[test]
+fn automatic_failures_replace_one_diagnostic_without_growing_the_transcript() {
+    let (app, _) = app();
+    let context = myco::TraceContext::root();
+    app.emit(AgentEvent::TextDelta {
+        text: "committed answer".into(),
+        context: context.clone(),
+    });
+    app.notice("Keep this unrelated notice");
+    app.resources(vec![process_inventory("local", "retained")]);
+    for attempt in 0..300 {
+        app.emit(AgentEvent::GenerationStarted {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::TextDelta {
+            text: "abandoned draft".into(),
+            context: context.clone(),
+        });
+        let error = format!("failure {attempt}");
+        app.emit(AgentEvent::Failure {
+            failure: myco::generative_model::GenerationFailure::transient(
+                myco::generative_model::GenerateError::ExecutionError(error.clone()),
+                None,
+            ),
+            attempt: 1,
+            max_attempts: 1,
+            retry_in: None,
+            context: context.clone(),
+        });
+        app.retrying(error, Duration::from_secs(5));
+        if attempt == 0 {
+            app.notice("Keep a later unrelated notice too");
+        }
+    }
+    let snapshot = app.snapshot().change["snapshot"].clone();
+    let blocks = snapshot["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(blocks[0]["text"], "committed answer");
+    assert_eq!(blocks[1]["text"], "Keep this unrelated notice");
+    assert_eq!(blocks[2]["resource"]["instance_id"], "retained");
+    assert_eq!(
+        blocks[3]["text"],
+        "failure 299 — auto-continue retrying in 5.0s"
+    );
+    assert_eq!(blocks[4]["text"], "Keep a later unrelated notice too");
+    assert_eq!(snapshot["status"], "Retrying");
+    assert!(!snapshot.to_string().contains("abandoned"));
+}
+
 fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc::Receiver<Work>) {
     let (work, receiver) = mpsc::channel(1);
     let app = Arc::new(App {
         live: Mutex::new(Live {
             generation_start: None,
+            retry_notice: None,
             snapshot: Snapshot {
                 revision: 0,
                 session_id: id.into(),

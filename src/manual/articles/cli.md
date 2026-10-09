@@ -160,9 +160,14 @@ start work; submit a task normally. It survives compaction and restart, but does
 not propagate to child sessions. Restarting never starts a saved task by itself.
 Ctrl-C stops the current run, including automatic continuations; the setting
 remains enabled for later submissions. Use `/auto-continue off` or
-`--auto-continue=false` to disable it. Provider errors still stop after their
-bounded retry policy, and persistence errors stop immediately. There is no
-automatic spending or elapsed-time limit in this mode.
+`--auto-continue=false` to disable it. While enabled, generation, persistence,
+and automatic compaction failures retry after 1, 2, 4, then 5 seconds, staying at
+5 seconds until recovery. Each retry reports its cause. Failed saves retain the
+same live state and retry persistence before advancing, so accepted input and
+completed tools are not repeated. Cancellation and disabling the mode interrupt
+the retry wait. There is no retry-count, spending, or elapsed-time limit in this
+mode. With auto-continue off, provider retries retain their configured bounds
+and persistence errors return to the caller.
 
 Both terminal modes share the browser's checkpoints, writer locks, attachment
 limits, and automatic compaction/continuation. `--resume` uses the saved model

@@ -142,6 +142,107 @@ async fn failed_generation_checkpoint_keeps_unsaved_text_out_of_native_stdout_an
     server.stop().await;
 }
 
+#[tokio::test]
+async fn automatic_checkpoint_retry_commits_native_output_once_after_storage_repair() {
+    let env = ServerEnv::new("native-auto-checkpoint");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = std::fs::read_to_string(&env.config).unwrap().replace(
+        "http://127.0.0.1:1/v1",
+        &format!("http://{}/v1", listener.local_addr().unwrap()),
+    );
+    std::fs::write(&env.config, config).unwrap();
+    let marker = env.dir.join("effect-count");
+    let responses = vec![
+        model_answer("Held until durable.", 100),
+        model_tool(
+            "bash",
+            json!({"command":format!("printf x >> {}", marker.display())}),
+            100,
+        ),
+        model_tool(
+            "session_meta",
+            json!({"action":"disable_auto_continue"}),
+            100,
+        ),
+        model_answer("Finished.", 100),
+    ];
+    let (started, requested) = tokio::sync::oneshot::channel();
+    let (release, ready) = tokio::sync::oneshot::channel();
+    let provider = tokio::spawn(async move {
+        let mut gate = Some((started, ready));
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_provider_request(&mut stream).await;
+            if let Some((started, ready)) = gate.take() {
+                started.send(()).unwrap();
+                ready.await.unwrap();
+            }
+            stream.write_all(&response).await.unwrap();
+        }
+    });
+    let server = Server::start(&env, &[]).await;
+    let id = server.create(None, false).await;
+    let (status, body) = server
+        .request(
+            "POST",
+            &format!("/api/sessions/{id}/auto-continue"),
+            json!({"session_id":id, "enabled":true}),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let detached = run_cli(cli(&env, &server, &id, &["--detach", "-p", "work"]), b"").await;
+    assert!(detached.status.success(), "{detached:?}");
+    assert!(detached.stdout.is_empty());
+    let reconnect = token(&detached);
+    let (instance, request) = reconnect.split_once(':').unwrap();
+    let output_path = format!(
+        "/profiles/default/api/service/sessions/{id}/turns/{request}/output?instance={instance}&offset=0"
+    );
+    tokio::time::timeout(Duration::from_secs(10), requested)
+        .await
+        .unwrap()
+        .unwrap();
+    let times = session_json(&env.dir, &id)["threads"][0]["user_turn_timestamps"].clone();
+    let store = env.dir.join("profiles/default/session");
+    let backup = env.dir.join("saved-store");
+    std::fs::rename(&store, &backup).unwrap();
+    std::fs::write(&store, b"storage unavailable").unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.snapshot(&id).await["status"] != "Retrying" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, pending) = server.request("GET", &output_path, Value::Null).await;
+    assert_eq!(status, 200, "{pending}");
+    assert_eq!(pending["output"], "");
+    assert!(pending["exit_code"].is_null(), "{pending}");
+    assert!(!marker.exists());
+    let saved = std::fs::read_to_string(backup.join(&id[..2]).join(format!("{id}.json"))).unwrap();
+    assert!(!saved.contains("Held until durable."));
+
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(backup, store).unwrap();
+    let output = run_cli(cli(&env, &server, &id, &["--observe", &reconnect]), b"").await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Held until durable.Finished.\n");
+    tokio::time::timeout(Duration::from_secs(10), provider)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+    let saved = session_json(&env.dir, &id);
+    assert!(saved.to_string().contains("Held until durable."));
+    assert!(saved.to_string().contains("Finished."));
+    assert_eq!(saved["threads"][0]["user_turn_timestamps"], times);
+    assert_eq!(times.as_object().unwrap().len(), 1);
+    let replay = run_cli(cli(&env, &server, &id, &["--observe", &reconnect]), b"").await;
+    assert_eq!(replay.stdout, output.stdout);
+    server.stop().await;
+}
+
 async fn read_provider_request(stream: &mut tokio::net::TcpStream) {
     let mut request = Vec::new();
     let mut buffer = [0; 4096];
