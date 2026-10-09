@@ -14,7 +14,6 @@ use crate::core::{
     Async, CancelToken, ModelInfo,
     image_store::{ImageStore, sha256, with_images},
 };
-use crate::external_command::GIT;
 use crate::generative_model::{
     self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message,
     TurnEndReason,
@@ -22,7 +21,7 @@ use crate::generative_model::{
 use crate::session::{ActiveSession, CompactOutcome, Session, Thread};
 use crate::{Config, ConfigUserSettings, Harness, SessionRuntime};
 
-use super::case::{Workspace, copy_tree, git};
+use super::case::copy_tree;
 use super::interventions::{Annotations, ResultIdentity};
 use super::metrics::{Metrics, Recorder};
 use super::{discover_cases, load_case, read_json, write_json};
@@ -54,10 +53,13 @@ struct Job {
     prelude: String,
     output: PathBuf,
     timeout_secs: u64,
+    grader_timeout_secs: u64,
     max_requests: u64,
     free_only: bool,
     effort: Effort,
     case_hash: String,
+    #[serde(default)]
+    frozen_case_hash: Option<String>,
     fingerprint: String,
     repetition: u32,
 }
@@ -124,7 +126,7 @@ fn enforce_free(model: &CatalogModel) -> Result<(), String> {
     Ok(())
 }
 
-fn model_hash(model: &CatalogModel) -> String {
+fn model_hash(model: &CatalogModel, config: &Config) -> String {
     let mut backend = model.backend.clone();
     match &mut backend {
         BackendConfig::Anthropic(c) => {
@@ -136,7 +138,15 @@ fn model_hash(model: &CatalogModel) -> String {
             c.debug_dump_api_requests = false;
         }
     }
-    sha256(format!("{:?}|{:?}", model.spec, backend).as_bytes())
+    sha256(
+        format!(
+            "{:?}|{:?}|{}",
+            model.spec,
+            backend,
+            super::provenance::runtime_settings(config)
+        )
+        .as_bytes(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -200,7 +210,7 @@ fn tree_hash(root: &Path) -> Result<String, String> {
                     .mode();
                 entries.push((
                     format!("{}:{mode}", path.strip_prefix(root).unwrap().display()),
-                    sha256(&std::fs::read(&path).map_err(|error| error.to_string())?),
+                    file_hash(&path)?,
                 ));
             } else {
                 return Err(format!(
@@ -215,6 +225,27 @@ fn tree_hash(root: &Path) -> Result<String, String> {
     collect(root, root, &mut entries)?;
     entries.sort();
     Ok(sha256(&serde_json::to_vec(&entries).unwrap()))
+}
+
+fn file_hash(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => digest.update(&buffer[..size]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
@@ -235,10 +266,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
     options.models.sort();
     options.models.dedup();
     let cases = discover_cases(&options.cases)?;
-    let binary_hash = sha256(
-        &std::fs::read(std::env::current_exe().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?,
-    );
+    let binary_hash = file_hash(&std::env::current_exe().map_err(|error| error.to_string())?)?;
     let cohort_hash = sha256(
         format!(
             "{:?}|{}|{}|{}|{}|{:?}|{}|{binary_hash}",
@@ -276,11 +304,11 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
         }
         let case_hash = tree_hash(&case_path)?;
         for model_key in &options.models {
-            let (_, model) = config(&options.config, model_key)?;
+            let (config, model) = config(&options.config, model_key)?;
             if options.free_only {
                 enforce_free(&model)?;
             }
-            let model_hash = model_hash(&model);
+            let model_hash = model_hash(&model, &config);
             for repetition in 0..options.repeat {
                 let fingerprint = sha256(
                     format!(
@@ -304,10 +332,12 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
                     prelude: prelude.clone(),
                     output,
                     timeout_secs: options.timeout_secs,
+                    grader_timeout_secs: options.grader_timeout_secs,
                     max_requests: options.max_requests,
                     free_only: options.free_only,
                     effort: options.effort,
                     case_hash: case_hash.clone(),
+                    frozen_case_hash: None,
                     fingerprint,
                     repetition,
                 });
@@ -330,7 +360,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
         return Err("another eval runner owns this output directory".into());
     }
     let results: Vec<_> = stream::iter(jobs)
-        .map(|job| run_one(job, options.grader_timeout_secs))
+        .map(run_one)
         .buffer_unordered(options.jobs)
         .collect()
         .await;
@@ -340,7 +370,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
     report(&options.output, None)
 }
 
-async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
+async fn run_one(job: Job) -> Result<(), String> {
     if !job.output.join("result.json").exists()
         && let Ok(pid) = std::fs::read_to_string(job.output.join("worker.pid"))
         && let Ok(pid) = pid.trim().parse::<i32>()
@@ -352,7 +382,7 @@ async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
             job.output.display()
         ));
     }
-    if let Err(error) = run_one_inner(job.clone(), grader_timeout).await {
+    if let Err(error) = run_one_inner(job.clone()).await {
         if job.output.join("result.json").exists() {
             return Err(error);
         }
@@ -382,7 +412,7 @@ async fn run_one(job: Job, grader_timeout: u64) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> {
+async fn run_one_inner(mut job: Job) -> Result<(), String> {
     let result_path = job.output.join("result.json");
     if result_path.exists() {
         let result: ResultRecord = read_json(&result_path)?;
@@ -402,7 +432,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
         std::fs::rename(&job.output, previous).map_err(|error| error.to_string())?;
     }
     std::fs::create_dir(&job.output).map_err(|error| error.to_string())?;
-    let case = load_case(&job.case)?;
+    let mut case = load_case(&job.case)?;
     eprintln!(
         "running: {} / {} repetition {}",
         case.name,
@@ -416,29 +446,9 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
     }
     job.case = frozen;
     let workspace = job.output.join("workspace");
-    match &case.workspace {
-        Workspace::Fixture => {
-            copy_tree(&job.case.join("workspace"), &workspace)?;
-            git(&workspace, &["init", "--quiet"])?;
-        }
-        Workspace::Git { repo, revision } => {
-            let output = GIT
-                .tokio_command()
-                .args(["clone", "--shared", "--no-checkout", "--"])
-                .arg(repo)
-                .arg(&workspace)
-                .output()
-                .await
-                .map_err(|error| error.to_string())?;
-            if !output.status.success() {
-                return Err(format!(
-                    "prepare git workspace: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            git(&workspace, &["checkout", "--detach", revision])?;
-        }
-    }
+    super::workspace::prepare(&mut case, &job.case, &workspace).await?;
+    let frozen_case_hash = tree_hash(&job.case)?;
+    job.frozen_case_hash = Some(frozen_case_hash.clone());
     write_json(&job.output.join("job.json"), &job)?;
     let stdout = std::fs::File::create(job.output.join("worker.stdout"))
         .map_err(|error| error.to_string())?;
@@ -497,7 +507,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
     };
     if !status.success() || result.agent.is_none() {
         result.feedback = "worker failed; inspect worker.stderr".into();
-    } else if tree_hash(&job.case)? != job.case_hash {
+    } else if tree_hash(&job.case)? != frozen_case_hash {
         result.status = "case_modified".into();
         result.feedback = "frozen case or grader changed during execution".into();
     } else {
@@ -523,7 +533,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
             .spawn()
             .map_err(|error| format!("start grader: {error}"))?;
         let grade_status =
-            tokio::time::timeout(Duration::from_secs(grader_timeout), child.wait()).await;
+            tokio::time::timeout(Duration::from_secs(job.grader_timeout_secs), child.wait()).await;
         if grade_status.is_err() {
             if let Some(pid) = child.id() {
                 unsafe {
@@ -554,7 +564,7 @@ async fn run_one_inner(mut job: Job, grader_timeout: u64) -> Result<(), String> 
                 }
             }
         }
-        if tree_hash(&job.case)? != job.case_hash {
+        if tree_hash(&job.case)? != frozen_case_hash {
             result.status = "case_modified".into();
             result.score = None;
             result.feedback = "grader or frozen inputs changed".into();
@@ -598,7 +608,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     if job.free_only {
         enforce_free(&catalog)?;
     }
-    if model_hash(&catalog) != job.model_hash {
+    if model_hash(&catalog, &config) != job.model_hash {
         return Err("model configuration changed after planning the run".into());
     }
     let home = crate::core::myco_home()?;
@@ -651,10 +661,45 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         }
     }
     let (epilogue, prelude) = crate::prompts::agent_prompt_epilogue();
-    let model = generative_model::new(GenerativeModelConfig {
-        model: catalog.spec.clone(), tools: harness.tool_specs(), backend_config: catalog.backend.clone(),
-        system_prompt: format!("You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.", epilogue, crate::prompts::model_stamp(&job.model), crate::prompts::auto_compact_notice(catalog.spec.auto_compact_at_tokens, catalog.spec.context_window_tokens), job.output.join("workspace").display()),
-    }).map_err(|error| error.to_string())?;
+    let model_config = GenerativeModelConfig {
+        model: catalog.spec.clone(),
+        tools: harness.tool_specs(),
+        backend_config: catalog.backend.clone(),
+        system_prompt: format!(
+            "You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.",
+            epilogue,
+            crate::prompts::model_stamp(&job.model),
+            crate::prompts::auto_compact_notice(
+                catalog.spec.auto_compact_at_tokens,
+                catalog.spec.context_window_tokens
+            ),
+            job.output.join("workspace").display()
+        ),
+    };
+    write_json(
+        &job.output.join("provenance.json"),
+        &serde_json::json!({
+            "version": 1,
+            "created_at": chrono::Utc::now(),
+            "myco_version": crate::manual::VERSION,
+            "myco_commit": crate::manual::GIT_COMMIT,
+            "fingerprint": job.fingerprint,
+            "case_hash": job.case_hash,
+            "frozen_case_hash": job.frozen_case_hash.as_ref().unwrap_or(&job.case_hash),
+            "model_hash": job.model_hash,
+            "environment": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+            "configuration": super::provenance::configuration(&config, &model_config),
+            "limits": {
+                "max_requests": job.max_requests, "timeout_secs": job.timeout_secs,
+                "grader_timeout_secs": job.grader_timeout_secs, "free_only": job.free_only,
+            },
+            "artifacts": {
+                "case": "case", "workspace": "workspace", "trace": "events.jsonl",
+                "agent": "agent.json", "result": "result.json", "sessions": "home/profiles/eval/session",
+            },
+        }),
+    )?;
+    let model = generative_model::new(model_config).map_err(|error| error.to_string())?;
     let recorder = Recorder::new(
         job.max_requests,
         std::fs::File::create(job.output.join("events.jsonl"))
@@ -685,7 +730,13 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     );
     let observer = recorder.clone();
     runner.set_observer(Arc::new(move |event| match event {
-        WorkflowEvent::Compacted(_) => observer.metrics.lock().unwrap().compactions += 1,
+        WorkflowEvent::Compacting { session_id, thread_id, automatic } => {
+            observer.event(serde_json::json!({"event":"compaction_started", "session_id":session_id, "thread_id":thread_id, "automatic":automatic}));
+        }
+        WorkflowEvent::Compacted(_) => {
+            observer.metrics.lock().unwrap().compactions += 1;
+            observer.event(serde_json::json!({"event":"compaction_finished"}));
+        }
         WorkflowEvent::Warning(message) => {
             observer.event(serde_json::json!({"event":"warning", "message":message}))
         }
@@ -744,6 +795,8 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         elapsed_ms: started.elapsed().as_millis(),
         metrics,
     };
+    recorder.event(serde_json::json!({"event":"run_finished", "status":result.status}));
+    recorder.check_trace()?;
     write_json(&job.output.join("agent.json"), &result)
 }
 
