@@ -7,7 +7,7 @@
 use crate::core::ToolResource;
 use crate::generative_model::{ToolResult, ToolUse};
 
-pub const HOST_PROTOCOL_VERSION: u32 = 4;
+pub const HOST_PROTOCOL_VERSION: u32 = 5;
 
 /// Controller → worker message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,6 +26,9 @@ pub enum Request {
         /// Per-call cap; absent/null retains the worker startup ceiling.
         /// Version 4 peers enforce the smaller of this cap and that ceiling.
         max_image_base64_bytes: Option<u64>,
+        /// Version 5 repeats discovery notices for a new conversation thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
         tool_use: ToolUse,
     },
     /// Cancel an in-flight tool call. Fire-and-forget: the original
@@ -117,6 +120,7 @@ mod tests {
             id: "1".into(),
             agent_id: uuid::Uuid::nil(),
             max_image_base64_bytes: Some(1234),
+            thread_id: Some("successor".into()),
             tool_use: ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo hi"}),
@@ -130,11 +134,13 @@ mod tests {
                 id,
                 tool_use,
                 max_image_base64_bytes,
+                thread_id,
                 ..
             } => {
                 assert_eq!(id, "1");
                 assert_eq!(tool_use.name, "bash");
                 assert_eq!(max_image_base64_bytes, Some(1234));
+                assert_eq!(thread_id.as_deref(), Some("successor"));
             }
             other => panic!("unexpected {other:?}"),
         }

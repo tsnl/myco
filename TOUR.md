@@ -94,7 +94,7 @@ supplies model-specific settings. The catalog has no built-in model list.
 
 For what actually goes into the model's prompt, follow `build_model` back into
 [src/prompts/mod.rs](src/prompts/mod.rs). It combines policy fragments, exported
-manual guidance, the prelude, and project guidance. The
+manual guidance, the prelude, project guidance, and local skill metadata. The
 [prelude](src/prelude.rs) is durable prompt content stored as entries in the
 agent workspace. [src/manual/mod.rs](src/manual/mod.rs) exports embedded articles
 to a directory keyed by version and commit; [build.rs](build.rs) supplies the
@@ -212,7 +212,7 @@ finished tasks from accumulating over a long-lived connection.
 
 The [ToolService trait](src/tool_services/mod.rs) is the seam for an individual
 tool implementation: advertise schemas, dispatch a call, and optionally clean
-up resources belonging to a released session runtime. Three useful implementations to visit:
+up resources belonging to a released session runtime. Useful implementations to visit:
 
 - [BashService](src/tool_services/bash_service/mod.rs): one-shot commands and
   persistent process sessions. Read `execute`, then `run_oneshot` or
@@ -225,6 +225,21 @@ up resources belonging to a released session runtime. Three useful implementatio
 - [ViewImageService](src/tool_services/view_image_service.rs): image content
   returned to the model. Shared decoding and size limits live in
   [src/core/image.rs](src/core/image.rs).
+- [SkillsService](src/tool_services/skills_service.rs): explicit discovery and
+  notices after successful bash, editor, and image calls. Its bounded observation
+  cache belongs to the runtime owner, resets when the conversation thread changes,
+  and is released with that owner. Discovery
+  does not create a retained resource that keeps idle host workers alive.
+
+[src/skills/](src/skills/) supplies the shared filesystem scanner and metadata
+parser, below prompts and host services. It checks known layouts in the operated
+directory, ancestors through the nearest Git root, and the host user's home.
+Descriptor-relative opens reject symlinked layouts and manifests; work and output
+are bounded. Catalogs retain paths to distinguish duplicate names and report
+partial scans. The model reads selected instructions through the editor, keeping
+discovery separate from skill execution and permission policy. Bash observations
+use the worker's launch directory; `skills(path, host)` covers explicit directory
+changes without parsing shell commands.
 
 The external programs myco spawns are named in
 [src/external_command.rs](src/external_command.rs); startup preflight uses that
@@ -286,14 +301,23 @@ sessions; `session_meta` also searches saved excerpts and legacy console tails.
 
 Compaction crosses three boundaries while holding the session writer:
 
-1. [src/chat/compact_worker.rs](src/chat/compact_worker.rs) runs a hidden agent
-   that reads the active thread and writes a fresh summary.
+1. [src/chat/compact_worker.rs](src/chat/compact_worker.rs) supplies the summary
+   prompt, restricted history tools, retry policy, and freshness check to
+   [src/chat/auxiliary.rs](src/chat/auxiliary.rs). The auxiliary runner creates a
+   hidden parent-linked session, holds its child writer lock, checkpoints its
+   agent, bounds provider requests including retries, and saves failed or
+   cancelled work for inspection.
 2. [src/session/compact.rs](src/session/compact.rs) builds a successor thread
    with the summary first and bounded recent context afterward. Copied context
    sheds old identity stamps; the original thread remains intact.
 3. `SessionWriter::commit_thread` checks the predecessor, appends the thread to
    the latest session metadata, and saves atomically before switching the live
    document. The runner binds the agent to that thread and rewires checkpoints.
+
+The auxiliary runner returns output to its caller; it does not install parent
+context or grant tools beyond the supplied executor. Compaction remains responsible
+for accepting a summary and building a successor. The helper provides this shared
+lifecycle without introducing additional worker roles or an approval policy.
 
 The session ID, writer lock, metadata, and runtime stay
 in place. [SessionHistoryTool](src/tool_services/session_history_service.rs)
@@ -326,6 +350,8 @@ seeds their context from a saved checkpoint.
 | Tool concurrency, history integrity | `Agent::run` in [agent](crates/myco-agent/src/lib.rs) |
 | Remote connection failures | [controller](src/host/host_controller.rs), then [SSH setup](src/harness/ssh.rs) |
 | Tool behavior | [tool_services](src/tool_services/mod.rs) and its implementation tests |
+| Skill discovery and catalog notices | [scanner](src/skills/mod.rs) and [host service](src/tool_services/skills_service.rs) |
+| Hidden inference worker lifecycle | [auxiliary runner](src/chat/auxiliary.rs) and [compaction role](src/chat/compact_worker.rs) |
 | Saved threads or compaction | [session](src/session/mod.rs) and [chat](src/chat/mod.rs) |
 | Live tool lifetime across agents | [session runtime](src/session_runtime.rs) |
 | Browser rendering | [Browser assets](src/bin/browser/assets/), projection, and Markdown renderer |
