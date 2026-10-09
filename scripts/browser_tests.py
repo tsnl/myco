@@ -1542,6 +1542,37 @@ context_window = 100000
         self.process, _ = self.launch(port=urlsplit(self.origin).port)
         expect(frame).to_have_attribute('data-state', 'ready', timeout=15000)
 
+    def test_state_borders_stay_visible_and_composer_aligns_with_tool_cards(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        tool, composer = page.locator('.tool.running').first, page.locator('#composer')
+        expect(tool).to_be_visible()
+        for width in [1200, 820, 650, 390]:
+            page.set_viewport_size({'width': width, 'height': 850})
+            card, input_box = tool.bounding_box(), composer.bounding_box()
+            self.assertAlmostEqual(card['x'], input_box['x'], delta=1)
+            self.assertAlmostEqual(card['width'], input_box['width'], delta=1)
+        page.set_viewport_size({'width': 1200, 'height': 850})
+        for phase in [0, 1200, 2400]:
+            page.evaluate("""time => document.getAnimations().forEach(animation => {
+                if (['running-border', 'composer-orbit'].includes(animation.animationName)) {
+                    animation.pause(); animation.currentTime = time;
+                }
+            })""", phase)
+            for panel in [tool, composer]:
+                expect(panel).to_have_css('border-top-width', '2px')
+                expect(panel).to_have_css('border-top-color', 'rgb(139, 213, 220)')
+                self.assertNotEqual(panel.evaluate('n => getComputedStyle(n).boxShadow'), 'none')
+        for state, color in [('done', 'rgb(166, 218, 149)'), ('failed', 'rgb(237, 135, 150)'), ('unknown', 'rgb(229, 200, 144)')]:
+            page.locator('.tool').first.evaluate('(n, state) => n.className = `tool ${state}`', state)
+            panel = page.locator('.tool').first
+            expect(panel).to_have_css('border-top-color', color)
+            expect(panel).to_have_css('border-top-width', '2px')
+            self.assertNotEqual(panel.evaluate('n => getComputedStyle(n).boxShadow'), 'none')
+        page.locator('.tool').first.evaluate("n => n.className = 'tool running'")
+        page.screenshot(path=str(self.artifacts / 'steady-borders.png'))
+        page.click('#cancel')
+
     def test_background_button_keeps_process_alive_across_reload_and_cancellation_of_a_later_turn(self):
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')
@@ -2282,7 +2313,7 @@ context_window = 100000
         sky, glow = page.locator("#sky"), page.locator(".sky-glow")
         expect(sky).to_have_attribute("data-weather", "live")
         expect(sky).to_have_attribute("data-clouds", "ready")
-        glass = lambda: page.locator('.toolbar').evaluate("n => getComputedStyle(n).backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number)")
+        glass = lambda: page.locator('.toolbar').evaluate("n => getComputedStyle(n, '::before').backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number)")
         day_glass = glass()
         self.assertGreater(day_glass[2], day_glass[0], 'Daylight glass should carry the cool sky tint')
         emission = lambda: page.locator('#composer-frame').evaluate("n => getComputedStyle(n).getPropertyValue('--composer-emission').match(/[\\d.]+/g).map(Number)")

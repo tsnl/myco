@@ -94,6 +94,12 @@ sky. Their tint follows the same light: cool blue in daylight, warm rose and amb
 around dawn and dusk, and deeper blue at night. Overcast weather softens the tint.
 The conversation stays in a central well, with the sky visible on both sides;
 its glass background continues below the viewport during native scroll bounce.
+The top bar stays fixed, with its glass extending above the viewport to keep
+both scroll limits covered. Native conversation scrolling and bounce remain
+enabled.
+The input bar aligns with tool cards. Colored state borders stay solid and two
+pixels wide; matching shadows lift those panels from the glass. Activity
+animations add light without dimming the base border.
 Floating controls use background blur. The conversation well is the lightest
 surface; the input bar and top banner share darker translucent glass, with
 dialogs darkest in front. Translucent clouds drift slowly in three
