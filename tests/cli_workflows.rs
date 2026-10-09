@@ -362,11 +362,11 @@ async fn gateway_cap_compacts_accumulated_tool_images_before_upload_and_continue
     let saved = env.saved(&id);
     assert_eq!(saved.threads().len(), 2);
     let active = serde_json::to_string(&saved.active_thread().messages).unwrap();
-    assert!(active.contains("Earlier answer."));
-    assert!(active.contains("inspect the images"));
-    assert!(active.contains("Image omitted to reduce request size"));
+    assert!(active.contains("Finish the pending task."));
+    assert!(active.len() < 64 * 1024);
     assert!(!active.contains("myco-image:sha256:"));
     let original = serde_json::to_string(&saved.threads()[0]).unwrap();
+    assert!(original.contains("Earlier answer."));
     assert!(original.contains("inspect the images"));
     assert_eq!(
         original.matches("myco-image:sha256:").count(),
