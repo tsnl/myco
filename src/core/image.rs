@@ -6,6 +6,7 @@
 //! resolved once in [`crate::config`] and passed down; this layer only
 //! enforces the number it is handed.
 
+use std::io::Read;
 use std::path::Path;
 
 use base64::Engine as _;
@@ -57,7 +58,30 @@ pub fn read_image_data_url(
     label: &str,
     max_base64_bytes: u64,
 ) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
+    let bytes = read_image_bytes(path, label, max_base64_bytes)?;
+    image_data_url(&bytes, label, max_base64_bytes)
+}
+
+/// Check the opened file and bound the read even if it grows after metadata.
+pub(crate) fn read_image_bytes(
+    path: &Path,
+    label: &str,
+    max_base64_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Opening a FIFO must not block before we can reject it as non-regular.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("cannot read image {label}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect image {label}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("image {label} must be a regular file"));
     }
@@ -71,8 +95,16 @@ pub fn read_image_data_url(
             mib(max_base64_bytes),
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read image {label}: {e}"))?;
-    image_data_url(&bytes, label, max_base64_bytes)
+    let mut bytes = Vec::new();
+    file.take((max_base64_bytes / 4) * 3 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read image {label}: {e}"))?;
+    if base64_len(bytes.len() as u64) > max_base64_bytes {
+        return Err(format!(
+            "image {label} grew beyond its {max_base64_bytes}-byte base64 limit; resize it before retrying"
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Validate and encode uploaded or file bytes using the same format and size policy.

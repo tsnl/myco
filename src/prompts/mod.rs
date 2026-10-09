@@ -30,9 +30,11 @@ pub fn auto_compact_notice(threshold: Option<u64>, context_window: u64) -> Strin
          Long tool loops can compact repeatedly as context grows. An answer triggers at most \
          one compact-and-continue cycle per submission. Estimates include new input and tool results \
          but are not exact tokenizer counts. An oversized successor estimate suspends automatic \
-         compaction pending its next provider usage report. If compaction fails or that reported \
-         prompt remains above the threshold, automatic compaction is disabled until \
-         manual compaction succeeds or another session is opened. Cancellation stops continuation."
+         compaction pending its next provider usage report. With auto-continue off, transient \
+         compaction response failures retry within the worker's request budget; other failures \
+         stop the run with its original history retained, and later submissions can try again. \
+         If the next reported prompt remains above the threshold, automatic compaction is disabled \
+         until manual compaction succeeds or another session is opened. Cancellation stops continuation."
     )
 }
 

@@ -6,13 +6,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::SessionRuntime;
-use crate::agent::{Agent, AgentInteractionError, RunOutcome, StateError};
+use crate::agent::{Agent, AgentEvent, AgentInteractionError, EventSink, RunOutcome, StateError};
 use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{CatalogModel, Content, GenerateError, GenerativeModel, Message};
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionWriter, Thread};
 
-use super::session_turn::{Submission, finish_turn, run_turn};
+use super::session_turn::{Submission, finish_turn, run_turn, settle_stopped_run};
 use super::{
     CompactWorkerError, SessionTurnOutcome, persist_session, run_compact_worker, wire_checkpoint,
 };
@@ -23,6 +23,16 @@ pub trait Compactor: Send + Sync {
         predecessor: Session,
         cancel: CancelToken,
     ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>>;
+
+    /// Observe recovery while preserving the same worker's request budget.
+    fn compact_observed(
+        self: Arc<Self>,
+        predecessor: Session,
+        cancel: CancelToken,
+        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
+    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        self.compact(predecessor, cancel)
+    }
 }
 
 pub struct ModelCompactor {
@@ -40,10 +50,55 @@ impl Compactor for ModelCompactor {
             run_compact_worker(&predecessor, &self.model, self.max_requests, cancel).await
         })
     }
+
+    fn compact_observed(
+        self: Arc<Self>,
+        predecessor: Session,
+        cancel: CancelToken,
+        observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
+    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        Box::pin(async move {
+            super::compact_worker::run_compact_worker_with_sink(
+                &predecessor,
+                &self.model,
+                self.max_requests,
+                cancel,
+                Arc::new(CompactionObserver(observer)),
+            )
+            .await
+        })
+    }
+}
+
+struct CompactionObserver(Arc<dyn Fn(WorkflowEvent) + Send + Sync>);
+
+impl EventSink for CompactionObserver {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::Failure {
+            failure,
+            attempt,
+            max_attempts,
+            retry_in: Some(delay),
+            ..
+        } = event
+        {
+            (self.0)(WorkflowEvent::Warning(format!(
+                "compaction response interrupted; retrying {}/{} in {:.1}s: {}",
+                attempt + 1,
+                max_attempts,
+                delay.as_secs_f64(),
+                failure.cause
+            )));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
+    Retrying {
+        error: String,
+        delay: std::time::Duration,
+    },
     Compacting {
         session_id: String,
         thread_id: String,
@@ -99,7 +154,7 @@ impl SessionRunner {
     pub fn set_compactor(&mut self, compactor: Arc<dyn Compactor>, auto_compact_at: Option<u64>) {
         self.workflow.compactor = Some(compactor);
         self.workflow.threshold = auto_compact_at.map(|tokens| tokens.max(1));
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
     }
 
     pub fn set_observer(&mut self, observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>) {
@@ -117,14 +172,9 @@ impl SessionRunner {
         model: Arc<dyn GenerativeModel>,
         info: ModelInfo,
     ) -> Result<(), AgentInteractionError> {
-        if !self.agent.state().is_idle() {
-            return Err(StateError::Busy.into());
-        }
         let session = self.runtime.session().clone();
         let _writer = session.writer().await;
-        if self.agent.checkpoint_failed() {
-            self.agent.checkpoint()?;
-        }
+        settle_stopped_run(&mut self.agent)?;
         let mut next = self.agent.state().clone();
         if crate::RuntimeRecord::latest(self.agent.history()).is_some_and(|old| old.model != info) {
             next.replace_context(self.agent.history().to_vec(), None)?;
@@ -161,7 +211,7 @@ impl SessionRunner {
         runtime.bind_agent(&mut self.agent)?;
         wire_checkpoint(&mut self.agent, runtime.session());
         self.runtime = runtime;
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
         self.workflow.resume_notice = true;
         self.forked = false;
         self.workflow
@@ -232,16 +282,25 @@ impl SessionRunner {
         let start = self.agent.state().effect().is_none();
         let result = self
             .workflow
-            .drive(&mut self.agent, &self.runtime, &writer, cancel, start)
+            .drive(
+                &mut self.agent,
+                &self.runtime,
+                &writer,
+                cancel.clone(),
+                start,
+            )
             .await;
         let observer = self.workflow.observer.clone();
         finish_turn(
             &mut self.agent,
             &self.runtime,
             &writer,
+            &self.workflow,
+            &cancel,
             result,
             move |warning| observer(WorkflowEvent::Warning(warning.into())),
         )
+        .await
     }
 
     /// Manual compaction ends at the new context; only automatic compaction continues work.
@@ -255,6 +314,7 @@ impl SessionRunner {
             _ = cancel.cancelled() => return Err(AgentInteractionError::Cancelled),
             writer = session.writer() => writer,
         };
+        settle_stopped_run(&mut self.agent)?;
         let outcome = self
             .workflow
             .compact(
@@ -265,7 +325,7 @@ impl SessionRunner {
                 CompactionMode::Manual,
             )
             .await?;
-        self.workflow.auto_failed = false;
+        self.workflow.auto_ineffective = false;
         Ok(outcome)
     }
 }
@@ -282,10 +342,11 @@ pub(super) struct Workflow {
     resume_notice: bool,
     compactor: Option<Arc<dyn Compactor>>,
     threshold: Option<u64>,
-    auto_failed: bool,
+    auto_ineffective: bool,
     compacted_after_completion: bool,
     awaiting_compacted_usage: bool,
     skip_preflight: bool,
+    recovering_size_error: bool,
     observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
     followups: Option<super::FollowupHandler>,
 }
@@ -297,10 +358,11 @@ impl Default for Workflow {
             resume_notice: false,
             compactor: None,
             threshold: None,
-            auto_failed: false,
+            auto_ineffective: false,
             compacted_after_completion: false,
             awaiting_compacted_usage: false,
             skip_preflight: false,
+            recovering_size_error: false,
             observer: Arc::new(|_| {}),
             followups: None,
         }
@@ -308,6 +370,47 @@ impl Default for Workflow {
 }
 
 impl Workflow {
+    /// Retry a synchronous operation that retains its own uncommitted state.
+    pub(super) async fn retry<T>(
+        &self,
+        runtime: &SessionRuntime,
+        cancel: &CancelToken,
+        mut operation: impl FnMut() -> Result<T, AgentInteractionError>,
+    ) -> Result<T, AgentInteractionError> {
+        let mut retry = super::autonomy::Retry::default();
+        loop {
+            match operation() {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    retry
+                        .wait(error, runtime.session(), cancel, &*self.observer)
+                        .await?
+                }
+            }
+        }
+    }
+
+    /// Input/system updates mutate the live agent before checkpointing. Once
+    /// applied, only retry the save; never append that input a second time.
+    pub(super) async fn checkpointed_update(
+        &self,
+        agent: &mut Agent,
+        runtime: &SessionRuntime,
+        cancel: &CancelToken,
+        mut update: impl FnMut(&mut Agent) -> Result<(), AgentInteractionError>,
+    ) -> Result<(), AgentInteractionError> {
+        let mut applied = false;
+        self.retry(runtime, cancel, || {
+            if applied {
+                return agent.checkpoint();
+            }
+            let result = update(agent);
+            applied = result.is_ok() || matches!(result, Err(AgentInteractionError::Checkpoint(_)));
+            result
+        })
+        .await
+    }
+
     pub(super) async fn runtime_notice(
         &mut self,
         agent: &Agent,
@@ -345,14 +448,49 @@ impl Workflow {
         cancel: CancelToken,
         start: bool,
     ) -> Result<RunOutcome, AgentInteractionError> {
+        if start {
+            self.recovering_size_error = false;
+            self.skip_preflight = false;
+            self.compacted_after_completion = false;
+            self.awaiting_compacted_usage = false;
+            self.checkpointed_update(agent, runtime, &cancel, |agent| {
+                super::autonomy::announce(agent, runtime.session())
+            })
+            .await?;
+        }
+        let mut start = start;
+        let mut retry = super::autonomy::Retry::default();
+        loop {
+            match self
+                .drive_until_error(agent, runtime, writer, cancel.clone(), start)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    retry
+                        .wait(error, runtime.session(), &cancel, &*self.observer)
+                        .await?
+                }
+            }
+            start = agent.state().effect().is_none();
+        }
+    }
+
+    async fn drive_until_error(
+        &mut self,
+        agent: &mut Agent,
+        runtime: &Arc<SessionRuntime>,
+        writer: &SessionWriter,
+        cancel: CancelToken,
+        start: bool,
+    ) -> Result<RunOutcome, AgentInteractionError> {
+        if agent.checkpoint_failed() {
+            agent.checkpoint()?;
+        }
         self.record_runtime(agent, runtime).await?;
         if start {
             agent.start_run()?;
-            self.compacted_after_completion = false;
-            self.awaiting_compacted_usage = false;
-            self.skip_preflight = false;
         }
-        let mut recovering_size_error = false;
         loop {
             self.deliver_followups(agent, runtime, &cancel)?;
             if matches!(
@@ -369,7 +507,7 @@ impl Workflow {
                 let reached = self.threshold_reached(Some(agent.context_tokens_estimate()));
                 if std::mem::take(&mut self.skip_preflight) {
                     if reached {
-                        self.auto_failed = true;
+                        self.auto_ineffective = true;
                         (self.observer)(WorkflowEvent::Warning("compaction did not reduce the estimated text prompt below its threshold; automatic compaction is suspended pending the next provider usage report. Manual compaction or a session change also resets it. Token estimates are approximate; request-size recovery remains available.".into()));
                     }
                 } else if reached {
@@ -378,7 +516,11 @@ impl Workflow {
                     continue;
                 }
             }
-            let result = agent.step(cancel.clone()).await;
+            let result = if runtime.session().with(|session| session.auto_continue) {
+                agent.step_once(cancel.clone()).await
+            } else {
+                agent.step(cancel.clone()).await
+            };
             if let Err(error @ AgentInteractionError::Checkpoint(_)) = result {
                 return Err(error);
             }
@@ -395,10 +537,10 @@ impl Workflow {
                     }
                     // A rejected compacted request must not loop through more
                     // summaries. Allow recovery again only after model progress.
-                    if recovering_size_error || self.compactor.is_none() {
+                    if self.recovering_size_error || self.compactor.is_none() {
                         return Err(error);
                     }
-                    recovering_size_error = true;
+                    self.recovering_size_error = true;
                     match self
                         .compact(
                             agent,
@@ -425,17 +567,17 @@ impl Workflow {
                 }
                 result => result?,
             };
-            recovering_size_error = false;
+            self.recovering_size_error = false;
             let used = agent.last_usage().map(|usage| usage.context_tokens());
             if self.awaiting_compacted_usage && used.is_some() {
                 self.awaiting_compacted_usage = false;
                 // A conservative successor estimate can suspend preflight
                 // until this measurement establishes the actual input size.
-                self.auto_failed = self
+                self.auto_ineffective = self
                     .threshold
                     .zip(used)
                     .is_some_and(|(threshold, used)| used >= threshold);
-                if self.auto_failed {
+                if self.auto_ineffective {
                     (self.observer)(WorkflowEvent::Warning("compaction did not reduce the prompt below its threshold; automatic compaction disabled until manual compaction or a session change".into()));
                 }
             }
@@ -448,15 +590,16 @@ impl Workflow {
                 && self.threshold_reached(used);
             if should_compact {
                 self.compacted_after_completion |= outcome.is_some();
-                if self
-                    .auto_compact(agent, runtime, writer, cancel.clone())
-                    .await?
-                {
-                    continue;
-                }
+                self.auto_compact(agent, runtime, writer, cancel.clone())
+                    .await?;
+                continue;
             }
             if let Some(outcome) = outcome {
                 if self.deliver_followups(agent, runtime, &cancel)? {
+                    continue;
+                }
+                if super::autonomy::continue_after(agent, runtime.session(), &outcome, &cancel)? {
+                    self.compacted_after_completion = false;
                     continue;
                 }
                 return Ok(outcome);
@@ -465,7 +608,7 @@ impl Workflow {
     }
 
     fn threshold_reached(&self, used: Option<u64>) -> bool {
-        !self.auto_failed
+        !self.auto_ineffective
             && self
                 .threshold
                 .zip(used)
@@ -478,19 +621,12 @@ impl Workflow {
         runtime: &Arc<SessionRuntime>,
         writer: &SessionWriter,
         cancel: CancelToken,
-    ) -> Result<bool, AgentInteractionError> {
+    ) -> Result<(), AgentInteractionError> {
         match self
             .compact(agent, runtime, writer, cancel, CompactionMode::Automatic)
             .await
         {
-            Ok(_) => Ok(true),
-            Err(AgentInteractionError::Compaction(reason)) => {
-                self.auto_failed = true;
-                (self.observer)(WorkflowEvent::Warning(format!(
-                    "auto-compaction failed: {reason}; disabled until manual compaction or a session change"
-                )));
-                Ok(false)
-            }
+            Ok(_) => Ok(()),
             Err(AgentInteractionError::Cancelled) => {
                 agent.cancel_at_boundary()?;
                 Err(AgentInteractionError::Cancelled)
@@ -531,36 +667,32 @@ impl Workflow {
             .compactor
             .clone()
             .ok_or_else(|| AgentInteractionError::Compaction("no compactor configured".into()))?;
-        self.record_runtime(agent, runtime).await?;
-        persist_session(agent, runtime.session(), true)
-            .map_err(AgentInteractionError::Checkpoint)?;
+        if !agent.history().is_empty()
+            && let Some(notice) = self.runtime_notice(agent, runtime).await
+        {
+            if automatic {
+                self.checkpointed_update(agent, runtime, &cancel, |agent| {
+                    agent.append_system(vec![notice.clone()])
+                })
+                .await?;
+            } else {
+                agent.append_system(vec![notice])?;
+            }
+        }
+        self.compact_retry(mode, runtime, &cancel, || {
+            persist_session(agent, runtime.session(), true)
+                .map_err(AgentInteractionError::Checkpoint)
+        })
+        .await?;
         let predecessor = runtime.session().snapshot();
         (self.observer)(WorkflowEvent::Compacting {
             session_id: predecessor.id.clone(),
             thread_id: predecessor.active_thread().id.clone(),
             automatic,
         });
-        let started = std::time::Instant::now();
-        let mut work = compactor.compact(predecessor, cancel.clone());
-        let mut progress = tokio::time::interval(std::time::Duration::from_secs(10));
-        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        progress.tick().await;
-        let result = loop {
-            tokio::select! {
-                biased;
-                result = &mut work => break result,
-                _ = progress.tick() => (self.observer)(WorkflowEvent::CompactionProgress {
-                    elapsed: started.elapsed(),
-                }),
-            }
-        };
-        if cancel.is_cancelled() {
-            return Err(AgentInteractionError::Cancelled);
-        }
-        let (mut successor, outcome) = result.map_err(|error| match error {
-            CompactWorkerError::Cancelled => AgentInteractionError::Cancelled,
-            CompactWorkerError::Failed(message) => AgentInteractionError::Compaction(message),
-        })?;
+        let (mut successor, outcome) = self
+            .summarize(compactor, predecessor, runtime, &cancel, automatic)
+            .await?;
         if mode == CompactionMode::RequestSize {
             omit_rejected_images(&mut successor, &outcome);
         }
@@ -573,17 +705,95 @@ impl Workflow {
                 }],
             });
         }
-        writer
-            .commit_thread(successor)
-            .map_err(AgentInteractionError::Checkpoint)?;
-        runtime.install_compacted_context(agent, automatic)?;
+        self.compact_retry(mode, runtime, &cancel, || {
+            writer
+                .commit_thread(successor.clone())
+                .map_err(AgentInteractionError::Checkpoint)
+        })
+        .await?;
+        self.compact_retry(mode, runtime, &cancel, || {
+            runtime.install_compacted_context(agent, automatic)
+        })
+        .await?;
         self.awaiting_compacted_usage = automatic;
         self.skip_preflight = automatic;
         wire_checkpoint(agent, runtime.session());
-        persist_session(agent, runtime.session(), true)
-            .map_err(AgentInteractionError::Checkpoint)?;
+        self.compact_retry(mode, runtime, &cancel, || {
+            persist_session(agent, runtime.session(), true)
+                .map_err(AgentInteractionError::Checkpoint)
+        })
+        .await?;
         (self.observer)(WorkflowEvent::Compacted(outcome.clone()));
         Ok(outcome)
+    }
+
+    async fn summarize(
+        &self,
+        compactor: Arc<dyn Compactor>,
+        predecessor: Session,
+        runtime: &SessionRuntime,
+        cancel: &CancelToken,
+        automatic: bool,
+    ) -> Result<(Thread, CompactOutcome), AgentInteractionError> {
+        let started = std::time::Instant::now();
+        let mut progress = tokio::time::interval(std::time::Duration::from_secs(10));
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        progress.tick().await;
+        let mut retry = super::autonomy::Retry::default();
+        loop {
+            let mut source = predecessor.clone();
+            // Keep the original task while observing mode changes between
+            // attempts. Explicit manual compaction retains configured retries.
+            source.auto_continue =
+                automatic && runtime.session().with(|session| session.auto_continue);
+            let mut work =
+                compactor
+                    .clone()
+                    .compact_observed(source, cancel.clone(), self.observer.clone());
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut work => break result,
+                    _ = progress.tick() => (self.observer)(WorkflowEvent::CompactionProgress {
+                        elapsed: started.elapsed(),
+                    }),
+                }
+            };
+            if cancel.is_cancelled() {
+                return Err(AgentInteractionError::Cancelled);
+            }
+            match result {
+                Ok(successor) => return Ok(successor),
+                Err(error) => {
+                    let error = match error {
+                        CompactWorkerError::Cancelled => AgentInteractionError::Cancelled,
+                        CompactWorkerError::Failed(message) => {
+                            AgentInteractionError::Compaction(message)
+                        }
+                    };
+                    if !automatic {
+                        return Err(error);
+                    }
+                    retry
+                        .wait(error, runtime.session(), cancel, &*self.observer)
+                        .await?;
+                }
+            }
+        }
+    }
+
+    async fn compact_retry<T>(
+        &self,
+        mode: CompactionMode,
+        runtime: &SessionRuntime,
+        cancel: &CancelToken,
+        mut operation: impl FnMut() -> Result<T, AgentInteractionError>,
+    ) -> Result<T, AgentInteractionError> {
+        if mode == CompactionMode::Manual {
+            operation()
+        } else {
+            self.retry(runtime, cancel, operation).await
+        }
     }
 }
 
@@ -619,6 +829,10 @@ fn replace_images_with_notice(parts: &mut [Content], notice: &str) {
 }
 
 #[cfg(test)]
+#[path = "compaction_retry_tests.rs"]
+mod compaction_retry_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{
         Mutex,
@@ -641,6 +855,7 @@ mod tests {
         sources: Mutex<Vec<Session>>,
         cancel: AtomicBool,
         failure: Option<&'static str>,
+        transient_failure: AtomicBool,
         break_store: Option<std::path::PathBuf>,
     }
 
@@ -654,6 +869,9 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 crate::agent::validate_context(&predecessor.active_thread().messages).unwrap();
                 self.sources.lock().unwrap().push(predecessor.clone());
+                if self.transient_failure.swap(false, Ordering::SeqCst) {
+                    return Err(CompactWorkerError::Failed("temporary outage".into()));
+                }
                 if let Some(reason) = self.failure {
                     return Err(CompactWorkerError::Failed(reason.into()));
                 }
@@ -1369,7 +1587,7 @@ mod tests {
                     .result
                     .unwrap();
                 assert_eq!(compactor.calls.load(Ordering::SeqCst), expected_compactions);
-                assert!(!runner.workflow.auto_failed);
+                assert!(!runner.workflow.auto_ineffective);
                 assert!(runner.agent().context_tokens_estimate() < 5_000);
             }
             assert_eq!(model.remaining(), 0);
@@ -1749,6 +1967,40 @@ mod tests {
                 assert_eq!(model.remaining(), 0);
                 assert_eq!(compactor.calls.load(Ordering::SeqCst), 0);
             }
+        });
+    }
+
+    #[test]
+    fn failed_auto_compaction_stops_work_and_a_later_submission_can_retry() {
+        let _home = temp_home("runner-compact-recovery");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer {
+                transient_failure: AtomicBool::new(true),
+                ..Default::default()
+            });
+            let (mut runner, model) = setup(
+                vec![
+                    output(90, None, TurnEndReason::EndTurn),
+                    output(20, None, TurnEndReason::EndTurn),
+                ],
+                compactor.clone(),
+            )
+            .await;
+            let error = submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap_err();
+            assert!(matches!(error, AgentInteractionError::Compaction(_)));
+            assert_eq!(model.remaining(), 1);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runner.runtime().session().snapshot().threads().len(), 1);
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(runner.runtime().session().snapshot().threads().len(), 2);
         });
     }
 

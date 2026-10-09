@@ -163,10 +163,14 @@ pub struct RetryPolicy {
     /// Total attempts including the first. `1` disables retry.
     pub max_attempts: u32,
     pub initial_backoff: std::time::Duration,
-    /// Ceiling on one wait, applied to a provider's `Retry-After` too, so a
-    /// hostile or mistaken header cannot park an unattended run for hours.
+    /// Ceiling on one wait. A longer provider minimum must stop retries rather
+    /// than cause an earlier request or an unbounded wait.
     pub max_backoff: std::time::Duration,
     pub backoff_multiplier: f64,
+    /// Optional elapsed recovery budget, starting at the first retryable failure.
+    /// Includes later waits and requests; the original request has no new deadline.
+    #[serde(default)]
+    pub max_elapsed: Option<std::time::Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -176,6 +180,7 @@ impl Default for RetryPolicy {
             initial_backoff: std::time::Duration::from_millis(500),
             max_backoff: std::time::Duration::from_secs(30),
             backoff_multiplier: 2.0,
+            max_elapsed: None,
         }
     }
 }
@@ -183,7 +188,8 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// Wait before `attempt` (1-based). Attempt 1 is the original send and
     /// never waits; `retry_after` is the provider's ask, honoured when it
-    /// exceeds the computed backoff and still capped by [`Self::max_backoff`].
+    /// exceeds the capped computed backoff. Callers must stop if the resulting
+    /// minimum exceeds [`Self::max_backoff`] or their remaining elapsed budget.
     ///
     /// No jitter: myco is one client per user, so there is no fleet to
     /// de-synchronise, and a deterministic schedule is one less thing to
@@ -202,8 +208,7 @@ impl RetryPolicy {
         let computed = std::time::Duration::from_millis(millis as u64);
         retry_after
             .unwrap_or(std::time::Duration::ZERO)
-            .max(computed)
-            .min(self.max_backoff)
+            .max(computed.min(self.max_backoff))
     }
 }
 
@@ -597,6 +602,39 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
         .collect()
 }
 
+/// Check an encoded image payload without decoding or copying it.
+pub fn check_image_size(encoded_bytes: u64, limit: u64) -> Result<(), GenerateError> {
+    if encoded_bytes > limit {
+        return Err(GenerateError::RequestTooLargeError(format!(
+            "image has {encoded_bytes} base64 bytes; the current model's max_image_base64_bytes is {limit}. Resize the image, compact the session, or select a model with a larger image limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate inline and legacy base64 images before constructing a provider body.
+/// Remote URLs carry no known payload size; the provider validates their content.
+/// Local references must be checked while resolving and never sent to a provider.
+pub fn validate_image_sizes(input: &[Message], limit: u64) -> Result<(), GenerateError> {
+    for part in input.iter().flat_map(Message::content) {
+        if let Content::Image { source } = part {
+            if source.starts_with("http://") || source.starts_with("https://") {
+                continue;
+            }
+            if source.starts_with("myco-image:") {
+                return Err(GenerateError::ExecutionError(
+                    "resolve local image references before calling a provider".into(),
+                ));
+            }
+            let payload = source
+                .split_once(',')
+                .map_or(source.as_str(), |(_, data)| data);
+            check_image_size(payload.len() as u64, limit)?;
+        }
+    }
+    Ok(())
+}
+
 /// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
 /// sends for the `j`-th tool_use of the assistant message at index `i`, and
 /// equally for the `j`-th result of the `ToolResults` message answering it.
@@ -715,6 +753,12 @@ impl GenerationFailure {
             retryable: true,
             retry_after,
         }
+    }
+}
+
+impl From<GenerateError> for GenerationFailure {
+    fn from(cause: GenerateError) -> Self {
+        Self::terminal(cause)
     }
 }
 
@@ -1005,8 +1049,8 @@ mod tests {
     }
 
     /// Backoff doubles from `initial_backoff`, stops at `max_backoff`, and a
-    /// provider's `Retry-After` wins when it asks for longer — still under the
-    /// cap, so a mistaken header cannot park an unattended run for hours.
+    /// provider's `Retry-After` remains a minimum; the caller decides whether
+    /// its budget permits waiting that long.
     #[test]
     fn retry_backoff_grows_caps_and_honours_retry_after() {
         use std::time::Duration;
@@ -1015,6 +1059,7 @@ mod tests {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(1000),
             backoff_multiplier: 2.0,
+            max_elapsed: None,
         };
 
         // Attempt 1 is the original send; it never waits.
@@ -1030,10 +1075,10 @@ mod tests {
             policy.backoff(2, Some(Duration::from_millis(500))),
             Duration::from_millis(500)
         );
-        // ...but is still capped.
+        // A provider minimum is never shortened to the policy's wait cap.
         assert_eq!(
             policy.backoff(2, Some(Duration::from_secs(3600))),
-            Duration::from_millis(1000)
+            Duration::from_secs(3600)
         );
         // A shorter one does not shrink the backoff.
         assert_eq!(

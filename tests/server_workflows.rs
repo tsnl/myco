@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 mod test_utils;
 
+#[path = "server_workflows/service.rs"]
+mod service;
+
 struct ServerEnv {
     dir: PathBuf,
     config: PathBuf,
@@ -291,6 +294,47 @@ fn configure_compact(env: &ServerEnv, server: &test_utils::StubHttpServer, enabl
         config.push_str("auto_compact_at = 1.0\n");
     }
     std::fs::write(&env.config, config).unwrap();
+}
+
+#[tokio::test]
+async fn server_recovers_after_a_tool_result_cannot_be_saved_without_replaying_the_tool() {
+    let env = ServerEnv::new("storage-recovery");
+    let provider = test_utils::StubHttpServer::sequence(vec![
+        model_tool(
+            "bash",
+            json!({"command": r#"
+            printf executed >> "$MYCO_HOME/effect"
+            mv "$MYCO_HOME/profiles/default/session" "$MYCO_HOME/saved-store"
+            printf unavailable > "$MYCO_HOME/profiles/default/session"
+        "#}),
+            100,
+        ),
+        model_answer("recovered successfully", 100),
+    ])
+    .await;
+    configure_compact(&env, &provider, false);
+    let server = Server::start(&env, &[]).await;
+    let id = server.create(None, false).await;
+    let failed = server.submit(&id, "run the task").await;
+    assert_eq!(failed["status"], "Stopped", "{failed}");
+    assert!(failed.to_string().contains("could not persist"));
+    assert_eq!(provider.connections(), 1);
+
+    let store = env.dir.join("profiles/default/session");
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(env.dir.join("saved-store"), store).unwrap();
+    let recovered = server.submit(&id, "storage is repaired; continue").await;
+    assert_eq!(recovered["status"], "Ready", "{recovered}");
+    assert!(recovered.to_string().contains("recovered successfully"));
+    assert_eq!(
+        std::fs::read_to_string(env.dir.join("effect")).unwrap(),
+        "executed"
+    );
+    assert_eq!(provider.connections(), 2);
+    let saved: myco::Session = serde_json::from_value(session_json(&env.dir, &id)).unwrap();
+    assert!(saved.active_thread().pending_operation.is_none());
+    myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+    server.stop().await;
 }
 
 #[tokio::test]

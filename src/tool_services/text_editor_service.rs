@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use ring::digest::{Context, SHA256, SHA256_OUTPUT_LEN};
 
 use super::*;
 
 /// Bound observations before they become history entries resent every turn.
 const MAX_VIEW_BYTES: u64 = 256 * 1024;
+
+type Fingerprint = [u8; SHA256_OUTPUT_LEN];
 
 /// Gives agents tools to view, create, and edit files, and handle its view, str_replace, create,
 /// and insert commands.
@@ -17,7 +22,7 @@ const MAX_VIEW_BYTES: u64 = 256 * 1024;
 #[derive(Default)]
 pub struct TextEditorService {
     /// Read fingerprints partitioned by session runtime owner.
-    read_files: Mutex<HashMap<uuid::Uuid, HashMap<PathBuf, u64>>>,
+    read_files: Mutex<HashMap<uuid::Uuid, HashMap<PathBuf, Fingerprint>>>,
 }
 
 impl TextEditorService {
@@ -158,17 +163,30 @@ fn require<T>(field: Option<T>, command: &str, name: &str) -> Result<T, String> 
 /// Content fingerprint for the read-stamp guard. Hashes the file bytes:
 /// mtime comparison misses external writes within the same filesystem clock
 /// granule, and byte identity is the property the guard actually promises.
-fn file_fingerprint(path: &Path) -> Result<u64, String> {
-    use std::hash::{Hash, Hasher};
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("Error reading file {path:?} to check if it was modified: {e}"))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(hasher.finish())
+fn file_fingerprint(path: &Path) -> Result<Fingerprint, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("Error opening file {path:?} to check if it was modified: {e}"))?;
+    fingerprint_reader(&mut file)
+        .map_err(|e| format!("Error reading file {path:?} to check if it was modified: {e}"))
+}
+
+/// A short ranged view still fingerprints all file bytes, including changes
+/// outside the viewed range, without allocating storage proportional to the file.
+fn fingerprint_reader(reader: &mut impl Read) -> io::Result<Fingerprint> {
+    let mut digest = Context::new(&SHA256);
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(digest.finish().as_ref().try_into().expect("SHA-256 length")),
+            Ok(count) => digest.update(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn ensure_mutated_file_already_read(
-    read_files: &HashMap<PathBuf, u64>,
+    read_files: &HashMap<PathBuf, Fingerprint>,
     path: &Path,
 ) -> Result<(), String> {
     let Some(read_fingerprint) = read_files.get(path) else {
@@ -581,6 +599,7 @@ mod tests {
                 agent_id: uuid::Uuid::nil(),
                 cancel: crate::core::CancelToken::new(),
                 background: crate::core::CancelToken::new(),
+                max_image_base64_bytes: None,
             },
         ))
     }
@@ -857,6 +876,58 @@ mod tests {
         );
         assert!(result.is_error);
         assert!(result_text(&result).contains("was not read"));
+    }
+
+    #[test]
+    fn ranged_views_detect_external_changes_outside_the_selected_lines() {
+        let tmp = temp_dir("editor-ranged-fingerprint");
+        let path = write_file(tmp.path(), "file", "visible\nhidden original\n");
+        let worker = harness();
+        let view = dispatch(
+            &worker,
+            json!({"command":"view", "path":path, "view_range":[1,1]}),
+        );
+        assert!(!view.is_error);
+        assert_eq!(result_text(&view), "visible");
+        std::fs::write(&path, "visible\nhidden modified\n").unwrap();
+        let edit = dispatch(
+            &worker,
+            json!({"command":"str_replace", "path":path, "old_str":"visible", "new_str":"edited"}),
+        );
+        assert!(edit.is_error);
+        assert!(result_text(&edit).contains("modified on disk"), "{edit:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "visible\nhidden modified\n"
+        );
+    }
+
+    #[test]
+    fn streaming_fingerprints_ignore_read_chunk_boundaries_and_retry_interruptions() {
+        struct Chunked<'a> {
+            bytes: &'a [u8],
+            interrupted: bool,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = buffer.len().min(3).min(self.bytes.len());
+                buffer[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        let bytes = b"same content, different read boundaries";
+        let expected = fingerprint_reader(&mut bytes.as_slice()).unwrap();
+        let actual = fingerprint_reader(&mut Chunked {
+            bytes,
+            interrupted: false,
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

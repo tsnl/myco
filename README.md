@@ -103,6 +103,10 @@ from stdin; piped input precedes an explicit prompt as context. Add `--resume SE
 to continue a saved conversation. `myco --mode cli` provides terminal chat with
 line editing, tool activity, `/compact`, and Ctrl-C cancellation. Both use the
 same sessions and automatic compaction as the browser; see `myco --help cli`.
+Use `myco --server http://localhost:8765/profiles/default --resume FULL_SESSION_ID
+-p "Continue"` to attach one-shot output to an existing server session. Add
+`--detach` and reconnect with the printed `--observe INSTANCE:REQUEST` token;
+tools keep running in the server profile workspace.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.

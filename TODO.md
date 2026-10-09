@@ -78,17 +78,19 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
       `auto_compact_at` fraction of `context_window`, checked at settled model/tool
       boundaries against the provider's reported prompt size. Runs the same worker
       as `/compact`, switches to the successor thread, and automatically continues
-      the task. Manual compaction waits for the next user message. Unset = off;
-      failed or ineffective automatic compaction stays disabled until manual
-      compaction or a session change.
+      the task. Manual compaction waits for the next user message. The default
+      threshold is the full context window. Compaction retries transient model
+      responses within the same worker and request budget with cancellable waits,
+      then stops on exhaustion with the original context retained. Ineffective summaries disable automatic
+      compaction until manual compaction or a session change.
   - Preserve decisions, paths, todos; drop raw tool noise.
   - > I like Zed's approach: new session, "resume from previous session".
 - [x] **Retry transient provider failures** — per-gateway `[gateways.NAME.retry]`
       (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `backoff_multiplier`),
-      applied by the agent before any response part arrives, honouring `Retry-After`.
-      Retry progress is visible and cancellable. Only pre-stream failures
-      (connection, 408, 429, 5xx) retry; deterministic statuses and mid-stream
-      failures still surface immediately.
+      applied by the agent from the last committed conversation boundary,
+      honouring `Retry-After`. Retry progress is visible and cancellable.
+      Transient transport failures, including broken streams, and retryable
+      statuses (408, 429, 5xx) retry; deterministic request errors stop the run.
 - [x] **Current token/context tracking** — browser footer shows input/output/cache
       usage and context consumption, including after reload.
 - [ ] **Cumulative usage and cost** — session totals and estimated cost; current
@@ -165,6 +167,11 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 ### Invocation surface
 
 - [x] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
+- [x] **Explicit service attachment** — existing-session `--server --resume -p`,
+      detach/reconnect, instance-bound deduplication, committed output receipts.
+- [ ] **CLI service discovery and private fallback** — preserve launch cwd/config,
+      strict readiness and single-writer ownership, and interactive client semantics.
+      Restart-safe native receipts need a durable acceptance/outcome contract.
 - [ ] **Terminal styling follow-up (deferred)** — scrolling chat is available;
       further visual parity with the browser was set aside to focus on the server.
 - [x] **User multimodal (images)** — browser picker, paste, drag/drop, and `@path`

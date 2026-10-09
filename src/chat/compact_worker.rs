@@ -13,7 +13,9 @@ use crate::generative_model::{
 use crate::session::{ActiveSession, CompactOutcome, Session, SessionKind, Thread, compact_thread};
 use crate::tool_services::{HostDispatchContext, SessionHistoryTool, ToolService};
 
-use crate::agent::{Agent, AgentInteractionError, NullEventSink, ToolExecutor, TraceContext};
+use crate::agent::{
+    Agent, AgentInteractionError, EventSink, NullEventSink, ToolExecutor, TraceContext,
+};
 
 const MAX_SUMMARY_CHARS: usize = 8_000;
 
@@ -140,9 +142,15 @@ async fn run_worker(
     }
 }
 
-/// A failed attempt can leave a summary behind. Require fresh contents so a
-/// worker that omits `write_summary` cannot silently reuse that stale context.
-fn read_fresh_summary(path: &Path, before: Option<&str>) -> Result<String, String> {
+/// A retry can legitimately write identical text. A successful write during this
+/// attempt proves freshness; the bytes alone cannot distinguish it from stale output.
+fn read_fresh_summary(path: &Path, written: bool) -> Result<String, String> {
+    if !written {
+        return Err(format!(
+            "worker finished without writing a new summary at {} (session unchanged)",
+            path.display()
+        ));
+    }
     let summary = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -155,13 +163,6 @@ fn read_fresh_summary(path: &Path, before: Option<&str>) -> Result<String, Strin
     if summary.trim().is_empty() {
         return Err(format!(
             "worker finished but summary file is empty ({})",
-            path.display()
-        ));
-    }
-    if before == Some(summary.as_str()) {
-        return Err(format!(
-            "worker finished without writing a new summary; {} still holds the previous \
-             compaction's text (session unchanged)",
             path.display()
         ));
     }
@@ -185,9 +186,13 @@ pub async fn run_compact_worker(
     max_requests: usize,
     cancel: CancelToken,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
-    run_compact_worker_with_model(predecessor, catalog_model, max_requests, cancel, |model| {
-        model
-    })
+    run_compact_worker_with_sink(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        Arc::new(NullEventSink),
+    )
     .await
 }
 
@@ -199,6 +204,45 @@ pub async fn run_compact_worker_with_model(
     cancel: CancelToken,
     wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    run_compact_worker_instrumented(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        wrap_model,
+        Arc::new(NullEventSink),
+    )
+    .await
+}
+
+/// Forward worker retry observations without changing its history or request budget.
+pub(crate) async fn run_compact_worker_with_sink(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    max_requests: usize,
+    cancel: CancelToken,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    run_compact_worker_instrumented(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        |model| model,
+        sink,
+    )
+    .await
+}
+
+async fn run_compact_worker_instrumented(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    max_requests: usize,
+    cancel: CancelToken,
+    wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    let auto_continue = predecessor.auto_continue;
     let worker_id = uuid::Uuid::new_v4();
     let worker_hex = uuid_simple_hex(worker_id);
     let mut worker_session = Session::new_hidden(
@@ -215,10 +259,7 @@ pub async fn run_compact_worker_with_model(
         CompactWorkerError::Failed(format!("could not save compact worker session: {error}"))
     })?;
 
-    // What the summary file holds before the worker runs, so a worker that never
-    // writes one cannot have stale text compacted in (see `read_fresh_summary`).
     let summary_path = predecessor.summary_path();
-    let summary_before = std::fs::read_to_string(&summary_path).ok();
 
     let tools = CompactTools::new(predecessor);
     let model = match generative_model::new(GenerativeModelConfig {
@@ -235,7 +276,6 @@ pub async fn run_compact_worker_with_model(
         }
     };
 
-    let sink = Arc::new(NullEventSink);
     let session = ActiveSession::new(worker_session.clone());
     let mut worker = Agent::with_context(
         Arc::new(CompactModel {
@@ -243,11 +283,12 @@ pub async fn run_compact_worker_with_model(
                 wrap_model(model),
                 crate::core::image_store::ImageStore::for_profile()
                     .map_err(CompactWorkerError::Failed)?,
+                catalog_model.spec.max_image_base64_bytes,
             ),
             requests: AtomicUsize::new(0),
             limit: max_requests,
         }),
-        tools,
+        tools.clone(),
         sink,
         TraceContext {
             agent_id: worker_id,
@@ -256,7 +297,12 @@ pub async fn run_compact_worker_with_model(
             thread_id: Some(worker_session.active_thread().id.clone()),
         },
     );
-    worker.set_retry_policy(catalog_model.backend.retry_policy());
+    let mut retry = catalog_model.backend.retry_policy();
+    if auto_continue {
+        // The parent session owns automatic retry timing, including provider hints.
+        retry.max_attempts = 1;
+    }
+    worker.set_retry_policy(retry);
     worker.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     super::wire_checkpoint(&mut worker, &session);
@@ -270,7 +316,7 @@ pub async fn run_compact_worker_with_model(
 
     result?;
 
-    let summary = read_fresh_summary(&summary_path, summary_before.as_deref())
+    let summary = read_fresh_summary(&summary_path, tools.summary_written.load(Ordering::SeqCst))
         .map_err(CompactWorkerError::Failed)?;
 
     compact_thread(predecessor, &summary)
@@ -307,6 +353,188 @@ mod tests {
     use crate::test_support::{ScriptedModel, temp_home};
     use futures::StreamExt;
     use serde_json::json;
+
+    fn test_catalog() -> CatalogModel {
+        crate::Config::resolve_with(
+            crate::ConfigUserSettings {
+                config_path: Some("/unused/config.toml".into()),
+                ..Default::default()
+            },
+            |_| None,
+            |_, _| {
+                Ok(toml::from_str(r#"
+                    [models.test]
+                    protocol = "openai-responses"
+                    base_url = "http://127.0.0.1:1"
+                    auth = { source = "none" }
+                    context_window = 100000
+                    retry = { max_attempts = 3, initial_backoff_ms = 7000, max_backoff_ms = 30000, backoff_multiplier = 1.0 }
+                "#).unwrap())
+            },
+            || Ok(vec![]),
+            |_| unreachable!(),
+        ).unwrap()
+        .models.get("test").unwrap().clone()
+    }
+
+    #[test]
+    fn a_successful_retry_can_rewrite_identical_summary_but_cannot_reuse_stale_output() {
+        let _home = temp_home("compact-identical-retry");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let catalog = test_catalog();
+            let summary = "# Goal\nPreserve the original task and constraints.";
+            for automatic in [false, true] {
+                let mut predecessor = Session::new("test");
+                predecessor.auto_continue = automatic;
+                predecessor.active_thread_mut().messages =
+                    vec![crate::test_support::user("original task")];
+                predecessor.save().unwrap();
+                let write = GenerateOutput {
+                    content: vec![],
+                    tool_uses: vec![ToolUse {
+                        name: "session_history".into(),
+                        input: json!({"action":"write_summary", "session_id":predecessor.id,
+                            "thread_id":predecessor.active_thread().id, "markdown":summary}),
+                    }],
+                    usage: None,
+                    turn_end_reason: TurnEndReason::ToolUse,
+                };
+                let done = GenerateOutput {
+                    content: vec![Content::Text {
+                        text: "summary ready".into(),
+                    }],
+                    tool_uses: vec![],
+                    usage: None,
+                    turn_end_reason: TurnEndReason::EndTurn,
+                };
+                let failed = ScriptedModel::from_results(vec![
+                    Ok(write.clone()),
+                    Err(GenerateError::ExecutionError(
+                        "failed after summary write".into(),
+                    )),
+                ]);
+                let first = run_compact_worker_with_model(
+                    &predecessor,
+                    &catalog,
+                    8,
+                    CancelToken::new(),
+                    |_| failed.clone(),
+                )
+                .await;
+                assert!(matches!(first, Err(CompactWorkerError::Failed(text))
+                    if text.contains("failed after summary write")));
+                assert_eq!(
+                    std::fs::read_to_string(predecessor.summary_path()).unwrap(),
+                    summary
+                );
+                assert_eq!(failed.remaining(), 0);
+
+                let repaired = ScriptedModel::new(vec![write, done.clone()]);
+                let (successor, _) = run_compact_worker_with_model(
+                    &predecessor,
+                    &catalog,
+                    8,
+                    CancelToken::new(),
+                    |_| repaired.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    successor.predecessor_id.as_deref(),
+                    Some(predecessor.active_thread().id.as_str())
+                );
+                assert_eq!(
+                    std::fs::read_to_string(predecessor.summary_path()).unwrap(),
+                    summary
+                );
+                assert_eq!(repaired.remaining(), 0);
+
+                let stale = ScriptedModel::new(vec![done]);
+                let omitted = run_compact_worker_with_model(
+                    &predecessor,
+                    &catalog,
+                    8,
+                    CancelToken::new(),
+                    |_| stale.clone(),
+                )
+                .await;
+                assert!(matches!(omitted, Err(CompactWorkerError::Failed(text))
+                    if text.contains("without writing a new summary")));
+                assert_eq!(stale.remaining(), 0);
+                assert_eq!(
+                    Session::load(&predecessor.json_path())
+                        .unwrap()
+                        .threads()
+                        .len(),
+                    1
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_leaves_retry_timing_to_its_parent() {
+        struct Transient {
+            calls: AtomicUsize,
+            retry_after: Option<std::time::Duration>,
+        }
+        impl GenerativeModel for Transient {
+            fn generate(&self, _: &[Message]) -> AsyncStream<GenerationEvent> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let failure = GenerationFailure::transient(
+                    GenerateError::ExecutionError("compaction provider unavailable".into()),
+                    self.retry_after,
+                );
+                Box::pin(futures::stream::once(async {
+                    GenerationEvent::Failure(failure)
+                }))
+            }
+        }
+        let _home = temp_home("compact-parent-retry");
+        let catalog = test_catalog();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for automatic in [false, true] {
+                    for retry_after in [None, Some(std::time::Duration::from_secs(17))] {
+                        let mut predecessor = Session::new("test");
+                        predecessor.auto_continue = automatic;
+                        predecessor.save().unwrap();
+                        let model = Arc::new(Transient {
+                            calls: AtomicUsize::new(0),
+                            retry_after,
+                        });
+                        let started = tokio::time::Instant::now();
+                        let result = run_compact_worker_with_model(
+                            &predecessor,
+                            &catalog,
+                            8,
+                            CancelToken::new(),
+                            |_| model.clone(),
+                        )
+                        .await;
+                        assert!(matches!(result, Err(CompactWorkerError::Failed(text))
+                            if text.contains("compaction provider unavailable")));
+                        assert_eq!(
+                            model.calls.load(Ordering::SeqCst),
+                            if automatic { 1 } else { 3 }
+                        );
+                        let seconds = if automatic {
+                            0
+                        } else if retry_after.is_some() {
+                            34
+                        } else {
+                            14
+                        };
+                        assert_eq!(started.elapsed(), std::time::Duration::from_secs(seconds));
+                        assert!(!predecessor.summary_path().exists());
+                    }
+                }
+            });
+    }
 
     #[test]
     fn worker_can_only_read_its_thread_and_write_one_bounded_summary() {
@@ -370,6 +598,23 @@ mod tests {
         );
         assert_eq!(inner.remaining(), 1);
         crate::agent::validate_context(worker.history()).unwrap();
+        assert!(worker.state().pending_operation().is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_checkpoint_failure_stops_before_generating_or_writing_a_summary() {
+        let inner = ScriptedModel::new(vec![]);
+        let mut worker = Agent::new(
+            inner,
+            CompactTools::new(&Session::new("test")),
+            Arc::new(NullEventSink),
+        );
+        worker.set_checkpoint(Some(Box::new(|_| Err("storage unavailable".into()))));
+        let result = run_worker(&mut worker, "summarize".into(), CancelToken::new()).await;
+        assert!(
+            matches!(result, Err(CompactWorkerError::Failed(text)) if text.contains("storage unavailable"))
+        );
+        assert!(worker.checkpoint_failed());
         assert!(worker.state().pending_operation().is_none());
     }
 
@@ -472,15 +717,17 @@ mod tests {
         let previous = "# Summary of an earlier compaction\n";
         std::fs::write(&path, previous).unwrap();
 
-        let err = read_fresh_summary(&path, Some(previous)).expect_err("stale must be rejected");
+        let err = read_fresh_summary(&path, false).expect_err("stale must be rejected");
         assert!(err.contains("without writing a new summary"), "{err}");
         assert!(err.contains("session unchanged"), "{err}");
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
 
+        // A successful rewrite can be byte-identical after a failed attempt.
+        assert_eq!(read_fresh_summary(&path, true).unwrap(), previous);
         std::fs::write(&path, "# Fresh summary\n").unwrap();
         assert_eq!(
-            read_fresh_summary(&path, Some(previous)).unwrap(),
+            read_fresh_summary(&path, true).unwrap(),
             "# Fresh summary\n"
         );
     }
@@ -491,15 +738,14 @@ mod tests {
         let dir = tmp.path();
         let path = dir.join("s.summary.md");
 
-        let err = read_fresh_summary(&path, None).expect_err("missing must fail");
+        let err = read_fresh_summary(&path, true).expect_err("missing must fail");
         assert!(err.contains("summary missing"), "{err}");
 
         std::fs::write(&path, "   \n\t\n").unwrap();
-        let err = read_fresh_summary(&path, None).expect_err("empty must fail");
+        let err = read_fresh_summary(&path, true).expect_err("empty must fail");
         assert!(err.contains("summary file is empty"), "{err}");
 
-        // First-ever compaction: nothing there before, so any content is fresh.
         std::fs::write(&path, "# First\n").unwrap();
-        assert_eq!(read_fresh_summary(&path, None).unwrap(), "# First\n");
+        assert_eq!(read_fresh_summary(&path, true).unwrap(), "# First\n");
     }
 }

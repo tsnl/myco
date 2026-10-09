@@ -16,6 +16,19 @@ URL directly; there is no login, token, or browser cookie. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
 
+**Auto-continue** is an opt-in per-session control, off by default. When on, the
+runner supplies internal follow-up prompts after completed responses or exhausted
+output caps. The agent disables it with `session_meta action=disable_auto_continue`
+when finished or when it needs user input. The control works during a run: turning
+it off prevents further automatic follow-ups; **Stop** cancels the current run.
+The setting persists across compaction and restart, but enabling it or reopening
+a session does not start work. Generation, persistence, and automatic compaction
+errors retry after 1, 2, 4, then 5 seconds, remaining at 5 seconds until recovery.
+The latest error and wait appear in the transcript. Failed saves retain live state
+and retry before advancing, without repeating input or completed tools. Turning
+the control off or pressing **Stop** interrupts the wait. This mode has no retry
+count, spending, or elapsed-time limit.
+
 For remote access, start Myco on the remote host, then open an SSH tunnel from
 the computer running your browser:
 
@@ -447,9 +460,12 @@ the server uses its default and shows a notice.
 When the threshold is reached, the runner settles pending tools, saves a summary
 in a successor thread, and continues the task automatically. Queued follow-ups
 join that continued context. Manual **Compact** finishes after creating the
-thread and waits for your next message. Failed or ineffective automatic compaction
-shows a warning and disables further attempts until manual compaction or a session
-change; cancellation preserves the source thread.
+thread and waits for your next message. Transient compaction response failures retry
+within the worker's existing request budget, with visible, cancellable waits.
+The source thread and completed tool observations survive. Exhausted retries or
+terminal errors stop the run; a later message can try again.
+An ineffective summary disables further automatic compaction until manual
+compaction or a session change. Cancellation preserves the source thread.
 
 ## Running and resuming
 
@@ -515,6 +531,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions/ID/background` | `{"session_id":"ID","call_id":"UUID"}` → 202; use the running tool block's `background_id` |
 | `POST /api/sessions/ID/archive` | `{"session_id":"ID","archived":true}` → 204; false restores |
 | `POST /api/sessions/ID/rename` | `{"session_id":"ID","title":"New name"}` → 204; blank titles are rejected |
+| `POST /api/sessions/ID/auto-continue` | Persist the mode with `{"session_id":"ID","enabled":true}` (or false); allowed during a run |
 | `GET /api/events` | Server-sent events with session IDs, revisions, and changes |
 | `GET /files/PATH`, `HEAD /files/PATH` | Profile workspace files; GET supports a single `Range: bytes=START-END` |
 

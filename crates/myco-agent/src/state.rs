@@ -243,9 +243,20 @@ impl AgentState {
 
     /// Explicitly abandon work whose future was dropped. Completed observations
     /// survive; an executing tool batch is reconciled as unknown, never replayed.
+    /// Live intents that never began have known, unexecuted outcomes.
     pub fn recover_interrupted(&mut self) -> Result<(), StateError> {
-        let history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
-        self.replace_history(history, self.last_usage);
+        if self.executing {
+            let history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+            self.replace_history(history, self.last_usage);
+        } else if let Phase::Tools {
+            operation, count, ..
+        } = self.phase
+        {
+            let results = (0..count).map(|_| ToolResult::err(
+                "not executed: the run stopped before this tool batch began. Reconsider this action using the latest input before trying again.",
+            )).collect();
+            self.tools_completed(operation, results, true)?;
+        }
         self.phase = Phase::Ready;
         self.executing = false;
         Ok(())
@@ -322,6 +333,8 @@ impl AgentState {
         self.max_truncated_resumes = resumes;
     }
 
+    /// Retry a failed generation within its existing run budget. Appending new
+    /// input first transitions to Ready and begins a fresh run instead.
     pub fn start(&mut self) -> Result<Effect, StateError> {
         self.require_ready()?;
         if self.history.is_empty() {
@@ -329,8 +342,10 @@ impl AgentState {
                 "cannot run an empty context".into(),
             ));
         }
-        self.run_usage = None;
-        self.truncations = 0;
+        if !matches!(self.phase, Phase::GenerationFailed) {
+            self.run_usage = None;
+            self.truncations = 0;
+        }
         Ok(self.generate())
     }
 
@@ -399,17 +414,23 @@ impl AgentState {
         if !matches!(self.phase, Phase::Generating(id) if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
-        self.executing = false;
         if output
             .content
             .iter()
             .any(|part| matches!(part, Content::System { .. }))
         {
-            self.phase = Phase::Ready;
+            self.generation_failed(operation)?;
             return Err(StateError::InvalidResponse(
                 "model output contains a runtime-only system part".into(),
             ));
         }
+        if output.turn_end_reason == TurnEndReason::ToolUse && output.tool_uses.is_empty() {
+            self.generation_failed(operation)?;
+            return Err(StateError::InvalidResponse(
+                "turn ended in tool_use but streamed zero tool uses".into(),
+            ));
+        }
+        self.executing = false;
         if let Some(usage) = output.usage {
             self.context_size.observe_input(usage);
             self.run_usage = Some(TokenUsage {
@@ -430,11 +451,6 @@ impl AgentState {
             turn_end_reason: Some(reason.clone()),
         });
         self.phase = Phase::Ready;
-        if reason == TurnEndReason::ToolUse && calls.is_empty() {
-            return Err(StateError::InvalidResponse(
-                "turn ended in tool_use but streamed zero tool uses".into(),
-            ));
-        }
         let resume = if reason == TurnEndReason::MaxTokens {
             self.truncations = self.truncations.saturating_add(1);
             self.truncations <= self.max_truncated_resumes
@@ -840,6 +856,82 @@ mod tests {
                 .generated(next, response(TurnEndReason::MaxTokens, 0))
                 .unwrap(),
             Effect::Generate { .. }
+        ));
+    }
+
+    #[test]
+    fn restarting_failed_generation_preserves_usage_and_truncation_limits() {
+        let mut machine = state();
+        machine.set_max_truncated_resumes(1);
+        let first = generation(machine.start().unwrap());
+        let pending = generation(
+            machine
+                .generated(first, response(TurnEndReason::MaxTokens, 0))
+                .unwrap(),
+        );
+        machine.generation_failed(pending).unwrap();
+        let retried = generation(machine.start().unwrap());
+        assert_eq!(machine.run_usage().unwrap().output_tokens, 10);
+        assert!(matches!(
+            machine
+                .generated(retried, response(TurnEndReason::MaxTokens, 0))
+                .unwrap(),
+            Effect::Finished {
+                reason: TurnEndReason::MaxTokens,
+                ..
+            }
+        ));
+        assert_eq!(machine.run_usage().unwrap().output_tokens, 20);
+
+        machine.append_input(user("new task")).unwrap();
+        let fresh = generation(machine.start().unwrap());
+        assert!(machine.run_usage().is_none());
+        assert!(matches!(
+            machine
+                .generated(fresh, response(TurnEndReason::MaxTokens, 0))
+                .unwrap(),
+            Effect::Generate { .. }
+        ));
+        assert_eq!(machine.run_usage().unwrap().output_tokens, 10);
+    }
+
+    #[test]
+    fn invalid_outputs_leave_history_usage_and_truncation_budget_unchanged() {
+        let mut machine = state();
+        machine.set_max_truncated_resumes(1);
+        let first = generation(machine.start().unwrap());
+        let mut pending = generation(
+            machine
+                .generated(first, response(TurnEndReason::MaxTokens, 0))
+                .unwrap(),
+        );
+        let history = serde_json::to_value(machine.history()).unwrap();
+        let usage = machine.run_usage();
+        let mut system_output = response(TurnEndReason::EndTurn, 0);
+        system_output.content.push(Content::System {
+            kind: "invalid".into(),
+            text: "invalid".into(),
+            data: serde_json::Value::Null,
+        });
+        for output in [response(TurnEndReason::ToolUse, 0), system_output] {
+            machine.begin_effect(pending).unwrap();
+            assert!(matches!(
+                machine.generated(pending, output),
+                Err(StateError::InvalidResponse(_))
+            ));
+            assert_eq!(serde_json::to_value(machine.history()).unwrap(), history);
+            assert_eq!(machine.run_usage(), usage);
+            assert_eq!(machine.last_usage(), usage);
+            pending = generation(machine.start().unwrap());
+        }
+        assert!(matches!(
+            machine
+                .generated(pending, response(TurnEndReason::MaxTokens, 0))
+                .unwrap(),
+            Effect::Finished {
+                reason: TurnEndReason::MaxTokens,
+                ..
+            }
         ));
     }
 }

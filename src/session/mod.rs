@@ -85,6 +85,9 @@ pub struct Session {
     pub model: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// Opt-in continuation after a model finishes. Does not start work on load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_continue: bool,
     #[serde(deserialize_with = "thread::deserialize_threads")]
     threads: Vec<Thread>,
     /// Short human label; agent maintained.
@@ -257,6 +260,18 @@ impl ActiveSession {
 
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
         f(&mut self.lock())
+    }
+
+    /// Persist before exposing a mode change to a running session.
+    pub fn set_auto_continue(&self, enabled: bool) -> Result<(), String> {
+        let mut current = self.lock();
+        let mut updated = current.clone();
+        updated.auto_continue = enabled;
+        updated.touch();
+        updated.externalize_images()?;
+        updated.save()?;
+        *current = updated;
+        Ok(())
     }
 
     /// Save a title without replacing concurrent conversation or tool updates.
@@ -467,6 +482,7 @@ impl Session {
             updated_at: now,
             model: model.into(),
             archived: false,
+            auto_continue: false,
             threads: vec![Thread::new()],
             title: None,
             links: Vec::new(),
@@ -1124,7 +1140,7 @@ pub fn format_session_list_line(index: usize, entry: &SessionListEntry) -> Strin
 pub fn format_session_detail(session: &Session) -> String {
     let console = session.console_path();
     // (label incl. padding, value); `None` rows are omitted.
-    let rows: [(&str, Option<String>); 16] = [
+    let rows: [(&str, Option<String>); 17] = [
         ("id:        ", Some(session.id.clone())),
         (
             "path:      ",
@@ -1138,6 +1154,7 @@ pub fn format_session_detail(session: &Session) -> String {
         ("updated:   ", Some(session.updated_at.to_rfc3339())),
         ("model:     ", Some(session.model.clone())),
         ("archived:  ", Some(session.archived.to_string())),
+        ("auto_continue: ", Some(session.auto_continue.to_string())),
         ("thread:    ", Some(session.active_thread().id.clone())),
         ("threads:   ", Some(session.threads().len().to_string())),
         (

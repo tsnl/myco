@@ -184,15 +184,16 @@ async fn early_body_failure_respects_retry_budget_and_disable_setting() {
 }
 
 #[tokio::test]
-async fn malformed_sse_is_terminal_even_before_output() {
+async fn malformed_sse_retries_from_the_committed_boundary_even_before_output() {
     let server =
         StubHttpServer::sequence(vec![broken_stream("data: invalid json\n\n"), answer()]).await;
     let (mut agent, events) = agent(&server, 3);
     myco::chat::interact(&mut agent, prompt(), CancelToken::new())
         .await
-        .unwrap_err();
-    assert_eq!(server.connections(), 1);
+        .unwrap();
+    assert_eq!(server.connections(), 2);
+    assert_eq!(agent.history().len(), 2);
     assert!(
-        events.0.lock().unwrap().iter().any(|event| matches!(event, AgentEvent::Failure { failure, retry_in: None, .. } if !failure.retryable))
+        events.0.lock().unwrap().iter().any(|event| matches!(event, AgentEvent::Failure { failure, retry_in: Some(_), .. } if failure.retryable))
     );
 }

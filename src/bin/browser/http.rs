@@ -22,6 +22,9 @@ use super::{
     weather::{Coordinates, Weather},
 };
 
+#[path = "service_http.rs"]
+mod service;
+
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
 impl IntoResponse for Error {
@@ -29,6 +32,7 @@ impl IntoResponse for Error {
         let (status, message) = match self {
             Self::Invalid(e) => (StatusCode::BAD_REQUEST, e),
             Self::NotFound(e) => (StatusCode::NOT_FOUND, e),
+            Self::Gone(e) => (StatusCode::GONE, e),
             Self::Conflict(e) => (StatusCode::CONFLICT, e),
             Self::Unavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e),
             Self::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -39,6 +43,7 @@ impl IntoResponse for Error {
 
 pub(super) struct Server {
     pub(super) sessions: Sessions,
+    pub(super) identity: crate::service_protocol::Identity,
     weather: Weather,
     files: Files,
     base_path: String,
@@ -48,6 +53,7 @@ impl Server {
     pub(super) fn new(sessions: Sessions, files: Files) -> Self {
         Self {
             sessions,
+            identity: crate::service_protocol::Identity::new(),
             weather: Weather::new(),
             files,
             base_path: String::new(),
@@ -56,6 +62,7 @@ impl Server {
 
     pub(super) fn with_profile(mut self, profile: &str) -> Self {
         self.base_path = format!("/profiles/{profile}");
+        self.identity.profile = profile.into();
         self.files = self.files.with_base_path(self.base_path.clone());
         self
     }
@@ -64,6 +71,20 @@ impl Server {
 pub(super) fn router(server: Arc<Server>) -> Router {
     let base = server.base_path.clone();
     let routes = super::assets::routes(&base)
+        .route("/api/service", get(service::identity))
+        .route(
+            "/api/service/sessions/{id}/turns",
+            post(service::submit)
+                .layer(DefaultBodyLimit::max(super::attachments::ACTION_BODY_LIMIT)),
+        )
+        .route(
+            "/api/service/sessions/{id}/turns/{request}/output",
+            get(service::output),
+        )
+        .route(
+            "/api/service/sessions/{id}/turns/{request}/cancel",
+            post(service::cancel),
+        )
         .route("/api/sky/weather", get(sky_weather))
         .route("/api/sky/locations", get(sky_locations))
         .route("/api/events", get(events))
@@ -79,6 +100,10 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/sessions/{id}/background", post(session_background))
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/sessions/{id}/rename", post(session_rename))
+        .route(
+            "/api/sessions/{id}/auto-continue",
+            post(session_auto_continue),
+        )
         .route("/api/markdown", post(render_markdown))
         .route("/api/image", get(image))
         .route("/files/{*path}", get(workspace_file))
@@ -307,6 +332,30 @@ async fn session_archive(
 struct RenameRequest {
     session_id: String,
     title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutoContinueRequest {
+    session_id: String,
+    enabled: bool,
+}
+
+async fn session_auto_continue(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<AutoContinueRequest>,
+) -> Result<StatusCode, Error> {
+    if request.session_id != id {
+        return Err(Error::Conflict(
+            "The request belongs to a different session.".into(),
+        ));
+    }
+    server
+        .sessions
+        .set_auto_continue(id, request.enabled)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn session_rename(

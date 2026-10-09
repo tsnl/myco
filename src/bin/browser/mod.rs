@@ -62,7 +62,11 @@ async fn run_worker(args: Args) -> Result<(), String> {
     }
     println!(
         "{}",
-        serde_json::to_string(&profile_worker::Ready { launch_path }).map_err(|e| e.to_string())?
+        serde_json::to_string(&profile_worker::Ready {
+            launch_path,
+            identity: server.identity.clone()
+        })
+        .map_err(|e| e.to_string())?
     );
     let shutdown = server.clone();
     let result = axum::serve(listener, http::router(server.clone()))
