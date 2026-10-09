@@ -18,6 +18,7 @@ mod autonomy;
 mod runner;
 pub use runner::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 
+mod auxiliary;
 mod compact_worker;
 pub use compact_worker::{
     CompactWorkerError, compact_subagent_prompt, run_compact_worker, run_compact_worker_with_model,
