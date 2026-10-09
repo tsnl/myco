@@ -460,7 +460,7 @@ fn strip_host_field(tool_use: &mut generative_model::ToolUse) {
 /// Inject optional `host` into a host tool's JSON schema so models can target machines.
 ///
 /// Host tool schemas are static in-repo objects with a `properties` object
-/// (pinned by `standard_catalog_is_bash_editor_view_image_manual_only`), so
+/// (pinned by `standard_catalog_contains_only_host_tools`), so
 /// anything else is a bug worth a panic, not a fallback.
 fn inject_host_field(mut spec: generative_model::ToolSpec) -> generative_model::ToolSpec {
     let props = spec
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_catalog_is_bash_editor_view_image_only() {
+    fn standard_catalog_contains_only_host_tools() {
         let names: Vec<_> = crate::host::HostWorker::standard_tool_specs(
             crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
         )
@@ -598,9 +598,10 @@ mod tests {
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"str_replace_based_edit_tool".to_string()));
         assert!(names.contains(&"view_image".to_string()));
+        assert!(names.contains(&"skills".to_string()));
         // The manual is files on disk (`crate::manual::export`), not a tool.
         assert!(!names.contains(&"manual".to_string()), "{names:?}");
-        assert_eq!(names.len(), 3, "catalog grew unexpectedly: {names:?}");
+        assert_eq!(names.len(), 4, "catalog grew unexpectedly: {names:?}");
     }
 
     /// No standard tool may declare its own `host` property.

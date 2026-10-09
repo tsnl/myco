@@ -135,6 +135,7 @@ mod tests {
                     cancel: CancelToken::new(),
                     background: CancelToken::new(),
                     max_image_base64_bytes: None,
+                    thread_id: None,
                 },
             ),
         )

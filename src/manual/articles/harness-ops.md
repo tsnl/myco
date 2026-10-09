@@ -201,9 +201,10 @@ When tools fail or the user asks why something is broken, investigate with tools
    - On remote: `ssh -o BatchMode=yes <alias> 'command -v myco; myco --version'` via the
      **local** host's bash. Compare that path and version with the expected install;
      connection requires matching package and host-protocol versions. A protocol
-     mismatch names the host to rebuild before tool calls can run. Host protocol 4
-     carries each call's selected model image limit; version 3 workers must be rebuilt
-     before use, even when the package versions match. A missing call limit retains
+     mismatch names the host to rebuild before tool calls can run. Host protocol 5
+     includes `skills` in the standard host catalog; older workers must be rebuilt
+     before use, even when the package versions match. Each call also carries its
+     selected model image limit. A missing call limit retains
      the worker startup ceiling; no call can raise that ceiling.
      An interactive login may use a different PATH. If missing/outdated: install a
      **binary built for that platform** (matching release asset), or **build on that host**
@@ -224,6 +225,17 @@ When tools fail or the user asks why something is broken, investigate with tools
 2. **Wrong machine / wrong files**
    - Check whether `host` was set; default is always `local`.
    - `bash` `uname -n` / `pwd` / `hostname` on the intended `host`.
+   - For missing skills, call `skills` with the intended directory and host.
+     Relative paths use the worker's launch directory, even after a bash `cd`.
+     Check `.agents/skills`, `.claude/skills`, or `.grok/skills` in that directory,
+     its ancestors through the nearest Git root, and that host user's home.
+     Outside Git, ancestors are not scanned. Each skill needs its own directory
+     and a regular `SKILL.md` with `name` and `description` frontmatter.
+   - Read discovery warnings: symlinks, malformed metadata, unreadable paths,
+     and scan limits can exclude entries. Explicit discovery refreshes the
+     catalog; successful file operations also discover their operated directory.
+     Read a selected skill with the editor on the same host. Identical names
+     in different paths remain distinct skills.
 
 3. **Session / state confusion**
    - Conversation resume ≠ restored bash sessions or editor state.
