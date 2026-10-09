@@ -1,4 +1,4 @@
-//! Human follow-ups join a settled model context only after they are durable.
+//! Follow-ups join a settled model context only after they are durable.
 
 use std::sync::Arc;
 
@@ -24,6 +24,17 @@ pub fn append_followup(
     crate::core::image_store::ImageStore::for_profile()
         .and_then(|store| store.externalize(&mut content))
         .map_err(AgentInteractionError::Checkpoint)?;
+    append_at_boundary(agent, session, content, Some(accepted_at))
+}
+
+/// Human and automatic follow-ups share the same durable handoff. Internal
+/// prompts have no human acceptance timestamp.
+pub(super) fn append_at_boundary(
+    agent: &mut Agent,
+    session: &ActiveSession,
+    content: Vec<Content>,
+    accepted_at: Option<DateTime<Utc>>,
+) -> Result<(), AgentInteractionError> {
     let mut history = agent.history().to_vec();
     let index = history.len();
     history.push(Message::UserMessage { content });
@@ -33,7 +44,12 @@ pub fn append_followup(
         AgentInteractionError::Checkpoint("agent is not bound to a thread".into())
     })?;
     session
-        .persist_agent_state(thread_id, &next, false, Some((index, accepted_at)))
+        .persist_agent_state(
+            thread_id,
+            &next,
+            false,
+            accepted_at.map(|time| (index, time)),
+        )
         .map_err(AgentInteractionError::Checkpoint)?;
     agent.replace_at_boundary(history, agent.last_usage())?;
     super::wire_checkpoint(agent, session);

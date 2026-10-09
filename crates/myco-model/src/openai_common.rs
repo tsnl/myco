@@ -8,6 +8,20 @@
 
 use super::*;
 
+/// Only explicit transient codes permit replay; prose and unknown codes never do.
+/// https://developers.openai.com/api/docs/guides/error-codes
+/// https://developers.openai.com/api/reference/resources/responses/methods/retrieve
+pub(super) fn stream_failure(code: Option<&str>, message: String) -> GenerationFailure {
+    GenerationFailure {
+        cause: GenerateError::ExecutionError(message),
+        retryable: matches!(
+            code,
+            Some("server_error" | "rate_limit_exceeded" | "slow_down" | "server_is_overloaded")
+        ),
+        retry_after: None,
+    }
+}
+
 /// Settings for either OpenAI dialect ([`BackendConfig::OpenAIResponses`] /
 /// [`BackendConfig::OpenAICompletions`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

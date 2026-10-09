@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use myco::Session;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 mod test_utils;
@@ -83,6 +83,15 @@ impl CliEnv {
         )
         .unwrap();
     }
+
+    fn retry(&self, policy: &str) {
+        let original = std::fs::read_to_string(&self.config).unwrap();
+        std::fs::write(
+            &self.config,
+            format!("{original}\n[models.pipetest.retry]\n{policy}\n"),
+        )
+        .unwrap();
+    }
 }
 
 impl Drop for CliEnv {
@@ -140,6 +149,251 @@ fn summary(session: &Session) -> Vec<u8> {
             "markdown":"# Goal / active task\nFinish the pending task."
         }),
     )
+}
+
+#[tokio::test]
+async fn prolonged_provider_outage_recovers_without_replaying_completed_tools() {
+    let mut replies = vec![tool(
+        "bash",
+        json!({"command":"printf once >> effects.txt"}),
+    )];
+    replies.extend((0..4).map(|_| StubHttpServer::status_response(503, "temporary outage")));
+    replies.push(answer("Recovered.", 100));
+    let provider = StubHttpServer::sequence(replies).await;
+    let env = CliEnv::new(&provider, false);
+    env.retry("max_attempts=24\ninitial_backoff_ms=1\nmax_backoff_ms=2\nmax_elapsed_ms=300000");
+    let output = env.run(&["-p", "work"], b"").await;
+    assert_eq!(success(&output), "Recovered.\n");
+    assert_eq!(provider.connections(), 6);
+    assert_eq!(
+        std::fs::read_to_string(env.dir.join("effects.txt")).unwrap(),
+        "once"
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("retrying 5/24"), "{diagnostics}");
+    assert!(diagnostics.contains("recovery budget left"));
+    let saved = env.saved(&session_id(&output));
+    assert!(saved.active_thread().pending_operation.is_none());
+    myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+}
+
+#[tokio::test]
+async fn stream_overload_recovery_keeps_completed_tools_and_discards_draft_calls() {
+    let provider = StubHttpServer::sequence(vec![
+        tool("bash", json!({"command":"printf once >> effects.txt"})),
+        StubHttpServer::sse_response(vec![
+            json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"type":"function_call", "name":"bash", "arguments":""}}),
+            json!({"type":"response.function_call_arguments.done", "output_index":0,
+                "arguments":json!({"command":"printf UNVALIDATED >> effects.txt"}).to_string()}),
+            json!({"type":"error", "code":"server_error", "message":"controlled overload"}),
+        ]),
+        answer("Recovered.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    env.retry("initial_backoff_ms=1\nmax_elapsed_ms=300000");
+    let output = env.run(&["-p", "work"], b"").await;
+    assert_eq!(success(&output), "Recovered.\n");
+    assert_eq!(provider.connections(), 3);
+    assert_eq!(
+        std::fs::read_to_string(env.dir.join("effects.txt")).unwrap(),
+        "once"
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("server_error") && diagnostics.contains("retrying 2/3"));
+    let saved = env.saved(&session_id(&output));
+    assert!(saved.active_thread().pending_operation.is_none());
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("UNVALIDATED")
+    );
+    myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+}
+
+#[tokio::test]
+async fn recovery_deadline_aborts_a_stalled_retry_and_saves_a_settled_boundary() {
+    let provider = StubHttpServer::sequence_then_pending(vec![StubHttpServer::status_response(
+        503,
+        "temporary outage",
+    )])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    env.retry("max_attempts=24\ninitial_backoff_ms=1\nmax_elapsed_ms=150");
+    let output = env.run(&["-p", "work"], b"").await;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(provider.connections(), 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recovery deadline exhausted"));
+    assert!(output.stdout.is_empty());
+    let saved = env.saved(&session_id(&output));
+    assert!(saved.active_thread().pending_operation.is_none());
+    myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_visible_prolonged_recovery_wait_does_not_send_another_request() {
+    let provider = StubHttpServer::sequence(vec![StubHttpServer::status_response(
+        503,
+        "temporary outage",
+    )])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let session = env.seed();
+    env.retry("max_attempts=24\ninitial_backoff_ms=30000\nmax_elapsed_ms=300000");
+    let mut child = env
+        .command(&["-p", "work", "--resume", &session.id])
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            assert!(stderr.read_line(&mut line).await.unwrap() > 0);
+            if line.contains("recovery budget left") {
+                assert!(line.contains("retrying 2/24 in 30.0s"), "{line}");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    child.stderr = Some(stderr.into_inner());
+    interrupt(&child);
+    let output = wait(child).await;
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    assert_eq!(provider.connections(), 1);
+    assert!(
+        env.saved(&session.id)
+            .active_thread()
+            .pending_operation
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn print_auto_continues_until_the_agent_disables_and_persists_the_setting() {
+    let provider = StubHttpServer::sequence(vec![
+        answer("More work remains.", 100),
+        tool("session_meta", json!({"action":"disable_auto_continue"})),
+        answer("Complete.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(&["-p", "finish the task", "--auto-continue"], b"")
+        .await;
+    assert_eq!(success(&output), "More work remains.Complete.\n");
+    assert_eq!(provider.connections(), 3);
+    let saved = env.saved(&session_id(&output));
+    assert!(!saved.auto_continue);
+    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+}
+
+#[tokio::test]
+async fn print_auto_retries_transient_and_terminal_errors_without_reaccepting_input() {
+    let provider = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":"temporarily unavailable"}"#),
+        StubHttpServer::status_response(400, r#"{"error":"request rejected"}"#),
+        tool("session_meta", json!({"action":"disable_auto_continue"})),
+        answer("Recovered.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(&["-p", "finish the task", "--auto-continue"], b"")
+        .await;
+    assert_eq!(success(&output), "Recovered.\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("auto-continue retrying in 1.0s"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("auto-continue retrying in 2.0s"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("temporarily unavailable"), "{stderr}");
+    assert!(stderr.contains("request rejected"), "{stderr}");
+    assert_eq!(provider.connections(), 4);
+    let saved = env.saved(&session_id(&output));
+    assert!(!saved.auto_continue);
+    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+}
+
+#[tokio::test]
+async fn print_auto_retry_wait_can_be_interrupted_without_another_attempt() {
+    let provider = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(400, r#"{"error":"request rejected"}"#),
+        answer("Must not retry after cancellation.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let session = env.seed();
+    let mut child = env
+        .command(&[
+            "-p",
+            "finish the task",
+            "--auto-continue",
+            "--resume",
+            &session.id,
+        ])
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = stderr.next_line().await.unwrap() {
+            if line.contains("auto-continue retrying") {
+                return;
+            }
+        }
+        panic!("CLI stopped without announcing the retry");
+    })
+    .await
+    .unwrap();
+    let accepted = env
+        .saved(&session.id)
+        .active_thread()
+        .user_turn_timestamps
+        .clone();
+    interrupt(&child);
+    let output = tokio::time::timeout(Duration::from_secs(2), wait(child))
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(provider.connections(), 1);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        env.saved(&session.id).active_thread().user_turn_timestamps,
+        accepted
+    );
+}
+
+#[tokio::test]
+async fn terminal_auto_continue_command_persists_without_starting_model_work() {
+    let provider = StubHttpServer::sequence(vec![]).await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(
+            &["--mode", "cli"],
+            b"/auto-continue on\n/auto-continue\n/quit\n",
+        )
+        .await;
+    success(&output);
+    let id = session_id(&output);
+    assert!(env.saved(&id).auto_continue);
+    assert_eq!(provider.connections(), 0);
+    let output = env
+        .run(
+            &["--mode", "cli", "--resume", &id, "--auto-continue=false"],
+            b"/quit\n",
+        )
+        .await;
+    success(&output);
+    assert!(!env.saved(&id).auto_continue);
 }
 
 #[tokio::test]
@@ -238,11 +492,11 @@ async fn gateway_cap_compacts_accumulated_tool_images_before_upload_and_continue
     let saved = env.saved(&id);
     assert_eq!(saved.threads().len(), 2);
     let active = serde_json::to_string(&saved.active_thread().messages).unwrap();
-    assert!(active.contains("Earlier answer."));
-    assert!(active.contains("inspect the images"));
-    assert!(active.contains("Image omitted to reduce request size"));
+    assert!(active.contains("Finish the pending task."));
+    assert!(active.len() < 64 * 1024);
     assert!(!active.contains("myco-image:sha256:"));
     let original = serde_json::to_string(&saved.threads()[0]).unwrap();
+    assert!(original.contains("Earlier answer."));
     assert!(original.contains("inspect the images"));
     assert_eq!(
         original.matches("myco-image:sha256:").count(),

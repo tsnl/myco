@@ -75,6 +75,9 @@ enum Command {
         /// JSON map of model keys to input/cached_input/output_per_million USD.
         #[arg(long)]
         prices: Option<PathBuf>,
+        /// Versioned observer-reported intervention counts bound to exact result hashes.
+        #[arg(long)]
+        interventions: Option<PathBuf>,
     },
     #[command(hide = true)]
     Execute { job: PathBuf },
@@ -191,8 +194,13 @@ fn main() {
                 output,
                 min_success_rate,
                 prices,
+                interventions,
             } => {
-                let report = myco::eval::report(&output, prices.as_deref())?;
+                let report = myco::eval::report_with_interventions(
+                    &output,
+                    prices.as_deref(),
+                    interventions.as_deref(),
+                )?;
                 if let Some(floor) = min_success_rate {
                     if !floor.is_finite() || !(0.0..=1.0).contains(&floor) {
                         return Err("success-rate floor must be 0..1".into());

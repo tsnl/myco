@@ -1,5 +1,10 @@
 //! Compaction creates a successor thread with a summary and bounded recent context.
 
+mod tail;
+
+pub use tail::select_tail;
+use tail::select_tail_indexed;
+
 use crate::generative_model::{Content, Message};
 use crate::prompts;
 use crate::session::Session;
@@ -90,92 +95,6 @@ pub fn compact_thread(
         tail_messages,
     };
     Ok((successor, outcome))
-}
-
-/// Select the last `user_turns` well-formed user turns (user → … → assistant end).
-pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize) -> Vec<Message> {
-    select_tail_indexed(messages, user_turns, tool_body_max)
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect()
-}
-
-fn select_tail_indexed(
-    messages: &[Message],
-    user_turns: usize,
-    tool_body_max: usize,
-) -> Vec<(usize, Message)> {
-    if user_turns == 0 || messages.is_empty() {
-        return Vec::new();
-    }
-    // Find start indices of UserMessage entries.
-    let user_idxs: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| m.is_user_turn().then_some(i))
-        .collect();
-    if user_idxs.is_empty() {
-        return Vec::new();
-    }
-    let start_user = user_idxs.len().saturating_sub(user_turns);
-    let start = user_idxs[start_user];
-
-    // Extend backward if we would start mid tool loop (shouldn't for UserMessage start).
-    let slice = &messages[start..];
-    // Ensure we don't end mid tool_use without results: if last is Assistant with tool_uses
-    // and no following ToolResults, drop that incomplete assistant.
-    let mut end = slice.len();
-    if let Some(Message::AssistantMessage { tool_uses, .. }) = slice.last()
-        && !tool_uses.is_empty()
-    {
-        end = end.saturating_sub(1);
-    }
-    let mut out: Vec<_> = slice[..end]
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, message)| (start + index, message))
-        .collect();
-    for (_, message) in &mut out {
-        if let Message::UserMessage { content } = message {
-            content
-                .retain(|part| !matches!(part, Content::System { kind, .. } if kind == "session" || kind == "runtime"));
-        }
-        truncate_message_bodies(message, tool_body_max);
-    }
-    out.retain(
-        |(_, message)| !matches!(message, Message::UserMessage { content } if content.is_empty()),
-    );
-    out
-}
-
-fn truncate_message_bodies(msg: &mut Message, max_chars: usize) {
-    match msg {
-        Message::ToolResults { tool_use_results } => {
-            for r in tool_use_results {
-                for c in &mut r.content {
-                    if let Content::Text { text } = c {
-                        *text = truncate_chars(text, max_chars);
-                    }
-                }
-            }
-        }
-        Message::AssistantMessage { content, .. } | Message::UserMessage { content } => {
-            for c in content {
-                if let Content::Text { text } = c {
-                    *text = truncate_chars(text, max_chars.max(8_000));
-                }
-            }
-        }
-    }
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let t: String = s.chars().take(max_chars.saturating_sub(20)).collect();
-    format!("{t}\n…(truncated for compact tail)")
 }
 
 #[cfg(test)]

@@ -143,14 +143,18 @@ impl EventSink for CliSink {
                 retry_in,
                 attempt,
                 max_attempts,
+                recovery_remaining,
                 context,
                 ..
             } if context.depth == 0 => {
                 self.state.lock().unwrap().pending.clear();
                 if let Some(delay) = retry_in {
                     let _ = self.finish();
+                    let budget = recovery_remaining
+                        .map(|left| format!(" ({:.1}s recovery budget left)", left.as_secs_f64()))
+                        .unwrap_or_default();
                     eprintln!(
-                        "myco: response interrupted; retrying {}/{} in {:.1}s: {}",
+                        "myco: response interrupted; retrying {}/{} in {:.1}s{budget}: {}",
                         attempt + 1,
                         max_attempts,
                         delay.as_secs_f64(),

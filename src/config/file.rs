@@ -37,6 +37,10 @@ pub struct FileConfig {
     /// resolve. (Config key kept as `attach_timeout_secs`.)
     #[serde(default)]
     pub attach_timeout_secs: Option<u64>,
+    /// Reap unused remote connections after this many seconds; 0 disables it.
+    /// Retained handles and in-flight calls keep their worker alive.
+    #[serde(default)]
+    pub host_idle_timeout_secs: Option<u64>,
     /// Cap on the rendered prelude (`workspace/prelude/` entries) appended to
     /// every agent system prompt. Enforced, not clamped: the `prelude` tool
     /// refuses an edit that would cross it and startup exits against a prelude
@@ -89,12 +93,15 @@ pub struct RetryEntry {
     /// Wait before the second attempt; doubles (or `backoff_multiplier`s) after.
     #[serde(default)]
     pub initial_backoff_ms: Option<u64>,
-    /// Ceiling on any single wait, including one a provider's `Retry-After` asks for.
+    /// Ceiling on any single wait; longer provider minimums stop automatic retry.
     #[serde(default)]
     pub max_backoff_ms: Option<u64>,
     /// Growth factor between successive waits.
     #[serde(default)]
     pub backoff_multiplier: Option<f64>,
+    /// Optional recovery deadline after the first retryable failure, 1..=300000 ms.
+    #[serde(default)]
+    pub max_elapsed_ms: Option<u64>,
 }
 
 /// `[models.KEY]`: one catalog entry. `gateway` pulls `protocol` / `base_url`

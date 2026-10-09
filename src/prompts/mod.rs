@@ -28,7 +28,7 @@ pub fn auto_compact_notice(threshold: Option<u64>, context_window: u64) -> Strin
          compaction as `/compact`. It creates a new thread within this session and keeps \
          live tools running. A `# Resumption` message then asks you to continue. \
          Long tool loops can compact repeatedly as context grows. An answer triggers at most \
-         one compact-and-continue cycle per submission. Transient compaction response failures \
+         one compact-and-continue cycle per submission. With auto-continue off, transient compaction response failures \
          retry within the worker's request budget; other failures stop the run with its original \
          history retained, and later submissions can try again. If the next reported prompt \
          remains above the threshold, automatic compaction is disabled until manual compaction \

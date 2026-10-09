@@ -12,6 +12,7 @@ use crate::harness::Harness;
 use crate::prelude::{self, PreludeEntry};
 use crate::session::ActiveSession;
 
+mod description;
 mod lifecycle;
 pub use lifecycle::RuntimeRecord;
 
@@ -95,12 +96,13 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     pub fn new(harness: Arc<Harness>, session: ActiveSession) -> Arc<Self> {
+        let limit = harness.max_image_base64_bytes();
         Arc::new(Self {
             harness,
             owner_id: Uuid::new_v4(),
             session_id: session.id(),
             session,
-            max_image_base64_bytes: AtomicU64::new(u64::MAX),
+            max_image_base64_bytes: AtomicU64::new(limit),
         })
     }
 
@@ -109,7 +111,10 @@ impl SessionRuntime {
     }
 
     pub fn set_max_image_base64_bytes(&self, limit: u64) {
-        self.max_image_base64_bytes.store(limit, Ordering::Relaxed);
+        self.max_image_base64_bytes.store(
+            limit.min(self.harness.max_image_base64_bytes()),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn session_id(&self) -> &str {
@@ -200,7 +205,8 @@ impl SessionRuntime {
 
 impl ToolExecutor for SessionRuntime {
     fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.harness.tool_specs()
+        self.harness
+            .tool_specs_with_image_limit(self.max_image_base64_bytes.load(Ordering::Relaxed))
     }
 
     fn dispatch(
@@ -210,6 +216,7 @@ impl ToolExecutor for SessionRuntime {
         background: CancelToken,
     ) -> Async<ToolResult> {
         Box::pin(async move {
+            let limit = self.max_image_base64_bytes.load(Ordering::Relaxed);
             let mut result = self
                 .harness
                 .clone()
@@ -219,18 +226,21 @@ impl ToolExecutor for SessionRuntime {
                         agent_id: self.owner_id,
                         cancel,
                         background,
+                        max_image_base64_bytes: Some(limit),
                     },
                 )
                 .await;
-            let limit = self.max_image_base64_bytes.load(Ordering::Relaxed);
-            if result.content.iter().any(|part| matches!(part,
-                crate::generative_model::Content::Image { source }
-                if source.split_once(',').map_or(source.len(), |(_, data)| data.len()) as u64 > limit)) {
-                return ToolResult::err(format!("image exceeds the current model's {limit}-byte base64 limit; resize it before viewing"));
-            }
-            if let Err(error) = crate::core::image_store::ImageStore::for_profile()
-                .and_then(|store| store.externalize(&mut result.content))
-            {
+            let stored = crate::core::image_store::ImageStore::for_profile().and_then(|store| {
+                for part in &result.content {
+                    if let crate::generative_model::Content::Image { source } = part {
+                        store
+                            .check_image_size(source, limit)
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                store.externalize(&mut result.content)
+            });
+            if let Err(error) = stored {
                 return ToolResult::err(format!("could not store tool image: {error}"));
             }
             result

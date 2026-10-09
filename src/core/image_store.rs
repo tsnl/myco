@@ -68,11 +68,22 @@ impl ImageStore {
         let hash = sha256(&bytes);
         let reference = format!("{PREFIX}{hash}:{mime}");
         let path = self.path(&reference)?;
-        match std::fs::read(&path) {
-            Ok(existing) if sha256(&existing) != hash => {
-                return Err(format!("corrupt image sidecar {}", path.display()));
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                // Existing blobs may be corrupt; never let one enlarge the
+                // bounded image we just decoded into an unbounded verification.
+                if !meta.is_file() || meta.len() != bytes.len() as u64 {
+                    return Err(format!("corrupt image sidecar {}", path.display()));
+                }
+                let existing = crate::core::image::read_image_bytes(
+                    &path,
+                    "sidecar",
+                    crate::core::image::base64_len(meta.len()),
+                )?;
+                if sha256(&existing) != hash {
+                    return Err(format!("corrupt image sidecar {}", path.display()));
+                }
             }
-            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir_all(path.parent().unwrap())
                     .map_err(|error| format!("create image store: {error}"))?;
@@ -85,12 +96,19 @@ impl ImageStore {
     }
 
     pub fn resolve(&self, source: &str) -> Result<String, String> {
+        self.resolve_with_limit(source, None)
+    }
+
+    fn resolve_with_limit(&self, source: &str, limit: Option<u64>) -> Result<String, String> {
         if !source.starts_with(PREFIX) {
             return Ok(source.into());
         }
         let (hash, mime) = parse_reference(source)?;
         let path = self.path(source)?;
-        let bytes = std::fs::read(&path).map_err(|error| format!("read image sidecar {}: {error}; restore the profile's images directory from backup", path.display()))?;
+        let bytes = match limit {
+            Some(limit) => crate::core::image::read_image_bytes(&path, "sidecar", limit),
+            None => std::fs::read(&path).map_err(|error| error.to_string()),
+        }.map_err(|error| format!("read image sidecar {}: {error}; restore the profile's images directory from backup if missing or corrupt", path.display()))?;
         if sha256(&bytes) != hash {
             return Err(format!(
                 "corrupt image sidecar {}; SHA-256 mismatch",
@@ -101,6 +119,30 @@ impl ImageStore {
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         ))
+    }
+
+    /// Check references from metadata before reading, decoding, or cloning input.
+    pub fn check_image_size(&self, source: &str, limit: u64) -> Result<(), GenerateError> {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            return Ok(());
+        }
+        let size = if is_reference(source) {
+            let path = self.path(source).map_err(GenerateError::ExecutionError)?;
+            let meta = std::fs::metadata(&path).map_err(|error| GenerateError::ExecutionError(format!(
+                "read image sidecar {}: {error}; restore the profile's images directory from backup", path.display()
+            )))?;
+            if !meta.is_file() {
+                return Err(GenerateError::ExecutionError(
+                    "image sidecar must be a regular file".into(),
+                ));
+            }
+            crate::core::image::base64_len(meta.len())
+        } else {
+            source
+                .split_once(',')
+                .map_or(source.len(), |(_, data)| data.len()) as u64
+        };
+        crate::generative_model::check_image_size(size, limit)
     }
 
     /// Copy exactly the referenced blobs when exporting a private eval case.
@@ -175,17 +217,35 @@ pub fn visit_content(
 
 /// Wrap an application model so sidecar references never reach provider APIs.
 /// Captures the store root; changing environment variables cannot redirect a run.
-pub fn with_images(inner: Arc<dyn GenerativeModel>, store: ImageStore) -> Arc<dyn GenerativeModel> {
-    Arc::new(ImageModel { inner, store })
+pub fn with_images(
+    inner: Arc<dyn GenerativeModel>,
+    store: ImageStore,
+    max_image_base64_bytes: u64,
+) -> Arc<dyn GenerativeModel> {
+    Arc::new(ImageModel {
+        inner,
+        store,
+        max_image_base64_bytes,
+    })
 }
 
 struct ImageModel {
     inner: Arc<dyn GenerativeModel>,
     store: ImageStore,
+    max_image_base64_bytes: u64,
 }
 
 impl GenerativeModel for ImageModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
+        for part in input.iter().flat_map(Message::content) {
+            if let Content::Image { source } = part
+                && let Err(error) = self
+                    .store
+                    .check_image_size(source, self.max_image_base64_bytes)
+            {
+                return image_failure(error);
+            }
+        }
         if !input.iter().flat_map(Message::content).any(|part| {
             matches!(part,
             Content::Image { source } if is_reference(source))
@@ -193,15 +253,28 @@ impl GenerativeModel for ImageModel {
             return self.inner.generate(input);
         }
         let mut input = input.to_vec();
-        if let Err(error) = self.store.resolve_messages(&mut input) {
-            return Box::pin(futures::stream::once(async move {
-                GenerationEvent::Failure(GenerationFailure::terminal(
-                    GenerateError::ExecutionError(error),
-                ))
-            }));
+        if let Err(error) = visit_content(&mut input, |content| {
+            for part in content {
+                if let Content::Image { source } = part
+                    && is_reference(source)
+                {
+                    *source = self
+                        .store
+                        .resolve_with_limit(source, Some(self.max_image_base64_bytes))?;
+                }
+            }
+            Ok(())
+        }) {
+            return image_failure(GenerateError::ExecutionError(error));
         }
         self.inner.generate(&input)
     }
+}
+
+fn image_failure(error: GenerateError) -> AsyncStream<GenerationEvent> {
+    Box::pin(futures::stream::once(async move {
+        GenerationEvent::Failure(GenerationFailure::terminal(error))
+    }))
 }
 
 #[cfg(test)]
@@ -328,9 +401,105 @@ mod tests {
             .unwrap();
         std::fs::remove_file(store.path(source).unwrap()).unwrap();
         let inner = ScriptedModel::new(vec![]);
-        let model = with_images(inner, store);
+        let model = with_images(inner, store, 1024);
         assert!(
             matches!(model.generate(&input).next().await, Some(GenerationEvent::Failure(failure)) if failure.cause.to_string().contains("sidecar"))
+        );
+    }
+
+    #[tokio::test]
+    async fn active_cap_applies_to_inline_legacy_and_restored_images_at_the_exact_boundary() {
+        use crate::generative_model::{GenerateOutput, TurnEndReason};
+        let temp = temp_dir("sidecar-active-cap");
+        let store = ImageStore::new(temp.path().join("images"));
+        for sidecar in [false, true] {
+            let mut input = vec![Message::UserMessage {
+                content: vec![inline(b"data")],
+            }];
+            if sidecar {
+                store.externalize_messages(&mut input).unwrap();
+            }
+            let inner = ScriptedModel::new(vec![GenerateOutput {
+                content: vec![],
+                tool_uses: vec![],
+                turn_end_reason: TurnEndReason::EndTurn,
+                usage: None,
+            }]);
+            let rejected = with_images(inner.clone(), store.clone(), 7);
+            let error = GenerateOutput::from_generation(rejected.generate(&input))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, GenerateError::RequestTooLargeError(_)),
+                "{error}"
+            );
+            assert_eq!(inner.remaining(), 1);
+            let accepted = with_images(inner.clone(), store.clone(), 8);
+            GenerateOutput::from_generation(accepted.generate(&input))
+                .await
+                .unwrap();
+            assert_eq!(inner.remaining(), 0);
+        }
+        let model = with_images(ScriptedModel::new(vec![]), store, 8);
+        let input = vec![Message::UserMessage {
+            content: vec![Content::Image {
+                source: "!".repeat(9),
+            }],
+        }];
+        let error = GenerateOutput::from_generation(model.generate(&input))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GenerateError::RequestTooLargeError(_)),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_restored_sidecars_fail_from_metadata_before_reading_or_hashing() {
+        let temp = temp_dir("sidecar-sparse-cap");
+        let store = ImageStore::new(temp.path().join("images"));
+        let source = format!("{PREFIX}{}:image/png", "a".repeat(64));
+        let path = store.path(&source).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // This sparse, invalid blob is deliberately much larger than the cap.
+        // Reading or hashing it would waste a GiB before the known size failure.
+        std::fs::File::create(path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        let model = with_images(ScriptedModel::new(vec![]), store, 1024);
+        let input = vec![Message::UserMessage {
+            content: vec![Content::Image { source }],
+        }];
+        let error =
+            crate::generative_model::GenerateOutput::from_generation(model.generate(&input))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, GenerateError::RequestTooLargeError(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reusing_an_image_does_not_read_an_oversized_corrupt_existing_blob() {
+        let temp = temp_dir("sidecar-corrupt-cap");
+        let store = ImageStore::new(temp.path().join("images"));
+        let mut content = vec![inline(b"data")];
+        store.externalize(&mut content).unwrap();
+        let Content::Image { source } = &content[0] else {
+            unreachable!()
+        };
+        std::fs::File::create(store.path(source).unwrap())
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            store
+                .externalize(&mut [inline(b"data")])
+                .unwrap_err()
+                .contains("corrupt image sidecar")
         );
     }
 }

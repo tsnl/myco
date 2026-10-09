@@ -123,6 +123,9 @@ pub struct HostDispatchContext {
     pub cancel: CancelToken,
     /// Stop waiting without terminating retained work, when supported.
     pub background: CancelToken,
+    /// Active model image cap; None retains the worker ceiling.
+    /// A call can lower the worker ceiling, never raise it.
+    pub max_image_base64_bytes: Option<u64>,
 }
 
 impl HostDispatchContext {
@@ -131,6 +134,7 @@ impl HostDispatchContext {
             agent_id,
             cancel,
             background: CancelToken::new(),
+            max_image_base64_bytes: None,
         }
     }
 }
