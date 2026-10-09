@@ -105,6 +105,7 @@ fn automatic_failures_replace_one_diagnostic_without_growing_the_transcript() {
             attempt: 1,
             max_attempts: 1,
             retry_in: None,
+            recovery_remaining: None,
             context: context.clone(),
         });
         app.retrying(error, Duration::from_secs(5));
