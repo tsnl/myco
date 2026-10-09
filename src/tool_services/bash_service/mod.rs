@@ -18,6 +18,7 @@ mod background;
 mod operation;
 mod process;
 
+use background::{BackgroundReason, Promotion};
 use operation::SessionOperation;
 use process::ProcessOwner;
 
@@ -77,17 +78,25 @@ impl BashService {
                 "Executes bash commands and manages long-lived interactive sessions \
                 (shells, Python REPLs, SSH, etc.).\n\n\
                 Actions:\n\
-                - exec (default): one-shot `bash -c <command>`; **blocks until the process \
-                exits** (or `timeout_ms`, default {DEFAULT_EXEC_TIMEOUT_MS} ms / \
-                {exec_default_s}s; max {MAX_EXEC_TIMEOUT_MS} ms / {exec_max_min} min). \
+                - exec (default): one-shot `bash -c <command>`; waits for process exit \
+                or `background_after`. Without background_after, `timeout_ms` defaults to \
+                {DEFAULT_EXEC_TIMEOUT_MS} ms / {exec_default_s}s; an explicit timeout is \
+                capped at {MAX_EXEC_TIMEOUT_MS} ms / {exec_max_min} min. \
                 Returns exit code, signal, stdout, stderr. Each stream is capped at \
                 `max_bytes` (default {DEFAULT_MAX_BYTES}): over the cap, the head and tail \
                 are kept and the middle is elided with a `[... N bytes omitted ...]` marker. \
                 Elided exec output is unrecoverable — pipe through grep/head/tail or \
                 redirect to a file when you expect a flood, or raise `max_bytes` when you \
                 truly need more. Prefer `exec` for finite commands (builds, tests, \
-                installs). Raise `timeout_ms` when the job may exceed {exec_default_s}s. \
-                A user can background a running call from the browser; it then returns \
+                installs). Use `background_after` in milliseconds (1..={MAX_EXEC_TIMEOUT_MS}) \
+                to return a session_id after waiting while the same command keeps running. \
+                Prefer this over adding shell timeout wrappers or `timeout_ms` merely to \
+                stop waiting: inspect later with read and decide whether to wait or close. \
+                With background_after, an omitted timeout imposes no kill deadline. \
+                An explicitly supplied `timeout_ms` remains a hard kill deadline after \
+                automatic backgrounding. If timeout expires before or at background_after, it kills \
+                the command as usual. Without background_after, exec keeps its existing \
+                foreground timeout. A user can background a running call from the browser; it then returns \
                 a session_id for read/signal/close, and its original timeout no longer \
                 applies. Continue other work instead of immediately waiting on it again.\n\
                 - start: spawn a long-lived process **in the background**. Requires \
@@ -107,10 +116,10 @@ impl BashService {
                 signal and the whole group gets it. Either way the session is not reaped — \
                 that is still `close`.\n\
                 - close: kill and reap a session.\n\
-                - list: list live sessions. Note the session cap ({MAX_SESSIONS}) is shared \
-                by every agent on the host while `list` shows only yours — if `start` \
-                reports too many sessions and your list looks short, other agents own the \
-                rest; close your own idle sessions and retry.\n\n\
+                - list: list live sessions. The `start` admission limit ({MAX_SESSIONS} \
+                retained sessions) is shared by every agent on the host while `list` shows \
+                only yours. Promoting an already-running exec can exceed that limit. If \
+                `start` reports too many sessions, close your own unused sessions and retry.\n\n\
                 For start/write/read, the child runs in the background. `start` without initial \
                 stdin returns after an idle gap even when the child is silent; `write` / `read` \
                 wait for output first. Calls otherwise return after the output goes idle \
@@ -228,6 +237,7 @@ impl ToolService for BashService {
                         "duration_ms": buffer.finished.map(|end| end.duration_since(session.shared.started).as_millis() as u64),
                         "process_exited": buffer.exited, "output_closed": buffer.is_finished(),
                         "exit_code": buffer.exit_code, "exit_signal": buffer.exit_signal,
+                        "exec_timeout_ms": buffer.exec_timeout_ms,
                     }),
                 }
             })
@@ -280,8 +290,12 @@ impl BashService {
             Action::Exec {
                 command,
                 timeout_ms,
+                background_after,
                 max_bytes,
-            } => self.run_oneshot(&command, timeout_ms, max_bytes, ctx).await,
+            } => {
+                self.run_oneshot(&command, timeout_ms, background_after, max_bytes, ctx)
+                    .await
+            }
             Action::Start {
                 session_id,
                 command,
@@ -354,7 +368,8 @@ impl BashService {
 
     /// Run `command` in a fresh bash process (`bash -c`).
     ///
-    /// Unlike sessions, exec **waits for the process to exit**. Bounded by
+    /// Exec waits for exit, or yields a retained session on background_after
+    /// or an explicit background request. Foreground waiting is bounded by
     /// `timeout_ms` so a runaway command cannot hang the agent forever; on
     /// timeout or cancel the child is killed and partial stdout/stderr are
     /// returned. The final pipe drain is bounded too (`EXEC_DRAIN_GRACE`):
@@ -365,10 +380,13 @@ impl BashService {
     async fn run_oneshot(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
+        background_after: Option<u64>,
         max_bytes: usize,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
+        let deadline =
+            timeout_ms.map(|millis| tokio::time::Instant::now() + Duration::from_millis(millis));
         let mut cmd = BASH.tokio_command();
         cmd.args(["-c", command])
             // Never inherit stdin: in `--mode host` it is the NDJSON protocol
@@ -408,26 +426,34 @@ impl BashService {
         let stdout_task = spawn_reader(stdout, StreamKind::Stdout, shared.clone());
         let stderr_task = spawn_reader(stderr, StreamKind::Stderr, shared.clone());
 
-        let deadline = Duration::from_millis(timeout_ms.max(1));
         // When cancel/timeout wins, select drops the wait future so we can
         // kill the process group + wait without a conflicting &mut Child borrow.
         enum Outcome {
             Cancelled,
             TimedOut,
-            Background,
+            Background(BackgroundReason),
             Status(std::io::Result<std::process::ExitStatus>),
         }
         let outcome = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => Outcome::Cancelled,
-            _ = tokio::time::sleep(deadline) => Outcome::TimedOut,
+            _ = background::until(deadline) => Outcome::TimedOut,
             status = child.wait() => Outcome::Status(status),
-            _ = ctx.background.cancelled() => Outcome::Background,
+            _ = ctx.background.cancelled() => Outcome::Background(BackgroundReason::User),
+            reason = background::after(background_after) => Outcome::Background(reason),
         };
 
         match outcome {
-            Outcome::Background => {
-                self.background_exec(command, ctx.agent_id, child, shared, max_bytes)
+            Outcome::Background(reason) => {
+                let promotion = Promotion {
+                    reason,
+                    deadline: if matches!(reason, BackgroundReason::AfterMillis(_)) {
+                        deadline.zip(timeout_ms)
+                    } else {
+                        None
+                    },
+                };
+                self.background_exec(command, ctx.agent_id, child, shared, max_bytes, promotion)
             }
             Outcome::Cancelled => {
                 kill_process_group(child_pid);
@@ -442,6 +468,8 @@ impl BashService {
                 ))
             }
             Outcome::TimedOut => {
+                let timeout_ms =
+                    timeout_ms.expect("no deadline without an explicit or legacy timeout");
                 kill_process_group(child_pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -871,6 +899,8 @@ struct OutputBuffer {
     /// Captured output streams whose readers have finished (stdout and stderr).
     eof_streams: u8,
     finished: Option<Instant>,
+    /// Explicit exec ceiling retained after an automatic background yield.
+    exec_timeout_ms: Option<u64>,
 }
 
 impl OutputBuffer {
@@ -900,6 +930,7 @@ struct SessionSnapshot {
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     background_output: bool,
+    exec_timeout_ms: Option<u64>,
     stdout: String,
     stderr: String,
     bytes_returned: usize,
@@ -911,7 +942,7 @@ struct SessionSnapshot {
 #[derive(Clone, Copy)]
 enum SnapshotStatus {
     Running,
-    Backgrounded,
+    Backgrounded(BackgroundReason),
     Exited,
     TimedOut,
     Truncated,
@@ -921,7 +952,7 @@ impl SnapshotStatus {
     fn as_str(self) -> &'static str {
         match self {
             SnapshotStatus::Running => "running",
-            SnapshotStatus::Backgrounded => "backgrounded",
+            SnapshotStatus::Backgrounded(_) => "backgrounded",
             SnapshotStatus::Exited => "exited",
             SnapshotStatus::TimedOut => "timed_out",
             SnapshotStatus::Truncated => "truncated",
@@ -942,7 +973,11 @@ impl SessionSnapshot {
             id: self.session_id.clone(),
             instance_id: self.instance_id.clone(),
         });
-        result.status = if matches!(self.status, SnapshotStatus::Backgrounded) {
+        result.status = if let Some(timeout_ms) = self.exec_timeout_ms {
+            Some(format!(
+                "timed out after {timeout_ms}ms; process group killed"
+            ))
+        } else if matches!(self.status, SnapshotStatus::Backgrounded(_)) {
             Some("backgrounded".into())
         } else {
             process_status(self.exit_code, self.exit_signal)
@@ -952,8 +987,14 @@ impl SessionSnapshot {
 
     fn format(&self) -> String {
         let mut out = String::new();
-        if matches!(self.status, SnapshotStatus::Backgrounded) {
-            out.push_str("User backgrounded this call. Continue with other work; use bash read on this session_id and the same host for later output, or bash close to stop it.\n");
+        if let SnapshotStatus::Backgrounded(reason) = self.status {
+            match reason {
+                BackgroundReason::User => out.push_str("User backgrounded this call. "),
+                BackgroundReason::AfterMillis(millis) => out.push_str(&format!(
+                    "background_after={millis}ms elapsed; command continues in the background. "
+                )),
+            }
+            out.push_str("Continue with other work; use bash read on this session_id and the same host for later output, or bash close to stop it.\n");
         }
         out.push_str(&format!("session_id: {}\n", self.session_id));
         out.push_str(&format!(
@@ -984,6 +1025,10 @@ impl SessionSnapshot {
         if self.background_output {
             out.push_str("(process exited; output still open, descendants may still be running — call read/close)\n");
         }
+        if let Some(timeout_ms) = self.exec_timeout_ms {
+            out.push_str(&format!("(exec reached its explicit timeout_ms={timeout_ms}; process group killed; read remaining output or close the session)\n"));
+            return out;
+        }
         match self.status {
             SnapshotStatus::TimedOut => {
                 out.push_str(
@@ -993,7 +1038,7 @@ impl SessionSnapshot {
             SnapshotStatus::Truncated => {
                 out.push_str("(output truncated at max_bytes; more may be buffered — call read)\n");
             }
-            SnapshotStatus::Running | SnapshotStatus::Backgrounded => {
+            SnapshotStatus::Running | SnapshotStatus::Backgrounded(_) => {
                 out.push_str("(session still running; call read/write/close as needed)\n");
             }
             SnapshotStatus::Exited => {
@@ -1264,7 +1309,7 @@ async fn collect_output(
         };
 
         if background.is_cancelled() {
-            status = SnapshotStatus::Backgrounded;
+            status = SnapshotStatus::Backgrounded(BackgroundReason::User);
             break;
         }
         if total > last_total {
@@ -1316,7 +1361,7 @@ async fn collect_output(
                 break;
             }
             _ = background.cancelled() => {
-                status = SnapshotStatus::Backgrounded;
+                status = SnapshotStatus::Backgrounded(BackgroundReason::User);
                 break;
             }
             _ = tokio::time::timeout(slice, shared.notify.notified()) => {}
@@ -1335,7 +1380,7 @@ fn take_snapshot(
     max_bytes: usize,
 ) -> SessionSnapshot {
     // Drain up to max_bytes from the buffer (stdout first, then stderr).
-    let (stdout, stderr, exit_code, exit_signal, background_output, bytes_dropped) = {
+    let (stdout, stderr, exit_code, exit_signal, background_output, bytes_dropped, exec_timeout_ms) = {
         let mut b = match shared.buffer.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -1348,6 +1393,7 @@ fn take_snapshot(
                     exit_code: None,
                     exit_signal: None,
                     background_output: false,
+                    exec_timeout_ms: None,
                     stdout: String::new(),
                     stderr: String::new(),
                     bytes_returned: 0,
@@ -1370,7 +1416,7 @@ fn take_snapshot(
         b.stderr.drain(..take_stderr);
 
         if !b.stdout.is_empty() || !b.stderr.is_empty() {
-            if !matches!(status, SnapshotStatus::Backgrounded) {
+            if !matches!(status, SnapshotStatus::Backgrounded(_)) {
                 status = SnapshotStatus::Truncated;
             }
         } else if b.is_finished() {
@@ -1384,6 +1430,7 @@ fn take_snapshot(
             b.exit_signal,
             b.exited && !b.is_finished(),
             std::mem::take(&mut b.dropped_bytes),
+            b.exec_timeout_ms,
         )
     };
 
@@ -1397,6 +1444,7 @@ fn take_snapshot(
         exit_code,
         exit_signal,
         background_output,
+        exec_timeout_ms,
         stdout,
         stderr,
         bytes_returned,
@@ -1436,9 +1484,18 @@ pub struct Input {
     signal: Option<SignalKind>,
     /// Hard wait ceiling in milliseconds.
     /// - start/write/read: default 30000 (30s), max 1800000 (30 min); early return on idle/byte cap.
-    /// - exec: default 60000 (60s), max 1800000 (30 min); waits for process exit.
+    /// - exec: default 60000 (60s) unless background_after is set, max 1800000 (30 min); kills the process group on expiry.
+    ///
+    /// Prefer background_after for choosing when to stop waiting without killing work.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Exec only: yield the same command as a background session after this many milliseconds.
+    /// Positive, at most 1800000 (30 min). Omit to keep waiting in the foreground.
+    /// Prefer this over shell timeout wrappers or timeout_ms for deciding when to stop waiting.
+    /// An explicit timeout_ms still kills the process group at its original deadline after yielding.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1_800_000))]
+    background_after: Option<u64>,
     /// Idle gap in milliseconds with no new output before returning (start/write/read). Default 300.
     #[serde(default)]
     idle_ms: Option<u64>,
@@ -1503,7 +1560,8 @@ impl SignalKind {
 enum Action {
     Exec {
         command: String,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
+        background_after: Option<u64>,
         max_bytes: usize,
     },
     Start {
@@ -1573,6 +1631,7 @@ fn is_empty_object(input: &Input) -> bool {
         stdin,
         signal,
         timeout_ms,
+        background_after,
         idle_ms,
         max_bytes,
     } = input;
@@ -1582,6 +1641,7 @@ fn is_empty_object(input: &Input) -> bool {
         && stdin.is_none()
         && signal.is_none()
         && timeout_ms.is_none()
+        && background_after.is_none()
         && idle_ms.is_none()
         && max_bytes.is_none()
 }
@@ -1625,9 +1685,23 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
         }
     };
 
+    let background_after = match input.background_after {
+        Some(_) if !matches!(kind, ActionKind::Exec) => {
+            return Err("background_after is only supported for exec; session actions already keep the process running".into());
+        }
+        Some(millis) if millis == 0 || millis > MAX_EXEC_TIMEOUT_MS => {
+            return Err(format!(
+                "background_after must be 1..={MAX_EXEC_TIMEOUT_MS} milliseconds"
+            ));
+        }
+        Some(millis) => Some(millis),
+        None => None,
+    };
+
     // Explicit timeout_ms above the safety ceiling is rejected (not silently
     // clamped). Defaults are generous enough for normal interactive work;
-    // raise timeout_ms for longer jobs. Cancel still aborts mid-wait.
+    // background_after yields longer exec jobs; an explicit timeout remains a
+    // hard ceiling. Cancel still aborts mid-wait.
     fn session_timeout(input: &Input) -> Result<u64, String> {
         match input.timeout_ms {
             None => Ok(DEFAULT_TIMEOUT_MS),
@@ -1637,13 +1711,14 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             Some(t) => Ok(t.max(1)),
         }
     }
-    fn exec_timeout(input: &Input) -> Result<u64, String> {
+    fn exec_timeout(input: &Input) -> Result<Option<u64>, String> {
         match input.timeout_ms {
-            None => Ok(DEFAULT_EXEC_TIMEOUT_MS),
+            None if input.background_after.is_some() => Ok(None),
+            None => Ok(Some(DEFAULT_EXEC_TIMEOUT_MS)),
             Some(t) if t > MAX_EXEC_TIMEOUT_MS => Err(format!(
                 "exec timeout_ms={t} exceeds max {MAX_EXEC_TIMEOUT_MS}ms (30 min); pass ≤{MAX_EXEC_TIMEOUT_MS}"
             )),
-            Some(t) => Ok(t.max(1)),
+            Some(t) => Ok(Some(t.max(1))),
         }
     }
 
@@ -1657,6 +1732,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             Ok(Action::Exec {
                 command,
                 timeout_ms: exec_timeout(input)?,
+                background_after,
                 max_bytes,
             })
         }
@@ -1737,3 +1813,6 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod background_after_tests;

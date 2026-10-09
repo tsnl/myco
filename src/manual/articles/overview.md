@@ -193,6 +193,33 @@ calls, `start` a shell (for example, `cd /path && bash --noprofile --norc`) and
 send commands through `write`. The bash tool has no separate working-directory
 argument; unsupported fields are rejected before execution.
 
+For builds, tests, and other finite commands, use `exec` with `background_after`
+in **milliseconds** to decide when to stop waiting without killing the job:
+
+```json
+{"command":"cargo test --offline", "background_after":1000}
+```
+
+If the command is still running after that wait, Myco returns a `bg-…` session
+handle with its current output. Continue useful work, then use `read` on that
+handle and the same host to inspect progress or wait again. The process is not
+restarted, and returned output is not repeated. Use `close` to stop it and release
+the handle. Promotion retains already-running work even when the host's
+8-session `start` admission limit is reached; close unused handles when finished.
+`background_after` is exec-only, accepts 1–1,800,000 milliseconds,
+and is omitted by default; omission retains the usual 60-second foreground exec
+timeout. If a timeout expires before or at the requested background wait, the
+command is killed instead of promoted.
+
+Prefer `background_after` over shell `timeout` wrappers or setting `timeout_ms`
+just to regain control. An **explicit** `timeout_ms` is a hard deadline from
+command start, even after automatic backgrounding; later reads report when it
+kills the process group. With `background_after` set and `timeout_ms` omitted,
+there is no implicit kill deadline before or after promotion. Manual browser backgrounding keeps its
+existing behavior of dropping the original timeout. Cancelling an in-flight
+exec still kills it; after promotion, the retained handle owns the process and
+`signal` or `close` controls it.
+
 ## Models & credentials (the catalog)
 
 Myco ships **no built-in models**: the `[gateways]` / `[models]` tables in

@@ -28,6 +28,44 @@ impl ProcessOwner {
         owner
     }
 
+    pub(super) fn enforce_deadline(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        timeout_ms: u64,
+    ) {
+        let owner = Arc::downgrade(self);
+        let closed = self.closed.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = closed.cancelled() => return,
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+            if let Some(owner) = owner.upgrade() {
+                owner.expire(timeout_ms);
+            }
+        });
+    }
+
+    fn expire(&self, timeout_ms: u64) {
+        let mut buffer = lock_unpoisoned(&self.shared.buffer);
+        // A completed leader and closed pipes do not prove its descendants
+        // exited. The retained leader still pins this group's identity.
+        match self.signal(libc::SIGKILL) {
+            Ok(()) if !buffer.is_finished() => buffer.exec_timeout_ms = Some(timeout_ms),
+            Ok(()) => {}
+            Err(error) => {
+                buffer.stderr.extend_from_slice(
+                    format!("\nmyco: could not enforce exec timeout_ms={timeout_ms}: {error}\n")
+                        .as_bytes(),
+                );
+                cap_session_stream(&mut buffer.stderr);
+            }
+        }
+        drop(buffer);
+        self.shared.notify.notify_waiters();
+    }
+
     pub(super) fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(Child::id)
     }
