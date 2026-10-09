@@ -1,4 +1,4 @@
-import { $, api, element, error, clearError, requestId, setArchived } from './common.js';
+import { $, api, element, error, clearError, requestId, setArchived, bindNewSessionLink } from './common.js';
 import { showActivity } from './activity.js';
 import { sessionTimers } from './timers.js';
 import { messageComposer } from './composer.js';
@@ -10,6 +10,7 @@ import { markdownContent } from './markdown-content.js';
 import { messageTimestamp } from './timestamps.js';
 import { showUsage } from './usage.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
+bindNewSessionLink($('new-session'));
 const transcript = $('transcript');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
