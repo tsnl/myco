@@ -133,7 +133,7 @@ The manual is regenerated on startup. The paths below show the default profile.
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `host_idle_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/profiles/default/images/{shard}/{sha256}` | Immutable raw image sidecars, shared by all threads and sessions in this profile. Back up this directory together with `session/`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.history` | Legacy readline history, preserved when present. |
@@ -148,6 +148,7 @@ top-level keys must come before the tables, per TOML):
 model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
+host_idle_timeout_secs = 1800 # 0 disables; retained tools keep workers alive
 # Hard cap on the rendered prelude in every agent system prompt (default 262144):
 # oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144

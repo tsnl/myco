@@ -23,6 +23,7 @@ impl HarnessConfig {
     pub fn from_ssh_aliases(
         ssh_aliases: Vec<String>,
         attach_timeout_secs: u64,
+        host_idle_timeout_secs: u64,
         max_image_base64_bytes: u64,
     ) -> Self {
         let remote_hosts = ssh_aliases
@@ -36,6 +37,7 @@ impl HarnessConfig {
         Self {
             remote_hosts,
             attach_timeout_secs,
+            host_idle_timeout_secs,
             max_image_base64_bytes,
         }
     }
@@ -278,6 +280,7 @@ mod tests {
         HarnessConfig::from_ssh_aliases(
             aliases_from(ssh_config),
             attach_timeout_secs,
+            1800,
             crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
         )
     }
@@ -287,7 +290,8 @@ mod tests {
     /// images the model rejects (or reject ones it would take).
     #[test]
     fn configured_image_cap_reaches_the_remote_argv() {
-        let cfg = HarnessConfig::from_ssh_aliases(vec!["devbox".into()], 10, 12 * 1024 * 1024);
+        let cfg =
+            HarnessConfig::from_ssh_aliases(vec!["devbox".into()], 10, 1800, 12 * 1024 * 1024);
         assert_eq!(cfg.max_image_base64_bytes, 12 * 1024 * 1024);
         let argv = &cfg.remote_hosts[0].command;
         let flag = argv

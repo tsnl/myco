@@ -97,6 +97,66 @@ mod tests {
     use super::*;
     use crate::core::ToolResource;
 
+    #[tokio::test(start_paused = true)]
+    async fn an_aging_host_failure_does_not_add_repeated_runtime_records() {
+        let harness = crate::harness::Harness::attach(crate::harness::HarnessConfig {
+            remote_hosts: vec![crate::harness::HostConfig {
+                name: "offline".into(),
+                command: vec!["/missing/myco-host".into()],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let owner = Uuid::new_v4();
+        let result = harness
+            .clone()
+            .dispatch_tool_use(
+                crate::generative_model::ToolUse {
+                    name: "bash".into(),
+                    input: serde_json::json!({"host":"offline", "command":"true"}),
+                },
+                owner,
+                crate::core::CancelToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        let model = ModelInfo::named("test");
+        let first = RuntimeRecord::observe(
+            &[],
+            owner,
+            model.clone(),
+            harness.resources(owner).await,
+            false,
+        )
+        .unwrap();
+        let history = vec![Message::UserMessage {
+            content: vec![first],
+        }];
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(
+            RuntimeRecord::observe(
+                &history,
+                owner,
+                model,
+                harness.resources(owner).await,
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            harness
+                .host_status()
+                .iter()
+                .find(|host| host.name == "offline")
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("10s ago")
+        );
+    }
+
     #[test]
     fn bounded_descriptions_preserve_complete_inventory_through_outage_and_restart() {
         let owner = Uuid::new_v4();

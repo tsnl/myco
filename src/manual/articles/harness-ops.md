@@ -32,12 +32,13 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
   followed; wildcard `*`/`?` and negated `!` patterns are ignored; alias `local`
   is reserved). Host name == alias == SSH destination.
 - **`~/.myco/profiles/default/config.toml`** (or `$MYCO_CONFIG` / `myco --config`) holds knobs only:
-  `attach_timeout_secs`, `max_prelude_bytes`.
+  `attach_timeout_secs`, `host_idle_timeout_secs`, `max_prelude_bytes`.
 
 - Read `~/.ssh/config` with tools when you need remote names or SSH destinations.
-- **Connection sharing:** every myco process (the supervisor and each nested agent)
-  opens its own `ssh <alias> myco --mode host` per remote it touches. OpenSSH
-  multiplexes them over one authenticated connection per host with:
+- **Connection sharing:** each session runtime opens its own
+  `ssh <alias> myco --mode host` worker per remote it touches. OpenSSH can
+  multiplex the SSH transports over one authenticated connection per host;
+  the tool workers and their owned resources still remain separate:
 
   ```
   Host *
@@ -45,6 +46,31 @@ Also needed when **building from source**: stable **Rust / cargo** (and `curl` a
       ControlPath ~/.ssh/cm-%r@%h:%p
       ControlPersist 10m
   ```
+- **Idle workers:** `host_idle_timeout_secs` defaults to 1800 (30 minutes); 0 disables
+  reaping. Unused connections with no outstanding calls or retained processes/output
+  close automatically and reconnect on the next `host=` call. Inventory polls do
+  not keep them alive. Close unused bash handles explicitly, including exited
+  processes whose output is still retained. Editor read fingerprints expire with
+  the connection; read the file again before editing after reconnect. Each host
+  worker uses two async runtime threads; blocking I/O may use additional threads
+  while needed.
+- **Resource ownership:** reusable shells survive user turns, live compaction,
+  and archival. Archival changes visibility; it does not cancel active work or
+  discard retained handles. Reaping applies to archived sessions under the same
+  rules. Ending the owning runtime releases its tools.
+- **Lazy connection status:** “connects on first tool use” is normal, not an outage.
+  Runtime records report the last failure timestamp; live status also shows its age. After a transport failure,
+  retry `host=<alias>` once before falling back to raw SSH. If the previous call
+  may have changed something, inspect its effects before repeating that command.
+- **Call timeouts:** one missing tool response requests cancellation of that call
+  and probes the worker. A responsive worker keeps its connection and other bash
+  sessions. A failed health check resets the connection and reports lost remote
+  sessions using the last available inventory (which may be incomplete).
+- **No pseudo-terminal:** `bash action=start` uses pipes on local and remote hosts.
+  Prefer `host=<alias>` with `command: "bash"` or `"bash -l"` for long-lived remote
+  shells. Many allocators and REPLs work without a TTY; check their noninteractive
+  options before using `ssh -tt`. Programs that require a controlling terminal or
+  job control are not supported by these pipe sessions.
 - **Shell handles:** an in-flight operation keeps its original input/output and owner
   even if another shell reuses the same handle name. Closing or reaping a handle
   still stops its process group while reads or writes are outstanding.
@@ -202,8 +228,8 @@ When tools fail or the user asks why something is broken, investigate with tools
      in-process sessions die with the agent process.
 
 4. **Explain product limits honestly**
-   - No heartbeat in V1: remote liveness is next tool error; local is always in-process.
-   - No mid-flight cancel over the host pipe yet; Ctrl-C cancels the agent turn locally.
+   - Remote health is checked after a missed call deadline; local is always in-process.
+   - Cancellation is forwarded over the host pipe. A lost acknowledgement leaves effects unknown; inspect state before repeating work.
    - You cannot invoke slash-commands; tell the user which to run.
 
 When helping the user change config, prefer **surgical edits** to `~/.ssh/config` (hosts) or

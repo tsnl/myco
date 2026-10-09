@@ -8,15 +8,16 @@
 //!
 //! Concurrent `call`s share one pipe (subprocess) or the same worker (in-process).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
@@ -50,7 +51,10 @@ enum Backend {
         config: HostConfig,
         conn: Mutex<Option<Conn>>,
         connect_timeout_secs: u64,
-        last_error: StdMutex<Option<String>>,
+        idle_timeout_secs: u64,
+        reaper_started: AtomicBool,
+        controller: Weak<HostController>,
+        last_error: StdMutex<Option<HostFailure>>,
     },
 }
 
@@ -69,8 +73,91 @@ struct Conn {
     write_tx: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
     dead: Arc<AtomicBool>,
+    activity: Arc<StdMutex<Activity>>,
     reader_abort: tokio::task::AbortHandle,
     writer_abort: tokio::task::AbortHandle,
+}
+
+//
+// Connection ownership and observations
+//
+
+#[derive(Clone)]
+struct HostFailure {
+    at: chrono::DateTime<chrono::Utc>,
+    since: Instant,
+    message: String,
+}
+
+impl HostFailure {
+    fn new(message: String) -> Self {
+        Self {
+            at: chrono::Utc::now(),
+            since: Instant::now(),
+            message,
+        }
+    }
+
+    /// Inventory is persisted and deduplicated, so its failure identity must
+    /// not change merely because time passes. Ages belong in live status only.
+    fn inventory_message(&self) -> String {
+        format!(
+            "last host failure at {}: {}",
+            self.at.to_rfc3339(),
+            self.message
+        )
+    }
+}
+
+/// Tool activity alone advances the idle clock; inventory polling is observational.
+/// An abandoned waiter does not mean its remote effect has finished.
+struct Activity {
+    last_used: Instant,
+    revision: u64,
+    calls: HashSet<String>,
+    owners: HashSet<uuid::Uuid>,
+    bash_sessions: HashMap<uuid::Uuid, usize>,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            last_used: Instant::now(),
+            revision: 0,
+            calls: HashSet::new(),
+            owners: HashSet::new(),
+            bash_sessions: HashMap::new(),
+        }
+    }
+}
+
+impl Activity {
+    fn touch(&mut self) {
+        self.last_used = Instant::now();
+        self.revision += 1;
+    }
+
+    fn finish(&mut self, id: &str) {
+        if self.calls.remove(id) {
+            self.touch();
+        }
+    }
+}
+
+/// Releasing a future before enqueueing cannot leave phantom remote work that
+/// pins an idle worker forever. After enqueueing, only the worker reply ends it.
+struct EnqueueGuard<'a> {
+    activity: &'a Arc<StdMutex<Activity>>,
+    id: &'a str,
+    sent: bool,
+}
+
+impl Drop for EnqueueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.activity.lock().unwrap().finish(self.id);
+        }
+    }
 }
 
 impl Drop for Conn {
@@ -88,6 +175,10 @@ impl Drop for Conn {
         }
     }
 }
+
+//
+// Host operations
+//
 
 impl HostController {
     /// Always-on local host: tools run in-process via `worker`.
@@ -123,8 +214,19 @@ impl HostController {
         connect_timeout_secs: u64,
         max_image_base64_bytes: u64,
     ) -> Arc<Self> {
+        Self::with_timeouts(config, connect_timeout_secs, 1800, max_image_base64_bytes)
+    }
+
+    /// Configure idle reaping in seconds (`0` disables it). Retained handles and
+    /// outstanding calls pin their worker, including between user turns.
+    pub fn with_timeouts(
+        config: HostConfig,
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_image_base64_bytes: u64,
+    ) -> Arc<Self> {
         let name = config.name.clone();
-        Arc::new(Self {
+        Arc::new_cyclic(|controller| Self {
             name,
             next_id: AtomicU64::new(1),
             tools: HostWorker::standard_tool_specs(max_image_base64_bytes),
@@ -132,6 +234,9 @@ impl HostController {
                 config,
                 conn: Mutex::new(None),
                 connect_timeout_secs,
+                idle_timeout_secs,
+                reaper_started: AtomicBool::new(false),
+                controller: controller.clone(),
                 last_error: StdMutex::new(None),
             },
         })
@@ -152,9 +257,10 @@ impl HostController {
     pub fn is_connected(&self) -> bool {
         match &self.backend {
             Backend::InProcess { .. } => true,
-            Backend::Subprocess { conn, .. } => {
-                conn.try_lock().map(|g| g.is_some()).unwrap_or(false)
-            }
+            Backend::Subprocess { conn, .. } => conn
+                .try_lock()
+                .map(|g| g.as_ref().is_some_and(|c| !c.dead.load(Ordering::SeqCst)))
+                .unwrap_or(false),
         }
     }
 
@@ -174,12 +280,20 @@ impl HostController {
     /// Query only an existing connection. An unavailable inventory is not empty
     /// and must never cause a lazy remote to connect or restart.
     pub async fn resources(&self, agent_id: uuid::Uuid) -> Result<Vec<ToolResource>, String> {
+        self.resources_on(agent_id, None).await
+    }
+
+    async fn resources_on(
+        &self,
+        agent_id: uuid::Uuid,
+        expected: Option<&Arc<StdMutex<Activity>>>,
+    ) -> Result<Vec<ToolResource>, String> {
         if let Backend::InProcess { worker } = &self.backend {
             return Ok(worker.resources(agent_id));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let query = async {
-            let rx = self
+            let (rx, activity) = self
                 .submit(
                     &id,
                     &Request::Resources {
@@ -189,8 +303,21 @@ impl HostController {
                     false,
                 )
                 .await?;
+            if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &activity)) {
+                self.abandon(&id).await;
+                return Err("original host connection was replaced".into());
+            }
             match rx.await {
-                Ok(Response::Resources { resources, .. }) => Ok(resources),
+                Ok(Response::Resources { resources, .. }) => {
+                    activity.lock().unwrap().bash_sessions.insert(
+                        agent_id,
+                        resources
+                            .iter()
+                            .filter(|resource| resource.tool == "bash")
+                            .count(),
+                    );
+                    Ok(resources)
+                }
                 Ok(Response::Error { message, .. }) => Err(message),
                 Ok(_) => Err("unexpected resource inventory response".into()),
                 Err(_) => Err("host connection closed".into()),
@@ -205,14 +332,22 @@ impl HostController {
         }
     }
 
-    /// Last connect failure, if any (cleared after a successful connect).
+    /// Last transport failure and age, if any (cleared after a successful connect).
     /// Always `None` for in-process hosts.
     pub fn last_error(&self) -> Option<String> {
+        self.last_failure().map(|failure| {
+            format!(
+                "{}s ago: {}",
+                failure.since.elapsed().as_secs(),
+                failure.message
+            )
+        })
+    }
+
+    fn last_failure(&self) -> Option<HostFailure> {
         match &self.backend {
             Backend::InProcess { .. } => None,
-            Backend::Subprocess { last_error, .. } => {
-                last_error.lock().ok().and_then(|g| g.clone())
-            }
+            Backend::Subprocess { last_error, .. } => last_error.lock().unwrap().clone(),
         }
     }
 
@@ -266,11 +401,9 @@ impl HostController {
             tool_use,
         };
 
-        let mut rx = match self.submit(&id, &request, true).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return ToolResult::err(format!("host {:?}: {e}", self.name));
-            }
+        let (mut rx, activity) = match self.submit(&id, &request, true).await {
+            Ok(submission) => submission,
+            Err(error) => return self.transport_error(&error),
         };
 
         let background_request = async {
@@ -294,16 +427,17 @@ impl HostController {
                     background_sent = true;
                     if let Err(error) = result {
                         self.abandon(&id).await;
-                        return ToolResult::err(format!("could not background remote tool: {error}; effects are unknown"));
+                        return self.transport_error(&format!("could not background remote tool: {error}; effects are unknown"));
                     }
                 }
                 _ = &mut deadline => {
+                    self.cancel_remote(&id).await;
+                    self.abandon(&id).await;
                     let message = format!(
-                        "tool call timed out after {}ms without a host response; connection reset",
+                        "tool call timed out after {}ms without a host response; cancellation requested; effects are unknown",
                         response_timeout.as_millis()
                     );
-                    self.reset_connection(&message).await;
-                    return ToolResult::err(format!("host {:?}: {message}", self.name));
+                    return self.check_after_timeout(agent_id, &activity, &message).await;
                 }
             }
         };
@@ -313,11 +447,9 @@ impl HostController {
         // Error — never another call's reply and never a hello.
         match reply {
             Ok(Response::ToolResult { result, .. }) => result,
-            Ok(Response::Error { message, .. }) => {
-                ToolResult::err(format!("host {:?}: {message}", self.name))
-            }
+            Ok(Response::Error { message, .. }) => self.transport_error(&message),
             Ok(_) => ToolResult::err("unexpected tool response"),
-            Err(_closed) => ToolResult::err(format!("host {:?}: connection closed", self.name)),
+            Err(_closed) => self.transport_error("connection closed"),
         }
     }
 
@@ -376,18 +508,27 @@ impl HostController {
         id: &str,
         request: &Request,
         connect_if_needed: bool,
-    ) -> Result<oneshot::Receiver<Response>, String> {
+    ) -> Result<(oneshot::Receiver<Response>, Arc<StdMutex<Activity>>), String> {
         let Backend::Subprocess {
             config,
             conn,
             connect_timeout_secs,
+            idle_timeout_secs,
+            reaper_started,
+            controller,
             last_error,
         } = &self.backend
         else {
             return Err("submit on in-process host".into());
         };
 
-        let (write_tx, pending, dead) = {
+        if connect_if_needed
+            && *idle_timeout_secs > 0
+            && !reaper_started.swap(true, Ordering::SeqCst)
+        {
+            Self::start_idle_reaper(controller.clone(), Duration::from_secs(*idle_timeout_secs));
+        }
+        let (write_tx, pending, dead, activity) = {
             let mut slot = conn.lock().await;
             // A connection whose reader/writer exited (host died, protocol
             // desync) sits in the slot looking alive; drop it — Conn::drop
@@ -398,10 +539,14 @@ impl HostController {
                 c.dead.load(Ordering::SeqCst) || c.child.try_wait().ok().flatten().is_some()
             }) {
                 *slot = None;
+                *last_error.lock().unwrap() = Some(HostFailure::new("host connection lost".into()));
             }
             if slot.is_none() {
                 if !connect_if_needed {
-                    return Err("host is not connected; inventory unavailable".into());
+                    return Err(match self.last_failure() {
+                        Some(error) => format!("{}; {}", error.inventory_message(), self.retry_guidance()),
+                        None => "host is not connected yet or was released while idle; connects on first tool use".into(),
+                    });
                 }
                 match connect_with_timeout(config, *connect_timeout_secs).await {
                     Ok(c) => {
@@ -412,7 +557,7 @@ impl HostController {
                     }
                     Err(e) => {
                         if let Ok(mut err) = last_error.lock() {
-                            *err = Some(e.clone());
+                            *err = Some(HostFailure::new(e.clone()));
                         }
                         return Err(e);
                     }
@@ -427,18 +572,30 @@ impl HostController {
                 *slot = None;
                 let msg = "host connection lost".to_string();
                 if let Ok(mut err) = last_error.lock() {
-                    *err = Some(msg.clone());
+                    *err = Some(HostFailure::new(msg.clone()));
                 }
                 return Err(msg);
             }
             let c = slot.as_ref().expect("connected");
+            if let Request::ToolCall { agent_id, .. } = request {
+                let mut activity = c.activity.lock().unwrap();
+                activity.touch();
+                activity.owners.insert(*agent_id);
+                activity.calls.insert(id.to_string());
+            }
             (
                 c.write_tx.clone(),
                 Arc::clone(&c.pending),
                 Arc::clone(&c.dead),
+                Arc::clone(&c.activity),
             )
         };
 
+        let mut guard = EnqueueGuard {
+            activity: &activity,
+            id,
+            sent: false,
+        };
         let (tx, rx) = oneshot::channel();
         {
             // Checking `dead` under the pending lock pairs with the reader
@@ -459,11 +616,13 @@ impl HostController {
             pending.remove(id);
             let msg = "write: connection closed".to_string();
             if let Ok(mut err) = last_error.lock() {
-                *err = Some(msg.clone());
+                *err = Some(HostFailure::new(msg.clone()));
             }
             return Err(msg);
         }
-        Ok(rx)
+        guard.sent = true;
+        drop(guard);
+        Ok((rx, activity))
     }
 
     /// Best-effort removal of this call's waiter so cancel returns instantly.
@@ -521,16 +680,125 @@ impl HostController {
             .map_err(|_| "host connection closed".to_string())
     }
 
-    async fn reset_connection(&self, message: &str) {
+    fn retry_guidance(&self) -> String {
+        format!(
+            "The next host={:?} call reconnects automatically if needed; retry once before falling back to ssh. Check effects before repeating a command with side effects.",
+            self.name
+        )
+    }
+
+    fn transport_error(&self, message: &str) -> ToolResult {
+        if let Backend::Subprocess { last_error, .. } = &self.backend {
+            *last_error.lock().unwrap() = Some(HostFailure::new(message.to_string()));
+        }
+        ToolResult::err(format!(
+            "host {:?}: {message}. {}",
+            self.name,
+            self.retry_guidance()
+        ))
+    }
+
+    async fn check_after_timeout(
+        &self,
+        owner: uuid::Uuid,
+        activity: &Arc<StdMutex<Activity>>,
+        message: &str,
+    ) -> ToolResult {
+        if self.resources_on(owner, Some(activity)).await.is_ok() {
+            return ToolResult::err(format!(
+                "host {:?}: {message}; host responded to a health check, connection and other sessions preserved. {}",
+                self.name,
+                self.retry_guidance()
+            ));
+        }
+        let lost = self.reset_connection(activity).await;
+        let outcome = match lost {
+            Some(count) => format!(
+                "connection reset after failed health check; remote bash sessions on this connection were lost (last-known count: {count}; inventory may be incomplete)"
+            ),
+            None => {
+                return ToolResult::err(format!(
+                    "host {:?}: {message}; original connection already replaced; newer connection preserved. {}",
+                    self.name,
+                    self.retry_guidance()
+                ));
+            }
+        };
+        self.transport_error(&format!("{message}; {outcome}"))
+    }
+
+    async fn reset_connection(&self, expected: &Arc<StdMutex<Activity>>) -> Option<usize> {
+        let Backend::Subprocess { conn, .. } = &self.backend else {
+            return None;
+        };
+        let mut slot = conn.lock().await;
+        let current = slot.as_ref()?;
+        if !Arc::ptr_eq(&current.activity, expected) {
+            return None;
+        }
+        let count = expected.lock().unwrap().bash_sessions.values().sum();
+        *slot = None;
+        Some(count)
+    }
+
+    fn start_idle_reaper(weak: Weak<Self>, timeout: Duration) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(timeout.min(Duration::from_secs(60))).await;
+                let Some(controller) = weak.upgrade() else {
+                    break;
+                };
+                controller.reap_idle(timeout).await;
+            }
+        });
+    }
+
+    async fn reap_idle(&self, timeout: Duration) {
         let Backend::Subprocess {
             conn, last_error, ..
         } = &self.backend
         else {
             return;
         };
-        *conn.lock().await = None;
-        if let Ok(mut error) = last_error.lock() {
-            *error = Some(message.to_string());
+        let (expected, revision, owners) = {
+            let mut slot = conn.lock().await;
+            let Some(current) = slot.as_ref() else { return };
+            if current.dead.load(Ordering::SeqCst) {
+                last_error
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| HostFailure::new("host connection lost".into()));
+                *slot = None;
+                return;
+            }
+            let activity = current.activity.lock().unwrap();
+            if !activity.calls.is_empty() || activity.last_used.elapsed() < timeout {
+                return;
+            }
+            (
+                current.activity.clone(),
+                activity.revision,
+                activity.owners.clone(),
+            )
+        };
+        for owner in owners {
+            match self.resources_on(owner, Some(&expected)).await {
+                Ok(resources)
+                    if resources
+                        .iter()
+                        .all(|resource| resource.tool == "str_replace_based_edit_tool") => {}
+                // Retained output and reusable shells pin the worker. Editor
+                // fingerprints may expire: editing then requires a fresh read.
+                // Unknown inventory cannot authorize resource destruction.
+                _ => return,
+            }
+        }
+        let mut slot = conn.lock().await;
+        if let Some(current) = slot.as_ref()
+            && Arc::ptr_eq(&current.activity, &expected)
+            && current.activity.lock().unwrap().revision == revision
+        {
+            *slot = None;
         }
     }
 }
@@ -545,7 +813,7 @@ fn response_timeout(tool_use: &ToolUse) -> Duration {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS)
         .min(MAX_RESPONSE_TIMEOUT_MS);
-    Duration::from_millis(tool_ms.saturating_add(RESPONSE_GRACE_MS))
+    Duration::from_millis(tool_ms.saturating_add(RESPONSE_GRACE_MS.max(tool_ms / 10)))
 }
 
 impl Drop for HostController {
@@ -557,6 +825,10 @@ impl Drop for HostController {
         }
     }
 }
+
+//
+// Pipe transport
+//
 
 async fn connect_with_timeout(
     config: &HostConfig,
@@ -639,6 +911,8 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_reader = Arc::clone(&pending);
+    let activity = Arc::new(StdMutex::new(Activity::default()));
+    let reader_activity = Arc::clone(&activity);
     let pending_writer = Arc::clone(&pending);
     let dead = Arc::new(AtomicBool::new(false));
     let writer_dead = Arc::clone(&dead);
@@ -649,7 +923,7 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
         run_writer(stdin, write_rx, pending_writer, writer_dead).await;
     });
     let reader = tokio::spawn(async move {
-        run_reader(stdout, pending_reader, reader_dead).await;
+        run_reader(stdout, pending_reader, reader_dead, reader_activity).await;
     });
 
     let conn = Conn {
@@ -657,6 +931,7 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
         write_tx,
         pending,
         dead,
+        activity,
         reader_abort: reader.abort_handle(),
         writer_abort: writer.abort_handle(),
     };
@@ -726,6 +1001,7 @@ async fn run_reader(
     mut stdout: BufReader<ChildStdout>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
     dead: Arc<AtomicBool>,
+    activity: Arc<StdMutex<Activity>>,
 ) {
     let exit_message = loop {
         let line = match read_line(&mut stdout).await {
@@ -739,12 +1015,14 @@ async fn run_reader(
 
         match &msg {
             Response::ToolResult { id, .. } | Response::Resources { id, .. } => {
+                activity.lock().unwrap().finish(id);
                 let mut pending = pending.lock().await;
                 if let Some(tx) = pending.remove(id) {
                     let _ = tx.send(msg);
                 }
             }
             Response::Error { id: Some(id), .. } => {
+                activity.lock().unwrap().finish(id);
                 let mut pending = pending.lock().await;
                 if let Some(tx) = pending.remove(id) {
                     let _ = tx.send(msg);
@@ -1001,7 +1279,7 @@ mod tests {
             ),
         );
         let result = tokio::time::timeout(
-            Duration::from_secs(8),
+            Duration::from_secs(12),
             ctl.call(
                 uuid::Uuid::nil(),
                 ToolUse {
@@ -1017,6 +1295,15 @@ mod tests {
         assert!(result.is_error, "{result:?}");
         let text = text_parts(&result).join("");
         assert!(text.contains("without a host response"), "{text}");
+        assert!(
+            text.contains("connection reset after failed health check"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sessions on this connection were lost"),
+            "{text}"
+        );
+        assert!(text.contains("retry once"), "{text}");
         assert!(!ctl.is_connected());
     }
 
@@ -1034,7 +1321,7 @@ mod tests {
         let ctl = scripted_host(
             "sub",
             format!(
-                "read -r _hello; printf '%s\\n' '{}'; read -r _request; printf '%s' '{}'",
+                "read -r _hello; printf '%s\\n' '{}'; read -r _request; printf '%s\\n' '{}'; read -r _done",
                 hello_line(env!("CARGO_PKG_VERSION")),
                 result_line.trim_end(),
             ),

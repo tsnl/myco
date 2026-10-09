@@ -150,7 +150,13 @@ fn main() {
     {
         eprintln!("warning: could not organize archived sessions: {error}");
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    // A worker multiplexes pipe I/O; allocating one thread per CPU exhausts
+    // shared remote process limits when many sessions touch the same host.
+    if args.mode == Mode::Host {
+        runtime.worker_threads(2);
+    }
+    runtime
         .enable_all()
         .build()
         .expect("create async runtime")
