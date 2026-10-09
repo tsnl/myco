@@ -56,6 +56,12 @@ a bounded wait. Inventory never connects a lazy remote. Failed queries retain ex
 last-known data rather than claiming the host is empty. This is an inventory of tool
 handles, not every OS process or file created by a command.
 
+The model-facing description is limited to 16 KiB across current and prior-runtime
+inventories, with 512-byte quoted previews for commands and errors. Included host,
+tool, handle, and process-instance identifiers remain complete. Omission counts make
+larger inventories explicit; use `bash` with `action="list"` on the configured host
+to inspect its handles. Saved runtime metadata retains the full observations.
+
 A new runtime records which previously observed handles are unavailable here. External
 side effects may survive: inspect them before retrying work, and re-read files before
 editing. Model and effort changes produce a new notice. Compaction and rejected-input

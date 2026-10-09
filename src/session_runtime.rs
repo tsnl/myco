@@ -12,6 +12,7 @@ use crate::harness::Harness;
 use crate::prelude::{self, PreludeEntry};
 use crate::session::ActiveSession;
 
+mod description;
 mod lifecycle;
 pub use lifecycle::RuntimeRecord;
 
