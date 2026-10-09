@@ -11,7 +11,7 @@ impl BashService {
         shared: Arc<SessionShared>,
         max_bytes: usize,
     ) -> generative_model::ToolResult {
-        let pid = child.id();
+        let process = ProcessOwner::retain(child, shared.clone());
         {
             let mut buffer = lock_unpoisoned(&shared.buffer);
             let (stdout, stderr) = buffer.exec_capture.take().expect("foreground exec capture");
@@ -26,14 +26,13 @@ impl BashService {
             Session {
                 owner,
                 cmdline: command.into(),
-                stdin: Mutex::new(None),
+                stdin: Arc::new(Mutex::new(None)),
                 shared: shared.clone(),
                 created_at: Instant::now(),
-                last_used: Mutex::new(Instant::now()),
-                pid,
+                last_used: Arc::new(Mutex::new(Instant::now())),
+                process,
             },
         );
-        spawn_waiter(child, shared.clone());
         let mut result = take_snapshot(
             &shared,
             &id,

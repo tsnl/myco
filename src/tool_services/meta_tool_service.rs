@@ -40,6 +40,9 @@ Actions (`action` is required):
   sets it, an empty string clears it (omitting `title` is an error, never a clear).
 - set_scratchpad: replace the **current** session scratchpad (markdown; size-capped).
   `scratchpad` is required; an empty string clears it.
+- disable_auto_continue: stop automatic follow-up prompts in the current session.
+  Call when the task is complete or needs user input, then report the outcome.
+  Only the user can enable this mode through the browser or terminal controls.
 - add_link: attach a GitHub PR or worktree to the **current** session (deduped).
 - remove_link: drop a link from the **current** session by `index`, or by `url` /
   `host`+`path`.
@@ -122,6 +125,13 @@ impl SessionMetaTool {
                 ))
             }
             ActionKind::SetTitle => self.action_set_title(input.title),
+            ActionKind::DisableAutoContinue => {
+                self.active.set_auto_continue(false)?;
+                Ok(
+                    "Auto-continue disabled. Finish the current response with the outcome.\n"
+                        .into(),
+                )
+            }
             ActionKind::SetScratchpad => match input.scratchpad {
                 Some(text) => self.action_set_scratchpad(text),
                 None => Err("set_scratchpad requires `scratchpad` (full markdown; \
@@ -377,6 +387,7 @@ enum ActionKind {
     Restore,
     SetTitle,
     SetScratchpad,
+    DisableAutoContinue,
     AddLink,
     RemoveLink,
     ExecutablePath,
@@ -463,6 +474,7 @@ mod tests {
                 "restore",
                 "set_title",
                 "set_scratchpad",
+                "disable_auto_continue",
                 "add_link",
                 "remove_link",
                 "executable_path",
