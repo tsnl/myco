@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use myco::Session;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 mod test_utils;
@@ -140,6 +140,130 @@ fn summary(session: &Session) -> Vec<u8> {
             "markdown":"# Goal / active task\nFinish the pending task."
         }),
     )
+}
+
+#[tokio::test]
+async fn print_auto_continues_until_the_agent_disables_and_persists_the_setting() {
+    let provider = StubHttpServer::sequence(vec![
+        answer("More work remains.", 100),
+        tool("session_meta", json!({"action":"disable_auto_continue"})),
+        answer("Complete.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(&["-p", "finish the task", "--auto-continue"], b"")
+        .await;
+    assert_eq!(success(&output), "More work remains.Complete.\n");
+    assert_eq!(provider.connections(), 3);
+    let saved = env.saved(&session_id(&output));
+    assert!(!saved.auto_continue);
+    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+}
+
+#[tokio::test]
+async fn print_auto_retries_transient_and_terminal_errors_without_reaccepting_input() {
+    let provider = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":"temporarily unavailable"}"#),
+        StubHttpServer::status_response(400, r#"{"error":"request rejected"}"#),
+        tool("session_meta", json!({"action":"disable_auto_continue"})),
+        answer("Recovered.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(&["-p", "finish the task", "--auto-continue"], b"")
+        .await;
+    assert_eq!(success(&output), "Recovered.\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("auto-continue retrying in 1.0s"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("auto-continue retrying in 2.0s"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("temporarily unavailable"), "{stderr}");
+    assert!(stderr.contains("request rejected"), "{stderr}");
+    assert_eq!(provider.connections(), 4);
+    let saved = env.saved(&session_id(&output));
+    assert!(!saved.auto_continue);
+    assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);
+}
+
+#[tokio::test]
+async fn print_auto_retry_wait_can_be_interrupted_without_another_attempt() {
+    let provider = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(400, r#"{"error":"request rejected"}"#),
+        answer("Must not retry after cancellation.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let session = env.seed();
+    let mut child = env
+        .command(&[
+            "-p",
+            "finish the task",
+            "--auto-continue",
+            "--resume",
+            &session.id,
+        ])
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = stderr.next_line().await.unwrap() {
+            if line.contains("auto-continue retrying") {
+                return;
+            }
+        }
+        panic!("CLI stopped without announcing the retry");
+    })
+    .await
+    .unwrap();
+    let accepted = env
+        .saved(&session.id)
+        .active_thread()
+        .user_turn_timestamps
+        .clone();
+    interrupt(&child);
+    let output = tokio::time::timeout(Duration::from_secs(2), wait(child))
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(provider.connections(), 1);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        env.saved(&session.id).active_thread().user_turn_timestamps,
+        accepted
+    );
+}
+
+#[tokio::test]
+async fn terminal_auto_continue_command_persists_without_starting_model_work() {
+    let provider = StubHttpServer::sequence(vec![]).await;
+    let env = CliEnv::new(&provider, false);
+    let output = env
+        .run(
+            &["--mode", "cli"],
+            b"/auto-continue on\n/auto-continue\n/quit\n",
+        )
+        .await;
+    success(&output);
+    let id = session_id(&output);
+    assert!(env.saved(&id).auto_continue);
+    assert_eq!(provider.connections(), 0);
+    let output = env
+        .run(
+            &["--mode", "cli", "--resume", &id, "--auto-continue=false"],
+            b"/quit\n",
+        )
+        .await;
+    success(&output);
+    assert!(!env.saved(&id).auto_continue);
 }
 
 #[tokio::test]
