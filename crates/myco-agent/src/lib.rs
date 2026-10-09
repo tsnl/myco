@@ -123,6 +123,8 @@ pub enum AgentEvent {
         attempt: u32,
         max_attempts: u32,
         retry_in: Option<std::time::Duration>,
+        /// Remaining elapsed recovery budget, if configured and recovery started.
+        recovery_remaining: Option<std::time::Duration>,
         context: TraceContext,
     },
     /// Incremental assistant text (for streaming UX).
@@ -1534,6 +1536,10 @@ mod tests {
             usage: None,
         }]);
         let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        agent.set_retry_policy(RetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        });
         let err = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],

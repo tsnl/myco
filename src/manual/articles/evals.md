@@ -98,6 +98,9 @@ are read from the named config/auth sources and are not copied into artifacts.
 Do not put credentials in gateway URLs. Full traces can still contain private
 work data or secrets encountered by the evaluated task.
 
+Generation failure traces include attempt counts, the next retry delay, and
+`recovery_remaining_ms` for an optional elapsed retry budget (null when inactive).
+
 `provenance.json` records format version 1, build revision, creation time, task
 and model fingerprints, OS/architecture, effective model/runtime settings, limits,
 the initial main-agent system prompt, and tool schemas. Its artifact paths are

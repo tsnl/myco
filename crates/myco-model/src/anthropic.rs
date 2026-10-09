@@ -296,7 +296,7 @@ struct StreamAccumulator {
 }
 
 impl SseAccumulator for StreamAccumulator {
-    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerationFailure> {
         let event: AnthropicStreamEvent = serde_json::from_str(data).map_err(|e| {
             GenerateError::MalformedResponseError(format!(
                 "Failed to parse Anthropic SSE event JSON: {e}; data={data}"
@@ -318,7 +318,7 @@ impl StreamAccumulator {
     fn handle_event(
         &mut self,
         event: AnthropicStreamEvent,
-    ) -> Result<Vec<MessagePart>, GenerateError> {
+    ) -> Result<Vec<MessagePart>, GenerationFailure> {
         let mut out = Vec::new();
 
         match event {
@@ -431,7 +431,8 @@ impl StreamAccumulator {
                     ) => {
                         return Err(GenerateError::MalformedResponseError(format!(
                             "input_json_delta on content block index {content_index}"
-                        )));
+                        ))
+                        .into());
                     }
                     (
                         Slot::ToolUse { index: tool_index },
@@ -448,7 +449,8 @@ impl StreamAccumulator {
                     ) => {
                         return Err(GenerateError::MalformedResponseError(
                             "text/thinking delta on tool_use block".into(),
-                        ));
+                        )
+                        .into());
                     }
                     (Slot::Ignored, _) | (_, AnthropicDelta::Other) => {}
                 }
@@ -462,7 +464,8 @@ impl StreamAccumulator {
                     if matches!(stop_reason, AnthropicStopReason::Refusal) {
                         return Err(GenerateError::RefusalError(
                             "Anthropic stop_reason=refusal".into(),
-                        ));
+                        )
+                        .into());
                     }
                     self.stop_reason = Some(stop_reason.clone());
                     out.push(MessagePart::TurnEndReason(TurnEndReason::from(stop_reason)));
@@ -473,9 +476,20 @@ impl StreamAccumulator {
             }
             AnthropicStreamEvent::Ping => {}
             AnthropicStreamEvent::Error { error } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "Anthropic stream error event: {error}"
-                )));
+                // The stream may report these failures after HTTP 200:
+                // https://platform.claude.com/docs/en/api/errors
+                return Err(GenerationFailure {
+                    retryable: matches!(
+                        error.get("type").and_then(serde_json::Value::as_str),
+                        Some(
+                            "overloaded_error" | "api_error" | "timeout_error" | "rate_limit_error"
+                        )
+                    ),
+                    cause: GenerateError::ExecutionError(format!(
+                        "Anthropic stream error event: {error}"
+                    )),
+                    retry_after: None,
+                });
             }
             AnthropicStreamEvent::Other => {}
         }

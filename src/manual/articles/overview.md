@@ -353,7 +353,9 @@ falls back to removing the rejected submission from active context; the saved
 threads keep the input and completed observations. The session still accepts new
 input. Another size recovery is allowed after a successful model response.
 
-**Retry** is per gateway — what is being tuned is one endpoint's tolerance for
+**Bounded generation retry** applies when session auto-continue is off; explicit
+auto-continue uses the session recovery policy described in `cli`. The retry
+configuration is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
 `max_attempts` (default 3, counting the first; `1` disables), `initial_backoff_ms`
 (500), `max_backoff_ms` (30 000), `backoff_multiplier` (2.0). Each unset field
@@ -370,13 +372,54 @@ until it validates. Terminal chat keeps streamed drafts visible, separated by
 retry diagnostics.
 
 A 413 or recognized size rejection goes to the session's context recovery instead
-of retrying the unchanged request. Other 400 and 401 errors, malformed response
-data, and incomplete responses that end without a transport error surface
-immediately. A provider's `Retry-After` is honoured when it asks for longer than
-the computed backoff, still bounded by `max_backoff_ms`. The agent owns retries;
+of retrying the unchanged request. Other 400 and 401 errors surface immediately.
+Malformed response data, including truncated tool JSON and incomplete streams,
+use the same bounded retry budget; no calls from an invalid response execute.
+A provider's `Retry-After` is honoured when it asks for longer than
+the computed backoff. If that minimum exceeds `max_backoff_ms` or the remaining
+recovery budget, automatic retry stops with a limit diagnostic; it never sends
+early by shortening the provider's requested wait. The agent owns retries;
 provider drivers perform one attempt and report failures. The browser shows
 “Retrying” during backoff and a notice with the next attempt and delay. Cancel
 stops the request, including retry waits. Notices are not added to model history.
+
+For longer temporary outages, opt into an elapsed recovery budget in the same
+table and raise its attempt count:
+
+```toml
+[models.my-model.retry]
+max_attempts = 24
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+max_elapsed_ms = 300000
+```
+
+`max_elapsed_ms` accepts 1–300000 milliseconds (at most five minutes). It starts
+at the first retryable failure of one generation and includes all later waits
+and requests, including partial streams. It does not impose a deadline on the
+original request or the whole task. Exhaustion discards the unvalidated draft
+and stops at the committed conversation boundary. CLI and browser
+retry notices show the remaining budget. Cancel interrupts both waiting and
+streaming. A validated response resets the budget for the next generation;
+earlier completed tool effects are never restarted.
+Malformed drafts use the same finite attempt/time budget. Authentication and
+deterministic request errors still stop immediately.
+
+Errors reported inside an HTTP 200 stream use that same recovery policy. Myco
+retries Anthropic `overloaded_error`, `api_error`, `timeout_error`, and
+`rate_limit_error`, and OpenAI `server_error`, `rate_limit_exceeded`, `slow_down`,
+and `server_is_overloaded` codes. Unknown codes, authentication errors, and
+invalid requests stop immediately; error-message wording never selects retries.
+Anthropic's `rate_limit_error` can also represent a spend cap, so its finite
+recovery budget may expire until account access is restored. Failed draft text
+and tool calls do not enter committed history or execute, even if they arrived
+before the error. A `Retry-After` response header remains a minimum delay.
+
+Without `max_elapsed_ms`, existing attempt/backoff limits apply (three attempts
+by default). Model retry tables replace gateway retry tables, so a model override
+must repeat this field to retain the gateway's elapsed budget. Compaction's
+separate request cap and eval run budgets still apply. These are recovery limits,
+not a spending limit for an entire autonomous task.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

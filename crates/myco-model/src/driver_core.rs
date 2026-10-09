@@ -42,7 +42,7 @@ pub(super) fn build_client(
 /// Accumulates one provider's SSE `data:` payloads into [`MessagePart`]s.
 pub(super) trait SseAccumulator: Send + 'static {
     /// Parse one `data:` payload and return the parts it yields.
-    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError>;
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerationFailure>;
     /// True once the provider signalled end of message; the drive loop stops reading.
     fn finished(&self) -> bool;
     /// Validate that the stream completed properly (stop reason arrived, …).
@@ -199,6 +199,7 @@ async fn drive_sse_stream<A: SseAccumulator>(
     mut acc: A,
     provider: &str,
 ) -> Result<(), GenerationFailure> {
+    let retry_after = parse_retry_after(response.headers());
     let mut byte_stream = response.bytes_stream();
     let mut sse = SseParser::default();
     let mut started = false;
@@ -209,14 +210,17 @@ async fn drive_sse_stream<A: SseAccumulator>(
                 GenerateError::ExecutionError(format!(
                     "Error reading {provider} stream body: {e:?}"
                 )),
-                None,
+                retry_after,
             )
         })?;
 
         for data in sse.push(&chunk) {
-            let mut parts = acc
-                .handle_data(&data)
-                .map_err(GenerationFailure::terminal)?;
+            let mut parts = acc.handle_data(&data).map_err(|mut failure| {
+                // The agent also retries malformed drafts. Keep the provider's
+                // minimum for any caller that elects to retry this failure.
+                failure.retry_after = failure.retry_after.max(retry_after);
+                failure
+            })?;
             // HTTP headers and SSE keepalives are not model output. Delay the
             // synthetic start until there is a response part to consume.
             if !started && !parts.is_empty() {
@@ -239,7 +243,11 @@ async fn drive_sse_stream<A: SseAccumulator>(
         }
     }
 
-    acc.finish().map_err(GenerationFailure::terminal)
+    acc.finish().map_err(|cause| GenerationFailure {
+        cause,
+        retryable: false,
+        retry_after,
+    })
 }
 
 /// Maps a provider's unified stream indices (Anthropic content blocks, OpenAI

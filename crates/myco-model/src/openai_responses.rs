@@ -228,7 +228,7 @@ struct Reasoning {
 }
 
 impl SseAccumulator for StreamAccumulator {
-    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerateError> {
+    fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerationFailure> {
         let event: ResponsesStreamEvent = serde_json::from_str(data).map_err(|e| {
             GenerateError::MalformedResponseError(format!(
                 "Failed to parse OpenAI Responses SSE event JSON: {e}; data={data}"
@@ -292,7 +292,7 @@ impl StreamAccumulator {
     fn handle_event(
         &mut self,
         event: ResponsesStreamEvent,
-    ) -> Result<Vec<MessagePart>, GenerateError> {
+    ) -> Result<Vec<MessagePart>, GenerationFailure> {
         let mut out = Vec::new();
 
         match event {
@@ -316,7 +316,8 @@ impl StreamAccumulator {
                         return Err(GenerateError::MalformedResponseError(format!(
                             "OpenAI Responses: function_call output_item.added for \
                              output_index={output_index} is missing name"
-                        )));
+                        ))
+                        .into());
                     };
                     let tool_index = self.slots.open_tool_use(output_index);
                     self.set_tool_json(output_index, arguments.unwrap_or_default());
@@ -401,7 +402,8 @@ impl StreamAccumulator {
                             "OpenAI Responses: function_call_arguments.delta for \
                              output_index={output_index} arrived without a prior \
                              output_item.added function_call (id/name unknown)"
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -432,10 +434,7 @@ impl StreamAccumulator {
             ResponsesStreamEvent::ResponseCompleted { response } => {
                 let reason = match response.status.as_deref() {
                     Some("failed") => {
-                        return Err(GenerateError::ExecutionError(format!(
-                            "OpenAI Responses failed: {:?}",
-                            response.error
-                        )));
+                        return Err(response.failure());
                     }
                     Some("incomplete") => {
                         let incomplete = response
@@ -449,7 +448,8 @@ impl StreamAccumulator {
                         } else if incomplete == Some("content_filter") {
                             return Err(GenerateError::RefusalError(
                                 "OpenAI Responses stopped for content_filter".into(),
-                            ));
+                            )
+                            .into());
                         } else if self.saw_tool_call {
                             TurnEndReason::ToolUse
                         } else {
@@ -475,15 +475,18 @@ impl StreamAccumulator {
                 self.finished = true;
             }
             ResponsesStreamEvent::ResponseFailed { response } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "OpenAI Responses failed: {:?}",
-                    response.error
-                )));
+                return Err(response.failure());
             }
-            ResponsesStreamEvent::Error { error, message } => {
-                return Err(GenerateError::ExecutionError(format!(
-                    "OpenAI Responses stream error: {error:?} {message:?}"
-                )));
+            ResponsesStreamEvent::Error {
+                code,
+                error,
+                message,
+            } => {
+                let code = code.as_ref().or_else(|| error.as_ref()?.get("code"));
+                return Err(super::openai_common::stream_failure(
+                    code.and_then(serde_json::Value::as_str),
+                    format!("OpenAI Responses stream error: code={code:?} {error:?} {message:?}"),
+                ));
             }
             ResponsesStreamEvent::Other => {}
         }
@@ -634,6 +637,8 @@ enum ResponsesStreamEvent {
     #[serde(rename = "error")]
     Error {
         #[serde(default)]
+        code: Option<serde_json::Value>,
+        #[serde(default)]
         error: Option<serde_json::Value>,
         #[serde(default)]
         message: Option<String>,
@@ -670,6 +675,17 @@ struct ResponsesCompletedBody {
     error: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<OpenAIUsage>,
+}
+
+impl ResponsesCompletedBody {
+    fn failure(&self) -> GenerationFailure {
+        super::openai_common::stream_failure(
+            self.error
+                .as_ref()
+                .and_then(|error| error.get("code")?.as_str()),
+            format!("OpenAI Responses failed: {:?}", self.error),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -816,7 +832,7 @@ mod tests {
             })
             .expect_err("missing name must be malformed");
         assert!(
-            matches!(err, GenerateError::MalformedResponseError(_)),
+            matches!(err.cause, GenerateError::MalformedResponseError(_)),
             "{err:?}"
         );
     }
@@ -1122,7 +1138,7 @@ mod tests {
                 delta: r#"{"x":1}"#.into(),
             })
             .unwrap_err();
-        match err {
+        match err.cause {
             GenerateError::MalformedResponseError(msg) => {
                 assert!(msg.contains("without a prior"), "{msg}");
             }
@@ -1145,6 +1161,9 @@ mod tests {
                 },
             })
             .unwrap_err();
-        assert!(matches!(err, GenerateError::RefusalError(_)), "{err:?}");
+        assert!(
+            matches!(err.cause, GenerateError::RefusalError(_)),
+            "{err:?}"
+        );
     }
 }
