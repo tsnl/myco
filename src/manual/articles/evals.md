@@ -154,6 +154,9 @@ optimization score is task quality; costs are measured, not hidden in that score
 
 GEPA checkpoints live in the output directory. Reusing it resumes optimization
 when inputs match; changed tasks/configuration, seed prelude, or binary require a fresh output
-directory. The adapter caps reflection calls separately. Budget exhaustion or
-infrastructure errors stop with diagnostic artifacts; they do not count as an
-improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).
+directory. The adapter caps reflection calls separately and reserves each attempt
+on disk before launching it. Failed attempts and interruptions consume that allowance,
+even when resuming an older optimizer checkpoint. Existing proposal directories count
+conservatively toward the allowance; keep them and `reflection-budget` when resuming.
+Budget exhaustion or infrastructure errors stop with diagnostic artifacts; they do
+not count as an improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).
