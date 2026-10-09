@@ -1536,6 +1536,10 @@ mod tests {
             usage: None,
         }]);
         let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        agent.set_retry_policy(RetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        });
         let err = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],
