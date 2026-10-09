@@ -3,12 +3,29 @@
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import uuid
 from pathlib import Path
 
 from gepa import optimize
 from gepa.core.adapter import EvaluationBatch
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def create_output(path):
+    path.mkdir(parents=True, exist_ok=True)
+    # An existing ancestor may be visible from another caller's mkdir before
+    # that caller flushes it, or after that caller failed. Repair the full chain.
+    for directory in (path, *path.parents):
+        sync_directory(directory)
 
 
 class MycoAdapter:
@@ -19,13 +36,32 @@ class MycoAdapter:
         self.config = str(Path(config).resolve())
         self.model = model
         self.output = Path(output).resolve()
-        self.output.mkdir(parents=True, exist_ok=True)
+        create_output(self.output)
         self.free_only = free_only
         self.max_requests = max_requests
         self.timeout_secs = timeout_secs
         self.reflection_requests = reflection_requests
         self.max_reflections = max_reflections
-        self.reflections = 0
+        # Older runs already have proposal directories even when GEPA's last
+        # checkpoint predates an attempted reflection. Count those conservatively.
+        self.reflections = sum(path.is_dir() for path in
+                               (self.output / "proposals").glob("*"))
+
+    def _reserve_reflection(self):
+        reservations = self.output / "reflection-budget"
+        reservations.mkdir(exist_ok=True)
+        sync_directory(self.output)
+        for index in range(self.reflections, self.max_reflections):
+            try:
+                (reservations / str(index)).mkdir()
+            except FileExistsError:
+                continue
+            # Atomic mkdir admits one caller. Persist it before any provider
+            # work; crashes and failed attempts must not restore spent budget.
+            sync_directory(reservations)
+            self.reflections = index + 1
+            return
+        raise RuntimeError("Myco reflection budget reached; saved optimizer state can be inspected")
 
     def _run(self, case, prelude, *, reflection=False):
         run_dir = self.output / ("reflection-" if reflection else "eval-") / uuid.uuid4().hex
@@ -91,9 +127,7 @@ class MycoAdapter:
     def propose_new_texts(self, candidate, reflective_dataset, components_to_update, **_):
         if components_to_update != ["prelude"]:
             raise ValueError("only the prelude can be optimized")
-        if self.reflections >= self.max_reflections:
-            raise RuntimeError("Myco reflection budget reached; saved optimizer state can be inspected")
-        self.reflections += 1
+        self._reserve_reflection()
         case = self.output / "proposals" / uuid.uuid4().hex
         (case / "workspace").mkdir(parents=True)
         prompt = ("Improve the following coding-agent prelude using the training feedback. "
@@ -124,7 +158,7 @@ class MycoAdapter:
         return {"reflections": self.reflections}
 
     def set_adapter_state(self, state):
-        self.reflections = state.get("reflections", 0)
+        self.reflections = max(self.reflections, state.get("reflections", 0))
 
 
 def dataset(directory):
@@ -168,7 +202,7 @@ def main():
         parser.error("all budgets must be positive")
     splits = dataset(args.dataset)
     root = Path(args.output).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    create_output(root)
     # Saved scores must not silently become evidence for changed tasks or models.
     signature = hashlib.sha256()
     for name in [args.binary, args.config, args.seed_prelude]:

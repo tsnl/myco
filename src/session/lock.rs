@@ -45,12 +45,14 @@ impl std::fmt::Display for SessionLockError {
     }
 }
 
-/// Held for as long as a session is the live one. Dropping it closes the
-/// descriptor, which releases the `flock`.
+/// Held for as long as a session is the live one. Dropping the owner unlocks
+/// explicitly; a child between fork and exec must not prolong ownership.
 #[derive(Debug)]
 pub struct SessionWriteLock {
     _file: File,
     path: PathBuf,
+    #[cfg(unix)]
+    owner_pid: u32,
 }
 
 impl SessionWriteLock {
@@ -74,7 +76,12 @@ impl SessionWriteLock {
             .map_err(|e| SessionLockError::Unavailable(format!("open {}: {e}", path.display())))?;
 
         match try_lock_exclusive(&file) {
-            LockAttempt::Acquired => Ok(Self { _file: file, path }),
+            LockAttempt::Acquired => Ok(Self {
+                _file: file,
+                path,
+                #[cfg(unix)]
+                owner_pid: std::process::id(),
+            }),
             LockAttempt::Busy => Err(SessionLockError::Busy { path }),
             LockAttempt::Failed(why) => Err(SessionLockError::Unavailable(why)),
         }
@@ -82,6 +89,21 @@ impl SessionWriteLock {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionWriteLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        if std::process::id() != self.owner_pid {
+            return; // A forked child's destructor must not unlock its parent.
+        }
+        // Closing alone leaves the lock held while a forked child retains the
+        // shared open-file description, even with close-on-exec enabled.
+        // SAFETY: the owned file remains open until this destructor returns.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -117,6 +139,38 @@ fn try_lock_exclusive(_file: &File) -> LockAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn releasing_the_owner_does_not_wait_for_a_child_to_close_an_inherited_descriptor() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let _home = crate::test_support::temp_home("lock-inherited");
+        let id = "aa00bb11cc22dd33ee44ff5566778800";
+        let owner = SessionWriteLock::acquire(id).unwrap();
+        let fd = owner._file.as_raw_fd();
+        let mut command = crate::external_command::BASH.command();
+        command
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped());
+        // Keep the inherited description alive after exec to make the ordinary
+        // fork-to-exec race deterministic. Only async-signal-safe fcntl runs here.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(owner);
+        let next_owner = SessionWriteLock::acquire(id);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(next_owner.is_ok(), "{next_owner:?}");
+    }
 
     /// The second writer of a session must be refused, and must become
     /// acceptable again once the first releases.

@@ -63,6 +63,12 @@ async fn read_turns(
                 boot.catalog_model.spec.key
             ),
             "/compact" => compact(boot).await,
+            "/auto-continue" => auto_continue(boot, None),
+            "/auto-continue on" => auto_continue(boot, Some(true)),
+            "/auto-continue off" => auto_continue(boot, Some(false)),
+            command if command.starts_with("/auto-continue ") => {
+                eprintln!("myco: use /auto-continue on or /auto-continue off");
+            }
             command if command.starts_with('/') && !command.contains(char::is_whitespace) => {
                 eprintln!("myco: unknown command {command}; use /help");
             }
@@ -104,11 +110,26 @@ async fn compact(boot: &mut Boot) {
     }
 }
 
+fn auto_continue(boot: &Boot, enabled: Option<bool>) {
+    if let Some(enabled) = enabled
+        && let Err(error) = boot.session.set_auto_continue(enabled)
+    {
+        eprintln!("myco: {error}");
+        return;
+    }
+    let enabled = boot.session.with(|session| session.auto_continue);
+    eprintln!(
+        "myco: auto-continue is {}",
+        if enabled { "on" } else { "off" }
+    );
+}
+
 fn help() {
     eprintln!(
         "Enter a prompt to start a turn. @./image.png attaches an image.\n\
         /compact  Summarize into a new thread in this session\n\
         /session  Show the session id and model\n\
+        /auto-continue [on|off]  Show or set automatic continuation\n\
         /quit     Exit (also /exit or Ctrl-D)\n\
         Ctrl-C cancels a running turn or clears the current input.\n\
         Resume later with myco --mode cli --resume ID; select a model with --model KEY."

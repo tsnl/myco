@@ -17,8 +17,8 @@ pub struct SessionTurnOutcome {
     pub rewound: Option<Vec<Content>>,
 }
 
-/// Submit already-expanded input. State persistence failures stop execution;
-/// nonfatal metadata/recovery failures reach `on_warning`.
+/// Submit already-expanded input. Automatic retries retain the live interpreter
+/// and wait for persistence before advancing effects.
 /// The caller keeps ownership of the agent, session lock, and cancellation source.
 pub async fn run_session_turn(
     agent: &mut Agent,
@@ -69,7 +69,12 @@ pub(super) async fn run_turn(
         writer = session.writer() => writer,
         _ = cancel.cancelled() => return SessionTurnOutcome { result: Err(AgentInteractionError::Cancelled), rewound: None },
     };
-    if let Err(error) = runtime.bind_agent(agent) {
+    if let Err(error) = workflow
+        .retry(runtime, &cancel, || {
+            settle_stopped_run(agent).and_then(|()| runtime.bind_agent(agent))
+        })
+        .await
+    {
         return SessionTurnOutcome {
             result: Err(error),
             rewound: None,
@@ -77,11 +82,16 @@ pub(super) async fn run_turn(
     }
     let accepted = accepted_at.map(|time| (agent.history().len(), time));
     wire_checkpoint_at(agent, session, accepted);
-    if let Err(error) = crate::core::image_store::ImageStore::for_profile()
-        .and_then(|store| store.externalize(&mut input))
+    if let Err(error) = workflow
+        .retry(runtime, &cancel, || {
+            crate::core::image_store::ImageStore::for_profile()
+                .and_then(|store| store.externalize(&mut input))
+                .map_err(AgentInteractionError::Checkpoint)
+        })
+        .await
     {
         return SessionTurnOutcome {
-            result: Err(AgentInteractionError::Checkpoint(error)),
+            result: Err(error),
             rewound: None,
         };
     }
@@ -96,24 +106,57 @@ pub(super) async fn run_turn(
     if let Some(notice) = workflow.runtime_notice(agent, runtime).await {
         input.push(notice);
     }
-    let result = match agent.append_input(Message::UserMessage { content: input }) {
-        Ok(()) => workflow.drive(agent, runtime, &writer, cancel, true).await,
+    let result = match workflow
+        .checkpointed_update(agent, runtime, &cancel, |agent| {
+            agent.append_input(Message::UserMessage {
+                content: input.clone(),
+            })
+        })
+        .await
+    {
+        Ok(()) => {
+            workflow
+                .drive(agent, runtime, &writer, cancel.clone(), true)
+                .await
+        }
         Err(error) => Err(error),
     };
-    finish_turn(agent, runtime, &writer, result, on_warning)
+    finish_turn(
+        agent, runtime, &writer, workflow, &cancel, result, on_warning,
+    )
+    .await
 }
 
-pub(super) fn finish_turn(
+/// A new user action supersedes a stopped run, including one paused by a failed
+/// save. Settle its intent before rebinding; never reload over unsaved results.
+/// The caller holds the session writer and owns the stopped interpreter.
+pub(super) fn settle_stopped_run(agent: &mut Agent) -> Result<(), AgentInteractionError> {
+    if !agent.state().is_idle() {
+        agent.recover_interrupted()?;
+    } else if agent.checkpoint_failed() {
+        agent.checkpoint()?;
+    }
+    Ok(())
+}
+
+pub(super) async fn finish_turn(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
     writer: &SessionWriter,
+    workflow: &Workflow,
+    cancel: &CancelToken,
     result: Result<RunOutcome, AgentInteractionError>,
     on_warning: impl Fn(&str),
 ) -> SessionTurnOutcome {
     let session = runtime.session();
-    if let Err(error) = persist_session(agent, session, true) {
+    if let Err(error) = workflow
+        .retry(runtime, cancel, || {
+            persist_session(agent, session, true).map_err(AgentInteractionError::Checkpoint)
+        })
+        .await
+    {
         return SessionTurnOutcome {
-            result: Err(AgentInteractionError::Checkpoint(error)),
+            result: Err(error),
             rewound: None,
         };
     }

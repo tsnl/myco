@@ -28,8 +28,11 @@ cases and results outside public repositories unless reviewed for publication.
 A session is conversation context, **not a filesystem snapshot**. Pick the
 starting commit explicitly. Earlier shell handles and editor state are not
 restored. Adapt tasks that depend on external services or unavailable files.
-Git workspaces require the local repository and commit to remain available;
-submodules, dependency installation, and external fixtures need preparation.
+The initial Git run requires the local repository and pinned commit. Each run
+then freezes that commit and its ancestors in `case/source.bundle`, with a
+relative path in `case/case.json`. The run workspace owns its Git objects and
+does not borrow the original repository's object store. Submodules, dependency
+installation, and external fixtures still need separate preparation.
 
 For a new task, or a small directory snapshot:
 
@@ -98,12 +101,48 @@ work data or secrets encountered by the evaluated task.
 Generation failure traces include attempt counts, the next retry delay, and
 `recovery_remaining_ms` for an optional elapsed retry budget (null when inactive).
 
+`provenance.json` records format version 1, build revision, creation time, task
+and model fingerprints, OS/architecture, effective model/runtime settings, limits,
+the initial main-agent system prompt, and tool schemas. Its artifact paths are
+relative to the run directory so inspection survives moving the bundle. Backend
+settings use an explicit allowlist excluding authentication; endpoint user info,
+query strings, and fragments are removed. Prompts and tool content are retained
+as task evidence, so review them before sharing. Git snapshots include committed
+source history reachable from the pinned commit, excluding unrelated refs and
+the source repository's local configuration, hooks, and authentication settings.
+`case_hash` identifies the original recipe; `frozen_case_hash` identifies the
+portable snapshot checked for modification during execution and grading.
+
+To replay a moved run, pass its frozen case and separately supplied configuration:
+
+```bash
+myco-eval run /moved/run/case --config /new/config.toml \
+  --model MODEL_KEY --output /new/results
+```
+
+`job.json` records the original execution paths; it is not a relocation script.
+The bundle preserves task inputs, not an operating system or installed tools.
+Use the same build, dependencies, model settings, and candidate prelude for a
+controlled comparison. Git recipes accept an absolute repository path or a
+relative path inside the case; relative paths cannot escape via `..`.
+
+Each new trace line has `version: 1`, a one-based `sequence`, UTC `timestamp`,
+and monotonic `elapsed_ms`. `request_started` and `request_finished` share a
+`request_id`; completions distinguish `finished`, `failed`, and `abandoned`
+streams. A finished stream is not itself proof of valid model output:
+`generation_accepted` records validation by the main agent. Retry failures include
+attempt counts and `retry_in_ms`; tool starts/finishes share a `call_id`.
+Compaction boundaries and the final run status are recorded too. The session
+store retains tool content and accepted conversation history. A trace write
+failure is an evaluator error, even if the task produced a useful artifact.
 
 Re-running the same command reuses finished results whose case, model, prelude,
 limits, repetition, and Myco build fingerprints match. Interrupted attempts are
 retained and retried in fresh workspaces; a still-running worker prevents reuse.
 Use a new output directory for fresh stochastic samples. Model aliases and
 external services can change independently of these local fingerprints.
+Runtime policy such as `max_prelude_bytes` and `compaction_max_requests` is part
+of the configuration fingerprint; changing either produces a fresh run.
 
 Reports separate cohorts with different tasks/settings and group by model,
 prelude, and split. Success means a normally completed run with score 1. The
@@ -124,6 +163,82 @@ are unknown unless `report --prices prices.json` supplies USD per million tokens
 The estimate separates cached input from total input. Missing request usage
 makes the estimate unknown. Provider billing, cache writes, and non-model
 services can differ; preserve the original token counts alongside estimates.
+The headless runner does not infer human interventions, or whether one was
+needed, from an error, deadline, or cancellation. Reports can separately join
+explicit observer annotations as described below.
+
+## Observer-reported interventions
+
+An experiment observer can supply counts after a run without editing its result,
+trace, session, or machine metrics:
+
+```bash
+myco-eval report /private/results > /private/result-identities.json
+myco-eval report /private/results --interventions /private/interventions.json
+```
+
+The first report's `results` array lists each relative `result_path`, its run
+`fingerprint`, and the SHA-256 of the exact `result.json` bytes. Copy both identity
+fields into a version 1 annotation document. The values below are placeholders:
+
+```json
+{
+  "version": 1,
+  "annotations": [
+    {
+      "fingerprint": "FINGERPRINT_FROM_REPORT",
+      "result_sha256": "RESULT_SHA256_FROM_REPORT",
+      "human_interventions": 0,
+      "observer": "experiment operator",
+      "annotated_at": "2026-10-06T12:00:00Z",
+      "note": "Observed the entire run; no human steering occurred.",
+      "evidence": ["experiment-notes.md#run-1"]
+    }
+  ]
+}
+```
+
+Count deliberate human actions that steer an ongoing evaluated run, such as
+supplying guidance, changing its workspace, or manually cancelling it. Exclude
+initial task setup, passive observation, and subsequent grading. Describe the
+observed actions and any counting assumptions in `note`. An explicit zero asserts
+that the observer knows no such action occurred during the entire run. Omit an
+entry when the count is unknown; never manufacture zero from an absence of
+signals, errors, or intervention records.
+
+Counts must be unsigned integers. Observer and note are required nonempty strings;
+`annotated_at` is the annotation time in RFC 3339 format. Optional `evidence`
+strings name the observer's references and must be nonempty. Myco does not fetch
+or verify those references, authenticate the observer, or establish the truth of
+the assertions. The hash binds an annotation to result bytes; it does not make
+the observer's account a machine measurement. Annotation files must be regular
+files of at most 4 MiB.
+
+Each group's `observer_reported_human_interventions` is the checked sum only when
+**every included result** has an annotation, including failed or cancelled runs.
+Otherwise it is null. `intervention_annotated_runs` and
+`intervention_unannotated_runs` expose coverage independently of the total. Without
+an annotation file, all intervention totals remain unknown. Existing success,
+cost, token, and tool metrics are unaffected; annotations do
+not change grading or optimizer selection.
+
+The report's `intervention_annotations` records the source file's SHA-256 and
+the supplied observer metadata. Report version 1 gains these additive fields;
+saved run formats are unchanged. Keep the report and annotation file with the
+experiment evidence. Reports include supplied notes and references, so review
+them before sharing.
+
+Both fingerprint and result hash must match. Different fresh attempts can share
+a fingerprint; different result hashes identify their separate annotations.
+Duplicate exact identity pairs in results or annotations are rejected, as are
+unknown results, stale or mismatched hashes, unsupported annotation versions,
+unknown fields, and overflowing totals. Even reformatting `result.json` changes
+its hash. Moving a bundle without changing its bytes preserves the binding.
+Annotations for excluded interrupted directories or another report's results
+are unknown entries and must be removed from the supplied annotation document.
+
+## Comparing runs
+
 Use repeated cases, held-out tasks, and your own success floor before selecting
 models for long-running work. The included examples verify the infrastructure;
 they are not a model leaderboard or evidence about long-task reliability.
@@ -158,6 +273,9 @@ optimization score is task quality; costs are measured, not hidden in that score
 
 GEPA checkpoints live in the output directory. Reusing it resumes optimization
 when inputs match; changed tasks/configuration, seed prelude, or binary require a fresh output
-directory. The adapter caps reflection calls separately. Budget exhaustion or
-infrastructure errors stop with diagnostic artifacts; they do not count as an
-improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).
+directory. The adapter caps reflection calls separately and reserves each attempt
+on disk before launching it. Failed attempts and interruptions consume that allowance,
+even when resuming an older optimizer checkpoint. Existing proposal directories count
+conservatively toward the allowance; keep them and `reflection-budget` when resuming.
+Budget exhaustion or infrastructure errors stop with diagnostic artifacts; they do
+not count as an improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).

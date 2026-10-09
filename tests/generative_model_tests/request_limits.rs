@@ -132,3 +132,58 @@ async fn every_protocol_counts_encoded_images_history_and_json_overhead_against_
         assert_eq!(exact.connections(), 1, "the exact limit must be allowed");
     }
 }
+
+#[tokio::test]
+async fn every_protocol_rejects_oversized_inline_and_legacy_images_before_upload() {
+    for protocol in [
+        Protocol::AnthropicMessages,
+        Protocol::OpenAIResponses,
+        Protocol::OpenAICompletions,
+    ] {
+        for prefix in ["data:image/png;base64,", ""] {
+            let rejected = StubHttpServer::status(400, "must not receive a request").await;
+            // Invalid base64 is deliberately large: size rejection must precede
+            // any decoding or provider-specific request allocation.
+            let history = vec![Message::UserMessage {
+                content: vec![Content::Image {
+                    source: format!("{prefix}{}", "!".repeat(1025)),
+                }],
+            }];
+            let error = GenerateOutput::from_generation(
+                model(&rejected, protocol, 30_000_000).generate(&history),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, GenerateError::RequestTooLargeError(_)),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("max_image_base64_bytes is 1024"),
+                "{error}"
+            );
+            assert_eq!(
+                rejected.connections(),
+                0,
+                "{protocol} uploaded an oversized image"
+            );
+        }
+        let accepted = StubHttpServer::status(400, "test response").await;
+        let history = vec![Message::UserMessage {
+            content: vec![Content::Image {
+                source: format!("data:image/png;base64,{}", "AAAA".repeat(256)),
+            }],
+        }];
+        let error = GenerateOutput::from_generation(
+            model(&accepted, protocol, 30_000_000).generate(&history),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, GenerateError::ExecutionError(_)), "{error}");
+        assert_eq!(
+            accepted.connections(),
+            1,
+            "{protocol} rejected an image at the exact cap"
+        );
+    }
+}

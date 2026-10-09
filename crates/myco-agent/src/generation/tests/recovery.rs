@@ -17,7 +17,9 @@ async fn prolonged_outage_recovers_beyond_short_retries_from_one_committed_bound
     let (mut agent, model) = setup(scripts, events.clone());
     prolonged(&mut agent);
     let started = Instant::now();
-    generate(&agent, CancelToken::new()).await.unwrap();
+    generate(&agent, CancelToken::new(), agent.retry_policy)
+        .await
+        .unwrap();
     assert_eq!(started.elapsed(), Duration::from_secs(65));
     let inputs = model.inputs.lock().unwrap();
     assert_eq!(inputs.len(), 5);
@@ -58,7 +60,9 @@ async fn provider_minimum_is_never_shortened_to_fit_a_wait_or_elapsed_cap() {
         prolonged(&mut agent);
         agent.retry_policy.max_elapsed = Some(Duration::from_secs(elapsed));
         let started = Instant::now();
-        let error = generate(&agent, CancelToken::new()).await.unwrap_err();
+        let error = generate(&agent, CancelToken::new(), agent.retry_policy)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
         assert_eq!(started.elapsed(), Duration::ZERO);
         assert_eq!(model.inputs.lock().unwrap().len(), 1);

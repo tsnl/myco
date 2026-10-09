@@ -602,6 +602,39 @@ pub fn answer_content(content: &[Content]) -> Vec<Content> {
         .collect()
 }
 
+/// Check an encoded image payload without decoding or copying it.
+pub fn check_image_size(encoded_bytes: u64, limit: u64) -> Result<(), GenerateError> {
+    if encoded_bytes > limit {
+        return Err(GenerateError::RequestTooLargeError(format!(
+            "image has {encoded_bytes} base64 bytes; the current model's max_image_base64_bytes is {limit}. Resize the image, compact the session, or select a model with a larger image limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate inline and legacy base64 images before constructing a provider body.
+/// Remote URLs carry no known payload size; the provider validates their content.
+/// Local references must be checked while resolving and never sent to a provider.
+pub fn validate_image_sizes(input: &[Message], limit: u64) -> Result<(), GenerateError> {
+    for part in input.iter().flat_map(Message::content) {
+        if let Content::Image { source } = part {
+            if source.starts_with("http://") || source.starts_with("https://") {
+                continue;
+            }
+            if source.starts_with("myco-image:") {
+                return Err(GenerateError::ExecutionError(
+                    "resolve local image references before calling a provider".into(),
+                ));
+            }
+            let payload = source
+                .split_once(',')
+                .map_or(source.as_str(), |(_, data)| data);
+            check_image_size(payload.len() as u64, limit)?;
+        }
+    }
+    Ok(())
+}
+
 /// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
 /// sends for the `j`-th tool_use of the assistant message at index `i`, and
 /// equally for the `j`-th result of the `ToolResults` message answering it.

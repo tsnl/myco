@@ -93,6 +93,9 @@ impl OpenAICompletionsGenerativeModel {
 
 impl GenerativeModel for OpenAICompletionsGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
+        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
+            return driver_core::error_stream(error);
+        }
         let messages = match convert_messages(&self.system_prompt, input) {
             Ok(messages) => messages,
             Err(e) => return driver_core::error_stream(e),
