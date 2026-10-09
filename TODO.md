@@ -165,6 +165,11 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 ### Invocation surface
 
 - [x] **Headless / one-shot** — `myco -p "…"` / stdin / CI-friendly non-interactive mode.
+- [x] **Explicit service attachment** — existing-session `--server --resume -p`,
+      detach/reconnect, instance-bound deduplication, committed output receipts.
+- [ ] **CLI service discovery and private fallback** — preserve launch cwd/config,
+      strict readiness and single-writer ownership, and interactive client semantics.
+      Restart-safe native receipts need a durable acceptance/outcome contract.
 - [ ] **Terminal styling follow-up (deferred)** — scrolling chat is available;
       further visual parity with the browser was set aside to focus on the server.
 - [x] **User multimodal (images)** — browser picker, paste, drag/drop, and `@path`

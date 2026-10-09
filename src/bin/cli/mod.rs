@@ -9,9 +9,12 @@ use super::{Args, Boot, boot_session, prepare_boot};
 mod interactive;
 mod output;
 mod print;
+mod service;
+mod service_client;
 
 pub(super) use interactive::run_interactive;
 pub(super) use print::run_print;
+pub(super) use service::run_service;
 
 //
 // Shared session lifecycle
