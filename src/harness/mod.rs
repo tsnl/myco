@@ -63,6 +63,7 @@ pub struct Harness {
     root_only_tool_names: std::collections::HashSet<String>,
     /// Cached tool specs advertised to the model (host field injected for multi-host tools).
     tool_specs: Vec<generative_model::ToolSpec>,
+    max_image_base64_bytes: u64,
 }
 
 /// How to construct a harness.
@@ -74,10 +75,9 @@ pub struct HarnessConfig {
     pub attach_timeout_secs: u64,
     /// Reap unused remote connections after this many seconds; 0 disables reaping.
     pub host_idle_timeout_secs: u64,
-    /// Image cap every host in this pool enforces — the driving model's
-    /// resolved `max_image_base64_bytes`. Remotes carry it in their spawn argv;
-    /// the local in-process worker is built with it directly. Never defaulted
-    /// here: [`crate::config`] resolves it and hands it down.
+    /// Worker ceiling: the largest image cap in the configured model catalog.
+    /// Remotes carry it in their spawn argv; local enforces it in-process.
+    /// Each session call can lower this ceiling for its active model.
     pub max_image_base64_bytes: u64,
 }
 
@@ -256,11 +256,30 @@ impl Harness {
             host_tool_names,
             root_only_tool_names,
             tool_specs,
+            max_image_base64_bytes,
         }
     }
 
     pub fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         self.tool_specs.clone()
+    }
+
+    /// Ceiling shared by all workers, independent of the active model.
+    pub fn max_image_base64_bytes(&self) -> u64 {
+        self.max_image_base64_bytes
+    }
+
+    /// Advertise the active image cap while retaining routing and other schemas.
+    pub fn tool_specs_with_image_limit(&self, limit: u64) -> Vec<generative_model::ToolSpec> {
+        let mut specs = self.tool_specs();
+        if let Some(spec) = specs.iter_mut().find(|spec| spec.name == "view_image") {
+            spec.description = crate::tool_services::ViewImageService::specs(
+                limit.min(self.max_image_base64_bytes),
+            )
+            .remove(0)
+            .description;
+        }
+        specs
     }
 
     /// Always `"local"`.

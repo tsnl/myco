@@ -240,6 +240,7 @@ pub async fn run_compact_worker_with_model(
                 wrap_model(model),
                 crate::core::image_store::ImageStore::for_profile()
                     .map_err(CompactWorkerError::Failed)?,
+                catalog_model.spec.max_image_base64_bytes,
             ),
             requests: AtomicUsize::new(0),
             limit: max_requests,

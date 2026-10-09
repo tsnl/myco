@@ -642,12 +642,18 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     session.replace_context(context, None);
     let session_id = session.id.clone();
     let session = ActiveSession::new(session);
-    let harness = Harness::local_with_services(vec![
-        Arc::new(crate::SessionMetaTool::new(session.clone())),
-        Arc::new(crate::SessionHistoryTool::new()),
-        Arc::new(crate::ListRecentService::new()),
-        Arc::new(crate::PreludeTool::new(config.max_prelude_bytes)),
-    ]);
+    let mut harness_config = config.harness.clone();
+    harness_config.remote_hosts.clear();
+    let harness = Harness::attach_with_root_services(
+        harness_config,
+        vec![
+            Arc::new(crate::SessionMetaTool::new(session.clone())),
+            Arc::new(crate::SessionHistoryTool::new()),
+            Arc::new(crate::ListRecentService::new()),
+            Arc::new(crate::PreludeTool::new(config.max_prelude_bytes)),
+        ],
+    )
+    .await?;
     let runtime = SessionRuntime::new(harness.clone(), session);
     runtime.set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
     match &mut catalog.backend {
@@ -663,7 +669,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     let (epilogue, prelude) = crate::prompts::agent_prompt_epilogue();
     let model_config = GenerativeModelConfig {
         model: catalog.spec.clone(),
-        tools: harness.tool_specs(),
+        tools: harness.tool_specs_with_image_limit(catalog.spec.max_image_base64_bytes),
         backend_config: catalog.backend.clone(),
         system_prompt: format!(
             "You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.",
@@ -705,7 +711,11 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         std::fs::File::create(job.output.join("events.jsonl"))
             .map_err(|error| error.to_string())?,
     );
-    let model = with_images(recorder.wrap(model, false), image_store);
+    let model = with_images(
+        recorder.wrap(model, false),
+        image_store,
+        catalog.spec.max_image_base64_bytes,
+    );
     let mut agent = Agent::new(model.clone(), runtime.clone(), recorder.clone());
     agent.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
         prelude,

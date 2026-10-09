@@ -87,6 +87,9 @@ impl OpenAIResponsesGenerativeModel {
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
+        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
+            return driver_core::error_stream(error);
+        }
         let input_items = match convert_messages(input) {
             Ok(items) => items,
             Err(e) => return driver_core::error_stream(e),

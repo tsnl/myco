@@ -51,10 +51,9 @@ impl HarnessConfig {
 /// `~/.ssh/config` for the alias. The remote `myco` must be on the PATH used
 /// by non-interactive SSH.
 ///
-/// The image cap rides the argv rather than the NDJSON handshake because a
-/// worker serves exactly one controller, whose model is fixed at startup: the
-/// remote can be fully configured before it serves its first call. Version
-/// skew cannot strand the flag — connect already fails loud on it.
+/// The startup ceiling covers the configured model catalog. Each NDJSON call
+/// can lower it for its active model, so model changes retain the same worker.
+/// Host protocol compatibility is checked before calls can run.
 pub fn ssh_spawn_command(alias: &str, max_image_base64_bytes: u64) -> Vec<String> {
     vec![
         "ssh".into(),
